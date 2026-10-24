@@ -8,6 +8,21 @@ export const LANDLOCK_MIN_ABI = 6;
 const CONNECT_TCP = 2n;
 const SCOPE_ABSTRACT_AND_SIGNAL = 3n;
 const RULE_NET_PORT = 2;
+/** The payload's environment, JSON-encoded in the launcher's own (never a command line's) environment. */
+export const PAYLOAD_ENV = "LIMITLESS_PAYLOAD_ENV";
+/** bwrap reads it from this descriptor (`--ro-bind-data`); the payload's shell sources it inside the sandbox. */
+export const ENV_FD = 9;
+export const ENV_FILE = "/run/limitless-env";
+// Read-only in some shells, so sourcing an assignment to them would abort the loader.
+const SHELL_OWNED = new Set(["UID", "EUID", "PPID", "GROUPS", "BASHOPTS", "SHELLOPTS", "BASH_VERSINFO"]);
+
+/** Shell `export` lines for the payload's variables; a name that is not a plain identifier is dropped. */
+export function envScript(env: Record<string, string>): string {
+  return Object.entries(env)
+    .filter(([name]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && !SHELL_OWNED.has(name))
+    .map(([name, value]) => `export ${name}='${value.replaceAll("'", "'\\''")}'\n`)
+    .join("");
+}
 
 /**
  * The launcher that confines a Linux command before bwrap starts. A source checkout runs it with a
@@ -31,6 +46,10 @@ function libc() {
     syscall: { args: [i64, i64, i64, i64, i64], returns: i64 },
     prctl: { args: [FFIType.i32, i64, i64, i64, i64], returns: FFIType.i32 },
     execve: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
+    memfd_create: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
+    write: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
+    lseek: { args: [FFIType.i32, i64, FFIType.i32], returns: i64 },
+    dup2: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
   }).symbols;
 }
 
@@ -113,7 +132,27 @@ export async function landlockEntry(args: string[]): Promise<number> {
   }
   if (mode === "--probe") return probe(port, rest[0] ?? "", Number(rest[1]));
   const argv = cstrings(rest);
-  const env = cstrings(Object.entries(process.env).map(([key, value]) => `${key}=${value ?? ""}`));
+  // A launch from `launch()` carries the payload's environment privately: bwrap and its loader get only
+  // the process-cleanup markers, and the payload's shell reads the rest from a descriptor inside.
+  const payload = process.env[PAYLOAD_ENV];
+  let inherited = Object.entries(process.env).filter(([key]) => key !== PAYLOAD_ENV);
+  if (payload !== undefined) {
+    try {
+      const vars = { ...(JSON.parse(payload) as Record<string, string>) };
+      inherited = inherited.filter(([key]) => key.startsWith("LIMITLESS_INVOCATION"));
+      for (const [key, value] of inherited) vars[key] = value ?? "";
+      const body = Buffer.from(envScript(vars));
+      const fd = sys.memfd_create(ptr(Buffer.from("limitless-env\0")), 0);
+      if (fd < 0 || Number(sys.write(fd, ptr(body), BigInt(body.length))) !== body.length)
+        throw new Error("cannot stage the payload environment");
+      sys.lseek(fd, 0n, 0);
+      if (sys.dup2(fd, ENV_FD) !== ENV_FD) throw new Error("cannot stage the payload environment");
+    } catch (error) {
+      console.error(`landlock: ${error instanceof Error ? error.message : String(error)}`);
+      return 125;
+    }
+  }
+  const env = cstrings(inherited.map(([key, value]) => `${key}=${value ?? ""}`));
   sys.execve(ptr(argv.buffers[0] ?? Buffer.from("\0")), ptr(argv.pointers), ptr(env.pointers));
   console.error(`landlock: cannot execute ${command}`);
   return 127;

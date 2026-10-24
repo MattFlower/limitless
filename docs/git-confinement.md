@@ -83,8 +83,17 @@ read-write binds for exactly the write roots above. Inside that, `setpriv` appli
 checks execute access on the loader too). Aliases that shell out, `core.fsmonitor`, credential
 helpers and every other program are refused, and transports fail without a network. A launch
 failure (stderr starting with `bwrap: ` or `setpriv: `) is a `ConfinementError`, never a git
-result. It needs `/usr/bin/bwrap` and util-linux 2.40 or later; see
+result. A seccomp filter (`setpriv --seccomp-filter`) makes `socket(AF_UNIX, …)` fail, because
+`--unshare-net` alone leaves pathname sockets on the host (a credential-cache daemon, for example)
+reachable. It needs `/usr/bin/bwrap` and util-linux 2.40 or later; see
 [OPERATIONS](OPERATIONS.md#linux-confinement).
+
+**Known Linux limitation.** Landlock's `execute` rule on the ELF loader also lets the loader run any
+readable binary, because the loader maps it with ordinary reads. A program Git is configured to start,
+such as an `ext::` transport or a configured helper, can therefore run other programs through the
+loader, where Seatbelt refuses the exec of the program itself. The network, filesystem write and
+Unix-socket restrictions still apply to whatever runs. Closing this needs Git's program-launching
+routes disabled or a loader-proof exec restriction, and is tracked as a follow-up.
 
 ## Checks run in the worker
 

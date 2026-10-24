@@ -1,8 +1,24 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bwrapGit, elfInterpreter, gitConfinement, gitSh } from "../src/git/confinement.ts";
+import {
+  bwrapGit,
+  checkApply,
+  elfInterpreter,
+  gitBwrapArgs,
+  gitConfinement,
+  gitSeccompFilter,
+  gitSh,
+} from "../src/git/confinement.ts";
 import { ConfinementError, platformConfinement, runSandboxed, SANDBOX_EXEC } from "../src/harness/sandbox.ts";
 import { BWRAP, bwrapArgs, linuxForPort, verifyLinux } from "../src/harness/sandbox-linux.ts";
 import type { WriteRoots } from "../src/harness/scratch.ts";
@@ -238,5 +254,174 @@ test.skipIf(process.platform !== "linux")(
     const script = join(root, "git");
     writeFileSync(script, "#!/bin/sh\n");
     expect(() => elfInterpreter(script)).toThrow(ConfinementError);
+  },
+);
+
+test("bwrapArgs refuses policies a bind mount cannot enforce", () => {
+  const { work, scratch, roots } = layout();
+  const sources = { dir: root, file: root };
+  // A denied file that does not exist yet could be created inside the writable checkout and read.
+  const future = { ...roots, denyRead: [...(roots.denyRead ?? []), join(work, "future.db")] };
+  expect(() => bwrapArgs(future, sources)).toThrow("does not exist yet");
+  // Outside every bound path nothing can create it, so an absent credential store is fine.
+  expect(() => bwrapArgs({ ...roots, denyRead: [join(root, "home", "missing")] }, sources)).not.toThrow();
+  // A write root under a denied parent without a read allowance would be bound back readable.
+  const private_ = join(root, "srv", "private");
+  mkdirSync(join(private_, "work"), { recursive: true });
+  const nested = { write: [join(private_, "work")], protect: [], denyRead: [private_] };
+  expect(() => bwrapArgs(nested, sources)).toThrow("under a denied path");
+  expect(() => bwrapArgs({ ...nested, allowRead: [join(private_, "work")] }, sources)).not.toThrow();
+  // A write root inside a protected path would drop the protection.
+  expect(() => bwrapArgs({ write: [join(private_, "work")], protect: [private_] }, sources)).toThrow(
+    "inside a protected path",
+  );
+  expect(() => bwrapArgs({ ...roots, write: [scratch], protect: [scratch] }, sources)).not.toThrow();
+});
+
+test("the Linux launch keeps the payload's environment and cwd off the unconfined launcher and bwrap", () => {
+  const { work, roots } = layout();
+  const secret = `secret-${crypto.randomUUID()}`;
+  const env = { BUN_OPTIONS: "--preload /x.js", LD_PRELOAD: "/x.so", NODE_OPTIONS: secret, PATH: "/usr/bin" };
+  const launch = linuxForPort(7).launch;
+  if (!launch) throw new Error("the Linux backend has no trusted launch");
+  const launched = launch(["/bin/true"], roots, { env, cwd: work });
+  expect(launched.cwd).toBe("/");
+  expect(Object.keys(launched.env).sort()).toEqual(["LIMITLESS_PAYLOAD_ENV", "PATH"]);
+  expect(launched.env.PATH).not.toBe(env.PATH);
+  expect(JSON.parse(launched.env.LIMITLESS_PAYLOAD_ENV ?? "")).toEqual(env);
+  // Argv is world-readable through /proc: nothing from the payload's environment may appear.
+  expect(launched.cmd.join("\0")).not.toContain(secret);
+  expect(launched.cmd[launched.cmd.indexOf("--chdir") + 1]).toBe(work);
+  expect(launched.cmd.slice(-2)).toEqual(["sh", "/bin/true"]);
+  expect(launched.cmd).toContain("--ro-bind-data");
+});
+
+test("gitBwrapArgs has no network, a Unix-socket filter, execute-only Landlock and write binds only for its roots", () => {
+  const bpf = join(root, "filter.bpf");
+  const args = gitBwrapArgs(["/usr/bin/git", "/lib/ld.so"], ["/w/b", "/w"], "bwrap", "setpriv", bpf);
+  expect(args[0]).toBe("bwrap");
+  expect(args).toContain("--unshare-net");
+  expect(args.filter((_, i) => args[i - 1] === "--bind")).toEqual(["/w", "/w/b"]);
+  expect(args.indexOf("--bind")).toBeLessThan(args.indexOf("--remount-ro"));
+  const setpriv = args.slice(args.indexOf("setpriv"));
+  expect(setpriv).toContain("--seccomp-filter");
+  expect(args[args.indexOf(bpf) - 1]).toBe("--ro-bind");
+  expect(setpriv.filter((arg) => arg.startsWith("path-beneath:"))).toEqual([
+    "path-beneath:execute:/usr/bin/git",
+    "path-beneath:execute:/lib/ld.so",
+  ]);
+  expect(() => gitBwrapArgs(["/usr/bin/git\n"], [], "bwrap", "setpriv", bpf)).toThrow(ConfinementError);
+});
+
+test("the Git seccomp filter denies only AF_UNIX sockets and rejects unknown architectures", () => {
+  // Decode the program: 8-byte instructions, each ending in a return that is the verdict.
+  for (const arch of ["x64", "arm64"]) {
+    const filter = gitSeccompFilter(arch);
+    expect(filter.length % 8).toBe(0);
+    const rets = Array.from(
+      { length: filter.length / 8 },
+      (_, i) => filter.readUInt16LE(i * 8) === 6 && filter.readUInt32LE(i * 8 + 4),
+    );
+    expect(rets.filter((r) => r !== false)).toEqual([0x0005000d, 0x7fff0000, 0x80000000]);
+  }
+  expect(() => gitSeccompFilter("riscv64")).toThrow(ConfinementError);
+});
+
+test("bwrap and setpriv stderr is a confinement failure on Linux only", () => {
+  const failed = { exitCode: 128, stderr: "bwrap: x" };
+  expect(() => checkApply(failed, "linux")).toThrow(ConfinementError);
+  expect(() => checkApply(failed, "darwin")).not.toThrow();
+});
+
+test.skipIf(process.platform !== "linux")(
+  "verifyLinux reports a leak before a cancellation and releases everything when setup fails (needs linux)",
+  async () => {
+    const { work, roots } = layout();
+    const bwrap = join(root, "bwrap");
+    writeFileSync(bwrap, "");
+    const controller = new AbortController();
+    const leakyThenAborted = async ({ cmd }: { cmd: string[] }) => {
+      if (cmd[0] !== "/bin/sh") return result("landlock-verified");
+      writeFileSync(cmd[6] ?? "", "leaked");
+      controller.abort(new Error("cancelled"));
+      return result("linux-verified");
+    };
+    await expect(
+      verifyLinux(roots, { signal: controller.signal }, leakyThenAborted as never, bwrap),
+    ).rejects.toThrow(ConfinementError);
+
+    const before = readdirSync(work);
+    const real = Bun.listen;
+    let calls = 0;
+    const listener = { stopped: false };
+    const spy = spyOn(Bun, "listen").mockImplementation(((options: Parameters<typeof Bun.listen>[0]) => {
+      if (++calls === 2) throw new Error("EMFILE");
+      const first = real(options);
+      const stop = first.stop.bind(first);
+      first.stop = (force?: boolean) => {
+        listener.stopped = true;
+        return stop(force);
+      };
+      return first;
+    }) as typeof Bun.listen);
+    try {
+      await expect(verifyLinux(roots, {}, async () => result(""), bwrap)).rejects.toThrow(ConfinementError);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(readdirSync(work)).toEqual(before);
+    expect(listener.stopped).toBe(true);
+  },
+);
+
+test.skipIf(bwrapSkip !== null)(
+  `nothing from the payload's environment or the checkout runs before confinement (${bwrapSkip})`,
+  async () => {
+    const { work, roots } = layout();
+    const marker = join(root, "preload-ran");
+    const preload = join(root, "preload.js");
+    writeFileSync(preload, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");`);
+    // A hostile checkout: a bunfig.toml preload in the payload's cwd, and one in its environment.
+    writeFileSync(join(work, "bunfig.toml"), `preload = [${JSON.stringify(preload)}]\n`);
+    const run = await runSandboxed(
+      {
+        cmd: ["/bin/sh", "-c", 'pwd; echo "$KEEP"; test -n "$LIMITLESS_INVOCATION" && echo marked'],
+        cwd: work,
+        env: { ...agentEnv(), BUN_OPTIONS: `--preload ${preload}`, BUN_BE_BUN: "1", KEEP: "it's here" },
+      },
+      roots,
+      undefined,
+      undefined,
+      linuxForPort(0),
+    );
+    expect(existsSync(marker)).toBe(false);
+    expect(run.stdout.trim().split("\n")).toEqual([work, "it's here", "marked"]);
+  },
+);
+
+test.skipIf(bwrapSkip !== null)(
+  `confined Git cannot connect to a host Unix socket (${bwrapSkip})`,
+  async () => {
+    const repo = join(root, "repo");
+    Bun.spawnSync(["git", "init", "-q", repo]);
+    let connections = 0;
+    const server = Bun.listen({
+      unix: join(repo, "s.sock"),
+      socket: { open: () => void connections++, data() {} },
+    });
+    try {
+      const git = await gitConfinement.run(bwrapGit(), () =>
+        gitSh(["git", "credential-cache", `--socket=${join(repo, "s.sock")}`, "get"], {
+          cwd: repo,
+          env: agentEnv(),
+          stdin: "protocol=https\nhost=example.com\n\n",
+          allowFail: true,
+        }),
+      );
+      expect(git.exitCode).not.toBe(0);
+    } finally {
+      server.stop(true);
+    }
+    expect(connections).toBe(0);
   },
 );

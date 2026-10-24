@@ -1,5 +1,13 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { ConfinementError } from "../harness/read-policy.ts";
@@ -141,12 +149,59 @@ export function elfInterpreter(path: string): string | undefined {
   return undefined;
 }
 
+const SECCOMP_FILE = "/run/limitless-git-seccomp";
+const ARCHITECTURES: Record<string, { audit: number; socket: number }> = {
+  x64: { audit: 0xc000003e, socket: 41 },
+  arm64: { audit: 0xc00000b7, socket: 198 },
+};
+
+/**
+ * A classic-BPF seccomp program that makes `socket(AF_UNIX, …)` fail with EACCES and kills anything
+ * running under another architecture. `--unshare-net` leaves pathname Unix sockets on the host reachable
+ * (connect needs no write access), and seccomp cannot read the address, so creating one is what is refused.
+ */
+export function gitSeccompFilter(arch: string = process.arch): Buffer {
+  const target = ARCHITECTURES[arch];
+  if (!target) throw new ConfinementError(`Git confinement has no Unix-socket filter for ${arch}`);
+  const insn = (code: number, jt: number, jf: number, k: number) => {
+    const out = Buffer.alloc(8);
+    out.writeUInt16LE(code, 0);
+    out[2] = jt;
+    out[3] = jf;
+    out.writeUInt32LE(k >>> 0, 4);
+    return out;
+  };
+  const [LD, JEQ, RET] = [0x20, 0x15, 0x06];
+  return Buffer.concat([
+    insn(LD, 0, 0, 4), // seccomp_data.arch
+    insn(JEQ, 0, 6, target.audit),
+    insn(LD, 0, 0, 0), // nr
+    insn(JEQ, 0, 3, target.socket),
+    insn(LD, 0, 0, 16), // args[0], the domain
+    insn(JEQ, 0, 1, 1), // AF_UNIX
+    insn(RET, 0, 0, 0x00050000 | 13), // ERRNO(EACCES)
+    insn(RET, 0, 0, 0x7fff0000), // ALLOW
+    insn(RET, 0, 0, 0x80000000), // KILL_PROCESS
+  ]);
+}
+
+/** The filter on disk in a directory no candidate can write, bound read-only into each sandbox. */
+let seccompPath: string | undefined;
+function seccompFile(): string {
+  if (seccompPath && existsSync(seccompPath)) return seccompPath;
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "limitless-git-seccomp-")));
+  seccompPath = join(dir, "filter.bpf");
+  writeFileSync(seccompPath, gitSeccompFilter(), { mode: 0o444 });
+  return seccompPath;
+}
+
 /** `gitProfile` on Linux: no network, writes only to `writes`, execute only git, its helpers and loader. */
 export function gitBwrapArgs(
   executables: string[],
   writes: string[],
   bwrap = BWRAP,
   setpriv = SETPRIV,
+  seccomp = seccompFile(),
 ): string[] {
   if ([...executables, ...writes].some((path) => [...path].some((c) => c < " " || c === "\x7f")))
     throw new ConfinementError("Unusual Git confinement path");
@@ -156,10 +211,9 @@ export function gitBwrapArgs(
     ...["--unshare-cgroup-try", "--die-with-parent", "--new-session", "--ro-bind", "/", "/"],
     ...["--dev", "/dev", "--proc", "/proc", "--perms", "0755", "--tmpfs", "/run", "--tmpfs", "/tmp"],
     ...[...writes].sort((a, b) => a.length - b.length).flatMap((path) => ["--bind", path, path]),
-    "--remount-ro",
-    "/run",
+    ...["--ro-bind", seccomp, SECCOMP_FILE, "--remount-ro", "/run"],
     setpriv,
-    ...["--landlock-access", "fs:execute"],
+    ...["--no-new-privs", "--seccomp-filter", SECCOMP_FILE, "--landlock-access", "fs:execute"],
     ...executables.flatMap((path) => ["--landlock-rule", `path-beneath:execute:${path}`]),
   ];
 }
@@ -206,13 +260,16 @@ export function bwrapGit(
 }
 export const gitBackend = { default: process.platform === "linux" ? bwrapGit() : seatbeltGit() };
 // Specific to sandbox-exec, bwrap and setpriv; Git's own failures must retain their normal classification.
-function checkApply(result: { exitCode: number | null; stderr: string }): void {
+export function checkApply(
+  result: { exitCode: number | null; stderr: string },
+  platform: string = process.platform,
+): void {
   if (
     (result.exitCode === 71 &&
       result.stderr
         .replace(/^sandbox-exec: /, "")
         .startsWith("sandbox_" + "apply: Operation not permitted")) ||
-    (result.exitCode !== 0 && /^(bwrap|setpriv): /.test(result.stderr))
+    (platform === "linux" && result.exitCode !== 0 && /^(bwrap|setpriv): /.test(result.stderr))
   )
     throw new ConfinementError("Cannot apply Git confinement");
 }

@@ -10,10 +10,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
-import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
-import { landlockCommand } from "./landlock.ts";
+import { type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
+import { ENV_FD, ENV_FILE, landlockCommand, PAYLOAD_ENV } from "./landlock.ts";
 import { ancestorReadPolicy, ConfinementError, specificReadDenies } from "./read-policy.ts";
-import type { ConfinementBackend } from "./sandbox.ts";
+import { type ConfinementBackend, killedByCancel } from "./sandbox.ts";
 import type { WriteRoots } from "./scratch.ts";
 
 export const BWRAP = "/usr/bin/bwrap";
@@ -37,6 +37,25 @@ function canonical(paths: readonly string[] = []): string[] {
   return [...new Set(resolved)].sort((a, b) => a.length - b.length);
 }
 
+/** The existing ancestor a path would be created under, so a not-yet-existing deny can be placed. */
+function creatableUnder(path: string): string {
+  for (let dir = dirname(path); ; dir = dirname(dir)) {
+    try {
+      return realpathSync(dir);
+    } catch {
+      if (dir === dirname(dir)) return dir;
+    }
+  }
+}
+
+/** Valid absolute policy paths that `realpath` cannot resolve. */
+function canonicalAbsent(paths: readonly string[] = []): string[] {
+  return paths.filter((path) => {
+    canonical([path]);
+    return !existsSync(path);
+  });
+}
+
 /** Empty, mode-000 sources for masks: outside every write root, so no candidate can change them. */
 let masks: { dir: string; file: string } | undefined;
 function maskSources(): { dir: string; file: string } {
@@ -58,6 +77,7 @@ export function bwrapArgs(
   roots: WriteRoots,
   sources = maskSources(),
   hidden = ["/run", "/tmp", "/var/tmp"],
+  envFd?: number,
 ): string[] {
   if (
     roots.daemonPort !== undefined &&
@@ -70,6 +90,18 @@ export function bwrapArgs(
   const own = canonical(roots.commands?.own);
   const commandRoots = canonical(roots.commands?.root);
   const bound = [...allow, ...write, ...own];
+  // A mount cannot hide a path that does not exist yet, and a candidate could create it inside a bound
+  // directory; a write root under a deny without an allowance, or inside a protected path, would be
+  // bound over its ancestor's rule. Seatbelt's pathname rules cover these; bind mounts cannot.
+  for (const path of canonicalAbsent(roots.denyRead))
+    if (bound.some((b) => within(b, creatableUnder(path))))
+      throw new ConfinementError(`Cannot confine a denied path that does not exist yet: ${path}`);
+  for (const w of write) {
+    if (deny.some((d) => d !== w && within(d, w)) && !allow.some((a) => within(a, w)))
+      throw new ConfinementError(`Cannot confine a write root under a denied path: ${w}`);
+    if (canonical(roots.protect).some((p) => p !== w && within(p, w)))
+      throw new ConfinementError(`Cannot confine a write root inside a protected path: ${w}`);
+  }
   const outer = deny.filter(
     (d) =>
       (!hidden.some((h) => within(h, d)) || bound.some((b) => within(d, b))) &&
@@ -88,6 +120,7 @@ export function bwrapArgs(
     ...["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"],
     ...["--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
     ...["--perms", "0755", "--tmpfs", "/run", ...resolv.flatMap((p) => ["--ro-bind", p, p])],
+    ...(envFd === undefined ? [] : ["--ro-bind-data", String(envFd), ENV_FILE]),
     // Private and writable: Codex's own bubblewrap keeps its mount registry in /tmp.
     ...["--perms", "1777", "--tmpfs", "/tmp", "--perms", "1777", "--tmpfs", "/var/tmp"],
     ...outer.flatMap((d) => (traversable.includes(d) ? ["--perms", "0111", "--tmpfs", d] : mask(d))),
@@ -117,10 +150,38 @@ const command = (cmd: string[], roots: WriteRoots, bwrap: string) => [
   ...cmd,
 ];
 
+const MAX_PAYLOAD_ENV = 100_000;
+// Sources the payload's variables inside the sandbox, from the descriptor the launcher staged.
+const LOAD_ENV = `. ${ENV_FILE} || exit 125; exec "$@"`;
+
+/**
+ * The launcher and bwrap run from "/" with only the cleanup markers (added by `runProcess`) and the
+ * payload environment in one variable the launcher consumes: BUN_OPTIONS, NODE_OPTIONS, LD_* and the
+ * checkout's files cannot run before confinement applies. bwrap --chdir enters the payload's cwd.
+ */
+function launch(cmd: string[], roots: WriteRoots, payload: { env: Record<string, string>; cwd: string }) {
+  const env = JSON.stringify(payload.env);
+  if (Buffer.byteLength(env) > MAX_PAYLOAD_ENV)
+    throw new ConfinementError("The confined command's environment is too large to stage");
+  if (!isAbsolute(payload.cwd)) throw new ConfinementError("The confined command's cwd must be absolute");
+  return {
+    cmd: [
+      ...landlockCommand(roots.daemonPort ?? 0),
+      "--",
+      BWRAP,
+      ...bwrapArgs(roots, undefined, undefined, ENV_FD),
+      ...["--chdir", payload.cwd, "--", "/bin/sh", "-c", LOAD_ENV, "sh", ...cmd],
+    ],
+    env: { PATH: "/usr/bin:/bin", [PAYLOAD_ENV]: env },
+    cwd: "/",
+  };
+}
+
 /** bwrap for the filesystem and PID namespace, Landlock for the daemon port, abstract sockets and signals. */
 export const linuxBackend: ConfinementBackend = {
   verify: (roots, opts, run) => verifyLinux(roots, opts, run),
   wrap: (cmd, roots) => command(cmd, roots, BWRAP),
+  launch,
 };
 
 export function linuxForPort(port: number): ConfinementBackend {
@@ -128,13 +189,15 @@ export function linuxForPort(port: number): ConfinementBackend {
   return {
     verify: (roots, opts, run) => linuxBackend.verify(rootsForPort(roots), opts, run),
     wrap: (cmd, roots) => linuxBackend.wrap(cmd, rootsForPort(roots)),
+    launch: (cmd, roots, payload) =>
+      (linuxBackend.launch ?? ((c) => ({ cmd: c, ...payload })))(cmd, rootsForPort(roots), payload),
   };
 }
 
 // Started by this supervisor: the sibling is another sandbox and `outer` an unconfined process.
 // Writes outside may land in the sandbox's private /tmp, so only the host can tell they were refused.
 const LINUX_PROBE = `
-ready=$1 inside=$2 outside=$3 beside=$4; shift 4
+ready=$1 inside=$2 outside=$3 beside=$4 denied=$5; shift 5
 sleep 30 & outer=$!
 sibling=""
 trap 'kill "$outer" $sibling 2>/dev/null; wait 2>/dev/null' EXIT
@@ -146,12 +209,12 @@ i=0; while [ ! -f "$ready" ]; do i=$((i+1)); [ "$i" -lt 1000 ] || exit 1; sleep 
   sleep 30 & child=$!; kill -TERM "$child"; wait "$child"; [ "$?" -gt 128 ] || exit 1
   printf ok > "$3" || exit 1
   printf no 2>/dev/null > "$4"; printf no 2>/dev/null > "$5"
-  printf "%s\\n" "$LIMITLESS_PROBE_DENIED" | while IFS= read -r file; do
+  printf "%s\\n" "$6" | while IFS= read -r file; do
     [ -n "$file" ] || continue
     if [ -d "$file" ]; then ls -A "$file"; else head -c 1 "$file"; fi >/dev/null 2>&1 && exit 1
     :
   done || exit 1
-' sh "$outer" "$sibling" "$inside" "$outside" "$beside" || exit 1
+' sh "$outer" "$sibling" "$inside" "$outside" "$beside" "$denied" || exit 1
 kill -0 "$outer" && kill -0 "$sibling" && printf linux-verified
 `;
 
@@ -174,55 +237,65 @@ export async function verifyLinux(
   opts.signal?.throwIfAborted();
   if (platform !== "linux" || !existsSync(bwrap))
     throw new ConfinementError(`Write confinement unavailable: ${platform} has no bubblewrap (${bwrap})`);
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "limitless-bwrap-probe-")));
-  const allowed = mkdtempSync(join(roots.write[0] ?? root, "bwrap-allowed-"));
-  const probeRoots = roots.write.length ? roots : { ...roots, write: [allowed] };
-  const tcp = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
-  const abstract = `limitless-probe-${crypto.randomUUID()}`;
-  const unix = Bun.listen({ unix: `\0${abstract}`, socket: { data() {} } });
-  let written: string[] = [];
-  const step = async (cmd: string[], env: Record<string, string> = {}) => {
-    const result = await run({
+  const listeners: { stop(force?: boolean): void }[] = [];
+  const created: string[] = [];
+  const temp = (parent: string, prefix: string) => {
+    const dir = mkdtempSync(join(parent, prefix));
+    created.push(dir);
+    return dir;
+  };
+  // The cancel kills a step before it reaches a verdict only when it is surfaced first; evidence of a
+  // leak, such as a write outside, still fails closed even when the cancel arrived afterwards.
+  const surfaceCancel = (result: ProcResult) => {
+    if (killedByCancel(result)) opts.signal?.throwIfAborted();
+  };
+  const step = (cmd: string[]) =>
+    run({
       cmd,
-      cwd: allowed,
-      env: { ...agentEnv(), ...env },
+      cwd: "/",
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
       timeoutMs: 30_000,
       signal: opts.signal,
     });
-    opts.signal?.throwIfAborted();
-    return result;
-  };
   try {
+    const root = realpathSync(temp(tmpdir(), "limitless-bwrap-probe-"));
+    const allowed = temp(roots.write[0] ?? root, "bwrap-allowed-");
+    const probeRoots = roots.write.length ? roots : { ...roots, write: [allowed] };
+    const tcp = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+    listeners.push(tcp);
+    const abstract = `limitless-probe-${crypto.randomUUID()}`;
+    listeners.push(Bun.listen({ unix: `\0${abstract}`, socket: { data() {} } }));
     const [inside, outside] = [join(allowed, "file"), join(root, "denied")];
     const beside = join(
       dirname(realpathSync(roots.write[0] ?? root)),
       `.limitless-denied-${crypto.randomUUID()}`,
     );
-    written = [outside, beside];
+    created.push(outside, beside);
     const denied = canonical(roots.denyRead).filter((p) => existsSync(p));
-    const sandbox = await step(
-      [
-        "/bin/sh",
-        "-c",
-        LINUX_PROBE,
-        "sh",
-        join(allowed, "ready"),
-        inside,
-        outside,
-        beside,
-        ...command([], probeRoots, bwrap),
-      ],
-      { LIMITLESS_PROBE_DENIED: denied.join("\n") },
-    );
+    const sandbox = await step([
+      "/bin/sh",
+      "-c",
+      LINUX_PROBE,
+      "sh",
+      join(allowed, "ready"),
+      inside,
+      outside,
+      beside,
+      denied.join("\n"),
+      ...command([], probeRoots, bwrap),
+    ]);
+    if (![outside, beside].some((p) => existsSync(p))) surfaceCancel(sandbox);
     if (
-      written.some((p) => existsSync(p)) ||
+      [outside, beside].some((p) => existsSync(p)) ||
       !conclusive(sandbox, "linux-verified") ||
+      !existsSync(inside) ||
       readFileSync(inside, "utf8") !== "ok"
     )
       throw new ConfinementError(
         `Write, read or signal confinement not verified: bubblewrap did not enforce its policy (exit ${sandbox.exitCode}); ${sandbox.stderr.trim()}`,
       );
     const network = await step([...landlockCommand(tcp.port), "--probe", abstract, String(process.pid)]);
+    surfaceCancel(network);
     if (!conclusive(network, "landlock-verified"))
       throw new ConfinementError(`Network and signal confinement not verified: ${network.stderr.trim()}`);
   } catch (error) {
@@ -230,9 +303,7 @@ export async function verifyLinux(
       throw error;
     throw new ConfinementError(`Linux confinement preflight failed: ${String(error)}`);
   } finally {
-    tcp.stop(true);
-    unix.stop(true);
-    for (const path of [allowed, ...written]) rmSync(path, { recursive: true, force: true });
-    rmSync(root, { recursive: true, force: true });
+    for (const listener of listeners) listener.stop(true);
+    for (const path of created) rmSync(path, { recursive: true, force: true });
   }
 }

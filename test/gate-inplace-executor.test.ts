@@ -96,6 +96,7 @@ async function withExecutor(
       for (const backend of [seatbeltBackend, linuxBackend]) {
         backend.verify = async (roots) => appendFileSync(${JSON.stringify(join(fixture.home, "executor-ports"))}, String(roots.daemonPort) + '\\n');
         backend.wrap = cmd => cmd;
+        backend.launch = (cmd, _roots, payload) => ({ cmd, ...payload });
       }
     }
     await processBootInspection.run(() => "test-boot", () => runInplaceExecutor(cfg, ${JSON.stringify(sha)}, controller.signal));
