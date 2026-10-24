@@ -13,6 +13,7 @@ export interface FailedTestFiles {
   failedFileTimes: Record<string, number>;
   /** Present only when every XML counter agrees with the descendant testcases. */
   attributedCounts?: AttributedTestCounts;
+  failureAttributionReason?: string;
 }
 
 /** Validate again before execution: the checkout may have changed since report capture. */
@@ -92,24 +93,35 @@ export function parseJUnit(xml: string, cwd: string): FailedTestFiles | undefine
     const failedFiles = [...failed];
     if (!validRetryFiles(failedFiles, cwd)) return undefined;
     const checkout = realpathSync(cwd);
-    const attributedCounts = attributedJUnitCounts(root, failed, cwd, (file) => {
-      try {
-        if (file.split(/[\\/]/).includes("node_modules")) return undefined;
-        const rel = relative(checkout, realpathSync(resolve(checkout, file)));
-        return rel &&
-          !isAbsolute(rel) &&
-          rel !== ".." &&
-          !rel.startsWith(`..${sep}`) &&
-          !rel.split(sep).includes("node_modules")
-          ? rel
-          : undefined;
-      } catch {
-        return undefined;
-      }
-    });
+    let failureAttributionReason: string | undefined;
+    const attributedCounts = attributedJUnitCounts(
+      root,
+      failed,
+      cwd,
+      (file) => {
+        try {
+          if (file.split(/[\\/]/).includes("node_modules")) return undefined;
+          const rel = relative(checkout, realpathSync(resolve(checkout, file)));
+          return rel &&
+            !isAbsolute(rel) &&
+            rel !== ".." &&
+            !rel.startsWith(`..${sep}`) &&
+            !rel.split(sep).includes("node_modules")
+            ? rel
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      },
+      undefined,
+      (reason) => {
+        failureAttributionReason = redactGateOutput(reason);
+      },
+    );
     return {
       failedFiles,
       ...(attributedCounts ? { attributedCounts } : {}),
+      ...(failureAttributionReason ? { failureAttributionReason } : {}),
       failedFileTimes: Object.fromEntries(
         failedFiles.flatMap((file) => {
           const time = times.get(file);
