@@ -16,6 +16,7 @@ type Reply = {
   capped?: boolean;
   capMs?: number;
   holder?: string;
+  factoryGate?: { status: number; text: string };
 };
 export type LeaseClient = (
   body: Record<string, unknown>,

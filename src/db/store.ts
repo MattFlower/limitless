@@ -325,6 +325,18 @@ export interface BaselineCacheKey {
   envHash: string;
 }
 
+export interface AgentGateKey {
+  runId: string;
+  treeHash: string;
+  gatesHash: string;
+  envHash: string;
+}
+export interface AgentGateRecord {
+  executionId: string;
+  createdAt: number;
+  comparison: unknown;
+}
+
 /** Issue numbers named by standalone `Closes #N` directives. */
 export const closedIssues = (prompt: string) =>
   new Set([...prompt.matchAll(/\bcloses\s+#([1-9][0-9]*)(?![\w#])/gi)].map((m) => Number(m[1])));
@@ -2392,6 +2404,38 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   // ---- baseline cache ------------------------------------------------------
+
+  getAgentGate(key: AgentGateKey): AgentGateRecord | null {
+    const row = this.db
+      .query(
+        "SELECT execution_id, created_at, gate_run FROM agent_gate_executions WHERE run_id = ? AND tree_hash = ? AND gates_hash = ? AND env_hash = ?",
+      )
+      .get(key.runId, key.treeHash, key.gatesHash, key.envHash) as Row | null;
+    return row
+      ? {
+          executionId: row.execution_id as string,
+          createdAt: row.created_at as number,
+          comparison: JSON.parse(row.gate_run as string),
+        }
+      : null;
+  }
+
+  putAgentGate(key: AgentGateKey, record: AgentGateRecord): void {
+    this.db
+      .query(
+        `INSERT INTO agent_gate_executions (run_id, tree_hash, gates_hash, env_hash, execution_id, created_at, gate_run) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id, tree_hash, gates_hash, env_hash) DO UPDATE SET execution_id = excluded.execution_id, created_at = excluded.created_at, gate_run = excluded.gate_run`,
+      )
+      .run(
+        key.runId,
+        key.treeHash,
+        key.gatesHash,
+        key.envHash,
+        record.executionId,
+        record.createdAt,
+        JSON.stringify(record.comparison),
+      );
+  }
 
   /** A cached baseline recorded after `since`; older entries are expired and never returned. */
   getBaselineCache<T>(key: BaselineCacheKey, since: number): T | null {

@@ -152,11 +152,12 @@ export function wrapperLeaseClient(
   if (config.port === undefined) return unix;
   let socket = false;
   return async (body, signal, onLateReply, onFailure) => {
-    const usingSocket = socket,
+    const usingSocket = body.gate !== undefined || socket,
       first = usingSocket ? unix : http,
       second = usingSocket ? http : unix;
     let pending: ReturnType<LeaseClient> | undefined;
     try {
+      if (body.gate !== undefined) return await first(body, signal);
       return await bounded(
         clock,
         (attempt) => {
@@ -203,6 +204,28 @@ export async function agentTestCommand(
     .filter((p) => p.every((token, i) => argv[i] === token))
     .sort((a, b) => b.length - a.length)[0];
   const lane = prefix ? testLane(argv, prefix) : undefined;
+  if (lane === "gate" && config.role === "implement" && config.agentFullSuite === "gate") {
+    try {
+      const reply = await client(
+        { token: config.token, name: redactCredentials(argv.join(" ")), lane, gate: crypto.randomUUID() },
+        new AbortController().signal,
+      );
+      const result = reply.factoryGate;
+      if (
+        !result ||
+        !Number.isInteger(result.status) ||
+        result.status < 0 ||
+        result.status > 255 ||
+        typeof result.text !== "string"
+      )
+        throw new LeaseRejected("invalid factory gate response");
+      console.log(redactCredentials(result.text));
+      return result.status;
+    } catch (error) {
+      console.error(redactCredentials(`agent-test: factory gate failed: ${String(error)}`));
+      return 1;
+    }
+  }
   if (lane === "gate" && config.role === "implement" && config.agentFullSuite === "refuse") {
     console.error(
       "agent-test: full suite refused; the factory's gates run the full suite after this round. Run the affected test files instead, for example: bun test test/<file>.test.ts",
