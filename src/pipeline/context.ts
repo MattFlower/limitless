@@ -577,6 +577,7 @@ export class RunContext {
     const { shadow } = opts;
     const chain = shadow ? undefined : this.run.models?.[opts.role as RunRole];
     const failures = new Map<string, string>();
+    const authenticationFailures = new Map<string, string>();
     const health = shadow ? undefined : tracker;
     const signal = shadow?.signal ?? this.signal;
     const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
@@ -629,6 +630,11 @@ export class RunContext {
         }),
         !shadow,
       );
+      decision.candidates = decision.candidates.filter((target) => {
+        const reason = authenticationFailures.get(target.provider);
+        if (reason) decision.skipped.push({ modelId: target.targetId ?? target.modelId, reason });
+        return !reason;
+      });
       if (chain && left() <= 0) exhaustPinned(decision, true);
       const candidates = decision.candidates;
       let target =
@@ -644,7 +650,7 @@ export class RunContext {
         const why = decision.skipped.map((s) => `${s.modelId} (${s.reason})`).join(", ");
         if (opts.privateOutput) {
           throw new NoCapacityError(
-            `No model available for ${opts.role}${origins.length ? `. ${origins.join(", ")}` : ""}`,
+            `No model available for ${opts.role}${authenticationFailures.size ? ": authentication failed" : ""}${origins.length ? `. ${origins.join(", ")}` : ""}`,
           );
         }
         throw new NoCapacityError(
@@ -995,6 +1001,8 @@ export class RunContext {
       }
       if (callSignal.aborted)
         result = { ...result, status: "cancelled", error: this.termination?.message ?? "cancelled" };
+      if (result.failureClass === "authentication" && result.status !== "cancelled")
+        result = { ...result, status: "unavailable", error: result.error || "authentication failed" };
       if (opts.requireStructured && result.status === "ok" && result.structured === null)
         result = { ...result, status: "error", error: "missing structured output" };
       let invalidSpecId = "";
@@ -1017,6 +1025,8 @@ export class RunContext {
       }
 
       result = redactCredentialData(result);
+      const privateError =
+        result.failureClass === "authentication" ? "authentication failed" : "private invocation failed";
       for (const [kind, text] of [
         ["error", result.error],
         ["result", result.finalText],
@@ -1028,7 +1038,7 @@ export class RunContext {
               ? kind === "error" && result.confinement?.ok === false
                 ? text
                 : kind === "error"
-                  ? "private invocation failed"
+                  ? privateError
                   : withholdText(text)
               : (redact?.(text) ?? text),
           );
@@ -1048,7 +1058,7 @@ export class RunContext {
         // A failed confinement probe ran before the agent, so its error holds no private output.
         error:
           opts.privateOutput && result.error && result.confinement?.ok !== false
-            ? "private invocation failed"
+            ? privateError
             : result.error && redact
               ? redact(result.error)
               : result.error,
@@ -1066,7 +1076,7 @@ export class RunContext {
             : { modelCooldown: { modelId: target.modelId, ms: result.modelCooldownMs } }),
           error:
             opts.privateOutput && result.error
-              ? "private invocation failed"
+              ? privateError
               : result.error && redact
                 ? redact(result.error)
                 : result.error,
@@ -1100,6 +1110,18 @@ export class RunContext {
         lastFailure = `${target.targetId ?? target.modelId}: ${result.error ?? ""}`.slice(0, 300);
         this.log(`${target.targetId ?? target.modelId} cannot confine reads; falling back`, "warn");
         attempt--;
+        continue;
+      }
+      if (result.failureClass === "authentication") {
+        lastFailure = opts.privateOutput
+          ? "authentication failed"
+          : `authentication failed: ${redact?.(result.error ?? "login rejected") ?? result.error ?? "login rejected"}`.slice(
+              0,
+              300,
+            );
+        authenticationFailures.set(target.provider, lastFailure);
+        failures.set(target.targetId ?? target.modelId, lastFailure);
+        this.log(`${target.provider}: ${lastFailure}; falling back`, "warn");
         continue;
       }
       if (result.status !== "ok" && MODEL_REJECTED.test(result.error ?? "")) {
@@ -1160,7 +1182,7 @@ export class RunContext {
     if (lastResort) return useLastResort(lastResort, `Gave up routing ${opts.role} after 6 failed attempts`);
     throw new NoCapacityError(
       opts.privateOutput
-        ? `Gave up routing ${opts.role}`
+        ? `Gave up routing ${opts.role}${authenticationFailures.size ? ": authentication failed" : ""}`
         : `Gave up routing ${opts.role}: ${lastFailure ?? "no candidates"}`,
     );
   }

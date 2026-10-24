@@ -69,6 +69,7 @@ export class ClaudeStreamParser {
   windows: Record<string, QuotaWindow> = {};
   quotaRejectedUntil: number | null = null;
   quotaText = false;
+  authenticationFailed = false;
 
   private readonly emit: (e: AgentEvent) => void;
   constructor(emit: (e: AgentEvent) => void) {
@@ -92,6 +93,7 @@ export class ClaudeStreamParser {
         break;
       }
       case "assistant": {
+        if (e.error === "authentication_failed") this.authenticationFailed = true;
         for (const b of blocks(e.message)) {
           if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
             this.lastAssistantText = b.text;
@@ -144,6 +146,7 @@ export class ClaudeStreamParser {
           typeof e.fast_mode_disabled_reason === "string" ? e.fast_mode_disabled_reason : null;
         this.subtype = (e.subtype as string) ?? null;
         this.isError = Boolean(e.is_error);
+        this.authenticationFailed = this.isError && (this.authenticationFailed || e.api_error_status === 401);
         this.sessionId = (e.session_id as string) ?? this.sessionId;
         this.numTurns = Number(e.num_turns ?? 0);
         this.reportedCostUsd = Number(e.total_cost_usd ?? 0);
@@ -482,6 +485,13 @@ export async function runClaude(
   if (proc.timedOut) return { ...base, status: "timeout", error: `timed out after ${spec.timeoutMs}ms` };
   if (proc.idleTimedOut)
     return { ...base, status: "stuck", error: `no output for ${Math.round(spec.idleTimeoutMs / 1000)}s` };
+  if (parser.authenticationFailed)
+    return {
+      ...base,
+      status: "unavailable",
+      failureClass: "authentication",
+      error: parser.finalText || parser.lastAssistantText || "Claude authentication failed",
+    };
   if (parser.quotaRejectedUntil || (parser.isError && parser.quotaText)) {
     return {
       ...base,

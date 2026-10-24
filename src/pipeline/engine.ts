@@ -1210,6 +1210,11 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
       ctx.state.agentJob = { round, id };
       await ctx.save("agent-job-started");
     },
+    async retired(id) {
+      if (ctx.state.agentJob?.id !== id || ctx.state.agentJob.round !== round) return;
+      delete ctx.state.agentJob;
+      await ctx.save("agent-job-retired");
+    },
     async resume(request) {
       try {
         return (
