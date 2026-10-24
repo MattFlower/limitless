@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import { ENV_FD, ENV_FILE, landlockCommand, PAYLOAD_ENV } from "./landlock.ts";
 import { ancestorReadPolicy, ConfinementError, specificReadDenies } from "./read-policy.ts";
@@ -39,23 +39,24 @@ function canonical(paths: readonly string[] = []): string[] {
   return [...new Set(resolved)].sort((a, b) => a.length - b.length);
 }
 
-/** The existing ancestor a path would be created under, so a not-yet-existing deny can be placed. */
-function creatableUnder(path: string): string {
-  for (let dir = dirname(path); ; dir = dirname(dir)) {
+/** The existing ancestor a not-yet-existing deny would be created under, and the name it would start as. */
+function creatableUnder(path: string): { dir: string; name: string } {
+  for (let child = path, dir = dirname(path); ; child = dir, dir = dirname(dir)) {
     try {
-      return realpathSync(dir);
+      return { dir: realpathSync(dir), name: basename(child) };
     } catch {
-      if (dir === dirname(dir)) return dir;
+      if (dir === dirname(dir)) return { dir, name: basename(child) };
     }
   }
 }
 
-/** Valid absolute policy paths that `realpath` cannot resolve. */
-function canonicalAbsent(paths: readonly string[] = []): string[] {
-  return paths.filter((path) => {
-    canonical([path]);
-    return !existsSync(path);
-  });
+/** `path` as an entry of its canonical parent: how `readdir` of that parent spells it. */
+function entryOf(path: string): string {
+  try {
+    return join(realpathSync(dirname(path)), basename(path));
+  } catch {
+    return path;
+  }
 }
 
 /** Empty, mode-000 sources for masks: outside every write root, so no candidate can change them. */
@@ -70,16 +71,18 @@ function maskSources(): { dir: string; file: string } {
 }
 
 /**
- * A read-only tmpfs over `dir` holding its current entries bound back: a deny that does not exist yet
- * stays absent even if a host process creates it later, which the read-only root bind would show.
- * Entries the host adds afterwards stay hidden too; one removed before bwrap binds it is skipped.
+ * A read-only tmpfs over `dir` holding its current entries bound back, except `denied`: a deny that does
+ * not exist yet stays absent even if a host process creates it later, which the read-only root bind would
+ * show. Entries the host adds afterwards stay hidden too; one removed before bwrap binds it is skipped.
  */
-export function shadow(dir: string): string[] {
+export function shadow(dir: string, denied: ReadonlySet<string> = new Set()): string[] {
   const mode = (statSync(dir).mode & 0o7777).toString(8).padStart(4, "0");
   return [
     ...["--perms", mode, "--tmpfs", dir],
     ...readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
       const path = join(dir, entry.name);
+      // Matched by name, so a denied entry created after the policy was inspected is not bound back.
+      if (denied.has(path)) return [];
       if (!entry.isSymbolicLink()) return ["--ro-bind-try", path, path];
       try {
         return ["--symlink", readlinkSync(path), path];
@@ -108,7 +111,12 @@ export function bwrapArgs(
     (!Number.isInteger(roots.daemonPort) || roots.daemonPort < 1 || roots.daemonPort > 65535)
   )
     throw new ConfinementError("Invalid daemon port for confinement");
-  const deny = canonical(roots.denyRead);
+  // One lookup per denied path decides between masking and shadowing it: a path the host created
+  // between two lookups would get neither.
+  const denied = (roots.denyRead ?? []).map((path) => ({ path, real: canonical([path])[0] }));
+  const deny = [...new Set(denied.flatMap(({ real }) => (real ? [real] : [])))].sort(
+    (a, b) => a.length - b.length,
+  );
   const allow = canonical(roots.allowRead);
   const write = canonical(roots.write);
   const own = canonical(roots.commands?.own);
@@ -117,9 +125,9 @@ export function bwrapArgs(
   // A mount cannot hide a path that does not exist yet, and a candidate could create it inside a bound
   // directory; a write root under a deny without an allowance, or inside a protected path, would be
   // bound over its ancestor's rule. Seatbelt's pathname rules cover these; bind mounts cannot.
-  const absent = canonicalAbsent(roots.denyRead);
-  for (const path of absent)
-    if (bound.some((b) => within(b, creatableUnder(path))))
+  const absent = denied.flatMap(({ path, real }) => (real ? [] : [{ path, ...creatableUnder(path) }]));
+  for (const { path, dir } of absent)
+    if (bound.some((b) => within(b, dir)))
       throw new ConfinementError(`Cannot confine a denied path that does not exist yet: ${path}`);
   for (const w of write) {
     if (deny.some((d) => d !== w && within(d, w)) && !allow.some((a) => within(a, w)))
@@ -137,11 +145,17 @@ export function bwrapArgs(
   const masked = [...hidden, ...outer];
   // Ancestors already behind a mask, a private tmpfs or another invocation's hidden command root show
   // nothing the host creates there later.
-  const shadowed = [...new Set(absent.map(creatableUnder))]
+  const shadowed = [...new Set(absent.map(({ dir }) => dir))]
     .filter((dir) => ![...masked, ...commandRoots].some((m) => within(m, dir)))
     .sort((a, b) => a.length - b.length);
   if (shadowed.includes("/"))
     throw new ConfinementError("Cannot confine a denied path whose only existing ancestor is /");
+  // Every denied path as a shadowed directory's entry, present or absent when it was looked up; an
+  // absent one counts from the first name that was missing, so its future ancestor stays out too.
+  const unbound = new Set([
+    ...denied.flatMap(({ path, real }) => (real ? [real, entryOf(path)] : [])),
+    ...absent.map(({ dir, name }) => join(dir, name)),
+  ]);
   const mask = (path: string) =>
     statSync(path).isDirectory() ? ["--ro-bind", sources.dir, path] : ["--ro-bind", sources.file, path];
   const resolv = canonical(["/etc/resolv.conf"]).filter((p) => within("/run", p));
@@ -152,7 +166,7 @@ export function bwrapArgs(
     ...["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"],
     ...["--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
     // Before the private tmpfs mounts and every mask, which must cover what the shadows bind back.
-    ...shadowed.flatMap(shadow),
+    ...shadowed.flatMap((dir) => shadow(dir, unbound)),
     ...["--perms", "0755", "--tmpfs", "/run", ...resolv.flatMap((p) => ["--ro-bind", p, p])],
     ...(envFd === undefined ? [] : ["--ro-bind-data", String(envFd), ENV_FILE]),
     // Private and writable: Codex's own bubblewrap keeps its mount registry in /tmp.

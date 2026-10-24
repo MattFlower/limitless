@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import {
   existsSync,
   mkdirSync,
@@ -11,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   bwrapGit,
   checkApply,
@@ -308,6 +309,58 @@ test("bwrapArgs refuses policies a bind mount cannot enforce", () => {
     "inside a protected path",
   );
   expect(() => bwrapArgs({ ...roots, write: [scratch], protect: [scratch] }, sources)).not.toThrow();
+});
+
+test("a denied path the host creates while the mounts are built is never bound back", () => {
+  const home = join(root, "home");
+  mkdirSync(join(home, "tool"), { recursive: true });
+  mkdirSync(join(home, ".ssh"));
+  const sources = { dir: join(root, "mask-dir"), file: join(root, "mask-file") };
+  const [netrc, hosts, npmrc] = [
+    join(home, ".netrc"),
+    join(home, ".config/gh/hosts.yml"),
+    join(home, ".npmrc"),
+  ];
+  const roots: WriteRoots = { write: [], protect: [], denyRead: [netrc, hosts, npmrc, join(home, ".ssh")] };
+  const [readdir, realpath] = [fs.readdirSync, fs.realpathSync];
+  let created = false;
+  const spies = [
+    // Credentials, one under a directory that was missing too, appear just before the shadow's scan.
+    spyOn(fs, "readdirSync").mockImplementation(((path: string, options: never) => {
+      if (path === home) {
+        writeFileSync(netrc, "secret");
+        mkdirSync(dirname(hosts), { recursive: true });
+        writeFileSync(hosts, "secret");
+      }
+      return readdir(path, options);
+    }) as typeof fs.readdirSync),
+    // Another appears right after the lookup that found it absent.
+    spyOn(fs, "realpathSync").mockImplementation(((path: string, options: never) => {
+      try {
+        return realpath(path, options);
+      } catch (error) {
+        if (path === npmrc && !created) {
+          created = true;
+          writeFileSync(npmrc, "secret");
+        }
+        throw error;
+      }
+    }) as typeof fs.realpathSync),
+  ];
+  let args: string[] = [];
+  try {
+    args = bwrapArgs(roots, sources, []);
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+  }
+  expect(created).toBe(true);
+  const at = (...seq: string[]) => args.findIndex((_, n) => seq.every((v, k) => args[n + k] === v));
+  expect(at("--tmpfs", home)).toBeGreaterThan(0);
+  expect(at("--ro-bind-try", join(home, "tool"), join(home, "tool"))).toBeGreaterThan(0);
+  for (const path of [netrc, npmrc, join(home, ".config")]) expect(args).not.toContain(path);
+  // A deny that existed is masked, never bound back first.
+  expect(at("--ro-bind", sources.dir, join(home, ".ssh"))).toBeGreaterThan(0);
+  expect(at("--ro-bind-try", join(home, ".ssh"), join(home, ".ssh"))).toBe(-1);
 });
 
 test("the Linux launch keeps the payload's environment and cwd off the unconfined launcher and bwrap", () => {
