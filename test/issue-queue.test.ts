@@ -580,7 +580,7 @@ test("poll query reads title evidence and looks up all body blockers", async () 
   expect(h.runs()).toHaveLength(1);
 });
 
-test.each(["run limit", "issue run limit", "draining", "stopped"])(
+test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval"])(
   "admission rechecks %s after repository resolution",
   async (mode) => {
     const h = harness();
@@ -589,6 +589,8 @@ test.each(["run limit", "issue run limit", "draining", "stopped"])(
     if (!repo) throw new Error("missing repo");
     const getRepo = h.store.getRepoBySlug.bind(h.store);
     let changed = false;
+    let competingId = "";
+    const finishedAt = Date.parse(at) + 1000;
     h.store.getRepoBySlug = (slug) => {
       h.store.getRepoBySlug = getRepo;
       // resolveRepo returns a promise, so this changes state while createRun awaits it.
@@ -605,7 +607,16 @@ test.each(["run limit", "issue run limit", "draining", "stopped"])(
             ).id,
             { status: "needs_human" },
           );
-        else if (mode === "draining") h.factory.scheduler.drain();
+        else if (mode === "re-approval") {
+          competingId = h.store.createRun(
+            repo,
+            issueRunRequest(
+              { repo: repo.slug, number: 1, title: "Other start", body: "", author: "owner" },
+              "owner",
+            ),
+          ).id;
+          h.store.updateRun(competingId, { status: "cancelled", finishedAt });
+        } else if (mode === "draining") h.factory.scheduler.drain();
         else h.stop();
         changed = true;
       });
@@ -616,11 +627,12 @@ test.each(["run limit", "issue run limit", "draining", "stopped"])(
       if (msg.kind === "run" && msg.run.sourceRef?.via === "queue") queuePublications.push(msg.run.id);
     });
     try {
-      h.data.set(repo.slug, [issue()]);
+      const candidate = issue();
+      h.data.set(repo.slug, [candidate]);
       h.start();
       await h.advance();
       expect(changed).toBe(true);
-      expect(h.runs()).toHaveLength(mode.includes("limit") ? 1 : 0);
+      expect(h.runs()).toHaveLength(mode.includes("limit") || mode === "re-approval" ? 1 : 0);
       expect(h.runs().some((r) => r.sourceRef?.via === "queue")).toBe(false);
       expect(queuePublications).toEqual([]);
       expect(h.store.db.query("SELECT count(*) AS n FROM events").get()).toEqual({ n: 0 });
@@ -631,6 +643,21 @@ test.each(["run limit", "issue run limit", "draining", "stopped"])(
         for (const run of h.runs()) h.store.updateRun(run.id, { status: "succeeded" });
         await h.advance(180_000);
         expect(h.runs().filter((r) => r.sourceRef?.via === "queue")).toHaveLength(1);
+      } else if (mode === "re-approval") {
+        expect(h.runs()).toMatchObject([
+          { id: competingId, status: "cancelled", sourceRef: { kind: "issue", number: 1 } },
+        ]);
+        candidate.timelineItems.nodes.push({
+          __typename: "LabeledEvent",
+          label: { name: "priority:1" },
+          actor: { login: "owner" },
+          createdAt: new Date(finishedAt + 1).toISOString(),
+        });
+        candidate.timelineItems.totalCount++;
+        await h.advance(180_000);
+        expect(h.runs()).toHaveLength(2);
+        expect(h.runs().filter((r) => r.sourceRef?.via === "queue")).toHaveLength(1);
+        expect(queuePublications).toHaveLength(1);
       }
     } finally {
       unsubscribe();
@@ -638,6 +665,23 @@ test.each(["run limit", "issue run limit", "draining", "stopped"])(
     }
   },
 );
+
+test("healthy daily polls retain their deadline across hourly wakeups", async () => {
+  const h = harness({ poll_seconds: 86400 });
+  h.start();
+  await h.advance();
+  expect(h.calls).toHaveLength(1);
+  for (let hour = 1; hour < 24; hour++) {
+    await h.advance(3_600_000);
+    expect(h.calls).toHaveLength(1);
+  }
+  await h.advance(3_599_999);
+  expect(h.calls).toHaveLength(1);
+  await h.advance(1);
+  expect(h.calls).toHaveLength(2);
+  expect(h.delays[0]).toBe(0);
+  expect(h.delays.slice(1).every((ms) => ms > 0 && ms <= 3_600_000)).toBe(true);
+});
 
 test("far-future rate reset caps every timer and queries nothing before the deadline", async () => {
   const h = harness();
@@ -653,9 +697,32 @@ test("far-future rate reset caps every timer and queries nothing before the dead
   expect(h.calls).toHaveLength(1);
   expect(h.delays.at(-1)).toBe(600_000);
   h.rate.remaining = 5000;
-  await h.advance(600_000);
+  await h.advance(599_999);
+  expect(h.calls).toHaveLength(1);
+  await h.advance(1);
   expect(h.calls).toHaveLength(2);
   expect(h.delays.at(-1)).toBe(180_000);
+  expect(h.delays.slice(1).every((ms) => ms > 0 && ms <= 3_600_000)).toBe(true);
+  await h.advance(179_999);
+  expect(h.calls).toHaveLength(2);
+  await h.advance(1);
+  expect(h.calls).toHaveLength(3);
+});
+
+test("stopping during an intermediate rate-limit wait clears the timer", async () => {
+  const h = harness();
+  h.rate.remaining = 1;
+  h.rate.resetAt = new Date(h.clock.now() + 40 * 24 * 3_600_000).toISOString();
+  h.start();
+  await h.advance();
+  await h.advance(3_600_000);
+  expect(h.calls).toHaveLength(1);
+  expect(h.clock.pending).toBe(1);
+  h.stop();
+  expect(h.clock.pending).toBe(0);
+  await h.advance(40 * 24 * 3_600_000);
+  expect(h.calls).toHaveLength(1);
+  expect(h.clock.pending).toBe(0);
 });
 
 test("low rate budget defers to reset and skips subsequent repositories; healthy polls use the normal cadence", async () => {
