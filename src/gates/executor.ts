@@ -36,6 +36,9 @@ export type ExecutionEvent =
 export interface GateRequest {
   env?: Record<string, string>;
   releaseSha?: string;
+  daemonPort?: number;
+  scratch?: string;
+  implementerIssue?: boolean;
   runId?: string;
   priority?: GatePriority;
   repo: string;

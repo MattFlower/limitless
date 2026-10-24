@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import type { Role } from "../core/types.ts";
 import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
@@ -7,7 +8,9 @@ import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.
 import type { AgentSpec } from "../harness/types.ts";
 import { loadOutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import {
+  ProcessTerminationError,
   processBirthSync,
+  processScope,
   recoverProcessCleanups,
   redactCredentialData,
   registerCredential,
@@ -26,6 +29,13 @@ import type { Store } from "./store.ts";
 
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
 export class PairingLimitError extends Error {}
+export function canonicalGateCwd(cwd: string): string {
+  try {
+    return realpathSync(cwd);
+  } catch {
+    return cwd;
+  }
+}
 export interface WorkerRun {
   runId: string;
   title: string;
@@ -363,24 +373,33 @@ export class WorkerStore {
       });
   }
   async waitStopped(id: string, signal?: AbortSignal) {
+    const unconfirmed = () => {
+      const error = new ProcessTerminationError(
+        `${ProcessTerminationError.prefix}: in-place job ${id}; process recovery required`,
+      );
+      const scope = processScope.getStore();
+      if (scope) scope.terminationError = error;
+      throw error;
+    };
     while (this.job(id)?.stopped === 0) {
       signal?.throwIfAborted();
       const job = this.job(id);
       const worker = job?.worker;
       if (!worker || !this.executor(worker, false)) {
         if (!job) return;
-        const { cwd } = JSON.parse(job.request) as GateRequest;
+        const cwd = canonicalGateCwd((JSON.parse(job.request) as GateRequest).cwd);
         const records = () => [
           ...this.store.listProcessDiscoveries(undefined, cwd),
           ...this.store.listProcessCleanups(undefined, cwd),
         ];
         await recoverProcessCleanups(this.store, records());
-        if (records().length) throw new Error("In-place gate stop is unconfirmed; process recovery required");
+        if (records().length) unconfirmed();
         this.store.db
           .query("UPDATE gate_jobs SET stopped=1 WHERE id=? AND worker IS ? AND stopped=0")
           .run(id, worker ?? null);
         continue;
       }
+      if (this.now() >= (job?.lease_expires_at ?? job?.updated_at ?? 0) + 2 * this.times.lease) unconfirmed();
       await Bun.sleep(this.times.tick);
     }
   }

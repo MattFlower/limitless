@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import type { WorkerStore } from "../db/workers.ts";
+import { canonicalGateCwd, type WorkerStore } from "../db/workers.ts";
+import { checkoutCommitted } from "../git/repos.ts";
 import {
   type Execution,
   type ExecutionEvent,
@@ -44,17 +45,16 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
     freshCheckoutFor: (repo) => !inplace && repos.includes(repo),
     async discard(handle) {
       workers.cancel(handle.id);
-      void live.get(handle.id)?.cancel();
+      await live.get(handle.id)?.cancel();
       starts.delete(handle.id);
       if (inplace) await workers.waitStopped(handle.id);
     },
     async start(req, signal) {
       signal.throwIfAborted();
       if (inplace) {
-        for (const j of workers.jobs(
-          "in_place=1 AND json_extract(request,'$.cwd')=? AND (state IN ('queued','leased') OR stopped=0)",
-          req.cwd,
-        )) {
+        const cwd = canonicalGateCwd(req.cwd);
+        for (const j of workers.jobs("in_place=1 AND (state IN ('queued','leased') OR stopped=0)")) {
+          if (canonicalGateCwd((JSON.parse(j.request) as GateRequest).cwd) !== cwd) continue;
           workers.cancel(j.id);
           await workers.waitStopped(j.id, signal);
         }
@@ -130,6 +130,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
           if (job.state === "failed") {
             if (inplace) await workers.waitStopped(handle.id, controller.signal);
             const request = JSON.parse(job.request) as GateRequest;
+            if (inplace) await checkoutCommitted(request.cwd, undefined, Boolean(request.implementerIssue));
             workers.event(handle.id, {
               type: "status",
               text: `${inplace ? "In-place" : "LAN"} gates falling back to local execution`,

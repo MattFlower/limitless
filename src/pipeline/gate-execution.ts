@@ -1,12 +1,35 @@
 import type { StageName } from "../core/types.ts";
 import { WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
-import { cancelGateExecution, executeGate, gateShutdown } from "../gates/executor.ts";
+import { cancelGateExecution, executeGate, type GateRequest, gateShutdown } from "../gates/executor.ts";
 import { lanExecutor } from "../gates/lan.ts";
 import type { GateHooks, GateRun } from "../gates/run.ts";
 import { gateEnv } from "../gates/run.ts";
 import { checkoutCommitted, headSha } from "../git/repos.ts";
+import { withCommandScratch } from "../harness/sandbox.ts";
+import { removeScratch, withScratch } from "../harness/scratch.ts";
+import { invocationScratch } from "../util/proc.ts";
 import type { RunContext } from "./context.ts";
+
+/** The daemon owns scratch across detachment, reattachment and the stage's retries. */
+export function gateCommandScope<T>(
+  ctx: RunContext,
+  stage: StageName,
+  purpose: string,
+  cwd: string,
+  fn: () => Promise<T>,
+): () => Promise<T> {
+  return async () => {
+    const handle = await resumeGateExecution(ctx, stage, purpose, cwd);
+    const job =
+      handle?.kind === "inplace" ? new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id) : null;
+    const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
+    return withScratch(cwd, (dir) => withCommandScratch(cwd, fn, dir), {
+      existing: scratch,
+      keep: () => gateShutdown(ctx.signal) && ctx.state.gateExecution?.handle.kind === "inplace",
+    });
+  };
+}
 
 /** Validate before preserving a surviving gate's worktree or doing destructive Git operations. */
 export async function resumeGateExecution(
@@ -33,16 +56,18 @@ export async function resumeGateExecution(
       ? pending.handle
       : undefined;
   if (pending && !stored) {
+    const workers = new WorkerStore(ctx.store, ctx.deps.buildSha);
+    const job = pending.handle.kind === "inplace" ? workers.job(pending.handle.id) : null;
+    const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
     await cancelGateExecution(
       pending.handle,
-      pending.handle.kind === "inplace"
-        ? lanExecutor(new WorkerStore(ctx.store, ctx.deps.buildSha), [], true)
-        : executor,
+      pending.handle.kind === "inplace" ? lanExecutor(workers, [], true) : executor,
     );
     ctx.state.gateExecution = undefined;
     await ctx.save();
     if (pending.handle.kind === "inplace")
       await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
+    if (scratch && scratch !== invocationScratch.getStore()) removeScratch(scratch);
   }
   return stored;
 }
@@ -68,6 +93,9 @@ export async function runGateExecution(
       {
         env,
         releaseSha: ctx.deps.buildSha,
+        daemonPort: ctx.deps.cfg.port,
+        scratch: invocationScratch.getStore(),
+        implementerIssue: Boolean(ctx.state.implementerIssue),
         runId: ctx.run.id,
         repo: ctx.repo.slug,
         cwd,

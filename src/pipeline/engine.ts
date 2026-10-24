@@ -78,7 +78,7 @@ import {
   withGitHubRetry,
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
-import { commandScope, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
+import { confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
@@ -108,7 +108,7 @@ import {
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
-import { resumeGateExecution, runGateExecution } from "./gate-execution.ts";
+import { gateCommandScope, resumeGateExecution, runGateExecution } from "./gate-execution.ts";
 import {
   checkDiscreetCommits,
   DiscreetError,
@@ -644,7 +644,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
       const baselineSha = await headSha(wt.path);
       const runBaseline = gateSlotScope(
-        commandScope(wt.path, async (): Promise<GateRun> => {
+        gateCommandScope(ctx, "prepare", "baseline", wt.path, async (): Promise<GateRun> => {
           const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait }, env);
           ctx.checkCancelled();
           // Retry before resetting, so a check sees the same build output as its first attempt.
@@ -1520,7 +1520,7 @@ async function oneRound(
     "gates",
     (stage) =>
       gateSlotScope(
-        commandScope(cwd, async () => {
+        gateCommandScope(ctx, "gates", "initial", cwd, async () => {
           const events = {
             ...gateEvents(ctx),
             onLocalSetup: () => {
@@ -3157,10 +3157,12 @@ async function mergeForDelivery(
   await validateMerge(cwd, before, fetched);
   if (!resuming) await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
+  const postMergeScope = <T>(fn: () => Promise<T>) =>
+    gateSlotScope(gateCommandScope(ctx, "gates", "rebase", cwd, fn));
   try {
     await ctx.stage(
       "gates",
-      gateSlotScope(async () => {
+      postMergeScope(async () => {
         const docs = await docsOnlyGates(
           cwd,
           assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
