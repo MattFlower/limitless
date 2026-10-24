@@ -92,6 +92,15 @@ export async function withSlottedCommands<T>(
       writeFileSync(bunfig, "preload = []\n", { mode: 0o400 });
     }
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    // Bun reads BUN_OPTIONS before our entry runs; carry it separately until dispatch.
+    const startup = `#!/bin/sh
+if [ "\${BUN_OPTIONS+x}" = x ]; then
+  export LIMITLESS_WRAPPER_BUN_OPTIONS="$BUN_OPTIONS"
+else
+  unset LIMITLESS_WRAPPER_BUN_OPTIONS
+fi
+unset BUN_OPTIONS
+`;
     for (const name of new Set(commands.map((c) => c[0]).filter((name): name is string => !!name)))
       writeFileSync(
         join(directory, name),
@@ -99,9 +108,10 @@ export async function withSlottedCommands<T>(
         // Absolute interpreters also work when the shell or Bun itself is a wrapped executable.
         // Pin the running binary. After brew upgrade + brew cleanup removes the old executable,
         // its daemon's wrappers fail with "not found" until limitless service install restarts it.
-        source === undefined
-          ? `#!/bin/sh\nunset BUN_BE_BUN\nexec ${quote(runtime.executable)} __agent-test "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`
-          : `#!/bin/sh\nexec ${quote(process.execPath)} --no-env-file --config=${quote(bunfig)} --cwd ${quote(directory)} ${quote(entry)} "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`,
+        startup +
+          (source === undefined
+            ? `unset BUN_BE_BUN\nexec ${quote(runtime.executable)} __agent-test "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`
+            : `exec ${quote(process.execPath)} --no-env-file --config=${quote(bunfig)} --cwd ${quote(directory)} ${quote(entry)} "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`),
         { mode: 0o500 },
       );
     return await invoke(`${directory}${delimiter}${process.env.PATH ?? ""}`, session.idleNow);
