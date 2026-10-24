@@ -5,17 +5,20 @@ import { isBranchName } from "../core/delivery.ts";
 import type { CreateRunRequest } from "../core/types.ts";
 import { IssueClaimed } from "../db/store.ts";
 import { inAnyCidr } from "../util/cidr.ts";
-import { redactCredentialData, redactCredentials, sh } from "../util/proc.ts";
+import { redactCredentialData, redactCredentials } from "../util/proc.ts";
+import { githubSh } from "./github-identity.ts";
 
 type GitHubFactory = Pick<Factory, "cfg" | "store" | "createRun">;
 export type GhRunner = (
   args: string[],
   signal?: AbortSignal,
   stdin?: string,
+  repo?: string,
 ) => Promise<string> | Promise<void>;
 
-export const runGh: GhRunner = async (args, signal, stdin) => {
-  return (await sh(["gh", ...args], { cwd: process.cwd(), timeoutMs: 30_000, signal, stdin })).stdout;
+export const runGh: GhRunner = async (args, signal, stdin, repo) => {
+  return (await githubSh(["gh", ...args], { cwd: process.cwd(), timeoutMs: 30_000, signal, stdin }, repo))
+    .stdout;
 };
 
 const object = (value: unknown): Record<string, unknown> | null =>
