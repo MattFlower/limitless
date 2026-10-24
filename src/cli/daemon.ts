@@ -52,6 +52,7 @@ async function startScopedDaemon(
     if (failure?.status === "rejected") throw failure.reason;
   };
   try {
+    factory.store.setSetting("executor.daemonRelease", factory.bootSha);
     detachSlots = await attachSlotPools(factory.store.db, factory.cfg.maxConcurrentGates);
     for (const [dir, files] of [
       ["worker-tls", ["key.pem"]],
