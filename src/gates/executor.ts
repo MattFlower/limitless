@@ -1,7 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
+import { withScratch } from "../harness/scratch.ts";
 import type { GateConfig } from "./detect.ts";
 import { lanExecutor } from "./lan.ts";
 import { redactGateData, redactGateOutput } from "./output.ts";
@@ -64,21 +66,20 @@ export async function gateProvenance(cwd: string, signal: AbortSignal, checkedSh
     const [sha, treeHash] = result.stdout.trim().split("\n");
     const hash = /^(?:[a-f\d]{40}|[a-f\d]{64})$/;
     if (sha && treeHash && hash.test(sha) && hash.test(treeHash)) {
-      // Exported snapshots have no stat cache; name-only diffs otherwise report unchanged files.
-      const refresh = await worktreeGit(["git", "update-index", "--refresh"], {
-        cwd,
-        signal,
-        allowFail: true,
+      const diffs = await withScratch(cwd, async (scratch) => {
+        // A fresh index has no gate-set assume-unchanged/skip-worktree flags or stat cache.
+        const opts = { cwd, signal, env: { ...process.env, GIT_INDEX_FILE: join(scratch, "index") } };
+        await worktreeGit(["git", "read-tree", checkedSha], opts);
+        const refresh = await worktreeGit(["git", "update-index", "--refresh"], { ...opts, allowFail: true });
+        if (refresh.exitCode !== 0 && refresh.exitCode !== 1) throw new Error("Index refresh failed");
+        const working = await worktreeGit(["git", "diff", "--name-only", "-z", "--no-renames", "--"], opts);
+        const staged = await worktreeGit(
+          ["git", "diff", "--cached", "--name-only", "-z", "--no-renames", checkedSha, "--"],
+          { cwd, signal },
+        );
+        signal.throwIfAborted();
+        return [working, staged];
       });
-      if (refresh.exitCode !== 0 && refresh.exitCode !== 1) throw new Error("Index refresh failed");
-      const diffs = await Promise.all(
-        [[], ["--cached"]].map((flags) =>
-          worktreeGit(["git", "diff", ...flags, "--no-renames", "--name-only", "-z", checkedSha, "--"], {
-            cwd,
-            signal,
-          }),
-        ),
-      );
       const paths = [...new Set(diffs.flatMap((diff) => diff.stdout.split("\0").filter(Boolean)))].map(
         redactGateOutput,
       );

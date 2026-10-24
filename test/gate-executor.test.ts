@@ -1,6 +1,6 @@
 import { expect, spyOn } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { auditDiff } from "../src/gates/audit.ts";
 import { baselineCacheKey, cacheableBaseline } from "../src/gates/cache.ts";
@@ -16,6 +16,7 @@ import {
   retryRegressions,
 } from "../src/gates/run.ts";
 import { acquireGateSlot, agentTestSlots, gateSlotScope, gateSlots } from "../src/gates/slots.ts";
+import * as gitCommand from "../src/git/command.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
 import { LandQueue } from "../src/land/queue.ts";
@@ -130,6 +131,97 @@ async function context(executor?: GateExecutor) {
   const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
   return { f, ctx, restore: () => new RunContext(f.deps, run, repo, new AbortController().signal) };
 }
+
+test.each(["assume-unchanged", "skip-worktree"])(
+  "passing gates cannot hide tracked rewrites with %s",
+  async (flag) => {
+    const cwd = fixture.repoDir;
+    const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const run = await confinementScope.run(fakeConfinement, () =>
+      executeGate(
+        {
+          ...request(cwd),
+          headSha,
+          gates: {
+            ...gates,
+            checks: [
+              {
+                name: "check",
+                run: `git update-index --${flag} greeting.txt && echo changed > greeting.txt`,
+              },
+            ],
+          },
+        },
+        new AbortController().signal,
+      ),
+    );
+    expect(run.checks[0]?.ok).toBe(true);
+    expect(run.checks[0]?.exitCode).toBe(0);
+    expect((await sh(["git", "ls-files", "-v", "--", "greeting.txt"], { cwd })).stdout).toBe(
+      `${flag === "assume-unchanged" ? "h" : "S"} greeting.txt\n`,
+    );
+    expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("changed\n");
+    expect(run.trackedClean).toBe(false);
+    expect(run.provenanceError).toContain('"greeting.txt"');
+  },
+);
+
+test.each(["clean", "read-tree", "refresh", "working-diff", "cached-diff", "cancelled"])(
+  "provenance preserves the real index and cleans temporary files: %s",
+  async (scenario) => {
+    const cwd = fixture.repoDir;
+    const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    await sh(["git", "update-index", "--assume-unchanged", "greeting.txt"], { cwd });
+    const index = readFileSync(join(cwd, ".git", "index"));
+    const flags = (await sh(["git", "ls-files", "-v"], { cwd })).stdout;
+    const controller = new AbortController();
+    const original = gitCommand.worktreeGit;
+    let temporaryIndex = "";
+    let injected = false;
+    const inspection = spyOn(gitCommand, "worktreeGit").mockImplementation(async (cmd, opts) => {
+      const temporary = opts.env?.GIT_INDEX_FILE;
+      if (temporary) {
+        temporaryIndex = temporary;
+        expect(relative(cwd, temporary).startsWith("..")).toBe(true);
+        expect(existsSync(dirname(temporary))).toBe(true);
+      }
+      if (
+        (scenario === "read-tree" && cmd.includes("read-tree")) ||
+        (scenario === "working-diff" && temporary && cmd.includes("diff")) ||
+        (scenario === "cached-diff" && cmd.includes("--cached"))
+      ) {
+        injected = true;
+        throw new Error("inspection failed");
+      }
+      if (scenario === "refresh" && cmd.includes("update-index")) {
+        injected = true;
+        return { stdout: "", stderr: "refresh failed", exitCode: 128 };
+      }
+      const result = await original(cmd, opts);
+      if (scenario === "cancelled" && cmd.includes("read-tree")) {
+        injected = true;
+        controller.abort();
+      }
+      return result;
+    });
+    try {
+      const provenance = await confinementScope.run(fakeConfinement, () =>
+        executeGate({ ...request(cwd), headSha }, controller.signal),
+      );
+      expect(provenance.checks[0]?.ok).toBe(true);
+      expect(provenance.checks[0]?.exitCode).toBe(0);
+      expect(temporaryIndex).not.toBe("");
+      expect(existsSync(dirname(temporaryIndex))).toBe(false);
+      expect(provenance.trackedClean).toBe(scenario === "clean");
+      expect(injected).toBe(scenario !== "clean");
+      if (scenario !== "clean") expect(provenance.provenanceError).toContain("could not be confirmed");
+      expect(readFileSync(join(cwd, ".git", "index"))).toEqual(index);
+      expect((await sh(["git", "ls-files", "-v"], { cwd })).stdout).toBe(flags);
+    } finally {
+      inspection.mockRestore();
+    }
+  },
+);
 
 test("executor selection defaults to config and an injected instance overrides it", async () => {
   expect(gateExecutorFor("local").kind).toBe("local");

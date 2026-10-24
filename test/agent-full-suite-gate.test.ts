@@ -45,6 +45,8 @@ agent_full_suite = "gate"
 const commit = "git -c user.name=Test -c user.email=test@example.com commit -qm gate";
 const mutations: Record<string, string> = {
   uncommitted: "echo generated > greeting.txt",
+  "assume-unchanged": "git update-index --assume-unchanged greeting.txt && echo generated > greeting.txt",
+  "skip-worktree": "git update-index --skip-worktree greeting.txt && echo generated > greeting.txt",
   "redacted-path": "git mv greeting.txt 'changed-synthetic-path-credential-845.txt'",
   staged: "echo generated > greeting.txt && git add greeting.txt",
   "staged-restored": "echo generated > greeting.txt && git add greeting.txt && echo edited > greeting.txt",
@@ -266,6 +268,11 @@ test.each([
       return {
         ...execution,
         result: execution.result.then(async (run) => {
+          if (["assume-unchanged", "skip-worktree"].includes(scenario)) {
+            const flags = await sh(["git", "ls-files", "-v", "--", "greeting.txt"], { cwd: request.cwd });
+            expect(flags.stdout).toBe(`${scenario === "assume-unchanged" ? "h" : "S"} greeting.txt\n`);
+            expect(readFileSync(join(request.cwd, "greeting.txt"), "utf8")).toBe("generated\n");
+          }
           if (executorKind === "lan" && !fallbacks.has(handle.id)) {
             // Simulate worker-reported post-execution state, independently of the request SHA.
             const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: request.cwd })).stdout.trim();
@@ -370,7 +377,15 @@ test.each([
                 ? "provenance could not be confirmed"
                 : scenario === "uncommitted" ||
                     scenario.endsWith("-rewrite") ||
-                    ["redacted-path", "staged", "staged-restored", "deleted", "renamed"].includes(scenario)
+                    [
+                      "assume-unchanged",
+                      "skip-worktree",
+                      "redacted-path",
+                      "staged",
+                      "staged-restored",
+                      "deleted",
+                      "renamed",
+                    ].includes(scenario)
                   ? "tracked files changed"
                   : "snapshot changed during the gate",
             );
