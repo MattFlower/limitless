@@ -323,7 +323,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       }),
     },
     "/api/admin/gate-slot": {
-      POST: handle(async (req) => {
+      POST: handle(async (req, server) => {
         if (req.headers.has("forwarded")) return error("forbidden", 403);
         const payload = await body<Record<string, unknown>>(req);
         // A capability bearer speaks only for its own invocation: the body must name that same capability.
@@ -338,9 +338,11 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         const { name, id, release, immediate, running, lane, priority } = payload;
         if (priority !== undefined && !isGatePriority(priority)) return error("invalid priority");
         if (payload.token !== undefined) {
+          if (payload.gate !== undefined) server.timeout(req, 0);
           req.signal.throwIfAborted();
           const lease = await agentTestLease(payload);
-          if (req.signal.aborted) await agentTestLease({ ...payload, id: lease.id, release: true });
+          if (req.signal.aborted && payload.gate === undefined)
+            await agentTestLease({ ...payload, id: lease.id, release: true });
           req.signal.throwIfAborted();
           return json(lease);
         }

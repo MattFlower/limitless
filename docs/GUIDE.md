@@ -348,6 +348,13 @@ never wait behind a full suite. Health reports this lane as `agentTestSlots` nex
 `gateSlots`; timeline events carry `kind: "agent-test"`, command, lane and queued wait ms.
 Gates, baselines, land checks and deploys keep their existing leases and PATH.
 
+`[limits] agent_full_suite` defaults to `"slot"`; `"refuse"` refuses implementers' full-suite
+requests. With `"gate"`, local implementers request the trusted `test` gate on a private snapshot
+instead. Its output returns to the session, and the round's gates reuse that factory execution
+only for the exact same tree, gate configuration and environment. Other checks still run.
+Without a local gate executor or a `test` check, requests are refused; worker implementers
+also use `"refuse"`. Reader roles keep normal slotting.
+
 Wrappers use loopback HTTP, with a scratch Unix socket fallback, without expanding
 sandbox permissions. Each invocation's wrappers and lease capability live in a private
 factory directory that every agent and gate sandbox denies reading, except to that invocation. If both transports are unavailable they warn and run the command,

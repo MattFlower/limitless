@@ -43,6 +43,7 @@ import {
   localAgentExecutor,
   runToolAgent,
 } from "./agent-executor.ts";
+import { runAgentGate } from "./agent-gate.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
@@ -912,11 +913,16 @@ export class RunContext {
                   invocationId: invocation.id,
                   type: "log",
                   level: "info",
-                  message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : `acquired after ${data.waitMs}ms`}`,
+                  message: `Agent test ${data.command} (${data.lane} lane): ${data.phase === "wait" ? "waiting for slot" : data.phase === "acquired" ? `acquired after ${data.waitMs}ms` : data.phase}`,
                   data,
                 }),
               dispatch,
               { role: opts.role, agentFullSuite: this.state.agentFullSuite },
+              opts.role === "implement" &&
+                this.state.agentFullSuite === "gate" &&
+                this.state.gatesConfig?.checks.some((c) => c.name === "test")
+                ? (signal) => runAgentGate(this, spec.cwd, signal)
+                : undefined,
             );
           result = await agentExecutor.run(
             {

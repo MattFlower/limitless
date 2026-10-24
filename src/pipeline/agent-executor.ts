@@ -1,6 +1,6 @@
 import type { Invocation, Role, Run } from "../core/types.ts";
 import type { AgentJobRequest } from "../db/workers.ts";
-import type { TestWait } from "../gates/agent-tests.ts";
+import type { FactoryGateHandler, TestWait } from "../gates/agent-tests.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { withSlottedCommands } from "../harness/slotted.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
@@ -68,6 +68,7 @@ export function runToolAgent(
   onSlotEvent: (data: TestWait) => void = () => {},
   dispatch?: () => void,
   policy: { role?: Role; agentFullSuite?: AgentFullSuite } = {},
+  factoryGate?: FactoryGateHandler,
 ): Promise<AgentResult> {
   return withScratch(spec.cwd, (scratchDir) => {
     dispatch?.();
@@ -94,6 +95,8 @@ export function runToolAgent(
             : `Idle watchdog resumed after ${elapsedMs}ms held off for slotted command`,
         }),
       policy,
+      undefined,
+      factoryGate,
     );
   });
 }

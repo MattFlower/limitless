@@ -171,6 +171,17 @@ test("coverage uses full commit IDs for SHA-256 repositories too", () => {
   expect(resolve(blocked, evidence, spec, evidence.sha).criteria[0]?.status).toBe("blocked");
 });
 
+test("a factory execution reused by the gates stage supplies ordinary gate evidence", () => {
+  const evidence = gates();
+  const check = evidence.checks[0];
+  if (!check) throw new Error("missing check");
+  check.result.reused = { executionId: "factory-test", treeHash: "c".repeat(40), createdAt: 1 };
+  const result = resolve(blocked, evidence);
+  expect(result.criteria[0]?.status).toBe("met");
+  expect(result.criteria[0]?.gateEvidence?.stageId).toBe(evidence.stageId);
+  expect(resolve(blocked, evidence, spec, "d".repeat(40)).criteria[0]?.status).toBe("blocked");
+});
+
 // Synthetic console fixtures below also provide a corresponding report; real Bun XML is
 // exercised separately through readJUnitSkips and through gate execution.
 function coverage(output: string) {
