@@ -338,6 +338,8 @@ test.each([
           const repo = f.store.listRepos()[0];
           if (!repo) throw new Error("missing repo");
           const other = f.store.createRun(repo, { repo: fixture.repoDir, prompt: "other run" });
+          // Only its identity is needed; cancel before yielding to the scheduler's shared handler.
+          f.store.updateRun(other.id, { status: "cancelled" });
           f.store.db.query("UPDATE agent_gate_executions SET run_id = ?").run(other.id);
         }
       };
@@ -387,7 +389,7 @@ test.each([
       "repeat",
       "repeat-lan",
     ].includes(scenario);
-    const finishing = requests.filter((r) => r.priority === "finish");
+    const finishing = requests.filter((r) => r.runId === run.id && r.priority === "finish");
     expect(finishing.some((r) => r.checks?.includes("test"))).toBe(!reuse && scenario !== "no-test");
     if (scenario === "only-test") expect(finishing).toEqual([]);
     else expect(finishing.some((r) => r.checks?.includes("lint"))).toBe(true);
