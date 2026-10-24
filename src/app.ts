@@ -15,6 +15,7 @@ import { type GateRequest, gateExecutorFor } from "./gates/executor.ts";
 import { gateSlots } from "./gates/slots.ts";
 import { collectGarbage, type GcResult } from "./gc.ts";
 import { resolveRepo } from "./git/repos.ts";
+import { withSubscriptionAuth } from "./harness/auth.ts";
 import { runClaude } from "./harness/claude.ts";
 import { runCodex } from "./harness/codex.ts";
 import { runDecisions } from "./harness/decisions.ts";
@@ -207,14 +208,12 @@ export class Factory {
           name,
           (async (spec) => {
             const fast = spec.fast ?? this.tracker.isFast(spec.target.provider);
+            const authenticated = withSubscriptionAuth(name, harness, cfg.secrets);
             const result = redactCredentialData(
-              await harness(
+              await authenticated(
                 protectCredentials({
                   ...spec,
                   fast,
-                  ...(name === "claude"
-                    ? { claudeSubscriptionToken: cfg.secrets.CLAUDE_CODE_OAUTH_TOKEN }
-                    : {}),
                 }),
               ),
             );
