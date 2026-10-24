@@ -47,6 +47,10 @@ for (const evidence of [
   "inspection-failed",
   "suite",
   "different-sha",
+  "different-sha-review-first",
+  "different-sha-inspection-failed",
+  "different-sha-cleanup-failed",
+  "different-sha-review-failed",
   "resume",
   "resume-redacted",
   "resume-failed-stage",
@@ -125,6 +129,31 @@ afterAll(async () => {
         : undefined;
     let attempts = 0;
     let initialGateSha = "";
+    const movedCommit = evidence.startsWith("different-sha");
+    const verifyReady = deferred<void>();
+    const reviewFinished = deferred<void>();
+    const verifyFinished = deferred<void>();
+    let failHeadInspection = false;
+    let failCleanup = false;
+    const originalHead = repos.headSha;
+    const headInspection =
+      evidence === "different-sha-inspection-failed"
+        ? spyOn(repos, "headSha").mockImplementation(async (cwd) => {
+            if (failHeadInspection) {
+              failHeadInspection = false;
+              throw new Error("verification HEAD inspection unavailable");
+            }
+            return originalHead(cwd);
+          })
+        : undefined;
+    const originalDiscard = repos.discardChanges;
+    const cleanup =
+      evidence === "different-sha-cleanup-failed"
+        ? spyOn(repos, "discardChanges").mockImplementation(async (...args) => {
+            if (failCleanup) throw new Error("reader cleanup unavailable");
+            return originalDiscard(...args);
+          })
+        : undefined;
     const loopbackSpec = {
       ...spec,
       acceptance_criteria: [
@@ -141,14 +170,20 @@ afterAll(async () => {
       if (role === "spec") return { structured: loopbackSpec };
       if (role === "holdout") return { structured: holdout };
       if (role === "review") {
-        if (evidence === "different-sha") {
+        if (movedCommit) {
           initialGateSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+          await verifyReady.promise;
+          if (evidence !== "different-sha-review-first") await verifyFinished.promise;
           await sh(["git", "commit", "--allow-empty", "-qm", "advance after gates"], { cwd: s.cwd });
+          failCleanup = evidence === "different-sha-cleanup-failed";
         }
         return { structured: approve };
       }
       if (role === "verify") {
         attempts++;
+        verifyReady.resolve();
+        if (evidence === "different-sha-review-first") await reviewFinished.promise;
+        failHeadInspection = evidence === "different-sha-inspection-failed";
         return {
           structured: {
             ...pass,
@@ -170,9 +205,22 @@ afterAll(async () => {
     });
     const resume = evidence.startsWith("resume");
     if (resume) f.deps.faults = { "stage:verify:after": { action: "kill", occurrence: 1 } };
+    if (evidence === "different-sha-review-failed")
+      f.deps.faults = {
+        "stage:review:after": {
+          action: "continue",
+          onHit: () => {
+            throw new Error("review completion unavailable");
+          },
+        },
+      };
     const interrupted = deferred<void>();
     const unsubscribe = f.store.subscribe((message) => {
       if (message.kind === "stage" && message.stage.status === "cancelled") interrupted.resolve();
+      if (message.kind === "stage" && message.stage.status !== "running") {
+        if (message.stage.name === "review") reviewFinished.resolve();
+        if (message.stage.name === "verify") verifyFinished.resolve();
+      }
     });
     const run = await f.createRun({
       repo: repoDir,
@@ -218,6 +266,8 @@ afterAll(async () => {
     } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
     unsubscribe();
     inspection?.mockRestore();
+    headInspection?.mockRestore();
+    cleanup?.mockRestore();
     const succeeds = [
       "matching",
       "untracked-output",
@@ -229,13 +279,24 @@ afterAll(async () => {
       "resume-skips",
     ].includes(evidence);
     if (!trackedOutput && evidence !== "inspection-failed")
-      expect(terminal).toBe(succeeds ? "succeeded" : "needs_human");
+      expect(
+        terminal,
+        JSON.stringify({ error: f.store.getRun(run.id)?.error, stages: f.store.listStages(run.id) }),
+      ).toBe(succeeds ? "succeeded" : "needs_human");
     const state = f.store.getRunState<RunState>(run.id);
-    if (evidence === "different-sha") {
+    if (movedCommit) {
       expect(f.store.getRun(run.id)?.error).toContain("Commit changed during verification");
       expect(state?.lastVerifiedSha).toBeUndefined();
       expect(f.store.listStages(run.id).some((stage) => stage.status === "running")).toBe(false);
       expect(initialGateSha).not.toBe("");
+      expect(f.store.listStages(run.id).find((stage) => stage.name === "review")?.status).toBe(
+        evidence === "different-sha-review-failed" ? "failed" : "succeeded",
+      );
+      expect(f.store.listStages(run.id).find((stage) => stage.name === "verify")?.status).toBe(
+        evidence === "different-sha-review-first" || evidence === "different-sha-inspection-failed"
+          ? "failed"
+          : "succeeded",
+      );
       return;
     }
     if (trackedOutput || evidence === "inspection-failed") {

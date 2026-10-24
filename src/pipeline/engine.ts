@@ -2144,6 +2144,12 @@ async function oneRound(
   };
   try {
     const verifiedSha = await headSha(cwd);
+    const checkVerifiedHead = async () => {
+      if ((await headSha(cwd)) !== verifiedSha)
+        throw new NeedsHumanError(
+          "Commit changed during verification; gate evidence cannot cover the new HEAD",
+        );
+    };
     const gateEvidence = ctx.state.gateEvidence;
     const usableGates = () => {
       const stage = gateEvidence ? ctx.store.getStage(gateEvidence.stageId) : null;
@@ -2227,10 +2233,7 @@ async function oneRound(
             redactHoldout: true,
           });
           if (!ctx.parallelChecks) await discardChanges(cwd);
-          if ((await headSha(cwd)) !== verifiedSha)
-            throw new NeedsHumanError(
-              "Commit changed during verification; gate evidence cannot cover the new HEAD",
-            );
+          await checkVerifiedHead();
           const modelOutput = VerifySchema.parse(result.structured);
           const v = resolveVerify(modelOutput);
           ctx.state.lastVerify = { ...v, modelId: target.modelId };
@@ -2270,28 +2273,32 @@ async function oneRound(
       ctx.parallelChecks = true;
       let results: [PromiseSettledResult<Review>, PromiseSettledResult<Verify>];
       try {
-        results = await Promise.allSettled([reviewStage(), verifyAttempt(0)]);
-      } finally {
-        ctx.parallelChecks = false;
-        await discardChanges(cwd);
+        try {
+          results = await Promise.allSettled([reviewStage(), verifyAttempt(0)]);
+        } finally {
+          ctx.parallelChecks = false;
+          await discardChanges(cwd);
+        }
+        // Fixed error precedence, independent of completion order. Both stages have settled.
+        if (results[0].status === "rejected") throw results[0].reason;
+        ctx.checkCancelled();
+        if (results[1].status === "rejected") {
+          const error: unknown = results[1].reason;
+          if (
+            results[0].value.verdict !== "request_changes" ||
+            error instanceof CancelledError ||
+            error instanceof SimulatedTermination ||
+            (error instanceof Error && error.message.startsWith("Commit changed during verification"))
+          )
+            throw error;
+        }
+      } catch (error) {
+        // A reader or cleanup error must not hide a commit moved by its sibling.
+        if (!(error instanceof CancelledError || error instanceof SimulatedTermination))
+          await checkVerifiedHead();
+        throw error;
       }
-      // Fixed error precedence, independent of completion order. Both stages have settled.
-      if (results[0].status === "rejected") throw results[0].reason;
-      ctx.checkCancelled();
-      if (results[1].status === "rejected") {
-        const error: unknown = results[1].reason;
-        if (
-          results[0].value.verdict !== "request_changes" ||
-          error instanceof CancelledError ||
-          error instanceof SimulatedTermination ||
-          (error instanceof Error && error.message.startsWith("Commit changed during verification"))
-        )
-          throw error;
-      }
-      if ((await headSha(cwd)) !== verifiedSha)
-        throw new NeedsHumanError(
-          "Commit changed during verification; gate evidence cannot cover the new HEAD",
-        );
+      await checkVerifiedHead();
       if (results[1].status === "rejected") {
         ctx.log(
           redactHoldoutText(
