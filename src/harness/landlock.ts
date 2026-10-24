@@ -3,11 +3,14 @@ import { connect } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { PACKAGED_BUILD } from "../release.ts";
 
-/** Scoped abstract sockets and signals arrived in ABI 6 (Linux 6.12). */
+/** Scoped abstract sockets and signals arrived in ABI 6 (Linux 6.12); confined Git needs only ABI 1. */
 export const LANDLOCK_MIN_ABI = 6;
 const CONNECT_TCP = 2n;
 const SCOPE_ABSTRACT_AND_SIGNAL = 3n;
 const RULE_NET_PORT = 2;
+const ACCESS_FS_EXECUTE = 1n;
+const RULE_PATH_BENEATH = 1;
+const [O_PATH, O_CLOEXEC] = [0o10000000, 0o2000000];
 /** The payload's environment, JSON-encoded in the launcher's own (never a command line's) environment. */
 export const PAYLOAD_ENV = "LIMITLESS_PAYLOAD_ENV";
 /** bwrap reads it from this descriptor (`--ro-bind-data`); the payload's shell sources it inside the sandbox. */
@@ -40,6 +43,67 @@ export function landlockCommand(port: number): string[] {
       ];
 }
 
+/** What the launcher itself reads, so a sandbox that hides their directories can bind them back. */
+export const launcherFiles = (): string[] =>
+  PACKAGED_BUILD ? [process.execPath] : [process.execPath, join(import.meta.dir, "..", "..")];
+
+const ARCHITECTURES: Record<string, { audit: number; socket: number; socketpair: number }> = {
+  x64: { audit: 0xc000003e, socket: 41, socketpair: 53 },
+  arm64: { audit: 0xc00000b7, socket: 198, socketpair: 199 },
+};
+const X32_SYSCALL_BIT = 0x40000000;
+const IO_URING_SETUP = 425;
+
+/**
+ * A classic-BPF seccomp program that makes `socket(AF_UNIX, …)` and `socketpair(AF_UNIX, …)` fail with
+ * EACCES and kills anything running under another architecture. `--unshare-net` leaves pathname Unix
+ * sockets on the host reachable (connect needs no write access), and seccomp cannot read the address, so
+ * creating one is what is refused. x32 calls (x86_64 numbers with bit 30 set) and io_uring, which creates
+ * sockets without a syscall the filter sees, fail with ENOSYS.
+ */
+export function seccompFilter(arch: string = process.arch): Buffer {
+  const target = ARCHITECTURES[arch];
+  if (!target) throw new Error(`no Unix-socket filter for ${arch}`);
+  const [LD, JEQ, JGE, RET] = [0x20, 0x15, 0x35, 0x06];
+  // Instructions are [code, k, jump-if-true label, jump-if-false label]; strings mark labels. Jumps fall
+  // through when a label is omitted and, as classic BPF requires, only go forward.
+  const program: (string | [number, number, string?, string?])[] = [
+    [LD, 4], // seccomp_data.arch
+    [JEQ, target.audit, undefined, "kill"],
+    [LD, 0], // nr
+    ...(arch === "x64" ? [[JGE, X32_SYSCALL_BIT, "nosys"] as [number, number, string]] : []),
+    [JEQ, IO_URING_SETUP, "nosys"],
+    [JEQ, target.socket, "domain"],
+    [JEQ, target.socketpair, "domain", "allow"],
+    "domain",
+    [LD, 16], // the low word of args[0], the domain the kernel reads as an int
+    [JEQ, 1, "deny", "allow"], // AF_UNIX
+    "allow",
+    [RET, 0x7fff0000],
+    "deny",
+    [RET, 0x00050000 | 13], // ERRNO(EACCES)
+    "nosys",
+    [RET, 0x00050000 | 38], // ERRNO(ENOSYS)
+    "kill",
+    [RET, 0x80000000], // KILL_PROCESS
+  ];
+  const labels = new Map<string, number>();
+  let count = 0;
+  for (const op of program) typeof op === "string" ? labels.set(op, count) : count++;
+  const insns = program.filter((op) => typeof op !== "string");
+  return Buffer.concat(
+    insns.map(([code, k, jt, jf], i) => {
+      const offset = (label?: string) => (label === undefined ? 0 : (labels.get(label) ?? -1) - i - 1);
+      const out = Buffer.alloc(8);
+      out.writeUInt16LE(code, 0);
+      out.writeUInt8(offset(jt), 2);
+      out.writeUInt8(offset(jf), 3);
+      out.writeUInt32LE(k >>> 0, 4);
+      return out;
+    }),
+  );
+}
+
 function libc() {
   const i64 = FFIType.i64;
   return dlopen("libc.so.6", {
@@ -50,6 +114,9 @@ function libc() {
     write: { args: [FFIType.i32, FFIType.ptr, FFIType.u64], returns: FFIType.i64 },
     lseek: { args: [FFIType.i32, i64, FFIType.i32], returns: i64 },
     dup2: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    open: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+    close: { args: [FFIType.i32], returns: FFIType.i32 },
+    chdir: { args: [FFIType.ptr], returns: FFIType.i32 },
   }).symbols;
 }
 
@@ -71,6 +138,42 @@ function restrict(sys: ReturnType<typeof libc>, port: number): void {
   }
   if (sys.prctl(38, 1, 0, 0, 0) !== 0) throw new Error("Cannot set no_new_privs");
   if (Number(sys.syscall(446, fd, 0, 0, 0)) !== 0) throw new Error("Cannot apply Landlock");
+}
+
+/** Allow executing only beneath `executables`, then refuse Unix sockets; both survive the exec. */
+function restrictExec(sys: ReturnType<typeof libc>, executables: string[]): void {
+  const abi = Number(sys.syscall(444, 0, 0, 1, 0));
+  if (abi < 1) throw new Error("Landlock is unavailable");
+  const attr = new BigUint64Array([ACCESS_FS_EXECUTE]);
+  const fd = Number(sys.syscall(444, ptr(attr), attr.byteLength, 0, 0));
+  if (fd < 0) throw new Error("Cannot create a Landlock ruleset");
+  for (const path of executables) {
+    const target = sys.open(ptr(Buffer.from(`${path}\0`)), O_PATH | O_CLOEXEC);
+    if (target < 0) throw new Error(`Cannot open ${path}`);
+    // struct landlock_path_beneath_attr is packed: the access mask, then the descriptor.
+    const rule = Buffer.alloc(12);
+    rule.writeBigUInt64LE(ACCESS_FS_EXECUTE, 0);
+    rule.writeInt32LE(target, 8);
+    const added = Number(sys.syscall(445, fd, RULE_PATH_BENEATH, ptr(rule), 0));
+    sys.close(target);
+    if (added !== 0) throw new Error(`Cannot add a Landlock rule for ${path}`);
+  }
+  if (sys.prctl(38, 1, 0, 0, 0) !== 0) throw new Error("Cannot set no_new_privs");
+  if (Number(sys.syscall(446, fd, 0, 0, 0)) !== 0) throw new Error("Cannot apply Landlock");
+  sys.close(fd);
+  const filter = seccompFilter();
+  const prog = Buffer.alloc(16);
+  prog.writeUInt16LE(filter.length / 8, 0);
+  prog.writeBigUInt64LE(BigInt(ptr(filter)), 8);
+  if (sys.prctl(22, 2, ptr(prog), 0, 0) !== 0) throw new Error("Cannot apply the Unix-socket filter");
+}
+
+/** The payload's own variables plus the process-cleanup markers `runProcess` gave the launcher. */
+function payloadVars(payload: string): Record<string, string> {
+  const vars = { ...(JSON.parse(payload) as Record<string, string>) };
+  for (const [key, value] of Object.entries(process.env))
+    if (key.startsWith("LIMITLESS_INVOCATION")) vars[key] = value ?? "";
+  return vars;
 }
 
 const cstrings = (values: string[]) => {
@@ -109,38 +212,56 @@ async function probe(port: number, abstract: string, pid: number): Promise<numbe
   return leaks.length ? 1 : 0;
 }
 
-/** `<port> -- /abs/cmd args…` execs under Landlock; `<port> --probe <abstract> <pid>` reports leaks. */
+/**
+ * `<port> -- /abs/cmd args…` execs under Landlock; `<port> --probe <abstract> <pid>` reports leaks;
+ * `0 --git <cwd> <executable>… -- /abs/git args…` runs inside Git's bubblewrap, where it allows executing
+ * only the listed paths, refuses Unix sockets, enters `cwd` and execs git with the payload's environment.
+ */
 export async function landlockEntry(args: string[]): Promise<number> {
   const [portArg = "", mode, ...rest] = args;
   const port = Number(portArg);
-  const command = rest[0] ?? "";
+  const split = rest.indexOf("--");
+  const command = mode === "--git" ? rest.slice(split + 1) : rest;
+  const git = rest.slice(0, split);
   if (
     !/^\d+$/.test(portArg) ||
     port > 65535 ||
-    (mode === "--" ? !isAbsolute(command) : mode !== "--probe" || rest.length !== 2)
+    (mode === "--"
+      ? !isAbsolute(command[0] ?? "")
+      : mode === "--git"
+        ? port !== 0 || split < 2 || ![...git, command[0] ?? ""].every(isAbsolute)
+        : mode !== "--probe" || rest.length !== 2)
   ) {
-    console.error("landlock: usage: <port> -- /absolute/command [args…] | <port> --probe <abstract> <pid>");
+    console.error(
+      "landlock: usage: <port> -- /absolute/command [args…] | <port> --probe <abstract> <pid> | 0 --git /cwd /executable… -- /absolute/git [args…]",
+    );
     return 2;
   }
   let sys: ReturnType<typeof libc>;
+  let gitEnv: string[] | undefined;
   try {
     sys = libc();
-    restrict(sys, port);
+    if (mode === "--git") {
+      const payload = process.env[PAYLOAD_ENV];
+      if (payload === undefined) throw new Error("Missing the payload environment");
+      gitEnv = Object.entries(payloadVars(payload)).map(([key, value]) => `${key}=${value}`);
+      restrictExec(sys, git.slice(1));
+      if (sys.chdir(ptr(Buffer.from(`${git[0]}\0`))) !== 0) throw new Error(`Cannot enter ${git[0]}`);
+    } else restrict(sys, port);
   } catch (error) {
     console.error(`landlock: ${error instanceof Error ? error.message : String(error)}`);
     return 125;
   }
   if (mode === "--probe") return probe(port, rest[0] ?? "", Number(rest[1]));
-  const argv = cstrings(rest);
+  const argv = cstrings(command);
   // A launch from `launch()` carries the payload's environment privately: bwrap and its loader get only
   // the process-cleanup markers, and the payload's shell reads the rest from a descriptor inside.
   const payload = process.env[PAYLOAD_ENV];
   let inherited = Object.entries(process.env).filter(([key]) => key !== PAYLOAD_ENV);
-  if (payload !== undefined) {
+  if (payload !== undefined && gitEnv === undefined) {
     try {
-      const vars = { ...(JSON.parse(payload) as Record<string, string>) };
+      const vars = payloadVars(payload);
       inherited = inherited.filter(([key]) => key.startsWith("LIMITLESS_INVOCATION"));
-      for (const [key, value] of inherited) vars[key] = value ?? "";
       const body = Buffer.from(envScript(vars));
       const fd = sys.memfd_create(ptr(Buffer.from("limitless-env\0")), 0);
       if (fd < 0 || Number(sys.write(fd, ptr(body), BigInt(body.length))) !== body.length)
@@ -152,9 +273,9 @@ export async function landlockEntry(args: string[]): Promise<number> {
       return 125;
     }
   }
-  const env = cstrings(inherited.map(([key, value]) => `${key}=${value ?? ""}`));
+  const env = cstrings(gitEnv ?? inherited.map(([key, value]) => `${key}=${value ?? ""}`));
   sys.execve(ptr(argv.buffers[0] ?? Buffer.from("\0")), ptr(argv.pointers), ptr(env.pointers));
-  console.error(`landlock: cannot execute ${command}`);
+  console.error(`landlock: cannot execute ${command[0]}`);
   return 127;
 }
 

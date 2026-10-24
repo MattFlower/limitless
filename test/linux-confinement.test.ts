@@ -4,8 +4,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,13 +18,13 @@ import {
   elfInterpreter,
   gitBwrapArgs,
   gitConfinement,
-  gitSeccompFilter,
   gitSh,
 } from "../src/git/confinement.ts";
+import { landlockCommand, PAYLOAD_ENV, seccompFilter } from "../src/harness/landlock.ts";
 import { ConfinementError, platformConfinement, runSandboxed, SANDBOX_EXEC } from "../src/harness/sandbox.ts";
-import { BWRAP, bwrapArgs, linuxForPort, verifyLinux } from "../src/harness/sandbox-linux.ts";
+import { BWRAP, bwrapArgs, linuxForPort, shadow, verifyLinux } from "../src/harness/sandbox-linux.ts";
 import type { WriteRoots } from "../src/harness/scratch.ts";
-import { agentEnv, type ProcResult } from "../src/util/proc.ts";
+import { agentEnv, invocationScratch, type ProcResult, runProcess } from "../src/util/proc.ts";
 import { bwrapSkip } from "./confinement.ts";
 
 let root: string;
@@ -263,8 +265,38 @@ test("bwrapArgs refuses policies a bind mount cannot enforce", () => {
   // A denied file that does not exist yet could be created inside the writable checkout and read.
   const future = { ...roots, denyRead: [...(roots.denyRead ?? []), join(work, "future.db")] };
   expect(() => bwrapArgs(future, sources)).toThrow("does not exist yet");
-  // Outside every bound path nothing can create it, so an absent credential store is fine.
-  expect(() => bwrapArgs({ ...roots, denyRead: [join(root, "home", "missing")] }, sources)).not.toThrow();
+  // Outside every bound path the sandbox cannot create it, but the host still could, and the read-only
+  // root bind would show it: a visible ancestor is shadowed by a tmpfs holding its current entries.
+  const home = join(root, "home");
+  symlinkSync("tool", join(home, "link"));
+  const absent = { ...roots, denyRead: [join(home, "missing")] };
+  const shadowed = bwrapArgs(absent, sources, []);
+  const at = (...seq: string[]) => shadowed.findIndex((_, n) => seq.every((v, k) => shadowed[n + k] === v));
+  expect(at("--tmpfs", home)).toBeGreaterThan(0);
+  expect(shadowed[at("--tmpfs", home) - 2]).toBe("--perms");
+  for (const entry of ["credential", "tool", "work"])
+    expect(at("--ro-bind-try", join(home, entry), join(home, entry))).toBeGreaterThan(at("--tmpfs", home));
+  expect(at("--symlink", "tool", join(home, "link"))).toBeGreaterThan(at("--tmpfs", home));
+  // Before the private tmpfs mounts and the write binds, which must override what it binds back.
+  expect(at("--tmpfs", home)).toBeLessThan(at("--tmpfs", "/run"));
+  expect(at("--bind", work, work)).toBeGreaterThan(
+    at("--ro-bind-try", join(home, "work"), join(home, "work")),
+  );
+  expect(at("--remount-ro", home)).toBeGreaterThan(0);
+  expect(shadowed).not.toContain(join(home, "missing"));
+  // An ancestor already behind a private tmpfs or a mask shows nothing the host creates there.
+  expect(bwrapArgs(absent, sources, [root])).not.toContain("--ro-bind-try");
+  expect(bwrapArgs({ ...absent, denyRead: [home, join(home, "missing")] }, sources, [])).not.toContain(
+    "--ro-bind-try",
+  );
+  const otherCommand = join(root, "cmds", "other", "missing");
+  expect(bwrapArgs({ ...absent, denyRead: [otherCommand] }, sources, [])).not.toContain(
+    join(root, "cmds", "other"),
+  );
+  // Nothing can shadow the root itself.
+  expect(() =>
+    bwrapArgs({ ...roots, denyRead: [`/limitless-absent-${crypto.randomUUID()}/x`] }, sources),
+  ).toThrow("only existing ancestor is /");
   // A write root under a denied parent without a read allowance would be bound back readable.
   const private_ = join(root, "srv", "private");
   mkdirSync(join(private_, "work"), { recursive: true });
@@ -296,41 +328,113 @@ test("the Linux launch keeps the payload's environment and cwd off the unconfine
   expect(launched.cmd).toContain("--ro-bind-data");
 });
 
-test("gitBwrapArgs has no network, a Unix-socket filter, execute-only Landlock and write binds only for its roots", () => {
-  const bpf = join(root, "filter.bpf");
-  const args = gitBwrapArgs(["/usr/bin/git", "/lib/ld.so"], ["/w/b", "/w"], "bwrap", "setpriv", bpf);
+test("gitBwrapArgs has no network and write binds only for its roots, then hands git to the confining launcher", () => {
+  const args = gitBwrapArgs(["/usr/bin/git", "/lib/ld.so"], ["/w/b", "/w"], "/w/b", "bwrap");
   expect(args[0]).toBe("bwrap");
   expect(args).toContain("--unshare-net");
   expect(args.filter((_, i) => args[i - 1] === "--bind")).toEqual(["/w", "/w/b"]);
   expect(args.indexOf("--bind")).toBeLessThan(args.indexOf("--remount-ro"));
-  const setpriv = args.slice(args.indexOf("setpriv"));
-  expect(setpriv).toContain("--seccomp-filter");
-  expect(args[args.indexOf(bpf) - 1]).toBe("--ro-bind");
-  expect(setpriv.filter((arg) => arg.startsWith("path-beneath:"))).toEqual([
-    "path-beneath:execute:/usr/bin/git",
-    "path-beneath:execute:/lib/ld.so",
-  ]);
-  expect(() => gitBwrapArgs(["/usr/bin/git\n"], [], "bwrap", "setpriv", bpf)).toThrow(ConfinementError);
+  // bwrap enters "/", never the checkout; the launcher confines itself and then enters the cwd.
+  const launcher = landlockCommand(0);
+  const at = args.indexOf(launcher[0] ?? "");
+  expect(args.slice(at - 2, at)).toEqual(["--chdir", "/"]);
+  expect(args.slice(at)).toEqual([...launcher, "--git", "/w/b", "/usr/bin/git", "/lib/ld.so", "--"]);
+  expect(() => gitBwrapArgs(["/usr/bin/git\n"], [], "/w", "bwrap")).toThrow(ConfinementError);
 });
 
-test("the Git seccomp filter denies only AF_UNIX sockets and rejects unknown architectures", () => {
-  // Decode the program: 8-byte instructions, each ending in a return that is the verdict.
-  for (const arch of ["x64", "arm64"]) {
-    const filter = gitSeccompFilter(arch);
-    expect(filter.length % 8).toBe(0);
-    const rets = Array.from(
-      { length: filter.length / 8 },
-      (_, i) => filter.readUInt16LE(i * 8) === 6 && filter.readUInt32LE(i * 8 + 4),
-    );
-    expect(rets.filter((r) => r !== false)).toEqual([0x0005000d, 0x7fff0000, 0x80000000]);
+/** Runs a classic-BPF seccomp program over one synthetic seccomp_data, as the kernel would. */
+function seccompVerdict(filter: Buffer, arch: number, nr: number, domain = 0n): number {
+  const data = Buffer.alloc(64);
+  data.writeUInt32LE(nr >>> 0, 0);
+  data.writeUInt32LE(arch >>> 0, 4);
+  data.writeBigUInt64LE(domain, 16);
+  let a = 0;
+  for (let pc = 0; pc < filter.length / 8; pc++) {
+    const [code, jt, jf, k] = [
+      filter.readUInt16LE(pc * 8),
+      filter.readUInt8(pc * 8 + 2),
+      filter.readUInt8(pc * 8 + 3),
+      filter.readUInt32LE(pc * 8 + 4),
+    ];
+    if (code === 0x20) a = data.readUInt32LE(k);
+    else if (code === 0x15) pc += a === k ? jt : jf;
+    else if (code === 0x35) pc += a >= k ? jt : jf;
+    else if (code === 0x06) return k;
+    else throw new Error(`unexpected BPF instruction ${code}`);
   }
-  expect(() => gitSeccompFilter("riscv64")).toThrow(ConfinementError);
+  throw new Error("the program ran past its end");
+}
+
+test.each([
+  { arch: "x64", audit: 0xc000003e, socket: 41, socketpair: 53, foreign: 0x40000003 },
+  { arch: "arm64", audit: 0xc00000b7, socket: 198, socketpair: 199, foreign: 0x40000028 },
+])(
+  "the Git seccomp filter refuses every way to a Unix socket it can see ($arch)",
+  ({ arch, audit, ...nr }) => {
+    const [ALLOW, EACCES, ENOSYS, KILL] = [0x7fff0000, 0x0005000d, 0x00050026, 0x80000000];
+    const verdict = (call: number, domain = 0n, on: number = audit) =>
+      seccompVerdict(seccompFilter(arch), on, call, domain);
+    expect(verdict(nr.socket, 1n)).toBe(EACCES);
+    expect(verdict(nr.socketpair, 1n)).toBe(EACCES);
+    // The kernel reads the domain as an int, so high bits do not make it another family.
+    expect(verdict(nr.socket, 0x1_0000_0001n)).toBe(EACCES);
+    expect(verdict(nr.socket, 2n)).toBe(ALLOW);
+    expect(verdict(nr.socketpair, 2n)).toBe(ALLOW);
+    expect(verdict(0, 1n)).toBe(ALLOW);
+    // io_uring creates sockets without a socket syscall the filter would see.
+    expect(verdict(425)).toBe(ENOSYS);
+    expect(verdict(nr.socket, 1n, nr.foreign)).toBe(KILL);
+    if (arch === "x64") {
+      // x32 calls report AUDIT_ARCH_X86_64 with bit 30 set in the number.
+      expect(verdict(0x40000000 | nr.socket, 1n)).toBe(ENOSYS);
+      expect(verdict(0x40000000 | nr.socketpair, 1n)).toBe(ENOSYS);
+      expect(verdict(0x40000000)).toBe(ENOSYS);
+    }
+  },
+);
+
+test("the Git seccomp filter has no program for an unknown architecture", () => {
+  expect(() => seccompFilter("riscv64")).toThrow("no Unix-socket filter");
 });
 
-test("bwrap and setpriv stderr is a confinement failure on Linux only", () => {
-  const failed = { exitCode: 128, stderr: "bwrap: x" };
-  expect(() => checkApply(failed, "linux")).toThrow(ConfinementError);
-  expect(() => checkApply(failed, "darwin")).not.toThrow();
+test.skipIf(process.platform !== "linux")(
+  "a Linux Git launch keeps the payload's environment and cwd off bwrap and the launcher (needs linux)",
+  async () => {
+    const repo = join(root, "repo");
+    mkdirSync(repo);
+    const bwrap = join(root, "bwrap");
+    writeFileSync(bwrap, "");
+    const secret = `secret-${crypto.randomUUID()}`;
+    const env = { ...agentEnv(), LD_PRELOAD: "/x.so", GIT_AUTHOR_NAME: secret };
+    const probes: { env?: Record<string, string>; cwd: string }[] = [];
+    const run = (async (cmd: string[], opts: { env?: Record<string, string>; cwd: string }) => {
+      probes.push(opts);
+      return { exitCode: 0, stdout: `${realpathSync(root)}\n`, stderr: "", cmd } as unknown as ProcResult;
+    }) as never;
+    const launch = await invocationScratch.run(root, () =>
+      bwrapGit("linux", bwrap, run).wrap(["git", "status"], { cwd: repo, env }),
+    );
+    for (const started of [...probes, launch]) {
+      expect(started.cwd).toBe("/");
+      expect(Object.keys(started.env ?? {}).sort()).toEqual([PAYLOAD_ENV, "PATH"]);
+    }
+    // The cached installation probe gets a fixed environment; the command gets the caller's.
+    expect(probes).toHaveLength(1);
+    expect(JSON.parse(probes[0]?.env?.[PAYLOAD_ENV] ?? "")).toEqual({ PATH: "/usr/bin:/bin" });
+    expect(JSON.parse(launch.env[PAYLOAD_ENV] ?? "")).toEqual(env);
+    expect(launch.cmd.join("\0")).not.toContain(secret);
+    expect(launch.cmd.slice(launch.cmd.indexOf("--git") + 1)[0]).toBe(repo);
+    expect(launch.cmd.slice(-2)).toEqual([expect.stringMatching(/^--exec-path=/), "status"]);
+  },
+);
+
+test("bwrap and launcher stderr is a confinement failure on Linux only", () => {
+  for (const stderr of ["bwrap: x", "landlock: Landlock is unavailable"]) {
+    const failed = { exitCode: 125, stderr };
+    expect(() => checkApply(failed, "linux")).toThrow(ConfinementError);
+    expect(() => checkApply(failed, "darwin")).not.toThrow();
+  }
+  expect(() => checkApply({ exitCode: 128, stderr: "fatal: not a git repository" }, "linux")).not.toThrow();
 });
 
 test.skipIf(process.platform !== "linux")(
@@ -349,6 +453,33 @@ test.skipIf(process.platform !== "linux")(
     await expect(
       verifyLinux(roots, { signal: controller.signal }, leakyThenAborted as never, bwrap),
     ).rejects.toThrow(ConfinementError);
+
+    // The network probe's report of a leak is evidence too, even when shutdown then killed it; a cancel
+    // without that report is still a cancellation.
+    const killed = { exitCode: null, signal: "SIGKILL", cancelled: true, cancelKilled: true };
+    const networkThenAborted =
+      (signal: AbortController, stderr: string) =>
+      async ({ cmd }: { cmd: string[] }) => {
+        if (cmd[0] === "/bin/sh") {
+          writeFileSync(cmd[5] ?? "", "ok");
+          return result("linux-verified");
+        }
+        signal.abort(new Error("cancelled"));
+        return { ...result(""), ...killed, stderr } as ProcResult;
+      };
+    const leak = new AbortController();
+    await expect(
+      verifyLinux(
+        roots,
+        { signal: leak.signal },
+        networkThenAborted(leak, "landlock: reached daemon port\n") as never,
+        bwrap,
+      ),
+    ).rejects.toThrow("Network and signal confinement not verified");
+    const cancel = new AbortController();
+    await expect(
+      verifyLinux(roots, { signal: cancel.signal }, networkThenAborted(cancel, "") as never, bwrap),
+    ).rejects.toThrow("cancelled");
 
     const before = readdirSync(work);
     const real = Bun.listen;
@@ -423,5 +554,76 @@ test.skipIf(bwrapSkip !== null)(
       server.stop(true);
     }
     expect(connections).toBe(0);
+  },
+);
+
+test.skipIf(bwrapSkip !== null)(
+  `nothing from the payload's environment runs before Git confinement, and git still gets it (${bwrapSkip})`,
+  async () => {
+    const repo = join(root, "repo");
+    Bun.spawnSync(["git", "init", "-q", repo]);
+    const debug = join(repo, "loader");
+    mkdirSync(debug);
+    // glibc's loader writes LD_DEBUG_OUTPUT.<pid>, naming the program it loads for, in every dynamically
+    // linked process that inherits it. The directory is writable inside and outside the sandbox alike.
+    const env = {
+      ...agentEnv(),
+      LD_DEBUG: "files",
+      LD_DEBUG_OUTPUT: join(debug, "ld"),
+      GIT_AUTHOR_NAME: "Kept",
+      GIT_AUTHOR_EMAIL: "kept@example.com",
+    };
+    const git = await gitConfinement
+      .run(bwrapGit(), () => gitSh(["git", "var", "GIT_AUTHOR_IDENT"], { cwd: repo, env, allowFail: true }))
+      .catch((error) => error as Error);
+    const loaded = new Set(
+      readdirSync(debug).flatMap((file) =>
+        [...readFileSync(join(debug, file), "utf8").matchAll(/needed by (\S+)/g)].map((m) => m[1]),
+      ),
+    );
+    // The installation probe and the command itself: git, and nothing that ran before confinement.
+    expect([...loaded]).toEqual([realpathSync(Bun.which("git") ?? "git")]);
+    expect(git instanceof Error ? git.message : git.stdout).toContain("Kept <kept@example.com>");
+  },
+);
+
+test.skipIf(bwrapSkip !== null)(
+  `a shadowed directory keeps its entries and hides a denied path the host creates later (${bwrapSkip})`,
+  async () => {
+    const { home, tool, work } = layout();
+    symlinkSync("tool", join(home, "link"));
+    const denied = join(home, "missing");
+    const script = `echo ready > ready; i=0; while [ ! -e go ]; do i=$((i+1)); [ "$i" -lt 3000 ] || exit 9; sleep .01; done
+      echo $(ls '${home}')
+      readlink '${home}/link'
+      ls '${tool}' >/dev/null && echo toolchain
+      if head -c 1 '${denied}' >/dev/null 2>&1; then echo leaked; else echo hidden; fi
+      if touch '${home}/new' 2>/dev/null; then echo writable; else echo read-only; fi`;
+    const sandbox = runProcess({
+      cmd: [
+        BWRAP,
+        ...["--unshare-user", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
+        ...shadow(home),
+        ...["--bind", work, work, "--remount-ro", home, "--chdir", work, "--", "/bin/sh", "-c", script],
+      ],
+      cwd: work,
+      env: agentEnv(),
+      timeoutMs: 60_000,
+    });
+    for (let i = 0; !existsSync(join(work, "ready")); i++) {
+      if (i > 3000) throw new Error("the sandbox never became ready");
+      await Bun.sleep(10);
+    }
+    writeFileSync(denied, "secret");
+    writeFileSync(join(work, "go"), "");
+    const run = await sandbox;
+    expect(run.stdout.trim().split("\n"), run.stderr).toEqual([
+      "credential link tool work",
+      "tool",
+      "toolchain",
+      "hidden",
+      "read-only",
+    ]);
+    expect(existsSync(join(home, "new"))).toBe(false);
   },
 );

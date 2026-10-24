@@ -226,8 +226,8 @@ Gates, land checks and Git on Linux run under bubblewrap and Landlock instead of
 (`src/harness/sandbox-linux.ts`, `src/harness/landlock.ts`, `bwrapGit`). The coordinator itself
 stays on macOS; this is for Linux workers (#832). Host requirements:
 
-- `/usr/bin/bwrap` (the `bubblewrap` package, not setuid) and `/usr/bin/setpriv` from util-linux 2.40
-  or later.
+- `/usr/bin/bwrap` (the `bubblewrap` package, not setuid). Git's Landlock and seccomp rules are
+  applied by the factory's own launcher, so no `setpriv` or util-linux version is needed.
 - Unprivileged user namespaces. On Ubuntu 23.10 and later, `kernel.apparmor_restrict_unprivileged_userns=1`
   needs an AppArmor profile that grants bwrap `userns`. Leave the sysctl on and add the profile
   rather than disabling the restriction. **This path is untested:** the host that built this had no
@@ -240,6 +240,10 @@ a `ConfinementError` that names the reason; nothing falls back to an unconfined 
 sandbox, `/run` (including `$XDG_RUNTIME_DIR`, the D-Bus session bus, ssh-agent, gpg-agent, keyring
 and systemd user manager sockets), `/tmp` and `/var/tmp` are private tmpfs mounts. `/tmp` stays
 writable because Codex's own bubblewrap keeps a registry there; writes to it never reach the host.
+A denied path that does not exist yet, such as a missing `~/.netrc`, is shadowed: its nearest existing
+ancestor becomes a read-only tmpfs holding that directory's entries at launch, so the file stays hidden
+if the host creates it mid-session. Other entries the host adds to that directory afterwards are not
+visible either.
 The daemon port is refused on every address (Landlock rules are per port), and other egress is
 allowed as on macOS. Launching costs about 5 ms for bwrap and about 70 ms for the 65,535 Landlock
 port rules a daemon port needs.

@@ -1,17 +1,17 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import {
-  existsSync,
-  lstatSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { landlockCommand, launcherFiles, PAYLOAD_ENV } from "../harness/landlock.ts";
 import { ConfinementError } from "../harness/read-policy.ts";
-import { CommandError, invocationScratch, ProcessTerminationError, processScope, sh } from "../util/proc.ts";
+import {
+  CommandError,
+  invocationScratch,
+  ProcessTerminationError,
+  processScope,
+  redactCredentials,
+  sh,
+} from "../util/proc.ts";
 
 export { ConfinementError };
 
@@ -19,14 +19,19 @@ export type GitOptions = Parameters<typeof sh>[1] & {
   /** Existing write roots chosen by the caller for this invocation, never by repository config. */
   additionalWriteRoots?: string[];
 };
-export interface GitConfinement {
-  wrap(cmd: string[], opts: GitOptions): Promise<string[]>;
+/** A command that must also start with its own environment and cwd instead of the caller's. */
+export interface GitLaunch {
+  cmd: string[];
+  env: Record<string, string>;
+  cwd: string;
+}
+export interface GitConfinement<Launch extends string[] | GitLaunch = string[] | GitLaunch> {
+  wrap(cmd: string[], opts: GitOptions): Promise<Launch>;
 }
 /** Explicit injection only; production has no environment/configuration selector. */
 export const gitConfinement = new AsyncLocalStorage<GitConfinement>();
 const sandbox = "/usr/bin/sandbox-exec";
 const BWRAP = "/usr/bin/bwrap";
-const SETPRIV = "/usr/bin/setpriv";
 
 export function gitProfile(binaries: string[], execPath: string | undefined, writes: string[]): string {
   const paths = (values: string[], kind: string) =>
@@ -92,7 +97,11 @@ function gitWrites(cmd: string[], opts: GitOptions, env: Record<string, string>,
   ];
 }
 
-export function seatbeltGit(platform = process.platform, executable = sandbox, run = sh): GitConfinement {
+export function seatbeltGit(
+  platform = process.platform,
+  executable = sandbox,
+  run = sh,
+): GitConfinement<string[]> {
   const installations = new Map<string, Promise<{ binaries: string[]; execPath: string }>>();
   return {
     async wrap(cmd, opts) {
@@ -149,103 +158,72 @@ export function elfInterpreter(path: string): string | undefined {
   return undefined;
 }
 
-const SECCOMP_FILE = "/run/limitless-git-seccomp";
-const ARCHITECTURES: Record<string, { audit: number; socket: number }> = {
-  x64: { audit: 0xc000003e, socket: 41 },
-  arm64: { audit: 0xc00000b7, socket: 198 },
+const within = (parent: string, path: string) => {
+  const rel = relative(parent, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 };
 
 /**
- * A classic-BPF seccomp program that makes `socket(AF_UNIX, …)` fail with EACCES and kills anything
- * running under another architecture. `--unshare-net` leaves pathname Unix sockets on the host reachable
- * (connect needs no write access), and seccomp cannot read the address, so creating one is what is refused.
+ * `gitProfile` on Linux: no network, writes only to `writes`, execute only git, its helpers and loader,
+ * and no Unix sockets. bwrap starts the launcher from "/"; the launcher confines itself before it enters
+ * `cwd` and execs git with the payload's environment.
  */
-export function gitSeccompFilter(arch: string = process.arch): Buffer {
-  const target = ARCHITECTURES[arch];
-  if (!target) throw new ConfinementError(`Git confinement has no Unix-socket filter for ${arch}`);
-  const insn = (code: number, jt: number, jf: number, k: number) => {
-    const out = Buffer.alloc(8);
-    out.writeUInt16LE(code, 0);
-    out[2] = jt;
-    out[3] = jf;
-    out.writeUInt32LE(k >>> 0, 4);
-    return out;
-  };
-  const [LD, JEQ, RET] = [0x20, 0x15, 0x06];
-  return Buffer.concat([
-    insn(LD, 0, 0, 4), // seccomp_data.arch
-    insn(JEQ, 0, 6, target.audit),
-    insn(LD, 0, 0, 0), // nr
-    insn(JEQ, 0, 3, target.socket),
-    insn(LD, 0, 0, 16), // args[0], the domain
-    insn(JEQ, 0, 1, 1), // AF_UNIX
-    insn(RET, 0, 0, 0x00050000 | 13), // ERRNO(EACCES)
-    insn(RET, 0, 0, 0x7fff0000), // ALLOW
-    insn(RET, 0, 0, 0x80000000), // KILL_PROCESS
-  ]);
-}
-
-/** The filter on disk in a directory no candidate can write, bound read-only into each sandbox. */
-let seccompPath: string | undefined;
-function seccompFile(): string {
-  if (seccompPath && existsSync(seccompPath)) return seccompPath;
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "limitless-git-seccomp-")));
-  seccompPath = join(dir, "filter.bpf");
-  writeFileSync(seccompPath, gitSeccompFilter(), { mode: 0o444 });
-  return seccompPath;
-}
-
-/** `gitProfile` on Linux: no network, writes only to `writes`, execute only git, its helpers and loader. */
-export function gitBwrapArgs(
-  executables: string[],
-  writes: string[],
-  bwrap = BWRAP,
-  setpriv = SETPRIV,
-  seccomp = seccompFile(),
-): string[] {
-  if ([...executables, ...writes].some((path) => [...path].some((c) => c < " " || c === "\x7f")))
+export function gitBwrapArgs(executables: string[], writes: string[], cwd: string, bwrap = BWRAP): string[] {
+  if ([...executables, ...writes, cwd].some((path) => [...path].some((c) => c < " " || c === "\x7f")))
     throw new ConfinementError("Unusual Git confinement path");
+  // The launcher reads its own files before it confines anything; bind back any the private mounts hide.
+  const launcher = launcherFiles()
+    .map((path) => realpathSync(path))
+    .filter((path) => ["/run", "/tmp"].some((hidden) => within(hidden, path)));
   return [
     bwrap,
     ...["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-net", "--unshare-uts"],
     ...["--unshare-cgroup-try", "--die-with-parent", "--new-session", "--ro-bind", "/", "/"],
     ...["--dev", "/dev", "--proc", "/proc", "--perms", "0755", "--tmpfs", "/run", "--tmpfs", "/tmp"],
+    ...launcher.flatMap((path) => ["--ro-bind", path, path]),
     ...[...writes].sort((a, b) => a.length - b.length).flatMap((path) => ["--bind", path, path]),
-    ...["--ro-bind", seccomp, SECCOMP_FILE, "--remount-ro", "/run"],
-    setpriv,
-    ...["--no-new-privs", "--seccomp-filter", SECCOMP_FILE, "--landlock-access", "fs:execute"],
-    ...executables.flatMap((path) => ["--landlock-rule", `path-beneath:execute:${path}`]),
+    ...["--remount-ro", "/run", "--chdir", "/"],
+    ...landlockCommand(0),
+    ...["--git", cwd, ...executables, "--"],
   ];
 }
 
-export function bwrapGit(
-  platform = process.platform,
-  bwrap = BWRAP,
-  setpriv = SETPRIV,
-  run = sh,
-): GitConfinement {
+const MAX_PAYLOAD_ENV = 100_000;
+/** bwrap and the launcher start from "/" with one variable the launcher consumes: no LD_* reaches them. */
+function trustedLaunch(env: Record<string, string>) {
+  const payload = JSON.stringify(env);
+  if (Buffer.byteLength(payload) > MAX_PAYLOAD_ENV)
+    throw new ConfinementError("The confined Git command's environment is too large to stage");
+  return { env: { PATH: "/usr/bin:/bin", [PAYLOAD_ENV]: payload }, cwd: "/" };
+}
+
+export function bwrapGit(platform = process.platform, bwrap = BWRAP, run = sh): GitConfinement<GitLaunch> {
   const installations = new Map<string, Promise<string[]>>();
   return {
     async wrap(cmd, opts) {
       opts.signal?.throwIfAborted();
       if (opts.additionalWriteRoots?.some((path) => !isAbsolute(path)))
         throw new ConfinementError("Additional Git write roots must be absolute paths");
-      if (platform !== "linux" || !existsSync(bwrap) || !existsSync(setpriv))
-        throw new ConfinementError("Git confinement requires Linux bubblewrap and setpriv");
+      if (platform !== "linux" || !existsSync(bwrap))
+        throw new ConfinementError("Git confinement requires Linux bubblewrap");
       const { env, git, scratch } = resolveGit(cmd, opts);
+      const launch = trustedLaunch(env);
       let installation = installations.get(git);
       if (!installation) {
         installation = (async () => {
           const loader = elfInterpreter(git);
           const base = [git, ...(loader ? [loader] : [])];
-          const result = await run([...gitBwrapArgs(base, [scratch], bwrap, setpriv), git, "--exec-path"], {
+          // Cached for every later caller, so no caller's environment may shape it.
+          const result = await run([...gitBwrapArgs(base, [scratch], scratch, bwrap), git, "--exec-path"], {
             ...opts,
-            env,
-            cwd: scratch,
+            ...trustedLaunch({ PATH: "/usr/bin:/bin" }),
             allowFail: true,
             stdin: undefined,
           });
-          if (result.exitCode !== 0) throw new ConfinementError("Cannot apply Git confinement");
+          if (result.exitCode !== 0)
+            throw new ConfinementError(
+              `Cannot apply Git confinement; it needs bubblewrap with user namespaces and Landlock: ${redactCredentials(result.stderr.trim().split("\n")[0] ?? "")}`,
+            );
           return [...base, realpathSync(result.stdout.trim())];
         })();
         installations.set(git, installation);
@@ -253,13 +231,13 @@ export function bwrapGit(
       }
       const executables = await installation;
       const execPath = executables.at(-1) ?? "";
-      const args = gitBwrapArgs(executables, gitWrites(cmd, opts, env, scratch), bwrap, setpriv);
-      return [...args, git, `--exec-path=${execPath}`, ...cmd.slice(1)];
+      const args = gitBwrapArgs(executables, gitWrites(cmd, opts, env, scratch), resolve(opts.cwd), bwrap);
+      return { cmd: [...args, git, `--exec-path=${execPath}`, ...cmd.slice(1)], ...launch };
     },
   };
 }
 export const gitBackend = { default: process.platform === "linux" ? bwrapGit() : seatbeltGit() };
-// Specific to sandbox-exec, bwrap and setpriv; Git's own failures must retain their normal classification.
+// Specific to sandbox-exec, bwrap and the launcher; Git's own failures must retain their normal classification.
 export function checkApply(
   result: { exitCode: number | null; stderr: string },
   platform: string = process.platform,
@@ -269,7 +247,7 @@ export function checkApply(
       result.stderr
         .replace(/^sandbox-exec: /, "")
         .startsWith("sandbox_" + "apply: Operation not permitted")) ||
-    (platform === "linux" && result.exitCode !== 0 && /^(bwrap|setpriv): /.test(result.stderr))
+    (platform === "linux" && result.exitCode !== 0 && /^(bwrap|landlock): /.test(result.stderr))
   )
     throw new ConfinementError("Cannot apply Git confinement");
 }
@@ -282,9 +260,10 @@ export const gitSh = async (cmd: string[], opts: GitOptions): ReturnType<typeof 
   try {
     return await invocationScratch.run(scratch, async () => {
       opts = { ...opts, env: { ...(opts.env ?? process.env), TMPDIR: scratch } };
-      let wrapped: string[];
+      let launch: { cmd: string[]; env?: Record<string, string>; cwd?: string };
       try {
-        wrapped = await (gitConfinement.getStore() ?? gitBackend.default).wrap(cmd, opts);
+        const wrapped = await (gitConfinement.getStore() ?? gitBackend.default).wrap(cmd, opts);
+        launch = Array.isArray(wrapped) ? { cmd: wrapped } : wrapped;
       } catch (error) {
         if (error instanceof ProcessTerminationError) throw error;
         opts.signal?.throwIfAborted();
@@ -292,7 +271,11 @@ export const gitSh = async (cmd: string[], opts: GitOptions): ReturnType<typeof 
         throw new ConfinementError("Cannot prepare Git confinement");
       }
       try {
-        const result = await sh(wrapped, opts);
+        const result = await sh(launch.cmd, {
+          ...opts,
+          env: launch.env ?? opts.env,
+          cwd: launch.cwd ?? opts.cwd,
+        });
         checkApply(result);
         return result;
       } catch (error) {

@@ -2,7 +2,9 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   statSync,
@@ -68,10 +70,32 @@ function maskSources(): { dir: string; file: string } {
 }
 
 /**
+ * A read-only tmpfs over `dir` holding its current entries bound back: a deny that does not exist yet
+ * stays absent even if a host process creates it later, which the read-only root bind would show.
+ * Entries the host adds afterwards stay hidden too; one removed before bwrap binds it is skipped.
+ */
+export function shadow(dir: string): string[] {
+  const mode = (statSync(dir).mode & 0o7777).toString(8).padStart(4, "0");
+  return [
+    ...["--perms", mode, "--tmpfs", dir],
+    ...readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const path = join(dir, entry.name);
+      if (!entry.isSymbolicLink()) return ["--ro-bind-try", path, path];
+      try {
+        return ["--symlink", readlinkSync(path), path];
+      } catch {
+        return [];
+      }
+    }),
+  ];
+}
+
+/**
  * bwrap arguments equivalent to `seatbeltProfile`: a read-only root; private /run, /tmp and /var/tmp
  * (hiding $XDG_RUNTIME_DIR and every host socket); denied reads masked, then allowances, write roots and
  * protected paths bound in that order, and specific denies masked again so they beat every allowance.
- * Denies inside `hidden`, the private tmpfs mounts, need a mask only when binds pass through them.
+ * Denies inside `hidden`, the private tmpfs mounts, need a mask only when binds pass through them; an
+ * absent deny anywhere else is shadowed at its nearest existing ancestor.
  */
 export function bwrapArgs(
   roots: WriteRoots,
@@ -93,7 +117,8 @@ export function bwrapArgs(
   // A mount cannot hide a path that does not exist yet, and a candidate could create it inside a bound
   // directory; a write root under a deny without an allowance, or inside a protected path, would be
   // bound over its ancestor's rule. Seatbelt's pathname rules cover these; bind mounts cannot.
-  for (const path of canonicalAbsent(roots.denyRead))
+  const absent = canonicalAbsent(roots.denyRead);
+  for (const path of absent)
     if (bound.some((b) => within(b, creatableUnder(path))))
       throw new ConfinementError(`Cannot confine a denied path that does not exist yet: ${path}`);
   for (const w of write) {
@@ -110,6 +135,13 @@ export function bwrapArgs(
   // A mask that later binds pass through stays traversable but unlistable.
   const traversable = outer.filter((d) => bound.some((b) => within(d, b)));
   const masked = [...hidden, ...outer];
+  // Ancestors already behind a mask, a private tmpfs or another invocation's hidden command root show
+  // nothing the host creates there later.
+  const shadowed = [...new Set(absent.map(creatableUnder))]
+    .filter((dir) => ![...masked, ...commandRoots].some((m) => within(m, dir)))
+    .sort((a, b) => a.length - b.length);
+  if (shadowed.includes("/"))
+    throw new ConfinementError("Cannot confine a denied path whose only existing ancestor is /");
   const mask = (path: string) =>
     statSync(path).isDirectory() ? ["--ro-bind", sources.dir, path] : ["--ro-bind", sources.file, path];
   const resolv = canonical(["/etc/resolv.conf"]).filter((p) => within("/run", p));
@@ -119,6 +151,8 @@ export function bwrapArgs(
   return [
     ...["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"],
     ...["--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
+    // Before the private tmpfs mounts and every mask, which must cover what the shadows bind back.
+    ...shadowed.flatMap(shadow),
     ...["--perms", "0755", "--tmpfs", "/run", ...resolv.flatMap((p) => ["--ro-bind", p, p])],
     ...(envFd === undefined ? [] : ["--ro-bind-data", String(envFd), ENV_FILE]),
     // Private and writable: Codex's own bubblewrap keeps its mount registry in /tmp.
@@ -137,7 +171,7 @@ export function bwrapArgs(
     // Other invocations' command capabilities: hidden; this invocation's own: readable, not writable.
     ...commandRoots.flatMap((r) => ["--perms", "0111", "--tmpfs", r]),
     ...own.flatMap((p) => ["--ro-bind", p, p]),
-    ...["/run", ...traversable, ...commandRoots].flatMap((p) => ["--remount-ro", p]),
+    ...["/run", ...shadowed, ...traversable, ...commandRoots].flatMap((p) => ["--remount-ro", p]),
   ];
 }
 
@@ -295,7 +329,9 @@ export async function verifyLinux(
         `Write, read or signal confinement not verified: bubblewrap did not enforce its policy (exit ${sandbox.exitCode}); ${sandbox.stderr.trim()}`,
       );
     const network = await step([...landlockCommand(tcp.port), "--probe", abstract, String(process.pid)]);
-    surfaceCancel(network);
+    const leaked =
+      /^landlock: reached (daemon port|abstract socket|signal)(, (daemon port|abstract socket|signal))*$/m;
+    if (!leaked.test(network.stderr)) surfaceCancel(network);
     if (!conclusive(network, "landlock-verified"))
       throw new ConfinementError(`Network and signal confinement not verified: ${network.stderr.trim()}`);
   } catch (error) {
