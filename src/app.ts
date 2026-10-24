@@ -181,7 +181,9 @@ export class Factory {
       agentExecutor:
         opts.agentExecutor ??
         (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined),
-      gateExecutor: opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos),
+      gateExecutor:
+        opts.gateExecutor ??
+        gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos, cfg.executorEnabled),
       confinement: opts.confinement ?? seatbeltForPort(cfg.port),
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
@@ -225,7 +227,7 @@ export class Factory {
       client: getGitHubPr,
       confinement: this.deps.confinement,
       get gateExecutor() {
-        return factory.deps.gateExecutor;
+        return factory.deps.gateExecutor?.kind === "inplace" ? undefined : factory.deps.gateExecutor;
       },
       ...opts.land,
     });
@@ -244,7 +246,8 @@ export class Factory {
         (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined))
       : this.deps.agentExecutor;
     const gate = workersChanged
-      ? (this.opts.gateExecutor ?? gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos))
+      ? (this.opts.gateExecutor ??
+        gateExecutorFor(cfg.gateExecutor, this.workers, cfg.workers.repos, cfg.executorEnabled))
       : this.deps.gateExecutor;
     this.cfg = cfg;
     this.deps.cfg = shadowOk ? cfg : { ...cfg, reviewShadow: "off" };

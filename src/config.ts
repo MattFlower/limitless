@@ -62,6 +62,7 @@ export interface Config {
   /** `[gates] baseline_cache`: reuse passing baselines per base commit. Off, every baseline runs (and refreshes). */
   baselineCache: boolean;
   gateExecutor: "local" | "lan";
+  executorEnabled?: boolean;
   workers: { listen?: string; repos: string[]; agentSlots: number; agents: Role[] };
   /** `[gates] baseline_env`: extra variable names whose values (hashed) key the baseline cache. */
   baselineEnv: string[];
@@ -477,6 +478,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     maxConcurrentGates: Math.max(1, Math.floor(num(limits.max_concurrent_gates, defaultGateSlots()))),
     baselineCache: gates.baseline_cache !== false,
     gateExecutor: gates.executor === "lan" ? "lan" : "local",
+    executorEnabled: (raw.executor as { enabled?: unknown } | undefined)?.enabled === true,
     workers: {
       listen: listen as string | undefined,
       repos: workerRepos,

@@ -77,6 +77,7 @@ Usage:
   limitless auth sessions [revoke <id>|revoke --all]  List or revoke UI sign-in sessions
   limitless gc [--dry-run]                Clean up expired worktrees, logs, debug events and baseline cache
   limitless gates clear-cache [--repo owner/name]  Drop cached passing baselines (all repos by default)
+  limitless executor                       Run in-place gate jobs in the foreground
   limitless worker pair --coordinator https://<host>:<port> [--name <name>]
   limitless worker --coordinator https://<host>:<port>  Send paired macOS worker heartbeats
   limitless workers ls|approve <code>|revoke <name>
@@ -407,6 +408,18 @@ async function main(): Promise<void> {
         return;
       }
       throw new Error("Usage: limitless workers ls|approve <code>|revoke <name>");
+    }
+    case "executor": {
+      if (rest.length) throw new Error("Usage: limitless executor");
+      const { loadConfig } = await import("../config.ts");
+      const { resolveBootSha } = await import("./boot-sha.ts");
+      const { runInplaceExecutor } = await import("../gates/inplace.ts");
+      const sha = await resolveReleaseBootSha(resolveBootSha);
+      if (!sha) throw new Error("Cannot determine executor release SHA");
+      const controller = new AbortController();
+      process.once("SIGINT", () => controller.abort());
+      process.once("SIGTERM", () => controller.abort());
+      return runInplaceExecutor(loadConfig(), sha, controller.signal);
     }
     case "worker": {
       if (!values.coordinator) throw new Error("--coordinator HTTPS URL required");

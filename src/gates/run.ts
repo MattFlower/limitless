@@ -70,6 +70,7 @@ export interface GateComparison {
 }
 
 export interface GateHooks {
+  env?: Record<string, string>;
   priority?: GatePriority;
   holder?: string;
   /** Only bounded targeted retries may bypass the full-suite queue. */
@@ -98,7 +99,12 @@ export const gateEnv = (): Record<string, string> =>
   });
 
 /** Gates run confined to the checkout; a ConfinementError propagates so it can never grade a check. */
-async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promise<GateResult> {
+async function runOne(
+  cmd: GateCommand,
+  cwd: string,
+  signal: AbortSignal,
+  env = gateEnv(),
+): Promise<GateResult> {
   const launch = launchFailureScan();
   const coverage = new BunTestCoverage(cwd);
   const excerpts = new FailureExcerpts();
@@ -115,7 +121,7 @@ async function runOne(cmd: GateCommand, cwd: string, signal: AbortSignal): Promi
   const res = await runConfined({
     command: cmd.run,
     cwd,
-    env: { ...gateEnv(), LIMITLESS_GATE_REPORT: report },
+    env: { ...env, LIMITLESS_GATE_REPORT: report },
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
     redactOutput: true,
@@ -168,7 +174,7 @@ export async function runLocalGates(
     hooks.priority,
   );
   try {
-    const result = await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult));
+    const result = await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult, hooks.env));
     if (result.setupOk && !signal.aborted) hooks.onLocalSetup?.();
     return result;
   } finally {
@@ -195,10 +201,16 @@ async function runAll(
   cfg: GateConfig,
   signal: AbortSignal,
   onResult: GateHooks["onResult"],
+  env?: Record<string, string>,
 ): Promise<GateRun> {
   const setup: GateResult[] = [];
   for (const [i, run] of cfg.setup.entries()) {
-    const r = await runOne({ name: `setup${cfg.setup.length > 1 ? `-${i + 1}` : ""}`, run }, cwd, signal);
+    const r = await runOne(
+      { name: `setup${cfg.setup.length > 1 ? `-${i + 1}` : ""}`, run },
+      cwd,
+      signal,
+      env,
+    );
     setup.push(r);
     onResult?.(r, "setup");
     if (!r.ok) return { setupOk: false, setup, checks: [] };
@@ -206,7 +218,7 @@ async function runAll(
   const checks: GateResult[] = [];
   for (const c of cfg.checks) {
     if (signal.aborted) break;
-    const r = await runOne(c, cwd, signal);
+    const r = await runOne(c, cwd, signal, env);
     checks.push(r);
     onResult?.(r, "check");
   }

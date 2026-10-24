@@ -14,10 +14,10 @@ import {
 import { bindGateSlotScope, type GatePriority } from "./slots.ts";
 
 export interface Executor<Req, Res> {
-  readonly kind: "local" | "github-actions" | "lan" | "claude-cloud";
+  readonly kind: "local" | "github-actions" | "lan" | "inplace" | "claude-cloud";
   start(req: Req, signal: AbortSignal): Promise<ExecutionHandle>;
   attach(handle: ExecutionHandle, signal: AbortSignal, req?: Req, hooks?: GateHooks): Execution<Res>;
-  discard?(handle: ExecutionHandle): void;
+  discard?(handle: ExecutionHandle): void | Promise<void>;
 }
 export interface ExecutionHandle {
   kind: Executor<unknown, unknown>["kind"];
@@ -34,6 +34,8 @@ export type ExecutionEvent =
   | { type: "status"; text: string }
   | { type: "check"; phase: "setup" | "check"; result: GateResult };
 export interface GateRequest {
+  env?: Record<string, string>;
+  releaseSha?: string;
   runId?: string;
   priority?: GatePriority;
   repo: string;
@@ -45,6 +47,7 @@ export interface GateRequest {
   skipGateSlot?: boolean;
 }
 export type GateExecutor = Executor<GateRequest, GateRun> & {
+  canResume?: (handle: ExecutionHandle, env?: Record<string, string>) => boolean;
   freshCheckoutFor?: (repo: string) => boolean;
 };
 export type GateRunner = (gates: GateConfig, options?: GateRetryOptions) => Promise<GateRun>;
@@ -61,17 +64,18 @@ export async function cancelGateExecution(handle: ExecutionHandle, executor?: Ga
   if (execution) {
     await execution.cancel();
     await execution.result.catch(() => {});
-  } else if (executor?.kind === handle.kind) executor.discard?.(handle);
+  } else if (executor?.kind === handle.kind) await executor.discard?.(handle);
 }
 
 export function gateExecutorFor(
   kind: "local" | "lan",
   workers?: WorkerStore,
   repos: readonly string[] = [],
+  inplace = false,
 ): GateExecutor {
   switch (kind) {
     case "local":
-      return localExecutor();
+      return inplace && workers ? lanExecutor(workers, [], true) : localExecutor();
     case "lan":
       if (!workers) throw new Error("LAN executor requires a worker store");
       return lanExecutor(workers, repos);
@@ -138,6 +142,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
           holder: slotHooks.holder,
           skipGateSlot: req.skipGateSlot,
           priority: req.priority,
+          env: req.env,
           onLocalSetup: slotHooks.onLocalSetup,
           onResult(r, phase) {
             results.push({ type: "check", phase, result: r });

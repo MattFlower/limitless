@@ -1,7 +1,10 @@
 import type { StageName } from "../core/types.ts";
+import { WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { cancelGateExecution, executeGate, gateShutdown } from "../gates/executor.ts";
+import { lanExecutor } from "../gates/lan.ts";
 import type { GateHooks, GateRun } from "../gates/run.ts";
+import { gateEnv } from "../gates/run.ts";
 import { headSha } from "../git/repos.ts";
 import type { RunContext } from "./context.ts";
 
@@ -13,6 +16,7 @@ export async function runGateExecution(
   cwd: string,
   gates: GateConfig,
   hooks: GateHooks = {},
+  env = gateEnv(),
 ): Promise<GateRun> {
   ctx.checkCancelled();
   const executor = ctx.deps.gateExecutor;
@@ -24,11 +28,17 @@ export async function runGateExecution(
     pending.round === round &&
     pending.purpose === purpose &&
     ["baseline", "initial", "rebase"].includes(purpose) &&
+    (pending.handle.kind !== "inplace" || executor?.canResume?.(pending.handle, env)) &&
     pending.sha === sha
       ? pending.handle
       : undefined;
   if (pending && !stored) {
-    await cancelGateExecution(pending.handle, executor);
+    await cancelGateExecution(
+      pending.handle,
+      pending.handle.kind === "inplace"
+        ? lanExecutor(new WorkerStore(ctx.store, ctx.deps.buildSha), [], true)
+        : executor,
+    );
     ctx.state.gateExecution = undefined;
     await ctx.save();
   }
@@ -36,6 +46,8 @@ export async function runGateExecution(
   try {
     const result = await executeGate(
       {
+        env,
+        releaseSha: ctx.deps.buildSha,
         runId: ctx.run.id,
         repo: ctx.repo.slug,
         cwd,
@@ -63,7 +75,10 @@ export async function runGateExecution(
     return result;
   } finally {
     // A termination before attach leaves the durable identity available for resume.
-    if (settled && !(ctx.state.gateExecution?.handle.kind === "lan" && gateShutdown(ctx.signal))) {
+    if (
+      settled &&
+      !(["lan", "inplace"].includes(ctx.state.gateExecution?.handle.kind ?? "") && gateShutdown(ctx.signal))
+    ) {
       ctx.state.gateExecution = undefined;
       await ctx.save("gate-result");
     }

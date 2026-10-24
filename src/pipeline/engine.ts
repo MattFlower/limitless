@@ -501,7 +501,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 // ---------------------------------------------------------------------------
 // prepare: repo cache, worktree, gate detection, baseline
 
-function gateEvents(ctx: RunContext, label?: string): Required<Omit<GateHooks, "onLocalSetup">> {
+function gateEvents(ctx: RunContext, label?: string): Required<Omit<GateHooks, "onLocalSetup" | "env">> {
   return {
     priority: "finish",
     skipGateSlot: false,
@@ -584,9 +584,9 @@ async function prepare(ctx: RunContext): Promise<void> {
     const verification = ctx.state.verification;
     if (verification) {
       ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
-      await resetTo(wt.path, verification.baseSha);
+      if (ctx.state.gateExecution?.handle.kind !== "inplace") await resetTo(wt.path, verification.baseSha);
     }
-    await discardChanges(wt.path);
+    if (ctx.state.gateExecution?.handle.kind !== "inplace") await discardChanges(wt.path);
     // A round's gate, audit and review settings come from its original run's base commit: an
     // earlier round's edits to the PR must never weaken the next round's checks.
     const trustedSha = review ? review.owner.baseSha : (verification?.baseSha ?? baseSha);
@@ -617,7 +617,12 @@ async function prepare(ctx: RunContext): Promise<void> {
         } catch (error) {
           ctx.state.shadowLenses = { error: String((error as Error).message).slice(0, 500) };
         }
-      gates = trusted ? trusted.gates : detectGates(wt.path);
+      gates =
+        ctx.state.gateExecution?.handle.kind === "inplace" && ctx.state.gatesConfig
+          ? ctx.state.gatesConfig
+          : trusted
+            ? trusted.gates
+            : detectGates(wt.path);
       gates.retryFiles = readRetryFiles(repoConfig, (message) => ctx.log(message, "warn"));
       ctx.state.gatesConfig = gates;
       ctx.state.baselineScripts = trusted
@@ -632,9 +637,10 @@ async function prepare(ctx: RunContext): Promise<void> {
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
       const baselineSha = await headSha(wt.path);
+      const env = gateEnv();
       const runBaseline = gateSlotScope(
         commandScope(wt.path, async (): Promise<GateRun> => {
-          const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait });
+          const run = await runGateExecution(ctx, "prepare", "baseline", wt.path, gates, { onWait }, env);
           ctx.checkCancelled();
           // Retry before resetting, so a check sees the same build output as its first attempt.
           const retried = await retryBaselineFailures(
@@ -651,6 +657,7 @@ async function prepare(ctx: RunContext): Promise<void> {
                 wt.path,
                 retry,
                 { onWait, skipGateSlot: options?.skipGateSlot },
+                env,
               ),
             ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
           );
@@ -666,7 +673,6 @@ async function prepare(ctx: RunContext): Promise<void> {
       else {
         const executor =
           cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local";
-        const env = gateEnv();
         const bunVersion =
           executor === "lan"
             ? (ctx.deps.bunVersion ?? Bun.version)
@@ -711,8 +717,10 @@ async function prepare(ctx: RunContext): Promise<void> {
           : await singleFlight(JSON.stringify(key), ctx.signal, baseline, (r) => cacheableBaseline(r, gates));
       }
     } finally {
-      if (verification) await resetTo(wt.path, verification.headSha);
-      else await discardChanges(wt.path);
+      if (ctx.state.gateExecution?.handle.kind !== "inplace") {
+        if (verification) await resetTo(wt.path, verification.headSha);
+        else await discardChanges(wt.path);
+      }
     }
     const baseline = redactGateData(ctx.state.baseline);
     if (baseline) {
@@ -1519,7 +1527,8 @@ async function oneRound(
           let testScripts: Record<string, string> = {};
           let baseTimeout = false;
           try {
-            await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
+            if (ctx.state.gateExecution?.handle.kind !== "inplace")
+              await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
             testScripts = pickScripts(readPackageJson(cwd), gateScriptNames(gates));
             let after = await runGateExecution(ctx, "gates", "initial", cwd, gates, events);
             ctx.checkCancelled();
@@ -1539,7 +1548,8 @@ async function oneRound(
               );
               // The re-run starts from the committed tree too, not from what the first attempt left behind.
               localSetupReady = false;
-              await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
+              if (ctx.state.gateExecution?.handle.kind !== "inplace")
+                await checkoutCommitted(cwd, undefined, Boolean(ctx.state.implementerIssue));
               after = await runGateExecution(ctx, "gates", "timeout", cwd, gates, events);
               ctx.checkCancelled();
               after = {
@@ -1588,11 +1598,12 @@ async function oneRound(
             );
           } finally {
             // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
-            await discardChanges(cwd).catch((error: unknown) => {
-              if (ctx.state.implementerIssue && error instanceof CommandError)
-                throw new WorktreeCleanError(error.message, { cause: error });
-              throw error;
-            });
+            if (ctx.state.gateExecution?.handle.kind !== "inplace")
+              await discardChanges(cwd).catch((error: unknown) => {
+                if (ctx.state.implementerIssue && error instanceof CommandError)
+                  throw new WorktreeCleanError(error.message, { cause: error });
+                throw error;
+              });
           }
           for (const c of cmp.filter((c) => c.firstAttempt)) {
             ctx.event({
