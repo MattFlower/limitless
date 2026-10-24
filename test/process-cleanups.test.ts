@@ -67,8 +67,14 @@ async function waitFor(check: () => boolean) {
 
 async function processState(pid: number): Promise<string> {
   if (process.platform === "linux") {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "";
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "";
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH") return "Z";
+      throw error;
+    }
   }
   const { dlopen, ptr, FFIType } = await import("bun:ffi");
   const library = dlopen("/usr/lib/libSystem.B.dylib", {
