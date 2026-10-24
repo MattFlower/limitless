@@ -24,7 +24,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
   return {
     kind: inplace ? "inplace" : "lan",
     canResume: inplace
-      ? (h, env) => {
+      ? (h, env, daemonPort) => {
           const j = workers.job(h.id);
           const req = j ? (JSON.parse(j.request) as GateRequest) : undefined;
           return (
@@ -32,6 +32,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
             !!workers.releaseSha &&
             req?.releaseSha === workers.releaseSha &&
             (!env || isDeepStrictEqual(req?.env, env)) &&
+            (daemonPort === undefined || req?.daemonPort === daemonPort) &&
             (j.state === "done" ||
               (j.state === "queued"
                 ? !!workers.executor()

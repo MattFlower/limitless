@@ -51,7 +51,7 @@ export interface GateRequest {
   skipGateSlot?: boolean;
 }
 export type GateExecutor = Executor<GateRequest, GateRun> & {
-  canResume?: (handle: ExecutionHandle, env?: Record<string, string>) => boolean;
+  canResume?: (handle: ExecutionHandle, env?: Record<string, string>, daemonPort?: number) => boolean;
   freshCheckoutFor?: (repo: string) => boolean;
 };
 export type GateRunner = (gates: GateConfig, options?: GateRetryOptions) => Promise<GateRun>;

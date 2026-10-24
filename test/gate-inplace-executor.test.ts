@@ -757,44 +757,58 @@ test("executor opt-in defaults off and reload requires a restart", () => {
   expect(gateExecutorFor("local", undefined, [], true).kind).toBe("local");
 });
 
-test("a running SHA mismatch waits for the executor to acknowledge process shutdown", async () => {
-  const { f, context, req } = await setup();
-  await withExecutor(f, async (workers) => {
-    const first = context();
-    const controller = new AbortController();
-    const current = new RunContext(f.deps, first.run, first.repo, controller.signal);
-    const long = {
-      ...gates,
-      setup: [],
-      checks: [{ name: "long", run: "echo $$ > previous-pid; while [ ! -f stop-old ]; do sleep 0.05; done" }],
-    };
-    const pending = runGateExecution(current, "gates", "initial", req.cwd, long).catch((e) => e);
-    try {
-      await wait(() => existsSync(join(req.cwd, "previous-pid")), { timeoutMs: 10_000 });
-      const old = current.state.gateExecution?.handle.id ?? "";
-      const pid = Number(readFileSync(join(req.cwd, "previous-pid"), "utf8"));
-      controller.abort(new Error("shutdown"));
-      await pending;
-      writeFileSync(join(req.cwd, "new-file"), "head moved");
-      await sh(["git", "add", "new-file"], { cwd: req.cwd });
-      await sh(["git", "commit", "-qm", "new head"], { cwd: req.cwd });
-      let stoppedBeforeResult = false;
-      const result = await runGateExecution(context(), "gates", "initial", req.cwd, gates, {
-        onResult: () => {
-          stoppedBeforeResult = recoveryProcessStopped(pid);
-        },
-      });
-      expect(result.setupOk).toBe(true);
-      expect(workers.job(old)).toMatchObject({ state: "cancelled", stopped: 1 });
-      expect(stoppedBeforeResult).toBe(true);
-      expect(workers.jobs("in_place=1")).toHaveLength(2);
-    } finally {
-      writeFileSync(join(req.cwd, "stop-old"), "");
-      controller.abort(new Error("shutdown"));
-      await pending;
-    }
-  });
-});
+test.each(["SHA", "daemon port"])(
+  "a running %s mismatch waits for the executor to acknowledge process shutdown",
+  async (kind) => {
+    const { f, context, req } = await setup();
+    const port = f.cfg.port === 65535 ? 1 : f.cfg.port + 1;
+    await withExecutor(f, async (workers) => {
+      const first = context();
+      const controller = new AbortController();
+      const current = new RunContext(f.deps, first.run, first.repo, controller.signal);
+      const long = {
+        ...gates,
+        setup: [],
+        checks: [
+          { name: "long", run: "echo $$ > previous-pid; while [ ! -f stop-old ]; do sleep 0.05; done" },
+        ],
+      };
+      const pending = runGateExecution(current, "gates", "initial", req.cwd, long).catch((e) => e);
+      try {
+        await wait(() => existsSync(join(req.cwd, "previous-pid")), { timeoutMs: 10_000 });
+        const old = current.state.gateExecution?.handle.id ?? "";
+        const pid = Number(readFileSync(join(req.cwd, "previous-pid"), "utf8"));
+        controller.abort(new Error("shutdown"));
+        await pending;
+        if (kind === "SHA") {
+          writeFileSync(join(req.cwd, "new-file"), "head moved");
+          await sh(["git", "add", "new-file"], { cwd: req.cwd });
+          await sh(["git", "commit", "-qm", "new head"], { cwd: req.cwd });
+        }
+        const resumed =
+          kind === "SHA"
+            ? context()
+            : new RunContext({ ...f.deps, cfg: { ...f.deps.cfg, port } }, first.run, first.repo, signal);
+        let stoppedBeforeResult = false;
+        const result = await runGateExecution(resumed, "gates", "initial", req.cwd, gates, {
+          onResult: () => {
+            stoppedBeforeResult = recoveryProcessStopped(pid);
+          },
+        });
+        expect(result.setupOk).toBe(true);
+        expect(workers.job(old)).toMatchObject({ state: "cancelled", stopped: 1 });
+        expect(stoppedBeforeResult).toBe(true);
+        expect(workers.jobs("in_place=1")).toHaveLength(2);
+        const ports = readFileSync(join(fixture.home, "executor-ports"), "utf8").trim().split("\n");
+        expect(ports.at(-1)).toBe(String(kind === "SHA" ? f.cfg.port : port));
+      } finally {
+        writeFileSync(join(req.cwd, "stop-old"), "");
+        controller.abort(new Error("shutdown"));
+        await pending;
+      }
+    });
+  },
+);
 
 test("a daemon release change stops a running job before in-process fallback", async () => {
   const { f, context, req } = await setup();

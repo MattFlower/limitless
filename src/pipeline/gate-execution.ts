@@ -51,7 +51,7 @@ export async function resumeGateExecution(
     pending.round === round &&
     pending.purpose === purpose &&
     ["baseline", "initial", "rebase"].includes(purpose) &&
-    (pending.handle.kind !== "inplace" || executor?.canResume?.(pending.handle, env)) &&
+    (pending.handle.kind !== "inplace" || executor?.canResume?.(pending.handle, env, ctx.deps.cfg.port)) &&
     pending.sha === sha
       ? pending.handle
       : undefined;
