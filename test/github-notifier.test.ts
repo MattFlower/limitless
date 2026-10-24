@@ -377,7 +377,9 @@ test("a merge observed by GitHub supersedes needs_human runs closing the same is
   const run = store.getRun(id);
   const repo = run && store.getRepo(run.repoId);
   if (!repo) throw new Error("missing repo");
-  const older = store.createRun(repo, { repo: repo.slug, prompt: "First try. Closes #12" });
+  // Older releases could persist overlapping claims; reconciliation must still resolve them.
+  const older = store.createRun(repo, { repo: repo.slug, prompt: "First try." });
+  store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("First try. Closes #12", older.id);
   store.updateRun(older.id, { status: "needs_human", finishedAt: 1 });
   await reconcileMergedRuns(store, async (url) =>
     url === prUrl ? { url, state: "MERGED", mergedAt: "2026-09-27T20:00:00Z", mergedBy: null } : null,

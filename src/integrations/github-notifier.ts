@@ -239,7 +239,7 @@ export function startGitHubNotifier(
   client: GitHubPrClient = getGitHubPr,
   configDir?: string,
   roots: string[] = [],
-  cfg: Pick<Config, "repos"> = {},
+  cfg: Pick<Config, "repos"> & Partial<Pick<Config, "githubQueue">> = {},
 ): () => Promise<void> {
   const seen = new Set<string>();
   const abort = new AbortController();
@@ -289,6 +289,13 @@ export function startGitHubNotifier(
       (ref.kind !== "issue" && ref.kind !== "pull_request") ||
       typeof ref.repo !== "string" ||
       typeof ref.number !== "number"
+    )
+      return;
+    // Queue issue lifecycle messages wait for Q1b's App identity.
+    if (
+      ref.kind === "issue" &&
+      !run.githubWebhookVerified &&
+      cfg.githubQueue?.repos.some((repo) => repo.toLowerCase() === String(ref.repo).toLowerCase())
     )
       return;
     // A resolution follows the terminal comment already posted for needs_human or failed.

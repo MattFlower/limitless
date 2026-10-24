@@ -1067,7 +1067,9 @@ test.each([
     const round = roundRun(pr.run.id, url(1), head);
     const repo = store.getRepo(pr.run.repoId);
     if (!repo) throw new Error("missing repository");
-    const other = store.createRun(repo, { repo: SLUG, prompt: "other request\nCloses #42" });
+    // Persist an overlapping claim as an older release could, before transactional claiming.
+    const other = store.createRun(repo, { repo: SLUG, prompt: "other request" });
+    store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("other request\nCloses #42", other.id);
     const finishedAt = 123;
     store.updateRun(other.id, { status: "needs_human", prUrl: url(2) });
     const second = roundRun(pr.run.id, url(1), head);

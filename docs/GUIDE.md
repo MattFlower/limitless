@@ -202,6 +202,10 @@ discovers an owner.
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[github] poll` | `true` | Observe the factory's own PRs (CI, conflicts, reviews, comments, merges) with one GraphQL query per repository and write changes to the feed. `false` restores per-run `gh pr view` merge checks. Access problems show in `limitless doctor`. |
 | `[github] poll_seconds` | `45` | Polling interval (minimum 15); repositories with a delivered, unmerged PR poll every 15 s |
+| `[github.queue] repos` | `[]` (queue disabled) | Poll approved issues in these owner/name repositories. Enable only after Q0's token isolation probe; see [issue contract](ISSUES.md). Restart required for queue settings. |
+| `[github.queue] trusted` | Configured GitHub owner, or `[]` | Logins trusted to author, edit and approve queued issues; case-insensitive. Empty disables polling. |
+| `[github.queue] max_issue_runs` | `1` | Positive integer cap on active issue-sourced runs; priority 0 may exceed it by one, within the overall run limit. |
+| `[github.queue] poll_seconds` | `180` | Positive polling interval, minimum 15 seconds; low GraphQL budget defers until reset. |
 | `[github] repos` | `[]` | Setup repositories, e.g. `["<owner>/<repo>"]`; doctor reads the first to check access and SSO. This is not a run allowlist. |
 | `[github] merge` | `"auto"` when absent; init chooses `"pr"` | Default for newly registered GitHub repos: `"auto"`, `"pr"`, or `"none"`. Existing repo rows stay unchanged; repository `.limitless.toml` policy still wins. |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
