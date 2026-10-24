@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findingLines, reviewEscapeCases, validateEscapeCase } from "../scripts/review-escape-cases.ts";
@@ -47,7 +56,14 @@ const seed = seeded(async (root) => {
   return { base, head, fix, middle, head2, fix2, unrelatedFix, late };
 });
 let root: string, store: Store, commits: Awaited<ReturnType<typeof seed>>["value"];
-let options: { db: string; repos: string; cases: string; proposals: string; confirm: string };
+let options: {
+  db: string;
+  repos: string;
+  cases: string;
+  proposals: string;
+  confirm: string;
+  repositoryRoots: string[];
+};
 let originalConfig: string | undefined;
 const prompt = "  Original request\nexactly as received.\n\n";
 const defect: ReviewFinding = {
@@ -106,7 +122,18 @@ beforeEach(async () => {
     cases: join(root, "cases.json"),
     proposals: join(root, "proposals.json"),
     confirm: join(root, "confirmed.json"),
+    repositoryRoots: [join(root, "work")],
   };
+  // Run the unchanged CLI with its default root pointing at isolated Git metadata.
+  const work = join(root, "work");
+  mkdirSync(join(work, "scripts"));
+  copyFileSync(
+    join(import.meta.dir, "../scripts/review-escape-cases.ts"),
+    join(work, "scripts/review-escape-cases.ts"),
+  );
+  copyFileSync(join(import.meta.dir, "../biome.json"), join(work, "biome.json"));
+  symlinkSync(join(import.meta.dir, "../src"), join(work, "src"));
+  symlinkSync(join(import.meta.dir, "../node_modules"), join(work, "node_modules"));
   originalConfig = process.env.LIMITLESS_CONFIG_DIR;
   process.env.LIMITLESS_CONFIG_DIR = join(root, "private-config");
   mkdirSync(process.env.LIMITLESS_CONFIG_DIR);
@@ -132,6 +159,18 @@ afterEach(() => {
 });
 const worktrees = () =>
   sh(["git", "worktree", "list", "--porcelain"], { cwd: join(options.repos, "test__repo.git") });
+
+test("supplied roots allow external private config and reject config inside the fixture repository", async () => {
+  row(10);
+  expect((await reviewEscapeCases(options)).cases).toHaveLength(1);
+  process.env.LIMITLESS_CONFIG_DIR = join(root, "work/private-config");
+  mkdirSync(process.env.LIMITLESS_CONFIG_DIR);
+  writeFileSync(join(process.env.LIMITLESS_CONFIG_DIR, "private-strings.txt"), "");
+  await expect(reviewEscapeCases(options)).rejects.toThrow("Private config is inside repository");
+  const result = await cli();
+  expect(result.exitCode).toBe(1);
+  expect(result.stderr).toContain("Private config is inside repository");
+});
 
 test("proposals pin each round to its historical main merge base and preserve the exact request", async () => {
   row(10);
@@ -212,8 +251,8 @@ test("write uses confirmed blocking labels only, preserves the prefix, formats, 
   expect(second.validation[0]?.status).toBe("duplicate");
   expect(readFileSync(options.cases, "utf8")).toBe(bytes);
   const biome = await sh(
-    ["bunx", "--no-install", "biome", "check", "--config-path", process.cwd(), options.cases],
-    { cwd: process.cwd(), allowFail: true },
+    ["bunx", "--no-install", "biome", "check", "--config-path", join(root, "work"), options.cases],
+    { cwd: join(root, "work"), allowFail: true },
   );
   expect(biome.stderr + biome.stdout).not.toContain("formatting");
   expect(biome.exitCode).toBe(0);
@@ -355,7 +394,7 @@ async function cli(args: string[] = [], preload = join(import.meta.dir, "git-pre
       options.proposals,
       ...args,
     ],
-    { cwd: process.cwd(), allowFail: true },
+    { cwd: join(root, "work"), allowFail: true },
   );
 }
 
@@ -494,7 +533,11 @@ test("default cache/proposal paths and non-defect proposals preserve findings fo
   const cache = join(root, "repos/test__repo.git");
   await sh(["git", "update-ref", "refs/remotes/origin/main", commits.late], { cwd: cache });
   await sh(["git", "update-ref", "refs/heads/main", commits.base], { cwd: cache });
-  const result = await reviewEscapeCases({ db: options.db, cases: options.cases });
+  const result = await reviewEscapeCases({
+    db: options.db,
+    cases: options.cases,
+    repositoryRoots: options.repositoryRoots,
+  });
   expect(result.cases).toHaveLength(1);
   expect(result.cases[0]?.base).toBe(commits.middle);
   const proposals = read(join(root, "review-escape-proposals.json"));

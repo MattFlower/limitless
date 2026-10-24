@@ -52,6 +52,7 @@ export type EscapeOptions = {
   confirm?: string;
   since?: string;
   write?: boolean;
+  repositoryRoots?: string[];
 };
 const readJSON = (path: string): unknown => JSON.parse(readFileSync(path, "utf8"));
 const findingText = (f: Finding) => `${f.severity} ${f.file ?? ""}:${f.line ?? 0}: ${f.title}\n${f.detail}`;
@@ -156,7 +157,10 @@ export async function reviewEscapeCases(options: EscapeOptions) {
     file = readJSON(casePath) as z.infer<typeof ReviewCaseFileSchema>;
   ReviewCaseFileSchema.parse(file);
   const labels = options.confirm ? confirmation.parse(readJSON(options.confirm)) : {};
-  const privateStrings = loadPrivateStrings(undefined, [resolve(import.meta.dir, "..")]);
+  const privateStrings = loadPrivateStrings(
+    undefined,
+    options.repositoryRoots ?? [resolve(import.meta.dir, "..")],
+  );
   const privacy = (value: unknown) => {
     for (const text of strings(value)) {
       const hit = privateMatches(text, privateStrings)[0];
