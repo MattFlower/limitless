@@ -14,7 +14,7 @@ import { formatGateOutput } from "../gates/failures.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
-import { confinementFailed, type GateResult, retryFailures } from "../gates/run.ts";
+import { confinementFailed, type GateResult, retryFailures, targetedRetrySkipReason } from "../gates/run.ts";
 import { gateSlotScope } from "../gates/slots.ts";
 import { cacheGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, prepareMerge } from "../git/merge.ts";
@@ -855,9 +855,12 @@ export class LandQueue {
         const selected = run.setupOk
           ? run.checks.flatMap((original) => {
               const check = findGateCounterpart(original, run.checks, gates.checks);
-              return check?.run === original.command ? [{ check, original }] : [];
+              return check && redactGateOutput(check.run) === redactGateOutput(original.command)
+                ? [{ check, original }]
+                : [];
             })
           : [];
+        const skipped = new Map<GateResult, string>();
         const retries = await retryFailures(
           selected,
           cwd,
@@ -875,6 +878,7 @@ export class LandQueue {
           },
           true,
           gateExecutor?.freshCheckoutFor?.(entry.repo),
+          (original, reason) => skipped.set(original, reason),
         );
         signal.throwIfAborted();
         const failed = [...run.setup, ...run.checks].filter((c) => {
@@ -882,6 +886,17 @@ export class LandQueue {
           const result = retries.get(c) ?? c;
           return !result.ok || result.timedOut || confinementFailed(result);
         });
+        for (const c of failed) {
+          if (retries.has(c) && !skipped.has(c)) continue;
+          const reason = run.setup.includes(c)
+            ? `setup failures are not retried; ${targetedRetrySkipReason(c, gates, cwd) ?? "setup failed"}`
+            : !selected.some((s) => s.original === c)
+              ? "check does not match base configuration"
+              : (skipped.get(c) ?? "targeted retry returned no check result");
+          const message = redactGateOutput(`Land ${entry.id} ${c.name}: no targeted retry: ${reason}`);
+          appendFileSync(log, `${message}\n`);
+          if (entry.runId) this.store.addEvent({ runId: entry.runId, type: "gate", level: "warn", message });
+        }
         if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
         for (const check of run.checks) {
           if (check.docsOnly?.mode !== "targeted") continue;

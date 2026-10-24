@@ -39,7 +39,7 @@ describe("JUnit failure files", () => {
         failedFileTimes: { "test/a.test.ts": 2 },
         ...(errors !== undefined
           ? { attributedCounts: { tests: 1, failures: 1 - errors, errors, skipped: 0 } }
-          : {}),
+          : { failureAttributionReason: `1 unattributed ${_kind === "suite errors" ? "error" : "failure"}` }),
       });
     } finally {
       f.close();
@@ -62,6 +62,7 @@ describe("JUnit failure files", () => {
       expect(parseJUnit(`<testsuites>${suite()}${suite()}</testsuites>`, f.cwd)).toEqual({
         failedFiles: ["test/a.test.ts"],
         failedFileTimes: { "test/a.test.ts": 4 },
+        failureAttributionReason: "1 unattributed failure",
       });
       expect(parseJUnit(suite("test/a.test.ts", 'failures="1"'), f.cwd)?.failedFileTimes).toEqual({});
     } finally {
@@ -476,27 +477,87 @@ test("incomplete land evidence preserves factory targeted and full retries", asy
   }
 });
 
-test("gate capture retains runner errors before the diagnostic tail", async () => {
-  const f = fixture();
-  try {
-    writeFileSync(
-      join(f.cwd, "runner.ts"),
-      `await Bun.write(process.env.LIMITLESS_GATE_REPORT, ${JSON.stringify(attributedSuite)});
-console.error("# Unhandled error between tests");
+test.each(["runner error count", "JUnit error count"])(
+  "gate capture retains %s before the diagnostic tail",
+  async (kind) => {
+    const f = fixture();
+    try {
+      writeFileSync(
+        join(f.cwd, "runner.ts"),
+        `await Bun.write(process.env.LIMITLESS_GATE_REPORT, ${JSON.stringify(kind === "JUnit error count" ? `<testsuites errors="1">${attributedSuite}</testsuites>` : attributedSuite)});
+console.error(${JSON.stringify(kind === "JUnit error count" ? "# Unhandled error between tests" : "1 error")});
 console.error("noise\\n".repeat(2000));
 console.error(${JSON.stringify(runnerSummary)});
 process.exit(1);`,
+      );
+      const run = await confinementScope.run(fakeConfinement, () =>
+        runGates(
+          f.cwd,
+          { ...config, checks: [{ name: "test", run: `'${process.execPath}' ./runner.ts` }] },
+          signal,
+        ),
+      );
+      expect(run.checks[0]?.output).not.toContain("1 error");
+      expect(run.checks[0]?.output).not.toContain("Unhandled error");
+      expect(run.checks[0]?.failedFiles).toEqual(["test/a.test.ts"]);
+      expect(run.checks[0]?.failureAttributionComplete).toBe(false);
+      expect(run.checks[0]?.failureAttributionReason).toContain("1 unattributed error");
+      if (kind === "JUnit error count")
+        expect(run.checks[0]?.failureAttributionReason).toContain("runner reported an error");
+    } finally {
+      f.close();
+    }
+  },
+);
+
+test("a completed attributed test timeout retries once with a slot and keeps its evidence", async () => {
+  const f = fixture();
+  try {
+    const xml = suite(
+      "test/a.test.ts",
+      'tests="1" failures="1" time="62"',
+      '<testcase><failure type="TimeoutError" message="test timed out"/></testcase>',
     );
+    writeFileSync(
+      join(f.cwd, "runner.ts"),
+      `await Bun.write(process.env.LIMITLESS_GATE_REPORT, ${JSON.stringify(xml)});
+console.error(${JSON.stringify(`(fail) slow test [62000ms]\n  ^ this test timed out after 60000ms.\n${runnerSummary}`)});
+process.exit(1);`,
+    );
+    const check = { ...testCheck, run: `'${process.execPath}' ./runner.ts` };
     const run = await confinementScope.run(fakeConfinement, () =>
-      runGates(
-        f.cwd,
-        { ...config, checks: [{ name: "test", run: `'${process.execPath}' ./runner.ts` }] },
-        signal,
-      ),
+      runGates(f.cwd, { ...config, checks: [check] }, signal),
     );
-    expect(run.checks[0]?.output).not.toContain("Unhandled error");
-    expect(run.checks[0]?.failedFiles).toEqual(["test/a.test.ts"]);
-    expect(run.checks[0]?.failureAttributionComplete).toBe(false);
+    const original = run.checks[0];
+    if (!original) throw new Error("Missing test result");
+    expect(original).toMatchObject({
+      exitCode: 1,
+      failureAttributionComplete: true,
+      failedFiles: ["test/a.test.ts"],
+      failedFileTimes: { "test/a.test.ts": 62 },
+    });
+    expect(original.timedOut).toBeUndefined();
+    const calls: string[] = [];
+    const results = await retryFailures(
+      [{ check, original }],
+      f.cwd,
+      config,
+      signal,
+      undefined,
+      async (cfg, options) => {
+        expect(options).toEqual({ targeted: true, skipGateSlot: false });
+        calls.push(...cfg.checks.map((c) => c.run));
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+    );
+    expect(calls).toEqual(["bun test './test/a.test.ts'"]);
+    expect(results.get(original)).toMatchObject({
+      ok: true,
+      firstAttempt: original,
+      targetedRetry: { ok: true },
+    });
+    expect(results.get(original)?.firstAttempt?.output).toContain("this test timed out");
   } finally {
     f.close();
   }
