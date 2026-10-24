@@ -307,7 +307,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
 function claudeEditorRoots(spec: AgentSpec, scratch: string) {
   const roots = writeRoots(spec.cwd, scratch, false, spec.denyRead);
   if (subscriptionToken(spec)) return roots;
-  // Without daemon-supplied auth (including LAN workers), the CLI still needs its Keychain login.
+  // Without locally configured subscription auth, the CLI still needs its Keychain login.
   // Native tools keep the full list; overlapping credential denies win here.
   const keychains = new Set(roots.keychainOnlyReadPaths);
   return { ...roots, denyRead: roots.denyRead?.filter((path) => !keychains.has(path)) };
