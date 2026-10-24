@@ -59,13 +59,14 @@ import {
   gradeImplement,
   implementRetryPrompt,
   nextImplementTarget,
-  prepareImplement,
   RETRY_FEEDBACK_GRADE,
 } from "./implement.ts";
 import {
   gradeCase,
   prepareCase,
   prepareEvalGates,
+  prepareImplement,
+  prepareImplementCase,
   schemaFor,
   seedContent,
   storedSchemaFor,
@@ -692,13 +693,27 @@ export class EvalRunner {
         "defects" in item ? seedContent(item, this.casePath ?? defaultCasePath(run.role)) : undefined;
       // Snapshot cases replace the pinned history, so every base-relative step uses its base.
       let effective = item;
-      if (!("gold" in item && "prompt" in item)) {
+      let implementation: Awaited<ReturnType<typeof prepareImplement>> | undefined;
+      if ("hidden" in item) {
+        preparationStarted = Date.now();
+        const candidate = await prepareImplementCase(
+          item,
+          cwd,
+          signal,
+          (base, snapshot) =>
+            createEvalWorktree(cfg.paths, store, item.repo, base, base, cwd, signal, labels, snapshot),
+          (effective, dir) => implementFor(effective, dir),
+        );
+        cleanup = candidate.cleanup;
+        effective = candidate.effective;
+        implementation = candidate.prepared;
+      } else if (!("gold" in item && "prompt" in item)) {
         const checkout = await createEvalWorktree(
           cfg.paths,
           store,
           item.repo,
           item.base,
-          "hidden" in item ? item.base : item.head,
+          item.head,
           cwd,
           signal,
           labels,
@@ -707,8 +722,7 @@ export class EvalRunner {
         cleanup = checkout;
         if (item.snapshot) effective = { ...item, base: checkout.base };
       }
-      preparationStarted = Date.now();
-      const implementation = "hidden" in effective ? await implementFor(effective, cwd) : undefined;
+      preparationStarted ??= Date.now();
       const prepared =
         "hidden" in effective
           ? implementation

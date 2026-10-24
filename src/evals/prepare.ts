@@ -6,13 +6,13 @@ import { auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { runGates } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
-import { diffSince, readFileAt } from "../git/repos.ts";
+import { diffSince, discardChanges, readFileAt } from "../git/repos.ts";
 import { readingTimeout } from "../pipeline/engine.ts";
-import { triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
+import { implementPrompt, triagePrompt, verifyPrompt } from "../pipeline/prompts.ts";
 import { type ReviewInput, reviewRequest } from "../pipeline/review.ts";
 import { ReviewSchema, StoredReviewSchema, TriageSchema, VerifySchema } from "../pipeline/schemas.ts";
 import { triageDecisions } from "../pipeline/triage-decisions.ts";
-import { sh } from "../util/proc.ts";
+import { agentEnv, sh } from "../util/proc.ts";
 import type { EvalCase, ImplementCase, ReviewCase } from "./cases.ts";
 import { gradeReview } from "./graders/review.ts";
 import { gradeTriage } from "./graders/triage.ts";
@@ -72,6 +72,57 @@ export async function prepareEvalGates(
   });
   signal.throwIfAborted();
   return { gates, baseline };
+}
+
+export async function prepareImplement(item: ImplementCase, cwd: string, signal: AbortSignal) {
+  const { gates, baseline } = await prepareEvalGates(item, cwd, signal);
+  if (!baseline.setupOk) throw new Error("baseline gate setup failed");
+  if (baseline.checks.some((check) => check.output.startsWith("[timed out]")))
+    throw new Error("baseline gate check timed out");
+  // A check already failing on the snapshot can never block (still_failing), so gates would
+  // stop grading anything; a repository whose checks read evals/ can't use snapshot mode.
+  const failing = item.snapshot ? baseline.checks.find((check) => !check.ok) : undefined;
+  if (failing)
+    throw new Error(
+      `snapshot mode removed evals/ and baseline check ${failing.name} fails; this case can't use snapshot mode`,
+    );
+  // Baseline gates already ran repository code that may have configured filters in .git/config
+  // and .gitattributes, so this checkout is no more trustworthy than a candidate's.
+  await discardChanges(cwd, agentEnv());
+  return {
+    gates,
+    baseline,
+    timeoutMs: 60 * 60_000,
+    prompt: implementPrompt({
+      prompt: item.prompt,
+      spec: item.spec,
+      gates,
+      baseline,
+      baseSha: item.base,
+      round: 0,
+      feedback: null,
+      hasHoldout: false,
+    }),
+  };
+}
+
+/** Prepare only the candidate base; never transfer the reference solution into its history. */
+export async function prepareImplementCase(
+  item: ImplementCase,
+  cwd: string,
+  signal: AbortSignal,
+  checkout: (base: string, snapshot: boolean) => Promise<(() => Promise<void>) & { base: string }>,
+  prepare = prepareImplement,
+) {
+  const cleanup = await checkout(item.base, item.snapshot === true);
+  try {
+    const effective = item.snapshot ? { ...item, base: cleanup.base } : item;
+    const prepared = await prepare(effective, cwd, signal);
+    return { effective, prepared, cleanup };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
 }
 
 export async function prepareCase(
