@@ -2,11 +2,16 @@ import { expect, spyOn } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { WorkerStore } from "../src/db/workers.ts";
 import { type GateExecutor, type GateRequest, localExecutor } from "../src/gates/executor.ts";
+import { lanExecutor } from "../src/gates/lan.ts";
 import type { GateComparison } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { applyGateEvidence } from "../src/pipeline/gate-evidence.ts";
+import type { Verify } from "../src/pipeline/schemas.ts";
 import { agentEnv, registerCredential, sh } from "../src/util/proc.ts";
-import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { GateRunSchema } from "../src/workers/protocol.ts";
+import { approve, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 import { test } from "./read-policy-support.ts";
 
 const fixture: { home: string; repoDir: string; factory: Factory | null } = {
@@ -16,10 +21,12 @@ const fixture: { home: string; repoDir: string; factory: Factory | null } = {
 };
 const { start } = pipelineSetup(fixture);
 
-async function configure(onlyTest = false, noTest = false, gitCheck = false) {
-  const testRun = gitCheck
-    ? 'git ls-files --error-unmatch greeting.txt && git describe --tags && git rev-parse HEAD^{tree} && test -z "$(git status --porcelain)" && echo trusted-test'
-    : "echo trusted-test";
+async function configure(onlyTest = false, noTest = false, gitCheck = false, snapshotCommand = "") {
+  const testRun = snapshotCommand
+    ? `if test -d .git; then ${snapshotCommand}; fi; echo trusted-test`
+    : gitCheck
+      ? 'git ls-files --error-unmatch greeting.txt && git describe --tags && git rev-parse HEAD^{tree} && test -z "$(git status --porcelain)" && echo trusted-test'
+      : "echo trusted-test";
   writeFileSync(
     join(fixture.repoDir, ".limitless.toml"),
     `[gates]
@@ -34,6 +41,15 @@ agent_full_suite = "gate"
   await sh(["git", "commit", "-qm", "trusted gate policy"], { cwd: fixture.repoDir });
   if (gitCheck) await sh(["git", "tag", "snapshot-base"], { cwd: fixture.repoDir });
 }
+
+const commit = "git -c user.name=Test -c user.email=test@example.com commit -qm gate";
+const mutations: Record<string, string> = {
+  commit: `echo changed > greeting.txt && ${commit} -a`,
+  "empty-commit": `${commit} --allow-empty`,
+  reset: "git reset --hard HEAD^",
+  unreadable: "rm .git/HEAD",
+  "tree-unreadable": "git hash-object -w --stdin < greeting.txt > .git/HEAD",
+};
 
 test.each([
   "same",
@@ -53,6 +69,14 @@ test.each([
   "lan",
   "lan-changed",
   "lan-fallback",
+  "lan-job-fallback",
+  "lan-job-fallback-commit",
+  "uncommitted",
+  "lan-missing",
+  "lan-commit-mismatch",
+  "lan-tree-mismatch",
+  "lan-sha-only",
+  ...Object.keys(mutations),
   "repeat",
   "repeat-lan",
   "no-test",
@@ -61,12 +85,26 @@ test.each([
   "confinement",
   "setup-fail",
 ])("implement snapshot and round gate reuse: %s", async (scenario) => {
-  await configure(scenario === "only-test", scenario === "no-test", scenario === "same");
+  await configure(
+    scenario === "only-test",
+    scenario === "no-test",
+    scenario === "same",
+    scenario === "uncommitted"
+      ? "echo generated > greeting.txt"
+      : scenario === "lan-job-fallback-commit"
+        ? mutations.commit
+        : mutations[scenario],
+  );
+  const unconfirmed =
+    scenario in mutations ||
+    scenario === "lan-job-fallback-commit" ||
+    ["lan-missing", "lan-commit-mismatch", "lan-tree-mismatch", "lan-sha-only"].includes(scenario);
   const requests: GateRequest[] = [];
   let tree = "",
     worktree = "",
     snapshotDir = "";
   const executor = localExecutor();
+  const fallbacks = new Map<string, GateExecutor>();
   let executorKind: GateExecutor["kind"] =
     scenario.includes("lan") || scenario === "executor-route" ? "lan" : "local";
   let remote = scenario !== "executor-route";
@@ -106,16 +144,44 @@ test.each([
           await sh(["git", "update-ref", "refs/heads/snapshot-only", "HEAD"], { cwd: request.cwd });
         }
       }
-      const handle = await executor.start(request, signal);
+      const failedWorker =
+        scenario.startsWith("lan-job-fallback") && worktree && request.priority === "start"
+          ? new WorkerStore(f.store, "test-build", { tick: 1 })
+          : null;
+      const actual = failedWorker ? lanExecutor(failedWorker, [request.repo]) : executor;
+      const handle = await actual.start(request, signal);
+      if (failedWorker) {
+        fallbacks.set(handle.id, actual);
+        failedWorker.fail(handle.id, "fixture worker unavailable");
+        failedWorker.fail(handle.id, "fixture worker unavailable");
+      }
       if (worktree && request.priority === "start") executions.push(handle.id);
       return { ...handle, kind: scenario === "lan-fallback" ? "local" : executorKind };
     },
     attach(handle, signal, request, hooks) {
-      const execution = executor.attach(handle, signal, request, hooks);
+      const execution = (fallbacks.get(handle.id) ?? executor).attach(handle, signal, request, hooks);
       if (!worktree || request?.priority !== "start") return execution;
       return {
         ...execution,
-        result: execution.result.then((run) => {
+        result: execution.result.then(async (run) => {
+          if (executorKind === "lan" && !fallbacks.has(handle.id)) {
+            // Simulate worker-reported post-execution state, independently of the request SHA.
+            const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: request.cwd })).stdout.trim();
+            run = GateRunSchema.parse({
+              ...run,
+              ...(scenario === "lan-missing"
+                ? {}
+                : { sha: scenario === "lan-commit-mismatch" ? "0".repeat(40) : head }),
+              ...(["lan-missing", "lan-sha-only"].includes(scenario)
+                ? {}
+                : {
+                    treeHash:
+                      scenario === "lan-tree-mismatch"
+                        ? "0".repeat(40)
+                        : (await sh(["git", "rev-parse", "HEAD^{tree}"], { cwd: request.cwd })).stdout.trim(),
+                  }),
+            });
+          }
           if (scenario === "setup-fail")
             return {
               setupOk: false,
@@ -148,6 +214,7 @@ test.each([
     },
   };
   let lookup: ReturnType<typeof spyOn> | undefined;
+  let runId = "";
   const f = start(
     async (agent) => {
       const role = roleOf(agent);
@@ -183,6 +250,41 @@ test.each([
           if (scenario === "same") {
             expect(result.stdout).toContain(tree);
             expect(result.stdout).toContain("snapshot-base-1-g");
+          }
+          if (unconfirmed) {
+            expect(result.stdout).toContain("Result is not reusable because");
+            expect(result.stdout).toContain(
+              scenario.includes("unreadable") || ["lan-missing", "lan-sha-only"].includes(scenario)
+                ? "provenance could not be confirmed"
+                : "snapshot changed during the gate",
+            );
+            expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual([]);
+            const state = f.store.getRunState<RunState>(runId);
+            const blocked: Verify = {
+              overall: "fail",
+              notes: "",
+              criteria: [
+                {
+                  id: "AC-1",
+                  status: "blocked",
+                  blockedReason: "sandbox",
+                  evidence: result.stdout,
+                  publicSummary: "",
+                },
+              ],
+            };
+            const substituted = applyGateEvidence(
+              blocked,
+              {
+                ...spec,
+                acceptance_criteria: [{ id: "AC-1", criterion: "tests pass", how_to_verify: "bun test" }],
+              },
+              { scenarios: [] },
+              beforeHead.trim(),
+              state?.gateEvidence,
+            );
+            expect(substituted.criteria[0]?.status).toBe("blocked");
+            expect(substituted.criteria[0]?.gateEvidence).toBeUndefined();
           }
         }
         if (scenario.startsWith("repeat")) {
@@ -272,9 +374,19 @@ test.each([
   );
   try {
     const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell.txt" });
+    runId = run.id;
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(sessionComplete, JSON.stringify(f.store.listInvocations(run.id).map((i) => i.error))).toBe(true);
-    const reuse = ["same", "only-test", "lan", "lan-fallback", "repeat", "repeat-lan"].includes(scenario);
+    const reuse = [
+      "same",
+      "only-test",
+      "lan",
+      "lan-fallback",
+      "lan-job-fallback",
+      "uncommitted",
+      "repeat",
+      "repeat-lan",
+    ].includes(scenario);
     const finishing = requests.filter((r) => r.priority === "finish");
     expect(finishing.some((r) => r.checks?.includes("test"))).toBe(!reuse && scenario !== "no-test");
     if (scenario === "only-test") expect(finishing).toEqual([]);
@@ -303,6 +415,7 @@ test.each([
     if (["corrupt", "invalid", "lookup"].includes(scenario))
       expect(events.some((e) => e.message.includes("Factory gate lookup failed"))).toBe(true);
     if (
+      unconfirmed ||
       ["no-build", "print-only", "no-test", "timeout", "cancelled", "confinement", "setup-fail"].includes(
         scenario,
       )
@@ -315,17 +428,29 @@ test.each([
 });
 
 test.each([
-  { flaky: false, kind: "local" as const },
-  { flaky: true, kind: "local" as const },
-  { flaky: false, kind: "lan" as const },
-  { flaky: true, kind: "lan" as const },
-])("reused failure and retry classification survive (%j)", async ({ flaky, kind }) => {
+  { flaky: false, kind: "local" as const, invalid: "" },
+  { flaky: true, kind: "local" as const, invalid: "" },
+  { flaky: false, kind: "lan" as const, invalid: "" },
+  { flaky: true, kind: "lan" as const, invalid: "" },
+  { flaky: true, kind: "local" as const, invalid: "retry-commit" },
+  { flaky: false, kind: "local" as const, invalid: "retry-unreadable" },
+  { flaky: true, kind: "lan" as const, invalid: "first-missing" },
+  { flaky: true, kind: "lan" as const, invalid: "retry-missing" },
+  { flaky: true, kind: "lan" as const, invalid: "retry-mismatch" },
+])("failure, retry classification and provenance survive (%j)", async ({ flaky, kind, invalid }) => {
   await configure();
   const configPath = join(fixture.repoDir, ".limitless.toml");
   writeFileSync(
     configPath,
     readFileSync(configPath, "utf8")
-      .replace("[gates]", '[gates]\nretry_files = "echo retry {files}"')
+      .replace(
+        "[gates]",
+        `[gates]\nretry_files = ${JSON.stringify(
+          kind === "local" && invalid
+            ? `if test -d .git; then ${invalid === "retry-commit" ? `${commit} --allow-empty` : "rm .git/HEAD"}; fi; echo retry {files}`
+            : "echo retry {files}",
+        )}`,
+      )
       .replace('setup = ["echo setup"]', `setup = ['touch "$HOME/setup-marker"']`)
       .replace('run="echo trusted-test"', `run='test -e "$HOME/setup-marker" && echo trusted-test'`),
   );
@@ -360,12 +485,22 @@ test.each([
       if (!worktree || req?.priority !== "start") return execution;
       calls++;
       const failed = !flaky || calls === 1;
+      const badReport =
+        invalid === "first-missing" ? calls === 1 : invalid.startsWith("retry-") && calls === 2;
       return {
         ...execution,
-        result: execution.result.then((run) => {
+        result: execution.result.then(async (run) => {
           expect(run.checks.every((check) => check.ok)).toBe(true);
           return {
             ...run,
+            ...(kind === "lan" && !(badReport && invalid.includes("missing"))
+              ? {
+                  sha: badReport
+                    ? "0".repeat(40)
+                    : (await sh(["git", "rev-parse", "HEAD"], { cwd: req.cwd })).stdout.trim(),
+                  treeHash: (await sh(["git", "rev-parse", "HEAD^{tree}"], { cwd: req.cwd })).stdout.trim(),
+                }
+              : {}),
             checks: run.checks.map((r) => ({
               ...r,
               ok: !failed,
@@ -403,7 +538,12 @@ test.each([
       expect(result.stdout).not.toContain(secret);
       expect(result.stdout).toContain(flaky ? "pass on retry" : "failure excerpt [redacted]");
       const stored = f.store.db.query("SELECT * FROM agent_gate_executions").all();
-      expect(stored).toHaveLength(1);
+      expect(stored).toHaveLength(invalid ? 0 : 1);
+      if (invalid) {
+        expect(result.stdout).toContain("Result is not reusable because");
+        sessionComplete = true;
+        return { text: "implementation complete" };
+      }
       const repeated = await sh([join(wrapper, "bun"), "test"], {
         cwd: worktree,
         env: agentEnv(),
@@ -426,6 +566,14 @@ test.each([
   expect(sessionComplete).toBe(true);
   const checks: GateComparison[] = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "null");
   const testCheck = checks.find((c) => c.name === "test");
+  if (invalid) {
+    expect(testCheck?.result.reused).toBeUndefined();
+    expect(testCheck?.result.ok).toBe(true);
+    expect(roundZeroTests).toBe(1);
+    expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual([]);
+    expect(calls).toBe(flaky ? 3 : 2);
+    return;
+  }
   expect(testCheck).toMatchObject({
     verdict: flaky ? "flaky" : "regressed",
     blocking: !flaky,

@@ -45,6 +45,8 @@ export interface GateResult {
 export interface GateRun {
   /** Actual baseline checkout commit; absent in legacy records. */
   sha?: string;
+  /** Post-execution committed tree, reported with sha by LAN execution or its local fallback. */
+  treeHash?: string;
   setupOk: boolean;
   setup: GateResult[];
   checks: GateResult[];

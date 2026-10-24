@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import type { AgentGateKey } from "../db/store.ts";
 import { baselineCacheKey, gateBunVersion, gateEnvDigest, lockfileHash } from "../gates/cache.ts";
-import { executeGate } from "../gates/executor.ts";
+import { executeGate, gateProvenance } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { compareGates, confinementFailed, type GateResult, gateEnv, retryRegressions } from "../gates/run.ts";
@@ -165,9 +165,16 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
           await worktreeGit(["git", "rev-parse", "HEAD"], { cwd: checkout, signal })
         ).stdout.trim();
         let executionId = "";
+        let nonReusable: string | undefined;
+        const confirm = (provenance: Awaited<ReturnType<typeof gateProvenance>>) => {
+          if (!provenance) nonReusable ||= "snapshot provenance could not be confirmed";
+          else if (provenance.sha !== head || provenance.treeHash !== tree)
+            nonReusable ||= "the snapshot changed during the gate";
+        };
         const gates = { ...config, checks: config.checks.filter((c) => c.name === "test") };
-        const run = (retry = gates, options?: { skipGateSlot?: boolean }) =>
-          executeGate(
+        const run = async (retry = gates, options?: { skipGateSlot?: boolean }) => {
+          let remoteExecution = false;
+          const result = await executeGate(
             {
               runId: ctx.run.id,
               repo: ctx.repo.slug,
@@ -185,8 +192,16 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
             undefined,
             async (handle) => {
               executionId ||= handle.id;
+              remoteExecution = handle.kind === "lan";
             },
           );
+          // Every remote attempt must attest independently; a later retry cannot repair provenance.
+          if (remoteExecution)
+            confirm(
+              result.sha && result.treeHash ? { sha: result.sha, treeHash: result.treeHash } : undefined,
+            );
+          return result;
+        };
         const after = await run();
         signal.throwIfAborted();
         const changed = (
@@ -219,14 +234,18 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
         const comparison = comparisons.find((c) => c.name === "test");
         const result = after.setupOk ? comparison?.result : after.setup.find((r) => !r.ok);
         if (!result) throw new Error("Factory gate returned no test result");
-        if (key && after.setupOk && comparison && completed(result)) {
+        confirm(await gateProvenance(checkout, signal));
+        signal.throwIfAborted();
+        if (!nonReusable && key && after.setupOk && comparison && completed(result)) {
           ctx.store.putAgentGate(key, {
             executionId,
             createdAt: Date.now(),
             comparison: redactGateData(comparison),
           });
         }
-        return sessionResult(result, tree);
+        const response = sessionResult(result, tree);
+        if (nonReusable) response.text += `\nResult is not reusable because ${nonReusable}.\n`;
+        return response;
       }),
     )();
   });
