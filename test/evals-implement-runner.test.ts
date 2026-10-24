@@ -288,6 +288,35 @@ for (const roles of [["triage", "review", "verify"], ["implement"]])
     }
   });
 
+test("snapshot implement preparation uses its effective base and exposes no reference solution", async () => {
+  const f = await fixture();
+  try {
+    await sh(["git", "checkout", "--detach", f.item.base], { cwd: f.source });
+    mkdirSync(join(f.source, "evals/implement"), { recursive: true });
+    writeFileSync(join(f.source, "evals/implement/cases.json"), '{"labels":"fixture history"}');
+    await pinBase(f);
+    expect((await f.run()).trials[0]?.details.reason).toContain("pinned history contains eval labels");
+    expect(f.calls).toHaveLength(0);
+    f.item.snapshot = true;
+    f.save();
+    f.respond(async (spec) => {
+      const base = (await sh(["git", "rev-parse", "HEAD^"], { cwd: spec.cwd })).stdout.trim();
+      expect(base).not.toBe(f.item.base);
+      expect(existsSync(join(spec.cwd, "evals"))).toBe(false);
+      expect(existsSync(join(spec.cwd, "solution"))).toBe(false);
+      expect(existsSync(join(spec.cwd, "hidden"))).toBe(false);
+      expect(
+        (await sh(["git", "cat-file", "-e", f.item.head], { cwd: spec.cwd, allowFail: true })).exitCode,
+      ).not.toBe(0);
+      return { files: { answer: "correct" } };
+    });
+    expect((await f.run()).trials[0]).toMatchObject({ status: "ok", pass: true });
+    expect(f.calls).toHaveLength(1);
+  } finally {
+    await f.close();
+  }
+});
+
 test("implement invokes once in edit mode with shared prompt, isolates head/hidden bytes, caches complete evidence", async () => {
   const f = await fixture("test ! -f broken && test ! -f hidden/check.sh");
   try {
