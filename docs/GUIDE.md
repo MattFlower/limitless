@@ -221,7 +221,7 @@ discovers an owner.
 | `[workers] repos` | `[]` | Repositories allowed to send gate code and agent sessions to paired workers, for example `["owner/name"]`. Gates also require `[gates] executor = "lan"`. |
 | `[gates] baseline_cache` | `true` | `false` skips the per-base-commit baseline cache: every run executes its baseline (a passing one still refreshes the entry). Per run: `limitless run --no-baseline-cache`. |
 | `[gates] baseline_env` | `[]` | Extra environment variable names that affect your gates (beyond PATH and known toolchain variables); a change to their values misses the baseline cache. Values are hashed, never stored. Listed names are always included, so don't list credentials. |
-| `[sandbox] deny_read` | `[]` | Additional credential paths denied to editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`. |
+| `[sandbox] deny_read` | `[]` | Additional credential paths denied to tool-enabled readers, editors and gates. Use absolute paths or `~/...`. The built-in list covers `.ssh`, `.config/limitless`, `.config/gh`, `.codex`, `.aws`, `.netrc`, `.npmrc`, `.docker`, `.gnupg` and `.kube`, plus `Library/Keychains` on macOS (Claude editors have the outer-profile exception below). |
 | `[sandbox] toolchain_paths` | `[]` | Additional gate-readable toolchain roots, from this factory configuration only. Only build subpaths of the Bun, Cargo and Rustup homes are included by default (using the factory's `BUN_INSTALL`, `CARGO_HOME` and `RUSTUP_HOME` when set); Cargo registry credentials stay denied. A root overlapping a denied credential path prevents launch. |
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[review] avoid_implementer_vendor` | `true` | `false` lets production single reviews follow the review routing chain regardless of the implementer's vendor. Panel finders, shadows, verification, verify-change and follow-up re-checks keep their vendor rules. Older releases refuse to start with this key set because `[review]` keys are validated strictly; remove it before rolling back past this release. |
@@ -238,14 +238,19 @@ Unknown repository settings are ignored with a warning naming the repository and
 Gates deny home reads except their checkout, scratch, recorded Git directories and approved
 toolchains; system paths remain readable. Exact ancestor manifest names and `node_modules`
 metadata remain readable for toolchain discovery, without directory listing access. Each factory
-retains its frozen configuration and credential-location environment snapshot. Editors and gates
-also deny relocated stores named by `CODEX_HOME`, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`,
+retains its frozen configuration and credential-location environment snapshot. Tool-enabled readers,
+editors and gates also deny relocated stores named by `CODEX_HOME`, `GH_CONFIG_DIR`, `XDG_CONFIG_HOME`,
 `LIMITLESS_CONFIG_DIR`, the AWS credential/config variables, `DOCKER_CONFIG`, `GNUPGHOME`,
-`KUBECONFIG`, `NETRC`, npm userconfig variables and Cargo's credential files. Editors deny the
-credential stores above, but Claude's
-own CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains readable until #369.
-macOS Keychain access through `security`, network egress and the loopback API (#484) remain separate
-gaps. Older releases ignore these optional sandbox settings and do not enforce these read rules.
+`KUBECONFIG`, `NETRC`, npm userconfig variables and Cargo's credential files. Readers retain broad
+reads outside the credential stores above unless explicitly confined.
+Codex verifies readers’ effective denies before launch and refuses unverified profiles. Claude's
+own file-backed CLI login (`~/.claude`, `~/.claude.json` or `CLAUDE_CONFIG_DIR`) remains readable until #369.
+On macOS, `~/Library/Keychains` is denied. Claude editors exempt keychain paths only in the outer
+profile so `security` can read their login; native Read, Grep and Glob tools still deny both path
+spellings. Overlapping credential or explicit denies take precedence over that exemption.
+The follow-up to #834 will supply that login from the daemon before denying outer-profile Keychain access.
+Network egress and the loopback API (#484) remain separate gaps. Older releases ignore these optional
+sandbox settings and do not enforce these read rules.
 
 To pair a macOS worker, run `limitless worker pair --coordinator https://<host>:7443`
 on that machine, then compare all 16 characters of its printed code with `limitless workers ls`
