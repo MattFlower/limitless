@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { checkLogin, loggedIn, probeAgents } from "../src/workers/capabilities.ts";
+import { redactCredentials } from "../src/util/proc.ts";
+import { type CapabilityRunner, checkLogin, loggedIn, probeAgents } from "../src/workers/capabilities.ts";
 import { Heartbeat } from "../src/workers/protocol.ts";
 
 const base = {
@@ -95,6 +96,56 @@ test("missing or failed CLIs never log in or expose command failures", async () 
   });
   expect(calls).toBe(2);
 });
+
+test.each([
+  { configured: true, accepted: true },
+  { configured: true, accepted: false },
+  { configured: false, accepted: true },
+  { configured: false, accepted: false },
+])("Claude capability authentication: %j", async ({ configured, accepted }) => {
+  const token = `probe-${crypto.randomUUID()}`;
+  const secrets: Record<string, string> = configured ? { CLAUDE_CODE_OAUTH_TOKEN: token } : {};
+  const calls: string[][] = [];
+  const run: CapabilityRunner = async (args, options) => {
+    calls.push(args);
+    const supplied = options.env?.CLAUDE_CODE_OAUTH_TOKEN;
+    expect(supplied).toBe(args[0] === "claude" && configured ? token : undefined);
+    if (args[1] === "--version")
+      return { exitCode: 0, stdout: args[0] === "claude" ? "2.1.3 (Claude Code)" : "codex-cli 0.50.0" };
+    if (args[0] === "codex") return { exitCode: 0, stdout: "logged in" };
+    expect(args).toEqual(["claude", "auth", "status"]);
+    return { exitCode: accepted ? 0 : 1, stdout: accepted ? "logged in" : `Rejected ${token}` };
+  };
+  const result = await probeAgents(run, undefined, secrets);
+  expect(result.claude).toEqual({ version: "2.1.3 (Claude Code)", loggedIn: accepted });
+  expect(result.codex.loggedIn).toBe(true);
+  expect(calls).toHaveLength(4);
+  expect(JSON.stringify(result)).not.toContain(token);
+  if (configured) expect(redactCredentials(`Rejected ${token}`)).toBe("Rejected [redacted]");
+});
+
+test.each(["stdout", "stderr", "throw"] as const)(
+  "Claude token rejection preserves redacted %s diagnostics before truncation",
+  async (source) => {
+    const token = `rejected-${crypto.randomUUID()}`;
+    const diagnostic = `Token rejected: ${"x".repeat(3960)} ${token}`;
+    let calls = 0;
+    await expect(
+      checkLogin(
+        "claude",
+        async (_args, options) => {
+          calls++;
+          expect(options.env?.CLAUDE_CODE_OAUTH_TOKEN).toBe(token);
+          if (source === "throw") throw new Error(diagnostic);
+          return { exitCode: 1, stdout: "", [source]: diagnostic };
+        },
+        undefined,
+        { CLAUDE_CODE_OAUTH_TOKEN: token },
+      ),
+    ).rejects.toThrow(`${source === "throw" ? "Error: " : ""}Token rejected: ${"x".repeat(3960)} [redacted]`);
+    expect(calls).toBe(1);
+  },
+);
 
 test("heartbeat additions are optional, strict, and validate digest shape", () => {
   expect(Heartbeat.safeParse(base).success).toBe(true);
