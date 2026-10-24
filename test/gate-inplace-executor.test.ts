@@ -10,6 +10,7 @@ import type { ExecutionEvent, ExecutionHandle, GateRequest } from "../src/gates/
 import { executeGate, gateExecutorFor } from "../src/gates/executor.ts";
 import { gateEnv } from "../src/gates/run.ts";
 import { attachSlotPools, gateSlotScope } from "../src/gates/slots.ts";
+import * as repos from "../src/git/repos.ts";
 import { headSha } from "../src/git/repos.ts";
 import { commandScope, confinementScope } from "../src/harness/sandbox.ts";
 import { createScratch, removeScratch } from "../src/harness/scratch.ts";
@@ -109,6 +110,7 @@ async function withExecutor(
   fn: (workers: WorkerStore, crash: () => Promise<void>) => Promise<void>,
   sha = release,
   realConfinement = false,
+  beforeRun = "",
 ) {
   const script = `
     import { runInplaceExecutor } from ${JSON.stringify(new URL("../src/gates/inplace.ts", import.meta.url).pathname)};
@@ -124,6 +126,7 @@ async function withExecutor(
       seatbeltBackend.verify = async (roots) => appendFileSync(${JSON.stringify(join(fixture.home, "executor-ports"))}, String(roots.daemonPort) + '\\n');
       seatbeltBackend.wrap = cmd => cmd;
     }
+    ${beforeRun}
     await processBootInspection.run(() => "test-boot", () => runInplaceExecutor(cfg, ${JSON.stringify(sha)}, controller.signal));
   `;
   const child = Bun.spawn([process.execPath, "--eval", script], {
@@ -146,7 +149,7 @@ async function withExecutor(
       }),
     );
   } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    if (child.exitCode === null && child.signalCode === null) child.kill(beforeRun ? "SIGKILL" : "SIGTERM");
     await child.exited;
     expect(await stderr).toBe("");
   }
@@ -346,6 +349,7 @@ test("executor crash fallback restores committed bytes after stopping the origin
   const pidFile = join(fixture.home, "fallback-pid");
   const proceed = join(fixture.home, "fallback-proceed");
   const observed = join(fixture.home, "fallback-observed");
+  const spawned = join(fixture.home, "fallback-spawned");
   req.gates = {
     ...gates,
     setup: [],
@@ -356,34 +360,62 @@ test("executor crash fallback restores committed bytes after stopping the origin
       },
     ],
   };
-  await withExecutor(f, async (workers, crash) => {
-    let pid = 0;
-    let stoppedBeforeFallback = false;
-    const record = workers.event.bind(workers);
-    const events = spyOn(workers, "event").mockImplementation((id, event) => {
-      if (event.type === "status" && event.text.includes("gates falling back"))
-        stoppedBeforeFallback = recoveryProcessStopped(pid);
-      return record(id, event);
+  await withExecutor(
+    f,
+    async (workers, crash) => {
+      let pid = 0;
+      let stoppedBeforeFallback = false;
+      const record = workers.event.bind(workers);
+      const events = spyOn(workers, "event").mockImplementation((id, event) => {
+        if (event.type === "status" && event.text.includes("gates falling back"))
+          stoppedBeforeFallback = recoveryProcessStopped(pid);
+        return record(id, event);
+      });
+      const checkoutCommitted = repos.checkoutCommitted;
+      const restore = spyOn(repos, "checkoutCommitted").mockImplementation((...args) => {
+        expect(recoveryProcessStopped(pid)).toBe(true);
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("dirty\n");
+        return checkoutCommitted(...args);
+      });
+      const pending = runGateExecution(context(), "gates", "initial", req.cwd, req.gates);
+      const rejected = pending.catch((e) => e);
+      try {
+        pid = await waitForPid(pidFile);
+        if (process.platform === "linux") await wait(() => existsSync(spawned), { timeoutMs: 10_000 });
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("dirty\n");
+        await crash();
+        expect((await pending).checks[0]?.ok).toBe(true);
+        expect(recoveryProcessStopped(pid)).toBe(true);
+        expect(stoppedBeforeFallback).toBe(true);
+        expect(readFileSync(observed, "utf8")).toBe("stopped\n");
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+        expect(workers.jobs("in_place=1")[0]?.stopped).toBe(1);
+      } finally {
+        events.mockRestore();
+        restore.mockRestore();
+        writeFileSync(proceed, "");
+        await rejected;
+        await recoverProcessCleanups(f.store);
+      }
+    },
+    release,
+    false,
+    `
+    import * as childProcess from 'node:child_process';
+    import { spyOn } from 'bun:test';
+    import { writeFileSync } from 'node:fs';
+    const spawn = childProcess.spawn;
+    spyOn(childProcess, 'spawn').mockImplementation((...args) => {
+      const child = spawn(...args);
+      if (process.platform === 'linux' && args[0] === '/bin/sh' && String(args[1]).includes('echo dirty')) {
+        writeFileSync(${JSON.stringify(spawned)}, '');
+        // The parent crashes us while spawn has not returned to runProcess.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+      }
+      return child;
     });
-    const pending = runGateExecution(context(), "gates", "initial", req.cwd, req.gates);
-    const rejected = pending.catch((e) => e);
-    try {
-      pid = await waitForPid(pidFile);
-      expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("dirty\n");
-      await crash();
-      expect((await pending).checks[0]?.ok).toBe(true);
-      expect(recoveryProcessStopped(pid)).toBe(true);
-      expect(stoppedBeforeFallback).toBe(true);
-      expect(readFileSync(observed, "utf8")).toBe("stopped\n");
-      expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
-      expect(workers.jobs("in_place=1")[0]?.stopped).toBe(1);
-    } finally {
-      events.mockRestore();
-      writeFileSync(proceed, "");
-      await rejected;
-      await recoverProcessCleanups(f.store);
-    }
-  });
+  `,
+  );
 });
 
 test.each(["baseline", "initial"])(

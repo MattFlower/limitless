@@ -785,20 +785,24 @@ for (const failure of ["discovery", "birth", "recording", "boot"] as const) {
     const recorder =
       failure === "recording" ? spyOn(store, "recordProcessCleanup").mockImplementation(fail) : undefined;
     let member = 0;
+    let cleaning = false;
     try {
       const invoke = () =>
-        processBootInspection.run(failure === "boot" ? fail : () => "test-boot", () =>
-          processScope.run(scope, () =>
-            runProcess({
-              cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
-              cwd: directory,
-              env: {},
-              onStdoutLine: (line) => {
-                member = Number(line);
-                controller.abort();
-              },
-            }),
-          ),
+        processBootInspection.run(
+          () => (failure === "boot" && cleaning ? fail() : "test-boot"),
+          () =>
+            processScope.run(scope, () =>
+              runProcess({
+                cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
+                cwd: directory,
+                env: {},
+                onStdoutLine: (line) => {
+                  member = Number(line);
+                  cleaning = true;
+                  controller.abort();
+                },
+              }),
+            ),
         );
       const pending =
         failure === "discovery"
