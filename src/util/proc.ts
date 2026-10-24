@@ -22,6 +22,7 @@ export const processScope = new AsyncLocalStorage<{
   checkout?: () => string | undefined;
   cleanups?: ProcessCleanupStore;
   ownershipMarker?: string;
+  /** Persist pending invocation and scratch ownership before spawning. */
   beforeSpawn?: (invocation?: string) => void;
 }>();
 
@@ -884,6 +885,27 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         : [];
     const spawnedAt = darwin?.darwinClock() ?? 0n;
     scope?.beforeSpawn?.(marker);
+    const recordDiscovery = (group: number, leader: DarwinInvocationLeader | null) => {
+      const cleanups = scope?.cleanups ?? processCleanupStore.getStore();
+      if (cleanups?.recordProcessDiscovery) {
+        const ownerBirth = (processOwnerInspection.getStore() ?? processBirthSync)(process.pid);
+        if (!ownerBirth) throw new Error("Process owner identity is unavailable");
+        cleanups.recordProcessDiscovery({
+          runId: scope?.runId ?? null,
+          invocation: marker,
+          directory,
+          boot: bootIdentity(),
+          createdAt: Date.now(),
+          ownerId: processOwner,
+          ownerPid: process.pid,
+          ownerBirth,
+          discovery: { group, started, directories, leader, spawnedAt: String(spawnedAt) },
+        });
+      }
+    };
+    // Workers already persist spawn intent in beforeSpawn. Linux needs only the marker.
+    const recordedBeforeSpawn = inspectionPlatform === "linux" && !scope?.beforeSpawn;
+    if (recordedBeforeSpawn) recordDiscovery(0, null);
     let child: ChildProcessWithoutNullStreams;
     try {
       child = spawn(bin, args, {
@@ -913,24 +935,8 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       discoveryError = error;
     }
     let persistenceError: unknown;
-    // A crash before shutdown must still leave enough ownership context for recovery.
     try {
-      const cleanups = scope?.cleanups ?? processCleanupStore.getStore();
-      if (child.pid !== undefined && cleanups?.recordProcessDiscovery) {
-        const ownerBirth = (processOwnerInspection.getStore() ?? processBirthSync)(process.pid);
-        if (!ownerBirth) throw new Error("Process owner identity is unavailable");
-        cleanups.recordProcessDiscovery({
-          runId: scope?.runId ?? null,
-          invocation: marker,
-          directory,
-          boot: bootIdentity(),
-          createdAt: Date.now(),
-          ownerId: processOwner,
-          ownerPid: process.pid,
-          ownerBirth,
-          discovery: { group: child.pid, started, directories, leader, spawnedAt: String(spawnedAt) },
-        });
-      }
+      if (!recordedBeforeSpawn && child.pid !== undefined) recordDiscovery(child.pid, leader);
     } catch (error) {
       persistenceError = error;
     }
