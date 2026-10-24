@@ -8,6 +8,7 @@ import {
   type FactoryGateHandler,
   type TestWait,
 } from "../gates/agent-tests.ts";
+import { type Release, release } from "../release.ts";
 import { commandDir, createCommandRoot } from "./scratch.ts";
 import type { SlottedCommands } from "./slotted-config.ts";
 
@@ -32,10 +33,11 @@ export async function withSlottedCommands<T>(
   invoke: (path?: string, idleNow?: () => number) => Promise<T>,
   onWatchdog?: (active: boolean, elapsedMs: number) => void,
   policy: Pick<WrapperConfig, "role" | "agentFullSuite"> = {},
+  runtime: { release: Release; executable: string } = { release, executable: process.execPath },
   factoryGate?: FactoryGateHandler,
 ): Promise<T> {
   if (!commands.length) return invoke();
-  const source = await wrapperBundle();
+  const source = runtime.release.kind === "source" ? await wrapperBundle() : undefined;
   createCommandRoot(cwd, scratch);
   // Every agent and gate profile denies reads under the shared root except to this directory's owner.
   const directory = commandDir(scratch, cwd);
@@ -85,15 +87,21 @@ export async function withSlottedCommands<T>(
       entry = join(directory, "entry.js"),
       bunfig = join(directory, "bunfig.toml");
     writeFileSync(configPath, JSON.stringify(config), { mode: 0o400 });
-    writeFileSync(entry, source, { mode: 0o400 });
-    writeFileSync(bunfig, "preload = []\n", { mode: 0o400 });
+    if (source !== undefined) {
+      writeFileSync(entry, source, { mode: 0o400 });
+      writeFileSync(bunfig, "preload = []\n", { mode: 0o400 });
+    }
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
     for (const name of new Set(commands.map((c) => c[0]).filter((name): name is string => !!name)))
       writeFileSync(
         join(directory, name),
         // Start outside the checkout so its env files and Bun preloads cannot affect the wrapper.
         // Absolute interpreters also work when the shell or Bun itself is a wrapped executable.
-        `#!/bin/sh\nexec ${quote(process.execPath)} --no-env-file --config=${quote(bunfig)} --cwd ${quote(directory)} ${quote(entry)} "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`,
+        // Pin the running binary. After brew upgrade + brew cleanup removes the old executable,
+        // its daemon's wrappers fail with "not found" until limitless service install restarts it.
+        source === undefined
+          ? `#!/bin/sh\nunset BUN_BE_BUN\nexec ${quote(runtime.executable)} __agent-test "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`
+          : `#!/bin/sh\nexec ${quote(process.execPath)} --no-env-file --config=${quote(bunfig)} --cwd ${quote(directory)} ${quote(entry)} "$(pwd -P)" ${quote(configPath)} ${quote(name)} "$@"\n`,
         { mode: 0o500 },
       );
     return await invoke(`${directory}${delimiter}${process.env.PATH ?? ""}`, session.idleNow);

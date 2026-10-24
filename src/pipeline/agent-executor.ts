@@ -95,6 +95,7 @@ export function runToolAgent(
             : `Idle watchdog resumed after ${elapsedMs}ms held off for slotted command`,
         }),
       policy,
+      undefined,
       factoryGate,
     );
   });

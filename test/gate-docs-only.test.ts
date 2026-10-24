@@ -1,0 +1,300 @@
+import { expect, spyOn } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { delimiter, join } from "node:path";
+import type { Factory } from "../src/app.ts";
+import type { GateComparison } from "../src/gates/run.ts";
+import type { RunState } from "../src/pipeline/context.ts";
+import * as proc from "../src/util/proc.ts";
+import { sh } from "../src/util/proc.ts";
+import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { test } from "./read-policy-support.ts";
+
+const fixture: { home: string; repoDir: string; factory: Factory | null } = {
+  home: "",
+  repoDir: "",
+  factory: null,
+};
+const { start, githubFixture, registerGithub, advanceBase } = pipelineSetup(fixture);
+
+test.each([
+  "targeted",
+  "snapshot-targeted",
+  "snapshot-skipped",
+  "snapshot-changed",
+  "failing baseline",
+  "retry",
+  "timeout",
+  "skipped",
+  "mixed",
+  "unconfigured",
+  "untrusted",
+  "invalid",
+  "post-merge",
+  "post-merge skip",
+  "post-merge failure",
+  "post-merge slow retry",
+  "post-merge slow retry failure",
+])("docs gates pipeline: %s", async (scenario) => {
+  const cwd = fixture.repoDir;
+  mkdirSync(join(cwd, "docs"));
+  mkdirSync(join(cwd, "test"));
+  writeFileSync(join(cwd, "docs/guide.md"), "base\n");
+  const snapshot = scenario.startsWith("snapshot-");
+  const initiallySkipped = ["skipped", "post-merge failure", "snapshot-skipped"].includes(scenario);
+  writeFileSync(join(cwd, "test/a.test.ts"), initiallySkipped ? "unrelated" : "guide.md");
+  writeFileSync(join(cwd, "test/b.test.ts"), "unrelated");
+  const config = `[gates]
+${["untrusted", "unconfigured"].includes(scenario) ? "" : scenario === "invalid" ? 'docs = "docs/**"' : 'docs = ["docs/**"]'}
+retry_files = "bun test {files}"
+setup = ["fake-setup"]
+checks = [{name="lint",run="fake-lint"}, {name="typecheck",run="fake-types"}, {name="test",run="bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"}]
+${snapshot ? '[limits]\nslotted_commands = ["bun test"]\nagent_full_suite = "gate"\n' : ""}`;
+  writeFileSync(join(cwd, ".limitless.toml"), config);
+  await sh(["git", "add", "."], { cwd });
+  await sh(["git", "commit", "-qm", "docs gate fixture"], { cwd });
+  const postMerge = scenario.startsWith("post-merge");
+  const slow = scenario.startsWith("post-merge slow");
+  const retryFails = scenario === "post-merge slow retry failure";
+  const bare = postMerge ? await githubFixture() : undefined;
+  let reviews = 0;
+  const f = start(async (s) => {
+    const role = roleOf(s);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review") {
+      reviews++;
+      if (bare)
+        await advanceBase(
+          bare,
+          scenario === "post-merge failure" || scenario === "post-merge skip" ? "test/a.test.ts" : "base.txt",
+          scenario === "post-merge failure" ? "guide.md" : "new base\n",
+        );
+      return { structured: approve };
+    }
+    if (snapshot) {
+      writeFileSync(join(s.cwd, "docs/guide.md"), "updated\n");
+      const wrapper = s.commandPath?.split(delimiter)[0];
+      if (!wrapper) throw new Error("missing wrapper");
+      const result = await sh([join(wrapper, "bun"), "test"], { cwd: s.cwd });
+      expect(result.stdout).toContain("Factory gate run of check test");
+      if (scenario === "snapshot-changed")
+        writeFileSync(join(s.cwd, "docs/guide.md"), "changed after snapshot\n");
+      return { text: "updated the guide" };
+    }
+    return {
+      files: {
+        "docs/guide.md": "updated\n",
+        ...(scenario === "mixed" ? { "source.ts": "export {};\n" } : {}),
+        ...(scenario === "untrusted"
+          ? { ".limitless.toml": config.replace("[gates]", '[gates]\ndocs = ["**"]') }
+          : {}),
+      },
+    };
+  });
+  if (bare) registerGithub(f, bare);
+  const commands: string[] = [];
+  let targetedAttempts = 0;
+  const realProcess = proc.runProcess;
+  const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+    if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
+    opts.onStdoutLine?.(opts.cmd[4] ?? "");
+    commands.push(opts.cmd.at(-1) ?? "");
+    const targeted = opts.cmd.at(-1)?.startsWith("bun test './") ?? false;
+    if (targeted) targetedAttempts++;
+    const firstFailure = targeted && targetedAttempts === 1 && ["retry", "timeout"].includes(scenario);
+    const slowFailure =
+      targeted && slow && (targetedAttempts === 2 || (targetedAttempts === 3 && retryFails));
+    const failed =
+      firstFailure ||
+      slowFailure ||
+      (targeted && scenario === "post-merge failure") ||
+      (scenario === "failing baseline" && opts.cmd.at(-1)?.includes("$LIMITLESS_GATE_REPORT"));
+    return {
+      exitCode: failed ? (scenario === "timeout" ? null : 1) : 0,
+      signal: null,
+      cancelled: false,
+      timedOut: firstFailure && scenario === "timeout",
+      idleTimedOut: false,
+      truncated: false,
+      stdout: "passed",
+      stderr: "",
+      durationMs: slowFailure ? 65_000 : slow ? 1000 : 1,
+    };
+  });
+  try {
+    const run = await f.createRun({
+      repo: bare ? "test/repo" : cwd,
+      prompt: "Update the guide",
+      profile: "quick",
+    });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+      scenario === "post-merge failure" || retryFails ? "needs_human" : "succeeded",
+    );
+    expect(reviews).toBe(1);
+    if (snapshot) {
+      const artifact = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]") as GateComparison[];
+      expect(artifact.map((c) => c.name)).toEqual(["lint", "typecheck", "test"]);
+      const check = artifact.find((c) => c.name === "test");
+      const reused = scenario !== "snapshot-changed";
+      expect(commands).toEqual([
+        "fake-setup",
+        "fake-lint",
+        "fake-types",
+        "bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",
+        "fake-setup",
+        "bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",
+        "fake-setup",
+        "fake-lint",
+        "fake-types",
+        ...(reused ? [] : ["bun test './test/a.test.ts'"]),
+      ]);
+      expect(check?.verdict).toBe(reused ? "pass" : "targeted_pass");
+      if (reused) {
+        expect(check?.result.reused?.executionId).toEqual(expect.any(String));
+        expect(check?.result.docsOnly).toBeUndefined();
+        expect(
+          f.store.getRunState<RunState>(run.id)?.gateEvidence?.checks.find((c) => c.name === "test")?.result
+            .reused,
+        ).toEqual(check?.result.reused);
+      } else {
+        expect(check?.result.reused).toBeUndefined();
+        expect(check?.result.docsOnly?.mode).toBe("targeted");
+      }
+      return;
+    }
+    const mode = ["mixed", "unconfigured", "untrusted", "invalid"].includes(scenario)
+      ? "full"
+      : initiallySkipped
+        ? "skipped"
+        : "targeted";
+    // The baseline always runs the full command, including its existing retry on failure.
+    const baselineCommands = scenario === "failing baseline" ? 5 : 4;
+    expect(commands.slice(0, baselineCommands)).toEqual([
+      "fake-setup",
+      "fake-lint",
+      "fake-types",
+      "bun test --reporter-outfile=$LIMITLESS_GATE_REPORT",
+      ...(scenario === "failing baseline" ? ["bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"] : []),
+    ]);
+    expect(commands.slice(baselineCommands, baselineCommands + 3)).toEqual([
+      "fake-setup",
+      "fake-lint",
+      "fake-types",
+    ]);
+    const expectedTest =
+      mode === "targeted"
+        ? ["bun test './test/a.test.ts'"]
+        : mode === "full"
+          ? ["bun test --reporter-outfile=$LIMITLESS_GATE_REPORT"]
+          : [];
+    expect(
+      commands.slice(
+        baselineCommands + 3,
+        postMerge ? baselineCommands + 3 + expectedTest.length : undefined,
+      ),
+    ).toEqual([
+      ...expectedTest,
+      ...(scenario === "retry"
+        ? expectedTest
+        : scenario === "timeout"
+          ? ["fake-setup", "fake-lint", "fake-types", ...expectedTest]
+          : []),
+    ]);
+    const artifact = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]") as GateComparison[];
+    const testCheck = artifact.find((c) => c.name === "test");
+    if (scenario === "retry") expect(testCheck?.verdict).toBe("flaky");
+    if (["targeted", "failing baseline"].includes(scenario)) {
+      expect(testCheck?.verdict).toBe("targeted_pass");
+      const report = f.store.getArtifact(run.id, "report.md") ?? "";
+      expect(report).toContain("✅ targeted pass (1 test file");
+      expect(report).toContain(testCheck?.result.docsOnly?.reason ?? "missing reason");
+      expect(report).not.toContain("✅ fixed");
+      expect(report).not.toMatch(/\| test \| ✅ pass/);
+    }
+    if (scenario === "timeout") expect(testCheck?.firstAttempt?.timedOut).toBe(true);
+    if (mode !== "full") {
+      expect(testCheck?.result.docsOnly).toMatchObject({
+        mode,
+        changedPaths: ["docs/guide.md"],
+        files: mode === "targeted" ? ["test/a.test.ts"] : [],
+      });
+      expect(
+        f.store
+          .listEvents(run.id)
+          .some(
+            (e) =>
+              e.type === "gate" &&
+              e.message.includes(`"mode":"${mode}"`) &&
+              e.message.includes("docs/guide.md"),
+          ),
+      ).toBe(true);
+    }
+    if (mode === "skipped") {
+      expect(testCheck).toMatchObject({
+        verdict: "not_run",
+        blocking: false,
+        result: { output: "docs-only change; no test reads the changed files" },
+      });
+      if (!postMerge)
+        expect(f.store.getArtifact(run.id, "report.md")).toContain(
+          "⚠️ not run (docs-only change; no test reads the changed files)",
+        );
+    }
+    const state = f.store.getRunState<RunState>(run.id);
+    if (postMerge) {
+      const rebase = JSON.parse(
+        f.store.getArtifact(run.id, "gates-rebase-0.json") ?? "[]",
+      ) as GateComparison[];
+      const mergedMode = scenario === "post-merge skip" ? "skipped" : "targeted";
+      expect(rebase.find((c) => c.name === "test")?.result.docsOnly?.mode).toBe(mergedMode);
+      expect(commands.slice(7 + expectedTest.length)).toEqual([
+        "fake-setup",
+        "fake-lint",
+        "fake-types",
+        ...(mergedMode === "targeted" ? ["bun test './test/a.test.ts'"] : []),
+        ...(slow ? ["bun test './test/a.test.ts'"] : []),
+      ]);
+      if (slow) {
+        expect(targetedAttempts).toBe(3);
+        const docsOnly = {
+          mode: "targeted",
+          changedPaths: ["docs/guide.md"],
+          files: ["test/a.test.ts"],
+          reason: "docs-only change; test source references a changed path or basename",
+        };
+        expect(rebase.find((c) => c.name === "test")).toMatchObject({
+          verdict: retryFails ? "targeted_failure" : "flaky",
+          blocking: retryFails,
+          firstAttempt: { ok: false, durationMs: 65_000, docsOnly },
+          result: { ok: !retryFails, docsOnly },
+        });
+        const warnings = f.store.listEvents(run.id).filter((e) => e.message.includes("post-merge re-check"));
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toMatchObject({
+          level: "warn",
+          message: `test post-merge re-check: ran 65.0x its pre-merge time (65s vs 1s): ${retryFails ? "FAIL again" : "pass (flaky, not blocking)"}`,
+          data: {
+            flaky: !retryFails,
+            firstAttempt: { ok: false, durationMs: 65_000, docsOnly },
+            retry: { ok: !retryFails, docsOnly },
+          },
+        });
+      }
+      if (scenario === "post-merge failure") {
+        expect(rebase.find((c) => c.name === "test")).toMatchObject({
+          verdict: "targeted_failure",
+          blocking: true,
+          result: { ok: false },
+        });
+        expect(f.store.getRun(run.id)?.error).toContain("post-merge gates regressed");
+      }
+    } else
+      expect(state?.lastGates?.map((c) => [c.name, c.verdict, c.blocking, c.result.docsOnly])).toEqual(
+        artifact.map((c) => [c.name, c.verdict, c.blocking, c.result.docsOnly]),
+      );
+    if (scenario === "invalid")
+      expect(f.store.listEvents(run.id).some((e) => e.message.includes("Invalid [gates].docs"))).toBe(true);
+  } finally {
+    await f.stop();
+    processSpy.mockRestore();
+  }
+});

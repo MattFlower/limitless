@@ -1,13 +1,16 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { connect, createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { isDeepStrictEqual, parseArgs } from "node:util";
 import { version } from "../package.json";
+import type { WrapperConfig } from "../src/cli/agent-test.ts";
 import { migrationNames } from "../src/db/migration-runner.ts";
 import { MIGRATIONS } from "../src/db/migrations.ts";
+import { withScratch } from "../src/harness/scratch.ts";
+import { withSlottedCommands } from "../src/harness/slotted.ts";
 import { DEFAULT_POLICY } from "../src/router/catalog.ts";
 import { redactCredentials } from "../src/util/proc.ts";
 
@@ -183,7 +186,7 @@ async function smoke(root: string, binaryPath: string | undefined, diagnostic: (
       PATH: `${join(root, "stubs")}:${process.env.PATH ?? ""}`,
       LANG: "C.UTF-8",
     };
-    const launch = (cmd: string[], cwd = hostile, timeout = 30_000, childEnv = env) => {
+    const launch = (cmd: string[], cwd = hostile, timeout = 30_000, childEnv: NodeJS.ProcessEnv = env) => {
       const out = join(root, `${children.length}.stdout`),
         err = join(root, `${children.length}.stderr`);
       const child = Bun.spawn(cmd, {
@@ -228,6 +231,72 @@ async function smoke(root: string, binaryPath: string | undefined, diagnostic: (
       for (const [key, expected] of Object.entries({ kind: "packaged", sha, version, bun: Bun.version }))
         if (actual?.[key] !== expected)
           throw new Error(`version ${key}: expected ${expected}, got ${actual?.[key]}`);
+    });
+    await run("slotted commands", async () => {
+      if (buildError) throw new Error(buildError);
+      const requests: Record<string, unknown>[] = [];
+      const unix = join(root, "lease.sock");
+      const marker = join(root, "agent-test-marker");
+      writeFileSync(
+        join(hostile, "package.json"),
+        JSON.stringify({ scripts: { "__agent-test": `touch '${marker.replaceAll("'", "'\\''")}'` } }),
+      );
+      writeFileSync(
+        join(root, "stubs", "slot-probe"),
+        `#!/bin/sh\n[ "\${BUN_BE_BUN+x}" != x ] || exit 91\nprintf "real:%s\\n" "$@"\n`,
+        { mode: 0o755 },
+      );
+      const stub = Bun.serve({
+        unix,
+        async fetch(req) {
+          requests.push(await req.json());
+          return Response.json({ id: "smoke-lease", acquired: true });
+        },
+      });
+      try {
+        await withScratch(hostile, (scratch) =>
+          withSlottedCommands(
+            [["slot-probe", "leased"]],
+            hostile,
+            scratch,
+            undefined,
+            () => {},
+            async (path) => {
+              if (!path) throw new Error("Missing wrapper PATH");
+              const configPath = join(path.split(delimiter)[0] ?? "", "config.json");
+              const config: WrapperConfig = JSON.parse(readFileSync(configPath, "utf8"));
+              chmodSync(configPath, 0o600);
+              writeFileSync(configPath, JSON.stringify({ ...config, unix }));
+              for (const mode of ["leased", "direct"]) {
+                const before = requests.length;
+                const cmd = launch(["slot-probe", mode], hostile, 30_000, {
+                  ...env,
+                  PATH: `${path.split(delimiter)[0]}${delimiter}${env.PATH}`,
+                  BUN_BE_BUN: "1",
+                });
+                if ((await cmd.done()) !== 0 || cmd.stdout() !== `real:${mode}\n` || existsSync(marker))
+                  throw new Error(`${mode} wrapper failed: ${cmd.tail()}`);
+                const observed = requests.slice(before);
+                if (
+                  mode === "leased"
+                    ? !observed.some(
+                        (r) =>
+                          r.name === "slot-probe leased" && r.token === config.token && r.lane === "gate",
+                      )
+                    : observed.length !== 0
+                )
+                  throw new Error(`${mode}: unexpected lease requests`);
+              }
+            },
+            undefined,
+            {},
+            { release: { kind: "packaged", version, sha, bun: Bun.version }, executable: binary },
+          ),
+        );
+      } finally {
+        stub.stop(true);
+        rmSync(unix, { force: true });
+      }
     });
     const get = async (path: string, timeout = 5000) => {
       const response = await fetch(`http://127.0.0.1:${port}${path}`, {

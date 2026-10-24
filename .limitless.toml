@@ -1,5 +1,6 @@
 # Gates and policy the Limitless factory applies when it works on this repository.
 [gates]
+docs = ["docs/**", "*.md", "test/AGENTS.md"]
 setup = ["bun install --frozen-lockfile"]
 # Confirm structured failing files before repeating the full suite.
 retry_files = "bun test --isolate {files}"

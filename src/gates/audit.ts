@@ -51,14 +51,17 @@ const SECRETS: [RegExp, string][] = [
 
 const ASSERTION = /\b(expect|assert\w*|should)\b|\bt\.(Error|Fatal|Fail)/;
 
-function globToRegex(glob: string): RegExp {
-  const escaped = glob
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*\/?/g, "@@GLOBSTAR@@")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, ".")
-    .replace(/@@GLOBSTAR@@/g, ".*");
-  return new RegExp(`^${escaped}$`);
+export function globToRegex(glob: string): RegExp {
+  const segments = (glob.endsWith("/") ? `${glob}**` : glob).split("/");
+  const escaped = segments.map((segment, index) => {
+    if (segment === "**") return index === segments.length - 1 ? ".*" : "(?:[^/]+/)*";
+    const pattern = segment
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*+/g, "[^/]*")
+      .replace(/\?/g, "[^/]");
+    return pattern + (index === segments.length - 1 ? "" : "/");
+  });
+  return new RegExp(`^${escaped.join("")}$(?!.)`, "s");
 }
 
 interface FilePatch {
