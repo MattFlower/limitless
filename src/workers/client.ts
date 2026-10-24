@@ -774,7 +774,7 @@ export async function runWorker(
             await posts;
             jobSignal.throwIfAborted();
             assertProcessesStopped();
-            Object.assign(run, await gateProvenance(cwd, jobSignal));
+            Object.assign(run, await gateProvenance(cwd, jobSignal, req.headSha));
             return () =>
               call(`/worker/jobs/${id}/result`, redactGateData({ run, sha: req.headSha }), jobSignal);
           },

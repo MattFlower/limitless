@@ -1,10 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
+import { withScratch } from "../harness/scratch.ts";
 import type { GateConfig } from "./detect.ts";
 import { lanExecutor } from "./lan.ts";
-import { redactGateData } from "./output.ts";
+import { redactGateData, redactGateOutput } from "./output.ts";
 import {
   type GateHooks,
   type GateResult,
@@ -58,16 +60,40 @@ export type GateExecutor = Executor<GateRequest, GateRun> & {
 export type GateRunner = (gates: GateConfig, options?: GateRetryOptions) => Promise<GateRun>;
 
 /** Inspect the checkout that executed the gate; an echoed request SHA is not provenance. */
-export async function gateProvenance(cwd: string, signal: AbortSignal) {
+export async function gateProvenance(cwd: string, signal: AbortSignal, checkedSha = "HEAD") {
   try {
     const result = await worktreeGit(["git", "rev-parse", "HEAD", "HEAD^{tree}"], { cwd, signal });
     const [sha, treeHash] = result.stdout.trim().split("\n");
     const hash = /^(?:[a-f\d]{40}|[a-f\d]{64})$/;
-    if (sha && treeHash && hash.test(sha) && hash.test(treeHash)) return { sha, treeHash };
+    if (sha && treeHash && hash.test(sha) && hash.test(treeHash)) {
+      const diffs = await withScratch(cwd, async (scratch) => {
+        // A fresh index has no gate-set assume-unchanged/skip-worktree flags or stat cache.
+        const opts = { cwd, signal, env: { ...process.env, GIT_INDEX_FILE: join(scratch, "index") } };
+        await worktreeGit(["git", "read-tree", checkedSha], opts);
+        const refresh = await worktreeGit(["git", "update-index", "--refresh"], { ...opts, allowFail: true });
+        if (refresh.exitCode !== 0 && refresh.exitCode !== 1) throw new Error("Index refresh failed");
+        const working = await worktreeGit(["git", "diff", "--name-only", "-z", "--no-renames", "--"], opts);
+        const staged = await worktreeGit(
+          ["git", "diff", "--cached", "--name-only", "-z", "--no-renames", checkedSha, "--"],
+          { cwd, signal },
+        );
+        signal.throwIfAborted();
+        return [working, staged];
+      });
+      const paths = [...new Set(diffs.flatMap((diff) => diff.stdout.split("\0").filter(Boolean)))].map(
+        redactGateOutput,
+      );
+      return {
+        sha,
+        treeHash,
+        trackedClean: paths.length === 0,
+        provenanceError: paths.length ? `tracked files changed: ${JSON.stringify(paths)}` : undefined,
+      };
+    }
   } catch {
     // A completed gate still returns its result when Git inspection is unavailable.
   }
-  return undefined;
+  return { trackedClean: false, provenanceError: "execution provenance could not be confirmed" };
 }
 
 /** Shutdown detaches durable jobs; owner cancellation discards them. */
@@ -242,6 +268,7 @@ export async function executeGate(
         if (event.type === "check") hooks.onResult?.(redactGateData(event.result), event.phase);
     })();
     const [result] = await Promise.all([execution.result, events]);
+    if (handle.kind === "local") Object.assign(result, await gateProvenance(req.cwd, signal, req.headSha));
     return result;
   } catch (error) {
     abort();

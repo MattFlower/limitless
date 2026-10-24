@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { WorkerStore } from "../src/db/workers.ts";
-import { type GateExecutor, type GateRequest, localExecutor } from "../src/gates/executor.ts";
+import { type GateExecutor, type GateRequest, gateProvenance, localExecutor } from "../src/gates/executor.ts";
 import { lanExecutor } from "../src/gates/lan.ts";
 import type { GateComparison } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
@@ -44,6 +44,14 @@ agent_full_suite = "gate"
 
 const commit = "git -c user.name=Test -c user.email=test@example.com commit -qm gate";
 const mutations: Record<string, string> = {
+  uncommitted: "echo generated > greeting.txt",
+  "assume-unchanged": "git update-index --assume-unchanged greeting.txt && echo generated > greeting.txt",
+  "skip-worktree": "git update-index --skip-worktree greeting.txt && echo generated > greeting.txt",
+  "redacted-path": "git mv greeting.txt 'changed-synthetic-path-credential-845.txt'",
+  staged: "echo generated > greeting.txt && git add greeting.txt",
+  "staged-restored": "echo generated > greeting.txt && git add greeting.txt && echo edited > greeting.txt",
+  deleted: "rm greeting.txt",
+  renamed: "git mv greeting.txt renamed.txt",
   commit: `echo changed > greeting.txt && ${commit} -a`,
   "empty-commit": `${commit} --allow-empty`,
   reset: "git reset --hard HEAD^",
@@ -80,7 +88,7 @@ test("agent full-suite bypasses the in-place executor and the gates stage reuses
       const result = await sh([join(directory, "bun"), "test"], { cwd: agent.cwd, env: agentEnv() });
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain("trusted-test");
-      expect(requests).toEqual([]);
+      expect(requests).toHaveLength(0);
       expect(f.store.db.query("SELECT * FROM gate_jobs WHERE in_place=1").all()).toEqual([]);
       const records = f.store.db
         .query<{ execution_id: string; tree_hash: string }, []>(
@@ -110,7 +118,7 @@ test("agent full-suite bypasses the in-place executor and the gates stage reuses
       invocations: f.store.listInvocations(run.id).map((i) => i.error),
     }),
   ).toBe("succeeded");
-  expect(requests).toEqual([]);
+  expect(requests).toHaveLength(0);
   expect(sessionComplete).toBe(true);
   expect(f.store.db.query("SELECT * FROM gate_jobs WHERE in_place=1").all()).toEqual([]);
   const state = f.store.getRunState<RunState>(run.id);
@@ -142,7 +150,11 @@ test.each([
   "lan-fallback",
   "lan-job-fallback",
   "lan-job-fallback-commit",
-  "uncommitted",
+  "untracked-output",
+  "ignored-output",
+  "lan-rewrite",
+  "lan-legacy",
+  "lan-job-fallback-rewrite",
   "lan-missing",
   "lan-commit-mismatch",
   "lan-tree-mismatch",
@@ -160,15 +172,27 @@ test.each([
     scenario === "only-test",
     scenario === "no-test",
     scenario === "same",
-    scenario === "uncommitted"
-      ? "echo generated > greeting.txt"
-      : scenario === "lan-job-fallback-commit"
-        ? mutations.commit
-        : mutations[scenario],
+    scenario === "untracked-output"
+      ? "echo generated > build-output"
+      : scenario === "ignored-output"
+        ? "echo cache-output >> .git/info/exclude; echo generated > cache-output"
+        : scenario === "uncommitted" || scenario.endsWith("-rewrite")
+          ? mutations.uncommitted
+          : scenario === "lan-job-fallback-commit"
+            ? mutations.commit
+            : mutations[scenario],
   );
+  if (scenario === "redacted-path")
+    registerCredential("changed-session-path", "synthetic-path-credential-845");
   const unconfirmed =
     scenario in mutations ||
-    scenario === "lan-job-fallback-commit" ||
+    [
+      "uncommitted",
+      "lan-rewrite",
+      "lan-job-fallback-rewrite",
+      "lan-legacy",
+      "lan-job-fallback-commit",
+    ].includes(scenario) ||
     ["lan-missing", "lan-commit-mismatch", "lan-tree-mismatch", "lan-sha-only"].includes(scenario);
   const requests: GateRequest[] = [];
   let tree = "",
@@ -231,15 +255,31 @@ test.each([
     },
     attach(handle, signal, request, hooks) {
       const execution = (fallbacks.get(handle.id) ?? executor).attach(handle, signal, request, hooks);
-      if (!worktree || request?.priority !== "start") return execution;
+      if (!worktree || request?.priority !== "start")
+        return {
+          ...execution,
+          result: execution.result.then(async (run) => ({
+            ...run,
+            ...(request && executorKind === "lan"
+              ? await gateProvenance(request.cwd, signal, request.headSha)
+              : {}),
+          })),
+        };
       return {
         ...execution,
         result: execution.result.then(async (run) => {
+          if (["assume-unchanged", "skip-worktree"].includes(scenario)) {
+            const flags = await sh(["git", "ls-files", "-v", "--", "greeting.txt"], { cwd: request.cwd });
+            expect(flags.stdout).toBe(`${scenario === "assume-unchanged" ? "h" : "S"} greeting.txt\n`);
+            expect(readFileSync(join(request.cwd, "greeting.txt"), "utf8")).toBe("generated\n");
+          }
           if (executorKind === "lan" && !fallbacks.has(handle.id)) {
             // Simulate worker-reported post-execution state, independently of the request SHA.
             const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: request.cwd })).stdout.trim();
+            const provenance = await gateProvenance(request.cwd, signal, request.headSha);
             run = GateRunSchema.parse({
               ...run,
+              ...provenance,
               ...(scenario === "lan-missing"
                 ? {}
                 : { sha: scenario === "lan-commit-mismatch" ? "0".repeat(40) : head }),
@@ -252,6 +292,12 @@ test.each([
                         : (await sh(["git", "rev-parse", "HEAD^{tree}"], { cwd: request.cwd })).stdout.trim(),
                   }),
             });
+            if (scenario === "lan-legacy") delete run.trackedClean;
+            if (scenario === "lan-missing") {
+              delete run.sha;
+              delete run.treeHash;
+            }
+            if (scenario === "lan-sha-only") delete run.treeHash;
           }
           if (scenario === "setup-fail")
             return {
@@ -323,13 +369,26 @@ test.each([
             expect(result.stdout).toContain("snapshot-base-1-g");
           }
           if (unconfirmed) {
+            expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual([]);
             expect(result.stdout).toContain("Result is not reusable because");
             expect(result.stdout).toContain(
-              scenario.includes("unreadable") || ["lan-missing", "lan-sha-only"].includes(scenario)
+              scenario.includes("unreadable") ||
+                ["lan-missing", "lan-sha-only", "lan-legacy"].includes(scenario)
                 ? "provenance could not be confirmed"
-                : "snapshot changed during the gate",
+                : scenario === "uncommitted" ||
+                    scenario.endsWith("-rewrite") ||
+                    [
+                      "assume-unchanged",
+                      "skip-worktree",
+                      "redacted-path",
+                      "staged",
+                      "staged-restored",
+                      "deleted",
+                      "renamed",
+                    ].includes(scenario)
+                  ? "tracked files changed"
+                  : "snapshot changed during the gate",
             );
-            expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual([]);
             const state = f.store.getRunState<RunState>(runId);
             const blocked: Verify = {
               overall: "fail",
@@ -409,6 +468,8 @@ test.each([
           const repo = f.store.listRepos()[0];
           if (!repo) throw new Error("missing repo");
           const other = f.store.createRun(repo, { repo: fixture.repoDir, prompt: "other run" });
+          // Its shared handler would overwrite snapshotDir; only a foreign run identity is needed.
+          f.store.updateRun(other.id, { status: "cancelled" });
           f.store.db.query("UPDATE agent_gate_executions SET run_id = ?").run(other.id);
         }
       };
@@ -454,11 +515,12 @@ test.each([
       "lan",
       "lan-fallback",
       "lan-job-fallback",
-      "uncommitted",
+      "untracked-output",
+      "ignored-output",
       "repeat",
       "repeat-lan",
     ].includes(scenario);
-    const finishing = requests.filter((r) => r.priority === "finish");
+    const finishing = requests.filter((r) => r.runId === run.id && r.priority === "finish");
     expect(finishing.some((r) => r.checks?.includes("test"))).toBe(!reuse && scenario !== "no-test");
     if (scenario === "only-test") expect(finishing).toEqual([]);
     else expect(finishing.some((r) => r.checks?.includes("lint"))).toBe(true);
@@ -492,6 +554,12 @@ test.each([
       )
     )
       expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual([]);
+    if (unconfirmed)
+      expect(events.some((event) => event.message.startsWith("Result is not reusable because"))).toBe(true);
+    if (scenario === "redacted-path") {
+      expect(JSON.stringify(events)).toContain("changed-[redacted].txt");
+      expect(JSON.stringify(events)).not.toContain("synthetic-path-credential-845");
+    }
     if (snapshotDir) expect(existsSync(snapshotDir)).toBe(false);
   } finally {
     lookup?.mockRestore();
@@ -503,6 +571,7 @@ test.each([
   { flaky: true, kind: "local" as const, invalid: "" },
   { flaky: false, kind: "lan" as const, invalid: "" },
   { flaky: true, kind: "lan" as const, invalid: "" },
+  { flaky: true, kind: "local" as const, invalid: "first-rewrite" },
   { flaky: true, kind: "local" as const, invalid: "retry-commit" },
   { flaky: false, kind: "local" as const, invalid: "retry-unreadable" },
   { flaky: true, kind: "lan" as const, invalid: "first-missing" },
@@ -518,12 +587,15 @@ test.each([
         "[gates]",
         `[gates]\nretry_files = ${JSON.stringify(
           kind === "local" && invalid
-            ? `if test -d .git; then ${invalid === "retry-commit" ? `${commit} --allow-empty` : "rm .git/HEAD"}; fi; echo retry {files}`
+            ? `if test -d .git; then ${invalid === "first-rewrite" ? "echo hello > greeting.txt" : invalid === "retry-commit" ? `${commit} --allow-empty` : "rm .git/HEAD"}; fi; echo retry {files}`
             : "echo retry {files}",
         )}`,
       )
       .replace('setup = ["echo setup"]', `setup = ['touch "$HOME/setup-marker"']`)
-      .replace('run="echo trusted-test"', `run='test -e "$HOME/setup-marker" && echo trusted-test'`),
+      .replace(
+        'run="echo trusted-test"',
+        `run='test -e "$HOME/setup-marker" && ${invalid === "first-rewrite" ? "if test -d .git; then echo changed > greeting.txt; fi; " : ""}echo trusted-test'`,
+      ),
   );
   writeFileSync(join(fixture.repoDir, "sample.test.ts"), "// fixture\n");
   await sh(["git", "add", ".limitless.toml", "sample.test.ts"], { cwd: fixture.repoDir });
@@ -553,7 +625,14 @@ test.each([
     },
     attach(handle, signal, req, hooks) {
       const execution = local.attach(handle, signal, req, hooks);
-      if (!worktree || req?.priority !== "start") return execution;
+      if (!worktree || req?.priority !== "start")
+        return {
+          ...execution,
+          result: execution.result.then(async (run) => ({
+            ...run,
+            ...(req && kind === "lan" ? await gateProvenance(req.cwd, signal, req.headSha) : {}),
+          })),
+        };
       calls++;
       const failed = !flaky || calls === 1;
       const badReport =
@@ -562,6 +641,11 @@ test.each([
         ...execution,
         result: execution.result.then(async (run) => {
           expect(run.checks.every((check) => check.ok)).toBe(true);
+          if (kind === "lan") Object.assign(run, await gateProvenance(req.cwd, signal, req.headSha));
+          if (kind === "lan" && badReport && invalid.includes("missing")) {
+            delete run.sha;
+            delete run.treeHash;
+          }
           return {
             ...run,
             ...(kind === "lan" && !(badReport && invalid.includes("missing"))
@@ -633,8 +717,9 @@ test.each([
     { gateExecutor: executor },
   );
   const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell.txt" });
-  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-  expect(sessionComplete).toBe(true);
+  const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+  expect(status, f.store.getRun(run.id)?.error ?? "").toBe("succeeded");
+  expect(sessionComplete, JSON.stringify(f.store.listInvocations(run.id).map((i) => i.error))).toBe(true);
   const checks: GateComparison[] = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "null");
   const testCheck = checks.find((c) => c.name === "test");
   if (invalid) {

@@ -151,7 +151,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
                 }
               })();
               const [run] = await Promise.all([execution.result, stream]);
-              Object.assign(run, await gateProvenance(request.cwd, controller.signal));
+              Object.assign(run, await gateProvenance(request.cwd, controller.signal, request.headSha));
               controller.signal.throwIfAborted();
               if (!workers.complete(handle.id, run, true)) throw new Error("LAN gate job cancelled");
               return workers.sanitize(run);

@@ -207,7 +207,17 @@ export class Factory {
           name,
           (async (spec) => {
             const fast = spec.fast ?? this.tracker.isFast(spec.target.provider);
-            const result = redactCredentialData(await harness(protectCredentials({ ...spec, fast })));
+            const result = redactCredentialData(
+              await harness(
+                protectCredentials({
+                  ...spec,
+                  fast,
+                  ...(name === "claude"
+                    ? { claudeSubscriptionToken: cfg.secrets.CLAUDE_CODE_OAUTH_TOKEN }
+                    : {}),
+                }),
+              ),
+            );
             this.tracker.observeFast(spec.target.provider, fast, result);
             return result;
           }) satisfies Harness,

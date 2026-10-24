@@ -237,13 +237,18 @@ async function smoke(root: string, binaryPath: string | undefined, diagnostic: (
       const requests: Record<string, unknown>[] = [];
       const unix = join(root, "lease.sock");
       const marker = join(root, "agent-test-marker");
+      const optionsMarker = join(root, "options-preload-marker");
+      writeFileSync(
+        join(hostile, "setup.cjs"),
+        `require("node:fs").writeFileSync(${JSON.stringify(optionsMarker)}, "ran"); process.exit(93);\n`,
+      );
       writeFileSync(
         join(hostile, "package.json"),
         JSON.stringify({ scripts: { "__agent-test": `touch '${marker.replaceAll("'", "'\\''")}'` } }),
       );
       writeFileSync(
         join(root, "stubs", "slot-probe"),
-        `#!/bin/sh\n[ "\${BUN_BE_BUN+x}" != x ] || exit 91\nprintf "real:%s\\n" "$@"\n`,
+        `#!/bin/sh\n[ "\${BUN_BE_BUN+x}" != x ] || exit 91\nprintf "real:%s\\n" "$@"\nprintf "options:%s:<%s>\\n" "\${BUN_OPTIONS+x}" "\${BUN_OPTIONS-}"\nexit 37\n`,
         { mode: 0o755 },
       );
       const stub = Bun.serve({
@@ -267,14 +272,28 @@ async function smoke(root: string, binaryPath: string | undefined, diagnostic: (
               const config: WrapperConfig = JSON.parse(readFileSync(configPath, "utf8"));
               chmodSync(configPath, 0o600);
               writeFileSync(configPath, JSON.stringify({ ...config, unix }));
-              for (const mode of ["leased", "direct"]) {
+              for (const [mode, options] of [
+                ["leased", "--preload=./setup.cjs"],
+                ["direct", "--preload=./setup.cjs"],
+                ["leased", undefined],
+                ["direct", undefined],
+                ["leased", ""],
+                ["direct", ""],
+              ] as const) {
                 const before = requests.length;
                 const cmd = launch(["slot-probe", mode], hostile, 30_000, {
                   ...env,
                   PATH: `${path.split(delimiter)[0]}${delimiter}${env.PATH}`,
                   BUN_BE_BUN: "1",
+                  ...(options === undefined ? {} : { BUN_OPTIONS: options }),
                 });
-                if ((await cmd.done()) !== 0 || cmd.stdout() !== `real:${mode}\n` || existsSync(marker))
+                if (
+                  (await cmd.done()) !== 37 ||
+                  cmd.stdout() !==
+                    `real:${mode}\noptions:${options === undefined ? "" : "x"}:<${options ?? ""}>\n` ||
+                  existsSync(marker) ||
+                  existsSync(optionsMarker)
+                )
                   throw new Error(`${mode} wrapper failed: ${cmd.tail()}`);
                 const observed = requests.slice(before);
                 if (
