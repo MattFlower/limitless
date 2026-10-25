@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
-import { ENV_FD, ENV_FILE, landlockCommand, PAYLOAD_ENV } from "./landlock.ts";
+import { bwrapOptions, ENV_FD, ENV_FILE, landlockCommand, PAYLOAD_ENV } from "./landlock.ts";
 import { ancestorReadPolicy, ConfinementError, specificReadDenies } from "./read-policy.ts";
 import { type ConfinementBackend, killedByCancel } from "./sandbox.ts";
 import type { WriteRoots } from "./scratch.ts";
@@ -93,6 +93,33 @@ export function shadow(dir: string, denied: ReadonlySet<string> = new Set()): st
   ];
 }
 
+type Hidden = { path: string; at: string; absent: boolean };
+
+/**
+ * Refuses a plan in which a later mount re-exposes a denied path. The last mount at or above each existing
+ * deny, and at or above each absent deny's first missing name, must be a tmpfs or a mask, and nothing may
+ * be mounted inside a missing name. It reads only the plan, so host lookups that disagreed while the plan
+ * was built cannot get past it; the launcher pins every bind source, so later renames cannot either.
+ */
+function assertHidden(args: string[], sources: { dir: string; file: string }, denies: Hidden[]): void {
+  const mounts = bwrapOptions([...args, "--"]).options.flatMap(([option = "", ...values]) =>
+    ["--perms", "--remount-ro", "--chdir"].includes(option) || !values.length
+      ? []
+      : [
+          {
+            at: values.at(-1) ?? "",
+            hides:
+              option === "--tmpfs" ||
+              (option.includes("bind") && [sources.dir, sources.file].includes(values[0] ?? "")),
+          },
+        ],
+  );
+  for (const { path, at, absent } of denies) {
+    const last = mounts.findLastIndex((m) => within(m.at, at));
+    if (!mounts[last]?.hides || (absent && mounts.slice(last).some((m) => !m.hides && within(at, m.at))))
+      throw new ConfinementError(`Cannot confine ${path}: the mount plan would expose it`);
+  }
+}
 /**
  * bwrap arguments equivalent to `seatbeltProfile`: a read-only root; private /run, /tmp and /var/tmp
  * (hiding $XDG_RUNTIME_DIR and every host socket); denied reads masked, then allowances, write roots and
@@ -167,7 +194,7 @@ export function bwrapArgs(
   const literals = canonical(ancestorReadPolicy(allow, deny).literals).filter(
     (p) => masked.some((m) => within(m, p)) && statSync(p).isFile(),
   );
-  return [
+  const args = [
     ...["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"],
     ...["--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
     // Before the private tmpfs mounts and every mask, which must cover what the shadows bind back.
@@ -192,11 +219,16 @@ export function bwrapArgs(
     ...own.flatMap((p) => ["--ro-bind", p, p]),
     ...["/run", ...shadowed, ...traversable, ...commandRoots].flatMap((p) => ["--remount-ro", p]),
   ];
+  assertHidden(args, sources, [
+    ...denied.flatMap(({ path, real }) => (real ? [{ path, at: real, absent: false }] : [])),
+    ...absent.map(({ path, dir, name }) => ({ path, at: join(dir, name), absent: true })),
+  ]);
+  return args;
 }
 
 const command = (cmd: string[], roots: WriteRoots, bwrap: string) => [
   ...landlockCommand(roots.daemonPort ?? 0),
-  "--",
+  "--bwrap",
   bwrap,
   ...bwrapArgs(roots),
   "--",
@@ -220,7 +252,7 @@ function launch(cmd: string[], roots: WriteRoots, payload: { env: Record<string,
   return {
     cmd: [
       ...landlockCommand(roots.daemonPort ?? 0),
-      "--",
+      "--bwrap",
       BWRAP,
       ...bwrapArgs(roots, undefined, undefined, ENV_FD),
       ...["--chdir", payload.cwd, "--", "/bin/sh", "-c", LOAD_ENV, "sh", ...cmd],
