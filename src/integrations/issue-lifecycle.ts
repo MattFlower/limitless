@@ -63,6 +63,8 @@ export async function reconcileIssueLifecycle(
           run = store.getRun(snapshot.id);
           if (!run) continue;
           const target = desiredLabel(run);
+          // A partial transition must not leave the old complete-set cursor valid.
+          save("labels", "pending");
           for (const label of labels) {
             if (signal.aborted) return;
             run = store.getRun(snapshot.id);
@@ -94,19 +96,21 @@ export async function reconcileIssueLifecycle(
       }
       run = store.getRun(snapshot.id);
       if (!run) continue;
-      const events: [string, string][] = [["started", `started: ${cfg.uiUrl}/runs/${run.id}`]];
-      if (run.prUrl) events.push(["pr", `opened ${run.prUrl}`]);
+      const events = new Map([["started", `started: ${cfg.uiUrl}/runs/${run.id}`]]);
+      if (run.prUrl) events.set("pr", `opened ${run.prUrl}`);
       if (run.status === "needs_human")
-        events.push(["needs_human", `needs you: ${run.error ?? "see the factory UI."}`]);
-      if (run.status === "failed") events.push(["failed", `failed: ${run.error ?? "see the factory UI."}`]);
+        events.set("needs_human", `needs you: ${run.error ?? "see the factory UI."}`);
+      if (run.status === "failed") events.set("failed", `failed: ${run.error ?? "see the factory UI."}`);
       if (run.status === "cancelled")
-        events.push([
+        events.set(
           "cancelled",
           `was cancelled${run.error?.startsWith("cancelled by ") ? " by the owner" : ""}.`,
-        ]);
-      for (const [event, text] of events) {
+        );
+      // Pending events outlive their status; retry with their original publication-safe body.
+      for (const event of ["started", "pr", "needs_human", "failed", "cancelled"]) {
         if (signal.aborted) return;
         const effect = `comment:${event}`;
+        if (!events.has(event) && state(effect) !== "pending") continue;
         if (state(effect) === "done") continue;
         if (repoSettings(cfg, repo).discreet) {
           save(effect, "done");
@@ -126,7 +130,11 @@ export async function reconcileIssueLifecycle(
               continue;
             }
           }
-          let body = `${marker}\n${redactCredentials(`Limitless run ${run.id} ${text}`)}`;
+          const fallback = `${marker}\nLimitless run ${run.id} ${event === "needs_human" ? "needs you" : event}: see the factory UI.`;
+          let body = redactCredentials(
+            state(`body:${event}`) ??
+              (events.has(event) ? `${marker}\nLimitless run ${run.id} ${events.get(event)}` : fallback),
+          );
           try {
             const worktree = store.getRunState<{ worktreePath?: string }>(run.id)?.worktreePath;
             checkPublicationText(
@@ -140,7 +148,7 @@ export async function reconcileIssueLifecycle(
               ]),
             );
           } catch {
-            body = `${marker}\nLimitless run ${run.id} ${event === "needs_human" ? "needs you" : event}: see the factory UI.`;
+            body = fallback;
             log(
               redactCredentials(
                 `Issue lifecycle run ${run.id}: comment text replaced by private-string policy`,
@@ -148,7 +156,10 @@ export async function reconcileIssueLifecycle(
             );
           }
           if (signal.aborted) return;
-          save(effect, "pending");
+          store.transaction(() => {
+            save(`body:${event}`, body);
+            save(effect, "pending");
+          });
           await call([`${path}/comments`, "-X", "POST", "-f", `body=${body}`]);
           save(effect, "done");
         } catch (error) {

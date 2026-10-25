@@ -1298,6 +1298,70 @@ test.each(["after label", "after comment"])("lifecycle resumes exactly once %s w
   expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
 });
 
+test.each(["write failure", "status changes"])(
+  "partial label transition recovers its previous desired set after %s",
+  async (interruption) => {
+    const h = harness();
+    const run = await linkedRun(h);
+    h.start();
+    await h.advance();
+    h.store.updateRun(run.id, { status: "needs_human" });
+    if (interruption === "write failure") {
+      h.intercept = (args) => {
+        if (args.at(-1) === "labels[]=limitless:needs-you") throw new Error("label write rejected");
+      };
+    } else {
+      h.afterWrite = (args) => {
+        if (args.includes("DELETE")) h.store.updateRun(run.id, { status: "running" });
+      };
+    }
+    await h.advance(180_000);
+    expect(h.labels.get(7)).toEqual(new Set());
+    h.store.updateRun(run.id, { status: "running" });
+    h.intercept = undefined;
+    h.afterWrite = undefined;
+    h.stop();
+    h.start();
+    await h.advance();
+    expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  },
+);
+
+test.each([
+  ["needs_human", false],
+  ["needs_human", true],
+  ["failed", false],
+  ["failed", true],
+] as const)("pending %s comment survives resolution and restart (accepted: %s)", async (status, accepted) => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.start();
+  await h.advance();
+  h.store.updateRun(run.id, { status, error: "original reason" });
+  const reject = (args: string[]) => {
+    if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("comment connection lost");
+  };
+  if (accepted) h.afterWrite = reject;
+  else h.intercept = reject;
+  await h.advance(180_000);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${status}`)).toBe("pending");
+  h.store.updateRun(run.id, { status: "resolved", error: "changed reason" });
+  h.stop();
+  h.start();
+  await h.advance();
+  if (!accepted) {
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${status}`)).toBe("pending");
+    h.intercept = undefined;
+    await h.advance(180_000);
+  }
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${status}`)).toBe("done");
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.comments.get(7)?.[1]).toContain("original reason");
+  expect(h.comments.get(7)?.[1]).not.toContain("changed reason");
+  await h.advance(180_000);
+  expect(h.comments.get(7)).toHaveLength(2);
+});
+
 test("migration excludes existing runs, including after reopening the database", async () => {
   const h = harness();
   const before = join(h.cfg.paths.home, "before");
