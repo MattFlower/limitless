@@ -91,7 +91,7 @@ const procResult: ProcResult = {
   durationMs: 1,
 };
 
-test("browser scratch is private, separated between invocations and removed on completion and cancel", async () => {
+test("refused browser setup stays in private scratch and is cleaned on completion and cancel", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "browser-lifecycle-")));
   const cwd = join(root, "checkout"),
     cache = join(root, "cache");
@@ -105,11 +105,13 @@ test("browser scratch is private, separated between invocations and removed on c
       const result = await runToolAgent(
         spec,
         fakeHarness((invocation) => {
-          const server = browserMcp(invocation, "codex");
-          expect(server).toBeDefined();
-          for (const flag of ["--user-data-dir", "--output-dir"]) {
-            const path = server?.args[(server?.args.indexOf(flag) ?? -2) + 1] ?? "";
-            expect(path.startsWith(`${realpathSync(invocation.scratchDir ?? "")}/`)).toBe(true);
+          expect(browserMcp(invocation, "codex")).toBeUndefined();
+          const scratch = realpathSync(invocation.scratchDir ?? "");
+          const directories = readdirSync(scratch).filter((name) => name.startsWith("browser-"));
+          expect(directories).toHaveLength(1);
+          for (const name of ["profile", "output"]) {
+            const path = join(scratch, directories[0] ?? "", name);
+            expect(path.startsWith(`${scratch}/`)).toBe(true);
             expect(existsSync(path)).toBe(true);
             expect(statSync(path).mode & 0o777).toBe(0o700);
             profiles.push(path);

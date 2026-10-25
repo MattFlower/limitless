@@ -33,7 +33,7 @@ async function fixture() {
   return { root, cwd, scratch, cache, fake, spec: browserSpec(cwd, scratch, cache) };
 }
 
-test("provisioning pins the package and installs chromium once, then configuration uses only the cache", async () => {
+test("provisioning pins the package and installs chromium once, then unsafe configuration is refused", async () => {
   const { cache, fake, spec } = await fixture();
   expect(fake.calls[0]?.cmd.slice(1)).toEqual([
     "install",
@@ -54,10 +54,15 @@ test("provisioning pins the package and installs chromium once, then configurati
   await provisionBrowserMcp(cache, async () => {
     throw new Error("must reuse matching cache");
   });
-  const server = browserMcp(spec, "codex");
-  expect(server?.command).toBe(realpathSync(Bun.which("node") ?? ""));
-  expect(server?.args[0]).toBe(join(cache, "node_modules/@playwright/mcp/cli.js"));
-  expect(server?.args).toContain(join(cache, "browsers/chromium"));
+  const events: AgentEvent[] = [];
+  spec.onEvent = (event) => events.push(event);
+  expect(browserMcp(spec, "codex")).toBeUndefined();
+  expect(events).toEqual([
+    expect.objectContaining({
+      code: "browser_unavailable",
+      text: expect.stringContaining("cannot confine redirects"),
+    }),
+  ]);
   expect(fake.calls).toHaveLength(4);
 });
 
@@ -71,15 +76,35 @@ test("provisioning refuses a CLI lacking browser-origin restriction support", as
 });
 
 test.each(["http://127.0.0.1:43210/x?q=1", "https://LOCALHOST:443/x", "http://[::1]:43210/x"])(
-  "one canonical allowed origin: %s",
+  "valid loopback origin still refuses unsafe browser confinement: %s",
   async (url) => {
     const { spec } = await fixture();
     if (!spec.browser) throw new Error("missing browser request");
     spec.browser.previewUrl = url;
-    const server = browserMcp(spec, "codex");
-    expect(server?.args.filter((arg) => arg === "--allowed-origins")).toHaveLength(1);
-    expect(server?.args[(server?.args.indexOf("--allowed-origins") ?? -2) + 1]).toBe(new URL(url).origin);
-    expect(server?.args).not.toContain("--allowed-hosts");
+    const events: AgentEvent[] = [];
+    spec.onEvent = (event) => events.push(event);
+    expect(browserMcp(spec, "codex")).toBeUndefined();
+    expect(events).toEqual([
+      expect.objectContaining({ text: expect.stringContaining("cannot confine redirects") }),
+    ]);
+  },
+);
+
+test.each(["claude", "codex"] as const)(
+  "%s refuses the pinned server's filename write bypass even with valid scratch and cache",
+  async (harness) => {
+    const { spec } = await fixture();
+    const events: AgentEvent[] = [];
+    spec.onEvent = (event) => events.push(event);
+    expect(browserMcp(spec, harness)).toBeUndefined();
+    expect(events).toEqual([
+      expect.objectContaining({
+        code: "browser_unavailable",
+        text: expect.stringContaining(
+          "filename tools can write outside scratch, including through checkout symlinks",
+        ),
+      }),
+    ]);
   },
 );
 

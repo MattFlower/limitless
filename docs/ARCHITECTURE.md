@@ -130,8 +130,9 @@ before model calls. A matching committed diff starts an isolated preview immedia
 verify attempt; reused round results do not start one. Build and seed use scratch HOME/TMPDIR,
 reserved environment keys are enforced, and readiness stays on the loopback preview origin. The
 server and scratch are torn down on success, failure or cancellation. Eligible local invocations
-use pinned, pre-provisioned Playwright MCP tooling (see [OPERATIONS](OPERATIONS.md#preview-browser-tooling));
-unavailable tooling or incompatible confinement records a no-browser warning. Older runs without
+request pinned, pre-provisioned Playwright MCP tooling (see [OPERATIONS](OPERATIONS.md#preview-browser-tooling));
+the current pin cannot enforce network and filesystem confinement, so browser setup fails closed
+with an invocation warning even when tooling is installed. Older runs without
 a snapshot restore it once from their recorded base SHA on resume, before any model calls; the
 edited worktree configuration is never used.
 

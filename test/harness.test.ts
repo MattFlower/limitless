@@ -54,7 +54,7 @@ const fixture = (name: string) =>
     .split("\n")
     .filter(Boolean);
 
-test("preview browsers use strict cached stdio MCP configuration in both harnesses", async () => {
+test("unsafe pinned browsers remain excluded by both harnesses despite a valid cache", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "harness-browser-")));
   const cwd = join(root, "checkout");
   const cache = join(root, "cache");
@@ -62,43 +62,39 @@ test("preview browsers use strict cached stdio MCP configuration in both harness
   try {
     await fakeBrowserCache(cache);
     await withScratch(cwd, async (scratchDir) => {
-      const spec = browserSpec(cwd, scratchDir, cache);
-      const claude = buildClaudeArgs(spec, "session");
-      expect(claude).toContain("--strict-mcp-config");
-      expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
-      const config = JSON.parse(claude[claude.indexOf("--mcp-config") + 1] ?? "{}");
-      expect(Object.keys(config.mcpServers)).toEqual(["playwright"]);
-      const codex = buildCodexArgs(spec);
-      expect(codex).toContain("--ignore-user-config");
-      expect(codex).toContain("--strict-config");
-      expect(codex).toContain("orchestrator.mcp.enabled=true");
-      const overrides = Object.assign(
-        {},
-        ...codex.flatMap((arg, i) => (codex[i - 1] === "-c" ? [Bun.TOML.parse(arg)] : [])),
-      );
-      expect(Object.keys(overrides.mcp_servers)).toEqual(["playwright"]);
-      expect(config.mcpServers.playwright.type).toBe("stdio");
-      for (const server of [config.mcpServers.playwright, overrides.mcp_servers.playwright]) {
-        expect(server.command).toBe(realpathSync(Bun.which("node") ?? ""));
-        expect(server.args[0]).toBe(join(cache, "node_modules/@playwright/mcp/cli.js"));
-        expect(server.args).toContain("--headless");
-        expect(server.args).toContain("--sandbox");
-        expect(server.args[server.args.indexOf("--allowed-origins") + 1]).toBe("http://127.0.0.1:43210");
-        expect(server.args).not.toContain("--allowed-hosts");
-        expect(server.args).not.toContain("--no-sandbox");
-        expect(server.args).not.toContain("--port");
-        for (const flag of ["--user-data-dir", "--output-dir"])
-          expect(server.args[server.args.indexOf(flag) + 1].startsWith(`${realpathSync(scratchDir)}/`)).toBe(
-            true,
-          );
-        expect(server.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD).toBe("1");
+      const events: AgentEvent[] = [];
+      const spec = {
+        ...browserSpec(cwd, scratchDir, cache),
+        onEvent: (event: AgentEvent) => events.push(event),
+      };
+      for (const mode of ["readonly", "edit"] as const) {
+        const claude = buildClaudeArgs({ ...spec, mode }, "session");
+        expect(claude).toContain("--strict-mcp-config");
+        expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
+        const config = JSON.parse(claude[claude.indexOf("--mcp-config") + 1] ?? "{}");
+        expect(config).toEqual({ mcpServers: {} });
+        expect(claude.some((arg) => arg.startsWith("mcp__playwright__"))).toBe(false);
+        const codex = buildCodexArgs({ ...spec, mode });
+        expect(codex).toContain("--ignore-user-config");
+        expect(codex).toContain("--strict-config");
+        const overrides = Object.assign(
+          {},
+          ...codex.flatMap((arg, i) => (codex[i - 1] === "-c" ? [Bun.TOML.parse(arg)] : [])),
+        );
+        expect(overrides.orchestrator.mcp.enabled).toBe(false);
+        expect(overrides.mcp_servers).toBeUndefined();
       }
-      expect(claude).toContain("mcp__playwright__browser_navigate");
-      expect(claude.slice(claude.indexOf("--disallowedTools") + 1)).toContain(
-        "mcp__playwright__browser_run_code_unsafe",
-      );
-      expect(overrides.mcp_servers.playwright.enabled_tools).toContain("browser_navigate");
-      expect(overrides.mcp_servers.playwright.enabled_tools).not.toContain("browser_run_code_unsafe");
+      expect(events.filter((event) => event.type === "warning")).toHaveLength(4);
+      expect(
+        events.filter((event) => event.type === "warning" && event.text.includes("cannot confine redirects")),
+      ).toHaveLength(3);
+      expect(
+        events.filter(
+          (event) =>
+            event.type === "warning" && event.text.includes("filename tools can write outside scratch"),
+        ),
+      ).toHaveLength(3);
+      events.length = 0;
       for (const variant of [{ browser: undefined }, { noTools: true }]) {
         const args = buildCodexArgs({ ...spec, ...variant });
         expect(args).toContain("orchestrator.mcp.enabled=false");
@@ -110,6 +106,7 @@ test("preview browsers use strict cached stdio MCP configuration in both harness
           });
         else expect(argsClaude[argsClaude.indexOf("--tools") + 1]).toBe("");
       }
+      expect(events).toEqual([]);
       const warnings: string[] = [];
       const editor = buildClaudeArgs(
         {
@@ -123,7 +120,7 @@ test("preview browsers use strict cached stdio MCP configuration in both harness
       );
       expect(JSON.parse(editor[editor.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({ mcpServers: {} });
       expect(warnings).toEqual([expect.stringContaining("outer confinement")]);
-      expect(buildCodexArgs({ ...spec, mode: "edit" })).toContain("orchestrator.mcp.enabled=true");
+      expect(buildCodexArgs({ ...spec, mode: "edit" })).toContain("orchestrator.mcp.enabled=false");
     });
   } finally {
     rmSync(root, { recursive: true, force: true });

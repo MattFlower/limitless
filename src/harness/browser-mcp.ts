@@ -166,42 +166,18 @@ export function browserMcp(spec: AgentSpec, harness: "claude" | "codex"): Browse
     const cwd = realpathSync(spec.cwd);
     if ([scratch, cwd].some((path) => inside(path, cache) || inside(cache, path)))
       throw new Error("browser cache overlaps agent write roots");
-    const { node, cli, browser } = installation(cache);
+    const { node } = installation(cache);
     if ([scratch, cwd].some((path) => inside(path, node)))
       throw new Error("browser runtime is agent-writable");
     const directory = mkdtempSync(join(scratch, "browser-"));
     const profile = join(directory, "profile"),
       output = join(directory, "output");
     for (const path of [profile, output]) mkdirSync(path, { mode: 0o700 });
-    return {
-      command: node,
-      args: [
-        cli,
-        "--headless",
-        "--sandbox",
-        "--user-data-dir",
-        profile,
-        "--output-dir",
-        output,
-        "--allowed-origins",
-        url.origin,
-        "--executable-path",
-        browser,
-        "--block-service-workers",
-        "--no-webmcp",
-      ],
-      env: {
-        ...Object.fromEntries(
-          Object.keys(process.env)
-            .filter((key) => key.startsWith("PLAYWRIGHT_MCP_"))
-            .map((key) => [key, ""]),
-        ),
-        NODE_OPTIONS: "",
-        NODE_PATH: "",
-        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1",
-        PLAYWRIGHT_BROWSERS_PATH: join(cache, "browsers"),
-      },
-    };
+    // Neither upstream guard is a security boundary. Do not start an MCP process outside the
+    // agent sandbox until redirects/connections and filename writes (including symlinks) are confined.
+    throw new Error(
+      `@playwright/mcp@${BROWSER_MCP_VERSION} cannot confine redirects and other browser connections to the preview origin; filename tools can write outside scratch, including through checkout symlinks`,
+    );
   } catch (error) {
     spec.onEvent({
       type: "warning",

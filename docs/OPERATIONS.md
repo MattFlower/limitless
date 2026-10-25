@@ -49,21 +49,24 @@ This installs exactly `@playwright/mcp@0.0.83` and its matching Chromium into
 must already be installed. A matching cache is reused. Runs never install packages or browsers;
 missing or incompatible tooling produces an invocation warning and continues without a browser.
 
-Live-preview verify calls and implement calls supplied a live preview use stdio MCP with
-`--headless`, `--user-data-dir`, `--output-dir` and exactly one `--allowed-origins` origin.
-Profiles and output are private invocation scratch directories, removed with scratch on completion
-or cancellation. Claude editors retain their outer confinement and record a no-browser warning;
-remote agents also receive no browser because the coordinator preview is host-local.
+Live-preview verify calls and implement calls supplied a live preview request browser setup, but
+**the current pin is disabled**. Each eligible invocation records a no-browser warning even with a
+valid cache: its origin filter does not cover redirects or all browser connections, and explicit
+filenames on output tools bypass `--output-dir`, including writes through checkout symlinks. The
+factory must enforce both network and filesystem confinement before enabling this server. Installing
+the cache does not enable it. No unrestricted server or download is used as a fallback.
 
 The pin's shipped `cli.js` delegates to `playwright-core@1.64.0-alpha-1790635538000`:
-`decorateMCPCommand`, `configFromCLIOptions` and `originOrHostGlob` were inspected. The allowlist
-controls browser requests; `--allowed-hosts` instead controls MCP HTTP transport hosts and is unused.
-Only UI operation tools are granted; server-side code, routing and browser reconfiguration tools
-are excluded. Chromium's sandbox is enabled; service workers and page-provided WebMCP tools are disabled.
-Upstream describes origin lists as a convenience guardrail that does not cover redirects, not a
-network security boundary ([configuration documentation](https://playwright.dev/mcp/configuration/options)).
-Fake tests cover configuration and cleanup; live startup and upstream enforcement need operational
-validation before relying on this guardrail for untrusted previews.
+`decorateMCPCommand`, `configFromCLIOptions` and `originOrHostGlob` were inspected. Supported options
+include `--headless`, `--user-data-dir`, `--output-dir` and `--allowed-origins`; `--allowed-hosts`
+instead controls MCP HTTP transport hosts. Upstream describes origin lists and file-access checks
+as convenience guardrails rather than security boundaries
+([configuration documentation](https://playwright.dev/mcp/configuration/options#access-control)).
+
+Setup directories remain private invocation scratch directories, removed on completion or
+cancellation. Claude editors retain their outer confinement and record a no-browser warning;
+remote agents also receive no browser because the coordinator preview is host-local. Fake tests
+cover cache provisioning, exclusion, diagnostics and cleanup without starting a browser.
 
 ## Reloading configuration
 
