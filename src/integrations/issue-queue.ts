@@ -4,7 +4,7 @@ import type { Run } from "../core/types.ts";
 import { ISSUE_CLAIM_STATUSES } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { type GhRunner, issueRunRequest, runGh } from "./github.ts";
-import { reconcileIssueLifecycle } from "./issue-lifecycle.ts";
+import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
 
 const date = z.string().refine((s) => Number.isFinite(Date.parse(s)));
 const actor = z.object({ login: z.string() }).nullable();
@@ -61,11 +61,8 @@ export function issueEligibility(
   const events = issue.timelineItems.nodes
     .filter((e) => e.__typename === "LabeledEvent")
     .filter((e) => priority(e.label.name));
-  const failedAt = Math.max(
-    -Infinity,
-    ...issue.timelineItems.nodes
-      .filter((e) => e.__typename === "LabeledEvent" && e.label.name === "limitless:failed")
-      .map((e) => Date.parse(e.createdAt)),
+  const failedIndex = issue.timelineItems.nodes.findLastIndex(
+    (e) => e.__typename === "LabeledEvent" && e.label.name === "limitless:failed",
   );
   const rename = issue.timelineItems.nodes
     .toReversed()
@@ -95,8 +92,13 @@ export function issueEligibility(
     reason = "factory status label";
   else if (
     issue.labels.nodes.some((l) => l.name === "limitless:failed") &&
-    (!Number.isFinite(failedAt) ||
-      !events.some((e) => trusts(e.actor?.login) && Date.parse(e.createdAt) > failedAt))
+    (failedIndex < 0 ||
+      !approved.some(
+        (label) =>
+          issue.timelineItems.nodes.findLastIndex(
+            (e) => e.__typename === "LabeledEvent" && e.label.name === label.name && trusts(e.actor?.login),
+          ) > failedIndex,
+      ))
   )
     reason = "factory status requires priority re-approval after failure";
   else if (issue.closedByPullRequestsReferences.nodes.some((p) => p.state === "OPEN"))
@@ -138,7 +140,12 @@ type QueueFactory = Pick<Factory, "cfg" | "store" | "scheduler" | "createRun">;
 
 export function startIssueQueue(
   factory: QueueFactory,
-  opts: { gh?: GhRunner; clock?: IssueQueueClock; log?: (s: string) => void } = {},
+  opts: {
+    gh?: GhRunner;
+    clock?: IssueQueueClock;
+    log?: (s: string) => void;
+    lifecycle?: IssueLifecycleOptions;
+  } = {},
 ): () => void {
   const q = factory.cfg.githubQueue;
   if (!q?.repos.length || !q.trusted.length) return () => {};
@@ -188,7 +195,7 @@ export function startIssueQueue(
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
     try {
-      await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log);
+      await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log, opts.lifecycle);
       for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
         try {

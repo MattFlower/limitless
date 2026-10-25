@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,6 +10,7 @@ import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { ISSUE_CLAIM_STATUSES, IssueClaimed, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { githubWebhook, issueRunRequest, mapGitHubEvent } from "../src/integrations/github.ts";
+import type { GitHubIdentity } from "../src/integrations/github-identity.ts";
 import { mountIntegrations } from "../src/integrations/index.ts";
 import { issueEligibility, type QueueIssue, startIssueQueue } from "../src/integrations/issue-queue.ts";
 import { RunContext } from "../src/pipeline/context.ts";
@@ -332,6 +333,10 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     requests,
     labels,
     comments,
+    commentAuthors: new Map<string, string>(),
+    login: "owner",
+    identity: async (_repo?: string): Promise<GitHubIdentity> => ({ kind: "owner" }),
+    maxCalls: undefined as number | undefined,
     intercept: undefined as ((args: string[]) => void) | undefined,
     afterWrite: undefined as ((args: string[]) => void) | undefined,
     rate: { cost: 1, remaining: 5000, resetAt: new Date(clock.now() + 3600_000).toISOString() },
@@ -345,6 +350,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
       if (h.hold) await h.hold;
       if (args[1] !== "graphql") {
         const path = args[1] ?? "";
+        if (path === "user") return JSON.stringify({ login: h.login });
         const number = Number(path.match(/issues\/(\d+)/)?.[1]);
         const current = labels.get(number) ?? new Set<string>();
         labels.set(number, current);
@@ -352,14 +358,29 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
         if (path.includes("/labels")) {
           if (method === "POST") current.add((args.at(-1) ?? "").replace("labels[]=", ""));
           else if (method === "DELETE") current.delete(decodeURIComponent(path.split("/labels/")[1] ?? ""));
-          else return JSON.stringify([[...current].map((name) => ({ name }))]);
+          else {
+            const page = Number(new URL(`https://example.com/${path}`).searchParams.get("page") ?? 1);
+            const result = [...current].slice((page - 1) * 100, page * 100).map((name) => ({ name }));
+            return JSON.stringify(args.includes("--slurp") ? [result] : result);
+          }
         } else if (path.includes("/comments")) {
-          if (method !== "POST")
-            return JSON.stringify([(comments.get(number) ?? []).map((body) => ({ body }))]);
-          comments.set(number, [...(comments.get(number) ?? []), (args.at(-1) ?? "").replace(/^body=/, "")]);
+          if (method !== "POST") {
+            const page = Number(new URL(`https://example.com/${path}`).searchParams.get("page") ?? 1);
+            const result = (comments.get(number) ?? [])
+              .map((body, i) => ({
+                id: number * 1000 + i + 1,
+                body,
+                user: { login: h.commentAuthors.get(body) ?? h.login },
+              }))
+              .slice((page - 1) * 100, page * 100);
+            return JSON.stringify(args.includes("--slurp") ? [result] : result);
+          }
+          const body = (args.at(-1) ?? "").replace(/^body=/, "");
+          comments.set(number, [...(comments.get(number) ?? []), body]);
+          h.commentAuthors.set(body, h.login);
         } else throw new Error(`unexpected lifecycle call ${args}`);
         h.afterWrite?.(args);
-        return "";
+        return JSON.stringify({ id: number * 1000 + (comments.get(number)?.length ?? 0) });
       }
       if (h.response !== undefined) return JSON.stringify(h.response);
       const query = args[3] ?? "";
@@ -378,6 +399,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     start() {
       stop = startIssueQueue(factory, {
         gh: h.gh,
+        lifecycle: { identity: h.identity, maxCalls: h.maxCalls },
         clock: {
           now: clock.now,
           set: ((fn: () => void, ms: number) => {
@@ -1201,9 +1223,9 @@ async function linkedRun(h: ReturnType<typeof harness>, number = 7) {
 }
 
 test.each([
-  ["needs_human", "limitless:needs-you", "needs you: reason"],
-  ["failed", "limitless:failed", "failed: reason"],
-  ["cancelled", null, "was cancelled by the owner."],
+  ["needs_human", "limitless:needs-you", "needs you: see"],
+  ["failed", "limitless:failed", "failed: see"],
+  ["cancelled", null, "was cancelled: see"],
 ] as const)(
   "lifecycle %s replaces labels and comments once across polling and restart",
   async (status, label, text) => {
@@ -1214,7 +1236,7 @@ test.each([
     await h.advance();
     expect(h.labels.get(7)).toEqual(new Set(["priority:1", "limitless:in-progress"]));
     expect(h.comments.get(7)).toEqual([
-      expect.stringContaining(`Limitless run ${run.id} started: ${h.cfg.uiUrl}/runs/${run.id}`),
+      expect.stringContaining(`Limitless run ${run.id} started: see ${h.cfg.uiUrl}/runs/${run.id}`),
     ]);
     h.store.updateRun(run.id, {
       status,
@@ -1230,7 +1252,7 @@ test.each([
     await h.advance();
     await h.advance(180_000);
     expect(h.comments.get(7)).toHaveLength(2);
-    expect(h.scopes.every((repo) => repo === "owner/repo")).toBe(true);
+    expect(h.scopes.filter(Boolean).every((repo) => repo === "owner/repo")).toBe(true);
   },
 );
 
@@ -1244,7 +1266,7 @@ test("PR opened comments once and merging clears labels without a merge comment"
   await h.advance(180_000);
   expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
   expect(h.comments.get(7)).toHaveLength(2);
-  expect(h.comments.get(7)?.[1]).toContain(`Limitless run ${run.id} opened ${prUrl}`);
+  expect(h.comments.get(7)?.[1]).toContain(`Limitless run ${run.id} opened a PR ${prUrl}`);
   h.store.updateRun(run.id, { merged: true });
   h.labels.get(7)?.add("limitless:needs-you");
   await h.advance(180_000);
@@ -1356,13 +1378,16 @@ test.each([
   }
   expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${status}`)).toBe("done");
   expect(h.comments.get(7)).toHaveLength(2);
-  expect(h.comments.get(7)?.[1]).toContain("original reason");
+  expect(h.comments.get(7)?.[1]).toContain(
+    `${status === "needs_human" ? "needs you" : "failed"}: see ${h.cfg.uiUrl}/runs/${run.id}.`,
+  );
+  expect(h.comments.get(7)?.[1]).not.toContain("original reason");
   expect(h.comments.get(7)?.[1]).not.toContain("changed reason");
   await h.advance(180_000);
   expect(h.comments.get(7)).toHaveLength(2);
 });
 
-test("migration excludes existing runs, including after reopening the database", async () => {
+test("migration suppresses history but reconciles later transitions after reopen", async () => {
   const h = harness();
   const before = join(h.cfg.paths.home, "before");
   cpSync(MIGRATION_DIR, before, {
@@ -1380,12 +1405,20 @@ test("migration excludes existing runs, including after reopening the database",
     mergePolicy: "pr",
   });
   const run = store.createRun(repo, { repo: repo.slug, prompt: "Closes #7" });
+  store.updateRun(run.id, { status: "running" });
+  const terminal = store.createRun(repo, { repo: repo.slug, prompt: "Closes #8" });
+  store.updateRun(terminal.id, { status: "failed" });
   store.close();
   store = new Store(path);
+  store.close();
+  store = new Store(path);
+  store.updateRun(run.id, { status: "failed" });
+  h.labels.set(7, new Set(["limitless:in-progress"]));
   const stop = startIssueQueue(
     { cfg: h.cfg, store, scheduler: h.factory.scheduler, createRun: h.factory.createRun },
     {
       gh: h.gh,
+      lifecycle: { identity: h.identity },
       clock: {
         now: h.clock.now,
         set: h.clock.timer.set as unknown as typeof setTimeout,
@@ -1395,40 +1428,47 @@ test("migration excludes existing runs, including after reopening the database",
   );
   try {
     await h.advance();
-    expect(store.issueLifecycleEffect(run.id, "", 0, "legacy")).toBe("done");
-    expect(h.calls.every((args) => args[1] === "graphql")).toBe(true);
+    await h.advance(180_000);
+    expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
+    expect(h.comments.get(7)).toEqual([expect.stringContaining(`Limitless run ${run.id} failed: see`)]);
+    expect(h.calls.some((args) => args[1]?.includes("issues/8"))).toBe(false);
   } finally {
     stop();
     store.close();
   }
 });
 
-test.each([undefined, "before", "equal", "untrusted", "trusted"] as const)(
-  "failure label re-approval: %s",
-  (mode) => {
-    const candidate = issue();
-    candidate.labels.nodes.push({ name: "limitless:failed" });
-    candidate.labels.totalCount++;
-    if (mode) {
-      candidate.timelineItems.nodes.push({
-        __typename: "LabeledEvent",
-        label: { name: "limitless:failed" },
-        actor: null,
-        createdAt: at,
-      });
-      candidate.timelineItems.nodes.push({
-        __typename: "LabeledEvent",
-        label: { name: "priority:1" },
-        actor: { login: mode === "untrusted" ? "stranger" : "owner" },
-        createdAt: new Date(
-          Date.parse(at) + (mode === "before" ? -1 : mode === "equal" ? 0 : 1),
-        ).toISOString(),
-      });
-    }
-    candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
-    expect(issueEligibility(candidate, ["owner"]).eligible).toBe(mode === "trusted");
-  },
-);
+test.each([
+  ["missing failure event", false],
+  ["removed priority", false],
+  ["priority before failure", false],
+  ["same timestamp later index", true],
+  ["untrusted failure then trusted priority", true],
+  ["untrusted failure without priority", false],
+  ["untrusted priority", false],
+] as const)("failure re-approval follows current labels and timeline: %s", (mode, eligible) => {
+  const candidate = issue();
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  if (mode !== "missing failure event")
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name: "limitless:failed" },
+      actor: { login: mode.startsWith("untrusted failure") ? "stranger" : "factory[bot]" },
+      createdAt: at,
+    });
+  if (!["priority before failure", "untrusted failure without priority"].includes(mode)) {
+    const name = mode === "removed priority" ? "priority:2" : "priority:1";
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name },
+      actor: { login: mode === "untrusted priority" ? "stranger" : "owner" },
+      createdAt: mode === "removed priority" ? new Date(Date.parse(at) + 1000).toISOString() : at,
+    });
+  }
+  candidate.labels.totalCount = candidate.labels.nodes.length;
+  candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
+  expect(issueEligibility(candidate, ["owner"]).eligible).toBe(eligible);
+});
 
 test("poll requires trusted re-approval later than the failure label", async () => {
   const h = harness();
@@ -1457,24 +1497,112 @@ test("poll requires trusted re-approval later than the failure label", async () 
   expect(h.runs()).toHaveLength(1);
 });
 
-test("comments redact credentials and replace private reasons", async () => {
+test.each(["failed", "needs_human"] as const)(
+  "%s comments contain only fixed public text",
+  async (status) => {
+    const h = harness();
+    const token = ["lifecycle", "test", "credential"].join("-");
+    const privateText = ["lifecycle", "private", "location"].join("-");
+    registerCredential("ISSUE_LIFECYCLE_TEST", token);
+    writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), privateText);
+    const run = await linkedRun(h);
+    const worktree = join(h.cfg.paths.work, run.id);
+    h.store.setRunState(run.id, { worktreePath: worktree });
+    const homePath = join(h.cfg.paths.home, "internal.db");
+    h.store.updateRun(run.id, { status, error: `${worktree} ${homePath} ${token} ${privateText}` });
+    h.start();
+    await h.advance();
+    expect(h.comments.get(7)).toHaveLength(2);
+    expect(h.comments.get(7)?.[1]).toBe(
+      `<!-- limitless-lifecycle:${run.id}:${status} -->\nLimitless run ${run.id} ${status === "failed" ? "failed" : "needs you"}: see ${h.cfg.uiUrl}/runs/${run.id}.`,
+    );
+    for (const value of [worktree, homePath, token, privateText])
+      expect(h.comments.get(7)?.[1]).not.toContain(value);
+  },
+);
+
+test("private lifecycle bodies are suppressed durably while labels still reconcile", async () => {
   const h = harness();
-  const token = ["lifecycle", "test", "credential"].join("-");
-  const privateText = ["lifecycle", "private", "location"].join("-");
-  registerCredential("ISSUE_LIFECYCLE_TEST", token);
-  writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), privateText);
   const run = await linkedRun(h);
-  h.store.updateRun(run.id, { status: "needs_human", error: `reason ${token}` });
+  writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), run.id);
   h.start();
   await h.advance();
-  expect(h.comments.get(7)?.[1]).toContain("reason [redacted");
-  h.store.updateRun(run.id, { status: "failed", error: `${token} ${privateText}` });
   await h.advance(180_000);
-  expect(h.comments.get(7)?.at(-1)).toContain(`Limitless run ${run.id} failed: see the factory UI.`);
-  expect([...h.comments.values()].flat().join("\n")).not.toContain(token);
-  expect([...h.comments.values()].flat().join("\n")).not.toContain(privateText);
-  expect(h.logs.join("\n")).toContain("text replaced");
+  expect(h.calls.some((args) => args[1]?.endsWith("/comments") && args.includes("POST"))).toBe(false);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
+  expect(h.logs.join("\n")).toContain(`owner/repo#7 run ${run.id}`);
+  expect(h.logs.join("\n")).toContain("Issue lifecycle comment");
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
 });
+
+test("records all observed events before a failed started delivery and later resolution", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "needs_human" });
+  h.intercept = (args) => {
+    if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("rejected");
+  };
+  h.start();
+  await h.advance();
+  for (const event of ["started", "needs_human"])
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${event}`)).toBe("pending");
+  h.intercept = undefined;
+  h.store.updateRun(run.id, { status: "resolved" });
+  await h.advance(180_000);
+  await h.advance(180_000);
+  expect(h.comments.get(7)).toEqual([
+    expect.stringContaining(`Limitless run ${run.id} started:`),
+    expect.stringContaining(`Limitless run ${run.id} needs you:`),
+  ]);
+});
+
+test("a foreign marker cannot acknowledge a pending comment; successful POST stores its id", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  const body = `<!-- limitless-lifecycle:${run.id}:started -->\nLimitless run ${run.id} started: see ${h.cfg.uiUrl}/runs/${run.id}.`;
+  h.store.setIssueLifecycleEffect(run.id, "owner/repo", 7, "comment:started", "pending", {
+    body,
+    login: "owner",
+  });
+  h.comments.set(7, [body]);
+  h.commentAuthors.set(body, "stranger");
+  h.start();
+  await h.advance();
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.calls.filter((a) => a[1]?.endsWith("/comments") && a.includes("POST"))).toHaveLength(1);
+  const effect = h.store
+    .issueLifecycleEffects(run.id, "owner/repo", 7)
+    .find((e) => e.effect === "comment:started");
+  expect(effect).toMatchObject({ state: "done", commentId: 7002 });
+});
+
+test.each(["app", "owner"] as const)(
+  "lost POST response dedupes using the %s posting identity",
+  async (kind) => {
+    const h = harness();
+    h.login = kind === "app" ? "factory[bot]" : "gh-user";
+    h.identity = async () => (kind === "app" ? { kind, token: "fake", botLogin: h.login } : { kind });
+    const run = await linkedRun(h);
+    h.afterWrite = (args) => {
+      if (args[1]?.endsWith("/comments")) {
+        h.stop();
+        throw new Error("response lost");
+      }
+    };
+    h.start();
+    await h.advance();
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("pending");
+    h.afterWrite = undefined;
+    h.start();
+    await h.advance();
+    expect(h.comments.get(7)).toHaveLength(1);
+    expect(h.calls.filter((a) => a[1]?.endsWith("/comments") && a.includes("POST"))).toHaveLength(1);
+    expect(
+      h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started"),
+    ).toMatchObject({ state: "done", commentId: 7001, login: h.login });
+    expect(h.calls.some((a) => a[1] === "user")).toBe(kind === "owner");
+  },
+);
 
 test("discreet lifecycle labels have durable suppression of comments", async () => {
   const h = harness();
@@ -1558,7 +1686,7 @@ test("lifecycle uses the status that wins while fetching labels", async () => {
   await h.advance();
   expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
   expect(h.comments.get(7)).toHaveLength(2);
-  expect(h.comments.get(7)?.[1]).toContain("failed: stopped during lookup");
+  expect(h.comments.get(7)?.[1]).toContain(`failed: see ${h.cfg.uiUrl}/runs/${run.id}.`);
 });
 
 test("a new run owns labels even when the old run is still failed", async () => {
@@ -1613,19 +1741,144 @@ test("issue links compare repository names case insensitively and ignore quoted 
   expect(h.scopes.filter((scope) => scope === "OWNER/REPO").length).toBeGreaterThan(0);
 });
 
-test("completed lifecycle checkpoints need no repeated GitHub reads", async () => {
+test("completed lifecycle history adds no GitHub calls or per-run reads", async () => {
+  const counts: number[][] = [];
+  for (const count of [1, 25]) {
+    const h = harness();
+    for (let i = 0; i < count; i++) {
+      const run = await linkedRun(h, i + 10);
+      h.store.updateRun(run.id, { status: "failed" });
+    }
+    h.start();
+    for (let i = 0; i < 6; i++) await h.advance(i ? 180_000 : 0);
+    expect(h.comments.size).toBe(count);
+    for (const comments of h.comments.values()) expect(comments).toHaveLength(2);
+    h.calls.length = 0;
+    const reads = spyOn(h.store, "getRun");
+    const effectReads = spyOn(h.store, "issueLifecycleEffect");
+    const batchReads = spyOn(h.store, "issueLifecycleEffects");
+    await h.advance(180_000);
+    expect(h.calls.every((args) => args[1] === "graphql")).toBe(true);
+    counts.push([reads.mock.calls.length, effectReads.mock.calls.length, batchReads.mock.calls.length]);
+    reads.mockRestore();
+    effectReads.mockRestore();
+    batchReads.mockRestore();
+  }
+  expect(counts).toEqual([
+    [0, 0, 0],
+    [0, 0, 0],
+  ]);
+});
+
+test.each([1, 5])(
+  "lifecycle call cap %s defers writes while admitting an eligible queue issue",
+  async (cap) => {
+    const h = harness();
+    h.maxCalls = cap;
+    for (let i = 10; i < 18; i++) {
+      const run = await linkedRun(h, i);
+      h.store.updateRun(run.id, { status: "failed" });
+    }
+    h.data.set("owner/repo", [issue()]);
+    h.start();
+    await h.advance();
+    expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(cap);
+    expect(h.runs()).toHaveLength(9);
+    for (let i = 0; i < 80; i++) {
+      h.calls.length = 0;
+      await h.advance(180_000);
+      expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(cap);
+    }
+    for (let i = 10; i < 18; i++) {
+      expect(h.labels.get(i)).toEqual(new Set(["limitless:failed"]));
+      expect(h.comments.get(i)).toHaveLength(2);
+    }
+    expect(h.labels.get(1)).toEqual(new Set(["limitless:in-progress"]));
+    expect(h.comments.get(1)).toHaveLength(1);
+  },
+);
+
+test("paginated lifecycle reads respect the cap and resume through a lost response", async () => {
+  const h = harness();
+  h.maxCalls = 1;
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "failed" });
+  const ordinary = Array.from({ length: 100 }, (_, i) => `ordinary:${i}`);
+  h.labels.set(7, new Set([...ordinary, "limitless:needs-you"]));
+  h.comments.set(
+    7,
+    Array.from({ length: 100 }, (_, i) => `Other comment ${i}`),
+  );
+  let interrupted = false;
+  h.afterWrite = (args) => {
+    if (args[1]?.endsWith("/comments")) {
+      interrupted = true;
+      h.stop();
+      throw new Error("response lost");
+    }
+  };
+  h.start();
+  for (let i = 0; i < 20 && !interrupted; i++) {
+    h.calls.length = 0;
+    await h.advance(i ? 180_000 : 0);
+    expect(h.calls.filter((a) => a[1] !== "graphql").length).toBeLessThanOrEqual(1);
+  }
+  expect(interrupted).toBe(true);
+  h.afterWrite = undefined;
+  h.start();
+  for (let i = 0; i < 12; i++) {
+    h.calls.length = 0;
+    await h.advance(i ? 180_000 : 0);
+    expect(h.calls.filter((a) => a[1] !== "graphql").length).toBeLessThanOrEqual(1);
+  }
+  expect(h.labels.get(7)).toEqual(new Set([...ordinary, "limitless:failed"]));
+  expect(h.comments.get(7)).toHaveLength(102);
+  for (const event of ["started", "failed"])
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${event}`)).toBe("done");
+});
+
+test("unavailable posting identity keeps comments pending until a later poll", async () => {
+  const h = harness();
+  h.login = "";
+  const run = await linkedRun(h);
+  h.start();
+  await h.advance();
+  expect(h.comments.size).toBe(0);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("pending");
+  h.login = "owner";
+  await h.advance(180_000);
+  expect(h.comments.get(7)).toHaveLength(1);
+});
+
+test("the exact posted body includes redaction and publication path sanitization", async () => {
   const h = harness();
   const run = await linkedRun(h);
-  h.store.updateRun(run.id, { status: "failed", error: "reason" });
+  h.cfg.uiUrl = `${h.cfg.paths.home}/ui`;
+  registerCredential("ISSUE_MARKER_TEST", run.id);
+  writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), h.cfg.paths.home);
   h.start();
   await h.advance();
-  expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
-  expect(h.comments.get(7)).toHaveLength(2);
-  h.calls.length = 0;
-  h.stop();
+  const body = h.comments.get(7)?.[0];
+  expect(body).toContain("<data>/ui/runs/");
+  expect(body).toContain("[redacted");
+  expect(body).not.toContain(h.cfg.paths.home);
+  expect(body).not.toContain(run.id);
+  expect(
+    h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started")?.body,
+  ).toBe(body);
+});
+
+test.each([
+  "https://github.com/owner/other/pull/8",
+  "https://example.com/owner/repo/pull/8",
+  "arbitrary run text",
+])("PR comments omit unvalidated URLs: %s", async (prUrl) => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "succeeded", prUrl });
   h.start();
   await h.advance();
-  await h.advance(180_000);
-  expect(h.calls).toHaveLength(2);
-  expect(h.calls.every((args) => args[1] === "graphql")).toBe(true);
+  expect(h.comments.get(7)?.[1]).toBe(
+    `<!-- limitless-lifecycle:${run.id}:pr -->\nLimitless run ${run.id} opened a PR: see ${h.cfg.uiUrl}/runs/${run.id}.`,
+  );
 });

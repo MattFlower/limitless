@@ -14,17 +14,25 @@ For issue-linked runs in enabled queue repositories, each poll reconciles:
 |---|---|---|
 | Run starts | in-progress; remove needs-you and failed | Run id and UI link |
 | PR opened | in-progress | PR link; PR body carries `Closes #n` |
-| needs_human | needs-you; remove in-progress | Reason |
-| Failed | failed; remove in-progress | Reason |
+| needs_human | needs-you; remove in-progress | Fixed needs-you text, run id and UI link |
+| Failed | failed; remove in-progress | Fixed failed text, run id and UI link |
 | Cancelled | remove in-progress | Cancellation |
 | PR merged | remove in-progress and needs-you | None; GitHub closes the issue |
 
-These effects have durable checkpoints; restarts do not duplicate comments. Runs created
-before lifecycle support receive no retroactive updates. Discreet repositories receive
-labels without comments. Text is credential-redacted and checked against private strings;
-blocked text is replaced with a fixed message directing readers to the factory UI.
+Comments contain only fixed event text, the run id and UI link, plus a validated same-repository
+PR URL for the PR event. Reasons and other free-form run text are never published. The exact
+body, including its dedupe marker, is credential-redacted, sanitized for local paths, and checked
+against private strings. A blocked body is recorded done without posting, with the reason logged.
+
+Observed events are recorded before delivery and have durable checkpoints, including comment
+ids and posting identities; restarts do not duplicate comments. Pre-existing active runs receive
+only later transitions, with no historical comments. Runs already terminal when lifecycle support
+was introduced receive no updates. Discreet repositories receive labels without comments.
 Writes use the GitHub App identity where `[github.app]` covers the repository, otherwise
 `gh` credentials. Write failures are logged and retried next poll without blocking runs.
+SQL selects only outstanding lifecycle work, so completed history adds no per-run reads or GitHub
+calls. Each poll caps lifecycle GitHub calls at 50 and resumes deferred work next poll;
+queue admission still proceeds when the lifecycle budget is exhausted.
 
 An issue with GitHub sub-issues is an epic and is never built itself. Finish each epic
 with an acceptance sub-issue blocked by its other sub-issues (as in #818 and #819).
@@ -70,8 +78,10 @@ An issue is eligible only when:
   Missing application evidence does not approve a label.
 - It has no sub-issues, every native and body blocker is closed, and no open PR closes it.
 - It has no `limitless:in-progress`. If it has `limitless:failed`, a trusted account
-  must apply a priority label strictly after the most recent failure label application.
-  Missing failure-label timeline evidence keeps it ineligible.
+  must apply a currently present priority label after the most recent failure label application
+  in timeline order, even when both events have the same timestamp. Failure labels block
+  regardless of who applied them; removed priority labels cannot re-approve. Missing failure-label
+  timeline evidence keeps it ineligible.
 - No active run claims it.
 - After any finished issue-sourced run (succeeded, resolved, failed or cancelled), a
   trusted account applied a priority label strictly after that latest run's `finishedAt`.

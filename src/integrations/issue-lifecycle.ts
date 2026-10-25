@@ -3,14 +3,20 @@ import { type Config, repoSettings } from "../config.ts";
 import type { Run } from "../core/types.ts";
 import { linkedIssues, type Store } from "../db/store.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
-import { checkPublicationText } from "../gates/publication.ts";
+import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { redactCredentials } from "../util/proc.ts";
 import type { GhRunner } from "./github.ts";
+import { githubIdentity } from "./github-identity.ts";
 
 export const lifecycleManaged = (cfg: Partial<Pick<Config, "githubQueue">>, repo: string) =>
   !!cfg.githubQueue?.trusted.length &&
   cfg.githubQueue.repos.some((r) => r.toLowerCase() === repo.toLowerCase());
 const labels = ["limitless:in-progress", "limitless:needs-you", "limitless:failed"] as const;
+const eventOrder = ["started", "pr", "needs_human", "failed", "cancelled"] as const;
+export const ISSUE_LIFECYCLE_CALL_CAP = 50;
+export type IssueLifecycleOptions = { identity?: typeof githubIdentity; maxCalls?: number };
+const cursors = new WeakMap<Store, string>();
+const exhausted = Symbol("lifecycle call budget exhausted");
 
 const desiredLabel = (run: Run) =>
   run.merged
@@ -31,142 +37,248 @@ export async function reconcileIssueLifecycle(
   gh: GhRunner,
   signal: AbortSignal,
   log: (s: string) => void,
+  opts: IssueLifecycleOptions = {},
 ): Promise<void> {
+  let remaining = opts.maxCalls ?? ISSUE_LIFECYCLE_CALL_CAP;
+  const call = (repo: string | undefined, args: string[], before?: () => void) => {
+    if (signal.aborted || remaining <= 0) throw exhausted;
+    remaining--;
+    before?.();
+    return gh(["api", ...args], signal, undefined, repo);
+  };
+  const logFailure = (run: Run, repo: string, number: number, error: unknown) => {
+    if (!signal.aborted && error !== exhausted)
+      log(redactCredentials(`Issue lifecycle ${repo}#${number} run ${run.id}: ${String(error)}`));
+  };
+  const checkBody = (run: Run, body: string) => {
+    const worktree = publicationWorktree(store.getRunState(run.id) ?? {});
+    const roots = [...worktree, store.getRepo(run.repoId)?.localPath ?? ""];
+    const checked = sanitizePublication(redactCredentials(body), roots, cfg.paths.home);
+    checkPublicationText(
+      checked,
+      "Issue lifecycle comment",
+      loadPrivateStrings(cfg.paths.configDir, [...roots, cfg.paths.repos, cfg.paths.work]),
+    );
+    return checked;
+  };
+  const observe = (run: Run, repo: string, number: number) => {
+    const effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
+    const save = (effect: string, state: string, details = {}) => {
+      store.setIssueLifecycleEffect(run.id, repo, number, effect, state, details);
+    };
+    const link = `${cfg.uiUrl}/runs/${run.id}`;
+    const events = new Map<string, string>([["started", `started: see ${link}.`]]);
+    if (run.prUrl) {
+      const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*\/?$/.exec(run.prUrl);
+      const pr = match?.[1]?.toLowerCase() === repo.toLowerCase() ? ` ${run.prUrl}` : "";
+      events.set("pr", `opened a PR${pr}: see ${link}.`);
+    }
+    if (run.status === "needs_human") events.set("needs_human", `needs you: see ${link}.`);
+    if (run.status === "failed") events.set("failed", `failed: see ${link}.`);
+    if (run.status === "cancelled") events.set("cancelled", `was cancelled: see ${link}.`);
+    for (const [event, text] of events) {
+      const effect = `comment:${event}`;
+      if (effects.has(effect)) continue;
+      if (repoSettings(cfg, repo).discreet) {
+        save(effect, "done");
+        continue;
+      }
+      try {
+        const body = checkBody(
+          run,
+          `<!-- limitless-lifecycle:${run.id}:${event} -->\nLimitless run ${run.id} ${text}`,
+        );
+        save(effect, "pending", { body });
+      } catch (error) {
+        save(effect, "done");
+        logFailure(run, repo, number, error);
+      }
+    }
+    if (!effects.has("labels")) save("labels", "pending");
+  };
   const runs = store.issueLifecycleRuns();
-  const latest = new Map<string, string>();
-  const key = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
-  for (const run of runs)
-    for (const issue of linkedIssues(run)) latest.set(key(issue.repo, issue.number), run.id);
-  for (const snapshot of runs) {
-    if (signal.aborted) return;
+  // Persist every observation before any delivery, even when the call budget is exhausted.
+  for (const run of runs) {
+    store.transaction(() => {
+      for (const { repo, number } of linkedIssues(run))
+        if (lifecycleManaged(cfg, repo)) observe(run, repo, number);
+      store.observeIssueLifecycle(run);
+    });
+  }
+  const start = runs.findIndex((r) => r.id === cursors.get(store)) + 1;
+  const ordered = [...runs.slice(start), ...runs.slice(0, start)];
+  const logins = new Map<string, string | undefined>();
+  const postingLogin = async (repo: string) => {
+    if (!logins.has(repo.toLowerCase())) {
+      const identity = await (opts.identity ?? githubIdentity)(repo);
+      const login =
+        identity.kind === "app"
+          ? identity.botLogin
+          : z.object({ login: z.string() }).parse(JSON.parse(String(await call(undefined, ["user"])))).login;
+      logins.set(repo.toLowerCase(), login || undefined);
+    }
+    return logins.get(repo.toLowerCase());
+  };
+  for (const snapshot of ordered) {
     for (const { repo, number } of linkedIssues(snapshot)) {
       if (!lifecycleManaged(cfg, repo)) continue;
+      if (signal.aborted) return;
       const path = `repos/${repo}/issues/${number}`;
-      const call = (args: string[]) => gh(["api", ...args], signal, undefined, repo);
-      const state = (effect: string) => store.issueLifecycleEffect(snapshot.id, repo, number, effect);
-      const save = (effect: string, value: string) =>
-        store.setIssueLifecycleEffect(snapshot.id, repo, number, effect, value);
-      const failure = (error: unknown) => {
-        if (!signal.aborted)
-          log(redactCredentials(`Issue lifecycle ${repo}#${number} run ${snapshot.id}: ${String(error)}`));
-      };
-      // Re-read after each issue: the pipeline may have advanced while GitHub was awaited.
+      const save = (effect: string, state: string, details = {}) =>
+        store.setIssueLifecycleEffect(snapshot.id, repo, number, effect, state, details);
+      const finishLabels = (target: string) =>
+        store.transaction(() => {
+          for (const e of store.issueLifecycleEffects(snapshot.id, repo, number))
+            if (e.effect.startsWith("label:") && e.state === "pending") save(e.effect, "done");
+          save("labels", target);
+        });
       let run = store.getRun(snapshot.id);
       if (!run) continue;
-      if (latest.get(key(repo, number)) === run.id && state("labels") !== desiredLabel(run)) {
-        try {
-          const current = z
-            .array(z.array(z.object({ name: z.string() })))
-            .parse(JSON.parse(String(await call([`${path}/labels?per_page=100`, "--paginate", "--slurp"]))))
-            .flat()
-            .map((l) => l.name);
-          run = store.getRun(snapshot.id);
-          if (!run) continue;
-          const target = desiredLabel(run);
-          // A partial transition must not leave the old complete-set cursor valid.
-          save("labels", "pending");
-          for (const label of labels) {
-            if (signal.aborted) return;
+      let effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
+      try {
+        if (effects.get("labels")?.state !== desiredLabel(run)) {
+          if (!store.issueLifecycleOwnsLabels(run, repo, number)) finishLabels(desiredLabel(run));
+          else {
+            let plan = effects.get("labels")?.body
+              ? z
+                  .object({
+                    target: z.string(),
+                    page: z.number(),
+                    current: z.array(z.string()),
+                  })
+                  .parse(JSON.parse(effects.get("labels")?.body ?? ""))
+              : null;
+            if (plan?.target !== desiredLabel(run))
+              plan = { target: desiredLabel(run), page: 1, current: [] };
+            while (plan.page) {
+              const current = z
+                .array(z.object({ name: z.string() }))
+                .parse(
+                  JSON.parse(String(await call(repo, [`${path}/labels?per_page=100&page=${plan.page}`]))),
+                );
+              plan.current.push(...current.map((l) => l.name));
+              plan.page = current.length === 100 ? plan.page + 1 : 0;
+              save("labels", "pending", { body: JSON.stringify(plan) });
+            }
             run = store.getRun(snapshot.id);
-            if (!run || desiredLabel(run) !== target) break;
-            const add = label === target;
-            const effect = `label:${label}:${add}`;
-            if (current.includes(label) === add) {
-              if (state(effect) === "pending") save(effect, "done");
-              continue;
+            if (!run) continue;
+            observe(run, repo, number);
+            const target = desiredLabel(run);
+            plan.target = target;
+            save("labels", "pending", { body: JSON.stringify(plan) });
+            for (const label of labels) {
+              if (signal.aborted) return;
+              run = store.getRun(snapshot.id);
+              if (!run || desiredLabel(run) !== target || !store.issueLifecycleOwnsLabels(run, repo, number))
+                break;
+              const add = label === target;
+              const effect = `label:${label}:${add}`;
+              if (plan.current.includes(label) === add) continue;
+              save(effect, "pending");
+              try {
+                await call(
+                  repo,
+                  add
+                    ? [`${path}/labels`, "-X", "POST", "-f", `labels[]=${label}`]
+                    : [`${path}/labels/${encodeURIComponent(label)}`, "-X", "DELETE"],
+                );
+              } catch (error) {
+                if (add || !/\bHTTP 404\b/.test(String(error))) throw error;
+              }
+              plan.current = plan.current.filter((l) => l !== label);
+              if (add) plan.current.push(label);
+              store.transaction(() => {
+                save(effect, "done");
+                save("labels", "pending", { body: JSON.stringify(plan) });
+              });
             }
-            save(effect, "pending");
-            try {
-              await call(
-                add
-                  ? [`${path}/labels`, "-X", "POST", "-f", `labels[]=${label}`]
-                  : [`${path}/labels/${encodeURIComponent(label)}`, "-X", "DELETE"],
-              );
-            } catch (error) {
-              if (add || !/\bHTTP 404\b/.test(String(error))) throw error;
+            run = store.getRun(snapshot.id);
+            if (
+              run &&
+              desiredLabel(run) === target &&
+              labels.every((l) => plan.current.includes(l) === (l === target))
+            ) {
+              finishLabels(target);
             }
-            save(effect, "done");
           }
-          run = store.getRun(snapshot.id);
-          // Keep a cursor for the complete set so finished history needs no GitHub reads.
-          if (run && desiredLabel(run) === target) save("labels", target);
-        } catch (error) {
-          failure(error);
         }
+      } catch (error) {
+        if (error === exhausted) {
+          cursors.set(store, snapshot.id);
+          return;
+        }
+        logFailure(snapshot, repo, number, error);
       }
       run = store.getRun(snapshot.id);
       if (!run) continue;
-      const events = new Map([["started", `started: ${cfg.uiUrl}/runs/${run.id}`]]);
-      if (run.prUrl) events.set("pr", `opened ${run.prUrl}`);
-      if (run.status === "needs_human")
-        events.set("needs_human", `needs you: ${run.error ?? "see the factory UI."}`);
-      if (run.status === "failed") events.set("failed", `failed: ${run.error ?? "see the factory UI."}`);
-      if (run.status === "cancelled")
-        events.set(
-          "cancelled",
-          `was cancelled${run.error?.startsWith("cancelled by ") ? " by the owner" : ""}.`,
-        );
-      // Pending events outlive their status; retry with their original publication-safe body.
-      for (const event of ["started", "pr", "needs_human", "failed", "cancelled"]) {
-        if (signal.aborted) return;
+      observe(run, repo, number);
+      effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
+      for (const event of eventOrder) {
         const effect = `comment:${event}`;
-        if (!events.has(event) && state(effect) !== "pending") continue;
-        if (state(effect) === "done") continue;
+        const pending = effects.get(effect);
+        if (pending?.state !== "pending") continue;
         if (repoSettings(cfg, repo).discreet) {
           save(effect, "done");
           continue;
         }
         try {
-          const marker = `<!-- limitless-lifecycle:${run.id}:${event} -->`;
-          if (state(effect) === "pending") {
-            const comments = z
-              .array(z.array(z.object({ body: z.string() })))
-              .parse(
-                JSON.parse(String(await call([`${path}/comments?per_page=100`, "--paginate", "--slurp"]))),
-              )
-              .flat();
-            if (comments.some((c) => c.body.includes(marker))) {
-              save(effect, "done");
-              continue;
-            }
-          }
-          const fallback = `${marker}\nLimitless run ${run.id} ${event === "needs_human" ? "needs you" : event}: see the factory UI.`;
-          let body = redactCredentials(
-            state(`body:${event}`) ??
-              (events.has(event) ? `${marker}\nLimitless run ${run.id} ${events.get(event)}` : fallback),
-          );
+          let body: string;
           try {
-            const worktree = store.getRunState<{ worktreePath?: string }>(run.id)?.worktreePath;
-            checkPublicationText(
-              body,
-              "Issue lifecycle comment",
-              loadPrivateStrings(cfg.paths.configDir, [
-                worktree,
-                store.getRepo(run.repoId)?.localPath,
-                cfg.paths.repos,
-                cfg.paths.work,
-              ]),
-            );
-          } catch {
-            body = fallback;
-            log(
-              redactCredentials(
-                `Issue lifecycle run ${run.id}: comment text replaced by private-string policy`,
+            if (!pending.body) throw new Error("missing lifecycle comment body");
+            body = checkBody(run, pending.body);
+          } catch (error) {
+            save(effect, "done");
+            logFailure(run, repo, number, error);
+            continue;
+          }
+          if (pending.page) {
+            const marker = body.split("\n")[0] ?? "";
+            let page = pending.page;
+            while (page) {
+              const comments = z
+                .array(
+                  z.object({
+                    id: z.number(),
+                    body: z.string(),
+                    user: z.object({ login: z.string() }).nullable(),
+                  }),
+                )
+                .parse(JSON.parse(String(await call(repo, [`${path}/comments?per_page=100&page=${page}`]))));
+              const found = comments.find((c) => c.user?.login === pending.login && c.body.includes(marker));
+              if (found) {
+                save(effect, "done", { commentId: found.id });
+                break;
+              }
+              page = comments.length === 100 ? page + 1 : 0;
+              save(effect, "pending", { page });
+            }
+            if (page) continue; // A matching factory comment was found.
+          }
+          const login = pending.login ?? (await postingLogin(repo));
+          if (!login) throw new Error("cannot identify lifecycle comment author");
+          save(effect, "pending", { body, login });
+          const created = z
+            .object({ id: z.number().int().positive() })
+            .parse(
+              JSON.parse(
+                String(
+                  await call(repo, [`${path}/comments`, "-X", "POST", "-f", `body=${body}`], () =>
+                    save(effect, "pending", { body, login, page: 1 }),
+                  ),
+                ),
               ),
             );
-          }
-          if (signal.aborted) return;
-          store.transaction(() => {
-            save(`body:${event}`, body);
-            save(effect, "pending");
-          });
-          await call([`${path}/comments`, "-X", "POST", "-f", `body=${body}`]);
-          save(effect, "done");
+          save(effect, "done", { commentId: created.id });
         } catch (error) {
-          failure(error);
+          if (error === exhausted) {
+            cursors.set(store, snapshot.id);
+            return;
+          }
+          logFailure(run, repo, number, error);
           break;
         }
       }
     }
+    cursors.set(store, snapshot.id);
   }
 }
