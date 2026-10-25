@@ -82,7 +82,7 @@ test("both harnesses serialize the pinned cached browser over stdio but exclude 
         expect(server.args).toContain("--headless");
         const value = (flag: string) => server.args[server.args.indexOf(flag) + 1] ?? "";
         expect(value("--allowed-origins")).toBe("http://127.0.0.1:43210");
-        expect(server.args[1]).toContain('(remote ip "127.0.0.1:43210")');
+        expect(server.args[1]).toContain('(allow network-outbound (remote ip "localhost:43210"))');
         expect(server.args).not.toContain("--allowed-hosts");
         expect(value("--executable-path")).toBe(join(cache, "browsers/chromium"));
         for (const flag of ["--user-data-dir", "--output-dir"]) {

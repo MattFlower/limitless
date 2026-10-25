@@ -31,5 +31,9 @@ No test provisions packages or downloads browsers.
 Before landing, also run `bun run check` unconfined from that checkout under the
 real home, as required for shared confinement-policy changes.
 
+Seatbelt network rules accept only `*` or `localhost` as the host, so the profile
+allows `localhost:<preview port>`: any loopback address on the preview port, and no
+other port or destination. Unit tests compile each loopback form with `sandbox-exec`.
+
 Only after those probes pass may the corresponding gap entries be removed.
 Claude editors and unsupported platforms remain excluded independently.

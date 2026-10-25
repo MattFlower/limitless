@@ -15,9 +15,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { browserMcp, provisionBrowserMcp } from "../src/harness/browser-mcp.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
+import { SANDBOX_EXEC } from "../src/harness/sandbox.ts";
 import type { AgentEvent } from "../src/harness/types.ts";
 import { protectPrivateFile } from "../src/util/private-reads.ts";
-import { registerCredential } from "../src/util/proc.ts";
+import { agentEnv, registerCredential, runProcess } from "../src/util/proc.ts";
 import { browserInstaller, browserSpec, fakeBrowserCache } from "./browser-mcp-support.ts";
 import { test } from "./read-policy-support.ts";
 
@@ -230,9 +231,21 @@ test.each([
   expect(args[args.indexOf("--allowed-origins") + 1]).toBe(origin);
   const parsed = new URL(url);
   expect(args[1]).toContain("(deny network-outbound)");
-  expect(args[1]).toContain(
-    `(remote ip "${parsed.hostname}:${parsed.port || (parsed.protocol === "https:" ? 443 : 80)}")`,
-  );
+  const allows = (args[1] ?? "").split("\n").filter((line) => line.startsWith("(allow network-outbound"));
+  expect(allows).toEqual([
+    `(allow network-outbound (remote ip "localhost:${parsed.port || (parsed.protocol === "https:" ? 443 : 80)}"))`,
+  ]);
+  // Seatbelt compiles the profile before applying it; exit 65 means it rejected the rule.
+  if (process.platform === "darwin") {
+    const compiled = await runProcess({
+      cmd: [SANDBOX_EXEC, "-p", args[1] ?? "", "/usr/bin/true"],
+      cwd: scratch,
+      env: agentEnv(),
+      timeoutMs: 10_000,
+    });
+    expect(compiled.stderr).not.toContain("Backtrace");
+    expect(compiled.exitCode === 0 || compiled.exitCode === 71, compiled.stderr).toBe(true);
+  }
   expect(args.filter((arg) => arg === "--allowed-origins")).toHaveLength(1);
   for (const flag of ["--user-data-dir", "--output-dir"])
     expect(args[args.indexOf(flag) + 1]?.startsWith(`${scratch}/browser-`)).toBe(true);
