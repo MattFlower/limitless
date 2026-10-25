@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import type { ConfinementFailure, ConfinementProbe, QuotaWindow } from "../core/types.ts";
 import { privateReadPaths } from "../util/private-reads.ts";
 import { agentEnv, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
+import { BROWSER_TOOLS, type BrowserMcpServer, browserMcp } from "./browser-mcp.ts";
 import {
   ConfinementError,
   homeReadPolicy,
@@ -788,7 +789,15 @@ async function sandboxProbe(
   return editing ? result(null, last) : result(INCONCLUSIVE, null);
 }
 
+export function codexMcpServers(browser: BrowserMcpServer): string {
+  const env = Object.entries(browser.env)
+    .map(([key, value]) => `${JSON.stringify(key)}=${JSON.stringify(value)}`)
+    .join(",");
+  return `mcp_servers={playwright={command=${JSON.stringify(browser.command)},args=${JSON.stringify(browser.args)},env={${env}},enabled_tools=${JSON.stringify(BROWSER_TOOLS)}}}`;
+}
+
 export function buildCodexArgs(spec: AgentSpec, executable?: string): string[] {
+  const browser = browserMcp(spec, "codex");
   const t = spec.target;
   if (spec.mode === "readonly" && spec.addDirs?.length)
     throw new Error("Reading invocations cannot grant additional directories");
@@ -854,6 +863,7 @@ export function buildCodexArgs(spec: AgentSpec, executable?: string): string[] {
       "code_mode",
     );
     if (spec.mode === "readonly") args.push("-c", 'web_search="disabled"');
+    if (browser) args.push("-c", codexMcpServers(browser));
   } else args.push("-s", "read-only");
   for (const dir of spec.addDirs ?? []) args.push("--add-dir", dir);
   if (spec.jsonSchema) {
