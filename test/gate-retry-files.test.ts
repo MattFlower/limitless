@@ -1,13 +1,19 @@
 import { describe, expect } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import { detectGates, readRetryFiles } from "../src/gates/detect.ts";
 import { executeGate, type GateRunner } from "../src/gates/executor.ts";
 import { extractFailures } from "../src/gates/failures.ts";
 import { MAX_RETRY_FILES, parseJUnit, readJUnit } from "../src/gates/junit.ts";
-import { type GateResult, retryFailures, retryRegressions, runGates } from "../src/gates/run.ts";
+import {
+  type GateResult,
+  retryFailures,
+  retryRegressions,
+  runGates,
+  runLocalGates,
+} from "../src/gates/run.ts";
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { sh } from "../src/util/proc.ts";
@@ -109,7 +115,7 @@ describe("JUnit failure files", () => {
         undefined,
         runner,
       );
-      expect(calls).toEqual(["full-test"]);
+      expect(calls).toEqual(["bun test"]);
       expect(result?.verdict).toBe("flaky");
     } finally {
       f.close();
@@ -149,7 +155,9 @@ describe("JUnit failure files", () => {
 });
 
 const signal = new AbortController().signal;
-const testCheck = { name: "test", run: "full-test", timeoutSec: 37 };
+// Resolve this Bun even when PATH starts with the factory's gate-slot wrapper.
+const bunEnv = { PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ""}` };
+const testCheck = { name: "test", run: "bun test", timeoutSec: 37 };
 const config = {
   setup: [],
   checks: [testCheck],
@@ -159,7 +167,7 @@ const config = {
 };
 const failed: GateResult = {
   name: "test",
-  command: "full-test",
+  command: "bun test",
   ok: false,
   exitCode: 1,
   output: "failed",
@@ -456,6 +464,206 @@ test.each([
   }
 });
 
+test("a quoted retry placeholder cannot turn a failing test into a shell success", async () => {
+  const f = fixture();
+  try {
+    const file = 'test/x"; true #.test.ts';
+    writeFileSync(
+      join(f.cwd, file),
+      'import { test, expect } from "bun:test"; test("still fails", () => expect(1).toBe(2));',
+    );
+    const check = {
+      ...testCheck,
+      run: 'bun test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"',
+    };
+    const cfg = { ...config, checks: [check], retryFiles: 'bun test "{files}"' };
+    await confinementScope.run(fakeConfinement, async () => {
+      const run = await runLocalGates(f.cwd, cfg, signal, { env: bunEnv });
+      const original = run.checks[0];
+      if (!original) throw new Error("Missing original check");
+      expect(original.ok).toBe(false);
+      expect(original.failureAttributionComplete).toBe(true);
+      expect(original.failedFiles).toEqual([file]);
+      let calls = 0;
+      const skipped: string[] = [];
+      const retries = await retryFailures(
+        [{ check, original }],
+        f.cwd,
+        cfg,
+        signal,
+        undefined,
+        (retry) => {
+          calls++;
+          return runLocalGates(f.cwd, retry, signal, { env: bunEnv });
+        },
+        true,
+        false,
+        (_original, reason) => skipped.push(reason),
+      );
+      expect(retries.get(original)?.ok ?? false).toBe(false);
+      expect(calls).toBe(0);
+      expect(skipped).toEqual(["retry_files must contain {files} once as an unquoted standalone argument"]);
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  "bun test '{files}'",
+  'bun test " {files} "',
+  "bun test \\{files}",
+  "bun test prefix{files}",
+  "bun test {files}suffix",
+  "bun test ''{files}",
+  'bun test {files}""',
+  "bun test prefix\\ {files}",
+  "bun test $(echo {files})",
+  'bun test "$(echo {files})"',
+  "bun test $(echo $(echo {files}))",
+  "bun test",
+  "bun test {files} {files}",
+])("targeted-only retries reject unsafe placeholder placement: %s", async (retryFiles) => {
+  const f = fixture();
+  try {
+    const original = { ...failed, failedFiles: ["test/a.test.ts"], failureAttributionComplete: true };
+    let calls = 0;
+    const skipped: string[] = [];
+    const retries = await retryFailures(
+      [{ check: testCheck, original }],
+      f.cwd,
+      { ...config, retryFiles },
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+      false,
+      (_original, reason) => skipped.push(reason),
+    );
+    expect(retries.size).toBe(0);
+    expect(calls).toBe(0);
+    expect(skipped).toEqual(["retry_files must contain {files} once as an unquoted standalone argument"]);
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  ["configured", "bun test; security-scan", "bun test"],
+  ["returned", "bun test", "bun test; security-scan"],
+])("targeted-only retries validate the %s check command", async (_label, run, command) => {
+  const f = fixture();
+  try {
+    const check = { ...testCheck, run };
+    const original = {
+      ...failed,
+      command,
+      failedFiles: ["test/a.test.ts"],
+      failureAttributionComplete: true,
+    };
+    let calls = 0;
+    const skipped: string[] = [];
+    const retries = await retryFailures(
+      [{ check, original }],
+      f.cwd,
+      { ...config, checks: [check] },
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+      false,
+      (_original, reason) => skipped.push(reason),
+    );
+    expect(retries.size).toBe(0);
+    expect(calls).toBe(0);
+    expect(skipped).toEqual(["check is not a single bun test invocation"]);
+  } finally {
+    f.close();
+  }
+});
+
+test("targeted-only retries recognize the exact expanded command before execution", async () => {
+  const f = fixture();
+  try {
+    // The shared parser conservatively rejects backticks, even inside quoted filenames.
+    const file = "test/tick`.test.ts";
+    writeFileSync(join(f.cwd, file), "");
+    const original = { ...failed, failedFiles: [file], failureAttributionComplete: true };
+    let calls = 0;
+    const skipped: string[] = [];
+    const retries = await retryFailures(
+      [{ check: testCheck, original }],
+      f.cwd,
+      config,
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+      false,
+      (_original, reason) => skipped.push(reason),
+    );
+    expect(retries.size).toBe(0);
+    expect(calls).toBe(0);
+    expect(skipped).toEqual(["expanded retry_files is not a single bun test invocation"]);
+  } finally {
+    f.close();
+  }
+});
+
+test.each(["bun test {files}; security-scan", "other-runner {files}"])(
+  "targeted-only retries reject an ineligible retry_files invocation: %s",
+  async (retryFiles) => {
+    const f = fixture();
+    try {
+      const original = {
+        ...failed,
+        failedFiles: ["test/a.test.ts"],
+        failureAttributionComplete: true,
+      };
+      const cfg = { ...config, retryFiles };
+      const calls: string[] = [];
+      const skipped: { original: GateResult; reason: string }[] = [];
+      const runner: GateRunner = async (retry) => {
+        calls.push(...retry.checks.map((c) => c.run));
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      };
+      const selected = [{ check: testCheck, original }];
+      const results = await retryFailures(
+        selected,
+        f.cwd,
+        cfg,
+        signal,
+        undefined,
+        runner,
+        true,
+        false,
+        (original, reason) => skipped.push({ original, reason }),
+      );
+      expect(results.size).toBe(0);
+      expect(calls).toEqual([]);
+      expect(skipped).toEqual([{ original, reason: "retry_files is not a single bun test invocation" }]);
+      const full = await retryFailures(selected, f.cwd, cfg, signal, undefined, runner);
+      expect(calls).toEqual([retryFiles.replace("{files}", "'./test/a.test.ts'"), "bun test"]);
+      expect(full.get(original)).toMatchObject({
+        ok: true,
+        firstAttempt: original,
+        targetedRetry: { ok: true },
+      });
+    } finally {
+      f.close();
+    }
+  },
+);
+
 test("incomplete land evidence preserves factory targeted and full retries", async () => {
   const f = fixture();
   try {
@@ -519,14 +727,14 @@ test("a completed attributed test timeout retries once with a slot and keeps its
       '<testcase><failure type="TimeoutError" message="test timed out"/></testcase>',
     );
     writeFileSync(
-      join(f.cwd, "runner.ts"),
+      join(f.cwd, "runner.test.ts"),
       `await Bun.write(process.env.LIMITLESS_GATE_REPORT, ${JSON.stringify(xml)});
 console.error(${JSON.stringify(`(fail) slow test [62000ms]\n  ^ this test timed out after 60000ms.\n${runnerSummary}`)});
 process.exit(1);`,
     );
-    const check = { ...testCheck, run: `'${process.execPath}' ./runner.ts` };
+    const check = { ...testCheck, run: "bun test ./runner.test.ts" };
     const run = await confinementScope.run(fakeConfinement, () =>
-      runGates(f.cwd, { ...config, checks: [check] }, signal),
+      runLocalGates(f.cwd, { ...config, checks: [check] }, signal, { env: bunEnv }),
     );
     const original = run.checks[0];
     if (!original) throw new Error("Missing test result");
@@ -624,7 +832,7 @@ test("targeted Bun arguments select exact paths and safely quote filenames", asy
     expect(result?.result.targetedRetry?.output).toContain("2 pass");
     expect(result?.result.targetedRetry?.output).not.toContain("unrelated file must not run");
     expect(calls).toHaveLength(2);
-    expect(calls[1]).toBe("full-test");
+    expect(calls[1]).toBe("bun test");
     expect(result?.verdict).toBe("flaky");
   } finally {
     f.close();
@@ -829,11 +1037,11 @@ test("fails once", () => {
       );
       const check = {
         name: "test",
-        run: `'${process.execPath}' test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" './${file}'`,
+        run: `bun test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT" './${file}'`,
       };
-      const cfg = { ...config, checks: [check], retryFiles: `'${process.execPath}' test {files}` };
+      const cfg = { ...config, checks: [check], retryFiles: "bun test {files}" };
       await confinementScope.run(fakeConfinement, async () => {
-        const run = await runGates(f.cwd, cfg, signal);
+        const run = await runLocalGates(f.cwd, cfg, signal, { env: bunEnv });
         const original = run.checks[0];
         if (!original) throw new Error("Missing check");
         expect(original.ok).toBe(false);
@@ -850,11 +1058,11 @@ test("fails once", () => {
           async (retry, options) => {
             expect(options?.targeted).toBe(true);
             calls.push(...retry.checks.map((c) => c.run));
-            return runGates(f.cwd, retry, signal);
+            return runLocalGates(f.cwd, retry, signal, { env: bunEnv });
           },
           true,
         );
-        expect(calls).toEqual([`'${process.execPath}' test './${file}'`]);
+        expect(calls).toEqual([`bun test './${file}'`]);
         expect(retries.get(original)?.ok).toBe(true);
         expect(retries.size).toBe(1);
       });
@@ -1022,7 +1230,7 @@ test.each([
     };
     const check = {
       name: "test",
-      run: "full-test",
+      run: "bun test",
       timeoutSec: "originalTimeout" in row ? row.originalTimeout : 300,
     };
     let calls = 0;
