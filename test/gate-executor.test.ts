@@ -1807,6 +1807,8 @@ test("privacy matching checks raw local gate streams before overlapping credenti
     // A diagnostic line clipped at 8,000 characters and a 6,000-character output tail each cut the host.
     const bad = [
       `BAD prefix-${host}`,
+      // Ordinary JSON output may escape every slash.
+      `JSON ${JSON.stringify({ host: `prefix-${host}` }).replaceAll("/", "\\/")}`,
       `${"x".repeat(7_990)}${host}`,
       "(fail) synthetic overlap",
       `${host}${"!".repeat(5_970)}`,
@@ -1833,6 +1835,7 @@ test("privacy matching checks raw local gate streams before overlapping credenti
     .find((event) => event.type === "gate" && event.message.startsWith("no-bad: FAIL"));
   const stored = JSON.stringify(failed?.data);
   expect(stored).toContain("BAD prefix-[redacted]");
+  expect(stored).toContain('JSON {\\"host\\":\\"prefix-[redacted]\\"}');
   expect(stored).toContain("(fail) synthetic overlap");
   for (const text of [stored, prompts[1] ?? ""])
     for (const fragment of ["private-domain", "host-syn", "overlap-token"])

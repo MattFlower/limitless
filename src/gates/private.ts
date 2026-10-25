@@ -234,13 +234,17 @@ export const redactLiteral = (text: string, entries: PrivateStrings) =>
     .flatMap(({ value }) => spellings(value))
     .reduce(
       (out, value) =>
-        out.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]"),
+        out.replace(
+          // JSON may spell each slash as \/, which decoding matches, so the literal must match it too.
+          new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replaceAll("/", "\\\\?/"), "gi"),
+          "[redacted]",
+        ),
       text,
     );
 /** Redact literals in a raw stream before credential redaction or cuts can split them, holding back
  * only what could still start one. */
 export function privateLiteralStream(entries: PrivateStrings) {
-  const hold = Math.max(0, ...entries.map(({ value }) => value.length - 1));
+  const hold = Math.max(0, ...entries.map(({ value }) => value.length + value.split("/").length - 2));
   let pending = "";
   return (chunk: string, flush: boolean) => {
     const text = redactLiteral(pending + chunk, entries);

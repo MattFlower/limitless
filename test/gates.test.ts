@@ -3433,4 +3433,14 @@ test("privacy matching redacts private literals across raw stream chunks before 
       "one [redacted] two [redacted]",
     );
   }
+  // An escaped spelling must be redacted here too, before an overlapping credential removes its start.
+  const secret = "synthetic/stream-token-880";
+  const escaped = `prefix-${host}`.replaceAll("/", "\\/");
+  proc.registerCredential("OVERLAP_STREAM_PRIVACY_880", `prefix-host-${secret}`);
+  for (let split = 0; split <= escaped.length; split++) {
+    const filter = privateLiteralStream([{ value: host, entry: 1 }]);
+    const raw =
+      filter(escaped.slice(0, split), false) + filter(escaped.slice(split), false) + filter("", true);
+    expect(redactPrivate(proc.redactCredentials(raw), [{ value: host, entry: 1 }])).toBe("prefix-[redacted]");
+  }
 });
