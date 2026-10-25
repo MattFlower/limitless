@@ -271,10 +271,14 @@ Gates, land checks and Git on Linux run under bubblewrap and Landlock instead of
 (`src/harness/sandbox-linux.ts`, `src/harness/landlock.ts`, `bwrapGit`). The coordinator itself
 stays on macOS; this is for Linux workers (#832). Host requirements:
 
-- `/usr/bin/bwrap` (the `bubblewrap` package, not setuid), 0.10 or later, or a distribution build
-  with the `--ro-bind-fd` backport that shipped with the CVE-2024-42472 fix. Without it the preflight
-  refuses with bwrap's "Unknown option". Git's Landlock and seccomp rules are applied by the
-  factory's own launcher, so no `setpriv` or util-linux version is needed.
+- `/usr/bin/bwrap` (the `bubblewrap` package, not setuid) with `--ro-bind-fd`: upstream 0.10 or
+  later, or a distribution build carrying the backport that came with the CVE-2024-42472 fix. Check
+  with `bwrap --help | grep -e --ro-bind-fd`. On Ubuntu 24.04 the stock 0.9.0-1 lacks it; the
+  security update 0.9.0-1ubuntu0.1 (USN-7046-1) should carry it, so run
+  `sudo apt update && sudo apt install --only-upgrade bubblewrap` and repeat the check. This is
+  unverified on Ubuntu itself, so trust the check, not the version number. Without it the preflight
+  refuses with "`/usr/bin/bwrap` has no --ro-bind-fd". Git's Landlock and seccomp rules are applied by
+  the factory's own launcher, so no `setpriv` or util-linux version is needed.
 - Unprivileged user namespaces. On Ubuntu 23.10 and later, `kernel.apparmor_restrict_unprivileged_userns=1`
   needs an AppArmor profile that grants bwrap `userns`. Leave the sysctl on and add the profile
   rather than disabling the restriction. **This path is untested:** the host that built this had no

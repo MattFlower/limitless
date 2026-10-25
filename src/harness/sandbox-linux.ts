@@ -370,6 +370,10 @@ export async function verifyLinux(
       ...command([], probeRoots, bwrap),
     ]);
     if (![outside, beside].some((p) => existsSync(p))) surfaceCancel(sandbox);
+    if (/Unknown option --(ro-)?bind-fd/.test(sandbox.stderr))
+      throw new ConfinementError(
+        `${bwrap} has no --ro-bind-fd: install bubblewrap 0.10 or later (Ubuntu 24.04: 0.9.0-1ubuntu0.1 or later)`,
+      );
     if (
       [outside, beside].some((p) => existsSync(p)) ||
       !conclusive(sandbox, "linux-verified") ||

@@ -135,6 +135,12 @@ test.skipIf(process.platform !== "linux")(
       return result("linux-verified");
     };
     await expect(verify(leaky)).rejects.toThrow("bubblewrap did not enforce its policy");
+    // A bwrap without descriptor binds names the requirement.
+    const old = (cmd: string[]) =>
+      cmd[0] === "/bin/sh"
+        ? { ...result("", 1), stderr: "bwrap: Unknown option --ro-bind-fd\n" }
+        : result("");
+    await expect(verify(old)).rejects.toThrow("has no --ro-bind-fd: install bubblewrap 0.10 or later");
     const network = (stdout: string) => (cmd: string[]) => {
       if (cmd[0] !== "/bin/sh") return result(stdout, stdout ? 0 : 1);
       writeFileSync(cmd[5] ?? "", "ok");
