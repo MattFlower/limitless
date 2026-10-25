@@ -1744,13 +1744,19 @@ test("failed lifecycle writes are redacted, retry next poll, and do not block se
   expect(h.comments.get(7)).toHaveLength(1);
 });
 
-test("non-GitHub Closes directives link issues and appear as PR closing paragraphs", async () => {
+test("non-GitHub Closes directives exclude fenced issues from claims and lifecycle targets", async () => {
   const h = harness();
   const run = await h.factory.createRun({
     repo: "owner/repo",
-    prompt: "work\nCloses #7\nCloses #8",
+    prompt: "work\n```text\nCloses #9\n```\nCloses #7\nCloses #8",
     source: "mcp",
   });
+  expect(linkedIssues(run, h.store)).toEqual([
+    { repo: "owner/repo", number: 7 },
+    { repo: "owner/repo", number: 8 },
+  ]);
+  expect(h.store.issueClaim("owner/repo", 7)?.id).toBe(run.id);
+  expect(h.store.issueClaim("owner/repo", 9)).toBeNull();
   h.start();
   await h.advance();
   for (const number of [7, 8]) {
@@ -1762,6 +1768,9 @@ test("non-GitHub Closes directives link issues and appear as PR closing paragrap
   const ctx = new RunContext(h.factory.deps, run, repo, new AbortController().signal);
   const body = buildReport(ctx, true);
   expect(body).toContain("\n\nCloses #7\n\nCloses #8\n\n");
+  expect(h.labels.has(9)).toBe(false);
+  expect(h.comments.has(9)).toBe(false);
+  expect(h.calls.some((args) => /issues\/9(?:\/|$)|issue\(number:9\)/.test(args.join(" ")))).toBe(false);
 });
 
 test.each(["needs_human", "failed"] as const)(
@@ -1867,34 +1876,39 @@ test.each(["ci", "conflict"] as const)("%s rounds inherit sourceRef links and em
   }
 });
 
-test("obsolete historical lifecycle effects make no GitHub calls", async () => {
-  const h = harness();
-  const origin = await h.factory.createRun({ repo: "owner/repo", prompt: "Work" });
-  h.store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("Quoted Closes #8\nCloses #7", origin.id);
-  for (const [effect, state] of [
-    ["labels", "pending"],
-    ["label:limitless:in-progress:true", "pending"],
-    ["comment:started", "pending"],
-    ["comment:failed", "done"],
-  ] as const)
-    h.store.setIssueLifecycleEffect(origin.id, "owner/repo", 8, effect, state, {
-      body: "obsolete comment",
-      login: "owner",
-      page: 1,
-    });
-  const signal = new AbortController().signal;
-  for (const status of ["running", "needs_human", "failed"] as const) {
-    h.store.updateRun(origin.id, { status });
-    await reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, h.logs.push.bind(h.logs), {
-      identity: h.identity,
-    });
-  }
-  expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
-  expect(h.comments.get(7)).toHaveLength(3);
-  expect(h.calls.some((args) => /issues\/8(?:\/|$)|issue\(number:8\)/.test(args.join(" ")))).toBe(false);
-  expect(h.labels.has(8)).toBe(false);
-  expect(h.comments.has(8)).toBe(false);
-});
+test.each(["Quoted Closes #8\nCloses #7", "```text\nCloses #8\n```\nCloses #7"])(
+  "obsolete historical lifecycle effects make no GitHub calls: %j",
+  async (prompt) => {
+    const h = harness();
+    const origin = await h.factory.createRun({ repo: "owner/repo", prompt: "Work" });
+    h.store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run(prompt, origin.id);
+    expect(h.store.issueClaim("owner/repo", 7)?.id).toBe(origin.id);
+    expect(h.store.issueClaim("owner/repo", 8)).toBeNull();
+    for (const [effect, state] of [
+      ["labels", "pending"],
+      ["label:limitless:in-progress:true", "pending"],
+      ["comment:started", "pending"],
+      ["comment:failed", "done"],
+    ] as const)
+      h.store.setIssueLifecycleEffect(origin.id, "owner/repo", 8, effect, state, {
+        body: "obsolete comment",
+        login: "owner",
+        page: 1,
+      });
+    const signal = new AbortController().signal;
+    for (const status of ["running", "needs_human", "failed"] as const) {
+      h.store.updateRun(origin.id, { status });
+      await reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, h.logs.push.bind(h.logs), {
+        identity: h.identity,
+      });
+    }
+    expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
+    expect(h.comments.get(7)).toHaveLength(3);
+    expect(h.calls.some((args) => /issues\/8(?:\/|$)|issue\(number:8\)/.test(args.join(" ")))).toBe(false);
+    expect(h.labels.has(8)).toBe(false);
+    expect(h.comments.has(8)).toBe(false);
+  },
+);
 
 test("lifecycle uses the status that wins while fetching labels", async () => {
   const h = harness();

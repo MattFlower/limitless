@@ -584,9 +584,13 @@ CLI, UI or other non-GitHub request with a directive on a line of its own:
 Closes #123
 ```
 
-`Closes` is case-insensitive; spaces or tabs may surround the directive and must separate
-`Closes` from `#`. The number must be positive, with nothing else on that line. Inline mentions,
-quotes, blockquotes and trailing prose do not link issues. Issue-created runs link through their
+`Closes` is case-insensitive; horizontal whitespace (including Unicode no-break and em spaces)
+may surround the directive and must separate `Closes` from `#`, without crossing a line break.
+The number must be positive, with nothing else on that line. Inline mentions, quotes, blockquotes,
+trailing prose and fenced code blocks do not link issues. Fences use at least three backticks or
+tildes, with optional indentation and an opening info string; a closing fence uses the same
+character, at least the opening length, and only surrounding horizontal whitespace. An unclosed
+fence excludes the rest of the prompt. Issue-created runs link through their
 recorded issue reference; GitHub prompt text cannot add links. Review, CI-fix and conflict rounds
 inherit exactly their original run's issues, including no issues. Factory-added findings,
 CI excerpts and instructions never add links, even when they contain a standalone directive.

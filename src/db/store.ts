@@ -337,13 +337,34 @@ export interface AgentGateRecord {
   comparison: unknown;
 }
 
-/** Issue numbers named by standalone `Closes #N` directives. */
-export const closedIssues = (prompt: string) =>
-  new Set(
-    [...prompt.matchAll(/(?:^|\n)[ \t]*closes[ \t]+#([1-9][0-9]*)[ \t]*(?=\r?\n|$)/gi)]
-      .map((m) => Number(m[1]))
-      .filter(Number.isSafeInteger),
-  );
+/** Issue numbers named by standalone `Closes #N` directives outside fenced blocks. */
+export function closedIssues(prompt: string): Set<number> {
+  const issues = new Set<number>();
+  let fence: string | undefined;
+  for (const line of prompt.split(/\r?\n/)) {
+    const [, marker, suffix] = /^[^\S\r\n]*(`{3,}|~{3,})(.*)$/.exec(line) ?? [];
+    if (fence) {
+      if (
+        marker &&
+        marker[0] === fence[0] &&
+        marker.length >= fence.length &&
+        /^[^\S\r\n]*$/.test(suffix ?? "")
+      )
+        fence = undefined;
+      continue;
+    }
+    if (marker) {
+      fence = marker;
+      continue;
+    }
+    const directive = /^[^\S\r\n]*closes[^\S\r\n]+#([1-9][0-9]*)[^\S\r\n]*$/i.exec(line);
+    if (directive) {
+      const number = Number(directive[1]);
+      if (Number.isSafeInteger(number)) issues.add(number);
+    }
+  }
+  return issues;
+}
 
 /** Follow admission rules: GitHub prompt text cannot add issue links. */
 export function linkedIssues(

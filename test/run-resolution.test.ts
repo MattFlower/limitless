@@ -140,6 +140,26 @@ test("Closes directives match standalone, case-insensitive issue numbers only", 
   expect([...closedIssues("Closes #0\nCloses #-12\nCloses #9007199254740992")]).toEqual([]);
 });
 
+test.each([
+  ["```text\nCloses #12\n```\nCloses #7", [7]],
+  [" \t~~~ ts\r\nCloses #12\r\n  ~~~~ \t\r\nCloses #7", [7]],
+  ["````text\n```\nCloses #12\n`````\nCloses #7", [7]],
+  ["~~~~\n~~~\nCloses #12\n~~~~\nCloses #7", [7]],
+  ["```\n~~~\nCloses #12\n```\nCloses #7", [7]],
+  ["~~~\n```\nCloses #12\n~~~\nCloses #7", [7]],
+  ["```\n``` trailing text\nCloses #12\n```\nCloses #7", [7]],
+  ["```text\nCloses #12", []],
+  ["~~~text\nCloses #12\n~~\nCloses #7", []],
+  ["    ```text\nCloses #12\n    ```\nCloses #7", [7]],
+] as const)("Closes directives ignore fenced blocks: %j", (prompt, expected) => {
+  expect([...closedIssues(prompt)]).toEqual([...expected]);
+});
+
+test("Closes directives accept Unicode horizontal whitespace without crossing lines", () => {
+  expect([...closedIssues("\u00a0Closes\u2003#12\u00a0\r\n\u2003CLOSES\u00a0#7\u2003")]).toEqual([12, 7]);
+  expect([...closedIssues("Closes\u00a0\n#12\nCloses\u2003\r\n#7")]).toEqual([]);
+});
+
 test("a merge recorded by the pipeline supersedes matching needs_human runs in its repository only", () => {
   const other = f.store.upsertRepo({
     slug: "local/other",
