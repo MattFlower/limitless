@@ -2499,3 +2499,66 @@ test("a newer CLI failure cannot reuse an older issue run's approved failure epi
   await h.advance(180_000);
   expect(h.runs()).toHaveLength(3);
 });
+
+test("review: a pre-lifecycle failed run can be re-approved after upgrading", async () => {
+  const h = harness();
+  const before = join(h.cfg.paths.home, "legacy-failure-migrations");
+  cpSync(MIGRATION_DIR, before, { recursive: true, filter: beforeLifecycle });
+  const path = join(h.cfg.paths.home, "legacy-failure.db");
+  let store = new Store(path, before);
+  const originalRepo = h.store.getRepoBySlug("owner/repo");
+  if (!originalRepo) throw new Error("missing repo");
+  const repo = store.upsertRepo(originalRepo);
+  const run = store.createRun(
+    repo,
+    issueRunRequest({ repo: repo.slug, number: 7, title: "work", body: "", author: "owner" }, "owner"),
+  );
+  store.updateRun(run.id, { status: "failed", finishedAt: Date.parse(at) + 999 });
+  store.close();
+  store = new Store(path);
+  const candidate = issue(7);
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  candidate.labels.totalCount++;
+  for (const [name, seconds] of [
+    ["limitless:failed", 1],
+    ["priority:1", 2],
+  ] as const)
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name },
+      actor: { login: "owner" },
+      createdAt: new Date(Date.parse(at) + seconds * 1000).toISOString(),
+    });
+  candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
+  h.data.set(repo.slug, [candidate]);
+  h.labels.set(7, new Set(["priority:1", "limitless:failed"]));
+  const created: CreateRunRequest[] = [];
+  const stop = startIssueQueue(
+    {
+      cfg: h.cfg,
+      store,
+      scheduler: h.factory.scheduler,
+      createRun: async (request) => {
+        created.push(request);
+        return store.createRun(repo, request);
+      },
+    },
+    {
+      gh: h.gh,
+      lifecycle: { identity: h.identity },
+      clock: {
+        now: h.clock.now,
+        set: h.clock.timer.set as unknown as typeof setTimeout,
+        clear: h.clock.timer.clear,
+      },
+    },
+  );
+  try {
+    await h.advance();
+    await h.advance(180_000);
+    expect(created).toHaveLength(1);
+  } finally {
+    stop();
+    store.close();
+  }
+});

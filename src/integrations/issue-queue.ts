@@ -111,8 +111,9 @@ export function issueEligibility(
   else if (
     context.latest &&
     !ISSUE_CLAIM_STATUSES.includes(context.latest.status) &&
-    (context.latest.status === "failed"
-      ? !(reapprovedAfterFailure && context.failureBoundary != null && failedIndex >= context.failureBoundary)
+    // A failure recorded before lifecycle support has no boundary: it follows the completion-time rule.
+    (context.latest.status === "failed" && context.failureBoundary != null
+      ? !(reapprovedAfterFailure && failedIndex >= context.failureBoundary)
       : context.latest.finishedAt === null ||
         !events.some(
           (e) => trusts(e.actor?.login) && Date.parse(e.createdAt) > (context.latest?.finishedAt ?? Infinity),
