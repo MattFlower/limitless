@@ -3,7 +3,7 @@ import type { Config } from "../config.ts";
 import { Store } from "../db/store.ts";
 import { canonicalGateCwd, WorkerStore } from "../db/workers.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
-import { confinementScope, seatbeltForPort, withCommandScratch } from "../harness/sandbox.ts";
+import { confinementScope, platformConfinement, withCommandScratch } from "../harness/sandbox.ts";
 import { processBirthSync, processCleanupStore, redactCredentials } from "../util/proc.ts";
 import { executeGate, type GateRequest } from "./executor.ts";
 import { attachSlotPools } from "./slots.ts";
@@ -68,7 +68,7 @@ export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal
             )
               throw new Error("In-place gate is missing a valid daemon port");
             const run = await confinementScope.run(
-              confinementScope.getStore() ?? seatbeltForPort(req.daemonPort),
+              confinementScope.getStore() ?? platformConfinement(req.daemonPort),
               () =>
                 withCommandScratch(
                   req.cwd,

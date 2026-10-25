@@ -79,7 +79,7 @@ import {
   withGitHubRetry,
 } from "../git/repos.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
-import { confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
+import { confinementScope, platformConfinement } from "../harness/sandbox.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
@@ -94,7 +94,11 @@ import {
   redactCredentials,
 } from "../util/proc.ts";
 import { publicationFields } from "../workers/publication.ts";
-import type { AgentPublication, AgentPublicationHooks } from "./agent-executor.ts";
+import {
+  type AgentPublication,
+  type AgentPublicationHooks,
+  prepareReaderCheckout,
+} from "./agent-executor.ts";
 import { reusableAgentGate } from "./agent-gate.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
@@ -177,6 +181,9 @@ import {
 
 const ROUNDS_PER_IMPLEMENTER = 2;
 
+// Resume the interrupted reader without publishing a draft or persisting a terminal reason.
+class ReaderSetupError extends NeedsHumanError {}
+
 /** Execute (or resume) one run to completion. Never throws. */
 export async function executeRun(
   deps: EngineDeps,
@@ -206,7 +213,7 @@ export async function executeRun(
       checkout: () => ctx.state.worktreePath,
     },
     () =>
-      confinementScope.run(deps.confinement ?? seatbeltForPort(deps.cfg.port), () =>
+      confinementScope.run(deps.confinement ?? platformConfinement(deps.cfg.port), () =>
         readPolicyScope.run(deps.cfg.readPolicy, () =>
           worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
         ),
@@ -408,7 +415,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       resolvingReview ||
       terminationBlocked;
     let message = redactGateOutput((e as Error).message) + waited;
-    if (resolvingReview) {
+    if (resolvingReview && !(e instanceof ReaderSetupError)) {
       message = redactGateOutput(
         `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
       );
@@ -428,6 +435,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     });
     if (
       verifiedFailure &&
+      !(e instanceof ReaderSetupError) &&
       !(e instanceof DeliveryHeadError) &&
       !(e instanceof GateNameCollisionError) &&
       !terminationBlocked &&
@@ -460,6 +468,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       }
     } else if (
       e instanceof NeedsHumanError &&
+      !(e instanceof ReaderSetupError) &&
       !(e instanceof DeliveryHeadError) &&
       !terminationBlocked &&
       ctx.state.worktreePath &&
@@ -1834,6 +1843,22 @@ async function oneRound(
   }
 
   const concurrent = profile(ctx) !== "quick" && ctx.state.flow !== "verify-change" && !resolution;
+  // Cached/resumed or remote gates are not evidence of an install in the reader's worktree.
+  // A matching preview already prepares this checkout before the concurrent readers start.
+  const previewWillSetup =
+    concurrent && ctx.state.previewConfig && needsPreview(ctx.state.previewConfig, diff);
+  let readerSetup: Promise<void> | undefined;
+  const prepareLocal = () =>
+    (readerSetup ??= (async () => {
+      if (localSetupReady) return;
+      try {
+        await prepareReaderCheckout(cwd, gates.setup, ctx.signal);
+        localSetupReady = true;
+      } catch (error) {
+        ctx.checkCancelled();
+        throw new ReaderSetupError(redactGateOutput((error as Error).message));
+      }
+    })());
   // --- review
   if (ctx.state.lastReview && !ctx.state.reviewHistory?.length)
     throw new NeedsHumanError("Previous review has no round history; cannot classify later findings");
@@ -1953,6 +1978,8 @@ async function oneRound(
           role: "review",
           stage,
           mode: "readonly",
+          readerSetup: gates.setup,
+          prepareLocal: invokeGuard.getStore() ? undefined : prepareLocal,
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
           constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
@@ -2186,7 +2213,7 @@ async function oneRound(
               ctx.checkCancelled();
               if (!setup.setupOk) {
                 const failed = setup.setup.find((result) => !result.ok);
-                throw new Error(
+                throw new ReaderSetupError(
                   redactGateOutput(
                     `Preview setup failed: $ ${failed?.command ?? "setup"}\n${failed?.failures ?? ""}\n${failed?.output ?? "No setup result"}`,
                   ),
@@ -2204,8 +2231,25 @@ async function oneRound(
         ctx.previewUrl = preview.url;
       }
     };
+    const prepareVerification = async () => {
+      try {
+        if (!previewWillSetup) await prepareLocal();
+        await preparePreview();
+      } catch (error) {
+        // Preparation precedes both concurrent readers, but belongs to local verification.
+        if (error instanceof ReaderSetupError)
+          return ctx.stage(
+            "verify",
+            async () => {
+              throw error;
+            },
+            round,
+          );
+        throw error;
+      }
+    };
     const verifyAttempt = async (attempt: number, excludeModels: string[] = []): Promise<Verify> => {
-      await preparePreview();
+      await prepareVerification();
       return ctx.stage(
         "verify",
         async (stage) => {
@@ -2254,8 +2298,9 @@ async function oneRound(
             ),
           );
           const met = v.criteria.filter((c) => c.status === "met").length;
+          const blocked = v.criteria.filter((c) => c.status === "blocked").length;
           return {
-            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met (${target.modelId})`,
+            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met${blocked ? `, ${blocked} blocked` : ""} (${target.modelId})`,
             value: v,
           };
         },
@@ -2269,7 +2314,7 @@ async function oneRound(
     const original = recorded?.modelOutput ?? recorded;
     let verify: Verify;
     if (concurrent) {
-      await preparePreview();
+      await prepareVerification();
       ctx.parallelChecks = true;
       let results: [PromiseSettledResult<Review>, PromiseSettledResult<Verify>];
       try {

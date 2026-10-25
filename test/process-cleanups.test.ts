@@ -67,8 +67,14 @@ async function waitFor(check: () => boolean) {
 
 async function processState(pid: number): Promise<string> {
   if (process.platform === "linux") {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "";
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "";
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH") return "Z";
+      throw error;
+    }
   }
   const { dlopen, ptr, FFIType } = await import("bun:ffi");
   const library = dlopen("/usr/lib/libSystem.B.dylib", {
@@ -484,8 +490,11 @@ for (const failure of ["throws", "missing"] as const) {
           );
         }),
     );
-    if (pid === undefined) throw new Error("Missing spawned process");
-    expectProcessStopped(pid);
+    if (process.platform === "linux") expect(pid).toBeUndefined();
+    else {
+      if (pid === undefined) throw new Error("Missing spawned process");
+      expectProcessStopped(pid);
+    }
     expect(store.listProcessDiscoveries()).toEqual([]);
     expect(store.listProcessCleanups()).toEqual([]);
   });
@@ -1387,7 +1396,11 @@ test("live parallel discoveries survive scoped and background startup recovery",
       expect(recorded).toHaveBeenCalledTimes(2);
       await Promise.all([recoverProcessCleanups(store), recoverScopedProcesses()]);
       expect(store.listProcessDiscoveries()).toEqual(evidence);
-      for (const row of evidence) expect(recoveryProcessStopped(row.discovery.group)).toBe(false);
+      expect(current.children.size).toBe(2);
+      for (const child of current.children.keys()) {
+        if (child.pid === undefined) throw new Error("Missing spawned process");
+        expect(recoveryProcessStopped(child.pid)).toBe(false);
+      }
       expect(
         (await runProcess({ cmd: [process.execPath, "-e", ""], cwd: directory, env: {} })).exitCode,
       ).toBe(0);

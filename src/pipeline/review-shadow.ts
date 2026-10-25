@@ -4,6 +4,7 @@ import type { ResolvedProfile, ReviewSystem } from "../core/types.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { worktreeGit } from "../git/command.ts";
 import { addDetachedWorktree } from "../git/repos.ts";
+import { prepareReaderCheckout } from "./agent-executor.ts";
 import { type InvokeOutcome, invokeGuard, NoCapacityError, type RunContext } from "./context.ts";
 import { type ReviewDeps, type ReviewInput, runReview } from "./review.ts";
 import { configuredReviewSystem } from "./review-system.ts";
@@ -62,6 +63,7 @@ export async function shadowReview(
         parent = createSnapshotParent();
         guard.cwd = join(parent, "shadow");
         await addDetachedWorktree(worktree, reviewedSha, guard.cwd, guard.signal);
+        await prepareReaderCheckout(guard.cwd, ctx.state.gatesConfig?.setup ?? [], guard.signal);
         const { previous: _previous, fixReview: _fix, ...prompt } = input.prompt;
         const request = { ...input, prompt, system, replayedFollowUps: undefined };
         const { output, decision, panel } = await runReview({ ...deps(system), finished }, request);
