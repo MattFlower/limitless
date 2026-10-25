@@ -1241,7 +1241,9 @@ export class Store {
   issueLifecycleRuns(): Run[] {
     return (
       this.db
-        .query(`${RUN_SELECT} WHERE
+        .query(`${RUN_SELECT} WHERE NOT EXISTS (
+          SELECT 1 FROM issue_lifecycle_effects e WHERE e.run_id = runs.id AND e.effect = 'excluded:terminal'
+        ) AND (
         runs.status IN ('queued','waiting','running','waiting_input','needs_human')
         OR NOT EXISTS (SELECT 1 FROM issue_lifecycle_effects e WHERE e.run_id = runs.id
           AND e.effect = 'observed'
@@ -1253,7 +1255,7 @@ export class Store {
             WHEN runs.status = 'failed' THEN 'limitless:failed'
             WHEN runs.status = 'cancelled' OR (runs.status IN ('succeeded','resolved')
               AND (runs.pr_url IS NULL OR runs.pr_closed_unmerged)) THEN 'none'
-            ELSE 'limitless:in-progress' END)))
+            ELSE 'limitless:in-progress' END))))
         ORDER BY runs.created_at, runs.rowid`)
         .all() as Row[]
     ).map(toRun);

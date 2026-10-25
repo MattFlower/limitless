@@ -1408,6 +1408,10 @@ test("migration suppresses history but reconciles later transitions after reopen
   store.updateRun(run.id, { status: "running" });
   const terminal = store.createRun(repo, { repo: repo.slug, prompt: "Closes #8" });
   store.updateRun(terminal.id, { status: "failed" });
+  const merged = store.createRun(repo, { repo: repo.slug, prompt: "Closes #9" });
+  store.updateRun(merged.id, { status: "succeeded", prUrl: "https://github.com/owner/repo/pull/90" });
+  const closed = store.createRun(repo, { repo: repo.slug, prompt: "Closes #10" });
+  store.updateRun(closed.id, { status: "succeeded", prUrl: "https://github.com/owner/repo/pull/100" });
   store.close();
   store = new Store(path);
   store.close();
@@ -1431,7 +1435,18 @@ test("migration suppresses history but reconciles later transitions after reopen
     await h.advance(180_000);
     expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
     expect(h.comments.get(7)).toEqual([expect.stringContaining(`Limitless run ${run.id} failed: see`)]);
-    expect(h.calls.some((args) => args[1]?.includes("issues/8"))).toBe(false);
+    expect(
+      h.calls
+        .filter((args) => args[1] !== "graphql")
+        .every((args) => !/issues\/(8|9|10)\b/.test(args[1] ?? "")),
+    ).toBe(true);
+    h.calls.length = 0;
+    expect(store.resolveMergedRun(merged.id, "owner", h.clock.now())).toBe(true);
+    store.updateRun(closed.id, { prClosedUnmerged: true });
+    await h.advance(180_000);
+    await h.advance(180_000);
+    expect(h.calls.filter((args) => args[1] !== "graphql")).toEqual([]);
+    expect(h.comments.get(7)).toHaveLength(1);
   } finally {
     stop();
     store.close();

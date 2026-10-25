@@ -18,6 +18,7 @@ INSERT INTO issue_lifecycle_effects (run_id, repo, number, effect, state)
 INSERT INTO issue_lifecycle_effects (run_id, repo, number, effect, state)
   SELECT id, '', 0, 'comment:' || status, 'done' FROM runs
   WHERE status IN ('needs_human', 'failed', 'cancelled');
+-- Terminal history stays excluded even when its PR metadata changes later.
 INSERT INTO issue_lifecycle_effects (run_id, repo, number, effect, state)
-  SELECT id, '', 0, 'observed', json_array(status, pr_url, merged, pr_closed_unmerged) FROM runs
+  SELECT id, '', 0, 'excluded:terminal', 'done' FROM runs
   WHERE status IN ('succeeded', 'failed', 'cancelled', 'resolved');
