@@ -64,8 +64,8 @@ test.skipIf(seatbeltSkip !== null)(
       const cache = browserCache(process.env.LIMITLESS_HOME ?? join(homedir(), ".limitless"));
       const spec = browserSpec(cwd, scratch, cache);
       spec.browser = { cacheDir: cache, previewUrl: `http://127.0.0.1:${preview.port}` };
-      // Waive only the pending evidence gate: exercise exactly the production launch configuration.
-      const server = browserMcp(spec, "codex", []);
+      // Exactly the production launch configuration, with the production gap list.
+      const server = browserMcp(spec, "codex");
       if (!server)
         throw new Error("Pinned browser unavailable; provision it with scripts/provision-browser-mcp.ts");
       const directory = server.env.HOME;

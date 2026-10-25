@@ -133,10 +133,11 @@ test.each([
   const events: AgentEvent[] = [];
   spec.mode = mode;
   spec.onEvent = (event) => events.push(event);
-  expect(!!browserMcp(spec, harness, [], platform)).toBe(enabled);
+  // Production gap list: the paths that apply the profile have no open gap.
+  expect(!!browserMcp(spec, harness, undefined, platform)).toBe(enabled);
   expect(events).toHaveLength(enabled ? 0 : 1);
   for (const variant of [{ noTools: true }, { browser: undefined }]) {
-    expect(browserMcp({ ...spec, ...variant }, harness, [], platform)).toBeUndefined();
+    expect(browserMcp({ ...spec, ...variant }, harness, undefined, platform)).toBeUndefined();
   }
   expect(events).toHaveLength(enabled ? 0 : 1);
 });
@@ -232,9 +233,13 @@ test.each([
   const parsed = new URL(url);
   expect(args[1]).toContain("(deny network-outbound)");
   const allows = (args[1] ?? "").split("\n").filter((line) => line.startsWith("(allow network-outbound"));
-  expect(allows).toEqual([
-    `(allow network-outbound (remote ip "localhost:${parsed.port || (parsed.protocol === "https:" ? 443 : 80)}"))`,
-  ]);
+  const port = parsed.port || (parsed.protocol === "https:" ? 443 : 80);
+  // Only the preview's own address family: a 127.0.0.1 preview cannot reach ::1, and vice versa.
+  const families = { "127.0.0.1": ["ip4"], "[::1]": ["ip6"], localhost: ["ip4", "ip6"] }[parsed.hostname];
+  expect(families).toBeDefined();
+  expect(allows).toEqual(
+    (families ?? []).map((family) => `(allow network-outbound (remote ${family} "localhost:${port}"))`),
+  );
   // Seatbelt compiles the profile before applying it; exit 65 means it rejected the rule.
   if (process.platform === "darwin") {
     const compiled = await runProcess({
@@ -252,12 +257,13 @@ test.each([
 });
 
 test.each(["claude", "codex"] as const)(
-  "%s gets no browser from the unconfined pin, even with a valid cache, preview and scratch",
+  "%s gets no browser while a confinement gap is unresolved, even with a valid cache, preview and scratch",
   async (harness) => {
     const { spec, scratch } = await fixture();
     const events: AgentEvent[] = [];
     spec.onEvent = (event) => events.push(event);
-    expect(browserMcp(spec, harness, undefined, "darwin")).toBeUndefined();
+    const gaps = ["redirects leave the preview origin", "filenames on output tools escape --output-dir"];
+    expect(browserMcp(spec, harness, gaps, "darwin")).toBeUndefined();
     expect(events).toEqual([
       expect.objectContaining({ code: "browser_unavailable", text: expect.stringContaining("not confined") }),
     ]);

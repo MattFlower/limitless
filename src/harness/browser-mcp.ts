@@ -51,12 +51,13 @@ export const BROWSER_TOOLS = [
   "browser_take_screenshot",
 ];
 
-// Keep these until the pinned-browser probes pass on unconfined macOS. Factory skips are not proof.
-// Upstream flags are convenience guards; the server and browser must share the factory profile.
-export const CONFINEMENT_GAPS = [
-  "--allowed-origins does not stop redirects or other browser connections leaving the preview origin",
-  "explicit filenames on output tools bypass --output-dir and can write into the checkout",
-];
+// Gaps the factory profile leaves open on the paths that apply it; any entry disables the browser.
+// Upstream flags are convenience guards. The profile closes the two known gaps, proven by the
+// unconfined probes in test/browser-mcp-seatbelt.test.ts (factory gates skip them):
+// - --allowed-origins does not stop redirects or other connections leaving the preview origin;
+// - explicit filenames on output tools bypass --output-dir and could write into the checkout.
+// Paths that cannot apply the profile (Claude editors, non-macOS) stay disabled before this check.
+export const CONFINEMENT_GAPS: readonly string[] = [];
 
 export const browserCache = (home: string) => join(home, "tools", `playwright-mcp-${BROWSER_MCP_VERSION}`);
 const inside = (root: string, path: string) => {

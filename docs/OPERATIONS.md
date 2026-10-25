@@ -49,30 +49,31 @@ This installs exactly `@playwright/mcp@0.0.83` and its matching Chromium into
 must already be installed. A matching cache is reused. Runs never install packages or browsers;
 missing or incompatible tooling produces an invocation warning and continues without a browser.
 
-Live-preview verify calls and implement calls supplied a live preview request the cached server,
-but **the current pin is disabled**. The server runs outside the agent sandbox, and two gaps remain:
-`--allowed-origins` installs request routes that do not stop redirects (or other browser
-connections) leaving the preview origin, and explicit filenames on output tools such as
-`browser_take_screenshot` bypass `--output-dir` and resolve anywhere in the checkout, past the
-harnesses' readonly and protected-path rules. Each eligible invocation therefore records a
-no-browser warning naming these gaps, even with a valid cache; installing the cache does not enable
-it. Missing or incompatible tooling, a non-loopback preview URL or a scratch failure records its own
-warning. The call continues without a browser; no unrestricted server or download is used as a
-fallback.
+Live-preview verify calls and implement calls supplied a live preview request the cached server.
+Upstream documents its guards as convenience guardrails: `--allowed-origins` installs request routes
+that do not stop redirects (or other browser connections) leaving the preview origin, and explicit
+filenames on output tools such as `browser_take_screenshot` bypass `--output-dir`. The agent CLIs
+spawn MCP servers outside the agent's command sandbox, so the factory confines the server itself.
 
-The macOS launch configuration wraps Node and Chromium together with the factory's
-`seatbeltProfile`, restricts outbound connections to the preview endpoint, and allows
-reads only from the invocation browser directory, pinned cache, recorded Node runtime
-and system resources. Explicit provisioning records Node's loaded libraries; older valid
-caches acquire that metadata without reinstalling packages. Chromium uses `--no-sandbox`
-only inside this factory profile because its own sandbox cannot nest under Seatbelt.
-The [pinned-browser probes](browser-mcp-probes.md) still need an unconfined macOS run
-before the confinement gaps can be cleared. Linux and other unsupported platforms receive no browser.
+On macOS the launch configuration wraps Node and its Chromium child together in the factory's
+`seatbeltProfile`. Outbound connections are allowed only to the preview's loopback address family
+and port, writes only to the invocation's browser directory in scratch, and reads only to that
+directory, the pinned cache, the recorded Node runtime and system resources, with every credential
+and private-path denial kept. Explicit provisioning records Node's loaded libraries; older valid
+caches acquire that metadata without reinstalling packages. Chromium uses `--no-sandbox` only inside
+this factory profile because its own sandbox cannot nest under Seatbelt. The
+[pinned-browser probes](browser-mcp-probes.md) exercise these boundaries on unconfined macOS.
 
-Once those probes pass, the server is launched over stdio: headless, with
-`--allowed-origins` set to exactly the preview origin, the cached Chromium, and profile and output
-directories in private invocation scratch. Only UI tools are granted; code execution, routing and
-raw network-request tools stay denied.
+Claude readers and Codex readers and editors get the browser. Claude editors get none: they already
+run inside the factory's outer profile, and Seatbelt cannot nest. LAN workers get none because the
+preview runs on the coordinator; Linux and other platforms get none. Each excluded or failed
+invocation records a no-browser warning naming its reason. Missing or incompatible tooling, a
+non-loopback preview URL or a scratch or profile failure records its own warning. The call continues
+without a browser; no unrestricted server or download is used as a fallback.
+
+The server is launched over stdio: headless, with `--allowed-origins` set to exactly the preview
+origin, the cached Chromium, and profile and output directories in private invocation scratch. Only
+UI tools are granted; code execution, routing and raw network-request tools stay denied.
 
 The pin's shipped `cli.js` delegates to `playwright-core@1.64.0-alpha-1790635538000`:
 `decorateMCPCommand`, `configFromCLIOptions` and `originOrHostGlob` were inspected. Supported options

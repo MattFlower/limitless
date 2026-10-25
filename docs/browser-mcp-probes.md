@@ -16,24 +16,30 @@ The orchestrator also established that headless Chromium renders without an oute
 profile, fails to initialize its own sandbox under any outer Seatbelt profile,
 and renders under an outer profile with its own sandbox disabled.
 
-The new pinned-server browser probes are **unperformed on unconfined macOS**.
-This factory session cannot nest Seatbelt. Skipped tests are not confinement evidence;
-both `CONFINEMENT_GAPS` remain, so production browser setup still fails closed.
+The new pinned-server browser probes are **unperformed on unconfined macOS**: this
+factory session cannot nest Seatbelt, so `test/browser-mcp-seatbelt.test.ts` skips
+here, and a skip is not confinement evidence. The profile closes both former
+`CONFINEMENT_GAPS` entries on the paths that apply it, so the list is now empty
+and those paths get a browser. The issue makes the orchestrator's unconfined review
+run of these probes the gate: if any probe fails, the change must not land, and the
+corresponding gap entry goes back.
 
 After explicit operator provisioning with `bun scripts/provision-browser-mcp.ts`,
 run `bun test test/browser-mcp-seatbelt.test.ts` from an unconfined macOS checkout
-under the real home. The test uses the production MCP configuration, the pinned
-server and its pinned Chromium, ephemeral local servers, and actual screenshot
-tools. It checks allowed navigation and screenshots, blocked off-port fetch and
-redirect, and denied screenshot creation and overwrite in the checkout.
+under the real home. The test uses the production MCP configuration and gap list,
+the pinned server and its pinned Chromium, ephemeral local servers, and actual
+screenshot tools. It checks allowed navigation and screenshots, blocked off-port
+fetch and redirect, and denied screenshot creation and overwrite in the checkout.
 `LIMITLESS_HOME` selects the provisioned tool-cache home, as in the provisioning script.
 No test provisions packages or downloads browsers.
 Before landing, also run `bun run check` unconfined from that checkout under the
 real home, as required for shared confinement-policy changes.
 
 Seatbelt network rules accept only `*` or `localhost` as the host, so the profile
-allows `localhost:<preview port>`: any loopback address on the preview port, and no
-other port or destination. Unit tests compile each loopback form with `sandbox-exec`.
+selects the preview's loopback address by family: `(remote ip4 "localhost:<port>")`
+for `127.0.0.1`, `(remote ip6 "localhost:<port>")` for `[::1]`, and both for
+`localhost`. No other port, address family or destination is allowed. Unit tests
+compile each loopback form with `sandbox-exec`.
 
-Only after those probes pass may the corresponding gap entries be removed.
-Claude editors and unsupported platforms remain excluded independently.
+Claude editors, LAN workers and unsupported platforms remain excluded independently
+of the gap list.

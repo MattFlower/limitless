@@ -63,8 +63,15 @@ test("browser restrictions are optional and reject unbounded endpoints", () => {
   expect(gate).not.toContain("(deny network-outbound)");
   expect(gate).not.toContain("(deny file-read*)");
   const browser = seatbeltProfile(roots, { host: "localhost", port: 8080 });
-  expect(browser).toContain('(allow network-outbound (remote ip "localhost:8080"))');
+  expect(browser).toContain('(allow network-outbound (remote ip4 "localhost:8080"))');
+  expect(browser).toContain('(allow network-outbound (remote ip6 "localhost:8080"))');
   expect(browser).toContain("(deny file-read*)");
+  const allows = (host: string) =>
+    seatbeltProfile(roots, { host, port: 8080 })
+      .split("\n")
+      .filter((line) => line.startsWith("(allow network-outbound"));
+  expect(allows("127.0.0.1")).toEqual(['(allow network-outbound (remote ip4 "localhost:8080"))']);
+  expect(allows("::1")).toEqual(['(allow network-outbound (remote ip6 "localhost:8080"))']);
   for (const endpoint of [
     { host: "example.com", port: 80 },
     { host: "localhost", port: 0 },

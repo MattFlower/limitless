@@ -67,8 +67,14 @@ export function seatbeltProfile(roots: WriteRoots, browser?: { host: string; por
     ...(browser
       ? [
           "(deny network-outbound)",
-          // Seatbelt rejects literal IPs ("host must be * or localhost"); localhost is loopback only.
-          `(allow network-outbound (remote ip "localhost:${browser.port}"))`,
+          // Seatbelt rejects literal IPs ("host must be * or localhost"), so the address family selects
+          // the preview's loopback address: ip4 for 127.0.0.1, ip6 for ::1, both for localhost.
+          ...(browser.host === "::1"
+            ? []
+            : [`(allow network-outbound (remote ip4 "localhost:${browser.port}"))`]),
+          ...(browser.host === "127.0.0.1"
+            ? []
+            : [`(allow network-outbound (remote ip6 "localhost:${browser.port}"))`]),
           "(deny file-read*)",
         ]
       : []),

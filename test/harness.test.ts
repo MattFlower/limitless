@@ -57,7 +57,7 @@ const fixture = (name: string) =>
     .split("\n")
     .filter(Boolean);
 
-test("both harnesses serialize the pinned cached browser over stdio but exclude the unconfined pin", async () => {
+test("both harnesses serialize the confined pinned browser over stdio and honour open confinement gaps", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "harness-browser-")));
   const cwd = join(root, "checkout");
   const cache = join(root, "cache");
@@ -82,7 +82,8 @@ test("both harnesses serialize the pinned cached browser over stdio but exclude 
         expect(server.args).toContain("--headless");
         const value = (flag: string) => server.args[server.args.indexOf(flag) + 1] ?? "";
         expect(value("--allowed-origins")).toBe("http://127.0.0.1:43210");
-        expect(server.args[1]).toContain('(allow network-outbound (remote ip "localhost:43210"))');
+        expect(server.args[1]).toContain('(allow network-outbound (remote ip4 "localhost:43210"))');
+        expect(server.args[1]).not.toContain("remote ip6");
         expect(server.args).not.toContain("--allowed-hosts");
         expect(value("--executable-path")).toBe(join(cache, "browsers/chromium"));
         for (const flag of ["--user-data-dir", "--output-dir"]) {
@@ -118,10 +119,10 @@ test("both harnesses serialize the pinned cached browser over stdio but exclude 
       expect(events).toEqual([]);
       const original = browserMcp;
       const browserSetup = spyOn(browserModule, "browserMcp").mockImplementation((spec, harness) =>
-        original(spec, harness, undefined, "darwin"),
+        original(spec, harness, ["unresolved gap"], "darwin"),
       );
       try {
-        // The real builders apply the default confinement gate: a valid cache still yields no server.
+        // The real builders honour the confinement gate: an open gap still yields no server.
         const claude = buildClaudeArgs(spec, "session");
         expect(claude).toContain("--strict-mcp-config");
         expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
@@ -157,7 +158,8 @@ test("both harnesses serialize the pinned cached browser over stdio but exclude 
           else expect(argsClaude[argsClaude.indexOf("--tools") + 1]).toBe("");
         }
         expect(events).toEqual([]);
-        browserSetup.mockImplementation((spec, harness) => original(spec, harness, [], "darwin"));
+        // The production gap list enables the confined server on macOS.
+        browserSetup.mockImplementation((spec, harness) => original(spec, harness, undefined, "darwin"));
         const enabledClaude = buildClaudeArgs(spec, "session");
         expectServer(
           JSON.parse(enabledClaude[enabledClaude.indexOf("--mcp-config") + 1] ?? "{}").mcpServers.playwright,
