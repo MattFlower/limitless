@@ -89,6 +89,87 @@ const remoteResult: AgentResult = {
   quota: { windows: { short: { utilization: 0.2, resetsAt: null } }, exhaustedUntil: null },
 };
 
+test("remote implement invocations omit the coordinator browser and persist the locality reason", async () => {
+  const f = fixture();
+  f.cfg.workers.agents = ["implement"];
+  f.cfg.workers.repos = [f.repo.slug];
+  f.context.previewUrl = "http://127.0.0.1:43210";
+  const parentSha = "b".repeat(40);
+  const prepared = {
+    parentSha,
+    baseSha: parentSha,
+    branch: "change/browser",
+    repoUrl: "https://github.com/example/repo.git",
+    expectedRemoteSha: null,
+    discreet: false,
+    privateStringsDigest: "c".repeat(64),
+    commit: {
+      message: "UI change",
+      authorName: "Test",
+      authorEmail: "test@example.com",
+      committerName: "Test",
+      committerEmail: "test@example.com",
+    },
+  };
+  const workers = new WorkerStore(f.store, "a".repeat(40), { tick: 1 });
+  const enqueue = workers.enqueueAgentJob.bind(workers);
+  spyOn(workers, "enqueueAgentJob").mockImplementation((request, id) => {
+    if (!id) throw new Error("missing job id");
+    expect(request).not.toHaveProperty("browser");
+    expect(JSON.stringify(request)).not.toContain("43210");
+    const job = enqueue(request, id);
+    f.store.db.query("UPDATE agent_jobs SET state='leased',worker='fixture-worker' WHERE id=?").run(id);
+    workers.completeAgentJob(
+      id,
+      {
+        ...remoteResult,
+        parentSha,
+        sha: parentSha,
+        branch: prepared.branch,
+        privateStringsDigest: prepared.privateStringsDigest,
+      },
+      "a".repeat(40),
+    );
+    return job;
+  });
+  const executor = lanAgentExecutor(workers, f.cfg);
+  f.context.deps.agentExecutor = {
+    kind: "lan",
+    run: (call, local) =>
+      executor.run(
+        { ...call, spec: { ...call.spec, target: { ...call.spec.target, harness: "claude" } } },
+        local,
+      ),
+  };
+  const outcome = await f.invoke({
+    publication: {
+      async started() {},
+      async retired() {},
+      async resume() {
+        return false;
+      },
+      async prepare() {
+        return prepared;
+      },
+      async adopt() {},
+      async remoteSha() {
+        return null;
+      },
+    },
+  });
+  expect(outcome.result.status).toBe("ok");
+  expect(f.calls).toHaveLength(0);
+  expect(f.store.listEvents(f.run.id)).toContainEqual(
+    expect.objectContaining({
+      invocationId: outcome.invocation.id,
+      level: "warn",
+      message: expect.stringContaining("remote invocation"),
+      data: { code: "browser_unavailable", id: "browser-unavailable" },
+    }),
+  );
+  expect(f.store.countEvents(f.run.id, "signal_attempt")).toBe(0);
+});
+
 test("NeedsHuman finalizes the invocation after releasing its slot without observing health", async () => {
   const reason = new NeedsHumanError("Run branch moved during a failed worker attempt");
   const f = fixture({

@@ -27,6 +27,7 @@ import { redactGateData, redactGateDiagnostics, redactGateOutput } from "../gate
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
+import { browserCache } from "../harness/browser-mcp.ts";
 import type { DecisionTask } from "../harness/decisions.ts";
 import { selectHarness } from "../harness/select.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
@@ -868,6 +869,10 @@ export class RunContext {
           ...(opts.confineReads ? { confineReads: true } : {}),
           ...(opts.allowLocalBinding ? { allowLocalBinding: true } : {}),
           noTools,
+          browser:
+            this.previewUrl && !noTools && (opts.role === "verify" || opts.role === "implement")
+              ? { previewUrl: this.previewUrl, cacheDir: browserCache(this.deps.cfg.paths.home) }
+              : undefined,
           privateSession: opts.privateOutput || opts.privateSession,
           // The private log sits in the shared temporary directory while a parallel implementer
           // runs as the same user, so it never holds the private text itself.
@@ -1230,7 +1235,8 @@ export class RunContext {
           redact && data !== undefined
             ? JSON.parse(
                 JSON.stringify(data, (_key, value: unknown) =>
-                  typeof value === "string" && !(_key === "code" && value === "signal_attempt")
+                  typeof value === "string" &&
+                  !(_key === "code" && (value === "signal_attempt" || value === "browser_unavailable"))
                     ? redact(value)
                     : value,
                 ),
@@ -1281,7 +1287,7 @@ export class RunContext {
         add("stderr", ev.text, undefined, "debug");
         break;
       case "warning":
-        add("status", ev.text, { code: "signal_attempt", id: ev.id }, "warn");
+        add("status", ev.text, { code: ev.code ?? "signal_attempt", id: ev.id }, "warn");
         break;
       case "status":
         add("status", ev.text);

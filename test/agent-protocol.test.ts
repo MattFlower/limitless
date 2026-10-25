@@ -1,5 +1,16 @@
 import { expect, test } from "bun:test";
-import { AgentResultReport } from "../src/workers/agent-protocol.ts";
+import { AgentEvents, AgentResultReport } from "../src/workers/agent-protocol.ts";
+
+test("browser diagnostics retain their code through the event protocol", () => {
+  const warning = {
+    type: "warning",
+    id: "browser-unavailable",
+    code: "browser_unavailable",
+    text: "Browser disabled: missing cache",
+  } as const;
+  expect(AgentEvents.parse({ seq: 0, events: [warning] }).events).toEqual([warning]);
+  expect(AgentEvents.safeParse({ seq: 0, events: [{ ...warning, code: "unknown" }] }).success).toBe(false);
+});
 
 test("agent result reports accept only terminal statuses and strict fields", () => {
   const report = {
