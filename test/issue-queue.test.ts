@@ -21,6 +21,8 @@ import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 const at = "2026-01-01T00:00:00Z";
+const beforeLifecycle = (path: string) =>
+  !path.endsWith("-issue-lifecycle.sql") && !path.endsWith("-issue-lifecycle-history.sql");
 function issue(number = 1, p = 1): QueueIssue {
   return {
     number,
@@ -1392,7 +1394,7 @@ test("migration suppresses history but reconciles later transitions after reopen
   const before = join(h.cfg.paths.home, "before");
   cpSync(MIGRATION_DIR, before, {
     recursive: true,
-    filter: (path) => !path.endsWith("20261024T224811-issue-lifecycle.sql"),
+    filter: beforeLifecycle,
   });
   const path = join(h.cfg.paths.home, "old.db");
   let store = new Store(path, before);
@@ -1441,9 +1443,17 @@ test("migration suppresses history but reconciles later transitions after reopen
         .every((args) => !/issues\/(8|9|10)\b/.test(args[1] ?? "")),
     ).toBe(true);
     h.calls.length = 0;
+    h.labels.set(9, new Set(["priority:1", "limitless:in-progress"]));
+    h.labels.set(10, new Set(["priority:1", "limitless:in-progress"]));
     expect(store.resolveMergedRun(merged.id, "owner", h.clock.now())).toBe(true);
     store.updateRun(closed.id, { prClosedUnmerged: true });
     await h.advance(180_000);
+    await h.advance(180_000);
+    for (const number of [9, 10]) {
+      expect(h.labels.get(number)).toEqual(new Set(["priority:1"]));
+      expect(h.comments.get(number) ?? []).toHaveLength(0);
+    }
+    h.calls.length = 0;
     await h.advance(180_000);
     expect(h.calls.filter((args) => args[1] !== "graphql")).toEqual([]);
     expect(h.comments.get(7)).toHaveLength(1);
@@ -1461,7 +1471,10 @@ test.each([
   ["untrusted failure then trusted priority", true],
   ["untrusted failure without priority", false],
   ["untrusted priority", false],
-] as const)("failure re-approval follows current labels and timeline: %s", (mode, eligible) => {
+] as const)("failure re-approval follows current labels and timeline: %s", async (mode, eligible) => {
+  const h = harness();
+  const run = await linkedRun(h);
+  const latest = h.store.updateRun(run.id, { status: "failed", finishedAt: Date.parse(at) + 999 });
   const candidate = issue();
   candidate.labels.nodes.push({ name: "limitless:failed" });
   if (mode !== "missing failure event")
@@ -1483,6 +1496,7 @@ test.each([
   candidate.labels.totalCount = candidate.labels.nodes.length;
   candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
   expect(issueEligibility(candidate, ["owner"]).eligible).toBe(eligible);
+  expect(issueEligibility(candidate, ["owner"], { latest }).eligible).toBe(eligible);
 });
 
 test("poll requires trusted re-approval later than the failure label", async () => {
@@ -1896,4 +1910,256 @@ test.each([
   expect(h.comments.get(7)?.[1]).toBe(
     `<!-- limitless-lifecycle:${run.id}:pr -->\nLimitless run ${run.id} opened a PR: see ${h.cfg.uiUrl}/runs/${run.id}.`,
   );
+});
+
+test.each(["app", "owner"] as const)(
+  "a retried comment checkpoints its new %s author before a lost response",
+  async (kind) => {
+    const h = harness();
+    const identity = (login: string): GitHubIdentity =>
+      login.endsWith("[bot]") ? { kind: "app", token: "fake", botLogin: login } : { kind: "owner" };
+    h.login = kind === "app" ? "gh-user" : "factory[bot]";
+    h.identity = async () => identity(h.login);
+    const run = await linkedRun(h);
+    h.intercept = (args) => {
+      if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("POST rejected");
+    };
+    h.start();
+    await h.advance();
+    h.stop();
+    expect(h.comments.get(7) ?? []).toHaveLength(0);
+    h.intercept = undefined;
+    h.login = kind === "app" ? "factory[bot]" : "gh-user";
+    h.afterWrite = (args) => {
+      if (args[1]?.endsWith("/comments") && args.includes("POST")) {
+        expect(
+          h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started"),
+        ).toMatchObject({ login: h.login, state: "pending", page: 1 });
+        throw new Error("response lost");
+      }
+    };
+    h.start();
+    await h.advance();
+    h.stop();
+    expect(h.comments.get(7)).toHaveLength(1);
+    expect(
+      h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started"),
+    ).toMatchObject({ login: h.login, state: "pending", page: 1 });
+    h.afterWrite = undefined;
+    h.start();
+    await h.advance();
+    expect(h.comments.get(7)).toHaveLength(1);
+  },
+);
+
+test("inaccessible linked issues cannot starve later issues of the same run", async () => {
+  const h = harness();
+  await h.factory.createRun({
+    repo: "owner/repo",
+    prompt: Array.from({ length: 26 }, (_, i) => `Closes #${i + 1}`).join("\n"),
+  });
+  h.intercept = (args) => {
+    const number = Number(args[1]?.match(/issues\/(\d+)/)?.[1]);
+    if (number && number < 26) throw new Error("HTTP 404: issue unavailable");
+  };
+  h.start();
+  for (let i = 0; i < 10; i++) {
+    h.calls.length = 0;
+    await h.advance(i ? 180_000 : 0);
+    expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(50);
+  }
+  expect(h.labels.get(26)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.comments.get(26)).toHaveLength(1);
+  expect(h.logs.join("\n")).toContain("issue unavailable");
+  h.intercept = undefined;
+  await h.advance(180_000);
+  for (let i = 0; i < 10; i++) await h.advance(180_000);
+  expect(h.labels.get(1)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.comments.get(1)).toHaveLength(1);
+});
+
+test("same-second timeline re-approval also works with the latest failed run", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  const finishedAt = Date.parse(at) + 1000;
+  const latest = h.store.updateRun(run.id, { status: "failed", finishedAt });
+  const candidate = issue(7);
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  candidate.labels.totalCount++;
+  for (const [name, login] of [
+    ["limitless:failed", "factory[bot]"],
+    ["priority:1", "owner"],
+  ]) {
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name: name ?? "" },
+      actor: { login: login ?? "" },
+      createdAt: new Date(finishedAt).toISOString(),
+    });
+  }
+  candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
+  expect(issueEligibility(candidate, ["owner"], { latest })).toEqual({ eligible: true, priority: 1 });
+});
+
+test("populated migration resumes label reconciliation after human edits", async () => {
+  const h = harness();
+  const before = join(h.cfg.paths.home, "all-statuses-before");
+  cpSync(MIGRATION_DIR, before, { recursive: true, filter: beforeLifecycle });
+  const path = join(h.cfg.paths.home, "all-statuses.db");
+  let store = new Store(path, before);
+  const repo = store.upsertRepo({
+    slug: "owner/repo",
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const statuses: RunStatus[] = [
+    "queued",
+    "waiting",
+    "running",
+    "waiting_input",
+    "needs_human",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "resolved",
+  ];
+  const runs = statuses.map((status, i) => {
+    const run = store.createRun(repo, { repo: repo.slug, prompt: `Closes #${i + 1}` });
+    return store.updateRun(run.id, { status });
+  });
+  store.close();
+  store = new Store(path);
+  expect(store.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(store.issueLifecycleRuns().map((run) => run.status)).toEqual(statuses.slice(0, 5));
+  store.close();
+  store = new Store(path);
+  const active = runs[2];
+  if (!active) throw new Error("missing running run");
+  store.updateRun(active.id, { status: "needs_human" });
+  h.labels.set(3, new Set(["limitless:in-progress"]));
+  h.intercept = (args) => {
+    if (args[1]?.includes("/issues/3/") && args.at(-1) === "labels[]=limitless:needs-you")
+      throw new Error("label write rejected");
+  };
+  const start = () =>
+    startIssueQueue(
+      { cfg: h.cfg, store, scheduler: h.factory.scheduler, createRun: h.factory.createRun },
+      {
+        gh: h.gh,
+        lifecycle: { identity: h.identity },
+        clock: {
+          now: h.clock.now,
+          set: h.clock.timer.set as unknown as typeof setTimeout,
+          clear: h.clock.timer.clear,
+        },
+      },
+    );
+  let stop = start();
+  try {
+    await h.advance();
+    expect(h.comments.get(3)).toEqual([expect.stringContaining("needs you: see")]);
+    expect(h.labels.get(3)).toEqual(new Set());
+    stop();
+    store.close();
+    store = new Store(path);
+    h.labels.set(3, new Set(["priority:1", "limitless:in-progress"]));
+    h.intercept = undefined;
+    stop = start();
+    await h.advance();
+    expect(h.labels.get(3)).toEqual(new Set(["priority:1", "limitless:needs-you"]));
+    expect(h.comments.get(3)).toHaveLength(1);
+  } finally {
+    stop();
+    store.close();
+  }
+});
+
+test.each(["merged", "closed", "merged before correction", "closed before correction"])(
+  "a pre-existing succeeded run clears issue labels when its open PR is %s",
+  async (state) => {
+    const h = harness();
+    const before = join(h.cfg.paths.home, "open-pr-before");
+    cpSync(MIGRATION_DIR, before, { recursive: true, filter: beforeLifecycle });
+    const path = join(h.cfg.paths.home, "open-pr.db");
+    let store = new Store(path, before);
+    const repo = store.upsertRepo({
+      slug: "owner/repo",
+      kind: "github",
+      url: null,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "Closes #7" });
+    store.updateRun(run.id, { status: "succeeded", prUrl: "https://github.com/owner/repo/pull/8" });
+    store.close();
+    cpSync(
+      join(MIGRATION_DIR, "20261024T224811-issue-lifecycle.sql"),
+      join(before, "20261024T224811-issue-lifecycle.sql"),
+    );
+    store = new Store(path, before);
+    const endPr = () => {
+      if (state.startsWith("merged"))
+        expect(store.resolveMergedRun(run.id, "owner", h.clock.now())).toBe(true);
+      else store.updateRun(run.id, { prClosedUnmerged: true });
+    };
+    if (state.includes("before correction")) endPr();
+    store.close();
+    store = new Store(path);
+    store.close();
+    store = new Store(path);
+    if (!state.includes("before correction")) endPr();
+    h.labels.set(7, new Set(["priority:1", "limitless:in-progress"]));
+    const stop = startIssueQueue(
+      { cfg: h.cfg, store, scheduler: h.factory.scheduler, createRun: h.factory.createRun },
+      {
+        gh: h.gh,
+        lifecycle: { identity: h.identity },
+        clock: {
+          now: h.clock.now,
+          set: h.clock.timer.set as unknown as typeof setTimeout,
+          clear: h.clock.timer.clear,
+        },
+      },
+    );
+    try {
+      await h.advance();
+      expect(h.comments.get(7) ?? []).toHaveLength(0);
+      expect(h.labels.get(7)).toEqual(new Set(["priority:1"]));
+      expect(store.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      h.calls.length = 0;
+      await h.advance(180_000);
+      expect(h.calls.filter((args) => args[1] !== "graphql")).toEqual([]);
+    } finally {
+      stop();
+      store.close();
+    }
+  },
+);
+
+test("a failed start comment cannot starve another effect on the same issue", async () => {
+  const h = harness();
+  h.maxCalls = 1;
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "needs_human" });
+  h.intercept = (args) => {
+    if (args.includes("POST") && args.at(-1)?.includes(":started -->"))
+      throw new Error("start comment rejected");
+  };
+  h.start();
+  for (let i = 0; i < 12; i++) {
+    h.calls.length = 0;
+    await h.advance(i ? 180_000 : 0);
+    expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(1);
+  }
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:needs-you"]));
+  expect(h.comments.get(7)).toEqual([expect.stringContaining("needs you: see")]);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("pending");
+  h.intercept = undefined;
+  for (let i = 0; i < 6; i++) await h.advance(180_000);
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
 });

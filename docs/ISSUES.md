@@ -25,9 +25,9 @@ body, including its dedupe marker, is credential-redacted, sanitized for local p
 against private strings. A blocked body is recorded done without posting, with the reason logged.
 
 Observed events are recorded before delivery and have durable checkpoints, including comment
-ids and posting identities; restarts do not duplicate comments. Pre-existing active runs receive
-only later transitions, with no historical comments. Runs already terminal when lifecycle support
-was introduced receive no updates. Discreet repositories receive labels without comments.
+ids and posting identities; restarts do not duplicate comments. Pre-existing runs receive only
+later transitions, with no historical comments. This includes label cleanup when an older run's
+open PR merges or closes unmerged. Discreet repositories receive labels without comments.
 Writes use the GitHub App identity where `[github.app]` covers the repository, otherwise
 `gh` credentials. Write failures are logged and retried next poll without blocking runs.
 SQL selects only outstanding lifecycle work, so completed history adds no per-run reads or GitHub

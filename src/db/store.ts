@@ -1241,9 +1241,7 @@ export class Store {
   issueLifecycleRuns(): Run[] {
     return (
       this.db
-        .query(`${RUN_SELECT} WHERE NOT EXISTS (
-          SELECT 1 FROM issue_lifecycle_effects e WHERE e.run_id = runs.id AND e.effect = 'excluded:terminal'
-        ) AND (
+        .query(`${RUN_SELECT} WHERE (
         runs.status IN ('queued','waiting','running','waiting_input','needs_human')
         OR NOT EXISTS (SELECT 1 FROM issue_lifecycle_effects e WHERE e.run_id = runs.id
           AND e.effect = 'observed'

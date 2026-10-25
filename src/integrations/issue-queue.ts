@@ -77,6 +77,15 @@ export function issueEligibility(
         .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
       return trusts(last?.actor?.login);
     });
+  const reapprovedAfterFailure =
+    failedIndex >= 0 &&
+    approved.some(
+      (label) =>
+        issue.timelineItems.nodes.findLastIndex(
+          (e) => e.__typename === "LabeledEvent" && e.label.name === label.name && trusts(e.actor?.login),
+        ) > failedIndex,
+    );
+  const failed = issue.labels.nodes.some((l) => l.name === "limitless:failed");
   let reason = "";
   if (issue.state !== "OPEN") reason = "issue is closed";
   else if (!trusts(issue.author?.login)) reason = "untrusted author";
@@ -90,16 +99,7 @@ export function issueEligibility(
     reason = "open or unresolved body blocker";
   else if (issue.labels.nodes.some((l) => l.name === "limitless:in-progress"))
     reason = "factory status label";
-  else if (
-    issue.labels.nodes.some((l) => l.name === "limitless:failed") &&
-    (failedIndex < 0 ||
-      !approved.some(
-        (label) =>
-          issue.timelineItems.nodes.findLastIndex(
-            (e) => e.__typename === "LabeledEvent" && e.label.name === label.name && trusts(e.actor?.login),
-          ) > failedIndex,
-      ))
-  )
+  else if (failed && !reapprovedAfterFailure)
     reason = "factory status requires priority re-approval after failure";
   else if (issue.closedByPullRequestsReferences.nodes.some((p) => p.state === "OPEN"))
     reason = "open closing PR";
@@ -114,9 +114,14 @@ export function issueEligibility(
     context.latest &&
     !ISSUE_CLAIM_STATUSES.includes(context.latest.status) &&
     (context.latest.finishedAt === null ||
-      !events.some(
-        (e) => trusts(e.actor?.login) && Date.parse(e.createdAt) > (context.latest?.finishedAt ?? Infinity),
-      ))
+      !(context.latest.status === "failed" && failed
+        ? reapprovedAfterFailure &&
+          Date.parse(issue.timelineItems.nodes[failedIndex]?.createdAt ?? "") >=
+            Math.floor(context.latest.finishedAt / 1000) * 1000
+        : events.some(
+            (e) =>
+              trusts(e.actor?.login) && Date.parse(e.createdAt) > (context.latest?.finishedAt ?? Infinity),
+          )))
   )
     reason = "priority re-approval required after the latest issue run";
   return reason

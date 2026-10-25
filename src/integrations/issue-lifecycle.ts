@@ -16,6 +16,7 @@ const eventOrder = ["started", "pr", "needs_human", "failed", "cancelled"] as co
 export const ISSUE_LIFECYCLE_CALL_CAP = 50;
 export type IssueLifecycleOptions = { identity?: typeof githubIdentity; maxCalls?: number };
 const cursors = new WeakMap<Store, string>();
+const sessions = new WeakMap<AbortSignal, { labels: Set<string>; logins: Map<string, string> }>();
 const exhausted = Symbol("lifecycle call budget exhausted");
 
 const desiredLabel = (run: Run) =>
@@ -40,6 +41,12 @@ export async function reconcileIssueLifecycle(
   opts: IssueLifecycleOptions = {},
 ): Promise<void> {
   let remaining = opts.maxCalls ?? ISSUE_LIFECYCLE_CALL_CAP;
+  let session = sessions.get(signal);
+  if (!session) {
+    session = { labels: new Set(), logins: new Map() };
+    sessions.set(signal, session);
+  }
+  const { labels: freshLabels, logins } = session;
   const call = (repo: string | undefined, args: string[], before?: () => void) => {
     if (signal.aborted || remaining <= 0) throw exhausted;
     remaining--;
@@ -105,36 +112,49 @@ export async function reconcileIssueLifecycle(
       store.observeIssueLifecycle(run);
     });
   }
-  const start = runs.findIndex((r) => r.id === cursors.get(store)) + 1;
-  const ordered = [...runs.slice(start), ...runs.slice(0, start)];
-  const logins = new Map<string, string | undefined>();
+  const work = runs.flatMap((snapshot) =>
+    linkedIssues(snapshot)
+      .filter(({ repo }) => lifecycleManaged(cfg, repo))
+      .flatMap((issue) =>
+        ["labels", ...eventOrder].map((effect) => ({
+          snapshot,
+          ...issue,
+          effect,
+          key: JSON.stringify([snapshot.id, issue.repo.toLowerCase(), issue.number, effect]),
+        })),
+      ),
+  );
+  const start = work.findIndex((w) => w.key === cursors.get(store)) + 1;
+  const ordered = [...work.slice(start), ...work.slice(0, start)];
   const postingLogin = async (repo: string) => {
+    const identity = await (opts.identity ?? githubIdentity)(repo);
+    if (identity.kind === "app") return identity.botLogin;
+    // Retain identity preparation only until its POST gets a call-budget slot.
     if (!logins.has(repo.toLowerCase())) {
-      const identity = await (opts.identity ?? githubIdentity)(repo);
-      const login =
-        identity.kind === "app"
-          ? identity.botLogin
-          : z.object({ login: z.string() }).parse(JSON.parse(String(await call(undefined, ["user"])))).login;
-      logins.set(repo.toLowerCase(), login || undefined);
+      const login = z
+        .object({ login: z.string() })
+        .parse(JSON.parse(String(await call(undefined, ["user"])))).login;
+      if (login) logins.set(repo.toLowerCase(), login);
     }
     return logins.get(repo.toLowerCase());
   };
-  for (const snapshot of ordered) {
-    for (const { repo, number } of linkedIssues(snapshot)) {
-      if (!lifecycleManaged(cfg, repo)) continue;
-      if (signal.aborted) return;
-      const path = `repos/${repo}/issues/${number}`;
-      const save = (effect: string, state: string, details = {}) =>
-        store.setIssueLifecycleEffect(snapshot.id, repo, number, effect, state, details);
-      const finishLabels = (target: string) =>
-        store.transaction(() => {
-          for (const e of store.issueLifecycleEffects(snapshot.id, repo, number))
-            if (e.effect.startsWith("label:") && e.state === "pending") save(e.effect, "done");
-          save("labels", target);
-        });
-      let run = store.getRun(snapshot.id);
-      if (!run) continue;
-      let effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
+  for (const { snapshot, repo, number, effect: task, key } of ordered) {
+    if (signal.aborted || remaining <= 0) return;
+    cursors.set(store, key);
+    const path = `repos/${repo}/issues/${number}`;
+    const save = (effect: string, state: string, details = {}) =>
+      store.setIssueLifecycleEffect(snapshot.id, repo, number, effect, state, details);
+    const finishLabels = (target: string) =>
+      store.transaction(() => {
+        for (const e of store.issueLifecycleEffects(snapshot.id, repo, number))
+          if (e.effect.startsWith("label:") && e.state === "pending") save(e.effect, "done");
+        save("labels", target);
+      });
+    let run = store.getRun(snapshot.id);
+    if (!run) continue;
+    if (task !== "labels") observe(run, repo, number);
+    const effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
+    if (task === "labels") {
       try {
         if (effects.get("labels")?.state !== desiredLabel(run)) {
           if (!store.issueLifecycleOwnsLabels(run, repo, number)) finishLabels(desiredLabel(run));
@@ -148,8 +168,11 @@ export async function reconcileIssueLifecycle(
                   })
                   .parse(JSON.parse(effects.get("labels")?.body ?? ""))
               : null;
-            if (plan?.target !== desiredLabel(run))
+            // Budget pauses can reuse this session's read; failures and restarts must refresh it.
+            if (plan?.target !== desiredLabel(run) || !freshLabels.has(key)) {
               plan = { target: desiredLabel(run), page: 1, current: [] };
+              freshLabels.add(key);
+            }
             while (plan.page) {
               const current = z
                 .array(z.object({ name: z.string() }))
@@ -191,6 +214,7 @@ export async function reconcileIssueLifecycle(
                 save(effect, "done");
                 save("labels", "pending", { body: JSON.stringify(plan) });
               });
+              freshLabels.delete(key);
             }
             run = store.getRun(snapshot.id);
             if (
@@ -199,86 +223,78 @@ export async function reconcileIssueLifecycle(
               labels.every((l) => plan.current.includes(l) === (l === target))
             ) {
               finishLabels(target);
+              freshLabels.delete(key);
             }
           }
         }
       } catch (error) {
         if (error === exhausted) {
-          cursors.set(store, snapshot.id);
           return;
         }
+        freshLabels.delete(key);
         logFailure(snapshot, repo, number, error);
       }
-      run = store.getRun(snapshot.id);
-      if (!run) continue;
-      observe(run, repo, number);
-      effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
-      for (const event of eventOrder) {
-        const effect = `comment:${event}`;
-        const pending = effects.get(effect);
-        if (pending?.state !== "pending") continue;
-        if (repoSettings(cfg, repo).discreet) {
-          save(effect, "done");
-          continue;
-        }
-        try {
-          let body: string;
-          try {
-            if (!pending.body) throw new Error("missing lifecycle comment body");
-            body = checkBody(run, pending.body);
-          } catch (error) {
-            save(effect, "done");
-            logFailure(run, repo, number, error);
-            continue;
-          }
-          if (pending.page) {
-            const marker = body.split("\n")[0] ?? "";
-            let page = pending.page;
-            while (page) {
-              const comments = z
-                .array(
-                  z.object({
-                    id: z.number(),
-                    body: z.string(),
-                    user: z.object({ login: z.string() }).nullable(),
-                  }),
-                )
-                .parse(JSON.parse(String(await call(repo, [`${path}/comments?per_page=100&page=${page}`]))));
-              const found = comments.find((c) => c.user?.login === pending.login && c.body.includes(marker));
-              if (found) {
-                save(effect, "done", { commentId: found.id });
-                break;
-              }
-              page = comments.length === 100 ? page + 1 : 0;
-              save(effect, "pending", { page });
-            }
-            if (page) continue; // A matching factory comment was found.
-          }
-          const login = pending.login ?? (await postingLogin(repo));
-          if (!login) throw new Error("cannot identify lifecycle comment author");
-          save(effect, "pending", { body, login });
-          const created = z
-            .object({ id: z.number().int().positive() })
-            .parse(
-              JSON.parse(
-                String(
-                  await call(repo, [`${path}/comments`, "-X", "POST", "-f", `body=${body}`], () =>
-                    save(effect, "pending", { body, login, page: 1 }),
-                  ),
-                ),
-              ),
-            );
-          save(effect, "done", { commentId: created.id });
-        } catch (error) {
-          if (error === exhausted) {
-            cursors.set(store, snapshot.id);
-            return;
-          }
-          logFailure(run, repo, number, error);
-          break;
-        }
-      }
+      continue;
     }
-    cursors.set(store, snapshot.id);
+    const effect = `comment:${task}`;
+    const pending = effects.get(effect);
+    if (pending?.state !== "pending") continue;
+    if (repoSettings(cfg, repo).discreet) {
+      save(effect, "done");
+      continue;
+    }
+    try {
+      let body: string;
+      try {
+        if (!pending.body) throw new Error("missing lifecycle comment body");
+        body = checkBody(run, pending.body);
+      } catch (error) {
+        save(effect, "done");
+        logFailure(run, repo, number, error);
+        continue;
+      }
+      if (pending.page) {
+        const marker = body.split("\n")[0] ?? "";
+        let page = pending.page;
+        while (page) {
+          const comments = z
+            .array(
+              z.object({
+                id: z.number(),
+                body: z.string(),
+                user: z.object({ login: z.string() }).nullable(),
+              }),
+            )
+            .parse(JSON.parse(String(await call(repo, [`${path}/comments?per_page=100&page=${page}`]))));
+          const found = comments.find((c) => c.user?.login === pending.login && c.body.includes(marker));
+          if (found) {
+            save(effect, "done", { commentId: found.id });
+            break;
+          }
+          page = comments.length === 100 ? page + 1 : 0;
+          save(effect, "pending", { page });
+        }
+        if (page) continue; // A matching factory comment was found.
+      }
+      const login = await postingLogin(repo);
+      if (!login) throw new Error("cannot identify lifecycle comment author");
+      save(effect, "pending", { body, login });
+      const created = z.object({ id: z.number().int().positive() }).parse(
+        JSON.parse(
+          String(
+            await call(repo, [`${path}/comments`, "-X", "POST", "-f", `body=${body}`], () => {
+              logins.delete(repo.toLowerCase());
+              save(effect, "pending", { body, login, page: 1 });
+            }),
+          ),
+        ),
+      );
+      save(effect, "done", { commentId: created.id });
+    } catch (error) {
+      if (error === exhausted) {
+        return;
+      }
+      logFailure(run, repo, number, error);
+    }
   }
 }
