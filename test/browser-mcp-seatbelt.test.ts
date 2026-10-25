@@ -13,13 +13,14 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { browserCache, browserMcp } from "../src/harness/browser-mcp.ts";
+import { agentEnv, runProcess } from "../src/util/proc.ts";
 import { browserSpec } from "./browser-mcp-support.ts";
 import { seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 
 // Requires operator provisioning; never substitute the repository's Playwright or download a browser.
 test.skipIf(seatbeltSkip !== null)(
-  `pinned MCP browser confines redirects, fetches and screenshot filenames ${seatbeltSkip ?? ""}`,
+  `pinned MCP browser confines reads, redirects, fetches and screenshot filenames ${seatbeltSkip ?? ""}`,
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "browser-seatbelt-")));
     const cwd = join(root, "checkout"),
@@ -67,6 +68,42 @@ test.skipIf(seatbeltSkip !== null)(
       const server = browserMcp(spec, "codex", []);
       if (!server)
         throw new Error("Pinned browser unavailable; provision it with scripts/provision-browser-mcp.ts");
+      const directory = server.env.HOME;
+      if (!directory) throw new Error("missing browser directory");
+      // Exercise the production profile with its validated Node runtime, including APFS aliases.
+      const read = (path: string) =>
+        runProcess({
+          cmd: [
+            server.command,
+            ...server.args.slice(0, 3),
+            "-e",
+            `
+          try { process.stdout.write(require('node:fs').readFileSync(process.argv[1])); }
+          catch (error) { process.exit(['EPERM', 'EACCES'].includes(error.code) ? 77 : 78); }
+        `,
+            "--",
+            path,
+          ],
+          cwd: directory,
+          env: { ...agentEnv(), ...server.env },
+          timeoutMs: 10_000,
+        });
+      const readable = join(directory, "readable.txt");
+      writeFileSync(readable, "allowed");
+      const allowedRead = await read(readable);
+      expect(allowedRead.exitCode, allowedRead.stderr).toBe(0);
+      expect(allowedRead.stdout).toBe("allowed");
+      const sibling = join(scratch, "browser-sibling");
+      mkdirSync(sibling);
+      for (const file of [join(cwd, "private.txt"), join(sibling, "private.txt")]) {
+        writeFileSync(file, "private probe");
+        for (const path of [file, `/System/Volumes/Data${file}`]) {
+          expect(readFileSync(path, "utf8")).toBe("private probe");
+          const denied = await read(path);
+          expect(denied.exitCode, denied.stderr).toBe(77);
+          expect(denied.stdout).toBe("");
+        }
+      }
       // The MCP SDK owns the server handle and closes it; browser_close stops its Chromium child.
       transport = new StdioClientTransport({ ...server, cwd, stderr: "pipe" });
       transport.stderr?.on("data", () => {});

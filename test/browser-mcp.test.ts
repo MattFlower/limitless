@@ -173,6 +173,49 @@ test("browser read allowlist and private denials enclose only its own writable d
   }
 });
 
+test("browser system reads exclude checkout and sibling scratch through Data-volume paths", async () => {
+  const { spec, cwd, scratch } = await fixture();
+  // Model macOS system directories on Linux too; the generated profile is the output under test.
+  const system = (path: unknown): path is string =>
+    typeof path === "string" && (path === "/System" || path.startsWith("/System/"));
+  const exists = fs.existsSync,
+    realpath = fs.realpathSync,
+    lstat = fs.lstatSync;
+  const directory = lstat(scratch);
+  const mocks = [
+    spyOn(fs, "existsSync").mockImplementation((path) => system(path) || exists(path)),
+    spyOn(fs, "realpathSync").mockImplementation(
+      new Proxy(realpath, {
+        apply(target, receiver, args) {
+          return system(args[0]) ? args[0] : Reflect.apply(target, receiver, args);
+        },
+      }),
+    ),
+    spyOn(fs, "lstatSync").mockImplementation(
+      new Proxy(lstat, {
+        apply(target, receiver, args) {
+          return system(args[0]) ? directory : Reflect.apply(target, receiver, args);
+        },
+      }),
+    ),
+  ];
+  try {
+    const server = browserMcp(spec, "codex", [], "darwin");
+    if (!server) throw new Error("missing server");
+    const reads = (server.args[1] ?? "").split("\n").filter((line) => line.startsWith("(allow file-read* "));
+    const subpaths = reads.flatMap((line) => [...line.matchAll(/\(subpath "([^"]+)"\)/g)].map((m) => m[1]));
+    const allowed = (path: string) =>
+      subpaths.some((root) => root && (path === root || path.startsWith(`${root}/`)));
+    expect(allowed("/System/Library/Frameworks/resource")).toBe(true);
+    for (const file of [join(cwd, "private.txt"), join(scratch, "browser-sibling/private.txt")]) {
+      expect(allowed(file)).toBe(false);
+      expect(allowed(`/System/Volumes/Data${file}`)).toBe(false);
+    }
+  } finally {
+    for (const mock of mocks) mock.mockRestore();
+  }
+});
+
 test.each([
   ["http://127.0.0.1:43210/x?q=1", "http://127.0.0.1:43210"],
   ["http://127.0.0.1", "http://127.0.0.1"],

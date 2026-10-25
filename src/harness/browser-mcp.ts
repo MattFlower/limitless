@@ -225,7 +225,8 @@ export function browserMcp(
       node,
       ...libraries,
       ...[
-        "/System",
+        // /System/Volumes/Data aliases user files, including other invocations' scratch.
+        "/System/Library",
         "/usr/lib",
         "/usr/share",
         "/Library/Fonts",
