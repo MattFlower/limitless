@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout } from "node:timers/promises";
+import { z } from "zod";
 import { pushBranch } from "../git/repos.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { CommandError } from "../util/proc.ts";
@@ -45,6 +46,12 @@ interface Dependencies {
 }
 const workflow = "actions/workflows/limitless-gates.yml";
 const branchFor = (handle: ExecutionHandle) => `limitless-gates/${handle.id}`;
+const setupRecord = z.object({
+  ok: z.boolean(),
+  exitCode: z.number().int().nullable(),
+  durationMs: z.number().nonnegative(),
+  output: z.string(),
+});
 
 export function githubActionsExecutor(deps: Dependencies = {}): GateExecutor {
   const now = deps.now ?? Date.now;
@@ -278,15 +285,22 @@ export function githubActionsExecutor(deps: Dependencies = {}): GateExecutor {
               if (!command) throw new Error("Unexpected GitHub gate job");
               const rawLog = (await api(req.repo, `actions/jobs/${job.id}/logs`, active)).text;
               const log = redactGateOutput(rawLog);
+              // Only the setup step's bounded records count; check stdout may contain marker text.
+              const setupLog =
+                rawLog
+                  .replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, "")
+                  .match(/^LIMITLESS_SETUP_BEGIN\r?\n([\s\S]*?)^LIMITLESS_SETUP_END\r?$/m)?.[1] ?? "";
               const setupStep = job.steps.find((s) => s.name === "Setup gates");
               const setupConclusion =
                 job.conclusion === "timed_out" && setupStep?.conclusion !== "success"
                   ? "timed_out"
                   : setupStep?.conclusion;
               const setup = req.gates.setup.map((run, i) => {
-                const marker = [...rawLog.matchAll(new RegExp(`LIMITLESS_SETUP_${i}=(.+)`, "g"))].at(-1)?.[1];
+                const marker = [...setupLog.matchAll(new RegExp(`^LIMITLESS_SETUP_${i}=(.+)$`, "gm"))].at(
+                  -1,
+                )?.[1];
                 if (marker) {
-                  const decoded = JSON.parse(marker) as GateResult;
+                  const decoded = setupRecord.parse(JSON.parse(marker));
                   return {
                     ok: decoded.ok,
                     exitCode: decoded.exitCode,
@@ -322,10 +336,7 @@ export function githubActionsExecutor(deps: Dependencies = {}): GateExecutor {
               if (completed.size === 1) for (const s of setup) emit("setup", s);
               if (setup.every((s) => s.ok)) emit("check", check);
             }
-            if (
-              (state.status === "completed" || jobs.length === checks.length) &&
-              jobs.every((j) => j.status === "completed")
-            ) {
+            if (state.status === "completed" && jobs.every((j) => j.status === "completed")) {
               if (completed.size !== checks.length) throw new Error("Incomplete GitHub gate results");
               const ordered = checks.map((_, i) =>
                 completed.get(jobs.find((j) => j.name === `gate-${i}`)?.id ?? -1),

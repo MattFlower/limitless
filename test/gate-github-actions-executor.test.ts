@@ -42,6 +42,7 @@ const request = (): GateRequest => ({
 });
 const response = (body: unknown, status = 200, etag?: string) =>
   `HTTP/2.0 ${status} OK\r\n${etag ? `ETag: ${etag}\r\n` : ""}\r\n${typeof body === "string" ? body : JSON.stringify(body)}`;
+const setupSection = (records: string) => `LIMITLESS_SETUP_BEGIN\n${records}\nLIMITLESS_SETUP_END`;
 const step = (name: string, conclusion = "success") => ({
   name,
   conclusion,
@@ -76,6 +77,7 @@ function fake() {
     jobs: [job(1, "failure"), job(0)],
     replies: [] as (Job[] | 304)[],
     pause: false,
+    runStatus: "completed",
     runConclusion: null as string | null,
     missing: false,
     deleteFails: false,
@@ -122,8 +124,13 @@ function fake() {
       calls.push({ op: "logs", path });
       return response(logs.get(Number(path.split("/").at(-2))) ?? "");
     }
-    if (/\/actions\/runs\/\d+$/.test(path))
-      return response({ status: "in_progress", conclusion: state.runConclusion }, state.missing ? 404 : 200);
+    if (/\/actions\/runs\/\d+$/.test(path)) {
+      calls.push({ op: "run", path });
+      return response(
+        { status: state.runStatus, conclusion: state.runConclusion },
+        state.missing ? 404 : 200,
+      );
+    }
     throw new Error(`Unexpected gh: ${args.join(" ")}`);
   };
   const deps = {
@@ -371,6 +378,33 @@ test.each(["cancelled", "missing"])("a remote run that is %s rejects instead of 
   expect(f.calls.at(-1)?.op).toBe("delete");
 });
 
+test.each(["success", "cancelled", "missing"])(
+  "completed jobs wait for the workflow's terminal observation (%s)",
+  async (outcome) => {
+    const f = fake();
+    f.state.jobs = [job(0), job(1)];
+    f.state.runStatus = "in_progress";
+    const gh = f.deps.gh;
+    f.deps.gh = async (args, signal, stdin) => {
+      const result = await gh(args, signal, stdin);
+      // The workflow changes after the first state read, while successful logs are fetched.
+      if (args[1]?.endsWith("/logs")) {
+        f.state.runStatus = "completed";
+        f.state.runConclusion = outcome === "cancelled" ? "cancelled" : "success";
+        f.state.missing = outcome === "missing";
+      }
+      return result ?? "";
+    };
+    const result = executeGate(request(), signal, {}, f.executor());
+    if (outcome === "success") expect((await result).checks.every((c) => c.ok)).toBe(true);
+    else await expect(result).rejects.toThrow(outcome === "cancelled" ? "cancelled" : "HTTP 404");
+    expect(f.calls.filter((c) => c.op === "run")).toHaveLength(2);
+    expect(f.calls.filter((c) => c.op === "logs")).toHaveLength(2);
+    expect(f.sleeps).toEqual([7]);
+    expect(f.calls.at(-1)?.op).toBe("delete");
+  },
+);
+
 test("a candidate workflow edit cannot change the default-branch workflow dispatch", async () => {
   const dir = join(fixture.repoDir, ".github/workflows");
   mkdirSync(dir, { recursive: true });
@@ -479,7 +513,7 @@ test("setup markers preserve command ordering, failure boundaries and decoded re
         `LIMITLESS_SETUP_${i}=${JSON.stringify(result).replaceAll("synthetic", "\\u0073ynthetic")}`,
     )
     .join("\n");
-  for (const j of f.state.jobs) f.logs.set(j.id, markers);
+  for (const j of f.state.jobs) f.logs.set(j.id, setupSection(markers));
   const remote = await executeGate(req, signal, {}, f.executor());
   const local = await confinementScope.run(fakeConfinement, () =>
     executeGate(req, signal, {}, localExecutor()),
@@ -493,10 +527,44 @@ test("setup log claims cannot override a failing setup step", async () => {
   const f = fake();
   f.state.jobs = [job(0, "failure", "failure"), job(1, "failure", "failure")];
   for (const j of f.state.jobs)
-    f.logs.set(j.id, 'LIMITLESS_SETUP_0={"ok":true,"exitCode":0,"durationMs":1,"output":"claimed pass"}');
+    f.logs.set(
+      j.id,
+      setupSection('LIMITLESS_SETUP_0={"ok":true,"exitCode":0,"durationMs":1,"output":"claimed pass"}'),
+    );
   const result = await executeGate(request(), signal, {}, f.executor());
   expect(result.setupOk).toBe(false);
   expect(result.checks).toEqual([]);
+});
+
+test.each(["ordinary check output", '{"ok":false,"exitCode":9,"durationMs":1,"output":"check claim"}'])(
+  "check stdout cannot replace a setup record (%s)",
+  async (claim) => {
+    const f = fake();
+    f.state.jobs = [job(0)];
+    const setup = setupSection(
+      'LIMITLESS_SETUP_0={"ok":true,"exitCode":0,"durationMs":12,"output":"authentic setup"}',
+    )
+      .split("\n")
+      .map((line) => `2026-01-01T00:00:00.1234567Z ${line}`)
+      .join("\n");
+    f.logs.set(10, `${setup}\nLIMITLESS_SETUP_0=${claim}\n${setupSection(`LIMITLESS_SETUP_0=${claim}`)}`);
+    const result = await executeGate({ ...request(), checks: ["pass"] }, signal, {}, f.executor());
+    expect(result.setupOk).toBe(true);
+    expect(result.setup[0]).toMatchObject({
+      ok: true,
+      exitCode: 0,
+      output: "authentic setup",
+      durationMs: 12,
+    });
+    expect(result.checks[0]?.ok).toBe(true);
+  },
+);
+
+test("malformed setup records are rejected before becoming GateResults", async () => {
+  const f = fake();
+  f.logs.set(10, setupSection('LIMITLESS_SETUP_0={"ok":"false","exitCode":0,"durationMs":1,"output":"bad"}'));
+  await expect(executeGate(request(), signal, {}, f.executor())).rejects.toThrow();
+  expect(f.calls.at(-1)?.op).toBe("delete");
 });
 
 test("timed-out jobs are failures with a null exit code and redacted output tails", async () => {
@@ -518,15 +586,36 @@ test("workflow setup script reports separate commands and stops at the first fai
   ) as { jobs: { gate: { steps: { name?: string; run?: string }[] } } };
   const script = workflow.jobs.gate.steps.find((s) => s.name === "Setup gates")?.run;
   if (!script) throw new Error("Missing setup script");
+  const commands = [
+    "echo first",
+    "echo LIMITLESS_SETUP_0=ordinary setup output; echo second; exit 3",
+    "echo never",
+  ];
   const result = await sh(["bash", "-c", script], {
     cwd: fixture.repoDir,
-    env: { ...process.env, SETUP: JSON.stringify(["echo first", "echo second; exit 3", "echo never"]) },
+    env: { ...process.env, SETUP: JSON.stringify(commands) },
     allowFail: true,
   });
   expect(result.exitCode).toBe(3);
   expect(result.stdout).toContain('LIMITLESS_SETUP_0={"ok": true, "exitCode": 0');
   expect(result.stdout).toContain('LIMITLESS_SETUP_1={"ok": false, "exitCode": 3');
+  expect(result.stdout).toContain("LIMITLESS_SETUP_BEGIN\nLIMITLESS_SETUP_0=");
+  expect(result.stdout.trim()).toEndWith("LIMITLESS_SETUP_END");
   expect(result.stdout).not.toContain("never");
+  const f = fake();
+  f.state.jobs = [job(0, "failure", "failure"), job(1, "failure", "failure")];
+  for (const j of f.state.jobs) f.logs.set(j.id, result.stdout);
+  const remote = await executeGate(
+    { ...request(), gates: { ...gates, setup: commands } },
+    signal,
+    {},
+    f.executor(),
+  );
+  expect(remote.setup.map((s) => [s.ok, s.exitCode, s.output])).toEqual([
+    [true, 0, "first"],
+    [false, 3, "LIMITLESS_SETUP_0=ordinary setup output\nsecond"],
+  ]);
+  expect(remote.checks).toEqual([]);
 });
 
 test("paginated jobs keep independent conditional caches and fetch each completed log once", async () => {
