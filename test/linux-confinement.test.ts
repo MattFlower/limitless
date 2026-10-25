@@ -248,6 +248,17 @@ test.skipIf(bwrapSkip !== null)(
     expect(connections).toBe(0);
     expect((await git(["init", "-q", join(repo, "..", "outside")])).exitCode).toBe(0);
     expect(existsSync(join(root, "outside"))).toBe(false);
+    // The ELF loader runs whatever an exec transport names, from the command line or repository config.
+    const loader = elfInterpreter(realpathSync(Bun.which("git") ?? "git")) ?? "";
+    const touch = (name: string) => `ext::${loader} ${Bun.which("touch")} ${join(repo, name)}`;
+    await git(["-c", "protocol.ext.allow=always", "ls-remote", touch("ext-cmdline")]);
+    await git(["config", "protocol.ext.allow", "always"]);
+    await git(["config", "remote.x.url", touch("ext-config")]);
+    expect((await git(["fetch", "x"])).stderr).toContain("transport 'ext' not allowed");
+    for (const marker of ["ext-cmdline", "ext-config"]) expect(existsSync(join(repo, marker))).toBe(false);
+    // Bundles, which workers fetch, still work.
+    expect((await git(["bundle", "create", join(repo, "b.bundle"), "HEAD"])).exitCode).toBe(0);
+    expect((await git(["fetch", "-q", join(repo, "b.bundle"), "HEAD"])).exitCode).toBe(0);
   },
 );
 
@@ -493,7 +504,12 @@ test.skipIf(process.platform !== "linux")(
     const bwrap = join(root, "bwrap");
     writeFileSync(bwrap, "");
     const secret = `secret-${crypto.randomUUID()}`;
-    const env = { ...agentEnv(), LD_PRELOAD: "/x.so", GIT_AUTHOR_NAME: secret };
+    const env = {
+      ...agentEnv(),
+      LD_PRELOAD: "/x.so",
+      GIT_AUTHOR_NAME: secret,
+      GIT_ALLOW_PROTOCOL: "ext:file",
+    };
     const probes: { env?: Record<string, string>; cwd: string }[] = [];
     const run = (async (cmd: string[], opts: { env?: Record<string, string>; cwd: string }) => {
       probes.push(opts);
@@ -509,7 +525,8 @@ test.skipIf(process.platform !== "linux")(
     // The cached installation probe gets a fixed environment; the command gets the caller's.
     expect(probes).toHaveLength(1);
     expect(JSON.parse(probes[0]?.env?.[PAYLOAD_ENV] ?? "")).toEqual({ PATH: "/usr/bin:/bin" });
-    expect(JSON.parse(launch.env[PAYLOAD_ENV] ?? "")).toEqual(env);
+    // Only local transports: an exec transport could start the loader with any program (#867).
+    expect(JSON.parse(launch.env[PAYLOAD_ENV] ?? "")).toEqual({ ...env, GIT_ALLOW_PROTOCOL: "file" });
     expect(launch.cmd.join("\0")).not.toContain(secret);
     expect(launch.cmd.slice(launch.cmd.indexOf("--git") + 1)[0]).toBe(repo);
     expect(launch.cmd.slice(-2)).toEqual([expect.stringMatching(/^--exec-path=/), "status"]);

@@ -207,7 +207,10 @@ export function bwrapGit(platform = process.platform, bwrap = BWRAP, run = sh): 
       if (platform !== "linux" || !existsSync(bwrap))
         throw new ConfinementError("Git confinement requires Linux bubblewrap");
       const { env, git, scratch } = resolveGit(cmd, opts);
-      const launch = trustedLaunch(env);
+      // Landlock lets the ELF loader run any binary for a program Git starts (#867). Exec transports
+      // (ext::) are the route that takes that program's path from configuration without a shell; with
+      // the network unshared, only local repositories and bundles can work anyway.
+      const launch = trustedLaunch({ ...env, GIT_ALLOW_PROTOCOL: "file" });
       let installation = installations.get(git);
       if (!installation) {
         installation = (async () => {

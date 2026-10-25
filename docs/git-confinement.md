@@ -95,13 +95,21 @@ Landlock (Linux 5.13 or later); see [OPERATIONS](OPERATIONS.md#linux-confinement
 costs about 23 ms on the development host, where the earlier `setpriv` chain cost about 13 ms, because
 the launcher is a Bun process.
 
-**Known Linux limitation ([#867](https://github.com/MattFlower/limitless/issues/867)).** Landlock's
+**The ELF loader ([#867](https://github.com/MattFlower/limitless/issues/867)).** Landlock's
 `execute` rule on the ELF loader also lets the loader run any readable binary, because the loader maps
-it with ordinary reads. A program Git is configured to start, such as an `ext::` transport or a
-configured helper, can therefore run other programs through the loader, where Seatbelt refuses the exec
-of the program itself. The network, filesystem write and Unix-socket restrictions still apply to
-whatever runs. Closing this needs Git's program-launching routes disabled or a loader-proof exec
-restriction.
+it with ordinary reads. So any program Git starts with a path-like first argument could run another
+binary through the loader, where Seatbelt refuses the exec of the program itself. Confined Git
+therefore runs with `GIT_ALLOW_PROTOCOL=file`, whatever the command line or repository config says.
+That refuses exec transports (`ext::`), the one route that takes such a program and its arguments from
+configuration without a shell; with the network unshared, only local repositories and bundles work
+anyway. The other configured programs either go through `sh`, which the execute rule refuses
+(aliases, `core.fsmonitor`, `uploadpack`, and any value with arguments), or are overridden
+(`GIT_SSH_COMMAND`, an empty `credential.helper`, signing turned off by `worktreeGit`). Those left get
+no program from the repository: the loader receives only an option it rejects, a bare name it looks up
+on the library path, or a file Git itself writes, such as an editor's message file. The network, filesystem write
+and Unix-socket restrictions still apply to whatever runs. Because `git-upload-pack` starts through
+`sh`, confined Git on Linux can fetch from a bundle but not from a local repository path; workers
+only fetch bundles.
 
 ## Checks run in the worker
 
