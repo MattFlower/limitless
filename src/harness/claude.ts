@@ -2,6 +2,7 @@ import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, idleWatchdog, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
+import { BROWSER_TOOLS, browserMcp } from "./browser-mcp.ts";
 import { homeReadPolicy } from "./read-policy.ts";
 import { ConfinementError, runSandboxed } from "./sandbox.ts";
 import {
@@ -173,6 +174,7 @@ export class ClaudeStreamParser {
 }
 
 export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: string): string[] {
+  const browser = browserMcp(spec, "claude");
   const t = spec.target;
   if (spec.mode === "readonly" && spec.addDirs?.length)
     throw new Error("Reading invocations cannot grant additional directories");
@@ -242,7 +244,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     args.push(
       "--strict-mcp-config",
       "--mcp-config",
-      '{"mcpServers":{}}',
+      JSON.stringify({ mcpServers: browser ? { playwright: { type: "stdio", ...browser } } : {} }),
       "--settings",
       JSON.stringify({
         ...fastSettings,
@@ -274,7 +276,12 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     args.push("--tools", "");
   } else if (spec.mode === "readonly") {
     args.push("--tools", "Read,Grep,Glob,Bash");
-    args.push("--allowedTools", ...readTools, "Bash");
+    args.push(
+      "--allowedTools",
+      ...readTools,
+      "Bash",
+      ...(browser ? BROWSER_TOOLS.map((name) => `mcp__playwright__${name}`) : []),
+    );
     denied.push("Bash(git commit:*)", "Bash(git reset:*)", "Bash(git checkout:*)");
   } else {
     args.push(
@@ -287,6 +294,14 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
       "TodoWrite",
       "WebFetch",
       "WebSearch",
+    );
+  }
+  if (browser) {
+    denied.push(
+      "mcp__playwright__browser_run_code_unsafe",
+      "mcp__playwright__browser_network_request",
+      "mcp__playwright__browser_route",
+      "mcp__playwright__browser_resume",
     );
   }
   args.push("--disallowedTools", ...denied);

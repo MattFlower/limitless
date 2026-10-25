@@ -36,6 +36,35 @@ the daemon with the same 45-minute wait as deploy, stops the old agent, then sta
 the replacement. A failed replacement restores the previous plist and starts that agent fresh.
 Only requested tunnel and mtplx agents migrate; they restart with rollback without draining.
 
+## Preview browser tooling
+
+From the trusted factory release checkout, provision browser tooling outside any run:
+
+```bash
+bun scripts/provision-browser-mcp.ts
+```
+
+This installs exactly `@playwright/mcp@0.0.83` and its matching Chromium into
+`$LIMITLESS_HOME/tools/playwright-mcp-0.0.83` (default `~/.limitless/tools/…`). Node and npm
+must already be installed. A matching cache is reused. Runs never install packages or browsers;
+missing or incompatible tooling produces an invocation warning and continues without a browser.
+
+Live-preview verify calls and implement calls supplied a live preview use stdio MCP with
+`--headless`, `--user-data-dir`, `--output-dir` and exactly one `--allowed-origins` origin.
+Profiles and output are private invocation scratch directories, removed with scratch on completion
+or cancellation. Claude editors retain their outer confinement and record a no-browser warning;
+remote agents also receive no browser because the coordinator preview is host-local.
+
+The pin's shipped `cli.js` delegates to `playwright-core@1.64.0-alpha-1790635538000`:
+`decorateMCPCommand`, `configFromCLIOptions` and `originOrHostGlob` were inspected. The allowlist
+controls browser requests; `--allowed-hosts` instead controls MCP HTTP transport hosts and is unused.
+Only UI operation tools are granted; server-side code, routing and browser reconfiguration tools
+are excluded. Chromium's sandbox is enabled; service workers and page-provided WebMCP tools are disabled.
+Upstream describes origin lists as a convenience guardrail that does not cover redirects, not a
+network security boundary ([configuration documentation](https://playwright.dev/mcp/configuration/options)).
+Fake tests cover configuration and cleanup; live startup and upstream enforcement need operational
+validation before relying on this guardrail for untrusted previews.
+
 ## Reloading configuration
 
 After editing `config.toml`, run `limitless config reload`. The CLI uses

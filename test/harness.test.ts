@@ -43,6 +43,7 @@ import {
 } from "../src/harness/types.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
 import { agentEnv, type ProcOptions, runProcess } from "../src/util/proc.ts";
+import { browserSpec, fakeBrowserCache } from "./browser-mcp-support.ts";
 import { fakeConfinement, seatbeltSkip } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
 import { providerFixture } from "./provider-config-support.ts";
@@ -52,6 +53,82 @@ const fixture = (name: string) =>
   readFileSync(join(import.meta.dir, "fixtures", name), "utf8")
     .split("\n")
     .filter(Boolean);
+
+test("preview browsers use strict cached stdio MCP configuration in both harnesses", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "harness-browser-")));
+  const cwd = join(root, "checkout");
+  const cache = join(root, "cache");
+  mkdirSync(cwd);
+  try {
+    await fakeBrowserCache(cache);
+    await withScratch(cwd, async (scratchDir) => {
+      const spec = browserSpec(cwd, scratchDir, cache);
+      const claude = buildClaudeArgs(spec, "session");
+      expect(claude).toContain("--strict-mcp-config");
+      expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
+      const config = JSON.parse(claude[claude.indexOf("--mcp-config") + 1] ?? "{}");
+      expect(Object.keys(config.mcpServers)).toEqual(["playwright"]);
+      const codex = buildCodexArgs(spec);
+      expect(codex).toContain("--ignore-user-config");
+      expect(codex).toContain("--strict-config");
+      expect(codex).toContain("orchestrator.mcp.enabled=true");
+      const overrides = Object.assign(
+        {},
+        ...codex.flatMap((arg, i) => (codex[i - 1] === "-c" ? [Bun.TOML.parse(arg)] : [])),
+      );
+      expect(Object.keys(overrides.mcp_servers)).toEqual(["playwright"]);
+      expect(config.mcpServers.playwright.type).toBe("stdio");
+      for (const server of [config.mcpServers.playwright, overrides.mcp_servers.playwright]) {
+        expect(server.command).toBe(realpathSync(Bun.which("node") ?? ""));
+        expect(server.args[0]).toBe(join(cache, "node_modules/@playwright/mcp/cli.js"));
+        expect(server.args).toContain("--headless");
+        expect(server.args).toContain("--sandbox");
+        expect(server.args[server.args.indexOf("--allowed-origins") + 1]).toBe("http://127.0.0.1:43210");
+        expect(server.args).not.toContain("--allowed-hosts");
+        expect(server.args).not.toContain("--no-sandbox");
+        expect(server.args).not.toContain("--port");
+        for (const flag of ["--user-data-dir", "--output-dir"])
+          expect(server.args[server.args.indexOf(flag) + 1].startsWith(`${realpathSync(scratchDir)}/`)).toBe(
+            true,
+          );
+        expect(server.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD).toBe("1");
+      }
+      expect(claude).toContain("mcp__playwright__browser_navigate");
+      expect(claude.slice(claude.indexOf("--disallowedTools") + 1)).toContain(
+        "mcp__playwright__browser_run_code_unsafe",
+      );
+      expect(overrides.mcp_servers.playwright.enabled_tools).toContain("browser_navigate");
+      expect(overrides.mcp_servers.playwright.enabled_tools).not.toContain("browser_run_code_unsafe");
+      for (const variant of [{ browser: undefined }, { noTools: true }]) {
+        const args = buildCodexArgs({ ...spec, ...variant });
+        expect(args).toContain("orchestrator.mcp.enabled=false");
+        expect(args.some((arg) => arg.startsWith("mcp_servers="))).toBe(false);
+        const argsClaude = buildClaudeArgs({ ...spec, ...variant }, "session");
+        if (!variant.noTools)
+          expect(JSON.parse(argsClaude[argsClaude.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({
+            mcpServers: {},
+          });
+        else expect(argsClaude[argsClaude.indexOf("--tools") + 1]).toBe("");
+      }
+      const warnings: string[] = [];
+      const editor = buildClaudeArgs(
+        {
+          ...spec,
+          mode: "edit",
+          onEvent: (event) => {
+            if (event.type === "warning") warnings.push(event.text);
+          },
+        },
+        "session",
+      );
+      expect(JSON.parse(editor[editor.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({ mcpServers: {} });
+      expect(warnings).toEqual([expect.stringContaining("outer confinement")]);
+      expect(buildCodexArgs({ ...spec, mode: "edit" })).toContain("orchestrator.mcp.enabled=true");
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 describe("ClaudeStreamParser", () => {
   test("parses a real stream-json run with structured output and rate limits", () => {
