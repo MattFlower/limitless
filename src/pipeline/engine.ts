@@ -26,6 +26,7 @@ import {
 } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
 import { gateProvenance } from "../gates/executor.ts";
+import { formatGateOutput } from "../gates/failures.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, PrivateError, privateStringsDigest, redactPrivate } from "../gates/private.ts";
@@ -122,6 +123,7 @@ import {
   discreetModelText,
   hasFactoryMark,
 } from "./markers.ts";
+import { confirmPostMerge, postMergeWorker } from "./post-merge-confirmation.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -3248,6 +3250,7 @@ async function mergeForDelivery(
   );
   if (!ctx.state.pendingRebaseSha) {
     ctx.state.pendingRebaseSha = fetched;
+    ctx.state.postMergeGates = undefined;
     ctx.state.preRebaseGates = ctx.state.lastGates ?? [];
     ctx.state.preRebaseHead = head;
     await ctx.save();
@@ -3276,90 +3279,140 @@ async function mergeForDelivery(
   await validateMerge(cwd, before, fetched);
   if (!resuming) await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
+  const sha = await headSha(cwd);
+  const saved = ctx.state.postMergeGates;
+  if (
+    !saved ||
+    saved.sha !== sha ||
+    saved.base !== fetched ||
+    saved.head !== before ||
+    saved.round !== ctx.state.round
+  ) {
+    ctx.state.postMergeGates = {
+      sha,
+      base: fetched,
+      head: before,
+      round: ctx.state.round,
+      // Bound original gates, their existing re-check and coordinator confirmation together.
+      deadline:
+        Date.now() +
+        (ctx.state.gatesConfig?.checks.reduce(
+          (sum, c) => sum + (c.timeoutSec ?? 900),
+          ctx.state.gatesConfig.setup.length * 900,
+        ) ?? 900) *
+          3_000,
+    };
+    await ctx.save();
+  }
+  const attempt = ctx.state.postMergeGates;
+  if (!attempt) throw new Error("Missing post-merge attempt");
   const postMergeScope = <T>(fn: () => Promise<T>) =>
     gateSlotScope(gateCommandScope(ctx, "gates", "rebase", cwd, fn));
   try {
     await ctx.stage(
       "gates",
       postMergeScope(async () => {
-        const docs = await docsOnlyGates(
-          cwd,
-          assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
-          fetched,
-          await headSha(cwd),
-        );
-        ctx.event({
-          runId: ctx.run.id,
-          type: "gate",
-          level: "info",
-          message: `Post-merge gate selection: ${JSON.stringify(redactGateData(docs.selection))}`,
-          data: docs.selection,
-        });
-        const timeoutOnly = (run: GateRun) =>
-          run.setupOk &&
-          ![...run.setup, ...run.checks].some(confinementFailed) &&
-          run.checks.some((r) => r.timedOut) &&
-          run.checks.every((r) => r.ok || r.timedOut || r.docsOnly?.mode === "skipped");
-        let after = await runGateExecution(ctx, "gates", "rebase", cwd, docs.gates, gateEvents(ctx), env);
-        ctx.checkCancelled();
-        if (timeoutOnly(after)) {
-          const first = after;
-          ctx.artifact(
-            `gates-rebase-timeout-${ctx.state.round}.json`,
-            "gates",
-            JSON.stringify(redactGateData(first)),
-          );
-          await checkoutCommitted(cwd);
-          after = await runGateExecution(ctx, "gates", "timeout", cwd, docs.gates, gateEvents(ctx));
-          ctx.checkCancelled();
-          after.checks = after.checks.map((r) => ({
-            ...r,
-            firstAttempt: findGateCounterpart(r, after.checks, first.checks),
-          }));
-        }
-        // A check fixed by the implementation must stay fixed after merging, even when
-        // it failed on the original base. Persist that regression in the evidence too.
-        const reference = previous.length
-          ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
-          : (ctx.state.baseline ?? null);
-        after = docs.annotate(after);
-        const initial = compareGates(reference, after).map((c) => ({
-          ...c,
-          firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
-        }));
-        const events = gateEvents(ctx);
-        const comparison = await retryRegressions(
-          initial,
-          cwd,
-          docs.gates,
-          [],
-          ctx.signal,
-          events.onWait,
-          (retry, options) =>
-            runGateExecution(
-              ctx,
-              "gates",
-              options?.targeted ? "regression-retry-targeted" : "regression-retry",
+        const checked =
+          attempt.result ??
+          (await (async () => {
+            const workers = new Map<string, string | null | undefined>();
+            const execute = (purpose: string, gates: GateConfig, hooks: GateHooks = gateEvents(ctx)) =>
+              runGateExecution(ctx, "gates", purpose, cwd, gates, hooks, env, (handle, run) => {
+                const worker = postMergeWorker(ctx, handle);
+                for (const check of [...gates.checks, ...run.setup]) workers.set(check.name, worker);
+              });
+            const docs = await docsOnlyGates(
               cwd,
-              retry,
-              { ...events, skipGateSlot: options?.skipGateSlot, fallbackSetup: docs.gates.setup },
-            ),
-          ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
-          (c) => isSlowRegression(c, initial, reference?.checks ?? []),
-        );
+              assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
+              fetched,
+              await headSha(cwd),
+            );
+            ctx.event({
+              runId: ctx.run.id,
+              type: "gate",
+              level: "info",
+              message: `Post-merge gate selection: ${JSON.stringify(redactGateData(docs.selection))}`,
+              data: docs.selection,
+            });
+            const timeoutOnly = (run: GateRun) =>
+              run.setupOk &&
+              ![...run.setup, ...run.checks].some(confinementFailed) &&
+              run.checks.some((r) => r.timedOut) &&
+              run.checks.every((r) => r.ok || r.timedOut || r.docsOnly?.mode === "skipped");
+            let after = await execute("rebase", docs.gates);
+            ctx.checkCancelled();
+            if (timeoutOnly(after)) {
+              const first = after;
+              ctx.artifact(
+                `gates-rebase-timeout-${ctx.state.round}.json`,
+                "gates",
+                JSON.stringify(redactGateData(first)),
+              );
+              await checkoutCommitted(cwd);
+              after = await execute("timeout", docs.gates);
+              ctx.checkCancelled();
+              after.checks = after.checks.map((r) => ({
+                ...r,
+                firstAttempt: findGateCounterpart(r, after.checks, first.checks),
+              }));
+            }
+            // A check fixed by the implementation must stay fixed after merging, even when
+            // it failed on the original base. Persist that regression in the evidence too.
+            const reference = previous.length
+              ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
+              : (ctx.state.baseline ?? null);
+            after = docs.annotate(after);
+            const initial = compareGates(reference, after).map((c) => ({
+              ...c,
+              firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
+            }));
+            const events = gateEvents(ctx);
+            const comparison = await retryRegressions(
+              initial,
+              cwd,
+              docs.gates,
+              [],
+              ctx.signal,
+              events.onWait,
+              (retry, options) =>
+                execute(options?.targeted ? "regression-retry-targeted" : "regression-retry", retry, {
+                  ...events,
+                  skipGateSlot: options?.skipGateSlot,
+                  fallbackSetup: docs.gates.setup,
+                }),
+              ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
+              (c) => isSlowRegression(c, initial, reference?.checks ?? []),
+            );
+            ctx.checkCancelled();
+            for (const c of comparison) {
+              if (!c.firstAttempt || c.result === initial.find((before) => before.name === c.name)?.result)
+                continue;
+              const before = findGateCounterpart(c, comparison, reference?.checks ?? []);
+              if (!before) continue;
+              ctx.event({
+                runId: ctx.run.id,
+                type: "gate",
+                level: "warn",
+                message: `${c.name} post-merge re-check: ran ${(c.firstAttempt.durationMs / before.durationMs).toFixed(1)}x its pre-merge time (${c.firstAttempt.durationMs / 1000}s vs ${before.durationMs / 1000}s): ${c.verdict === "flaky" ? "pass (flaky, not blocking)" : "FAIL again"}`,
+                data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
+              });
+            }
+            await confirmPostMerge(ctx, cwd, docs.gates, comparison, workers, attempt.deadline, sha);
+            return { setupOk: after.setupOk, timedOut: timeoutOnly(after), comparison };
+          })());
         ctx.checkCancelled();
+        const { setupOk, timedOut, comparison } = checked;
+        if (comparison.some((c) => c.coordinatorConfirmation)) {
+          attempt.result = redactGateData(checked);
+          await ctx.save("post-merge-confirmed");
+        }
         for (const c of comparison) {
-          if (!c.firstAttempt || c.result === initial.find((before) => before.name === c.name)?.result)
-            continue;
-          const before = findGateCounterpart(c, comparison, reference?.checks ?? []);
-          if (!before) continue;
-          ctx.event({
-            runId: ctx.run.id,
-            type: "gate",
-            level: "warn",
-            message: `${c.name} post-merge re-check: ran ${(c.firstAttempt.durationMs / before.durationMs).toFixed(1)}x its pre-merge time (${c.firstAttempt.durationMs / 1000}s vs ${before.durationMs / 1000}s): ${c.verdict === "flaky" ? "pass (flaky, not blocking)" : "FAIL again"}`,
-            data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
-          });
+          const confirmation = c.coordinatorConfirmation;
+          if (confirmation)
+            ctx.log(
+              `${c.name} post-merge coordinator confirmation (${confirmation.worker ?? "unknown worker"}): ${confirmation.reason}`,
+              "warn",
+            );
         }
         await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
         await mergeGit(cwd, ["clean", "-fdq"]);
@@ -3371,7 +3424,7 @@ async function mergeForDelivery(
           JSON.stringify(redactGateData(comparison), null, 2),
         );
         const regressed =
-          !after.setupOk ||
+          !setupOk ||
           comparison.some((c) => c.blocking) ||
           previous.some((c) => {
             const current = findGateCounterpart(c, previous, comparison)?.result;
@@ -3379,7 +3432,14 @@ async function mergeForDelivery(
           });
         if (regressed)
           throw new MergeRegressedError(
-            timeoutOnly(after) ? "post-merge gate timed out" : "post-merge gates regressed",
+            (timedOut ? "post-merge gate timed out" : "post-merge gates regressed") +
+              comparison
+                .filter((c) => c.blocking && c.coordinatorConfirmation)
+                .map((c) => {
+                  const confirmation = c.coordinatorConfirmation;
+                  return `\n${c.name} coordinator confirmation (${confirmation?.worker ?? "unknown worker"}): ${confirmation?.reason}\n${confirmation?.result ? formatGateOutput(confirmation.result, 9_000) : ""}`;
+                })
+                .join(""),
           );
         return { summary: `${comparison.length} post-merge checks ok`, value: undefined };
       }),

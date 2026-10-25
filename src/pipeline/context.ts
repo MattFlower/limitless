@@ -140,6 +140,15 @@ export interface RunState {
   /** Pinned delivery merge target (legacy field name); gates must pass before this becomes run.baseSha. */
   pendingRebaseSha?: string;
   preRebaseGates?: GateComparison[];
+  /** Coordinator confirmation is scoped to this merge attempt, including its original deadline. */
+  postMergeGates?: {
+    sha: string;
+    base: string;
+    head: string;
+    round: number;
+    deadline: number;
+    result?: { setupOk: boolean; timedOut: boolean; comparison: GateComparison[] };
+  };
   /** Expected first merge parent; also the fallback head if clean-merge gates regress. */
   preRebaseHead?: string;
   /** Completed, gated delivery merges; scoped to the run and review that authorized them. */
@@ -360,6 +369,9 @@ export class RunContext {
       checks.map((check) => ({
         ...check,
         result: redactGateDiagnostics(check.result),
+        ...(check.coordinatorConfirmation
+          ? { coordinatorConfirmation: redactGateData(check.coordinatorConfirmation) }
+          : {}),
         ...(check.firstAttempt ? { firstAttempt: redactGateDiagnostics(check.firstAttempt) } : {}),
       }));
     const baseline = this.state.baseline;
@@ -370,6 +382,9 @@ export class RunContext {
     for (const field of ["preRebaseGates", "lastGates"] as const) {
       const checks = this.state[field];
       if (checks) this.state[field] = comparisons(checks);
+    }
+    if (this.state.postMergeGates?.result) {
+      this.state.postMergeGates.result.comparison = comparisons(this.state.postMergeGates.result.comparison);
     }
     if (this.state.gateEvidence) this.state.gateEvidence.checks = comparisons(this.state.gateEvidence.checks);
     if (this.state.lastVerifiedEvidence?.lastGates)

@@ -1,10 +1,12 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, spyOn } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { Store } from "../src/db/store.ts";
 import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import type { RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
 import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { sh } from "../src/util/proc.ts";
 import {
@@ -18,6 +20,8 @@ import {
   triage,
   waitFor,
 } from "./pipeline-support.ts";
+import { postMergeWorkerFixture } from "./post-merge-worker-support.ts";
+import { test } from "./read-policy-support.ts";
 
 let home: string;
 let repoDir: string;
@@ -53,6 +57,74 @@ const {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["pass", "fail"])(
+    "post-merge confirmation checkpoint resumes %s without another execution",
+    async (outcome) => {
+      writeFileSync(
+        join(repoDir, ".limitless.toml"),
+        `[gates]\nretry_files = "fake-targeted {files}"\nchecks = [{ name = "test", run = "fake-suite" }]\n`,
+      );
+      await sh(
+        [
+          "git",
+          "-c",
+          "user.email=t@t",
+          "-c",
+          "user.name=t",
+          "commit",
+          "-qam",
+          "confirmation restart fixture",
+        ],
+        { cwd: repoDir },
+      );
+      const bare = await githubFixture();
+      const f = start(async (s) => {
+        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (roleOf(s) === "review") {
+          await advanceBase(bare, "base.txt", "new base\n");
+          return { structured: approve };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      await f.stop();
+      registerGithub(f, bare);
+      const fixture = postMergeWorkerFixture(f, outcome);
+      const save = f.store.setRunState.bind(f.store);
+      const persist = spyOn(f.store, "setRunState").mockImplementation((id, state) => {
+        save(id, state);
+        if ((state as RunState).postMergeGates?.result)
+          throw new SimulatedTermination("after confirmation checkpoint");
+      });
+      let reopened: Store | undefined;
+      try {
+        const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+        expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
+        persist.mockRestore();
+        reopened = new Store(f.deps.cfg.paths.db);
+        const saved = reopened.getRunState<RunState>(run.id)?.postMergeGates;
+        expect(saved?.result?.comparison[0]?.coordinatorConfirmation?.result?.ok).toBe(outcome === "pass");
+        expect(fixture.local).toHaveLength(1);
+        expect(fixture.remote).toHaveLength(2);
+        expect(await executeRun({ ...f.deps, store: reopened }, run.id, new AbortController().signal)).toBe(
+          outcome === "pass" ? "succeeded" : "needs_human",
+        );
+        expect(fixture.local).toHaveLength(1);
+        expect(fixture.remote).toHaveLength(2);
+        expect(reopened.getRunState<RunState>(run.id)?.postMergeGates).toEqual(saved);
+        if (outcome === "fail") {
+          expect(reopened.getRun(run.id)?.error).toContain("coordinator assertion detail");
+          expect(reopened.getArtifact(run.id, "gates-rebase-0.json")).toContain(
+            "coordinator assertion detail",
+          );
+        }
+      } finally {
+        persist.mockRestore();
+        reopened?.close();
+        fixture.processSpy.mockRestore();
+      }
+    },
+  );
+
   const invalidMergeHeads = [
     "wrong MERGE_HEAD",
     "multiple MERGE_HEAD entries",

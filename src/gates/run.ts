@@ -77,6 +77,13 @@ export interface GateComparison {
   result: GateResult;
   /** The matched baseline check could not provide usable comparison evidence. */
   baselineConfinementError?: boolean;
+  /** Coordinator-owned confirmation; result retains the worker failure and prior retries. */
+  coordinatorConfirmation?: {
+    worker?: string;
+    originalVerdict: GateVerdict;
+    reason: string;
+    result?: GateResult;
+  };
   /** The failing run that triggered a retry. */
   firstAttempt?: GateResult;
 }
