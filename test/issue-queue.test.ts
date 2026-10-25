@@ -19,6 +19,7 @@ import { buildReport } from "../src/pipeline/report.ts";
 import { reviewRoundPrompt } from "../src/pipeline/review-round.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { feedRound } from "./feed-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -950,6 +951,29 @@ test.each([
   if ("run" in round) h.store.updateRun(round.run.id, { status: "succeeded" });
   h.store.updateRun(run.id, { status: "failed", finishedAt: Date.now() });
   expect((await httpStart(h)).status).toBe(201);
+});
+
+test("client-supplied round IDs cannot bypass issue admission claims", async () => {
+  const h = harness();
+  const origin = await h.factory.createRun({ repo: "owner/repo", prompt: "Unlinked work" });
+  const repo = h.store.getRepo(origin.repoId);
+  if (!repo) throw new Error("missing repo");
+  const round = feedRound(h.store, repo, origin, "review");
+  const claimed = await h.factory.createRun({ repo: repo.slug, prompt: "Closes #7" });
+  const route = (createHttpRoutes(h.factory)["/api/runs"] as { POST: Route }).POST;
+  for (const id of [undefined, round.id]) {
+    const response = await route(
+      requestWithParams("http://localhost:7400/api/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo: repo.slug, prompt: "Closes #7", id }),
+      }),
+      localServer,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain(claimed.id);
+  }
+  expect(h.runs()).toHaveLength(3);
 });
 
 test("simultaneous poll, webhook and HTTP starts create one run", async () => {

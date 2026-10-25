@@ -1216,7 +1216,12 @@ export class Store {
           throw new Error("issue sourceRef requires a repository and positive issue number");
       }
       for (const claim of linkedIssues(
-        { ...req, source: req.source ?? "ui", sourceRef: req.sourceRef ?? null, repoSlug: repo.slug },
+        {
+          prompt: req.prompt,
+          source: req.source ?? "ui",
+          sourceRef: req.sourceRef ?? null,
+          repoSlug: repo.slug,
+        },
         this,
       )) {
         const run = this.issueClaim(claim.repo, claim.number);
