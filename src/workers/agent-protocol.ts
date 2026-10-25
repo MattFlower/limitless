@@ -17,7 +17,14 @@ const event: z.ZodType<AgentEvent> = z.discriminatedUnion("type", [
   z
     .object({ type: z.literal("rate_limit"), status: z.string(), windows, resetsAt: number.nullable() })
     .strict(),
-  z.object({ type: z.literal("warning"), id: z.string(), text: z.string() }).strict(),
+  z
+    .object({
+      type: z.literal("warning"),
+      id: z.string(),
+      text: z.string(),
+      code: z.literal("browser_unavailable").optional(),
+    })
+    .strict(),
 ]);
 export const AgentEvents = z
   .object({

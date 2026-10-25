@@ -129,9 +129,12 @@ The optional preview configuration is validated and saved from the base revision
 before model calls. A matching committed diff starts an isolated preview immediately before a new
 verify attempt; reused round results do not start one. Build and seed use scratch HOME/TMPDIR,
 reserved environment keys are enforced, and readiness stays on the loopback preview origin. The
-server and scratch are torn down on success, failure or cancellation. Browser/MCP integration is
-a separate step. Older runs without a snapshot restore it once from their recorded base SHA on
-resume, before any model calls; the edited worktree configuration is never used.
+server and scratch are torn down on success, failure or cancellation. Eligible local invocations
+request pinned, pre-provisioned Playwright MCP tooling (see [OPERATIONS](OPERATIONS.md#preview-browser-tooling));
+the current pin cannot confine redirects or output filenames, so browser setup fails closed with an
+invocation warning even when tooling is installed. Older runs without
+a snapshot restore it once from their recorded base SHA on resume, before any model calls; the
+edited worktree configuration is never used.
 
 ### Why the holdout author is blind (our twist on StrongDM's scenarios)
 StrongDM keeps scenarios in a directory the agent can't read. We go one better and cheaper: the

@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -16,6 +17,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { recordWorktree } from "../src/git/command.ts";
+import { browserMcp } from "../src/harness/browser-mcp.ts";
 import { buildClaudeArgs, runClaude } from "../src/harness/claude.ts";
 import {
   buildCodexArgs,
@@ -25,6 +27,7 @@ import {
   type ReaderProbeOptions,
   runCodex,
 } from "../src/harness/codex.ts";
+import { fakeHarness } from "../src/harness/fake.ts";
 import {
   configureReadPolicy,
   homeReadPolicy,
@@ -47,9 +50,11 @@ import {
   writeRoots,
 } from "../src/harness/scratch.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import { runToolAgent } from "../src/pipeline/agent-executor.ts";
 import { withholdText } from "../src/pipeline/context.ts";
 import { protectPrivateFile } from "../src/util/private-reads.ts";
 import { agentEnv, type ProcOptions, type ProcResult, runProcess } from "../src/util/proc.ts";
+import { browserSpec, fakeBrowserCache } from "./browser-mcp-support.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 
@@ -85,6 +90,49 @@ const procResult: ProcResult = {
   truncated: false,
   durationMs: 1,
 };
+
+test("browser profile and output stay in private scratch and are cleaned on completion and cancel", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "browser-lifecycle-")));
+  const cwd = join(root, "checkout"),
+    cache = join(root, "cache");
+  mkdirSync(cwd);
+  const profiles: string[] = [];
+  try {
+    await fakeBrowserCache(cache);
+    for (const cancel of [false, true]) {
+      const controller = new AbortController();
+      const spec = { ...browserSpec(cwd, "unused", cache), signal: controller.signal };
+      const result = await runToolAgent(
+        spec,
+        fakeHarness((invocation) => {
+          const args = browserMcp(invocation, "codex", [])?.args ?? [];
+          const scratch = realpathSync(invocation.scratchDir ?? "");
+          const directories = readdirSync(scratch).filter((name) => name.startsWith("browser-"));
+          expect(directories).toHaveLength(1);
+          for (const [flag, name] of [
+            ["--user-data-dir", "profile"],
+            ["--output-dir", "output"],
+          ]) {
+            const path = join(scratch, directories[0] ?? "", name ?? "");
+            expect(args[args.indexOf(flag ?? "") + 1]).toBe(path);
+            expect(path.startsWith(`${scratch}/`)).toBe(true);
+            expect(existsSync(path)).toBe(true);
+            expect(statSync(path).mode & 0o777).toBe(0o700);
+            profiles.push(path);
+          }
+          if (cancel) controller.abort();
+          return { text: "done" };
+        }),
+        [],
+      );
+      expect(result.status).toBe(cancel ? "cancelled" : "ok");
+      for (const path of profiles) expect(existsSync(path)).toBe(false);
+    }
+    expect(new Set(profiles).size).toBe(4);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("private database and sidecars are denied for both editors and readers with a configured factory home", async () => {
   const root = mkdtempSync(join(tmpdir(), "private-database-profile-"));

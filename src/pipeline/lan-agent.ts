@@ -171,6 +171,13 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
           request = JSON.parse(job.request);
         }
         call.dispatch();
+        if (spec.browser)
+          spec.onEvent({
+            type: "warning",
+            id: "browser-unavailable",
+            code: "browser_unavailable",
+            text: "Browser disabled: remote invocation cannot reach the coordinator preview",
+          });
         const log = (text: string) => spec.onEvent({ type: "status", text: workers.sanitize(text) });
         let attempt = workers.agentJob(id)?.attempt ?? 0;
         for (;;) {

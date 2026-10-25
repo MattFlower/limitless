@@ -39,7 +39,7 @@ export type AgentEvent =
   | { type: "rate_limit"; status: string; windows: Record<string, QuotaWindow>; resetsAt: number | null }
   | { type: "stderr"; text: string }
   | { type: "status"; text: string }
-  | { type: "warning"; id: string; text: string };
+  | { type: "warning"; id: string; text: string; code?: "browser_unavailable" };
 
 export interface AgentSpec {
   /** Supplied from each machine's own configuration at launch; never sent over LAN. */
@@ -48,6 +48,8 @@ export interface AgentSpec {
   cwd: string;
   /** Disposable write root owned by the invocation lifecycle, outside cwd. */
   scratchDir?: string;
+  /** Factory-local live preview and provisioned tooling; never forwarded to another host. */
+  browser?: { previewUrl: string; cacheDir: string };
   /** Factory-owned command wrappers, supplied only to agent processes. */
   commandPath?: string;
   prompt: string;
