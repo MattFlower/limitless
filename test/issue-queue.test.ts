@@ -12,6 +12,7 @@ import { fakeHarness } from "../src/harness/fake.ts";
 import { githubWebhook, issueRunRequest, mapGitHubEvent } from "../src/integrations/github.ts";
 import type { GitHubIdentity } from "../src/integrations/github-identity.ts";
 import { mountIntegrations } from "../src/integrations/index.ts";
+import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
 import { issueEligibility, type QueueIssue, startIssueQueue } from "../src/integrations/issue-queue.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { buildReport } from "../src/pipeline/report.ts";
@@ -401,7 +402,12 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     start() {
       stop = startIssueQueue(factory, {
         gh: h.gh,
-        lifecycle: { identity: h.identity, maxCalls: h.maxCalls },
+        lifecycle: {
+          identity: h.identity,
+          get maxCalls() {
+            return h.maxCalls;
+          },
+        },
         clock: {
           now: clock.now,
           set: ((fn: () => void, ms: number) => {
@@ -1799,6 +1805,65 @@ test("completed lifecycle history adds no GitHub calls or per-run reads", async 
   ]);
 });
 
+test("a one-call pause refreshes completed labels after a human edit in the same session", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  const signal = new AbortController().signal;
+  const poll = (maxCalls: number) =>
+    reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, (s) => h.logs.push(s), {
+      identity: h.identity,
+      maxCalls,
+    });
+  await poll(50);
+  h.store.updateRun(run.id, { status: "needs_human" });
+  h.labels.set(7, new Set(["priority:1"]));
+  h.calls.length = 0;
+  await poll(1);
+  expect(h.calls).toHaveLength(1);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "labels")).toBe("pending");
+  h.labels.set(7, new Set(["priority:1", "limitless:in-progress"]));
+  await poll(50);
+  expect(h.labels.get(7)).toEqual(new Set(["priority:1", "limitless:needs-you"]));
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "labels")).toBe("limitless:needs-you");
+  await poll(50);
+  expect(h.comments.get(7)).toEqual([
+    expect.stringContaining("started: see"),
+    expect.stringContaining("needs you: see"),
+  ]);
+});
+
+test("owner credentials changed during a budget pause use a fresh author for a lost POST", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.labels.set(7, new Set(["limitless:in-progress"]));
+  h.store.setIssueLifecycleEffect(run.id, "owner/repo", 7, "labels", "limitless:in-progress");
+  const signal = new AbortController().signal;
+  const poll = (maxCalls: number) =>
+    reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, (s) => h.logs.push(s), {
+      identity: h.identity,
+      maxCalls,
+    });
+  h.login = "owner-a";
+  await poll(1);
+  expect(h.calls.length).toBeLessThanOrEqual(1);
+  expect(h.comments.size).toBe(0);
+  h.login = "owner-b";
+  h.afterWrite = (args) => {
+    if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("response lost");
+  };
+  h.calls.length = 0;
+  await poll(2);
+  expect(h.calls.length).toBeLessThanOrEqual(2);
+  expect(h.comments.get(7)).toHaveLength(1);
+  expect(
+    h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started"),
+  ).toMatchObject({ state: "pending", login: "owner-b", page: 1 });
+  h.afterWrite = undefined;
+  await poll(50);
+  expect(h.comments.get(7)).toHaveLength(1);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
+});
+
 test.each([1, 5])(
   "lifecycle call cap %s defers writes while admitting an eligible queue issue",
   async (cap) => {
@@ -1813,10 +1878,13 @@ test.each([1, 5])(
     await h.advance();
     expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(cap);
     expect(h.runs()).toHaveLength(9);
+    // Fresh reads and their writes need two slots; retain the one-slot admission/deferral check above.
+    const progressCap = Math.max(2, cap);
+    h.maxCalls = progressCap;
     for (let i = 0; i < 80; i++) {
       h.calls.length = 0;
       await h.advance(180_000);
-      expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(cap);
+      expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(progressCap);
     }
     for (let i = 10; i < 18; i++) {
       expect(h.labels.get(i)).toEqual(new Set(["limitless:failed"]));
@@ -1847,10 +1915,14 @@ test("paginated lifecycle reads respect the cap and resume through a lost respon
     }
   };
   h.start();
+  await h.advance();
+  expect(h.calls.filter((a) => a[1] !== "graphql")).toHaveLength(1);
+  expect(h.comments.get(7)).toHaveLength(100);
+  h.maxCalls = 2;
   for (let i = 0; i < 20 && !interrupted; i++) {
     h.calls.length = 0;
-    await h.advance(i ? 180_000 : 0);
-    expect(h.calls.filter((a) => a[1] !== "graphql").length).toBeLessThanOrEqual(1);
+    await h.advance(180_000);
+    expect(h.calls.filter((a) => a[1] !== "graphql").length).toBeLessThanOrEqual(2);
   }
   expect(interrupted).toBe(true);
   h.afterWrite = undefined;
@@ -1858,7 +1930,7 @@ test("paginated lifecycle reads respect the cap and resume through a lost respon
   for (let i = 0; i < 12; i++) {
     h.calls.length = 0;
     await h.advance(i ? 180_000 : 0);
-    expect(h.calls.filter((a) => a[1] !== "graphql").length).toBeLessThanOrEqual(1);
+    expect(h.calls.filter((a) => a[1] !== "graphql").length).toBeLessThanOrEqual(2);
   }
   expect(h.labels.get(7)).toEqual(new Set([...ordinary, "limitless:failed"]));
   expect(h.comments.get(7)).toHaveLength(102);
@@ -2150,10 +2222,14 @@ test("a failed start comment cannot starve another effect on the same issue", as
       throw new Error("start comment rejected");
   };
   h.start();
+  await h.advance();
+  expect(h.calls.filter((args) => args[1] !== "graphql")).toHaveLength(1);
+  expect(h.comments.get(7) ?? []).toHaveLength(0);
+  h.maxCalls = 2;
   for (let i = 0; i < 12; i++) {
     h.calls.length = 0;
-    await h.advance(i ? 180_000 : 0);
-    expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(1);
+    await h.advance(180_000);
+    expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(2);
   }
   expect(h.labels.get(7)).toEqual(new Set(["limitless:needs-you"]));
   expect(h.comments.get(7)).toEqual([expect.stringContaining("needs you: see")]);

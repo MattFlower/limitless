@@ -16,7 +16,7 @@ const eventOrder = ["started", "pr", "needs_human", "failed", "cancelled"] as co
 export const ISSUE_LIFECYCLE_CALL_CAP = 50;
 export type IssueLifecycleOptions = { identity?: typeof githubIdentity; maxCalls?: number };
 const cursors = new WeakMap<Store, string>();
-const sessions = new WeakMap<AbortSignal, { labels: Set<string>; logins: Map<string, string> }>();
+const sessions = new WeakMap<AbortSignal, Set<string>>();
 const exhausted = Symbol("lifecycle call budget exhausted");
 
 const desiredLabel = (run: Run) =>
@@ -41,12 +41,11 @@ export async function reconcileIssueLifecycle(
   opts: IssueLifecycleOptions = {},
 ): Promise<void> {
   let remaining = opts.maxCalls ?? ISSUE_LIFECYCLE_CALL_CAP;
-  let session = sessions.get(signal);
-  if (!session) {
-    session = { labels: new Set(), logins: new Map() };
-    sessions.set(signal, session);
+  let freshLabels = sessions.get(signal);
+  if (!freshLabels) {
+    freshLabels = new Set();
+    sessions.set(signal, freshLabels);
   }
-  const { labels: freshLabels, logins } = session;
   const call = (repo: string | undefined, args: string[], before?: () => void) => {
     if (signal.aborted || remaining <= 0) throw exhausted;
     remaining--;
@@ -129,14 +128,9 @@ export async function reconcileIssueLifecycle(
   const postingLogin = async (repo: string) => {
     const identity = await (opts.identity ?? githubIdentity)(repo);
     if (identity.kind === "app") return identity.botLogin;
-    // Retain identity preparation only until its POST gets a call-budget slot.
-    if (!logins.has(repo.toLowerCase())) {
-      const login = z
-        .object({ login: z.string() })
-        .parse(JSON.parse(String(await call(undefined, ["user"])))).login;
-      if (login) logins.set(repo.toLowerCase(), login);
-    }
-    return logins.get(repo.toLowerCase());
+    // Look up the owner only when the POST can follow in this poll.
+    if (remaining < 2) throw exhausted;
+    return z.object({ login: z.string() }).parse(JSON.parse(String(await call(undefined, ["user"])))).login;
   };
   for (const { snapshot, repo, number, effect: task, key } of ordered) {
     if (signal.aborted || remaining <= 0) return;
@@ -168,12 +162,14 @@ export async function reconcileIssueLifecycle(
                   })
                   .parse(JSON.parse(effects.get("labels")?.body ?? ""))
               : null;
-            // Budget pauses can reuse this session's read; failures and restarts must refresh it.
+            // Only unfinished pagination survives a budget pause; completed snapshots need a refresh.
             if (plan?.target !== desiredLabel(run) || !freshLabels.has(key)) {
               plan = { target: desiredLabel(run), page: 1, current: [] };
               freshLabels.add(key);
             }
             while (plan.page) {
+              // Leave the last page and a write together for the next poll.
+              if (plan.page > 1 && remaining < 2) throw exhausted;
               const current = z
                 .array(z.object({ name: z.string() }))
                 .parse(
@@ -183,6 +179,7 @@ export async function reconcileIssueLifecycle(
               plan.page = current.length === 100 ? plan.page + 1 : 0;
               save("labels", "pending", { body: JSON.stringify(plan) });
             }
+            freshLabels.delete(key);
             run = store.getRun(snapshot.id);
             if (!run) continue;
             observe(run, repo, number);
@@ -283,7 +280,6 @@ export async function reconcileIssueLifecycle(
         JSON.parse(
           String(
             await call(repo, [`${path}/comments`, "-X", "POST", "-f", `body=${body}`], () => {
-              logins.delete(repo.toLowerCase());
               save(effect, "pending", { body, login, page: 1 });
             }),
           ),
