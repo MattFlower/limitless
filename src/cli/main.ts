@@ -27,7 +27,8 @@ Usage:
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
         [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
-        [--allow submodules|gitattributes|binary]  Allow that blocked audit change (repeatable)
+        [--allow submodules|gitattributes|binary|workflows]  Allow that blocked audit change (repeatable)
+          Older daemons reject --allow workflows submitted by a newer CLI.
         [--model role=model[@effort][,fallback]]  Pin a role's chain (repeatable; | joins alternatives)
   limitless retry <run> [--model role=chain]  Retry, inheriting or replacing model chains
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]

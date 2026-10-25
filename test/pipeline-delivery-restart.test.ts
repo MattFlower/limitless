@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
 import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { NeedsHumanError, type RunState } from "../src/pipeline/context.ts";
 import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { sh } from "../src/util/proc.ts";
 import {
@@ -53,6 +53,94 @@ const {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["missing audit", "stale audit", "verified fallback", "skipped audit"])(
+    "workflow publication refuses %s before any push",
+    async (scenario) => {
+      const bare = await githubFixture();
+      const refs = () => sh(["git", "show-ref"], { cwd: bare }).then((r) => r.stdout);
+      const before = await refs();
+      const f = start((s) => {
+        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (roleOf(s) === "review") return { structured: approve };
+        return { files: { ".github/workflows/added.yml": "on: push\njobs: {}\n" } };
+      });
+      registerGithub(f, bare);
+      f.deps.faults =
+        scenario === "skipped audit"
+          ? {
+              "stage:audit:before": {
+                action: "continue",
+                onHit: () => {
+                  throw new NeedsHumanError("injected audit failure");
+                },
+              },
+            }
+          : { "stage:deliver:before": { action: "kill" } };
+      const push = spyOn(repos, "pushBranch");
+      const existing = spyOn(repos, "pushExistingBranch");
+      try {
+        const run = await f.createRun({
+          repo: "test/repo",
+          prompt: "Update CI",
+          profile: "quick",
+          ...(scenario === "skipped audit" ? {} : { allow: ["workflows"] as const }),
+        });
+        let resumed = f;
+        if (scenario !== "skipped audit") {
+          await wait(() => f.store.listStages(run.id).at(-1)?.status === "cancelled", {
+            timeoutMs: 10_000,
+            description: "delivery interrupted",
+            pollMs: null,
+            subscribe: (wake) => f.store.subscribe(wake),
+          });
+          await f.stop();
+          const state = f.store.getRunState<RunState>(run.id);
+          if (!state?.worktreePath) throw new Error("missing delivery state");
+          f.store.db.query("UPDATE runs SET audit_allow = '[]' WHERE id = ?").run(run.id);
+          state.lastAudit = scenario === "missing audit" ? undefined : [];
+          if (scenario === "verified fallback") {
+            // Keep HEAD clean so checking only HEAD would miss the fallback's workflow.
+            await sh(["git", "reset", "--hard", f.store.getRun(run.id)?.baseSha ?? "missing"], {
+              cwd: state.worktreePath,
+            });
+          }
+          f.store.setRunState(run.id, state);
+          f.store.close();
+          resumed = start(
+            () => {
+              throw new Error("delivery must not call an agent");
+            },
+            false,
+            false,
+            scenario === "verified fallback"
+              ? {
+                  faults: {
+                    "stage:deliver:before": {
+                      action: "continue",
+                      onHit: () => {
+                        throw new Error("injected delivery failure");
+                      },
+                    },
+                  },
+                }
+              : {},
+          );
+        }
+        expect(await waitFor(resumed, run.id, ["needs_human", "succeeded", "failed"])).toBe("needs_human");
+        expect(push).not.toHaveBeenCalled();
+        expect(existing).not.toHaveBeenCalled();
+        expect(await refs()).toBe(before);
+        expect(resumed.store.getRun(run.id)?.prUrl).toBeNull();
+        const error = resumed.store.getRun(run.id)?.error;
+        expect(error).toContain(".github/workflows/added.yml");
+        expect(error).toContain("If this is intended, add `Allow: workflows` to the request.");
+      } finally {
+        push.mockRestore();
+        existing.mockRestore();
+      }
+    },
+  );
+
   const invalidMergeHeads = [
     "wrong MERGE_HEAD",
     "multiple MERGE_HEAD entries",

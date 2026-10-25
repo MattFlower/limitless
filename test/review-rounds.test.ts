@@ -699,7 +699,7 @@ test.each(["unmet", "unclear"] as const)(
   },
 );
 
-test.each(["amended round", "unchanged round", "amended existing branch"])(
+test.each(["amended round", "unchanged round", "amended existing branch", "stale workflow audit"])(
   "delivery restart checks the reviewed HEAD: %s",
   async (scenario) => {
     const original = await delivered();
@@ -732,18 +732,27 @@ test.each(["amended round", "unchanged round", "amended existing branch"])(
             true,
           ).id
         : ((await changes(original.id)).body.round?.id as string);
+    if (scenario === "stale workflow audit") {
+      onImplement = async () => ({ ".github/workflows/repair.yml": "on: push\njobs: {}\n" });
+      factory.store.db.query("UPDATE runs SET audit_allow = '[\"workflows\"]' WHERE id = ?").run(id);
+    }
     await settle(id, (run) => run.status === "running");
     const state = factory.store.getRunState<RunState>(id);
     if (!state?.worktreePath || !state.reviewedSha) throw new Error("missing checked round");
     expect(state.phase).toBe("deliver");
     const expected = state.reviewedSha;
     const cwd = state.worktreePath;
-    if (scenario !== "unchanged round") {
+    if (scenario === "stale workflow audit") {
+      state.lastAudit = [];
+      factory.store.setRunState(id, state);
+      factory.store.db.query("UPDATE runs SET audit_allow = '[]' WHERE id = ?").run(id);
+    } else if (scenario !== "unchanged round") {
       writeFileSync(join(cwd, "fix.txt"), "unreviewed amendment\n");
       await sh(["git", "add", "fix.txt"], { cwd });
       await sh(["git", "commit", "--amend", "--no-edit", "-q"], { cwd });
     }
     const actual = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const pushed = spyOn(repos, "pushExistingBranch");
     await restart();
     const finished = await settle(id);
     if (scenario === "unchanged round") {
@@ -753,6 +762,13 @@ test.each(["amended round", "unchanged round", "amended existing branch"])(
       expect(kinds().filter((kind) => kind === "review.round_delivered")).toHaveLength(1);
       expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
       expect(factory.store.getRunState<RunState>(id)?.reviewedSha).toBe(expected);
+    } else if (scenario === "stale workflow audit") {
+      expect(finished.status).toBe("needs_human");
+      expect(finished.error).toContain(".github/workflows/repair.yml");
+      expect(finished.error).toContain("Allow: workflows");
+      expect(pushed).not.toHaveBeenCalled();
+      expect(await remoteHead()).toBe(originalHead);
+      expect(kinds()).not.toContain("review.round_delivered");
     } else {
       expect(actual).not.toBe(expected);
       expect(finished.status).toBe("needs_human");
