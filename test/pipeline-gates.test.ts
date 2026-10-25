@@ -51,9 +51,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "confinement",
     "slot deadline",
   ])("post-merge worker confirmation: %s", async (scenario) => {
+    const secret = "synthetic-confirmation-retry-credential";
+    registerCredential("confirmation-retry", secret);
+    const retry = `fake-targeted {files}${["pass", "fail"].includes(scenario) ? ` # ${secret}` : ""}`;
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      `[gates]\nretry_files = "fake-targeted {files}"\nchecks = [{ name = "test", run = "fake-suite", timeoutSec = 37 }]\n`,
+      `[gates]\nretry_files = "${retry}"\nchecks = [{ name = "test", run = "fake-suite", timeoutSec = 37 }]\n`,
     );
     await sh(
       ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "worker confirmation fixture"],
@@ -72,6 +75,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
     await f.stop();
     registerGithub(f, bare);
+    const checkpoints: string[] = [];
+    const save = f.store.setRunState.bind(f.store);
+    const persist = spyOn(f.store, "setRunState").mockImplementation((id, state) => {
+      save(id, state);
+      const evidence = f.store.getRunState<RunState>(id)?.postMergeGates;
+      if (evidence) checkpoints.push(JSON.stringify(evidence));
+    });
     const previous = gateSlots.limit;
     gateSlots.setLimit(1);
     const clock = waitClock();
@@ -125,7 +135,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(check?.result.ok).toBe(scenario === "pass");
       expect(fixture.remote).toHaveLength(scenario === "mismatch" ? 1 : 2);
       expect(fixture.local.map((c) => c.command)).toEqual(
-        ["pass", "fail"].includes(scenario) ? ["fake-targeted './greeting.txt'"] : [],
+        ["pass", "fail"].includes(scenario) ? [retry.replace("{files}", "'./greeting.txt'")] : [],
       );
       if (scenario === "local" || scenario === "fallback")
         expect(check?.coordinatorConfirmation).toBeUndefined();
@@ -139,6 +149,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain('"coordinatorConfirmation"');
       }
       if (scenario === "pass" || scenario === "fail") {
+        expect(checkpoints.length).toBeGreaterThan(1);
+        for (const checkpoint of checkpoints) expect(checkpoint).not.toContain(secret);
+        expect(JSON.stringify(saved)).not.toContain(secret);
+        expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).not.toContain(secret);
+        expect(f.store.getRun(run.id)?.error ?? "").not.toContain(secret);
+        expect(check?.result.command).toContain("# [redacted]");
+        expect(check?.result.targetedRetry?.command).toContain("# [redacted]");
+        expect(check?.result.firstAttempt?.targetedRetry?.command).toStartWith("[withheld:");
+        expect(check?.coordinatorConfirmation?.result?.command).toContain("# [redacted]");
         expect(check?.firstAttempt?.ok).toBe(false);
         expect(check?.result.firstAttempt?.targetedRetry?.ok).toBe(false);
         expect(check?.result.firstAttempt?.output).toStartWith("[withheld:");
@@ -175,6 +194,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.getRun(run.id)?.error).toContain(reason);
       }
     } finally {
+      persist.mockRestore();
       timeoutSpy?.mockRestore();
       admissionSpy?.mockRestore();
       release?.();

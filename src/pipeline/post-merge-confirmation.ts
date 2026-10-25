@@ -25,7 +25,6 @@ export async function confirmPostMerge(
   cwd: string,
   gates: GateConfig,
   comparisons: GateComparison[],
-  workers: Map<string, string | null | undefined>,
   deadline: number,
   sha: string,
   save: () => Promise<void>,
@@ -39,7 +38,7 @@ export async function confirmPostMerge(
   for (const c of comparisons) {
     if (c.coordinatorConfirmation) continue;
     if (!c.blocking || !["regressed", "targeted_failure"].includes(c.verdict)) continue;
-    const worker = workers.get(c.name);
+    const worker = c.postMergeWorker;
     if (worker === undefined) continue;
     let reason = "worker execution attribution unavailable";
     let result: GateResult | undefined;
@@ -107,7 +106,10 @@ export async function confirmPostMerge(
     });
     if (result) {
       c.firstAttempt ??= c.result;
-      c.result = { ...result, ...(c.result.docsOnly ? { docsOnly: c.result.docsOnly } : {}) };
+      c.result = redactGateData({
+        ...result,
+        ...(c.result.docsOnly ? { docsOnly: c.result.docsOnly } : {}),
+      });
     }
     if (result?.ok && !result.timedOut && !confinementFailed(result)) {
       c.verdict = "flaky";

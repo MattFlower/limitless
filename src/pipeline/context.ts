@@ -152,7 +152,7 @@ export interface RunState {
       setupOk: boolean;
       timedOut: boolean;
       comparison: GateComparison[];
-      /** Missing entries are local; null means LAN execution with unavailable attribution. */
+      /** Legacy attribution; normalized onto comparison entries on load. */
       workers?: Record<string, string | null | undefined>;
     };
   };
@@ -313,6 +313,30 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
   verify: 25 * 60_000,
 };
 
+/** Attach attribution before redaction; ambiguous sanitized names must never borrow a worker. */
+export function redactPostMergeComparisons(
+  checks: GateComparison[],
+  workers: Record<string, string | null | undefined> = {},
+): GateComparison[] {
+  const entries = Object.entries(workers);
+  return redactGateData(
+    checks.map((check) => {
+      const name = redactGateOutput(check.name);
+      const matches = entries.filter(([key]) => redactGateOutput(key) === name);
+      const worker =
+        matches.length === 1 && checks.filter((c) => redactGateOutput(c.name) === name).length === 1
+          ? matches[0]?.[1]
+          : matches.length
+            ? null
+            : undefined;
+      return {
+        ...check,
+        postMergeWorker: check.postMergeWorker !== undefined ? check.postMergeWorker : worker,
+      };
+    }),
+  );
+}
+
 export class RunContext {
   readonly deps: EngineDeps;
   private readonly stageConfig = new AsyncLocalStorage<Config>();
@@ -391,7 +415,10 @@ export class RunContext {
       if (checks) this.state[field] = comparisons(checks);
     }
     if (this.state.postMergeGates?.result) {
-      this.state.postMergeGates.result.comparison = comparisons(this.state.postMergeGates.result.comparison);
+      const result = this.state.postMergeGates.result;
+      result.comparison = redactPostMergeComparisons(result.comparison, result.workers);
+      delete result.workers;
+      this.state.postMergeGates.result = redactGateData(result);
     }
     if (this.state.gateEvidence) this.state.gateEvidence.checks = comparisons(this.state.gateEvidence.checks);
     if (this.state.lastVerifiedEvidence?.lastGates)

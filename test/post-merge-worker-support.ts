@@ -10,7 +10,12 @@ import type { RunState } from "../src/pipeline/context.ts";
 import * as proc from "../src/util/proc.ts";
 
 /** Remote results go through WorkerStore withholding; only confirmation executes local commands. */
-export function postMergeWorkerFixture(f: Factory, scenario = "pass", onRetry?: () => void) {
+export function postMergeWorkerFixture(
+  f: Factory,
+  scenario = "pass",
+  onRetry?: () => void,
+  workerFor = (_name: string) => "test-worker",
+) {
   const workers = new WorkerStore(f.store, undefined);
   const requests = new Map<string, GateRequest>();
   const remote: string[] = [];
@@ -53,8 +58,8 @@ export function postMergeWorkerFixture(f: Factory, scenario = "pass", onRetry?: 
         };
         if (handle.kind === "lan") {
           f.store.db
-            .query("UPDATE gate_jobs SET state='leased',worker='test-worker' WHERE id=?")
-            .run(handle.id);
+            .query("UPDATE gate_jobs SET state='leased',worker=? WHERE id=?")
+            .run(workerFor(req.gates.checks[0]?.name ?? ""), handle.id);
           workers.complete(handle.id, run);
           if (scenario === "fallback")
             f.store.db
@@ -63,8 +68,9 @@ export function postMergeWorkerFixture(f: Factory, scenario = "pass", onRetry?: 
           if (scenario === "unknown worker")
             f.store.db.query("UPDATE gate_jobs SET worker=NULL WHERE id=?").run(handle.id);
         }
+        const sanitized = handle.kind === "lan" ? workers.sanitize(run) : run;
         if (merged && remote.length === 2) onRetry?.();
-        return handle.kind === "lan" ? workers.sanitize(run) : run;
+        return sanitized;
       })();
       return { result, cancel: async () => {}, events: { async *[Symbol.asyncIterator]() {} } };
     },

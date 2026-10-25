@@ -112,6 +112,7 @@ import {
   Preempted,
   RunContext,
   type RunState,
+  redactPostMergeComparisons,
 } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
@@ -3400,25 +3401,16 @@ async function mergeForDelivery(
             attempt.result = redactGateData({
               setupOk: after.setupOk,
               timedOut: timeoutOnly(after),
-              comparison,
-              workers: Object.fromEntries(workers),
+              comparison: redactPostMergeComparisons(comparison, Object.fromEntries(workers)),
             });
             await ctx.save("post-merge-confirmation-pending");
             return attempt.result;
           })());
         ctx.checkCancelled();
         const { setupOk, timedOut, comparison } = checked;
-        if (checked.workers)
-          await confirmPostMerge(
-            ctx,
-            cwd,
-            docs.gates,
-            comparison,
-            new Map(Object.entries(checked.workers)),
-            attempt.deadline,
-            sha,
-            () => ctx.save("post-merge-confirmed"),
-          );
+        await confirmPostMerge(ctx, cwd, docs.gates, comparison, attempt.deadline, sha, () =>
+          ctx.save("post-merge-confirmed"),
+        );
         ctx.checkCancelled();
         for (const c of comparison) {
           const confirmation = c.coordinatorConfirmation;
