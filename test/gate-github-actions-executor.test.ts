@@ -42,7 +42,8 @@ const request = (): GateRequest => ({
 });
 const response = (body: unknown, status = 200, etag?: string) =>
   `HTTP/2.0 ${status} OK\r\n${etag ? `ETag: ${etag}\r\n` : ""}\r\n${typeof body === "string" ? body : JSON.stringify(body)}`;
-const setupSection = (records: string) => `LIMITLESS_SETUP_BEGIN\n${records}\nLIMITLESS_SETUP_END`;
+const setupSection = (records: string, token = "c".repeat(32)) =>
+  `LIMITLESS_SETUP_TOKEN=${token}\n${records.replace(/^LIMITLESS_SETUP_(\d+)=/gm, `LIMITLESS_SETUP_${token}_$1=`)}`;
 const step = (name: string, conclusion = "success") => ({
   name,
   conclusion,
@@ -547,7 +548,10 @@ test.each(["ordinary check output", '{"ok":false,"exitCode":9,"durationMs":1,"ou
       .split("\n")
       .map((line) => `2026-01-01T00:00:00.1234567Z ${line}`)
       .join("\n");
-    f.logs.set(10, `${setup}\nLIMITLESS_SETUP_0=${claim}\n${setupSection(`LIMITLESS_SETUP_0=${claim}`)}`);
+    f.logs.set(
+      10,
+      `${setup}\nLIMITLESS_SETUP_0=${claim}\n${setupSection(`LIMITLESS_SETUP_0=${claim}`, "d".repeat(32))}`,
+    );
     const result = await executeGate({ ...request(), checks: ["pass"] }, signal, {}, f.executor());
     expect(result.setupOk).toBe(true);
     expect(result.setup[0]).toMatchObject({
@@ -559,6 +563,20 @@ test.each(["ordinary check output", '{"ok":false,"exitCode":9,"durationMs":1,"ou
     expect(result.checks[0]?.ok).toBe(true);
   },
 );
+
+test("delimiter-shaped setup stdout before the authentic record cannot replace it", async () => {
+  const f = fake();
+  f.state.jobs = [job(0)];
+  const forged = setupSection("LIMITLESS_SETUP_0=ordinary", "e".repeat(32));
+  const stdout = `LIMITLESS_SETUP_BEGIN\nLIMITLESS_SETUP_0=ordinary\nLIMITLESS_SETUP_END\n${forged}`;
+  const record = JSON.stringify({ ok: true, exitCode: 0, durationMs: 5, output: "authentic" });
+  const authentic = setupSection(`LIMITLESS_SETUP_0=${record}`).split("\n");
+  f.logs.set(10, [authentic[0], stdout, authentic[1]].join("\n"));
+  const result = await executeGate({ ...request(), checks: ["pass"] }, signal, {}, f.executor());
+  expect(result.setupOk).toBe(true);
+  expect(result.setup[0]).toMatchObject({ ok: true, exitCode: 0, durationMs: 5, output: "authentic" });
+  expect(result.checks[0]?.ok).toBe(true);
+});
 
 test("malformed setup records are rejected before becoming GateResults", async () => {
   const f = fake();
@@ -586,8 +604,10 @@ test("workflow setup script reports separate commands and stops at the first fai
   ) as { jobs: { gate: { steps: { name?: string; run?: string }[] } } };
   const script = workflow.jobs.gate.steps.find((s) => s.name === "Setup gates")?.run;
   if (!script) throw new Error("Missing setup script");
+  // Delimiter-shaped setup stdout, printed before the authentic records, must not replace them.
+  const forged = `LIMITLESS_SETUP_TOKEN=${"0".repeat(32)}\nLIMITLESS_SETUP_${"0".repeat(32)}_0=ordinary\nLIMITLESS_SETUP_BEGIN\nLIMITLESS_SETUP_0=ordinary\nLIMITLESS_SETUP_END\nfirst`;
   const commands = [
-    "echo first",
+    `printf '%s\\n' '${forged.replaceAll("\n", "' '")}'`,
     "echo LIMITLESS_SETUP_0=ordinary setup output; echo second; exit 3",
     "echo never",
   ];
@@ -597,10 +617,10 @@ test("workflow setup script reports separate commands and stops at the first fai
     allowFail: true,
   });
   expect(result.exitCode).toBe(3);
-  expect(result.stdout).toContain('LIMITLESS_SETUP_0={"ok": true, "exitCode": 0');
-  expect(result.stdout).toContain('LIMITLESS_SETUP_1={"ok": false, "exitCode": 3');
-  expect(result.stdout).toContain("LIMITLESS_SETUP_BEGIN\nLIMITLESS_SETUP_0=");
-  expect(result.stdout.trim()).toEndWith("LIMITLESS_SETUP_END");
+  const token = result.stdout.match(/^LIMITLESS_SETUP_TOKEN=([a-f0-9]{32})\n/)?.[1];
+  expect(token).not.toBe("0".repeat(32));
+  expect(result.stdout).toContain(`LIMITLESS_SETUP_${token}_0={"ok": true, "exitCode": 0`);
+  expect(result.stdout).toContain(`LIMITLESS_SETUP_${token}_1={"ok": false, "exitCode": 3`);
   expect(result.stdout).not.toContain("never");
   const f = fake();
   f.state.jobs = [job(0, "failure", "failure"), job(1, "failure", "failure")];
@@ -612,7 +632,7 @@ test("workflow setup script reports separate commands and stops at the first fai
     f.executor(),
   );
   expect(remote.setup.map((s) => [s.ok, s.exitCode, s.output])).toEqual([
-    [true, 0, "first"],
+    [true, 0, forged],
     [false, 3, "LIMITLESS_SETUP_0=ordinary setup output\nsecond"],
   ]);
   expect(remote.checks).toEqual([]);

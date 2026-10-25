@@ -50,24 +50,20 @@ jobs:
         run: |
           python3 - <<'PY'
           import json, os, subprocess, time
-          records = []
-          try:
-              for i, command in enumerate(json.loads(os.environ['SETUP'])):
-                  start = time.monotonic()
-                  result = subprocess.run(command, shell=True, capture_output=True, text=True)
-                  output = (result.stdout + '\n' + result.stderr).strip()
-                  print(output, flush=True)
-                  records.append('LIMITLESS_SETUP_' + str(i) + '=' + json.dumps({
-                      'ok': result.returncode == 0, 'exitCode': result.returncode,
-                      'durationMs': round((time.monotonic() - start) * 1000), 'output': output[-6000:]
-                  }))
-                  if result.returncode:
-                      raise SystemExit(result.returncode)
-          finally:
-              print('LIMITLESS_SETUP_BEGIN', flush=True)
-              for record in records:
-                  print(record, flush=True)
-              print('LIMITLESS_SETUP_END', flush=True)
+          # Printed before any command runs and never shown to commands, so their output cannot forge records.
+          token = os.urandom(16).hex()
+          print('LIMITLESS_SETUP_TOKEN=' + token, flush=True)
+          for i, command in enumerate(json.loads(os.environ['SETUP'])):
+              start = time.monotonic()
+              result = subprocess.run(command, shell=True, capture_output=True, text=True)
+              output = (result.stdout + '\n' + result.stderr).strip()
+              print(output, flush=True)
+              print('LIMITLESS_SETUP_' + token + '_' + str(i) + '=' + json.dumps({
+                  'ok': result.returncode == 0, 'exitCode': result.returncode,
+                  'durationMs': round((time.monotonic() - start) * 1000), 'output': output[-6000:]
+              }), flush=True)
+              if result.returncode:
+                  raise SystemExit(result.returncode)
           PY
       - name: Check gate
         env:

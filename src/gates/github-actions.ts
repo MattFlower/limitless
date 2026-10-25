@@ -285,20 +285,18 @@ export function githubActionsExecutor(deps: Dependencies = {}): GateExecutor {
               if (!command) throw new Error("Unexpected GitHub gate job");
               const rawLog = (await api(req.repo, `actions/jobs/${job.id}/logs`, active)).text;
               const log = redactGateOutput(rawLog);
-              // Only the setup step's bounded records count; check stdout may contain marker text.
-              const setupLog =
-                rawLog
-                  .replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, "")
-                  .match(/^LIMITLESS_SETUP_BEGIN\r?\n([\s\S]*?)^LIMITLESS_SETUP_END\r?$/m)?.[1] ?? "";
+              // The first token line precedes all command output; only records carrying it count.
+              const plain = rawLog.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, "");
+              const token = plain.match(/^LIMITLESS_SETUP_TOKEN=([a-f0-9]{32})\r?$/m)?.[1];
               const setupStep = job.steps.find((s) => s.name === "Setup gates");
               const setupConclusion =
                 job.conclusion === "timed_out" && setupStep?.conclusion !== "success"
                   ? "timed_out"
                   : setupStep?.conclusion;
               const setup = req.gates.setup.map((run, i) => {
-                const marker = [...setupLog.matchAll(new RegExp(`^LIMITLESS_SETUP_${i}=(.+)$`, "gm"))].at(
-                  -1,
-                )?.[1];
+                const marker = token
+                  ? plain.match(new RegExp(`^LIMITLESS_SETUP_${token}_${i}=(.+?)\\r?$`, "m"))?.[1]
+                  : undefined;
                 if (marker) {
                   const decoded = setupRecord.parse(JSON.parse(marker));
                   return {
