@@ -2607,7 +2607,7 @@ function githubUnavailable(error: unknown): boolean {
 }
 
 async function checkWorkflowPublication(ctx: RunContext, sha: string): Promise<void> {
-  const base = ctx.state.verification?.headSha ?? reviewRound(ctx)?.reviewedSha ?? ctx.run.baseSha;
+  const base = ctx.state.verification?.headSha ?? ctx.run.baseSha;
   if (!base) throw new DeliveryHeadError("Workflow publication check requires a recorded base");
   try {
     await assertWorkflowPublication(

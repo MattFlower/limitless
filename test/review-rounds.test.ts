@@ -809,27 +809,50 @@ test("a push to the PR during the round is never overwritten", async () => {
   expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
 });
 
-test("a PR behind its base gets a factory merge commit before the round's work", async () => {
-  const original = await delivered();
-  const reviewed = await remoteHead();
-  const tip = await push("main", "notes.txt", "base moved on\n");
-  const round = await settle((await changes(original.id)).body.round?.id as string);
-  expect(round.status).toBe("succeeded");
-  const head = await remoteHead();
-  const parents = async (rev: string) =>
-    (await sh(["git", "rev-list", "--parents", "-n", "1", rev], { cwd: remote })).stdout
-      .trim()
-      .split(" ")
-      .slice(1);
-  const [merge] = await parents(head);
-  expect(await parents(merge as string)).toEqual([reviewed, tip]);
-  expect(
-    (await sh(["git", "log", "-1", "--format=%an", merge as string], { cwd: remote })).stdout.trim(),
-  ).toBe("Limitless");
-  // The round's own change is measured from the merge: the base's commit is not part of it.
-  const changed = await sh(["git", "diff", "--name-only", merge as string, head], { cwd: remote });
-  expect(changed.stdout.trim()).toBe("fix.txt");
-});
+test.each([
+  { baseFile: "notes.txt", repairFile: "fix.txt" },
+  { baseFile: ".github/workflows/check.yml", repairFile: "fix.txt" },
+  { baseFile: ".github/workflows/check.yml", repairFile: ".github/workflows/check.yml" },
+])(
+  "a PR behind its base imports $baseFile before repairing $repairFile",
+  async ({ baseFile, repairFile }) => {
+    const original = await delivered();
+    const reviewed = await remoteHead();
+    mkdirSync(join(work, ".github/workflows"), { recursive: true });
+    const tip = await push("main", baseFile, "base moved on\n");
+    onImplement = async () => ({ [repairFile]: "fixed\n" });
+    const pushed = spyOn(repos, "pushExistingBranch");
+    const round = await settle((await changes(original.id)).body.round?.id as string);
+    if (repairFile === baseFile) {
+      expect(round.status).toBe("needs_human");
+      expect(round.error).toContain(`[ci-config] ${repairFile}`);
+      expect(round.error).toContain("Allow: workflows");
+      expect(pushed).not.toHaveBeenCalled();
+      expect(await remoteHead()).toBe(reviewed);
+      return;
+    }
+    expect(round.status).toBe("succeeded");
+    const head = await remoteHead();
+    const parents = async (rev: string) =>
+      (await sh(["git", "rev-list", "--parents", "-n", "1", rev], { cwd: remote })).stdout
+        .trim()
+        .split(" ")
+        .slice(1);
+    const [merge] = await parents(head);
+    expect(await parents(merge as string)).toEqual([reviewed, tip]);
+    expect(round.baseSha).toBe(merge as string);
+    expect(pushed).toHaveBeenCalledTimes(1);
+    expect((await sh(["git", "show", `${head}:${baseFile}`], { cwd: remote })).stdout).toBe(
+      "base moved on\n",
+    );
+    expect(
+      (await sh(["git", "log", "-1", "--format=%an", merge as string], { cwd: remote })).stdout.trim(),
+    ).toBe("Limitless");
+    // The round's own change is measured from the merge: the base's commit is not part of it.
+    const changed = await sh(["git", "diff", "--name-only", merge as string, head], { cwd: remote });
+    expect(changed.stdout.trim()).toBe(repairFile);
+  },
+);
 
 test("a round that changes nothing ends needs_human without touching the PR", async () => {
   const original = await delivered();
