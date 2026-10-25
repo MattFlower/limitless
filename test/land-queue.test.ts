@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadConfig, type Paths } from "../src/config.ts";
 import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
@@ -390,14 +390,17 @@ const ghCalls = (verb: string) =>
 const gateLog = () =>
   existsSync(gateLogPath()) ? readFileSync(gateLogPath(), "utf8").trim().split("\n") : [];
 
+const testCommand =
+  'bun test --parallel=$(bun scripts/test-workers.ts) --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"';
+const otherTestCommand = "bun test ./other.test.ts";
 const retryFile = "space ' quote.test.ts";
-const retryCommand = "base-retry './space '\\'' quote.test.ts'";
+const retryCommand = "bun test --isolate './space '\\'' quote.test.ts'";
 
 async function retryLandFixture(
-  retryFiles: unknown = "base-retry {files}",
+  retryFiles: unknown = "bun test --isolate {files}",
   checkName = "test",
   setup = "prepare",
-  command = "full-test",
+  command = testCommand,
 ) {
   writeFileSync(
     join(seed, retryFile),
@@ -407,7 +410,7 @@ async function retryLandFixture(
     join(seed, ".limitless.toml"),
     `[gates]
 setup = [${JSON.stringify(setup)}]
-checks = [{ name = ${JSON.stringify(checkName)}, run = ${JSON.stringify(command)}, timeoutSec = 300 }, { name = "other", run = "full-other", timeoutSec = 90 }, { name = "lint", run = "lint" }]
+checks = [{ name = ${JSON.stringify(checkName)}, run = ${JSON.stringify(command)}, timeoutSec = 300 }, { name = "other", run = ${JSON.stringify(otherTestCommand)}, timeoutSec = 90 }, { name = "lint", run = "lint" }]
 ${retryFiles === null ? "" : `retry_files = ${JSON.stringify(retryFiles)}`}
 `,
   );
@@ -560,7 +563,7 @@ test("a land check pins its executor through fresh-checkout retries; the next en
   await settle();
   expect(store.getLandEntry(first.id)?.state).toBe("landed");
   expect(a.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
-    ["full-test", "full-other", "lint"],
+    [testCommand, otherTestCommand, "lint"],
     [retryCommand],
   ]);
   expect(a.requests[1]?.gates.setup).toEqual(["prepare"]);
@@ -578,6 +581,30 @@ test("a land check pins its executor through fresh-checkout retries; the next en
   expect(a.requests).toHaveLength(2);
   expect(b.requests).toHaveLength(1);
   expect(b.requests[0]?.headSha).toBe(head);
+});
+
+test("a compound land check cannot pass on its failing test files alone", async () => {
+  const command = "bun test; security-scan";
+  const { pr, head } = await retryLandFixture(undefined, "test", "prepare", command);
+  const fake = fakeLandGates((req, attempt) => retryRun(req, attempt === 1 ? { test: testFailure } : {}));
+  const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+  await settle();
+  const blocked = store.getLandEntry(entry.id);
+  expect(blocked).toMatchObject({
+    state: "blocked",
+    pushedSha: null,
+    reason: `test failed (${blocked?.logPath})`,
+  });
+  expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
+    [command, otherTestCommand, "lint"],
+  ]);
+  const log = readFileSync(blocked?.logPath ?? "", "utf8");
+  expect(log).toContain("initial test failure");
+  expect(log).toContain(
+    `Land ${entry.id} test: no targeted retry: check is not a single bun test invocation`,
+  );
+  expect(await remoteHead("pr-1")).toBe(head);
+  expect(ghCalls("pr merge")).toEqual([]);
 });
 
 test.each([false, true])("targeted land retries record flakes through CI (restart: %s)", async (restart) => {
@@ -602,9 +629,9 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
   const summary = `flaky: test (${retryFile}); other (README.md)`;
   expect(store.getLandEntry(entry.id)?.reason).toBe(summary);
   expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
-    ["full-test", "full-other", "lint"],
+    [testCommand, otherTestCommand, "lint"],
     [retryCommand],
-    ["base-retry './README.md'"],
+    ["bun test --isolate './README.md'"],
   ]);
   expect(fake.requests.map((r) => r.gates.setup)).toEqual([["prepare"], ["prepare"], ["prepare"]]);
   expect(fake.requests.map((r) => r.priority)).toEqual(["ship", "ship", "ship"]);
@@ -616,7 +643,7 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
     { type: "gate", message: `Land ${entry.id} ${summary}` },
   ]);
   const log = readFileSync(store.getLandEntry(entry.id)?.logPath ?? "", "utf8");
-  expect(log).toContain("$ full-test\ninitial test failure [redacted]");
+  expect(log).toContain(`$ ${testCommand}\ninitial test failure [redacted]`);
   expect(log).toContain(
     `# targeted retry\n\n$ prepare\npassed\n\n$ ${retryCommand}\ntargeted pass [redacted]`,
   );
@@ -651,7 +678,7 @@ test.each(["pass", "cancel", "stop"])("local targeted land retry keeps its slot 
     opts.onStdoutLine?.(opts.cmd[4] ?? "");
     const command = opts.cmd.at(-1) ?? "";
     commands.push(command);
-    if (command === "full-test") {
+    if (command === testCommand) {
       initial.resolve();
       await finishInitial.promise;
       const report = opts.env?.LIMITLESS_GATE_REPORT;
@@ -662,7 +689,7 @@ test.each(["pass", "cancel", "stop"])("local targeted land retry keeps its slot 
       );
       for (const line of ["0 pass", "1 fail", "Ran 1 test across 1 file."]) opts.onStdoutLine?.(line);
     }
-    if (command.startsWith("base-retry")) {
+    if (command.startsWith("bun test --isolate")) {
       retry.resolve();
       if (action === "pass") await finishRetry.promise;
       else {
@@ -675,7 +702,7 @@ test.each(["pass", "cancel", "stop"])("local targeted land retry keeps its slot 
       }
     }
     return {
-      exitCode: command === "full-test" ? 1 : 0,
+      exitCode: command === testCommand ? 1 : 0,
       signal: null,
       cancelled: false,
       timedOut: false,
@@ -721,7 +748,13 @@ test.each(["pass", "cancel", "stop"])("local targeted land retry keeps its slot 
       await q.stop();
       expect(store.getLandEntry(entry.id)?.state).toBe(action === "stop" ? "checking" : "cancelled");
     }
-    expect(commands).toEqual(["prepare", "full-test", "full-other", "lint", "base-retry './README.md'"]);
+    expect(commands).toEqual([
+      "prepare",
+      testCommand,
+      otherTestCommand,
+      "lint",
+      "bun test --isolate './README.md'",
+    ]);
     expect(await remoteHead("pr-1")).toBe(head);
     expect(ghCalls("pr merge")).toEqual([]);
     release();
@@ -741,7 +774,7 @@ test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)",
   const setup = setupFails
     ? "echo retry setup failed >&2; exit 1"
     : "mkdir -p node_modules/retry-dependency && echo 'export default true;' > node_modules/retry-dependency/index.js";
-  const template = `'${process.execPath}' test {files}`;
+  const template = "bun test {files}";
   const { pr, head } = await retryLandFixture(template, "test", setup);
   const fresh = join(root, "retry-checkout");
   const fake = fakeLandGates((req, attempt, signal) => {
@@ -749,7 +782,11 @@ test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)",
     mkdirSync(fresh);
     writeFileSync(join(fresh, retryFile), readFileSync(join(req.cwd, retryFile)));
     expect(existsSync(join(fresh, "node_modules"))).toBe(false);
-    return confinementScope.run(fakeConfinement, () => runLocalGates(fresh, req.gates, signal));
+    return confinementScope.run(fakeConfinement, () =>
+      runLocalGates(fresh, req.gates, signal, {
+        env: { PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ""}` },
+      }),
+    );
   });
   const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
   await settle();
@@ -769,7 +806,7 @@ test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)",
     expect(store.listEvents(pr.run.id)).toContainEqual(
       expect.objectContaining({ type: "gate", message: diagnostic }),
     );
-    expect(log).not.toContain(`\n$ '${process.execPath}' test`);
+    expect(log).not.toContain("\n$ bun test './");
     expect(ghCalls("pr merge")).toEqual([]);
   } else {
     expect(completed).toMatchObject({
@@ -778,7 +815,7 @@ test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)",
     });
     expect(log).toContain("(pass) retry dependency");
     expect(log.indexOf(`\n$ ${setup}`, log.indexOf("# targeted retry"))).toBeLessThan(
-      log.indexOf(`\n$ '${process.execPath}' test`),
+      log.indexOf("\n$ bun test './"),
     );
     expect(ghCalls("pr merge")).toHaveLength(1);
   }
@@ -814,7 +851,7 @@ test.each([
       reason: `${unresolved ? "lint" : "test"} failed (${blocked?.logPath})`,
     });
     expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
-      ["full-test", "full-other", "lint"],
+      [testCommand, otherTestCommand, "lint"],
       [retryCommand],
     ]);
     expect(await remoteHead("pr-1")).toBe(head);
@@ -838,8 +875,8 @@ const ineligibleRetries: { label: string; result?: Partial<GateResult>; template
     result: { targetedRetry: gateResult("test", "earlier", { confinementError: true }) },
   },
   { label: "missing template", template: null },
-  { label: "malformed template", template: "base-retry" },
-  { label: "duplicate placeholder", template: "base-retry {files} {files}" },
+  { label: "malformed template", template: "bun test --isolate" },
+  { label: "duplicate placeholder", template: "bun test --isolate {files} {files}" },
   { label: "invalid files", result: { failedFiles: ["../escape.ts"] } },
   { label: "unmatched command", result: { command: "different-command" } },
 ];
@@ -909,8 +946,8 @@ test.each(ineligibleRetries)("an ineligible land failure blocks without retry: $
 test("a completed attributed test timeout with a redacted command lands after one targeted retry", async () => {
   const credential = "synthetic-land-command-secret";
   registerCredential("LAND_COMMAND_SECRET", credential);
-  const command = `full-test # ${credential}`;
-  const { pr, head } = await retryLandFixture("base-retry {files}", "test", "prepare", command);
+  const command = `bun test --test-name-pattern="${credential}"`;
+  const { pr, head } = await retryLandFixture("bun test --isolate {files}", "test", "prepare", command);
   const realProcess = proc.runProcess;
   const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
     if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
@@ -945,7 +982,7 @@ test("a completed attributed test timeout with a redacted command lands after on
     const run = GateRunSchema.parse(redactGateData(await runLocalGates(req.cwd, req.gates, signal)));
     expect(validRun(req, run)).toBe(true);
     expect(run.checks[0]).toMatchObject({
-      command: "full-test # [redacted]",
+      command: 'bun test --test-name-pattern="[redacted]"',
       exitCode: 1,
       failureAttributionComplete: true,
       failedFileTimes: { [retryFile]: 62 },
@@ -961,7 +998,7 @@ test("a completed attributed test timeout with a redacted command lands after on
       reason: `flaky: test (${retryFile}); merged ${head.slice(0, 12)}`,
     });
     expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
-      [command, "full-other", "lint"],
+      [command, otherTestCommand, "lint"],
       [retryCommand],
     ]);
     expect(fake.requests[1]?.skipGateSlot).toBe(false);
@@ -1026,7 +1063,7 @@ test("flaky land diagnostics strip formatting before credential redaction", asyn
   const credential = "synthetic-color-gate-secret";
   const colored = "synthetic-color-\u001b[31mgate-secret\u001b[0m";
   registerCredential("COLOR_GATE_SECRET", credential);
-  const { pr, head } = await retryLandFixture("base-retry {files}", colored);
+  const { pr, head } = await retryLandFixture("bun test --isolate {files}", colored);
   const fake = fakeLandGates((req, attempt) =>
     retryRun(req, {
       [colored]:
@@ -1087,7 +1124,11 @@ test.each(["stop", "cancel"])("a %s during a targeted retry cannot authorize lan
     expect(fresh.requests).toHaveLength(action === "stop" ? 1 : 0);
     if (action === "stop") {
       expect(fresh.requests[0]?.gates.setup).toEqual(["prepare"]);
-      expect(fresh.requests[0]?.gates.checks.map((c) => c.run)).toEqual(["full-test", "full-other", "lint"]);
+      expect(fresh.requests[0]?.gates.checks.map((c) => c.run)).toEqual([
+        testCommand,
+        otherTestCommand,
+        "lint",
+      ]);
       expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
     }
     expect(await remoteHead("pr-1")).toBe(head);

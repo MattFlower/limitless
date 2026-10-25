@@ -5,7 +5,7 @@ import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
-import { type DocsSelection, quoteRetryFiles } from "./docs.ts";
+import { type DocsSelection, quoteRetryFiles, singleBunTest } from "./docs.ts";
 import { executeGate, type GateRunner } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
 import { type FailedTestFiles, readJUnit, readJUnitSkips, validRetryFiles } from "./junit.ts";
@@ -287,6 +287,8 @@ export function targetedRetrySkipReason(r: GateResult, cfg: GateConfig, cwd: str
   if (cfg.retryFiles?.split("{files}").length !== 2) return "unusable retry_files configuration";
   if (!r.failedFiles?.length) return "absent retry files";
   if (!validRetryFiles(r.failedFiles, cwd)) return "invalid retry files";
+  if (!singleBunTest(r.command)) return "check is not a single bun test invocation";
+  if (!singleBunTest(cfg.retryFiles)) return "retry_files is not a single bun test invocation";
   return undefined;
 }
 

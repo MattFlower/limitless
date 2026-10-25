@@ -13,7 +13,7 @@ export interface DocsSelection {
 }
 
 /** Recognize one invocation without evaluating shell content; unknown syntax keeps the full check. */
-function singleBunTest(command: string): boolean {
+export function singleBunTest(command: string): boolean {
   if (!/^[\t ]*bun[\t ]+test(?:[\t ]|$)/.test(command)) return false;
   const stack = [{ quote: "" }];
   for (let i = 0; i < command.length; i++) {
