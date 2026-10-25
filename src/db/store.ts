@@ -1339,12 +1339,23 @@ export class Store {
   }
 
   latestIssueRun(repo: string, number: number): Run | null {
-    const row = this.db
-      .query(`${RUN_SELECT} WHERE json_extract(runs.source_ref, '$.kind') = 'issue'
-      AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
-      AND json_extract(runs.source_ref, '$.number') = ? ORDER BY runs.created_at DESC, runs.rowid DESC LIMIT 1`)
-      .get(repo, number) as Row | null;
-    return row ? toRun(row) : null;
+    const rows = this.db
+      .query(`${RUN_SELECT} WHERE
+      (json_extract(runs.source_ref, '$.kind') = 'issue'
+        AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
+        AND json_extract(runs.source_ref, '$.number') = ?)
+      OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%')
+      ORDER BY runs.created_at DESC, runs.rowid DESC`)
+      .all(repo, number, repo) as Row[];
+    return (
+      rows
+        .map(toRun)
+        .find((run) =>
+          linkedIssues(run).some(
+            (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
+          ),
+        ) ?? null
+    );
   }
 
   /** `round`: the review handler's grant; such a run's prompt quotes findings, so it allows nothing itself. */

@@ -15,7 +15,7 @@ const labels = ["limitless:in-progress", "limitless:needs-you", "limitless:faile
 const eventOrder = ["started", "pr", "needs_human", "failed", "cancelled"] as const;
 export const ISSUE_LIFECYCLE_CALL_CAP = 50;
 export type IssueLifecycleOptions = { identity?: typeof githubIdentity; maxCalls?: number };
-const cursors = new WeakMap<Store, string>();
+const cursors = new WeakMap<Store, { key: string; deferred: boolean }>();
 const sessions = new WeakMap<AbortSignal, Set<string>>();
 const exhausted = Symbol("lifecycle call budget exhausted");
 
@@ -40,7 +40,11 @@ export async function reconcileIssueLifecycle(
   log: (s: string) => void,
   opts: IssueLifecycleOptions = {},
 ): Promise<void> {
-  let remaining = opts.maxCalls ?? ISSUE_LIFECYCLE_CALL_CAP;
+  const cap = opts.maxCalls ?? ISSUE_LIFECYCLE_CALL_CAP;
+  let remaining = cap;
+  const reserve = (calls: number) => {
+    if (remaining < calls) throw exhausted;
+  };
   let freshLabels = sessions.get(signal);
   if (!freshLabels) {
     freshLabels = new Set();
@@ -123,18 +127,19 @@ export async function reconcileIssueLifecycle(
         })),
       ),
   );
-  const start = work.findIndex((w) => w.key === cursors.get(store)) + 1;
+  const cursor = cursors.get(store);
+  const start = Math.max(0, work.findIndex((w) => w.key === cursor?.key) + (cursor?.deferred ? 0 : 1));
   const ordered = [...work.slice(start), ...work.slice(0, start)];
   const postingLogin = async (repo: string) => {
     const identity = await (opts.identity ?? githubIdentity)(repo);
     if (identity.kind === "app") return identity.botLogin;
     // Look up the owner only when the POST can follow in this poll.
-    if (remaining < 2) throw exhausted;
+    reserve(2);
     return z.object({ login: z.string() }).parse(JSON.parse(String(await call(undefined, ["user"])))).login;
   };
   for (const { snapshot, repo, number, effect: task, key } of ordered) {
     if (signal.aborted || remaining <= 0) return;
-    cursors.set(store, key);
+    cursors.set(store, { key, deferred: false });
     const path = `repos/${repo}/issues/${number}`;
     const save = (effect: string, state: string, details = {}) =>
       store.setIssueLifecycleEffect(snapshot.id, repo, number, effect, state, details);
@@ -153,6 +158,36 @@ export async function reconcileIssueLifecycle(
         if (effects.get("labels")?.state !== desiredLabel(run)) {
           if (!store.issueLifecycleOwnsLabels(run, repo, number)) finishLabels(desiredLabel(run));
           else {
+            let failure = effects.get("failure");
+            const prepareFailure = async () => {
+              if (failure) return;
+              // Persist the timeline boundary before refreshing this run's failure event.
+              // Admission needs an observed failure beyond it, even after a lost write response.
+              const [owner, name] = repo.split("/");
+              const query = `query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) {
+                issue(number:${number}) { timelineItems(first:1, itemTypes:[LABELED_EVENT, RENAMED_TITLE_EVENT]) { totalCount } }
+              } }`;
+              const evidence = z
+                .object({
+                  errors: z.array(z.unknown()).optional(),
+                  data: z.object({
+                    repository: z.object({
+                      issue: z.object({
+                        timelineItems: z.object({ totalCount: z.number().int().nonnegative() }),
+                      }),
+                    }),
+                  }),
+                })
+                .parse(JSON.parse(String(await call(repo, ["graphql", "-f", `query=${query}`]))));
+              if (evidence.errors?.length) throw new Error("incomplete failure timeline evidence");
+              save("failure", "removing", {
+                body: String(evidence.data.repository.issue.timelineItems.totalCount),
+              });
+              failure = store
+                .issueLifecycleEffects(snapshot.id, repo, number)
+                .find((e) => e.effect === "failure");
+            };
+            if (desiredLabel(run) === labels[2]) await prepareFailure();
             let plan = effects.get("labels")?.body
               ? z
                   .object({
@@ -169,7 +204,7 @@ export async function reconcileIssueLifecycle(
             }
             while (plan.page) {
               // Leave the last page and a write together for the next poll.
-              if (plan.page > 1 && remaining < 2) throw exhausted;
+              reserve(Math.min(2, cap));
               const current = z
                 .array(z.object({ name: z.string() }))
                 .parse(
@@ -184,8 +219,19 @@ export async function reconcileIssueLifecycle(
             if (!run) continue;
             observe(run, repo, number);
             const target = desiredLabel(run);
+            if (target === labels[2]) await prepareFailure();
+            run = store.getRun(snapshot.id);
+            if (!run || desiredLabel(run) !== target || !store.issueLifecycleOwnsLabels(run, repo, number))
+              continue;
             plan.target = target;
             save("labels", "pending", { body: JSON.stringify(plan) });
+            if (target === labels[2] && failure?.state === "removing") {
+              if (plan.current.includes(labels[2])) {
+                await call(repo, [`${path}/labels/${encodeURIComponent(labels[2])}`, "-X", "DELETE"]);
+                plan.current = plan.current.filter((l) => l !== labels[2]);
+              }
+              save("failure", "adding");
+            }
             for (const label of labels) {
               if (signal.aborted) return;
               run = store.getRun(snapshot.id);
@@ -219,6 +265,7 @@ export async function reconcileIssueLifecycle(
               desiredLabel(run) === target &&
               labels.every((l) => plan.current.includes(l) === (l === target))
             ) {
+              if (target === labels[2]) save("failure", "done");
               finishLabels(target);
               freshLabels.delete(key);
             }
@@ -226,6 +273,7 @@ export async function reconcileIssueLifecycle(
         }
       } catch (error) {
         if (error === exhausted) {
+          cursors.set(store, { key, deferred: true });
           return;
         }
         freshLabels.delete(key);
@@ -288,6 +336,7 @@ export async function reconcileIssueLifecycle(
       save(effect, "done", { commentId: created.id });
     } catch (error) {
       if (error === exhausted) {
+        cursors.set(store, { key, deferred: true });
         return;
       }
       logFailure(run, repo, number, error);

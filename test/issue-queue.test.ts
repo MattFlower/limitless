@@ -336,8 +336,10 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     requests,
     labels,
     comments,
+    timelines: new Map<number, QueueIssue["timelineItems"]>(),
     commentAuthors: new Map<string, string>(),
     login: "owner",
+    labelAt: at,
     identity: async (_repo?: string): Promise<GitHubIdentity> => ({ kind: "owner" }),
     maxCalls: undefined as number | undefined,
     intercept: undefined as ((args: string[]) => void) | undefined,
@@ -359,8 +361,22 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
         labels.set(number, current);
         const method = args[args.indexOf("-X") + 1];
         if (path.includes("/labels")) {
-          if (method === "POST") current.add((args.at(-1) ?? "").replace("labels[]=", ""));
-          else if (method === "DELETE") current.delete(decodeURIComponent(path.split("/labels/")[1] ?? ""));
+          if (method === "POST") {
+            const name = (args.at(-1) ?? "").replace("labels[]=", "");
+            if (!current.has(name)) {
+              const timeline = data.get(repo ?? "")?.find((i) => i.number === number)?.timelineItems ??
+                h.timelines.get(number) ?? { totalCount: 0, nodes: [] };
+              timeline.nodes.push({
+                __typename: "LabeledEvent",
+                label: { name },
+                actor: { login: h.login },
+                createdAt: h.labelAt,
+              });
+              timeline.totalCount++;
+              h.timelines.set(number, timeline);
+            }
+            current.add(name);
+          } else if (method === "DELETE") current.delete(decodeURIComponent(path.split("/labels/")[1] ?? ""));
           else {
             const page = Number(new URL(`https://example.com/${path}`).searchParams.get("page") ?? 1);
             const result = [...current].slice((page - 1) * 100, page * 100).map((name) => ({ name }));
@@ -384,6 +400,14 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
         } else throw new Error(`unexpected lifecycle call ${args}`);
         h.afterWrite?.(args);
         return JSON.stringify({ id: number * 1000 + (comments.get(number)?.length ?? 0) });
+      }
+      if (args[3]?.includes("timelineItems(first:1, itemTypes:")) {
+        const number = Number(args[3].match(/issue\(number:(\d+)/)?.[1]);
+        const timeline =
+          data.get(repo ?? "")?.find((i) => i.number === number)?.timelineItems ?? h.timelines.get(number);
+        return JSON.stringify({
+          data: { repository: { issue: { timelineItems: { totalCount: timeline?.totalCount ?? 0 } } } },
+        });
       }
       if (h.response !== undefined) return JSON.stringify(h.response);
       const query = args[3] ?? "";
@@ -566,6 +590,7 @@ test.each(["failed", "cancelled"] as const)(
     const h = harness();
     const i = issue();
     h.data.set("owner/repo", [i]);
+    h.labels.set(1, new Set(["priority:1"]));
     h.start();
     await h.advance();
     const run = h.runs()[0];
@@ -580,6 +605,10 @@ test.each(["failed", "cancelled"] as const)(
     });
     i.timelineItems.totalCount++;
     await h.advance(180_000);
+    if (status === "failed") {
+      i.labels.nodes.push({ name: "limitless:failed" });
+      i.labels.totalCount++;
+    }
     expect(h.runs()).toHaveLength(1);
     i.timelineItems.nodes.push({
       __typename: "LabeledEvent",
@@ -1502,7 +1531,7 @@ test.each([
   candidate.labels.totalCount = candidate.labels.nodes.length;
   candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
   expect(issueEligibility(candidate, ["owner"]).eligible).toBe(eligible);
-  expect(issueEligibility(candidate, ["owner"], { latest }).eligible).toBe(eligible);
+  expect(issueEligibility(candidate, ["owner"], { latest, failureBoundary: 1 }).eligible).toBe(eligible);
 });
 
 test("poll requires trusted re-approval later than the failure label", async () => {
@@ -1876,7 +1905,9 @@ test.each([1, 5])(
     h.data.set("owner/repo", [issue()]);
     h.start();
     await h.advance();
-    expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(cap);
+    expect(
+      h.calls.filter((args) => args[1] !== "graphql" || !args[3]?.includes("rateLimit")).length,
+    ).toBeLessThanOrEqual(cap);
     expect(h.runs()).toHaveLength(9);
     // Fresh reads and their writes need two slots; retain the one-slot admission/deferral check above.
     const progressCap = Math.max(2, cap);
@@ -1884,7 +1915,9 @@ test.each([1, 5])(
     for (let i = 0; i < 80; i++) {
       h.calls.length = 0;
       await h.advance(180_000);
-      expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(progressCap);
+      expect(
+        h.calls.filter((args) => args[1] !== "graphql" || !args[3]?.includes("rateLimit")).length,
+      ).toBeLessThanOrEqual(progressCap);
     }
     for (let i = 10; i < 18; i++) {
       expect(h.labels.get(i)).toEqual(new Set(["limitless:failed"]));
@@ -1916,13 +1949,16 @@ test("paginated lifecycle reads respect the cap and resume through a lost respon
   };
   h.start();
   await h.advance();
-  expect(h.calls.filter((a) => a[1] !== "graphql")).toHaveLength(1);
+  expect(h.calls).toHaveLength(2); // One lifecycle observation plus queue admission.
+  expect(h.calls.filter((a) => a[1] !== "graphql" || !a[3]?.includes("rateLimit"))).toHaveLength(1);
   expect(h.comments.get(7)).toHaveLength(100);
   h.maxCalls = 2;
   for (let i = 0; i < 20 && !interrupted; i++) {
     h.calls.length = 0;
     await h.advance(180_000);
-    expect(h.calls.filter((a) => a[1] !== "graphql").length).toBeLessThanOrEqual(2);
+    expect(
+      h.calls.filter((a) => a[1] !== "graphql" || !a[3]?.includes("rateLimit")).length,
+    ).toBeLessThanOrEqual(2);
   }
   expect(interrupted).toBe(true);
   h.afterWrite = undefined;
@@ -1930,7 +1966,9 @@ test("paginated lifecycle reads respect the cap and resume through a lost respon
   for (let i = 0; i < 12; i++) {
     h.calls.length = 0;
     await h.advance(i ? 180_000 : 0);
-    expect(h.calls.filter((a) => a[1] !== "graphql").length).toBeLessThanOrEqual(2);
+    expect(
+      h.calls.filter((a) => a[1] !== "graphql" || !a[3]?.includes("rateLimit")).length,
+    ).toBeLessThanOrEqual(2);
   }
   expect(h.labels.get(7)).toEqual(new Set([...ordinary, "limitless:failed"]));
   expect(h.comments.get(7)).toHaveLength(102);
@@ -2070,7 +2108,10 @@ test("same-second timeline re-approval also works with the latest failed run", a
     });
   }
   candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
-  expect(issueEligibility(candidate, ["owner"], { latest })).toEqual({ eligible: true, priority: 1 });
+  expect(issueEligibility(candidate, ["owner"], { latest, failureBoundary: 1 })).toEqual({
+    eligible: true,
+    priority: 1,
+  });
 });
 
 test("populated migration resumes label reconciliation after human edits", async () => {
@@ -2238,4 +2279,223 @@ test("a failed start comment cannot starve another effect on the same issue", as
   for (let i = 0; i < 6; i++) await h.advance(180_000);
   expect(h.comments.get(7)).toHaveLength(2);
   expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
+});
+
+test.each([11_000, 999])(
+  "review: fast second failure at +%sms requires its own ordered approval",
+  async (offset) => {
+    const h = harness();
+    const candidate = issue(7);
+    candidate.labels.nodes.push({ name: "limitless:failed" });
+    candidate.labels.totalCount++;
+    for (const name of ["limitless:failed", "priority:1"])
+      candidate.timelineItems.nodes.push({
+        __typename: "LabeledEvent",
+        label: { name },
+        actor: { login: name === "priority:1" ? "owner" : "factory[bot]" },
+        createdAt:
+          name === "priority:1" && offset === 11_000 ? new Date(Date.parse(at) + 10_000).toISOString() : at,
+      });
+    h.labelAt = new Date(Date.parse(at) + Math.floor(offset / 1000) * 1000).toISOString();
+    candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
+    h.data.set("owner/repo", [candidate]);
+    h.labels.set(7, new Set(["priority:1", "limitless:failed"]));
+    const run = await linkedRun(h);
+    const latest = h.store.updateRun(run.id, { status: "failed", finishedAt: Date.parse(at) + offset });
+    const boundary = () => {
+      const effect = h.store
+        .issueLifecycleEffects(run.id, "owner/repo", 7)
+        .find((e) => e.effect === "failure");
+      return effect?.state === "done" ? Number(effect.body) : null;
+    };
+    const check = () => {
+      const current = [...(h.labels.get(7) ?? [])];
+      candidate.labels = { nodes: current.map((name) => ({ name })), totalCount: current.length };
+      return issueEligibility(candidate, ["owner"], { latest, failureBoundary: boundary() });
+    };
+    const poll = () =>
+      reconcileIssueLifecycle(h.store, h.cfg, h.gh, new AbortController().signal, () => {}, {
+        identity: h.identity,
+      });
+    expect(check().eligible).toBe(false); // The previous episode and approval cannot authorize this run.
+    h.intercept = (args) => {
+      if (args.at(-1) === "labels[]=limitless:failed") throw new Error("addition unavailable");
+    };
+    await poll();
+    expect(h.labels.get(7)).toEqual(new Set(["priority:1"]));
+    expect(check().eligible).toBe(false); // Including during the temporary absence of the failure label.
+    h.intercept = undefined;
+    h.afterWrite = (args) => {
+      if (args.at(-1) === "labels[]=limitless:failed") throw new Error("accepted addition lost response");
+    };
+    await poll();
+    expect(check().eligible).toBe(false);
+    h.afterWrite = undefined;
+    await poll();
+    expect(boundary()).toBe(3);
+    expect(check().eligible).toBe(false); // New episode observed, but no fresh approval.
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name: "priority:1" },
+      actor: { login: "owner" },
+      createdAt: offset === 999 ? at : new Date(Date.parse(at) + 20_000).toISOString(),
+    });
+    candidate.timelineItems.totalCount++;
+    expect(check()).toEqual({ eligible: true, priority: 1 });
+    h.labels.get(7)?.delete("limitless:failed");
+    expect(check()).toEqual({ eligible: true, priority: 1 }); // Established timeline evidence survives label removal.
+    const current = candidate.timelineItems;
+    candidate.timelineItems = { totalCount: 3, nodes: current.nodes.slice(0, 3) };
+    expect(check().eligible).toBe(false); // A stale read cannot support the completed checkpoint.
+    candidate.timelineItems = current;
+    expect(h.calls.filter((args) => args.includes("DELETE"))).toHaveLength(1);
+    expect(h.calls.filter((args) => args.at(-1) === "labels[]=limitless:failed")).toHaveLength(2);
+  },
+);
+
+test.each(["remove", "remove lost response", "add", "add lost response", "comment lost response"])(
+  "failure episode survives a database reopen after %s",
+  async (point) => {
+    const h = harness();
+    const path = join(h.cfg.paths.home, "failure.db");
+    let store = new Store(path);
+    try {
+      const repo = h.store.getRepoBySlug("owner/repo");
+      if (!repo) throw new Error("missing repo");
+      const run = store.createRun(store.upsertRepo(repo), { repo: repo.slug, prompt: "Closes #7" });
+      store.updateRun(run.id, { status: "failed" });
+      store.setIssueLifecycleEffect(run.id, "owner/repo", 7, "comment:started", "done");
+      h.labels.set(7, new Set(["priority:1", "ordinary", "limitless:failed"]));
+      const controller = new AbortController();
+      let interrupted = false;
+      h.afterWrite = (args) => {
+        const matches = point.startsWith("remove")
+          ? args.includes("DELETE")
+          : point.startsWith("add")
+            ? args.at(-1) === "labels[]=limitless:failed"
+            : args[1]?.endsWith("/comments");
+        if (!matches || interrupted) return;
+        interrupted = true;
+        controller.abort();
+        if (point.includes("lost response")) throw new Error("accepted write lost response");
+      };
+      await reconcileIssueLifecycle(store, h.cfg, h.gh, controller.signal, () => {}, {
+        identity: h.identity,
+      });
+      expect(interrupted).toBe(true);
+      store.close();
+      store = new Store(path);
+      h.afterWrite = undefined;
+      for (let i = 0; i < 3; i++)
+        await reconcileIssueLifecycle(store, h.cfg, h.gh, new AbortController().signal, () => {}, {
+          identity: h.identity,
+        });
+      expect(h.labels.get(7)).toEqual(new Set(["priority:1", "ordinary", "limitless:failed"]));
+      expect(store.issueLifecycleEffect(run.id, "owner/repo", 7, "failure")).toBe("done");
+      expect(h.calls.filter((args) => args.includes("DELETE"))).toHaveLength(1);
+      expect(h.calls.filter((args) => args.at(-1) === "labels[]=limitless:failed")).toHaveLength(1);
+      expect(h.comments.get(7)).toEqual([expect.stringContaining(`Limitless run ${run.id} failed: see`)]);
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.each(["labels", "comment"] as const)(
+  "review: a %s task gets two adjacent call slots despite 49 persistent failures",
+  async (task) => {
+    const h = harness();
+    for (let number = 1; number <= 49; number++) {
+      const run = await linkedRun(h, number);
+      h.store.setIssueLifecycleEffect(run.id, "owner/repo", number, "comment:started", "done");
+    }
+    const healthy = await linkedRun(h, 50);
+    if (task === "labels")
+      h.store.setIssueLifecycleEffect(healthy.id, "owner/repo", 50, "comment:started", "done");
+    else {
+      h.labels.set(50, new Set(["limitless:in-progress"]));
+      h.store.setIssueLifecycleEffect(healthy.id, "owner/repo", 50, "labels", "limitless:in-progress");
+    }
+    h.intercept = (args) => {
+      const number = Number(args[1]?.match(/issues\/(\d+)/)?.[1]);
+      if (number && number < 50) throw new Error("HTTP 404: issue unavailable");
+    };
+    const signal = new AbortController().signal;
+    for (let i = 0; i < 10; i++) {
+      h.calls.length = 0;
+      await reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, () => {}, { identity: h.identity });
+      expect(h.calls.length).toBeLessThanOrEqual(50);
+    }
+    if (task === "labels") expect(h.labels.get(50)).toEqual(new Set(["limitless:in-progress"]));
+    else expect(h.comments.get(50) ?? []).toHaveLength(1);
+  },
+);
+
+test("a deferred task stays first when its preceding run leaves the lifecycle worklist", async () => {
+  const h = harness();
+  for (let number = 1; number <= 50; number++) {
+    const run = await linkedRun(h, number);
+    h.store.setIssueLifecycleEffect(run.id, "owner/repo", number, "comment:started", "done");
+    if (number === 50) {
+      h.store.updateRun(run.id, { status: "resolved" });
+      h.store.setIssueLifecycleEffect(run.id, "owner/repo", number, "labels", "none");
+    }
+  }
+  const healthy = await linkedRun(h, 51);
+  h.store.setIssueLifecycleEffect(healthy.id, "owner/repo", 51, "comment:started", "done");
+  h.intercept = (args) => {
+    const number = Number(args[1]?.match(/issues\/(\d+)/)?.[1]);
+    if (number && number < 50) throw new Error("HTTP 404: issue unavailable");
+  };
+  const signal = new AbortController().signal;
+  const poll = () =>
+    reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, () => {}, { identity: h.identity });
+  await poll();
+  expect(h.calls).toHaveLength(49);
+  expect(h.labels.has(51)).toBe(false);
+  h.calls.length = 0;
+  await poll();
+  expect(h.calls[0]?.[1]).toContain("issues/51/labels?");
+  expect(h.calls.length).toBeLessThanOrEqual(50);
+  expect(h.labels.get(51)).toEqual(new Set(["limitless:in-progress"]));
+});
+
+test("a newer CLI failure cannot reuse an older issue run's approved failure episode", async () => {
+  const h = harness();
+  const candidate = issue(7);
+  h.data.set("owner/repo", [candidate]);
+  h.labels.set(7, new Set(["priority:1"]));
+  const first = await linkedRun(h);
+  h.store.updateRun(first.id, { status: "failed" });
+  await reconcileIssueLifecycle(h.store, h.cfg, h.gh, new AbortController().signal, () => {}, {
+    identity: h.identity,
+  });
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  candidate.labels.totalCount++;
+  candidate.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "priority:1" },
+    actor: { login: "owner" },
+    createdAt: at,
+  });
+  candidate.timelineItems.totalCount++;
+  const retry = await h.factory.createRun({ repo: "owner/repo", prompt: "Closes #7" });
+  h.store.updateRun(retry.id, { status: "failed" });
+  h.maxCalls = 0;
+  h.start();
+  await h.advance();
+  expect(h.runs()).toHaveLength(2);
+  expect(h.store.latestIssueRun("OWNER/REPO", 7)?.id).toBe(retry.id);
+  h.maxCalls = 50;
+  await h.advance(180_000);
+  expect(h.runs()).toHaveLength(2);
+  candidate.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "priority:1" },
+    actor: { login: "owner" },
+    createdAt: at,
+  });
+  candidate.timelineItems.totalCount++;
+  await h.advance(180_000);
+  expect(h.runs()).toHaveLength(3);
 });
