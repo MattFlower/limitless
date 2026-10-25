@@ -48,6 +48,13 @@ export const BROWSER_TOOLS = [
   "browser_take_screenshot",
 ];
 
+// The server runs outside the agent sandbox, and upstream documents its guards as convenience
+// guardrails, not a security boundary. No browser starts while any of these remains.
+export const CONFINEMENT_GAPS = [
+  "--allowed-origins does not stop redirects or other browser connections leaving the preview origin",
+  "explicit filenames on output tools bypass --output-dir and can write into the checkout",
+];
+
 export const browserCache = (home: string) => join(home, "tools", `playwright-mcp-${BROWSER_MCP_VERSION}`);
 const inside = (root: string, path: string) => {
   const rel = relative(root, path);
@@ -148,7 +155,11 @@ export interface BrowserMcpServer {
   env: Record<string, string>;
 }
 
-export function browserMcp(spec: AgentSpec, harness: "claude" | "codex"): BrowserMcpServer | undefined {
+export function browserMcp(
+  spec: AgentSpec,
+  harness: "claude" | "codex",
+  gaps: readonly string[] = CONFINEMENT_GAPS,
+): BrowserMcpServer | undefined {
   if (!spec.browser || spec.noTools) return;
   try {
     if (harness === "claude" && spec.mode === "edit")
@@ -169,6 +180,8 @@ export function browserMcp(spec: AgentSpec, harness: "claude" | "codex"): Browse
     const { node, cli, browser } = installation(cache);
     if ([scratch, cwd].some((path) => inside(path, node)))
       throw new Error("browser runtime is agent-writable");
+    if (gaps.length)
+      throw new Error(`@playwright/mcp@${BROWSER_MCP_VERSION} is not confined: ${gaps.join("; ")}`);
     const directory = mkdtempSync(join(scratch, "browser-"));
     const profile = join(directory, "profile"),
       output = join(directory, "output");
