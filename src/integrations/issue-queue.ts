@@ -4,6 +4,7 @@ import type { Run } from "../core/types.ts";
 import { ISSUE_CLAIM_STATUSES } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { type GhRunner, issueRunRequest, runGh } from "./github.ts";
+import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
 
 const date = z.string().refine((s) => Number.isFinite(Date.parse(s)));
 const actor = z.object({ login: z.string() }).nullable();
@@ -53,6 +54,7 @@ export function issueEligibility(
     blockers?: ReadonlyMap<number, string>;
     claim?: Run | null;
     latest?: Run | null;
+    failureBoundary?: number | null;
   } = {},
 ): { eligible: true; priority: number } | { eligible: false; reason: string } {
   const trusts = (login: string | undefined) =>
@@ -60,6 +62,9 @@ export function issueEligibility(
   const events = issue.timelineItems.nodes
     .filter((e) => e.__typename === "LabeledEvent")
     .filter((e) => priority(e.label.name));
+  const failedIndex = issue.timelineItems.nodes.findLastIndex(
+    (e) => e.__typename === "LabeledEvent" && e.label.name === "limitless:failed",
+  );
   const rename = issue.timelineItems.nodes
     .toReversed()
     .filter((e) => e.__typename === "RenamedTitleEvent")
@@ -67,12 +72,18 @@ export function issueEligibility(
   const approved = issue.labels.nodes
     .filter((l) => priority(l.name))
     .filter((l) => {
-      const last = events
-        .toReversed()
-        .filter((e) => e.label.name === l.name)
-        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+      const last = events.toReversed().find((e) => e.label.name === l.name);
       return trusts(last?.actor?.login);
     });
+  const reapprovedAfterFailure =
+    failedIndex >= 0 &&
+    approved.some(
+      (label) =>
+        issue.timelineItems.nodes.findLastIndex(
+          (e) => e.__typename === "LabeledEvent" && e.label.name === label.name && trusts(e.actor?.login),
+        ) > failedIndex,
+    );
+  const failed = issue.labels.nodes.some((l) => l.name === "limitless:failed");
   let reason = "";
   if (issue.state !== "OPEN") reason = "issue is closed";
   else if (!trusts(issue.author?.login)) reason = "untrusted author";
@@ -84,8 +95,10 @@ export function issueEligibility(
   else if (issue.blockedBy.nodes.some((b) => b.state !== "CLOSED")) reason = "open native blocker";
   else if (blockers(issue.body).some((n) => context.blockers?.get(n) !== "CLOSED"))
     reason = "open or unresolved body blocker";
-  else if (issue.labels.nodes.some((l) => ["limitless:in-progress", "limitless:failed"].includes(l.name)))
+  else if (issue.labels.nodes.some((l) => l.name === "limitless:in-progress"))
     reason = "factory status label";
+  else if (failed && !reapprovedAfterFailure)
+    reason = "factory status requires priority re-approval after failure";
   else if (issue.closedByPullRequestsReferences.nodes.some((p) => p.state === "OPEN"))
     reason = "open closing PR";
   else if (
@@ -98,10 +111,13 @@ export function issueEligibility(
   else if (
     context.latest &&
     !ISSUE_CLAIM_STATUSES.includes(context.latest.status) &&
-    (context.latest.finishedAt === null ||
-      !events.some(
-        (e) => trusts(e.actor?.login) && Date.parse(e.createdAt) > (context.latest?.finishedAt ?? Infinity),
-      ))
+    // A failure recorded before lifecycle support has no boundary: it follows the completion-time rule.
+    (context.latest.status === "failed" && context.failureBoundary != null
+      ? !(reapprovedAfterFailure && failedIndex >= context.failureBoundary)
+      : context.latest.finishedAt === null ||
+        !events.some(
+          (e) => trusts(e.actor?.login) && Date.parse(e.createdAt) > (context.latest?.finishedAt ?? Infinity),
+        ))
   )
     reason = "priority re-approval required after the latest issue run";
   return reason
@@ -125,7 +141,12 @@ type QueueFactory = Pick<Factory, "cfg" | "store" | "scheduler" | "createRun">;
 
 export function startIssueQueue(
   factory: QueueFactory,
-  opts: { gh?: GhRunner; clock?: IssueQueueClock; log?: (s: string) => void } = {},
+  opts: {
+    gh?: GhRunner;
+    clock?: IssueQueueClock;
+    log?: (s: string) => void;
+    lifecycle?: IssueLifecycleOptions;
+  } = {},
 ): () => void {
   const q = factory.cfg.githubQueue;
   if (!q?.repos.length || !q.trusted.length) return () => {};
@@ -170,11 +191,21 @@ export function startIssueQueue(
     if (response.errors?.length) throw new Error("GraphQL issue query returned errors");
     return z.record(z.string(), z.unknown()).parse(response.data.repository);
   };
+  const latestContext = (repo: string, number: number) => {
+    const latest = factory.store.latestIssueRun(repo, number);
+    const failure =
+      latest?.status === "failed"
+        ? factory.store.issueLifecycleEffects(latest.id, repo, number).find((e) => e.effect === "failure")
+        : null;
+    const boundary = failure?.state === "done" && failure.body !== null ? Number(failure.body) : NaN;
+    return { latest, failureBoundary: Number.isInteger(boundary) && boundary >= 0 ? boundary : null };
+  };
   const tick = async () => {
     limited = false;
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
     try {
+      await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log, opts.lifecycle);
       for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
         try {
@@ -206,7 +237,7 @@ export function startIssueQueue(
             const result = issueEligibility(issue, q.trusted, {
               blockers: states,
               claim: factory.store.issueClaim(repo, issue.number),
-              latest: factory.store.latestIssueRun(repo, issue.number),
+              ...latestContext(repo, issue.number),
             });
             if (result.eligible) candidates.push({ repo, issue, priority: result.priority, states });
             else if (result.reason.startsWith("claimed"))
@@ -227,7 +258,7 @@ export function startIssueQueue(
         const current = issueEligibility(issue, q.trusted, {
           blockers: states,
           claim: factory.store.issueClaim(repo, issue.number),
-          latest: factory.store.latestIssueRun(repo, issue.number),
+          ...latestContext(repo, issue.number),
         });
         if (!current.eligible) {
           log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${current.reason}`));
@@ -238,7 +269,7 @@ export function startIssueQueue(
           if (factory.scheduler.draining) return "scheduler draining";
           const eligibility = issueEligibility(issue, q.trusted, {
             blockers: states,
-            latest: factory.store.latestIssueRun(repo, issue.number),
+            ...latestContext(repo, issue.number),
           });
           if (!eligibility.eligible) return eligibility.reason;
           const active = factory.store.listRuns({

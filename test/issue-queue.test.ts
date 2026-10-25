@@ -1,21 +1,29 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, RunStatus } from "../src/core/types.ts";
+import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { ISSUE_CLAIM_STATUSES, IssueClaimed, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { githubWebhook, issueRunRequest, mapGitHubEvent } from "../src/integrations/github.ts";
+import type { GitHubIdentity } from "../src/integrations/github-identity.ts";
 import { mountIntegrations } from "../src/integrations/index.ts";
+import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
 import { issueEligibility, type QueueIssue, startIssueQueue } from "../src/integrations/issue-queue.ts";
+import { RunContext } from "../src/pipeline/context.ts";
+import { buildReport } from "../src/pipeline/report.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 const at = "2026-01-01T00:00:00Z";
+const beforeLifecycle = (path: string) =>
+  !path.endsWith("-issue-lifecycle.sql") && !path.endsWith("-issue-lifecycle-history.sql");
 function issue(number = 1, p = 1): QueueIssue {
   return {
     number,
@@ -308,6 +316,8 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
   const clock = waitClock();
   const data = new Map(repos.map((r) => [r, [] as QueueIssue[]]));
   const states = new Map<number, string | null>();
+  const labels = new Map<number, Set<string>>();
+  const comments = new Map<number, string[]>();
   const calls: string[][] = [];
   const delays: number[] = [];
   const logs: string[] = [];
@@ -324,6 +334,16 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     delays,
     logs,
     requests,
+    labels,
+    comments,
+    timelines: new Map<number, QueueIssue["timelineItems"]>(),
+    commentAuthors: new Map<string, string>(),
+    login: "owner",
+    labelAt: at,
+    identity: async (_repo?: string): Promise<GitHubIdentity> => ({ kind: "owner" }),
+    maxCalls: undefined as number | undefined,
+    intercept: undefined as ((args: string[]) => void) | undefined,
+    afterWrite: undefined as ((args: string[]) => void) | undefined,
     rate: { cost: 1, remaining: 5000, resetAt: new Date(clock.now() + 3600_000).toISOString() },
     response: undefined as unknown,
     hold: undefined as Promise<void> | undefined,
@@ -331,7 +351,64 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     async gh(args: string[], _signal?: AbortSignal, _stdin?: string, repo?: string) {
       h.scopes.push(repo);
       calls.push(args);
+      h.intercept?.(args);
       if (h.hold) await h.hold;
+      if (args[1] !== "graphql") {
+        const path = args[1] ?? "";
+        if (path === "user") return JSON.stringify({ login: h.login });
+        const number = Number(path.match(/issues\/(\d+)/)?.[1]);
+        const current = labels.get(number) ?? new Set<string>();
+        labels.set(number, current);
+        const method = args[args.indexOf("-X") + 1];
+        if (path.includes("/labels")) {
+          if (method === "POST") {
+            const name = (args.at(-1) ?? "").replace("labels[]=", "");
+            if (!current.has(name)) {
+              const timeline = data.get(repo ?? "")?.find((i) => i.number === number)?.timelineItems ??
+                h.timelines.get(number) ?? { totalCount: 0, nodes: [] };
+              timeline.nodes.push({
+                __typename: "LabeledEvent",
+                label: { name },
+                actor: { login: h.login },
+                createdAt: h.labelAt,
+              });
+              timeline.totalCount++;
+              h.timelines.set(number, timeline);
+            }
+            current.add(name);
+          } else if (method === "DELETE") current.delete(decodeURIComponent(path.split("/labels/")[1] ?? ""));
+          else {
+            const page = Number(new URL(`https://example.com/${path}`).searchParams.get("page") ?? 1);
+            const result = [...current].slice((page - 1) * 100, page * 100).map((name) => ({ name }));
+            return JSON.stringify(args.includes("--slurp") ? [result] : result);
+          }
+        } else if (path.includes("/comments")) {
+          if (method !== "POST") {
+            const page = Number(new URL(`https://example.com/${path}`).searchParams.get("page") ?? 1);
+            const result = (comments.get(number) ?? [])
+              .map((body, i) => ({
+                id: number * 1000 + i + 1,
+                body,
+                user: { login: h.commentAuthors.get(body) ?? h.login },
+              }))
+              .slice((page - 1) * 100, page * 100);
+            return JSON.stringify(args.includes("--slurp") ? [result] : result);
+          }
+          const body = (args.at(-1) ?? "").replace(/^body=/, "");
+          comments.set(number, [...(comments.get(number) ?? []), body]);
+          h.commentAuthors.set(body, h.login);
+        } else throw new Error(`unexpected lifecycle call ${args}`);
+        h.afterWrite?.(args);
+        return JSON.stringify({ id: number * 1000 + (comments.get(number)?.length ?? 0) });
+      }
+      if (args[3]?.includes("timelineItems(first:1, itemTypes:")) {
+        const number = Number(args[3].match(/issue\(number:(\d+)/)?.[1]);
+        const timeline =
+          data.get(repo ?? "")?.find((i) => i.number === number)?.timelineItems ?? h.timelines.get(number);
+        return JSON.stringify({
+          data: { repository: { issue: { timelineItems: { totalCount: timeline?.totalCount ?? 0 } } } },
+        });
+      }
       if (h.response !== undefined) return JSON.stringify(h.response);
       const query = args[3] ?? "";
       const owner = query.match(/owner:"([^"]+)"/)?.[1];
@@ -349,6 +426,12 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     start() {
       stop = startIssueQueue(factory, {
         gh: h.gh,
+        lifecycle: {
+          identity: h.identity,
+          get maxCalls() {
+            return h.maxCalls;
+          },
+        },
         clock: {
           now: clock.now,
           set: ((fn: () => void, ms: number) => {
@@ -507,6 +590,7 @@ test.each(["failed", "cancelled"] as const)(
     const h = harness();
     const i = issue();
     h.data.set("owner/repo", [i]);
+    h.labels.set(1, new Set(["priority:1"]));
     h.start();
     await h.advance();
     const run = h.runs()[0];
@@ -521,6 +605,10 @@ test.each(["failed", "cancelled"] as const)(
     });
     i.timelineItems.totalCount++;
     await h.advance(180_000);
+    if (status === "failed") {
+      i.labels.nodes.push({ name: "limitless:failed" });
+      i.labels.totalCount++;
+    }
     expect(h.runs()).toHaveLength(1);
     i.timelineItems.nodes.push({
       __typename: "LabeledEvent",
@@ -1070,7 +1158,7 @@ test("explicit empty trust or repositories disable polling; positive short inter
   expect(harness({ poll_seconds: 0.5 }).cfg.githubQueue?.pollSeconds).toBe(15);
 });
 
-test("mounted queue starts work without notifier writes and cleans up its timer", async () => {
+test("mounted queue reconciles lifecycle writes and cleans up its timer", async () => {
   const h = harness();
   h.data.set("owner/repo", [issue()]);
   const integrations = await mountIntegrations(h.factory, {
@@ -1090,9 +1178,11 @@ test("mounted queue starts work without notifier writes and cleans up its timer"
     const run = h.runs()[0];
     if (!run) throw new Error("missing run");
     h.store.updateRun(run.id, { status: "failed", finishedAt: h.clock.now() });
-    await h.advance();
-    expect(h.calls.every((args) => args[0] === "api" && args[1] === "graphql")).toBe(true);
-    expect(h.calls).toHaveLength(1);
+    await h.advance(180_000);
+    expect(h.labels.get(1)).toEqual(new Set(["limitless:failed"]));
+    expect(h.comments.get(1)).toHaveLength(2);
+    expect(h.comments.get(1)?.[0]).toContain(`Limitless run ${run.id} started:`);
+    expect(h.comments.get(1)?.[1]).toContain(`Limitless run ${run.id} failed:`);
   } finally {
     await integrations.stop();
   }
@@ -1161,4 +1251,1314 @@ test("issue queue scopes both list and dependency GraphQL calls to the repositor
   h.start();
   await h.advance();
   expect(h.scopes).toEqual(["owner/repo", "owner/repo"]);
+});
+
+async function linkedRun(h: ReturnType<typeof harness>, number = 7) {
+  return h.factory.createRun(
+    issueRunRequest({ repo: "owner/repo", number, title: "work", body: "", author: "owner" }, "owner"),
+  );
+}
+
+test.each([
+  ["needs_human", "limitless:needs-you", "needs you: see"],
+  ["failed", "limitless:failed", "failed: see"],
+  ["cancelled", null, "was cancelled: see"],
+] as const)(
+  "lifecycle %s replaces labels and comments once across polling and restart",
+  async (status, label, text) => {
+    const h = harness();
+    const run = await linkedRun(h);
+    h.labels.set(7, new Set(["priority:1", "limitless:failed", "limitless:needs-you"]));
+    h.start();
+    await h.advance();
+    expect(h.labels.get(7)).toEqual(new Set(["priority:1", "limitless:in-progress"]));
+    expect(h.comments.get(7)).toEqual([
+      expect.stringContaining(`Limitless run ${run.id} started: see ${h.cfg.uiUrl}/runs/${run.id}`),
+    ]);
+    h.store.updateRun(run.id, {
+      status,
+      error: status === "cancelled" ? "cancelled by discord:private-id" : "reason",
+    });
+    await h.advance(180_000);
+    expect(h.labels.get(7)).toEqual(new Set(["priority:1", ...(label ? [label] : [])]));
+    expect(h.comments.get(7)).toHaveLength(2);
+    expect(h.comments.get(7)?.[1]).toContain(`Limitless run ${run.id} ${text}`);
+    expect(h.comments.get(7)?.[1]).not.toContain("discord:");
+    h.stop();
+    h.start();
+    await h.advance();
+    await h.advance(180_000);
+    expect(h.comments.get(7)).toHaveLength(2);
+    expect(h.scopes.filter(Boolean).every((repo) => repo === "owner/repo")).toBe(true);
+  },
+);
+
+test("PR opened comments once and merging clears labels without a merge comment", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.start();
+  await h.advance();
+  const prUrl = "https://github.com/owner/repo/pull/8";
+  h.store.updateRun(run.id, { status: "succeeded", prUrl });
+  await h.advance(180_000);
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.comments.get(7)?.[1]).toContain(`Limitless run ${run.id} opened a PR ${prUrl}`);
+  h.store.updateRun(run.id, { merged: true });
+  h.labels.get(7)?.add("limitless:needs-you");
+  await h.advance(180_000);
+  h.stop();
+  h.start();
+  await h.advance();
+  expect(h.labels.get(7)).toEqual(new Set());
+  expect(h.comments.get(7)).toHaveLength(2);
+});
+
+test.each(["succeeded", "resolved"] as const)(
+  "%s without an open PR releases lifecycle labels",
+  async (status) => {
+    const h = harness();
+    const run = await linkedRun(h);
+    h.start();
+    await h.advance();
+    h.store.updateRun(run.id, { status });
+    await h.advance(180_000);
+    expect(h.labels.get(7)).toEqual(new Set());
+    expect(h.comments.get(7)).toHaveLength(1);
+    h.store.updateRun(run.id, { prUrl: "https://github.com/owner/repo/pull/8", prClosedUnmerged: true });
+    await h.advance(180_000);
+    expect(h.labels.get(7)).toEqual(new Set());
+  },
+);
+
+test.each(["after label", "after comment"])("lifecycle resumes exactly once %s write", async (point) => {
+  const h = harness();
+  const run = await linkedRun(h);
+  let interrupted = false;
+  h.afterWrite = (args) => {
+    if (interrupted || args[args.indexOf("-X") + 1] !== "POST") return;
+    if (!args[1]?.endsWith(point === "after label" ? "/labels" : "/comments")) return;
+    interrupted = true;
+    h.stop();
+    if (point === "after comment") throw new Error("connection lost after accepted comment");
+  };
+  h.start();
+  await h.advance();
+  expect(interrupted).toBe(true);
+  expect(h.comments.get(7) ?? []).toHaveLength(point === "after label" ? 0 : 1);
+  if (point === "after comment")
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("pending");
+  h.start();
+  await h.advance();
+  await h.advance(180_000);
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.comments.get(7)).toHaveLength(1);
+  expect(h.calls.filter((a) => a[1]?.endsWith("/labels") && a.includes("POST"))).toHaveLength(1);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
+});
+
+test.each(["write failure", "status changes"])(
+  "partial label transition recovers its previous desired set after %s",
+  async (interruption) => {
+    const h = harness();
+    const run = await linkedRun(h);
+    h.start();
+    await h.advance();
+    h.store.updateRun(run.id, { status: "needs_human" });
+    if (interruption === "write failure") {
+      h.intercept = (args) => {
+        if (args.at(-1) === "labels[]=limitless:needs-you") throw new Error("label write rejected");
+      };
+    } else {
+      h.afterWrite = (args) => {
+        if (args.includes("DELETE")) h.store.updateRun(run.id, { status: "running" });
+      };
+    }
+    await h.advance(180_000);
+    expect(h.labels.get(7)).toEqual(new Set());
+    h.store.updateRun(run.id, { status: "running" });
+    h.intercept = undefined;
+    h.afterWrite = undefined;
+    h.stop();
+    h.start();
+    await h.advance();
+    expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  },
+);
+
+test.each([
+  ["needs_human", false],
+  ["needs_human", true],
+  ["failed", false],
+  ["failed", true],
+] as const)("pending %s comment survives resolution and restart (accepted: %s)", async (status, accepted) => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.start();
+  await h.advance();
+  h.store.updateRun(run.id, { status, error: "original reason" });
+  const reject = (args: string[]) => {
+    if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("comment connection lost");
+  };
+  if (accepted) h.afterWrite = reject;
+  else h.intercept = reject;
+  await h.advance(180_000);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${status}`)).toBe("pending");
+  h.store.updateRun(run.id, { status: "resolved", error: "changed reason" });
+  h.stop();
+  h.start();
+  await h.advance();
+  if (!accepted) {
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${status}`)).toBe("pending");
+    h.intercept = undefined;
+    await h.advance(180_000);
+  }
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${status}`)).toBe("done");
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.comments.get(7)?.[1]).toContain(
+    `${status === "needs_human" ? "needs you" : "failed"}: see ${h.cfg.uiUrl}/runs/${run.id}.`,
+  );
+  expect(h.comments.get(7)?.[1]).not.toContain("original reason");
+  expect(h.comments.get(7)?.[1]).not.toContain("changed reason");
+  await h.advance(180_000);
+  expect(h.comments.get(7)).toHaveLength(2);
+});
+
+test("migration suppresses history but reconciles later transitions after reopen", async () => {
+  const h = harness();
+  const before = join(h.cfg.paths.home, "before");
+  cpSync(MIGRATION_DIR, before, {
+    recursive: true,
+    filter: beforeLifecycle,
+  });
+  const path = join(h.cfg.paths.home, "old.db");
+  let store = new Store(path, before);
+  const repo = store.upsertRepo({
+    slug: "owner/repo",
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const run = store.createRun(repo, { repo: repo.slug, prompt: "Closes #7" });
+  store.updateRun(run.id, { status: "running" });
+  const terminal = store.createRun(repo, { repo: repo.slug, prompt: "Closes #8" });
+  store.updateRun(terminal.id, { status: "failed" });
+  const merged = store.createRun(repo, { repo: repo.slug, prompt: "Closes #9" });
+  store.updateRun(merged.id, { status: "succeeded", prUrl: "https://github.com/owner/repo/pull/90" });
+  const closed = store.createRun(repo, { repo: repo.slug, prompt: "Closes #10" });
+  store.updateRun(closed.id, { status: "succeeded", prUrl: "https://github.com/owner/repo/pull/100" });
+  store.close();
+  store = new Store(path);
+  store.close();
+  store = new Store(path);
+  store.updateRun(run.id, { status: "failed" });
+  h.labels.set(7, new Set(["limitless:in-progress"]));
+  const stop = startIssueQueue(
+    { cfg: h.cfg, store, scheduler: h.factory.scheduler, createRun: h.factory.createRun },
+    {
+      gh: h.gh,
+      lifecycle: { identity: h.identity },
+      clock: {
+        now: h.clock.now,
+        set: h.clock.timer.set as unknown as typeof setTimeout,
+        clear: h.clock.timer.clear,
+      },
+    },
+  );
+  try {
+    await h.advance();
+    await h.advance(180_000);
+    expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
+    expect(h.comments.get(7)).toEqual([expect.stringContaining(`Limitless run ${run.id} failed: see`)]);
+    expect(
+      h.calls
+        .filter((args) => args[1] !== "graphql")
+        .every((args) => !/issues\/(8|9|10)\b/.test(args[1] ?? "")),
+    ).toBe(true);
+    h.calls.length = 0;
+    h.labels.set(9, new Set(["priority:1", "limitless:in-progress"]));
+    h.labels.set(10, new Set(["priority:1", "limitless:in-progress"]));
+    expect(store.resolveMergedRun(merged.id, "owner", h.clock.now())).toBe(true);
+    store.updateRun(closed.id, { prClosedUnmerged: true });
+    await h.advance(180_000);
+    await h.advance(180_000);
+    for (const number of [9, 10]) {
+      expect(h.labels.get(number)).toEqual(new Set(["priority:1"]));
+      expect(h.comments.get(number) ?? []).toHaveLength(0);
+    }
+    h.calls.length = 0;
+    await h.advance(180_000);
+    expect(h.calls.filter((args) => args[1] !== "graphql")).toEqual([]);
+    expect(h.comments.get(7)).toHaveLength(1);
+  } finally {
+    stop();
+    store.close();
+  }
+});
+
+test.each([
+  ["missing failure event", false],
+  ["removed priority", false],
+  ["priority before failure", false],
+  ["same timestamp later index", true],
+  ["untrusted failure then trusted priority", true],
+  ["untrusted failure without priority", false],
+  ["untrusted priority", false],
+] as const)("failure re-approval follows current labels and timeline: %s", async (mode, eligible) => {
+  const h = harness();
+  const run = await linkedRun(h);
+  const latest = h.store.updateRun(run.id, { status: "failed", finishedAt: Date.parse(at) + 999 });
+  const candidate = issue();
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  if (mode !== "missing failure event")
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name: "limitless:failed" },
+      actor: { login: mode.startsWith("untrusted failure") ? "stranger" : "factory[bot]" },
+      createdAt: at,
+    });
+  if (!["priority before failure", "untrusted failure without priority"].includes(mode)) {
+    const name = mode === "removed priority" ? "priority:2" : "priority:1";
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name },
+      actor: { login: mode === "untrusted priority" ? "stranger" : "owner" },
+      createdAt: mode === "removed priority" ? new Date(Date.parse(at) + 1000).toISOString() : at,
+    });
+  }
+  candidate.labels.totalCount = candidate.labels.nodes.length;
+  candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
+  expect(issueEligibility(candidate, ["owner"]).eligible).toBe(eligible);
+  expect(issueEligibility(candidate, ["owner"], { latest, failureBoundary: 1 }).eligible).toBe(eligible);
+});
+
+test("poll requires trusted re-approval later than the failure label", async () => {
+  const h = harness();
+  const candidate = issue();
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  candidate.labels.totalCount++;
+  candidate.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "limitless:failed" },
+    actor: { login: "factory[bot]" },
+    createdAt: at,
+  });
+  candidate.timelineItems.totalCount++;
+  h.data.set("owner/repo", [candidate]);
+  h.start();
+  await h.advance();
+  expect(h.runs()).toHaveLength(0);
+  candidate.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "priority:1" },
+    actor: { login: "owner" },
+    createdAt: new Date(Date.parse(at) + 1).toISOString(),
+  });
+  candidate.timelineItems.totalCount++;
+  await h.advance(180_000);
+  expect(h.runs()).toHaveLength(1);
+});
+
+test.each(["failed", "needs_human"] as const)(
+  "%s comments contain only fixed public text",
+  async (status) => {
+    const h = harness();
+    const token = ["lifecycle", "test", "credential"].join("-");
+    const privateText = ["lifecycle", "private", "location"].join("-");
+    registerCredential("ISSUE_LIFECYCLE_TEST", token);
+    writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), privateText);
+    const run = await linkedRun(h);
+    const worktree = join(h.cfg.paths.work, run.id);
+    h.store.setRunState(run.id, { worktreePath: worktree });
+    const homePath = join(h.cfg.paths.home, "internal.db");
+    h.store.updateRun(run.id, { status, error: `${worktree} ${homePath} ${token} ${privateText}` });
+    h.start();
+    await h.advance();
+    expect(h.comments.get(7)).toHaveLength(2);
+    expect(h.comments.get(7)?.[1]).toBe(
+      `<!-- limitless-lifecycle:${run.id}:${status} -->\nLimitless run ${run.id} ${status === "failed" ? "failed" : "needs you"}: see ${h.cfg.uiUrl}/runs/${run.id}.`,
+    );
+    for (const value of [worktree, homePath, token, privateText])
+      expect(h.comments.get(7)?.[1]).not.toContain(value);
+  },
+);
+
+test("private lifecycle bodies are suppressed durably while labels still reconcile", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), run.id);
+  h.start();
+  await h.advance();
+  await h.advance(180_000);
+  expect(h.calls.some((args) => args[1]?.endsWith("/comments") && args.includes("POST"))).toBe(false);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
+  expect(h.logs.join("\n")).toContain(`owner/repo#7 run ${run.id}`);
+  expect(h.logs.join("\n")).toContain("Issue lifecycle comment");
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+});
+
+test("records all observed events before a failed started delivery and later resolution", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "needs_human" });
+  h.intercept = (args) => {
+    if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("rejected");
+  };
+  h.start();
+  await h.advance();
+  for (const event of ["started", "needs_human"])
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${event}`)).toBe("pending");
+  h.intercept = undefined;
+  h.store.updateRun(run.id, { status: "resolved" });
+  await h.advance(180_000);
+  await h.advance(180_000);
+  expect(h.comments.get(7)).toEqual([
+    expect.stringContaining(`Limitless run ${run.id} started:`),
+    expect.stringContaining(`Limitless run ${run.id} needs you:`),
+  ]);
+});
+
+test("a foreign marker cannot acknowledge a pending comment; successful POST stores its id", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  const body = `<!-- limitless-lifecycle:${run.id}:started -->\nLimitless run ${run.id} started: see ${h.cfg.uiUrl}/runs/${run.id}.`;
+  h.store.setIssueLifecycleEffect(run.id, "owner/repo", 7, "comment:started", "pending", {
+    body,
+    login: "owner",
+  });
+  h.comments.set(7, [body]);
+  h.commentAuthors.set(body, "stranger");
+  h.start();
+  await h.advance();
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.calls.filter((a) => a[1]?.endsWith("/comments") && a.includes("POST"))).toHaveLength(1);
+  const effect = h.store
+    .issueLifecycleEffects(run.id, "owner/repo", 7)
+    .find((e) => e.effect === "comment:started");
+  expect(effect).toMatchObject({ state: "done", commentId: 7002 });
+});
+
+test.each(["app", "owner"] as const)(
+  "lost POST response dedupes using the %s posting identity",
+  async (kind) => {
+    const h = harness();
+    h.login = kind === "app" ? "factory[bot]" : "gh-user";
+    h.identity = async () => (kind === "app" ? { kind, token: "fake", botLogin: h.login } : { kind });
+    const run = await linkedRun(h);
+    h.afterWrite = (args) => {
+      if (args[1]?.endsWith("/comments")) {
+        h.stop();
+        throw new Error("response lost");
+      }
+    };
+    h.start();
+    await h.advance();
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("pending");
+    h.afterWrite = undefined;
+    h.start();
+    await h.advance();
+    expect(h.comments.get(7)).toHaveLength(1);
+    expect(h.calls.filter((a) => a[1]?.endsWith("/comments") && a.includes("POST"))).toHaveLength(1);
+    expect(
+      h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started"),
+    ).toMatchObject({ state: "done", commentId: 7001, login: h.login });
+    expect(h.calls.some((a) => a[1] === "user")).toBe(kind === "owner");
+  },
+);
+
+test("discreet lifecycle labels have durable suppression of comments", async () => {
+  const h = harness();
+  h.cfg.repos = { "owner/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false } };
+  const run = await linkedRun(h);
+  h.start();
+  await h.advance();
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  h.store.updateRun(run.id, { status: "needs_human" });
+  await h.advance(180_000);
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:needs-you"]));
+  h.store.updateRun(run.id, { status: "failed" });
+  await h.advance(180_000);
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
+  h.stop();
+  h.start();
+  await h.advance();
+  await h.advance(180_000);
+  expect(h.comments.size).toBe(0);
+  h.cfg.repos = {};
+  await h.advance(180_000);
+  expect(h.comments.size).toBe(0);
+});
+
+test("failed lifecycle writes are redacted, retry next poll, and do not block selection", async () => {
+  const h = harness({ max_issue_runs: 3 });
+  const run = await linkedRun(h);
+  const token = ["lifecycle", "write", "credential"].join("-");
+  registerCredential("ISSUE_WRITE_TEST", token);
+  const failed = new Set<string>();
+  h.intercept = (args) => {
+    const endpoint = args[1]?.split("/").at(-1) ?? "";
+    if (args.includes("POST") && !failed.has(endpoint)) {
+      failed.add(endpoint);
+      throw new Error(`write rejected ${token}`);
+    }
+  };
+  h.data.set("owner/repo", [issue()]);
+  h.start();
+  await h.advance();
+  expect(h.runs()).toHaveLength(2);
+  expect(h.store.getRun(run.id)?.status).toBe("queued");
+  expect(h.comments.size).toBe(0);
+  expect(h.logs.join("\n")).toContain("write rejected [redacted");
+  expect(h.logs.join("\n")).not.toContain(token);
+  await h.advance(180_000);
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.comments.get(7)).toHaveLength(1);
+  await h.advance(180_000);
+  expect(h.comments.get(7)).toHaveLength(1);
+});
+
+test("non-GitHub Closes directives link issues and appear as PR closing paragraphs", async () => {
+  const h = harness();
+  const run = await h.factory.createRun({
+    repo: "owner/repo",
+    prompt: "work\nCloses #7\nCloses #8",
+    source: "mcp",
+  });
+  h.start();
+  await h.advance();
+  for (const number of [7, 8]) {
+    expect(h.labels.get(number)).toEqual(new Set(["limitless:in-progress"]));
+    expect(h.comments.get(number)).toHaveLength(1);
+  }
+  const repo = h.store.getRepo(run.repoId);
+  if (!repo) throw new Error("missing repo");
+  const ctx = new RunContext(h.factory.deps, run, repo, new AbortController().signal);
+  const body = buildReport(ctx, true);
+  expect(body).toContain("\n\nCloses #7\n\nCloses #8\n\n");
+});
+
+test("lifecycle uses the status that wins while fetching labels", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.intercept = (args) => {
+    if (args[1]?.includes("/labels?"))
+      h.store.updateRun(run.id, { status: "failed", error: "stopped during lookup" });
+  };
+  h.start();
+  await h.advance();
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.comments.get(7)?.[1]).toContain(`failed: see ${h.cfg.uiUrl}/runs/${run.id}.`);
+});
+
+test("a new run owns labels even when the old run is still failed", async () => {
+  const h = harness();
+  const old = await linkedRun(h);
+  h.store.updateRun(old.id, { status: "failed" });
+  h.start();
+  await h.advance();
+  const next = await linkedRun(h);
+  // Give both runs the same timestamp to exercise creation order rather than random ids.
+  h.store.db.query("UPDATE runs SET created_at = ? WHERE id = ?").run(old.createdAt, next.id);
+  await h.advance(180_000);
+  await h.advance(180_000);
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.calls.filter((a) => a.at(-1) === "labels[]=limitless:failed")).toHaveLength(1);
+  expect(h.comments.get(7)).toHaveLength(3);
+});
+
+test.each(["outside repo", "disabled", "GitHub prompt"])("lifecycle ignores %s", async (mode) => {
+  const h = harness();
+  if (mode === "GitHub prompt") {
+    await h.factory.createRun({ repo: "owner/repo", prompt: "Closes #7", source: "github" });
+  } else {
+    await linkedRun(h);
+    if (mode === "disabled") h.cfg.githubQueue = null;
+    else if (h.cfg.githubQueue) h.cfg.githubQueue.repos = ["owner/other"];
+  }
+  h.start();
+  await h.advance();
+  expect(h.labels.size).toBe(0);
+  expect(h.comments.size).toBe(0);
+});
+
+test("issue links compare repository names case insensitively and ignore quoted closures", async () => {
+  const h = harness();
+  const run = await h.factory.createRun({
+    repo: "owner/repo",
+    prompt: "quoted Closes #8",
+    source: "github",
+    sourceRef: { kind: "issue", repo: "OWNER/REPO", number: 7 },
+  });
+  h.start();
+  await h.advance();
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.labels.has(8)).toBe(false);
+  const repo = h.store.getRepo(run.repoId);
+  if (!repo) throw new Error("missing repo");
+  const ctx = new RunContext(h.factory.deps, run, repo, new AbortController().signal);
+  const body = buildReport(ctx, true);
+  expect(body).toContain("\n\nCloses #7\n\n");
+  expect(body).not.toContain("\n\nCloses #8\n\n");
+  expect(h.scopes.filter((scope) => scope === "OWNER/REPO").length).toBeGreaterThan(0);
+});
+
+test("completed lifecycle history adds no GitHub calls or per-run reads", async () => {
+  const counts: number[][] = [];
+  for (const count of [1, 25]) {
+    const h = harness();
+    for (let i = 0; i < count; i++) {
+      const run = await linkedRun(h, i + 10);
+      h.store.updateRun(run.id, { status: "failed" });
+    }
+    h.start();
+    for (let i = 0; i < 6; i++) await h.advance(i ? 180_000 : 0);
+    expect(h.comments.size).toBe(count);
+    for (const comments of h.comments.values()) expect(comments).toHaveLength(2);
+    h.calls.length = 0;
+    const reads = spyOn(h.store, "getRun");
+    const effectReads = spyOn(h.store, "issueLifecycleEffect");
+    const batchReads = spyOn(h.store, "issueLifecycleEffects");
+    await h.advance(180_000);
+    expect(h.calls.every((args) => args[1] === "graphql")).toBe(true);
+    counts.push([reads.mock.calls.length, effectReads.mock.calls.length, batchReads.mock.calls.length]);
+    reads.mockRestore();
+    effectReads.mockRestore();
+    batchReads.mockRestore();
+  }
+  expect(counts).toEqual([
+    [0, 0, 0],
+    [0, 0, 0],
+  ]);
+});
+
+test("a one-call pause refreshes completed labels after a human edit in the same session", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  const signal = new AbortController().signal;
+  const poll = (maxCalls: number) =>
+    reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, (s) => h.logs.push(s), {
+      identity: h.identity,
+      maxCalls,
+    });
+  await poll(50);
+  h.store.updateRun(run.id, { status: "needs_human" });
+  h.labels.set(7, new Set(["priority:1"]));
+  h.calls.length = 0;
+  await poll(1);
+  expect(h.calls).toHaveLength(1);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "labels")).toBe("pending");
+  h.labels.set(7, new Set(["priority:1", "limitless:in-progress"]));
+  await poll(50);
+  expect(h.labels.get(7)).toEqual(new Set(["priority:1", "limitless:needs-you"]));
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "labels")).toBe("limitless:needs-you");
+  await poll(50);
+  expect(h.comments.get(7)).toEqual([
+    expect.stringContaining("started: see"),
+    expect.stringContaining("needs you: see"),
+  ]);
+});
+
+test("owner credentials changed during a budget pause use a fresh author for a lost POST", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.labels.set(7, new Set(["limitless:in-progress"]));
+  h.store.setIssueLifecycleEffect(run.id, "owner/repo", 7, "labels", "limitless:in-progress");
+  const signal = new AbortController().signal;
+  const poll = (maxCalls: number) =>
+    reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, (s) => h.logs.push(s), {
+      identity: h.identity,
+      maxCalls,
+    });
+  h.login = "owner-a";
+  await poll(1);
+  expect(h.calls.length).toBeLessThanOrEqual(1);
+  expect(h.comments.size).toBe(0);
+  h.login = "owner-b";
+  h.afterWrite = (args) => {
+    if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("response lost");
+  };
+  h.calls.length = 0;
+  await poll(2);
+  expect(h.calls.length).toBeLessThanOrEqual(2);
+  expect(h.comments.get(7)).toHaveLength(1);
+  expect(
+    h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started"),
+  ).toMatchObject({ state: "pending", login: "owner-b", page: 1 });
+  h.afterWrite = undefined;
+  await poll(50);
+  expect(h.comments.get(7)).toHaveLength(1);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
+});
+
+test.each([1, 5])(
+  "lifecycle call cap %s defers writes while admitting an eligible queue issue",
+  async (cap) => {
+    const h = harness();
+    h.maxCalls = cap;
+    for (let i = 10; i < 18; i++) {
+      const run = await linkedRun(h, i);
+      h.store.updateRun(run.id, { status: "failed" });
+    }
+    h.data.set("owner/repo", [issue()]);
+    h.start();
+    await h.advance();
+    expect(
+      h.calls.filter((args) => args[1] !== "graphql" || !args[3]?.includes("rateLimit")).length,
+    ).toBeLessThanOrEqual(cap);
+    expect(h.runs()).toHaveLength(9);
+    // Fresh reads and their writes need two slots; retain the one-slot admission/deferral check above.
+    const progressCap = Math.max(2, cap);
+    h.maxCalls = progressCap;
+    for (let i = 0; i < 80; i++) {
+      h.calls.length = 0;
+      await h.advance(180_000);
+      expect(
+        h.calls.filter((args) => args[1] !== "graphql" || !args[3]?.includes("rateLimit")).length,
+      ).toBeLessThanOrEqual(progressCap);
+    }
+    for (let i = 10; i < 18; i++) {
+      expect(h.labels.get(i)).toEqual(new Set(["limitless:failed"]));
+      expect(h.comments.get(i)).toHaveLength(2);
+    }
+    expect(h.labels.get(1)).toEqual(new Set(["limitless:in-progress"]));
+    expect(h.comments.get(1)).toHaveLength(1);
+  },
+);
+
+test("paginated lifecycle reads respect the cap and resume through a lost response", async () => {
+  const h = harness();
+  h.maxCalls = 1;
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "failed" });
+  const ordinary = Array.from({ length: 100 }, (_, i) => `ordinary:${i}`);
+  h.labels.set(7, new Set([...ordinary, "limitless:needs-you"]));
+  h.comments.set(
+    7,
+    Array.from({ length: 100 }, (_, i) => `Other comment ${i}`),
+  );
+  let interrupted = false;
+  h.afterWrite = (args) => {
+    if (args[1]?.endsWith("/comments")) {
+      interrupted = true;
+      h.stop();
+      throw new Error("response lost");
+    }
+  };
+  h.start();
+  await h.advance();
+  expect(h.calls).toHaveLength(2); // One lifecycle observation plus queue admission.
+  expect(h.calls.filter((a) => a[1] !== "graphql" || !a[3]?.includes("rateLimit"))).toHaveLength(1);
+  expect(h.comments.get(7)).toHaveLength(100);
+  h.maxCalls = 2;
+  for (let i = 0; i < 20 && !interrupted; i++) {
+    h.calls.length = 0;
+    await h.advance(180_000);
+    expect(
+      h.calls.filter((a) => a[1] !== "graphql" || !a[3]?.includes("rateLimit")).length,
+    ).toBeLessThanOrEqual(2);
+  }
+  expect(interrupted).toBe(true);
+  h.afterWrite = undefined;
+  h.start();
+  for (let i = 0; i < 12; i++) {
+    h.calls.length = 0;
+    await h.advance(i ? 180_000 : 0);
+    expect(
+      h.calls.filter((a) => a[1] !== "graphql" || !a[3]?.includes("rateLimit")).length,
+    ).toBeLessThanOrEqual(2);
+  }
+  expect(h.labels.get(7)).toEqual(new Set([...ordinary, "limitless:failed"]));
+  expect(h.comments.get(7)).toHaveLength(102);
+  for (const event of ["started", "failed"])
+    expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, `comment:${event}`)).toBe("done");
+});
+
+test("unavailable posting identity keeps comments pending until a later poll", async () => {
+  const h = harness();
+  h.login = "";
+  const run = await linkedRun(h);
+  h.start();
+  await h.advance();
+  expect(h.comments.size).toBe(0);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("pending");
+  h.login = "owner";
+  await h.advance(180_000);
+  expect(h.comments.get(7)).toHaveLength(1);
+});
+
+test("the exact posted body includes redaction and publication path sanitization", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.cfg.uiUrl = `${h.cfg.paths.home}/ui`;
+  registerCredential("ISSUE_MARKER_TEST", run.id);
+  writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), h.cfg.paths.home);
+  h.start();
+  await h.advance();
+  const body = h.comments.get(7)?.[0];
+  expect(body).toContain("<data>/ui/runs/");
+  expect(body).toContain("[redacted");
+  expect(body).not.toContain(h.cfg.paths.home);
+  expect(body).not.toContain(run.id);
+  expect(
+    h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started")?.body,
+  ).toBe(body);
+});
+
+test.each([
+  "https://github.com/owner/other/pull/8",
+  "https://example.com/owner/repo/pull/8",
+  "arbitrary run text",
+])("PR comments omit unvalidated URLs: %s", async (prUrl) => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "succeeded", prUrl });
+  h.start();
+  await h.advance();
+  expect(h.comments.get(7)?.[1]).toBe(
+    `<!-- limitless-lifecycle:${run.id}:pr -->\nLimitless run ${run.id} opened a PR: see ${h.cfg.uiUrl}/runs/${run.id}.`,
+  );
+});
+
+test.each(["app", "owner"] as const)(
+  "a retried comment checkpoints its new %s author before a lost response",
+  async (kind) => {
+    const h = harness();
+    const identity = (login: string): GitHubIdentity =>
+      login.endsWith("[bot]") ? { kind: "app", token: "fake", botLogin: login } : { kind: "owner" };
+    h.login = kind === "app" ? "gh-user" : "factory[bot]";
+    h.identity = async () => identity(h.login);
+    const run = await linkedRun(h);
+    h.intercept = (args) => {
+      if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("POST rejected");
+    };
+    h.start();
+    await h.advance();
+    h.stop();
+    expect(h.comments.get(7) ?? []).toHaveLength(0);
+    h.intercept = undefined;
+    h.login = kind === "app" ? "factory[bot]" : "gh-user";
+    h.afterWrite = (args) => {
+      if (args[1]?.endsWith("/comments") && args.includes("POST")) {
+        expect(
+          h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started"),
+        ).toMatchObject({ login: h.login, state: "pending", page: 1 });
+        throw new Error("response lost");
+      }
+    };
+    h.start();
+    await h.advance();
+    h.stop();
+    expect(h.comments.get(7)).toHaveLength(1);
+    expect(
+      h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started"),
+    ).toMatchObject({ login: h.login, state: "pending", page: 1 });
+    h.afterWrite = undefined;
+    h.start();
+    await h.advance();
+    expect(h.comments.get(7)).toHaveLength(1);
+  },
+);
+
+test("inaccessible linked issues cannot starve later issues of the same run", async () => {
+  const h = harness();
+  await h.factory.createRun({
+    repo: "owner/repo",
+    prompt: Array.from({ length: 26 }, (_, i) => `Closes #${i + 1}`).join("\n"),
+  });
+  h.intercept = (args) => {
+    const number = Number(args[1]?.match(/issues\/(\d+)/)?.[1]);
+    if (number && number < 26) throw new Error("HTTP 404: issue unavailable");
+  };
+  h.start();
+  for (let i = 0; i < 10; i++) {
+    h.calls.length = 0;
+    await h.advance(i ? 180_000 : 0);
+    expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(50);
+  }
+  expect(h.labels.get(26)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.comments.get(26)).toHaveLength(1);
+  expect(h.logs.join("\n")).toContain("issue unavailable");
+  h.intercept = undefined;
+  await h.advance(180_000);
+  for (let i = 0; i < 10; i++) await h.advance(180_000);
+  expect(h.labels.get(1)).toEqual(new Set(["limitless:in-progress"]));
+  expect(h.comments.get(1)).toHaveLength(1);
+});
+
+test("same-second timeline re-approval also works with the latest failed run", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  const finishedAt = Date.parse(at) + 1000;
+  const latest = h.store.updateRun(run.id, { status: "failed", finishedAt });
+  const candidate = issue(7);
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  candidate.labels.totalCount++;
+  for (const [name, login] of [
+    ["limitless:failed", "factory[bot]"],
+    ["priority:1", "owner"],
+  ]) {
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name: name ?? "" },
+      actor: { login: login ?? "" },
+      createdAt: new Date(finishedAt).toISOString(),
+    });
+  }
+  candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
+  expect(issueEligibility(candidate, ["owner"], { latest, failureBoundary: 1 })).toEqual({
+    eligible: true,
+    priority: 1,
+  });
+});
+
+test("populated migration resumes label reconciliation after human edits", async () => {
+  const h = harness();
+  const before = join(h.cfg.paths.home, "all-statuses-before");
+  cpSync(MIGRATION_DIR, before, { recursive: true, filter: beforeLifecycle });
+  const path = join(h.cfg.paths.home, "all-statuses.db");
+  let store = new Store(path, before);
+  const repo = store.upsertRepo({
+    slug: "owner/repo",
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const statuses: RunStatus[] = [
+    "queued",
+    "waiting",
+    "running",
+    "waiting_input",
+    "needs_human",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "resolved",
+  ];
+  const runs = statuses.map((status, i) => {
+    const run = store.createRun(repo, { repo: repo.slug, prompt: `Closes #${i + 1}` });
+    return store.updateRun(run.id, { status });
+  });
+  store.close();
+  store = new Store(path);
+  expect(store.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(store.issueLifecycleRuns().map((run) => run.status)).toEqual(statuses.slice(0, 5));
+  store.close();
+  store = new Store(path);
+  const active = runs[2];
+  if (!active) throw new Error("missing running run");
+  store.updateRun(active.id, { status: "needs_human" });
+  h.labels.set(3, new Set(["limitless:in-progress"]));
+  h.intercept = (args) => {
+    if (args[1]?.includes("/issues/3/") && args.at(-1) === "labels[]=limitless:needs-you")
+      throw new Error("label write rejected");
+  };
+  const start = () =>
+    startIssueQueue(
+      { cfg: h.cfg, store, scheduler: h.factory.scheduler, createRun: h.factory.createRun },
+      {
+        gh: h.gh,
+        lifecycle: { identity: h.identity },
+        clock: {
+          now: h.clock.now,
+          set: h.clock.timer.set as unknown as typeof setTimeout,
+          clear: h.clock.timer.clear,
+        },
+      },
+    );
+  let stop = start();
+  try {
+    await h.advance();
+    expect(h.comments.get(3)).toEqual([expect.stringContaining("needs you: see")]);
+    expect(h.labels.get(3)).toEqual(new Set());
+    stop();
+    store.close();
+    store = new Store(path);
+    h.labels.set(3, new Set(["priority:1", "limitless:in-progress"]));
+    h.intercept = undefined;
+    stop = start();
+    await h.advance();
+    expect(h.labels.get(3)).toEqual(new Set(["priority:1", "limitless:needs-you"]));
+    expect(h.comments.get(3)).toHaveLength(1);
+  } finally {
+    stop();
+    store.close();
+  }
+});
+
+test.each(["merged", "closed", "merged before correction", "closed before correction"])(
+  "a pre-existing succeeded run clears issue labels when its open PR is %s",
+  async (state) => {
+    const h = harness();
+    const before = join(h.cfg.paths.home, "open-pr-before");
+    cpSync(MIGRATION_DIR, before, { recursive: true, filter: beforeLifecycle });
+    const path = join(h.cfg.paths.home, "open-pr.db");
+    let store = new Store(path, before);
+    const repo = store.upsertRepo({
+      slug: "owner/repo",
+      kind: "github",
+      url: null,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "pr",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "Closes #7" });
+    store.updateRun(run.id, { status: "succeeded", prUrl: "https://github.com/owner/repo/pull/8" });
+    store.close();
+    cpSync(
+      join(MIGRATION_DIR, "20261024T224811-issue-lifecycle.sql"),
+      join(before, "20261024T224811-issue-lifecycle.sql"),
+    );
+    store = new Store(path, before);
+    const endPr = () => {
+      if (state.startsWith("merged"))
+        expect(store.resolveMergedRun(run.id, "owner", h.clock.now())).toBe(true);
+      else store.updateRun(run.id, { prClosedUnmerged: true });
+    };
+    if (state.includes("before correction")) endPr();
+    store.close();
+    store = new Store(path);
+    store.close();
+    store = new Store(path);
+    if (!state.includes("before correction")) endPr();
+    h.labels.set(7, new Set(["priority:1", "limitless:in-progress"]));
+    const stop = startIssueQueue(
+      { cfg: h.cfg, store, scheduler: h.factory.scheduler, createRun: h.factory.createRun },
+      {
+        gh: h.gh,
+        lifecycle: { identity: h.identity },
+        clock: {
+          now: h.clock.now,
+          set: h.clock.timer.set as unknown as typeof setTimeout,
+          clear: h.clock.timer.clear,
+        },
+      },
+    );
+    try {
+      await h.advance();
+      expect(h.comments.get(7) ?? []).toHaveLength(0);
+      expect(h.labels.get(7)).toEqual(new Set(["priority:1"]));
+      expect(store.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+      h.calls.length = 0;
+      await h.advance(180_000);
+      expect(h.calls.filter((args) => args[1] !== "graphql")).toEqual([]);
+    } finally {
+      stop();
+      store.close();
+    }
+  },
+);
+
+test("a failed start comment cannot starve another effect on the same issue", async () => {
+  const h = harness();
+  h.maxCalls = 1;
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "needs_human" });
+  h.intercept = (args) => {
+    if (args.includes("POST") && args.at(-1)?.includes(":started -->"))
+      throw new Error("start comment rejected");
+  };
+  h.start();
+  await h.advance();
+  expect(h.calls.filter((args) => args[1] !== "graphql")).toHaveLength(1);
+  expect(h.comments.get(7) ?? []).toHaveLength(0);
+  h.maxCalls = 2;
+  for (let i = 0; i < 12; i++) {
+    h.calls.length = 0;
+    await h.advance(180_000);
+    expect(h.calls.filter((args) => args[1] !== "graphql").length).toBeLessThanOrEqual(2);
+  }
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:needs-you"]));
+  expect(h.comments.get(7)).toEqual([expect.stringContaining("needs you: see")]);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("pending");
+  h.intercept = undefined;
+  for (let i = 0; i < 6; i++) await h.advance(180_000);
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
+});
+
+test.each([11_000, 999])(
+  "review: fast second failure at +%sms requires its own ordered approval",
+  async (offset) => {
+    const h = harness();
+    const candidate = issue(7);
+    candidate.labels.nodes.push({ name: "limitless:failed" });
+    candidate.labels.totalCount++;
+    for (const name of ["limitless:failed", "priority:1"])
+      candidate.timelineItems.nodes.push({
+        __typename: "LabeledEvent",
+        label: { name },
+        actor: { login: name === "priority:1" ? "owner" : "factory[bot]" },
+        createdAt:
+          name === "priority:1" && offset === 11_000 ? new Date(Date.parse(at) + 10_000).toISOString() : at,
+      });
+    h.labelAt = new Date(Date.parse(at) + Math.floor(offset / 1000) * 1000).toISOString();
+    candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
+    h.data.set("owner/repo", [candidate]);
+    h.labels.set(7, new Set(["priority:1", "limitless:failed"]));
+    const run = await linkedRun(h);
+    const latest = h.store.updateRun(run.id, { status: "failed", finishedAt: Date.parse(at) + offset });
+    const boundary = () => {
+      const effect = h.store
+        .issueLifecycleEffects(run.id, "owner/repo", 7)
+        .find((e) => e.effect === "failure");
+      return effect?.state === "done" ? Number(effect.body) : null;
+    };
+    const check = () => {
+      const current = [...(h.labels.get(7) ?? [])];
+      candidate.labels = { nodes: current.map((name) => ({ name })), totalCount: current.length };
+      return issueEligibility(candidate, ["owner"], { latest, failureBoundary: boundary() });
+    };
+    const poll = () =>
+      reconcileIssueLifecycle(h.store, h.cfg, h.gh, new AbortController().signal, () => {}, {
+        identity: h.identity,
+      });
+    expect(check().eligible).toBe(false); // The previous episode and approval cannot authorize this run.
+    h.intercept = (args) => {
+      if (args.at(-1) === "labels[]=limitless:failed") throw new Error("addition unavailable");
+    };
+    await poll();
+    expect(h.labels.get(7)).toEqual(new Set(["priority:1"]));
+    expect(check().eligible).toBe(false); // Including during the temporary absence of the failure label.
+    h.intercept = undefined;
+    h.afterWrite = (args) => {
+      if (args.at(-1) === "labels[]=limitless:failed") throw new Error("accepted addition lost response");
+    };
+    await poll();
+    expect(check().eligible).toBe(false);
+    h.afterWrite = undefined;
+    await poll();
+    expect(boundary()).toBe(3);
+    expect(check().eligible).toBe(false); // New episode observed, but no fresh approval.
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name: "priority:1" },
+      actor: { login: "owner" },
+      createdAt: offset === 999 ? at : new Date(Date.parse(at) + 20_000).toISOString(),
+    });
+    candidate.timelineItems.totalCount++;
+    expect(check()).toEqual({ eligible: true, priority: 1 });
+    h.labels.get(7)?.delete("limitless:failed");
+    expect(check()).toEqual({ eligible: true, priority: 1 }); // Established timeline evidence survives label removal.
+    const current = candidate.timelineItems;
+    candidate.timelineItems = { totalCount: 3, nodes: current.nodes.slice(0, 3) };
+    expect(check().eligible).toBe(false); // A stale read cannot support the completed checkpoint.
+    candidate.timelineItems = current;
+    expect(h.calls.filter((args) => args.includes("DELETE"))).toHaveLength(1);
+    expect(h.calls.filter((args) => args.at(-1) === "labels[]=limitless:failed")).toHaveLength(2);
+  },
+);
+
+test.each(["remove", "remove lost response", "add", "add lost response", "comment lost response"])(
+  "failure episode survives a database reopen after %s",
+  async (point) => {
+    const h = harness();
+    const path = join(h.cfg.paths.home, "failure.db");
+    let store = new Store(path);
+    try {
+      const repo = h.store.getRepoBySlug("owner/repo");
+      if (!repo) throw new Error("missing repo");
+      const run = store.createRun(store.upsertRepo(repo), { repo: repo.slug, prompt: "Closes #7" });
+      store.updateRun(run.id, { status: "failed" });
+      store.setIssueLifecycleEffect(run.id, "owner/repo", 7, "comment:started", "done");
+      h.labels.set(7, new Set(["priority:1", "ordinary", "limitless:failed"]));
+      const controller = new AbortController();
+      let interrupted = false;
+      h.afterWrite = (args) => {
+        const matches = point.startsWith("remove")
+          ? args.includes("DELETE")
+          : point.startsWith("add")
+            ? args.at(-1) === "labels[]=limitless:failed"
+            : args[1]?.endsWith("/comments");
+        if (!matches || interrupted) return;
+        interrupted = true;
+        controller.abort();
+        if (point.includes("lost response")) throw new Error("accepted write lost response");
+      };
+      await reconcileIssueLifecycle(store, h.cfg, h.gh, controller.signal, () => {}, {
+        identity: h.identity,
+      });
+      expect(interrupted).toBe(true);
+      store.close();
+      store = new Store(path);
+      h.afterWrite = undefined;
+      for (let i = 0; i < 3; i++)
+        await reconcileIssueLifecycle(store, h.cfg, h.gh, new AbortController().signal, () => {}, {
+          identity: h.identity,
+        });
+      expect(h.labels.get(7)).toEqual(new Set(["priority:1", "ordinary", "limitless:failed"]));
+      expect(store.issueLifecycleEffect(run.id, "owner/repo", 7, "failure")).toBe("done");
+      expect(h.calls.filter((args) => args.includes("DELETE"))).toHaveLength(1);
+      expect(h.calls.filter((args) => args.at(-1) === "labels[]=limitless:failed")).toHaveLength(1);
+      expect(h.comments.get(7)).toEqual([expect.stringContaining(`Limitless run ${run.id} failed: see`)]);
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.each(["labels", "comment"] as const)(
+  "review: a %s task gets two adjacent call slots despite 49 persistent failures",
+  async (task) => {
+    const h = harness();
+    for (let number = 1; number <= 49; number++) {
+      const run = await linkedRun(h, number);
+      h.store.setIssueLifecycleEffect(run.id, "owner/repo", number, "comment:started", "done");
+    }
+    const healthy = await linkedRun(h, 50);
+    if (task === "labels")
+      h.store.setIssueLifecycleEffect(healthy.id, "owner/repo", 50, "comment:started", "done");
+    else {
+      h.labels.set(50, new Set(["limitless:in-progress"]));
+      h.store.setIssueLifecycleEffect(healthy.id, "owner/repo", 50, "labels", "limitless:in-progress");
+    }
+    h.intercept = (args) => {
+      const number = Number(args[1]?.match(/issues\/(\d+)/)?.[1]);
+      if (number && number < 50) throw new Error("HTTP 404: issue unavailable");
+    };
+    const signal = new AbortController().signal;
+    for (let i = 0; i < 10; i++) {
+      h.calls.length = 0;
+      await reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, () => {}, { identity: h.identity });
+      expect(h.calls.length).toBeLessThanOrEqual(50);
+    }
+    if (task === "labels") expect(h.labels.get(50)).toEqual(new Set(["limitless:in-progress"]));
+    else expect(h.comments.get(50) ?? []).toHaveLength(1);
+  },
+);
+
+test("a deferred task stays first when its preceding run leaves the lifecycle worklist", async () => {
+  const h = harness();
+  for (let number = 1; number <= 50; number++) {
+    const run = await linkedRun(h, number);
+    h.store.setIssueLifecycleEffect(run.id, "owner/repo", number, "comment:started", "done");
+    if (number === 50) {
+      h.store.updateRun(run.id, { status: "resolved" });
+      h.store.setIssueLifecycleEffect(run.id, "owner/repo", number, "labels", "none");
+    }
+  }
+  const healthy = await linkedRun(h, 51);
+  h.store.setIssueLifecycleEffect(healthy.id, "owner/repo", 51, "comment:started", "done");
+  h.intercept = (args) => {
+    const number = Number(args[1]?.match(/issues\/(\d+)/)?.[1]);
+    if (number && number < 50) throw new Error("HTTP 404: issue unavailable");
+  };
+  const signal = new AbortController().signal;
+  const poll = () =>
+    reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, () => {}, { identity: h.identity });
+  await poll();
+  expect(h.calls).toHaveLength(49);
+  expect(h.labels.has(51)).toBe(false);
+  h.calls.length = 0;
+  await poll();
+  expect(h.calls[0]?.[1]).toContain("issues/51/labels?");
+  expect(h.calls.length).toBeLessThanOrEqual(50);
+  expect(h.labels.get(51)).toEqual(new Set(["limitless:in-progress"]));
+});
+
+test("a newer CLI failure cannot reuse an older issue run's approved failure episode", async () => {
+  const h = harness();
+  const candidate = issue(7);
+  h.data.set("owner/repo", [candidate]);
+  h.labels.set(7, new Set(["priority:1"]));
+  const first = await linkedRun(h);
+  h.store.updateRun(first.id, { status: "failed" });
+  await reconcileIssueLifecycle(h.store, h.cfg, h.gh, new AbortController().signal, () => {}, {
+    identity: h.identity,
+  });
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  candidate.labels.totalCount++;
+  candidate.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "priority:1" },
+    actor: { login: "owner" },
+    createdAt: at,
+  });
+  candidate.timelineItems.totalCount++;
+  const retry = await h.factory.createRun({ repo: "owner/repo", prompt: "Closes #7" });
+  h.store.updateRun(retry.id, { status: "failed" });
+  h.maxCalls = 0;
+  h.start();
+  await h.advance();
+  expect(h.runs()).toHaveLength(2);
+  expect(h.store.latestIssueRun("OWNER/REPO", 7)?.id).toBe(retry.id);
+  h.maxCalls = 50;
+  await h.advance(180_000);
+  expect(h.runs()).toHaveLength(2);
+  candidate.timelineItems.nodes.push({
+    __typename: "LabeledEvent",
+    label: { name: "priority:1" },
+    actor: { login: "owner" },
+    createdAt: at,
+  });
+  candidate.timelineItems.totalCount++;
+  await h.advance(180_000);
+  expect(h.runs()).toHaveLength(3);
+});
+
+test("review: a pre-lifecycle failed run can be re-approved after upgrading", async () => {
+  const h = harness();
+  const before = join(h.cfg.paths.home, "legacy-failure-migrations");
+  cpSync(MIGRATION_DIR, before, { recursive: true, filter: beforeLifecycle });
+  const path = join(h.cfg.paths.home, "legacy-failure.db");
+  let store = new Store(path, before);
+  const originalRepo = h.store.getRepoBySlug("owner/repo");
+  if (!originalRepo) throw new Error("missing repo");
+  const repo = store.upsertRepo(originalRepo);
+  const run = store.createRun(
+    repo,
+    issueRunRequest({ repo: repo.slug, number: 7, title: "work", body: "", author: "owner" }, "owner"),
+  );
+  store.updateRun(run.id, { status: "failed", finishedAt: Date.parse(at) + 999 });
+  store.close();
+  store = new Store(path);
+  const candidate = issue(7);
+  candidate.labels.nodes.push({ name: "limitless:failed" });
+  candidate.labels.totalCount++;
+  for (const [name, seconds] of [
+    ["limitless:failed", 1],
+    ["priority:1", 2],
+  ] as const)
+    candidate.timelineItems.nodes.push({
+      __typename: "LabeledEvent",
+      label: { name },
+      actor: { login: "owner" },
+      createdAt: new Date(Date.parse(at) + seconds * 1000).toISOString(),
+    });
+  candidate.timelineItems.totalCount = candidate.timelineItems.nodes.length;
+  h.data.set(repo.slug, [candidate]);
+  h.labels.set(7, new Set(["priority:1", "limitless:failed"]));
+  const created: CreateRunRequest[] = [];
+  const stop = startIssueQueue(
+    {
+      cfg: h.cfg,
+      store,
+      scheduler: h.factory.scheduler,
+      createRun: async (request) => {
+        created.push(request);
+        return store.createRun(repo, request);
+      },
+    },
+    {
+      gh: h.gh,
+      lifecycle: { identity: h.identity },
+      clock: {
+        now: h.clock.now,
+        set: h.clock.timer.set as unknown as typeof setTimeout,
+        clear: h.clock.timer.clear,
+      },
+    },
+  );
+  try {
+    await h.advance();
+    await h.advance(180_000);
+    expect(created).toHaveLength(1);
+  } finally {
+    stop();
+    store.close();
+  }
 });

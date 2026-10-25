@@ -78,7 +78,7 @@ test("comments once at creation and terminal status with cost and PR link", asyn
 test.each([
   ["queue", undefined, 0],
   ["queue without config", undefined, 0],
-  ["ordinary", undefined, 2],
+  ["ordinary", undefined, 0],
   ["ordinary", [], 2],
   ["queue disabled", undefined, 2],
 ] as const)("issue lifecycle comments for %s runs with trust %j", async (kind, trusted, expected) => {

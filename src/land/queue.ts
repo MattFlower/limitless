@@ -6,7 +6,7 @@ import { type Config, type Paths, repoSettings } from "../config.ts";
 import { isBranchName } from "../core/delivery.ts";
 import type { LandEntry, Repo, Run } from "../core/types.ts";
 import { ACTIVE_LAND_STATES } from "../core/types.ts";
-import type { Store } from "../db/store.ts";
+import { linkedIssues, type Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
 import { executeGate, type GateExecutor } from "../gates/executor.ts";
@@ -1279,11 +1279,9 @@ export class LandQueue {
             freeFirstRouting:
               run.requestedBy === "dependabot[bot]" && this.deps.cfg?.dependabotRouting === "free_first",
             signalWarnings: this.store.countEvents(run.id, "signal_attempt"),
-            ...(run.sourceRef?.kind === "issue" &&
-            run.sourceRef.repo === repo?.slug &&
-            typeof run.sourceRef.number === "number"
-              ? { closesIssue: run.sourceRef.number }
-              : {}),
+            closesIssues: linkedIssues(run)
+              .filter((i) => i.repo.toLowerCase() === repo?.slug.toLowerCase())
+              .map((i) => i.number),
           },
           (text) => sanitizePublication(redactCredentials(text), worktree, this.deps.paths.home),
         ).report
