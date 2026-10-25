@@ -441,7 +441,7 @@ test("a merge observed by GitHub supersedes needs_human runs closing the same is
   if (!repo) throw new Error("missing repo");
   // Older releases could persist overlapping claims; reconciliation must still resolve them.
   const older = store.createRun(repo, { repo: repo.slug, prompt: "First try." });
-  store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("First try. Closes #12", older.id);
+  store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("First try.\nCloses #12", older.id);
   store.updateRun(older.id, { status: "needs_human", finishedAt: 1 });
   await reconcileMergedRuns(store, async (url) =>
     url === prUrl ? { url, state: "MERGED", mergedAt: "2026-09-27T20:00:00Z", mergedBy: null } : null,
@@ -457,7 +457,7 @@ for (const status of ["needs_human", "succeeded"] as const) {
     const merging = store.updateRun(id, { status });
     const targets = [needsHuman(null), needsHuman(null)];
     for (const target of targets)
-      store.db.query("UPDATE runs SET prompt = 'Retry. Closes #12' WHERE id = ?").run(target);
+      store.db.query("UPDATE runs SET prompt = 'Retry.\nCloses #12' WHERE id = ?").run(target);
     const before = targets.map((target) => store.getRun(target));
     const feed = store.readFeed().items;
     const events = [id, ...targets].map((target) => store.listEvents(target));
@@ -508,7 +508,7 @@ for (const timing of ["already resolved", "lookup in flight"] as const) {
     const id = needsHuman();
     store.db.query("UPDATE runs SET prompt = 'Closes #12' WHERE id = ?").run(id);
     const target = needsHuman(null);
-    store.db.query("UPDATE runs SET prompt = 'Old attempt. Closes #12' WHERE id = ?").run(target);
+    store.db.query("UPDATE runs SET prompt = 'Old attempt.\nCloses #12' WHERE id = ?").run(target);
     const resolve = () =>
       store.resolveRun(id, {
         kind: "done_elsewhere",

@@ -116,7 +116,7 @@ test("other statuses are 409, unknown runs 404, bad input 400; none change state
 });
 
 test("Closes directives match standalone, case-insensitive issue numbers only", () => {
-  expect([...closedIssues("Closes #12\nalso CLOSES\t#7, closes  #12.")]).toEqual([12, 7]);
+  expect([...closedIssues("Closes #12\n \tCLOSES\t#7 \t\r\ncloses  #12\n")]).toEqual([12, 7]);
   for (const text of [
     "Closes #123",
     "Encloses #12",
@@ -124,8 +124,20 @@ test("Closes directives match standalone, case-insensitive issue numbers only", 
     "Fixes #12",
     "Closes o/r#12",
     "Closes #12a",
+    "Mention Closes #12 inline",
+    "> Closes #12",
+    '"Closes #12"',
+    "`Closes #12`",
+    "Closes #12.",
+    "Closes #12 extra",
+    "Closes #12 Closes #7",
+    "Closes\n#12",
+    "Closes\r\n#12",
+    "Closes #012",
+    "Closes #+12",
   ])
     expect(closedIssues(text).has(12)).toBe(false);
+  expect([...closedIssues("Closes #0\nCloses #-12\nCloses #9007199254740992")]).toEqual([]);
 });
 
 test("a merge recorded by the pipeline supersedes matching needs_human runs in its repository only", () => {
@@ -138,7 +150,7 @@ test("a merge recorded by the pipeline supersedes matching needs_human runs in i
     mergePolicy: "none",
   });
   const matching = Array.from({ length: 105 }, (_, i) =>
-    finished("needs_human", i % 2 ? "Do it.\n\ncloses   #12" : "Closes #3 and Closes #12"),
+    finished("needs_human", i % 2 ? "Do it.\n\ncloses   #12" : "Closes #3\nCloses #12"),
   );
   const byOtherIssue = finished("needs_human", "Closes #7");
   const untouched = [
@@ -150,7 +162,7 @@ test("a merge recorded by the pipeline supersedes matching needs_human runs in i
   const decided = finished("needs_human", "Closes #12");
   f.store.resolveRun(decided, { kind: "wont_do", by: "human" });
   const merged = f.store.createRun(f.repo(), { repo: "local/feed", prompt: "Fix" });
-  f.store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("Fix\n\nCloses #12, Closes #7", merged.id);
+  f.store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("Fix\n\nCloses #12\nCloses #7", merged.id);
   const prUrl = "https://github.com/o/r/pull/9";
   f.store.updateRun(merged.id, { prUrl, merged: true });
 

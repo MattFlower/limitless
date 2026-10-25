@@ -1279,7 +1279,7 @@ export class LandQueue {
             freeFirstRouting:
               run.requestedBy === "dependabot[bot]" && this.deps.cfg?.dependabotRouting === "free_first",
             signalWarnings: this.store.countEvents(run.id, "signal_attempt"),
-            closesIssues: linkedIssues(run)
+            closesIssues: linkedIssues(run, this.store)
               .filter((i) => i.repo.toLowerCase() === repo?.slug.toLowerCase())
               .map((i) => i.number),
           },
