@@ -28,7 +28,16 @@ export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 export { ConfinementError } from "./read-policy.ts";
 
 /** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
-export function seatbeltProfile(roots: WriteRoots): string {
+export function seatbeltProfile(roots: WriteRoots, browser?: { host: string; port: number }): string {
+  if (
+    browser &&
+    (!["127.0.0.1", "localhost", "::1"].includes(browser.host) ||
+      !Number.isInteger(browser.port) ||
+      browser.port < 1 ||
+      browser.port > 65535 ||
+      !roots.allowRead?.length)
+  )
+    throw new ConfinementError("Invalid browser confinement policy");
   if (
     roots.daemonPort !== undefined &&
     (!Number.isInteger(roots.daemonPort) || roots.daemonPort < 1 || roots.daemonPort > 65535)
@@ -43,7 +52,9 @@ export function seatbeltProfile(roots: WriteRoots): string {
       })
       .join(" ");
   const ancestors = ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []);
-  const specificDenies = specificReadDenies(roots.allowRead ?? [], roots.denyRead ?? []);
+  const specificDenies = browser
+    ? (roots.denyRead ?? [])
+    : specificReadDenies(roots.allowRead ?? [], roots.denyRead ?? []);
   const readHoles = [...specificDenies, ...(roots.commands?.root ?? [])].filter((deny) =>
     (roots.allowRead ?? []).some((allow) => {
       const rel = relative(allow, deny);
@@ -53,6 +64,13 @@ export function seatbeltProfile(roots: WriteRoots): string {
   return [
     "(version 1)",
     "(allow default)",
+    ...(browser
+      ? [
+          "(deny network-outbound)",
+          `(allow network-outbound (remote ip "${browser.host === "::1" ? "[::1]" : browser.host}:${browser.port}"))`,
+          "(deny file-read*)",
+        ]
+      : []),
     // Seatbelt's localhost selector covers IPv4 and IPv6 loopback.
     ...(roots.daemonPort ? [`(deny network-outbound (remote ip "localhost:${roots.daemonPort}"))`] : []),
     "(deny signal)",
@@ -75,7 +93,9 @@ export function seatbeltProfile(roots: WriteRoots): string {
         ]
       : []),
     // realpath/Git inspect every ancestor; literal metadata grants do not allow directory listings.
-    ...(ancestors.literals.length ? [`(allow file-read* ${paths(ancestors.literals, "literal")})`] : []),
+    ...(!browser && ancestors.literals.length
+      ? [`(allow file-read* ${paths(ancestors.literals, "literal")})`]
+      : []),
     ...(ancestors.metadata.length
       ? [`(allow file-read-metadata ${paths(ancestors.metadata, "literal")})`]
       : []),

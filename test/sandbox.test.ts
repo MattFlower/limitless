@@ -56,6 +56,26 @@ import { test } from "./read-policy-support.ts";
 setDefaultTimeout(30_000);
 
 const darwin = process.platform === "darwin";
+
+test("browser restrictions are optional and reject unbounded endpoints", () => {
+  const roots = { write: ["/scratch/browser"], protect: [], allowRead: ["/scratch/browser", "/runtime"] };
+  const gate = seatbeltProfile(roots);
+  expect(gate).not.toContain("(deny network-outbound)");
+  expect(gate).not.toContain("(deny file-read*)");
+  const browser = seatbeltProfile(roots, { host: "localhost", port: 8080 });
+  expect(browser).toContain('(allow network-outbound (remote ip "localhost:8080"))');
+  expect(browser).toContain("(deny file-read*)");
+  for (const endpoint of [
+    { host: "example.com", port: 80 },
+    { host: "localhost", port: 0 },
+    { host: "::1", port: 65536 },
+    { host: "localhost", port: 1.5 },
+  ])
+    expect(() => seatbeltProfile(roots, endpoint)).toThrow("Invalid browser confinement");
+  expect(() => seatbeltProfile({ write: [], protect: [] }, { host: "localhost", port: 80 })).toThrow(
+    "Invalid browser confinement",
+  );
+});
 let root: string;
 let cache: string;
 let work: string;

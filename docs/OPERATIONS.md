@@ -60,7 +60,16 @@ it. Missing or incompatible tooling, a non-loopback preview URL or a scratch fai
 warning. The call continues without a browser; no unrestricted server or download is used as a
 fallback.
 
-Once the factory confines both, the server is launched over stdio: headless, with
+The macOS launch configuration wraps Node and Chromium together with the factory's
+`seatbeltProfile`, restricts outbound connections to the preview endpoint, and allows
+reads only from the invocation browser directory, pinned cache, recorded Node runtime
+and system resources. Explicit provisioning records Node's loaded libraries; older valid
+caches acquire that metadata without reinstalling packages. Chromium uses `--no-sandbox`
+only inside this factory profile because its own sandbox cannot nest under Seatbelt.
+The [pinned-browser probes](browser-mcp-probes.md) still need an unconfined macOS run
+before the confinement gaps can be cleared. Linux and other unsupported platforms receive no browser.
+
+Once those probes pass, the server is launched over stdio: headless, with
 `--allowed-origins` set to exactly the preview origin, the cached Chromium, and profile and output
 directories in private invocation scratch. Only UI tools are granted; code execution, routing and
 raw network-request tools stay denied.

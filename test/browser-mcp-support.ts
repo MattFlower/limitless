@@ -6,7 +6,7 @@ import type { ProcOptions, ProcResult } from "../src/util/proc.ts";
 
 export function browserInstaller(
   root: string,
-  help = "--headless --sandbox --user-data-dir --output-dir --allowed-origins --executable-path --block-service-workers --no-webmcp",
+  help = "--headless --sandbox --no-sandbox --user-data-dir --output-dir --allowed-origins --executable-path --block-service-workers --no-webmcp",
 ) {
   const calls: ProcOptions[] = [];
   const runner = async (opts: ProcOptions): Promise<ProcResult> => {
@@ -31,7 +31,8 @@ export function browserInstaller(
       const executable = join(root, "browsers", "chromium");
       writeFileSync(executable, "fake browser, never executed\n");
       chmodSync(executable, 0o700);
-    } else if (cmd.includes("-e")) stdout = join(root, "browsers", "chromium");
+    } else if (cmd.some((arg) => arg.includes("sharedObjects"))) stdout = "[]";
+    else if (cmd.includes("-e")) stdout = join(root, "browsers", "chromium");
     else throw new Error("Unexpected process: no real installers or downloads allowed");
     return {
       exitCode: 0,

@@ -14,6 +14,7 @@ import { delimiter, dirname, join } from "node:path";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
+import * as browserModule from "../src/harness/browser-mcp.ts";
 import { browserMcp } from "../src/harness/browser-mcp.ts";
 import { buildClaudeArgs, ClaudeStreamParser, claudeMcpConfig, runClaude } from "../src/harness/claude.ts";
 import {
@@ -71,12 +72,17 @@ test("both harnesses serialize the pinned cached browser over stdio but exclude 
       };
       const scratch = realpathSync(scratchDir);
       const expectServer = (server: { command: string; args: string[]; env: Record<string, string> }) => {
-        expect(server.command).toBe(realpathSync(Bun.which("node") ?? ""));
-        expect(server.args[0]).toBe(join(cache, "node_modules/@playwright/mcp/cli.js"));
+        expect(server.command).toBe("/usr/bin/sandbox-exec");
+        expect(server.args[0]).toBe("-p");
+        expect(server.args[1]).toContain("(deny file-read*)");
+        expect(server.args[2]).toBe(realpathSync(Bun.which("node") ?? ""));
+        expect(server.args).toContain("--no-sandbox");
+        expect(server.args).not.toContain("--sandbox");
+        expect(server.args[3]).toBe(join(cache, "node_modules/@playwright/mcp/cli.js"));
         expect(server.args).toContain("--headless");
         const value = (flag: string) => server.args[server.args.indexOf(flag) + 1] ?? "";
         expect(value("--allowed-origins")).toBe("http://127.0.0.1:43210");
-        expect(server.args.filter((arg) => arg.includes("127.0.0.1"))).toEqual(["http://127.0.0.1:43210"]);
+        expect(server.args[1]).toContain('(remote ip "127.0.0.1:43210")');
         expect(server.args).not.toContain("--allowed-hosts");
         expect(value("--executable-path")).toBe(join(cache, "browsers/chromium"));
         for (const flag of ["--user-data-dir", "--output-dir"]) {
@@ -86,7 +92,7 @@ test("both harnesses serialize the pinned cached browser over stdio but exclude 
         expect(server.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD).toBe("1");
       };
       for (const harness of ["claude", "codex"] as const) {
-        const server = browserMcp(spec, harness, []);
+        const server = browserMcp(spec, harness, [], "darwin");
         if (!server) throw new Error("missing browser server");
         if (harness === "claude") {
           const config = JSON.parse(claudeMcpConfig(server));
@@ -110,50 +116,73 @@ test("both harnesses serialize the pinned cached browser over stdio but exclude 
         }
       }
       expect(events).toEqual([]);
-      // The real builders apply the default confinement gate: a valid cache still yields no server.
-      const claude = buildClaudeArgs(spec, "session");
-      expect(claude).toContain("--strict-mcp-config");
-      expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
-      expect(JSON.parse(claude[claude.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({ mcpServers: {} });
-      expect(claude.some((arg) => arg.startsWith("mcp__playwright__browser_navigate"))).toBe(false);
-      for (const mode of ["readonly", "edit"] as const) {
-        const codex = buildCodexArgs({ ...spec, mode });
-        expect(codex).toContain("--ignore-user-config");
-        expect(codex).toContain("--strict-config");
-        const overrides = Object.assign(
-          {},
-          ...codex.flatMap((arg, i) => (codex[i - 1] === "-c" ? [Bun.TOML.parse(arg)] : [])),
-        );
-        expect(overrides.orchestrator.mcp.enabled).toBe(false);
-        expect(overrides.mcp_servers).toBeUndefined();
-      }
-      expect(events).toHaveLength(3);
-      for (const event of events)
-        expect(event).toMatchObject({
-          code: "browser_unavailable",
-          text: expect.stringContaining("not confined"),
-        });
-      events.length = 0;
-      for (const variant of [{ browser: undefined }, { noTools: true }]) {
-        const args = buildCodexArgs({ ...spec, ...variant });
-        expect(args).toContain("orchestrator.mcp.enabled=false");
-        expect(args.some((arg) => arg.startsWith("mcp_servers="))).toBe(false);
-        const argsClaude = buildClaudeArgs({ ...spec, ...variant }, "session");
-        if (!variant.noTools)
-          expect(JSON.parse(argsClaude[argsClaude.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({
-            mcpServers: {},
+      const original = browserMcp;
+      const browserSetup = spyOn(browserModule, "browserMcp").mockImplementation((spec, harness) =>
+        original(spec, harness, undefined, "darwin"),
+      );
+      try {
+        // The real builders apply the default confinement gate: a valid cache still yields no server.
+        const claude = buildClaudeArgs(spec, "session");
+        expect(claude).toContain("--strict-mcp-config");
+        expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
+        expect(JSON.parse(claude[claude.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({ mcpServers: {} });
+        expect(claude.some((arg) => arg.startsWith("mcp__playwright__browser_navigate"))).toBe(false);
+        for (const mode of ["readonly", "edit"] as const) {
+          const codex = buildCodexArgs({ ...spec, mode });
+          expect(codex).toContain("--ignore-user-config");
+          expect(codex).toContain("--strict-config");
+          const overrides = Object.assign(
+            {},
+            ...codex.flatMap((arg, i) => (codex[i - 1] === "-c" ? [Bun.TOML.parse(arg)] : [])),
+          );
+          expect(overrides.orchestrator.mcp.enabled).toBe(false);
+          expect(overrides.mcp_servers).toBeUndefined();
+        }
+        expect(events).toHaveLength(3);
+        for (const event of events)
+          expect(event).toMatchObject({
+            code: "browser_unavailable",
+            text: expect.stringContaining("not confined"),
           });
-        else expect(argsClaude[argsClaude.indexOf("--tools") + 1]).toBe("");
+        events.length = 0;
+        for (const variant of [{ browser: undefined }, { noTools: true }]) {
+          const args = buildCodexArgs({ ...spec, ...variant });
+          expect(args).toContain("orchestrator.mcp.enabled=false");
+          expect(args.some((arg) => arg.startsWith("mcp_servers="))).toBe(false);
+          const argsClaude = buildClaudeArgs({ ...spec, ...variant }, "session");
+          if (!variant.noTools)
+            expect(JSON.parse(argsClaude[argsClaude.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({
+              mcpServers: {},
+            });
+          else expect(argsClaude[argsClaude.indexOf("--tools") + 1]).toBe("");
+        }
+        expect(events).toEqual([]);
+        browserSetup.mockImplementation((spec, harness) => original(spec, harness, [], "darwin"));
+        const enabledClaude = buildClaudeArgs(spec, "session");
+        expectServer(
+          JSON.parse(enabledClaude[enabledClaude.indexOf("--mcp-config") + 1] ?? "{}").mcpServers.playwright,
+        );
+        expect(enabledClaude).toContain("mcp__playwright__browser_navigate");
+        for (const mode of ["readonly", "edit"] as const) {
+          const enabled = buildCodexArgs({ ...spec, mode });
+          const override = enabled.find((arg) => arg.startsWith("mcp_servers="));
+          expect(override).toBeDefined();
+          const parsed = Bun.TOML.parse(override ?? "") as {
+            mcp_servers: { playwright: { command: string; args: string[]; env: Record<string, string> } };
+          };
+          expectServer(parsed.mcp_servers.playwright);
+        }
+        const editor = buildClaudeArgs({ ...spec, mode: "edit" }, "session");
+        expect(JSON.parse(editor[editor.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({ mcpServers: {} });
+        expect(events).toEqual([
+          expect.objectContaining({
+            code: "browser_unavailable",
+            text: expect.stringContaining("outer confinement"),
+          }),
+        ]);
+      } finally {
+        browserSetup.mockRestore();
       }
-      expect(events).toEqual([]);
-      const editor = buildClaudeArgs({ ...spec, mode: "edit" }, "session");
-      expect(JSON.parse(editor[editor.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({ mcpServers: {} });
-      expect(events).toEqual([
-        expect.objectContaining({
-          code: "browser_unavailable",
-          text: expect.stringContaining("outer confinement"),
-        }),
-      ]);
     });
   } finally {
     rmSync(root, { recursive: true, force: true });
