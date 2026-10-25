@@ -3293,7 +3293,7 @@ async function mergeForDelivery(
       base: fetched,
       head: before,
       round: ctx.state.round,
-      // Bound original gates, their existing re-check and coordinator confirmation together.
+      // Bound coordinator confirmation slot wait and execution from this merge attempt's start.
       deadline:
         Date.now() +
         (ctx.state.gatesConfig?.checks.reduce(
@@ -3312,6 +3312,12 @@ async function mergeForDelivery(
     await ctx.stage(
       "gates",
       postMergeScope(async () => {
+        const docs = await docsOnlyGates(
+          cwd,
+          assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
+          fetched,
+          sha,
+        );
         const checked =
           attempt.result ??
           (await (async () => {
@@ -3321,12 +3327,6 @@ async function mergeForDelivery(
                 const worker = postMergeWorker(ctx, handle);
                 for (const check of [...gates.checks, ...run.setup]) workers.set(check.name, worker);
               });
-            const docs = await docsOnlyGates(
-              cwd,
-              assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
-              fetched,
-              await headSha(cwd),
-            );
             ctx.event({
               runId: ctx.run.id,
               type: "gate",
@@ -3397,15 +3397,29 @@ async function mergeForDelivery(
                 data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
               });
             }
-            await confirmPostMerge(ctx, cwd, docs.gates, comparison, workers, attempt.deadline, sha);
-            return { setupOk: after.setupOk, timedOut: timeoutOnly(after), comparison };
+            attempt.result = redactGateData({
+              setupOk: after.setupOk,
+              timedOut: timeoutOnly(after),
+              comparison,
+              workers: Object.fromEntries(workers),
+            });
+            await ctx.save("post-merge-confirmation-pending");
+            return attempt.result;
           })());
         ctx.checkCancelled();
         const { setupOk, timedOut, comparison } = checked;
-        if (comparison.some((c) => c.coordinatorConfirmation)) {
-          attempt.result = redactGateData(checked);
-          await ctx.save("post-merge-confirmed");
-        }
+        if (checked.workers)
+          await confirmPostMerge(
+            ctx,
+            cwd,
+            docs.gates,
+            comparison,
+            new Map(Object.entries(checked.workers)),
+            attempt.deadline,
+            sha,
+            () => ctx.save("post-merge-confirmed"),
+          );
+        ctx.checkCancelled();
         for (const c of comparison) {
           const confirmation = c.coordinatorConfirmation;
           if (confirmation)

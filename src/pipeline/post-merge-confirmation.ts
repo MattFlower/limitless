@@ -28,6 +28,7 @@ export async function confirmPostMerge(
   workers: Map<string, string | null | undefined>,
   deadline: number,
   sha: string,
+  save: () => Promise<void>,
 ): Promise<void> {
   const left = deadline - Date.now();
   const signal = AbortSignal.any([
@@ -36,6 +37,7 @@ export async function confirmPostMerge(
   ]);
   const local = localExecutor();
   for (const c of comparisons) {
+    if (c.coordinatorConfirmation) continue;
     if (!c.blocking || !["regressed", "targeted_failure"].includes(c.verdict)) continue;
     const worker = workers.get(c.name);
     if (worker === undefined) continue;
@@ -111,5 +113,6 @@ export async function confirmPostMerge(
       c.verdict = "flaky";
       c.blocking = false;
     }
+    await save();
   }
 }

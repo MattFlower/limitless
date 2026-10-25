@@ -148,7 +148,13 @@ export interface RunState {
     head: string;
     round: number;
     deadline: number;
-    result?: { setupOk: boolean; timedOut: boolean; comparison: GateComparison[] };
+    result?: {
+      setupOk: boolean;
+      timedOut: boolean;
+      comparison: GateComparison[];
+      /** Missing entries are local; null means LAN execution with unavailable attribution. */
+      workers?: Record<string, string | null | undefined>;
+    };
   };
   /** Expected first merge parent; also the fallback head if clean-merge gates regress. */
   preRebaseHead?: string;

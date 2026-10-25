@@ -57,9 +57,10 @@ const {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
-  test.each(["pass", "fail"])(
+  test.each(["pass", "fail", "confinement", "legacy fail"])(
     "post-merge confirmation checkpoint resumes %s without another execution",
-    async (outcome) => {
+    async (savedOutcome) => {
+      const outcome = savedOutcome.replace("legacy ", "");
       writeFileSync(
         join(repoDir, ".limitless.toml"),
         `[gates]\nretry_files = "fake-targeted {files}"\nchecks = [{ name = "test", run = "fake-suite" }]\n`,
@@ -88,11 +89,20 @@ describe("pipeline (fake agents, real git + gates)", () => {
       });
       await f.stop();
       registerGithub(f, bare);
+      let confinementChecks = 0;
+      if (outcome === "confinement")
+        f.deps.confinement = {
+          verify: async () => {
+            confinementChecks++;
+            throw new Error("coordinator confinement unavailable");
+          },
+          wrap: (cmd) => cmd,
+        };
       const fixture = postMergeWorkerFixture(f, outcome);
       const save = f.store.setRunState.bind(f.store);
       const persist = spyOn(f.store, "setRunState").mockImplementation((id, state) => {
         save(id, state);
-        if ((state as RunState).postMergeGates?.result)
+        if ((state as RunState).postMergeGates?.result?.comparison[0]?.coordinatorConfirmation)
           throw new SimulatedTermination("after confirmation checkpoint");
       });
       let reopened: Store | undefined;
@@ -101,14 +111,29 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
         persist.mockRestore();
         reopened = new Store(f.deps.cfg.paths.db);
-        const saved = reopened.getRunState<RunState>(run.id)?.postMergeGates;
-        expect(saved?.result?.comparison[0]?.coordinatorConfirmation?.result?.ok).toBe(outcome === "pass");
-        expect(fixture.local).toHaveLength(1);
+        const state = reopened.getRunState<RunState>(run.id);
+        const saved = state?.postMergeGates;
+        if (savedOutcome === "legacy fail" && saved?.result) {
+          delete saved.result.workers;
+          reopened.setRunState(run.id, state);
+        }
+        const check = saved?.result?.comparison[0];
+        const confirmation = check?.coordinatorConfirmation;
+        expect(confirmation?.worker).toBe("test-worker");
+        expect(confirmation?.originalVerdict).toBe("regressed");
+        expect(check?.verdict).toBe(outcome === "pass" ? "flaky" : "regressed");
+        expect(check?.firstAttempt?.ok).toBe(false);
+        if (outcome === "confinement") {
+          expect(confirmation?.result).toBeUndefined();
+          expect(confirmation?.reason).toContain("coordinator confinement unavailable");
+          expect(confinementChecks).toBe(1);
+        } else expect(confirmation?.result?.ok).toBe(outcome === "pass");
+        expect(fixture.local).toHaveLength(outcome === "confinement" ? 0 : 1);
         expect(fixture.remote).toHaveLength(2);
         expect(await executeRun({ ...f.deps, store: reopened }, run.id, new AbortController().signal)).toBe(
           outcome === "pass" ? "succeeded" : "needs_human",
         );
-        expect(fixture.local).toHaveLength(1);
+        expect(fixture.local).toHaveLength(outcome === "confinement" ? 0 : 1);
         expect(fixture.remote).toHaveLength(2);
         expect(reopened.getRunState<RunState>(run.id)?.postMergeGates).toEqual(saved);
         if (outcome === "fail") {
@@ -117,6 +142,159 @@ describe("pipeline (fake agents, real git + gates)", () => {
             "coordinator assertion detail",
           );
         }
+        if (outcome === "confinement") {
+          expect(confinementChecks).toBe(1);
+          expect(reopened.getRun(run.id)?.error).toContain(confirmation?.reason ?? "missing reason");
+        }
+      } finally {
+        persist.mockRestore();
+        reopened?.close();
+        fixture.processSpy.mockRestore();
+      }
+    },
+  );
+
+  test("restart between coordinator confirmations keeps the completed first check", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nretry_files = "fake-targeted {files}"\nchecks = [{ name = "test-a", run = "fake-suite-a" }, { name = "test-b", run = "fake-suite-b" }]\n`,
+    );
+    await sh(
+      [
+        "git",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qam",
+        "interrupted confirmation fixture",
+      ],
+      { cwd: repoDir },
+    );
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") {
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    const fixture = postMergeWorkerFixture(f);
+    const execute = fixture.processSpy.getMockImplementation();
+    if (!execute) throw new Error("Missing process mock");
+    let confirmations = 0;
+    fixture.processSpy.mockImplementation(async (opts) => {
+      if (opts.cmd[0] === "/bin/sh" && ++confirmations === 2)
+        throw new SimulatedTermination("during second coordinator confirmation");
+      return execute(opts);
+    });
+    let reopened: Store | undefined;
+    const remoteCommands = [
+      "fake-suite-a",
+      "fake-suite-b",
+      "fake-targeted './greeting.txt'",
+      "fake-targeted './greeting.txt'",
+    ];
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
+      expect(fixture.local).toHaveLength(1);
+      expect(fixture.remote).toEqual(remoteCommands);
+      reopened = new Store(f.deps.cfg.paths.db);
+      const saved = reopened.getRunState<RunState>(run.id)?.postMergeGates;
+      expect(saved?.result?.comparison[0]).toMatchObject({
+        verdict: "flaky",
+        blocking: false,
+        coordinatorConfirmation: { worker: "test-worker", result: { ok: true } },
+      });
+      expect(saved?.result?.comparison[1]?.coordinatorConfirmation).toBeUndefined();
+      fixture.processSpy.mockImplementation(execute);
+      expect(await executeRun({ ...f.deps, store: reopened }, run.id, new AbortController().signal)).toBe(
+        "succeeded",
+      );
+      expect(fixture.local).toHaveLength(2);
+      expect(fixture.local.map((c) => c.command)).toEqual([
+        "fake-targeted './greeting.txt'",
+        "fake-targeted './greeting.txt'",
+      ]);
+      expect(fixture.remote).toEqual(remoteCommands);
+      const resumed = reopened.getRunState<RunState>(run.id)?.postMergeGates;
+      expect(resumed?.deadline).toBe(saved?.deadline);
+      expect(resumed?.result?.comparison[0]).toEqual(saved?.result?.comparison[0]);
+    } finally {
+      reopened?.close();
+      fixture.processSpy.mockRestore();
+    }
+  });
+
+  test.each(["pass", "unknown worker", "local", "fallback"])(
+    "preconfirmation checkpoint resumes with persisted attribution: %s",
+    async (scenario) => {
+      writeFileSync(
+        join(repoDir, ".limitless.toml"),
+        `[gates]\nretry_files = "fake-targeted {files}"\nchecks = [{ name = "test", run = "fake-suite" }]\n`,
+      );
+      await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "pending fixture"], {
+        cwd: repoDir,
+      });
+      const bare = await githubFixture();
+      const f = start(async (s) => {
+        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (roleOf(s) === "review") {
+          await advanceBase(bare, "base.txt", "new base\n");
+          return { structured: approve };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      await f.stop();
+      registerGithub(f, bare);
+      const fixture = postMergeWorkerFixture(f, scenario);
+      const save = f.store.setRunState.bind(f.store);
+      const persist = spyOn(f.store, "setRunState").mockImplementation((id, state) => {
+        save(id, state);
+        if ((state as RunState).postMergeGates?.result)
+          throw new SimulatedTermination("before coordinator confirmation");
+      });
+      let reopened: Store | undefined;
+      try {
+        const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+        expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
+        persist.mockRestore();
+        reopened = new Store(f.deps.cfg.paths.db);
+        const saved = reopened.getRunState<RunState>(run.id)?.postMergeGates;
+        expect(saved?.result).toMatchObject({ setupOk: true, timedOut: false });
+        expect(saved?.result?.workers).toEqual(
+          scenario === "pass" ? { test: "test-worker" } : scenario === "unknown worker" ? { test: null } : {},
+        );
+        expect(saved?.result?.comparison[0]).toMatchObject({
+          name: "test",
+          blocking: true,
+          verdict: "regressed",
+          result: { ok: false, targetedRetry: { ok: false } },
+        });
+        expect(saved?.result?.comparison[0]?.coordinatorConfirmation).toBeUndefined();
+        expect(fixture.local).toHaveLength(0);
+        expect(fixture.remote).toEqual(["fake-suite", "fake-targeted './greeting.txt'"]);
+        expect(await executeRun({ ...f.deps, store: reopened }, run.id, new AbortController().signal)).toBe(
+          scenario === "pass" ? "succeeded" : "needs_human",
+        );
+        expect(fixture.local).toHaveLength(scenario === "pass" ? 1 : 0);
+        expect(fixture.remote).toEqual(["fake-suite", "fake-targeted './greeting.txt'"]);
+        const resumed = reopened.getRunState<RunState>(run.id)?.postMergeGates;
+        expect(resumed?.deadline).toBe(saved?.deadline);
+        const check = resumed?.result?.comparison[0];
+        if (scenario === "pass")
+          expect(check).toMatchObject({
+            verdict: "flaky",
+            coordinatorConfirmation: { worker: "test-worker", result: { ok: true } },
+          });
+        else if (scenario === "unknown worker")
+          expect(check?.coordinatorConfirmation?.reason).toContain("attribution unavailable");
+        else expect(check?.coordinatorConfirmation).toBeUndefined();
       } finally {
         persist.mockRestore();
         reopened?.close();
