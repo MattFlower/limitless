@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
-import { cpus, hostname, release, totalmem } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { cpus, hostname, release, tmpdir, totalmem } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { z } from "zod";
@@ -18,8 +18,8 @@ import { withSubscriptionAuth } from "../harness/auth.ts";
 import { runClaude } from "../harness/claude.ts";
 import { runCodex } from "../harness/codex.ts";
 import { ConfinementError, readPolicyScope } from "../harness/read-policy.ts";
-import { type ConfinementBackend, confinementScope, seatbeltForPort } from "../harness/sandbox.ts";
-import { removeScratch, restoreDirectoryPermissions } from "../harness/scratch.ts";
+import { type ConfinementBackend, confinementScope, platformConfinement } from "../harness/sandbox.ts";
+import { removeScratch, restoreDirectoryPermissions, writeRoots } from "../harness/scratch.ts";
 import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
 import { prepareReaderCheckout, runToolAgent } from "../pipeline/agent-executor.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
@@ -35,6 +35,7 @@ import {
   recoverProcessCleanups,
   redactCredentials,
   registerCredential,
+  runProcess,
   sh,
 } from "../util/proc.ts";
 import { AgentResultReport } from "./agent-protocol.ts";
@@ -194,7 +195,11 @@ const Lease = z.object({
   cancelled: z.array(z.string()).default([]),
 });
 
-async function machineState(): Promise<{ onAC: boolean; idleSeconds: number }> {
+async function machineState(
+  platform: string = process.platform,
+): Promise<{ onAC: boolean; idleSeconds: number }> {
+  // Linux has no desktop-independent idle time or power source; the coordinator only displays them.
+  if (platform === "linux") return { onAC: true, idleSeconds: 0 };
   const [power, idle] = await Promise.all([
     sh(["/usr/bin/pmset", "-g", "batt"], { cwd: process.cwd(), env: agentEnv(), timeoutMs: 5000 }),
     sh(["/usr/sbin/ioreg", "-c", "IOHIDSystem"], { cwd: process.cwd(), env: agentEnv(), timeoutMs: 5000 }),
@@ -202,6 +207,29 @@ async function machineState(): Promise<{ onAC: boolean; idleSeconds: number }> {
   const ns = /"HIDIdleTime"\s*=\s*(\d+)/.exec(idle.stdout)?.[1];
   if (!ns) throw new Error("Cannot observe worker idle time");
   return { onAC: power.stdout.includes("AC Power"), idleSeconds: Number(ns) / 1e9 };
+}
+
+/** A Linux worker starts only where its gate confinement verifies, with gate-shaped roots. */
+async function verifyWorkerConfinement(cfg: Config, confinement: ConfinementBackend, signal: AbortSignal) {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "limitless-worker-preflight-")));
+  try {
+    for (const name of ["work", "scratch"]) mkdirSync(join(dir, name));
+    const roots = readPolicyScope.run(cfg.readPolicy, () =>
+      writeRoots(join(dir, "work"), join(dir, "scratch"), true),
+    );
+    await confinement.verify(
+      roots,
+      { cmd: ["/bin/true"], cwd: join(dir, "work"), env: agentEnv(), signal },
+      runProcess,
+    );
+  } catch (error) {
+    if (signal.aborted) throw error;
+    throw new ConfinementError(
+      `Linux workers need bubblewrap and Landlock confinement: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 class CoordinatorRefusal extends Error {
@@ -225,6 +253,7 @@ export async function runWorker(
     probeAgents?: typeof probeAgents;
     capabilityRefreshMs?: number;
     confinement?: ConfinementBackend;
+    platform?: string;
     harnesses?: Partial<Record<"claude" | "codex", Harness>>;
     tokenLookup?: Parameters<typeof publishAgentChanges>[4];
     heartbeatMs?: number;
@@ -238,8 +267,11 @@ export async function runWorker(
     updateRetry?: { initialMs?: number; maxMs?: number; deadlineMs?: number; now?: () => number };
   } = {},
 ) {
-  if (process.platform !== "darwin" && !options.confinement)
-    throw new Error("Workers require macOS Seatbelt");
+  const platform = options.platform ?? process.platform;
+  if (!["darwin", "linux"].includes(platform) && !options.confinement)
+    throw new Error("Workers require macOS Seatbelt or Linux bubblewrap and Landlock");
+  const confinement = options.confinement ?? platformConfinement(cfg.port, platform);
+  if (platform === "linux") await verifyWorkerConfinement(cfg, confinement, signal);
   const home = join(cfg.paths.home, "worker");
   mkdirSync(home, { recursive: true });
   const held = [protectPrivateFile(join(home, "key.pem"))];
@@ -556,18 +588,24 @@ export async function runWorker(
       // Retained cleanup must not delay lease renewal for unrelated active jobs.
       void recover().catch(unresolved);
       const slots = gateSlots.snapshot(),
-        state = await (options.machineState ?? machineState)();
+        state = await (options.machineState ?? (() => machineState(platform)))();
       const body: Capabilities = {
         releaseSha,
         bunVersion: Bun.version,
-        os: "darwin",
+        os: platform === "linux" ? "linux" : "darwin",
         osVersion: release(),
         cpuCount: cpus().length,
         ramBytes: totalmem(),
         freeSlots: updateBlocked()
           ? 0
           : Math.max(0, Math.min(slots.limit - slots.occupied, slots.limit - jobs.size)),
-        ...(optionalFields ? { agents, ...(supportsUpdates && updateWarning ? { updateWarning } : {}) } : {}),
+        ...(optionalFields
+          ? {
+              agents,
+              confinement: platform === "linux" ? ("bwrap-landlock" as const) : ("seatbelt" as const),
+              ...(supportsUpdates && updateWarning ? { updateWarning } : {}),
+            }
+          : {}),
         ...state,
         jobs: heldJobs(),
       };
@@ -757,7 +795,7 @@ export async function runWorker(
             let posts = Promise.resolve();
             const gates = { ...req.gates, checks: requestedChecks(req) };
             const run = await readPolicyScope.run(cfg.readPolicy, () =>
-              confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), () =>
+              confinementScope.run(confinement, () =>
                 runLocalGates(cwd, gates, jobSignal, {
                   priority: req.priority,
                   onResult(result, phase) {
@@ -871,7 +909,7 @@ export async function runWorker(
             },
           };
           const result = await readPolicyScope.run(cfg.readPolicy, () =>
-            confinementScope.run(options.confinement ?? seatbeltForPort(cfg.port), async () => {
+            confinementScope.run(confinement, async () => {
               if (req.mode === "readonly") await prepareReaderCheckout(cwd, req.readerSetup ?? [], jobSignal);
               return runToolAgent(
                 spec,
@@ -1010,10 +1048,11 @@ export async function runWorker(
         for (const id of leased.cancelled) cancel(id);
         if (leased.agentJob) {
           const { id, request, remainingMs } = leased.agentJob;
-          if (updateBlocked())
-            await call(`/worker/agent-jobs/${id}/failure`, { reason: "Worker update pending" }).catch(
-              () => {},
-            );
+          if (updateBlocked() || platform !== "darwin")
+            await call(`/worker/agent-jobs/${id}/failure`, {
+              reason:
+                platform === "darwin" ? "Worker update pending" : "Agent rounds run on macOS workers only",
+            }).catch(() => {});
           else {
             const controller = new AbortController();
             const timer = setTimeout(

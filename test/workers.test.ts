@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { request as httpsRequest } from "node:https";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { agentTestCommand, type WrapperConfig } from "../src/cli/agent-test.ts";
@@ -49,7 +49,7 @@ import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { runClaude } from "../src/harness/claude.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
-import { readPolicyScope } from "../src/harness/read-policy.ts";
+import { ConfinementError, readPolicyScope } from "../src/harness/read-policy.ts";
 import { confinementScope, seatbeltProfile } from "../src/harness/sandbox.ts";
 import * as scratchPolicy from "../src/harness/scratch.ts";
 import { removeScratch } from "../src/harness/scratch.ts";
@@ -85,7 +85,7 @@ import { agentPathMask } from "../src/workers/reporting.ts";
 import { certificate, fingerprint, workerRequest } from "../src/workers/tls.ts";
 import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
-import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { bwrapSkip, fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 import {
   captureSetupEnv,
@@ -887,6 +887,7 @@ async function loop(
   );
   const controller = new AbortController();
   const task = runWorker(listener.url.origin, remote, releaseSha, controller.signal, {
+    platform: "darwin",
     confinement: fakeConfinement,
     heartbeatMs: 10,
     retryMs: 5,
@@ -1510,85 +1511,98 @@ test.each([
   30_000,
 );
 
-test("a worker survives connection failures, 503s and a coordinator restart with its job still running", async () => {
-  const server = await listen(),
-    address = `127.0.0.1:${server.url.port}`,
-    req = await request(true);
-  req.gates.setup = [];
-  const started = Promise.withResolvers<void>(),
-    finish = Promise.withResolvers<void>();
-  const paths = ["/worker/heartbeat", "/worker/lease"];
-  const disconnected = new Map(paths.map((p) => [p, Promise.withResolvers<void>()])),
-    recovered = new Map(paths.map((p) => [p, Promise.withResolvers<void>()])),
-    unavailable = new Set<string>();
-  let offline = false;
-  const worker = await loop({
-    heartbeatMs: 10,
-    confinement: {
-      ...fakeConfinement,
-      async verify(_roots, opts) {
-        started.resolve();
-        const abort = () => finish.resolve();
-        opts.signal?.addEventListener("abort", abort, { once: true });
-        await finish.promise;
-        opts.signal?.removeEventListener("abort", abort);
-        opts.signal?.throwIfAborted();
+test.each(["darwin", "linux"])(
+  "a %s worker survives connection failures, 503s and a coordinator restart with its job still running",
+  async (platform) => {
+    const server = await listen(),
+      address = `127.0.0.1:${server.url.port}`,
+      req = await request(true);
+    req.gates.setup = [];
+    const started = Promise.withResolvers<void>(),
+      finish = Promise.withResolvers<void>();
+    const paths = ["/worker/heartbeat", "/worker/lease"];
+    const disconnected = new Map(paths.map((p) => [p, Promise.withResolvers<void>()])),
+      recovered = new Map(paths.map((p) => [p, Promise.withResolvers<void>()])),
+      unavailable = new Set<string>();
+    let offline = false;
+    const worker = await loop({
+      heartbeatMs: 10,
+      platform,
+      confinement: {
+        ...fakeConfinement,
+        async verify(_roots, opts) {
+          // A Linux worker's startup preflight verifies too, before any job.
+          if (opts.cwd.includes("limitless-worker-preflight-")) return;
+          started.resolve();
+          const abort = () => finish.resolve();
+          opts.signal?.addEventListener("abort", abort, { once: true });
+          await finish.promise;
+          opts.signal?.removeEventListener("abort", abort);
+          opts.signal?.throwIfAborted();
+        },
       },
-    },
-    async request(...args) {
-      const path = args[1];
-      try {
-        const reply = await workerRequest(...args);
-        if (offline && paths.includes(path)) {
-          if (!unavailable.has(path)) {
-            unavailable.add(path);
-            return { ...reply, status: 503 };
+      async request(...args) {
+        const path = args[1];
+        try {
+          const reply = await workerRequest(...args);
+          if (offline && paths.includes(path)) {
+            if (!unavailable.has(path)) {
+              unavailable.add(path);
+              return { ...reply, status: 503 };
+            }
+            recovered.get(path)?.resolve();
           }
-          recovered.get(path)?.resolve();
+          return reply;
+        } catch (error) {
+          if (offline) disconnected.get(path)?.resolve();
+          throw error;
         }
-        return reply;
-      } catch (error) {
-        if (offline) disconnected.get(path)?.resolve();
-        throw error;
-      }
-    },
-  });
-  const alive = <T>(promise: Promise<T>) =>
-    Promise.race([
-      promise,
-      worker.task.then(() => {
-        throw new Error("Worker exited before reconnecting");
-      }),
-    ]);
-  const executor = gateExecutorFor("lan", workers, [req.repo]);
-  const handle = await executor.start(req, new AbortController().signal);
-  try {
-    await alive(started.promise);
-    offline = true;
-    await server.stop();
-    listener = undefined;
-    await alive(Promise.all([...disconnected.values()].map((p) => p.promise)));
-    store.close();
-    store = new Store(cfg.paths.db);
-    workers = new WorkerStore(store, releaseSha, { poll: 30, tick: 5 });
-    await listen(address);
-    await alive(Promise.all([...recovered.values()].map((p) => p.promise)));
-    expect(unavailable.size).toBe(2);
-    finish.resolve();
-    const run = await alive(
-      executeGate(req, AbortSignal.timeout(120_000), {}, gateExecutorFor("lan", workers, [req.repo]), handle),
-    );
-    expect(fields(run)).toEqual([
-      { name: "pass", ok: true, exitCode: 0 },
-      { name: "fail", ok: false, exitCode: 7 },
-    ]);
-    expect(workers.jobs("1=1")).toHaveLength(1);
-    expect(workers.job(handle.id)).toMatchObject({ state: "done", attempt: 1, failure_reason: null });
-  } finally {
-    finish.resolve();
-    await worker.stop();
-  }
-}, 150_000);
+      },
+    });
+    const alive = <T>(promise: Promise<T>) =>
+      Promise.race([
+        promise,
+        worker.task.then(() => {
+          throw new Error("Worker exited before reconnecting");
+        }),
+      ]);
+    const executor = gateExecutorFor("lan", workers, [req.repo]);
+    const handle = await executor.start(req, new AbortController().signal);
+    try {
+      await alive(started.promise);
+      offline = true;
+      await server.stop();
+      listener = undefined;
+      await alive(Promise.all([...disconnected.values()].map((p) => p.promise)));
+      store.close();
+      store = new Store(cfg.paths.db);
+      workers = new WorkerStore(store, releaseSha, { poll: 30, tick: 5 });
+      await listen(address);
+      await alive(Promise.all([...recovered.values()].map((p) => p.promise)));
+      expect(unavailable.size).toBe(2);
+      finish.resolve();
+      const run = await alive(
+        executeGate(
+          req,
+          AbortSignal.timeout(120_000),
+          {},
+          gateExecutorFor("lan", workers, [req.repo]),
+          handle,
+        ),
+      );
+      expect(fields(run)).toEqual([
+        { name: "pass", ok: true, exitCode: 0 },
+        { name: "fail", ok: false, exitCode: 7 },
+      ]);
+      expect(workers.jobs("1=1")).toHaveLength(1);
+      expect(workers.job(handle.id)).toMatchObject({ state: "done", attempt: 1, failure_reason: null });
+    } finally {
+      finish.resolve();
+      await worker.stop();
+    }
+  },
+  150_000,
+);
 
 test("repos without opt-in use local execution without creating jobs", async () => {
   const req = await request();
@@ -1810,6 +1824,90 @@ test("restart reattaches to the durable job without enqueueing again", async () 
     await worker.stop();
   }
 }, 180_000);
+
+test("a Linux worker starts only when its confinement verifies, and refuses with the preflight's reason", async () => {
+  await listen();
+  let preflight: scratchPolicy.WriteRoots | undefined;
+  const worker = await loop({
+    platform: "linux",
+    confinement: {
+      ...fakeConfinement,
+      async verify(roots) {
+        preflight = roots;
+        throw new ConfinementError("bubblewrap missing");
+      },
+    },
+  });
+  await expect(worker.task).rejects.toThrow(
+    "Linux workers need bubblewrap and Landlock confinement: bubblewrap missing",
+  );
+  // Gate-shaped roots: the home is denied and only the probe's checkout and scratch are readable.
+  expect(preflight?.denyRead).toContain(realpathSync(homedir()));
+  expect(preflight?.allowRead?.length).toBeGreaterThan(0);
+  expect(workers.worker("loop-runner")?.last_heartbeat_at).toBeNull();
+  const other = runWorker("https://127.0.0.1:1", cfg, releaseSha, new AbortController().signal, {
+    platform: "win32",
+  });
+  await expect(other).rejects.toThrow("Workers require macOS Seatbelt or Linux bubblewrap and Landlock");
+});
+
+test("a Linux worker advertises its platform and backend, runs gate jobs and is never leased an agent job", async () => {
+  await listen();
+  const req = await request(true);
+  const agent = enqueueAgent();
+  const worker = await loop({ platform: "linux" });
+  try {
+    // It reports logged-in agents, so only the coordinator's filter keeps the agent job queued.
+    await until(
+      () => workers.list().find((w) => w.name === "loop-runner")?.agents?.claude?.loggedIn === true,
+    );
+    const run = await executeGate(
+      req,
+      AbortSignal.timeout(60_000),
+      {},
+      gateExecutorFor("lan", workers, [req.repo]),
+    );
+    expect(fields(run)).toEqual([
+      { name: "pass", ok: true, exitCode: 0 },
+      { name: "fail", ok: false, exitCode: 7 },
+    ]);
+    expect(workers.jobs("1=1")[0]).toMatchObject({ state: "done", worker: "loop-runner" });
+    expect(Heartbeat.parse(JSON.parse(workers.worker("loop-runner")?.capabilities ?? "{}"))).toMatchObject({
+      os: "linux",
+      confinement: "bwrap-landlock",
+    });
+    expect(workers.agentJob(agent)).toMatchObject({ state: "queued", worker: null, failure_reason: null });
+  } finally {
+    await worker.stop();
+  }
+}, 60_000);
+
+test("a Linux worker reports an agent job it is sent as failed instead of running it", async () => {
+  await listen();
+  const agent = enqueueAgent();
+  let ran = false;
+  const worker = await loop({
+    platform: "linux",
+    harnesses: {
+      claude: fakeHarness(async () => {
+        ran = true;
+        return {};
+      }),
+    },
+    // A coordinator that believes the worker is macOS leases it the agent job.
+    async request(origin, path, body, options) {
+      const claimed = path === "/worker/heartbeat" ? { ...(body as object), os: "darwin" } : body;
+      return workerRequest(origin, path, claimed, options);
+    },
+  });
+  try {
+    await until(() => workers.agentJob(agent)?.failure_reason === "Agent rounds run on macOS workers only");
+    expect(JSON.parse(workers.agentJob(agent)?.excluded ?? "[]")).toEqual(["loop-runner"]);
+    expect(ran).toBe(false);
+  } finally {
+    await worker.stop();
+  }
+});
 
 test("expired leases retry once on a different worker then fall back locally without implementer feedback", async () => {
   let now = Date.now();
@@ -2335,12 +2433,13 @@ test("cancelling execution aborts the worker's running gate on a held-job reply"
   }
 }, 30_000);
 
-test.skipIf(seatbeltSkip !== null)(
-  `worker gates cannot read their token, pin or coordinator TLS key (${seatbeltSkip})`,
+const platformSkip = process.platform === "linux" ? bwrapSkip : seatbeltSkip;
+test.skipIf(platformSkip !== null)(
+  `worker gates cannot read their token, pin or coordinator TLS key (${platformSkip})`,
   async () => {
     const server = await listen(),
       req = await request(true);
-    const worker = await loop({ confinement: undefined });
+    const worker = await loop({ confinement: undefined, platform: process.platform });
     const files = [
       server.tls.keyPath,
       ...["token", "coordinator-fingerprint"].map((name) => join(worker.remote.paths.home, "worker", name)),
@@ -2358,7 +2457,8 @@ test.skipIf(seatbeltSkip !== null)(
       for (const check of run.checks) {
         expect(check.ok).toBe(false);
         expect(check.confinementError).toBe(false);
-        expect(check.output).toMatch(/Operation not permitted|Permission denied/);
+        // Seatbelt denies the read; bubblewrap leaves the files out of the sandbox.
+        expect(check.output).toMatch(/Operation not permitted|Permission denied|No such file or directory/);
       }
       expect(workers.jobs("1=1")[0]).toMatchObject({ state: "done", attempt: 1, worker: "loop-runner" });
     } finally {
@@ -2907,6 +3007,7 @@ test.each(["changed", "equal", "unavailable", "unrecorded"] as const)(
             },
             () =>
               runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+                platform: "darwin",
                 confinement: fakeConfinement,
                 heartbeatMs: 5,
                 machineState: async () => ({ onAC: true, idleSeconds: 0 }),
@@ -3002,6 +3103,7 @@ test("pending recovery requires a changed boot while saved null-leader context a
           { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
           () =>
             runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+              platform: "darwin",
               confinement: fakeConfinement,
               heartbeatMs: 5,
               machineState: async () => ({ onAC: true, idleSeconds: 0 }),
@@ -3127,6 +3229,7 @@ test.each([true, false])(
         { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
         () =>
           runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+            platform: "darwin",
             confinement: fakeConfinement,
             machineState: async () => ({ onAC: true, idleSeconds: 0 }),
             log: (text) => diagnostics.push(text),
@@ -3358,6 +3461,7 @@ test("worker retains a pending job until a change from its first readable boot",
             { stopped: recoveryProcessStopped, timeoutMs: 1000, discover: async () => [] },
             () =>
               runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+                platform: "darwin",
                 confinement: fakeConfinement,
                 heartbeatMs: 5,
                 machineState: async () => ({ onAC: true, idleSeconds: 0 }),
@@ -3465,6 +3569,7 @@ test("worker startup retains legacy cleanup without termination evidence across 
     });
     const controller = new AbortController();
     const task = runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+      platform: "darwin",
       confinement: fakeConfinement,
       heartbeatMs: 10,
       retryMs: 5,
@@ -3607,6 +3712,7 @@ test("worker retains a job after an ordinary final confirmation error and later 
       { stopped: recoveryProcessStopped, timeoutMs: 100, discover: async () => [] },
       () =>
         runWorker(server.url.origin, worker.remote, releaseSha, controller.signal, {
+          platform: "darwin",
           confinement: fakeConfinement,
           machineState: async () => ({ onAC: true, idleSeconds: 0 }),
           request: async (...args) => {
@@ -6154,6 +6260,7 @@ test.each([
       await processBootInspection.run(() => 'test-boot', () => runWorker(${JSON.stringify(server.url.origin)}, loadConfig({
         home: ${JSON.stringify(remote.paths.home)}, configDir: ${JSON.stringify(cfg.paths.configDir)}, raw: {},
       }), ${JSON.stringify(releaseSha)}, new AbortController().signal, {
+        platform: "darwin",
         heartbeatMs: 10, retryMs: 5,
         capabilityRunner: async (args) => ({ exitCode: 0, stdout: args[1] === "--version" ? "2.1.3 (Claude Code)" : "logged in" }),
         machineState: async () => ({ onAC: true, idleSeconds: 0 }),
@@ -6215,6 +6322,7 @@ test.each([
         },
         () =>
           runWorker(server.url.origin, remote, releaseSha, unavailable.signal, {
+            platform: "darwin",
             confinement: fakeConfinement,
             log: (text) => diagnostics.push(text),
             machineState: async () => ({ onAC: true, idleSeconds: 0 }),
@@ -6251,6 +6359,7 @@ test.each([
         () => (savedDiscovery ? "test-boot" : "next-boot"),
         () =>
           runWorker(server.url.origin, remote, releaseSha, controller.signal, {
+            platform: "darwin",
             confinement: fakeConfinement,
             machineState: async () => ({ onAC: true, idleSeconds: 0 }),
             request: async (...args) => {
@@ -6437,6 +6546,7 @@ test.each([
         request: NonNullable<Parameters<typeof runWorker>[4]>["request"],
       ) =>
         runWorker(server.url.origin, worker.remote, releaseSha, signal, {
+          platform: "darwin",
           confinement: fakeConfinement,
           machineState: async () => ({ onAC: true, idleSeconds: 0 }),
           request,

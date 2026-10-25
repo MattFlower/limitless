@@ -227,7 +227,8 @@ export class WorkerStore {
       !!this.releaseSha &&
       c?.releaseSha === this.releaseSha &&
       c.bunVersion === Bun.version &&
-      (agent || c.freeSlots > 0)
+      // Agent rounds stay on macOS workers until Linux editors are confined (#839).
+      (agent ? c.os === "darwin" : c.freeSlots > 0)
     );
   }
   private agentCapabilities(w: WorkerRow) {
