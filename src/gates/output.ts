@@ -94,16 +94,19 @@ const redactData = <T>(value: T): T =>
       );
 
 /** Reload a known gate result without rewriting executable inputs or comparison identities. */
-export const redactGateDiagnostics = <T extends GateResult>(result: T): T => ({
+export const redactGateDiagnostics = <T extends GateResult>(
+  result: T,
+  privacy: (text: string) => string = (text) => text,
+): T => ({
   ...result,
   confinementError: result.confinementError ?? launchFailure(result.output),
-  output: redactGateOutput(result.output),
+  output: redactGateOutput(privacy(result.output)),
   ...(result.failureAttributionReason !== undefined
-    ? { failureAttributionReason: redactGateOutput(result.failureAttributionReason) }
+    ? { failureAttributionReason: redactGateOutput(privacy(result.failureAttributionReason)) }
     : {}),
   ...(result.testCoverage ? { testCoverage: redactGateData(result.testCoverage) } : {}),
-  ...(result.failures !== undefined ? { failures: redactGateOutput(result.failures) } : {}),
-  ...(result.firstAttempt ? { firstAttempt: redactGateDiagnostics(result.firstAttempt) } : {}),
+  ...(result.failures !== undefined ? { failures: redactGateOutput(privacy(result.failures)) } : {}),
+  ...(result.firstAttempt ? { firstAttempt: redactGateDiagnostics(result.firstAttempt, privacy) } : {}),
 });
 
 /** Runner redaction covers accidental disclosure before framing or cuts. Deliberate cross-stream

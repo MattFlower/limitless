@@ -150,6 +150,7 @@ const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
 const decoded = (text: string) =>
   text
     .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
+    .replace(/\\\//g, "/")
     // Diagnostics may JSON-quote a field's literal Unicode escapes.
     .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
 export const base64Runs = /[A-Za-z0-9+/]+=*/g;

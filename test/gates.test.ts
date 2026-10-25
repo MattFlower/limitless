@@ -53,6 +53,7 @@ import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
 import { ConfinementError } from "../src/harness/sandbox.ts";
 import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts.ts";
+import { loadOutputPrivacy, privateOutputData } from "../src/util/private-output.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { resolveTestWorkers } from "../src/util/test-workers.ts";
@@ -3364,5 +3365,60 @@ test.each([
     expect(JSON.stringify(parsed) ?? "").not.toContain(secret);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("privacy matching decodes JSON slashes and carries only applicable clipping provenance", () => {
+  const dir = tempDir({ "private-strings.txt": "synthetic/slash-private-880\nprotected-host-880.example\n" });
+  const previous = process.env.LIMITLESS_CONFIG_DIR;
+  process.env.LIMITLESS_CONFIG_DIR = dir;
+  proc.registerCredential("CLIPPED_CREDENTIAL_880", "synthetic/clipped-credential-880");
+  try {
+    const entries = loadPrivateStrings(dir);
+    expect(privateMatches("synthetic\\/slash-private-880", entries)).toHaveLength(1);
+    const privacy = loadOutputPrivacy();
+    if (!privacy) throw new Error("Missing privacy policy");
+    const prefix = "diagnostic protected-host-880";
+    const escaped = "diagnostic protected-host-880\\u00";
+    expect(privateOutputData({ truncated: true, preview: escaped, note: prefix }, privacy)).toEqual({
+      truncated: true,
+      preview: "[withheld: private text]",
+      note: prefix,
+    });
+    expect(privateOutputData({ preview: prefix }, privacy)).toEqual({ preview: prefix });
+    expect(privateOutputData({ truncated: true, preview: `${prefix}!` }, privacy).preview).toBe(`${prefix}!`);
+    expect(privateOutputData({ truncated: true, text: "synthetic\\/clipped-" }, privacy).text).toBe(
+      "[withheld: private text]",
+    );
+    expect(privateOutputData<Record<string, string>>({ [prefix]: prefix }, privacy, true)).toEqual({
+      "[withheld: private text]": "[withheld: private text]",
+    });
+    expect(
+      privateOutputData({ text: prefix, total: 100, nextOffset: 30, truncated: true }, privacy).text,
+    ).toBe(prefix);
+    expect(
+      privateOutputData({ preview: prefix, total: 100, nextOffset: 30, truncated: true }, privacy).preview,
+    ).toBe("[withheld: private text]");
+    expect(
+      privateOutputData(
+        { message: `${"!".repeat(4000 - prefix.length)}${prefix}`, ts: 1, runId: "r", type: "gate" },
+        privacy,
+      ).message,
+    ).toBe("[withheld: private text]");
+    const feed = { ts: 1, kind: "run.failed", title: `${"🧪".repeat(190)}protected-`, summary: "safe" };
+    expect(
+      privateOutputData({ ...feed, title: `${feed.title} (shared PR round sequence)` }, privacy).title,
+    ).toBe("[withheld: private text]");
+    expect(privateOutputData(feed, privacy)).toMatchObject({
+      title: "[withheld: private text]",
+      summary: "safe",
+    });
+    expect(privateOutputData({ ...feed, title: `${"🧪".repeat(189)}protected-` }, privacy).title).toBe(
+      `${"🧪".repeat(189)}protected-`,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+    else process.env.LIMITLESS_CONFIG_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
   }
 });

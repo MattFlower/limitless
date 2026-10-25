@@ -1,15 +1,15 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
 import { sanitizePublication } from "../src/gates/publication.ts";
 import * as commands from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
-import { factoryBackend } from "../src/integrations/mcp.ts";
+import { factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { buildReportArtifacts, renderReportArtifacts, saveReport } from "../src/pipeline/report.ts";
 import { reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import {
   type ChangePage,
   changeFixture,
@@ -1073,4 +1073,64 @@ test("cancelling a feed long poll or closing the connection releases its listene
   expect(await closed).toBe("closed");
   await Bun.sleep(20);
   expect(listeners()).toBe(idle);
+});
+
+test("privacy matching protects clipped event previews and Unicode feed boundaries in MCP", async () => {
+  const run = await create();
+  const { store } = f.factory;
+  writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), "protected-host-880.example\n");
+  const prefix = "protected-host-880";
+  // Store clips the serialized object at 16,000 UTF-16 code units, inside a Unicode escape.
+  const tail = `${prefix}\\u00`;
+  store.addEvent({
+    runId: run.id,
+    type: "gate",
+    message: "clipped",
+    data: {
+      body: `${"!".repeat(16_000 - JSON.stringify({ body: "" }).length + 2 - tail.length)}${tail}2eexample`,
+    },
+  });
+  expect(
+    resultValue<{ events: RunEvent[] }>(await call("get_run", { id: run.id, full: true })).events,
+  ).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ data: { truncated: true, preview: "[withheld: private text]" } }),
+    ]),
+  );
+  store.db
+    .query(`INSERT INTO feed_add VALUES ('run.failed', ?, NULL, ?, ?, '{}', ?)`)
+    .run(
+      run.id,
+      `${"🧪".repeat(190)}protected-host-880.example`,
+      `${"🧪".repeat(490)}protected-host-880.example`,
+      run.id,
+    );
+  const feed = resultValue<FeedPage>(await call("feed", { after: 0 }));
+  expect(feed.items.find((item) => item.runId === run.id && item.kind === "run.failed")).toMatchObject({
+    title: "[withheld: private text]",
+    summary: "[withheld: private text]",
+  });
+});
+
+test("privacy matching inspects MCP success and HTTP errors before credential redaction", async () => {
+  const secret = "synthetic/mcp-token-880";
+  const host = `host-${secret}.example`;
+  registerCredential("MCP_PRIVACY_880", secret);
+  writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), `${host}\n`);
+  const run = await create({ title: host });
+  expect(resultValue<{ title: string }>(await call("get_run", { id: run.id, full: true })).title).toBe(
+    "[withheld: private text]",
+  );
+  const backend = httpBackend("http://daemon.invalid", async () =>
+    Response.json({ error: host }, { status: 500 }),
+  );
+  await expect(backend.detail(run.id)).rejects.toThrow("[withheld: private text]");
+  const proxy = await connect(backend);
+  try {
+    const error = await proxy.client.callTool({ name: "limitless_get_run", arguments: { id: run.id } });
+    expect(error.isError).toBe(true);
+    expect(error.content).toEqual([{ type: "text", text: "[withheld: private text]" }]);
+  } finally {
+    await proxy.close();
+  }
 });

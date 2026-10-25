@@ -138,9 +138,8 @@ export class WorkerStore {
     this.times = { ...timing, ...times };
   }
   sanitize<T>(data: T): T {
-    return privateOutputData(
-      redactGateData(data),
-      loadOutputPrivacy() ?? (() => "[withheld: private policy unavailable]"),
+    return redactGateData(
+      privateOutputData(data, loadOutputPrivacy() ?? (() => "[withheld: private policy unavailable]")),
     );
   }
   pair(name: string, fingerprint: string, coordinator: string) {

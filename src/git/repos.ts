@@ -1018,7 +1018,7 @@ export async function checkPrivatePublication(
       path = stripVTControlCharacters(path);
       try {
         checkPublicationText(path, "filename", protectedNames);
-        return privacy.redactPrivate(redactCredentials(path), entries);
+        return redactCredentials(privacy.redactPrivate(path, entries));
       } catch {
         return "[redacted filename]";
       }

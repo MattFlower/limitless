@@ -5,7 +5,7 @@ import { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
-import { verifierPrompt } from "../src/pipeline/prompts.ts";
+import { formatGateFeedback, implementPrompt, verifierPrompt } from "../src/pipeline/prompts.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { customProvider, providerFixture } from "./provider-config-support.ts";
 
@@ -328,6 +328,88 @@ test("stored escape-split findings are sanitized before encoding verifier model 
     expect(outcome.result.status).toBe("ok");
     expect(calls).toBe(1);
     expect(restored.state.lastReview?.findings[0]?.title).toBe(title);
+  } finally {
+    await factory.stop();
+    store.close();
+    fixture.close();
+  }
+});
+
+test("privacy matching checks resumed feedback and complete gate diagnostics before prompt clipping", async () => {
+  const secret = "synthetic/prompt-token-880";
+  const host = `host-${secret}.example`;
+  registerCredential("PROMPT_PRIVACY_880", secret);
+  const fixture = providerFixture([customProvider]);
+  writeFileSync(join(fixture.configDir, "private-strings.txt"), `${host}\n`);
+  const store = new Store(":memory:");
+  let calls = 0;
+  const factory = new Factory(fixture.load(), {
+    store,
+    harnesses: {
+      claude: fakeHarness((spec) => {
+        calls++;
+        expect(spec.prompt).not.toContain("host-");
+        expect(spec.prompt).not.toContain("prompt-token-880");
+        expect(spec.prompt).toContain("[redacted]");
+        return { structured: {} };
+      }),
+    },
+  });
+  try {
+    const repo = store.upsertRepo({
+      slug: "fixture/repo",
+      kind: "local",
+      localPath: fixture.root,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+    const initial = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    const result = {
+      name: "check",
+      command: "true",
+      ok: false,
+      exitCode: 1,
+      durationMs: 1,
+      // A tail excerpt would retain only part of the host without the complete-source check.
+      output: `${host}${"!".repeat(2990)}`,
+      failures: `error ${secret.replaceAll("/", "\\/")}`,
+    };
+    initial.state.feedback = `Previous error ${host}`;
+    initial.state.implementerReport = host;
+    initial.state.lastGates = [{ name: "check", verdict: "new_failure", blocking: true, result }];
+    await initial.save();
+    const restored = new RunContext(factory.deps, run, repo, new AbortController().signal);
+    expect(restored.state.feedback).toBe("Previous error [redacted]");
+    expect(restored.state.implementerReport).toBe("[redacted]");
+    expect(restored.state.lastGates?.[0]?.result.output).toBe(`[redacted]${"!".repeat(2990)}`);
+    const gates = {
+      setup: [],
+      checks: [{ name: "check", run: "true" }],
+      source: "none" as const,
+      protectedPaths: [],
+    };
+    const prompt = implementPrompt({
+      prompt: "test",
+      spec: null,
+      gates,
+      baseline: null,
+      baseSha: "base",
+      round: 1,
+      hasHoldout: false,
+      feedback: restored.state.feedback + formatGateFeedback(restored.state.lastGates ?? [], gates),
+    });
+    const outcome = await restored.invoke({
+      role: "implement",
+      stage: store.startStage(run.id, "implement", 1),
+      prompt,
+      mode: "readonly",
+      complexity: "small",
+      constraints: { only: "claude/haiku" },
+    });
+    expect(outcome.result.status).toBe("ok");
+    expect(calls).toBe(1);
   } finally {
     await factory.stop();
     store.close();

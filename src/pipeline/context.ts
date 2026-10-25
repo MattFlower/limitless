@@ -24,7 +24,8 @@ import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
 import { redactGateData, redactGateDiagnostics, redactGateOutput } from "../gates/output.ts";
-import type { GateComparison, GateRun } from "../gates/run.ts";
+import { loadPrivateStrings, redactPrivate } from "../gates/private.ts";
+import type { GateComparison, GateResult, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
 import { browserCache } from "../harness/browser-mcp.ts";
@@ -357,16 +358,22 @@ export class RunContext {
       feedback: null,
       toolCommands: [],
     };
+    let entries: ReturnType<typeof loadPrivateStrings> | undefined;
+    const privateText = (text: string) => {
+      entries ??= loadPrivateStrings(deps.cfg.paths.configDir);
+      return redactPrivate(text, entries);
+    };
+    const diagnostic = <T extends GateResult>(result: T) => redactGateDiagnostics(result, privateText);
     const comparisons = <T extends GateComparison>(checks: T[]): T[] =>
       checks.map((check) => ({
         ...check,
-        result: redactGateDiagnostics(check.result),
-        ...(check.firstAttempt ? { firstAttempt: redactGateDiagnostics(check.firstAttempt) } : {}),
+        result: diagnostic(check.result),
+        ...(check.firstAttempt ? { firstAttempt: diagnostic(check.firstAttempt) } : {}),
       }));
     const baseline = this.state.baseline;
     if (baseline) {
-      baseline.setup = baseline.setup.map(redactGateDiagnostics);
-      baseline.checks = baseline.checks.map(redactGateDiagnostics);
+      baseline.setup = baseline.setup.map(diagnostic);
+      baseline.checks = baseline.checks.map(diagnostic);
     }
     for (const field of ["preRebaseGates", "lastGates"] as const) {
       const checks = this.state[field];
@@ -388,7 +395,7 @@ export class RunContext {
       "rebaseNote",
     ] as const) {
       const value = this.state[field];
-      if (typeof value === "string") this.state[field] = redactGateOutput(value);
+      if (typeof value === "string") this.state[field] = redactGateOutput(privateText(value));
     }
   }
 

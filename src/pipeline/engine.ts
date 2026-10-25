@@ -85,6 +85,7 @@ import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
+import { privateOutputData } from "../util/private-output.ts";
 import {
   assertProcessesStopped,
   CommandError,
@@ -1741,11 +1742,11 @@ async function oneRound(
   const comparison = await checks.catch(async (error: unknown) => {
     ctx.checkCancelled();
     if (!(error instanceof WorktreeCleanError) || !ctx.state.implementerIssue) throw error;
-    ctx.state.feedback = redactPrivate(
-      redactGateOutput(
+    ctx.state.feedback = redactGateOutput(
+      redactPrivate(
         `### Your previous session ended early\n${ctx.state.implementerIssue}\n\nWorktree cleanup failed after retry:\n${error.message}`,
+        privateStrings(),
       ),
-      privateStrings(),
     );
     ctx.log(ctx.state.feedback, "warn");
     await ctx.save();
@@ -1823,7 +1824,10 @@ async function oneRound(
     round,
   );
 
-  const gateFeedback = formatGateFeedback(comparison, gates);
+  const gateFeedback = formatGateFeedback(
+    privateOutputData(comparison, (text) => redactPrivate(text, privateStrings())),
+    gates,
+  );
   const auditFeedback = formatAuditFeedback(audit);
   if (gateFeedback || auditFeedback) {
     // Don't spend reviewer tokens on work that fails deterministic checks.
@@ -1831,7 +1835,7 @@ async function oneRound(
       ? `### Your previous session ended early\n${ctx.state.implementerIssue}\nKeep the next attempt focused and finish by running the checks.`
       : "";
     ctx.state.feedback = [issue, gateFeedback, auditFeedback].filter(Boolean).join("\n\n");
-    ctx.state.feedback = redactPrivate(redactGateOutput(ctx.state.feedback), privateStrings());
+    ctx.state.feedback = redactGateOutput(redactPrivate(ctx.state.feedback, privateStrings()));
     await ctx.save();
     ctx.log(
       comparison.some((c) => c.blocking && c.result.timedOut)
@@ -1874,7 +1878,7 @@ async function oneRound(
         findings: priorReview.blocking,
       }
     : undefined;
-  const reviewText = (text: string) => redactPrivate(redactGateOutput(text), privateStrings());
+  const reviewText = (text: string) => redactGateOutput(redactPrivate(text, privateStrings()));
   const firstParentRange = `${ctx.state.preRebaseHead}..${reviewedSha}`;
   const firstParentFiles = resolution ? ctx.state.conflictFiles : undefined;
   const firstParentDiff = firstParentFiles?.length
@@ -1967,6 +1971,7 @@ async function oneRound(
           ...(fixSha && panelReview ? { fixReview: panelReview } : {}),
         },
       };
+      input.prompt = privateOutputData(input.prompt, reviewText);
       // The concurrent pair owns cleanup of the production worktree; shadows own their checkout.
       const call = async (
         request: ReviewRequest | VerifierRequest,
@@ -1983,6 +1988,7 @@ async function oneRound(
           complexity: profile(ctx) === "deep" ? "large" : ctx.complexity,
           constraints: { ...constraints, ...(prefer ? { prefer } : {}) },
           ...request,
+          prompt: reviewText(request.prompt),
           ...(deadline ? { deadline } : {}),
           shadow: invokeGuard.getStore(),
           checkout:

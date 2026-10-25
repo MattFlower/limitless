@@ -1,5 +1,5 @@
 import { expect, spyOn } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { auditDiff } from "../src/gates/audit.ts";
@@ -1699,3 +1699,53 @@ test.each(["baseline", "regression", "cancel baseline", "cancel regression"])(
     }
   },
 );
+
+test("privacy matching redacts slash-escaped local gate output and stored events", async () => {
+  const secret = "synthetic/local-gate-token-880";
+  const escaped = secret.replaceAll("/", "\\/");
+  registerCredential("LOCAL_GATE_PRIVACY_880", secret);
+  const { ctx, f } = await context();
+  writeFileSync(join(fixture.home, "gate-output-880"), escaped);
+  const run = await confinementScope.run(fakeConfinement, () =>
+    runGateExecution(
+      ctx,
+      "gates",
+      "initial",
+      fixture.repoDir,
+      { ...gates, checks: [{ name: "check", run: `cat '${join(fixture.home, "gate-output-880")}'` }] },
+      {
+        onResult: (result) =>
+          ctx.event({ runId: ctx.run.id, type: "gate", message: "gate result", data: result }),
+      },
+    ),
+  );
+  expect(run.checks[0]).toMatchObject({ ok: true, output: "[redacted]" });
+  expect(f.store.listEvents(ctx.run.id).find((event) => event.type === "gate")?.data).toMatchObject({
+    output: "[redacted]",
+  });
+});
+
+test("privacy matching checks review inputs before prompt credential redaction", async () => {
+  const secret = "synthetic/review-token-880";
+  const host = `host-${secret}.example`;
+  registerCredential("REVIEW_PRIVACY_880", secret);
+  let reviewed = false;
+  const f = start((s) => {
+    if (roleOf(s) === "review") {
+      reviewed = true;
+      expect(s.prompt).not.toContain("host-");
+      expect(s.prompt).not.toContain("review-token-880");
+      expect(s.prompt).toContain("[redacted]");
+    }
+    return handler(s);
+  });
+  mkdirSync(f.deps.cfg.paths.configDir, { recursive: true });
+  writeFileSync(join(f.deps.cfg.paths.configDir, "private-strings.txt"), `${host}\n`);
+  const run = await f.createRun({
+    repo: fixture.repoDir,
+    prompt: `Update greeting for ${host}`,
+    profile: "quick",
+  });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(reviewed).toBe(true);
+});

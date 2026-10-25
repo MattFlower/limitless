@@ -23,7 +23,7 @@ import {
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
-import { redactCredentialData, redactCredentials } from "../util/proc.ts";
+import { redactCredentialData } from "../util/proc.ts";
 import { ChangeQuerySchema, getChange } from "./mcp-change.ts";
 import { explainStatus, statusDetailSchema, statusLandsSchema } from "./mcp-status.ts";
 
@@ -229,7 +229,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
       });
     } catch (e) {
       throw new Error(
-        redactCredentials(
+        (loadOutputPrivacy() ?? (() => "[withheld: private policy unavailable]"))(
           `Cannot reach the Limitless daemon at ${base}: ${String(e)}. Start limitless serve. Mutation outcomes may be unknown; inspect runs before retrying.`,
         ),
       );
@@ -237,9 +237,11 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
     const text = await response.text();
     if (!response.ok) {
       // Decode JSON before redacting so \u-escaped credentials cannot slip past literal matching.
-      let detail = redactCredentials(text);
+      const privacy = loadOutputPrivacy() ?? (() => "[withheld: private policy unavailable]");
+      let detail = privacy(text);
+      if (detail !== text) throw new Error(detail);
       try {
-        detail = JSON.stringify(redactCredentialData(JSON.parse(text)));
+        detail = JSON.stringify(redactCredentialData(privateOutputData(JSON.parse(text), privacy)));
       } catch {
         // not json
       }
@@ -513,11 +515,11 @@ export function createMcpServer(backend: McpBackend): Server {
     try {
       const tool = tools.find((tool) => tool.name === params.name);
       if (!tool) throw new Error(`Unknown tool: ${params.name}`);
-      const result = redactGateData(await tool.execute(params.arguments ?? {}, signal, privacy));
+      const result = await tool.execute(params.arguments ?? {}, signal, privacy);
       const output = privacy
-        ? privateOutputData(result, privacy)
+        ? redactGateData(privateOutputData(result, privacy))
         : params.name === "limitless_status"
-          ? result
+          ? redactGateData(result)
           : { message: "Tool output withheld; privacy policy unavailable." };
       // Apply the page budget after privacy substitutions, which can expand small strings.
       const bounded =
@@ -533,7 +535,7 @@ export function createMcpServer(backend: McpBackend): Server {
             ? e.message
             : String(e);
       const text = privacy
-        ? privacy(redactGateOutput(message))
+        ? redactGateOutput(privacy(message))
         : "MCP tool failed; privacy policy unavailable.";
       return { isError: true, content: [{ type: "text", text }] };
     }

@@ -9,6 +9,7 @@ import {
   registeredCredentials,
 } from "../src/util/proc.ts";
 import { TERMINAL_HOLD, terminalRedactor } from "../src/util/terminal-redaction.ts";
+import { credentialInText } from "../src/workers/validation.ts";
 
 function variants(values: string[]) {
   const result = new Map<string, boolean>();
@@ -429,4 +430,29 @@ test("an unterminated strict string bounds carry and releases visible text while
   expect(output.length).toBeGreaterThan(5_000);
   output += redactor.push(`${SECRET} end`, true);
   expect(output).toBe(`x [redacted]]0;${`${"line ".repeat(39)}\n`.repeat(50)}[redacted] end`);
+});
+
+test("privacy matching decodes ordinary JSON slash escapes through shared credential paths", () => {
+  const secret = "synthetic/slash-token-880";
+  registerCredential("SLASH_CREDENTIAL_880", secret);
+  const escaped = secret.replaceAll("/", "\\/");
+  for (const spelling of [secret, escaped]) {
+    const input = `before ${spelling} after`;
+    expect(redactCredentials(input)).toBe("before [redacted] after");
+    expect(credentialInText(input)).toBe(true);
+    expect(redactCredentials(input, { start: 9, end: 14 })).toBe("[redacted]");
+    for (let split = 0; split <= input.length; split++) {
+      const stream = credentialMatcher().stream();
+      expect(stream.push(input.slice(0, split)) + stream.push(input.slice(split), true)).toBe(
+        "before [redacted] after",
+      );
+      const terminal = terminalRedactor();
+      expect(terminal.push(input.slice(0, split)) + terminal.push(input.slice(split), true)).toBe(
+        "before [redacted] after",
+      );
+    }
+  }
+  registerCredential("SHORT_SLASH_CREDENTIAL_880", "q/rstu7");
+  expect(redactCredentials("q\\/rstu7")).toBe("[redacted]");
+  expect(redactCredentials("before q\\/rstu7 after")).toBe("before q\\/rstu7 after");
 });
