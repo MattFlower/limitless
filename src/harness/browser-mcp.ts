@@ -51,13 +51,15 @@ export const BROWSER_TOOLS = [
   "browser_take_screenshot",
 ];
 
-// Gaps the factory profile leaves open on the paths that apply it; any entry disables the browser.
-// Upstream flags are convenience guards. The profile closes the two known gaps, proven by the
-// unconfined probes in test/browser-mcp-seatbelt.test.ts (factory gates skip them):
-// - --allowed-origins does not stop redirects or other connections leaving the preview origin;
-// - explicit filenames on output tools bypass --output-dir and could write into the checkout.
-// Paths that cannot apply the profile (Claude editors, non-macOS) stay disabled before this check.
-export const CONFINEMENT_GAPS: readonly string[] = [];
+// Gaps not yet proven closed on the paths that apply the factory profile; any entry disables the
+// browser. Upstream flags are convenience guards. Remove an entry only after its unconfined probe in
+// test/browser-mcp-seatbelt.test.ts passes against the pinned build; factory gates skip that probe,
+// and a skip is not evidence. Paths that cannot apply the profile (Claude editors, non-macOS) stay
+// disabled before this check.
+export const CONFINEMENT_GAPS: readonly string[] = [
+  "--allowed-origins does not stop redirects or other browser connections leaving the preview origin",
+  "explicit filenames on output tools bypass --output-dir and can write into the checkout",
+];
 
 export const browserCache = (home: string) => join(home, "tools", `playwright-mcp-${BROWSER_MCP_VERSION}`);
 const inside = (root: string, path: string) => {

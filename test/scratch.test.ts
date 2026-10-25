@@ -105,7 +105,7 @@ test("browser profile and output stay in private scratch and are cleaned on comp
       const result = await runToolAgent(
         spec,
         fakeHarness((invocation) => {
-          const args = browserMcp(invocation, "codex", undefined, "darwin")?.args ?? [];
+          const args = browserMcp(invocation, "codex", [], "darwin")?.args ?? [];
           const scratch = realpathSync(invocation.scratchDir ?? "");
           const directories = readdirSync(scratch).filter((name) => name.startsWith("browser-"));
           expect(directories).toHaveLength(1);

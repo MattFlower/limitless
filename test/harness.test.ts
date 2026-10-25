@@ -158,8 +158,8 @@ test("both harnesses serialize the confined pinned browser over stdio and honour
           else expect(argsClaude[argsClaude.indexOf("--tools") + 1]).toBe("");
         }
         expect(events).toEqual([]);
-        // The production gap list enables the confined server on macOS.
-        browserSetup.mockImplementation((spec, harness) => original(spec, harness, undefined, "darwin"));
+        // With the gaps cleared, the real builders emit the confined server on macOS.
+        browserSetup.mockImplementation((spec, harness) => original(spec, harness, [], "darwin"));
         const enabledClaude = buildClaudeArgs(spec, "session");
         expectServer(
           JSON.parse(enabledClaude[enabledClaude.indexOf("--mcp-config") + 1] ?? "{}").mcpServers.playwright,

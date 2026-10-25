@@ -95,12 +95,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const f = start((agent) => {
       const request =
         failure === "scratch failure" ? { ...agent, scratchDir: join(home, "missing-scratch") } : agent;
-      // Other cases use the production gap list, so only the injected failure disables the browser.
+      // Other cases clear the gaps, so only the injected failure disables the browser.
       const setup = () =>
         browserMcp(
           request,
           "codex",
-          failure === "unresolved gap" ? ["browser redirects leave the preview"] : undefined,
+          failure === "unresolved gap" ? ["browser redirects leave the preview"] : [],
           "darwin",
         );
       expect(
@@ -339,7 +339,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
           expect(stage?.status).toBe("succeeded");
           const url = stage?.summary?.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
           expect(agent.browser?.previewUrl).toBe(url);
-          const browser = browserMcp(agent, "codex", undefined, "darwin");
+          const browser = browserMcp(agent, "codex", [], "darwin");
           expect(browser?.args[(browser?.args.indexOf("--allowed-origins") ?? -2) + 1]).toBe(url);
           const response = await fetch(`${url}/health`);
           expect(await response.text()).toBe("seeded\n");

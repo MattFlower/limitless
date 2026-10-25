@@ -133,13 +133,16 @@ test.each([
   const events: AgentEvent[] = [];
   spec.mode = mode;
   spec.onEvent = (event) => events.push(event);
-  // Production gap list: the paths that apply the profile have no open gap.
-  expect(!!browserMcp(spec, harness, undefined, platform)).toBe(enabled);
+  // With the gaps cleared, exactly the paths that apply the profile get a browser.
+  expect(!!browserMcp(spec, harness, [], platform)).toBe(enabled);
   expect(events).toHaveLength(enabled ? 0 : 1);
   for (const variant of [{ noTools: true }, { browser: undefined }]) {
-    expect(browserMcp({ ...spec, ...variant }, harness, undefined, platform)).toBeUndefined();
+    expect(browserMcp({ ...spec, ...variant }, harness, [], platform)).toBeUndefined();
   }
   expect(events).toHaveLength(enabled ? 0 : 1);
+  // Until the unconfined probes clear the production gap list, no path gets a browser.
+  expect(browserMcp(spec, harness, undefined, platform)).toBeUndefined();
+  expect(events).toHaveLength(enabled ? 1 : 2);
 });
 
 test("browser read allowlist and private denials enclose only its own writable directory", async () => {

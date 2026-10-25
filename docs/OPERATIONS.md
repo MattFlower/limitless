@@ -64,7 +64,10 @@ caches acquire that metadata without reinstalling packages. Chromium uses `--no-
 this factory profile because its own sandbox cannot nest under Seatbelt. The
 [pinned-browser probes](browser-mcp-probes.md) exercise these boundaries on unconfined macOS.
 
-Claude readers and Codex readers and editors get the browser. Claude editors get none: they already
+Claude readers and Codex readers and editors apply this profile, but **the browser stays disabled**
+until the pinned-browser probes pass unconfined and the matching `CONFINEMENT_GAPS` entries are
+removed; until then each eligible invocation records a no-browser warning naming the open gaps.
+Claude editors get none: they already
 run inside the factory's outer profile, and Seatbelt cannot nest. LAN workers get none because the
 preview runs on the coordinator; Linux and other platforms get none. Each excluded or failed
 invocation records a no-browser warning naming its reason. Missing or incompatible tooling, a

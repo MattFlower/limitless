@@ -18,11 +18,12 @@ and renders under an outer profile with its own sandbox disabled.
 
 The new pinned-server browser probes are **unperformed on unconfined macOS**: this
 factory session cannot nest Seatbelt, so `test/browser-mcp-seatbelt.test.ts` skips
-here, and a skip is not confinement evidence. The profile closes both former
-`CONFINEMENT_GAPS` entries on the paths that apply it, so the list is now empty
-and those paths get a browser. The issue makes the orchestrator's unconfined review
-run of these probes the gate: if any probe fails, the change must not land, and the
-corresponding gap entry goes back.
+here, and a skip is not confinement evidence. Both `CONFINEMENT_GAPS` entries
+therefore stay, and no path gets a browser yet. Remove an entry only after its probe
+passes in an unconfined run against the pinned build: the off-port redirect and fetch
+assertions for the `--allowed-origins` entry, the checkout screenshot assertions for
+the `--output-dir` entry. The probe calls `browserMcp` with the gaps cleared, so it
+exercises the confined launch configuration the paths would then receive.
 
 After explicit operator provisioning with `bun scripts/provision-browser-mcp.ts`,
 run `bun test test/browser-mcp-seatbelt.test.ts` from an unconfined macOS checkout
