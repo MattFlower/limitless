@@ -12,6 +12,8 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { decodeHTML } from "entities";
+import { type CredentialMatcher, credentialMatcher } from "../util/credential-matcher.ts";
+import { redactCredentials } from "../util/proc.ts";
 
 const darwin = process.platform === "darwin" ? await import("../util/processes-darwin.ts") : undefined;
 
@@ -187,24 +189,39 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
   }
   return null;
 }
+// Capture can redact a credential inside a private string before any private check sees the text, so
+// each entry also matches as redacted, while something private remains beside the markers.
+let forms: { matcher?: CredentialMatcher; spellings: Map<string, string[]> } = { spellings: new Map() };
+const spellings = (value: string) => {
+  if (forms.matcher !== credentialMatcher()) forms = { matcher: credentialMatcher(), spellings: new Map() };
+  const known = forms.spellings.get(value);
+  if (known) return known;
+  const redacted = redactCredentials(value);
+  const result =
+    redacted !== value && redacted.replaceAll("[redacted]", "").trim() ? [value, redacted] : [value];
+  forms.spellings.set(value, result);
+  return result;
+};
 /** A clipped value also protects any trailing fragment of a private string. */
 export function privateMatches(text: string, entries: PrivateStrings, truncated = false): PrivateStrings {
   const normalized = normalizedLayers(text, entries);
   if (normalized)
-    return entries.filter(({ value }) => {
-      const protectedText = normalize(value);
-      return normalized.some((layer) => {
-        if (layer.includes(protectedText)) return true;
-        if (!truncated) return false;
-        // A cutoff can split an escape or a UTF-8 percent sequence, hiding the decoded tail.
-        const tails = [layer, layer.replace(/(?:%[0-9a-f]?|\\+u[0-9a-f]{0,3}|\\+|\ufffd)+$/i, "")];
-        return tails.some((tail) => {
-          for (let length = 1; length < protectedText.length && length <= tail.length; length++)
-            if (tail.endsWith(protectedText.slice(0, length))) return true;
-          return false;
+    return entries.filter((entry) =>
+      spellings(entry.value).some((value) => {
+        const protectedText = normalize(value);
+        return normalized.some((layer) => {
+          if (layer.includes(protectedText)) return true;
+          if (!truncated) return false;
+          // A cutoff can split an escape or a UTF-8 percent sequence, hiding the decoded tail.
+          const tails = [layer, layer.replace(/(?:%[0-9a-f]?|\\+u[0-9a-f]{0,3}|\\+|\ufffd)+$/i, "")];
+          return tails.some((tail) => {
+            for (let length = 1; length < protectedText.length && length <= tail.length; length++)
+              if (tail.endsWith(protectedText.slice(0, length))) return true;
+            return false;
+          });
         });
-      });
-    });
+      }),
+    );
   // Entry zero marks unsafe decoding, including when the denylist is empty.
   return [{ value: "", entry: 0 }];
 }
@@ -213,11 +230,13 @@ export const privateReason = (location: string, entry: number) =>
     ? `${location} exceeds the private text decoding limit; publication blocked`
     : `${location} contains a private string (entry ${entry} in private-strings.txt)`;
 export const redactLiteral = (text: string, entries: PrivateStrings) =>
-  entries.reduce(
-    (out, { value }) =>
-      out.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]"),
-    text,
-  );
+  entries
+    .flatMap(({ value }) => spellings(value))
+    .reduce(
+      (out, value) =>
+        out.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]"),
+      text,
+    );
 export function redactPrivate(text: string, entries: PrivateStrings): string {
   text = redactLiteral(text, entries);
   return privateMatches(text, entries).length ? "[redacted diagnostic]" : text;

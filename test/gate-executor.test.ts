@@ -1746,6 +1746,44 @@ test("privacy matching checks review inputs before prompt credential redaction",
     prompt: `Update greeting for ${host}`,
     profile: "quick",
   });
-  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  // The PR body quotes the credential-redacted prompt, whose private remainder still blocks publication.
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+  expect(f.store.listEvents(run.id).map((event) => event.message)).toContain(
+    "Run needs a human: PR body contains a private string (entry 1 in private-strings.txt)",
+  );
   expect(reviewed).toBe(true);
+});
+
+test("privacy matching withholds live gate feedback whose credential capture already redacted", async () => {
+  const secret = "synthetic/live-gate-token-880";
+  const host = `host-${secret}.example`;
+  registerCredential("LIVE_GATE_PRIVACY_880", secret);
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    '[gates]\nchecks = [{ name = "no-bad", run = "cat *.txt; ! grep -rq BAD --include=*.txt ." }]\n',
+  );
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "gate output fixture"], { cwd: fixture.repoDir });
+  const prompts: string[] = [];
+  const f = start((s) => {
+    if (roleOf(s) !== "implement") return handler(s);
+    prompts.push(s.prompt);
+    // The failing gate prints the private value as JSON, with its slash escaped.
+    const bad = `BAD ${JSON.stringify(host).replaceAll("/", "\\/")}\n`;
+    return { files: { "farewell.txt": prompts.length === 1 ? bad : "goodbye\n" } };
+  });
+  mkdirSync(f.deps.cfg.paths.configDir, { recursive: true });
+  writeFileSync(join(f.deps.cfg.paths.configDir, "private-strings.txt"), `${host}\n`);
+  const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell" });
+  await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+  expect(prompts).toHaveLength(2);
+  const events = f.store.listEvents(run.id);
+  // Capture redacted the credential before any private check could see the original value.
+  const failed = events.find((event) => event.type === "gate" && event.message.startsWith("no-bad: FAIL"));
+  expect(JSON.stringify(failed?.data)).toContain("host-[redacted].example");
+  expect(JSON.stringify(events)).not.toContain("live-gate-token-880");
+  expect(prompts[1]).toContain('BAD "[redacted]"');
+  expect(prompts[1]).not.toContain("host-");
+  expect(prompts[1]).not.toContain(".example");
+  expect(JSON.stringify(events.filter((event) => event.type !== "gate"))).not.toContain("host-");
 });

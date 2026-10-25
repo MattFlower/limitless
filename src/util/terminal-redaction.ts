@@ -14,12 +14,16 @@ const [A, B, C, D, E, FORK] = [1, 2, 4, 8, 16, 32];
 const [GROUND, ESC, ESC_INTER, CSI, STRING, STRING_ESC] = [0, 1, 2, 3, 4, 5];
 const [TEXT, DROP, BODY, BREAK] = [0, 1, 2, 3];
 type Parser = { state: number; osc: boolean; body: number };
-type View = { state: MatchState; count: number; ring: number[] };
+// held: a backslash not yet matched, since a following slash reads with it as one escaped slash.
+type View = { state: MatchState; count: number; ring: number[]; held?: number };
 
-// Bulk processing stops at controls, and inside a lenient string also at line breaks.
+// Bulk processing stops at controls and backslashes, and inside a lenient string also at line breaks.
 const STOPS = ["", "\\n\\r"].map(
   (breaks) =>
-    new RegExp(`[${["\\0-\\x08", "\\x0b\\x0c", "\\x0e-\\x1f", "\\x7f-\\x9f", breaks].join("")}]`, "g"),
+    new RegExp(
+      `[${["\\0-\\x08", "\\x0b\\x0c", "\\x0e-\\x1f", "\\x7f-\\x9f", "\\\\", breaks].join("")}]`,
+      "g",
+    ),
 );
 const control = (c: number) => (c < 0x20 && c !== 9 && c !== 10 && c !== 13) || (c >= 0x7f && c <= 0x9f);
 /** Classify one character; BREAK ends a malformed string before it, and the caller rereads it. */
@@ -108,6 +112,15 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
     while (k < view.count && (view.ring[k % size] ?? fallback) < base) k++;
     return k < view.count ? (view.ring[k % size] ?? fallback) : fallback;
   };
+  const settle = (view: View) => {
+    const held = view.held;
+    if (held === undefined) return;
+    view.held = undefined;
+    view.state = matcher.step(view.state, "\\");
+    view.ring[view.count++ % size] = held;
+    const output = view.state.output;
+    if (output) addSpan(matchStart(view, view.count - output.depth, held), held + 1);
+  };
   const feed = (mask: number, char: string, pos: number) => {
     if (!size) return;
     let from: MatchState | undefined;
@@ -115,13 +128,20 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
     for (let v = 0; v < 5; v++) {
       const view = views[v];
       if (!view || !(mask & (1 << v))) continue;
+      const start = char === "/" ? (view.held ?? pos) : pos;
+      if (char === "/") view.held = undefined;
+      settle(view);
+      if (char === "\\") {
+        view.held = pos;
+        continue;
+      }
       // Readings that agree share one transition.
       if (view.state !== from) {
         from = view.state;
         to = matcher.step(from, char);
       }
       view.state = to;
-      view.ring[view.count++ % size] = pos;
+      view.ring[view.count++ % size] = start;
       if (to.output) addSpan(matchStart(view, view.count - to.output.depth, pos), pos + 1);
     }
   };
@@ -139,7 +159,11 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
     shown.fill(mask & C ? 1 : 0, from - bufBase, to - bufBase);
     if (!size) return;
     const active = views.filter((_, v) => mask & (1 << v));
-    for (; from < to && active.some((view) => view.state !== active[0]?.state); from++)
+    for (
+      ;
+      from < to && active.some((view) => view.state !== active[0]?.state || view.held !== undefined);
+      from++
+    )
       feed(mask, buf.charAt(from - bufBase), from);
     if (from === to) return;
     const scanned = matcher.scan(buf.slice(from - bufBase, to - bufBase), active[0]?.state, from);
@@ -194,7 +218,7 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
       if (start < pos) addSpan(start, pos);
     }
     [views[3], views[4]] = [restart, kept];
-    [restart.state, restart.count] = [plain.state, plain.count];
+    [restart.state, restart.count, restart.held] = [plain.state, plain.count, plain.held];
     // Later matches start within the current depth, so only those positions are copied.
     for (let k = plain.count - plain.state.depth; k < plain.count; k++)
       restart.ring[k % size] = plain.ring[k % size] ?? 0;
@@ -224,10 +248,13 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
   const release = (stop: number) => {
     const string = lenient.state >= STRING ? lenient.body : stop;
     let safe = Math.min(stop - pad, string, taint?.start ?? stop);
-    for (const view of views)
+    for (const view of views) {
       if (view.state.depth) safe = Math.min(safe, view.ring[(view.count - view.state.depth) % size] ?? 0);
+      safe = Math.min(safe, view.held ?? safe);
+    }
     // Only the per-character bound forces a release, so its position is independent of chunking.
     if (stop - safe <= limit || stop - base <= limit) return emit(Math.max(base, safe));
+    for (const view of views) settle(view);
     let [from, to] = [Infinity, -1];
     for (const view of views)
       for (let k = view.count - view.state.depth; k < view.count; k++) {
@@ -321,6 +348,7 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
       if (flush) {
         if (lenient.state >= STRING) reveal(lenient.body, end);
         strict.state = lenient.state = GROUND;
+        for (const view of views) settle(view);
         emit(end);
         reset();
       } else release(end);

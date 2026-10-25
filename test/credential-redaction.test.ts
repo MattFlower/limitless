@@ -433,10 +433,12 @@ test("an unterminated strict string bounds carry and releases visible text while
 });
 
 test("privacy matching decodes ordinary JSON slash escapes through shared credential paths", () => {
-  const secret = "synthetic/slash-token-880";
+  const secret = "synthetic</slash/token-880";
   registerCredential("SLASH_CREDENTIAL_880", secret);
   const escaped = secret.replaceAll("/", "\\/");
-  for (const spelling of [secret, escaped]) {
+  // HTML-safe JSON serializers escape only "</", leaving other slashes literal.
+  const mixed = secret.replaceAll("</", "<\\/");
+  for (const spelling of [secret, escaped, mixed]) {
     const input = `before ${spelling} after`;
     expect(redactCredentials(input)).toBe("before [redacted] after");
     expect(credentialInText(input)).toBe(true);
@@ -451,6 +453,17 @@ test("privacy matching decodes ordinary JSON slash escapes through shared creden
         "before [redacted] after",
       );
     }
+  }
+  // An escaping backslash is redacted with a leading slash; other backslashes stay as written.
+  registerCredential("LEADING_SLASH_CREDENTIAL_880", "/opt/synthetic-token-880");
+  const leading = 'C:\\temp "\\/opt/synthetic-token-880\\" \\';
+  const expected = 'C:\\temp "[redacted]\\" \\';
+  expect(redactCredentials(leading)).toBe(expected);
+  for (let split = 0; split <= leading.length; split++) {
+    const stream = credentialMatcher().stream();
+    expect(stream.push(leading.slice(0, split)) + stream.push(leading.slice(split), true)).toBe(expected);
+    const terminal = terminalRedactor();
+    expect(terminal.push(leading.slice(0, split)) + terminal.push(leading.slice(split), true)).toBe(expected);
   }
   registerCredential("SHORT_SLASH_CREDENTIAL_880", "q/rstu7");
   expect(redactCredentials("q\\/rstu7")).toBe("[redacted]");

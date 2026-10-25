@@ -15,16 +15,33 @@ type Hit = { end: number; node: Node };
 type Match = Hit;
 type RedactionWindow = { start: number; end: number };
 export type MatchingWork = { transitions: number; outputs: number; boundaries: number };
+// JSON may escape any slash, so matching reads "\/" as "/"; starts keeps each read character's raw offset.
+const unescapeSlashes = (text: string) => text.replace(/\\(?=\/)/g, "");
+function starts(text: string) {
+  const offsets: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    offsets.push(i);
+    if (text.charAt(i) === "\\" && text.charAt(i + 1) === "/") i++;
+  }
+  return offsets;
+}
 
 export class CredentialMatcher {
   readonly root: Node;
   readonly maxLength: number;
-  constructor(private variants: ReadonlyMap<string, boolean>) {
+  private variants = new Map<string, boolean>();
+  constructor(registered: ReadonlyMap<string, boolean>) {
     this.root = new Node();
     this.maxLength = 0;
+    for (const [text, substring] of registered)
+      this.variants.set(
+        unescapeSlashes(text),
+        substring || (this.variants.get(unescapeSlashes(text)) ?? false),
+      );
     let rank = 0;
-    for (const [text, substring] of variants) {
-      this.maxLength = Math.max(this.maxLength, text.length);
+    for (const [text, substring] of this.variants) {
+      // The longest raw spelling escapes every slash.
+      this.maxLength = Math.max(this.maxLength, text.length + text.split("/").length - 1);
       let node = this.root;
       for (const char of text.split("")) {
         node.rest = Math.max(node.rest, text.length - node.depth);
@@ -94,21 +111,24 @@ export class CredentialMatcher {
     }
   }
   has(text: string): boolean {
-    return this.variants.has(text);
+    return this.variants.has(unescapeSlashes(text));
   }
   redact(text: string, work?: MatchingWork, window?: RedactionWindow): string {
     if (!this.maxLength || !text) return render(text, [], window);
-    return this.replace(text, this.scan(text, undefined, 0, work).hits, 0, work, window);
+    const plain = text.includes("\\/") ? unescapeSlashes(text) : text;
+    const spans = this.replace(plain, this.scan(plain, undefined, 0, work).hits, 0, work);
+    if (plain === text) return render(text, spans, window);
+    const at = starts(text);
+    const raw = (i: number) => at[i] ?? text.length;
+    return render(
+      text,
+      spans.map(({ start, end }) => ({ start: raw(start), end: raw(end) })),
+      window,
+    );
   }
-  private replace(
-    text: string,
-    hits: Hit[],
-    offset: number,
-    work?: MatchingWork,
-    window?: RedactionWindow,
-  ): string {
-    if (this.variants.has(text)) return render(text, [{ start: 0, end: text.length }], window);
-    if (!hits.some((hit) => hit.node.output)) return render(text, [], window);
+  private replace(text: string, hits: Hit[], offset: number, work?: MatchingWork): RedactionWindow[] {
+    if (this.variants.has(text)) return [{ start: 0, end: text.length }];
+    if (!hits.some((hit) => hit.node.output)) return [];
     const heap: Match[] = [];
     const better = (a: Match, b: Match) => {
       if (work) work.outputs++;
@@ -186,23 +206,28 @@ export class CredentialMatcher {
       }
     }
     selected.sort((a, b) => a.end - b.end);
-    return render(
-      text,
-      selected.map(({ end, node }) => ({ start: end - node.depth, end })),
-      window,
-    );
+    return selected.map(({ end, node }) => ({ start: end - node.depth, end }));
   }
   stream(work?: MatchingWork) {
-    let pending = "";
+    // Matching reads unescaped pending text; raw keeps its spelling, with each character's offset in at.
+    let [pending, raw, held] = ["", "", ""];
+    let at: number[] = [];
     let offset = 0;
     let state = this.root;
     let hits: Hit[] = [];
     let components: { start: number; end: number }[] = [];
     return {
       get pending() {
-        return pending;
+        return raw + held;
       },
-      push: (chunk: string, flush = false): string => {
+      push: (input: string, flush = false): string => {
+        // A trailing backslash waits for the next character, which may be an escaped slash.
+        let chunk = held + input;
+        held = !flush && chunk.endsWith("\\") ? "\\" : "";
+        if (held) chunk = chunk.slice(0, -1);
+        for (const start of starts(chunk)) at.push(raw.length + start);
+        raw += chunk;
+        chunk = unescapeSlashes(chunk);
         const scanned = this.scan(chunk, state, offset + pending.length, work);
         pending += chunk;
         state = scanned.state;
@@ -238,7 +263,13 @@ export class CredentialMatcher {
           if (work) work.boundaries++;
           count++;
         }
-        const result = this.replace(pending.slice(0, cut), hits.slice(0, count), offset, work);
+        const rawAt = (i: number) => at[i] ?? raw.length;
+        const spans = this.replace(pending.slice(0, cut), hits.slice(0, count), offset, work);
+        const end = rawAt(cut);
+        const result = render(
+          raw.slice(0, end),
+          spans.map((span) => ({ start: rawAt(span.start), end: rawAt(span.end) })),
+        );
         if (count) hits = hits.slice(count);
         let consumed = 0;
         while (consumed < components.length && (components[consumed]?.end ?? Infinity) <= offset + cut) {
@@ -247,6 +278,8 @@ export class CredentialMatcher {
         }
         if (consumed) components = components.slice(consumed);
         pending = pending.slice(cut);
+        raw = raw.slice(end);
+        at = at.slice(cut).map((start) => start - end);
         offset += cut;
         return result;
       },
