@@ -4263,6 +4263,7 @@ test("a discreet stored PR lands with a neutral base merge subject", async () =>
 
 test.each([true, false])("squash body uses current repository settings (discreet: %s)", async (discreet) => {
   const pr = delivered(1, "change/feature", "dependabot[bot]");
+  store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("Work\nCloses #7\nCloses #8", pr.run.id);
   const head = await pushBranch("change/feature", "one.txt", "one\n");
   observe(1, head);
   approve(1, head);
@@ -4306,6 +4307,7 @@ test.each([true, false])("squash body uses current repository settings (discreet
   if (discreet) {
     expect(body).toContain("## Checks");
     expect(body).toContain("Public summary");
+    expect(body).toContain("\n\nCloses #7\n\nCloses #8");
     expect(body).toContain("Retained evidence");
     expect(body).toContain("| ✅ AC-1 | Input accepted | Observed input |");
     expect(body).toContain("Verifier: `claude-opus-5-5` (separate session from the implementer).");

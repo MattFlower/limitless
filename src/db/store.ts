@@ -341,6 +341,23 @@ export interface AgentGateRecord {
 export const closedIssues = (prompt: string) =>
   new Set([...prompt.matchAll(/\bcloses\s+#([1-9][0-9]*)(?![\w#])/gi)].map((m) => Number(m[1])));
 
+/** Follow admission rules: GitHub prompt text cannot add issue links. */
+export function linkedIssues(
+  run: Pick<Run, "sourceRef" | "source" | "prompt" | "repoSlug">,
+): { repo: string; number: number }[] {
+  const ref = run.sourceRef;
+  if (ref?.kind === "issue")
+    return typeof ref.repo === "string" &&
+      typeof ref.number === "number" &&
+      Number.isSafeInteger(ref.number) &&
+      ref.number > 0
+      ? [{ repo: ref.repo, number: ref.number }]
+      : [];
+  return run.source !== "github"
+    ? [...closedIssues(run.prompt)].map((number) => ({ repo: run.repoSlug, number }))
+    : [];
+}
+
 export const ISSUE_CLAIM_STATUSES: RunStatus[] = [
   "queued",
   "waiting",
@@ -1221,13 +1238,124 @@ export class Store {
     );
   }
 
-  latestIssueRun(repo: string, number: number): Run | null {
+  issueLifecycleRuns(): Run[] {
+    return (
+      this.db
+        .query(`${RUN_SELECT} WHERE (
+        runs.status IN ('queued','waiting','running','waiting_input','needs_human')
+        OR NOT EXISTS (SELECT 1 FROM issue_lifecycle_effects e WHERE e.run_id = runs.id
+          AND e.effect = 'observed'
+          AND e.state = json_array(runs.status, runs.pr_url, runs.merged, runs.pr_closed_unmerged))
+        OR EXISTS (SELECT 1 FROM issue_lifecycle_effects e WHERE e.run_id = runs.id AND
+          (e.state = 'pending' OR (e.effect = 'labels' AND e.state != CASE
+            WHEN runs.merged THEN 'none'
+            WHEN runs.status = 'needs_human' THEN 'limitless:needs-you'
+            WHEN runs.status = 'failed' THEN 'limitless:failed'
+            WHEN runs.status = 'cancelled' OR (runs.status IN ('succeeded','resolved')
+              AND (runs.pr_url IS NULL OR runs.pr_closed_unmerged)) THEN 'none'
+            ELSE 'limitless:in-progress' END))))
+        ORDER BY runs.created_at, runs.rowid`)
+        .all() as Row[]
+    ).map(toRun);
+  }
+
+  observeIssueLifecycle(run: Run): void {
+    this.setIssueLifecycleEffect(
+      run.id,
+      "",
+      0,
+      "observed",
+      JSON.stringify([run.status, run.prUrl, Number(run.merged), Number(run.prClosedUnmerged)]),
+    );
+  }
+
+  issueLifecycleEffects(run: string, repo: string, number: number) {
+    return this.db
+      .query(`SELECT effect, state, body, comment_id AS commentId, login, page
+      FROM issue_lifecycle_effects WHERE run_id = ? AND
+      ((repo = ? COLLATE NOCASE AND number = ?) OR (repo = '' AND number = 0))
+      ORDER BY number`)
+      .all(run, repo, number) as {
+      effect: string;
+      state: string;
+      body: string | null;
+      commentId: number | null;
+      login: string | null;
+      page: number;
+    }[];
+  }
+
+  issueLifecycleEffect(run: string, repo: string, number: number, effect: string): string | null {
     const row = this.db
-      .query(`${RUN_SELECT} WHERE json_extract(runs.source_ref, '$.kind') = 'issue'
-      AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
-      AND json_extract(runs.source_ref, '$.number') = ? ORDER BY runs.created_at DESC, runs.rowid DESC LIMIT 1`)
-      .get(repo, number) as Row | null;
-    return row ? toRun(row) : null;
+      .query(`SELECT state FROM issue_lifecycle_effects
+      WHERE run_id = ? AND repo = ? COLLATE NOCASE AND number = ? AND effect = ?`)
+      .get(run, repo, number, effect) as { state: string } | null;
+    return row?.state ?? null;
+  }
+
+  setIssueLifecycleEffect(
+    run: string,
+    repo: string,
+    number: number,
+    effect: string,
+    state: string,
+    details: { body?: string; commentId?: number; login?: string; page?: number } = {},
+  ): void {
+    this.db
+      .query(`INSERT INTO issue_lifecycle_effects
+      (run_id, repo, number, effect, state, body, comment_id, login, page) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_id, repo, number, effect) DO UPDATE SET state = excluded.state,
+        body = coalesce(excluded.body, body), comment_id = coalesce(excluded.comment_id, comment_id),
+        login = coalesce(excluded.login, login), page = excluded.page`)
+      .run(
+        run,
+        repo,
+        number,
+        effect,
+        state,
+        details.body ?? null,
+        details.commentId ?? null,
+        details.login ?? null,
+        details.page ?? 0,
+      );
+  }
+
+  issueLifecycleOwnsLabels(run: Run, repo: string, number: number): boolean {
+    const rows = this.db
+      .query(`${RUN_SELECT} WHERE
+      (runs.created_at > ? OR (runs.created_at = ? AND runs.rowid > (SELECT rowid FROM runs WHERE id = ?)))
+      AND ((json_extract(runs.source_ref, '$.kind') = 'issue'
+        AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
+        AND json_extract(runs.source_ref, '$.number') = ?)
+        OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%'))`)
+      .all(run.createdAt, run.createdAt, run.id, repo, number, repo) as Row[];
+    return !rows
+      .map(toRun)
+      .some((candidate) =>
+        linkedIssues(candidate).some(
+          (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
+        ),
+      );
+  }
+
+  latestIssueRun(repo: string, number: number): Run | null {
+    const rows = this.db
+      .query(`${RUN_SELECT} WHERE
+      (json_extract(runs.source_ref, '$.kind') = 'issue'
+        AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
+        AND json_extract(runs.source_ref, '$.number') = ?)
+      OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%')
+      ORDER BY runs.created_at DESC, runs.rowid DESC`)
+      .all(repo, number, repo) as Row[];
+    return (
+      rows
+        .map(toRun)
+        .find((run) =>
+          linkedIssues(run).some(
+            (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
+          ),
+        ) ?? null
+    );
   }
 
   /** `round`: the review handler's grant; such a run's prompt quotes findings, so it allows nothing itself. */
