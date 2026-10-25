@@ -1,6 +1,7 @@
-/** Usage: mkdir "$TMPDIR/baseline"; for f in proc credential-matcher; do
+/** Usage: mkdir "$TMPDIR/baseline"; for f in proc credential-matcher terminal-redaction; do
  *   git show <base>:src/util/$f.ts > "$TMPDIR/baseline/$f.ts"; done
  * bun scripts/benchmark-credential-redaction.ts "$TMPDIR/baseline/proc.ts"
+ * Freeze terminal-redaction too so process output uses the snapshot's credential registry.
  * Modules beside the snapshot stay frozen; other imports resolve in the checkout.
  * Each version/size runs in a fresh process; median of 5 trials after 2 warmups.
  */

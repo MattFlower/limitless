@@ -34,6 +34,7 @@ import {
   localExecutor,
 } from "../src/gates/executor.ts";
 import { redactGateData } from "../src/gates/output.ts";
+import * as privacyMatchers from "../src/gates/private.ts";
 import { loadPrivateStrings, privateStringsDigest } from "../src/gates/private.ts";
 import {
   compareGates,
@@ -7550,12 +7551,19 @@ test("privacy matching protects worker fields before terminal credential removal
   const host = `host-${secret}.example`;
   registerCredential("WORKER_PRIVACY_880", secret);
   writeFileSync(join(cfg.paths.configDir, "private-strings.txt"), `${host}\n`);
-  expect(workers.sanitize({ host, escaped: secret.replaceAll("/", "\\/") })).toEqual({
-    host: "[withheld: private text]",
-    escaped: "[withheld: private text]",
-  });
-  expect(workers.sanitize({ truncated: true, preview: "host-synthetic\\/worker-" })).toEqual({
-    truncated: true,
-    preview: "[withheld: private text]",
-  });
+  const inspected = spyOn(privacyMatchers, "privateMatches");
+  try {
+    expect(workers.sanitize({ host, escaped: secret.replaceAll("/", "\\/") })).toEqual({
+      host: "[withheld: private text]",
+      escaped: "[withheld: private text]",
+    });
+    // Whole-field marker withholding must not mask credential-first ordering.
+    expect(inspected.mock.calls.some(([text]) => text === host)).toBe(true);
+    expect(workers.sanitize({ truncated: true, preview: "host-synthetic\\/worker-" })).toEqual({
+      truncated: true,
+      preview: "[withheld: private text]",
+    });
+  } finally {
+    inspected.mockRestore();
+  }
 });

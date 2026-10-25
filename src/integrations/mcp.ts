@@ -229,7 +229,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
       });
     } catch (e) {
       throw new Error(
-        (loadOutputPrivacy() ?? (() => "[withheld: private policy unavailable]"))(
+        (loadOutputPrivacy(false) ?? (() => "[withheld: private policy unavailable]"))(
           `Cannot reach the Limitless daemon at ${base}: ${String(e)}. Start limitless serve. Mutation outcomes may be unknown; inspect runs before retrying.`,
         ),
       );
@@ -237,7 +237,8 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
     const text = await response.text();
     if (!response.ok) {
       // Decode JSON before redacting so \u-escaped credentials cannot slip past literal matching.
-      const privacy = loadOutputPrivacy() ?? (() => "[withheld: private policy unavailable]");
+      // Keep authentication guidance while withholding private strings before credential redaction.
+      const privacy = loadOutputPrivacy(false) ?? (() => "[withheld: private policy unavailable]");
       let detail = privacy(text);
       if (detail !== text) throw new Error(detail);
       try {

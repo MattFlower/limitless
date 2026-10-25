@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FeedPage, ProviderStatus, Question, Run, RunEvent } from "../src/core/types.ts";
+import * as privacyMatchers from "../src/gates/private.ts";
 import { sanitizePublication } from "../src/gates/publication.ts";
 import * as commands from "../src/git/command.ts";
 import { cachePath } from "../src/git/repos.ts";
@@ -1117,14 +1118,27 @@ test("privacy matching inspects MCP success and HTTP errors before credential re
   const host = `host-${secret}.example`;
   registerCredential("MCP_PRIVACY_880", secret);
   writeFileSync(join(f.factory.cfg.paths.configDir, "private-strings.txt"), `${host}\n`);
-  const run = await create({ title: host });
-  expect(resultValue<{ title: string }>(await call("get_run", { id: run.id, full: true })).title).toBe(
-    "[withheld: private text]",
-  );
+  const run = await create();
+  f.factory.store.addEvent({ runId: run.id, type: "gate", message: "diagnostic", data: { host } });
+  const inspected = spyOn(privacyMatchers, "privateMatches");
+  try {
+    const detail = resultValue<{ events: RunEvent[] }>(await call("get_run", { id: run.id, full: true }));
+    expect(detail.events.find((event) => event.message === "diagnostic")?.data).toEqual({
+      host: "[withheld: private text]",
+    });
+    // Assert the matcher saw the original value, independently of marker withholding.
+    expect(inspected.mock.calls.some(([text]) => text === host)).toBe(true);
+  } finally {
+    inspected.mockRestore();
+  }
   const backend = httpBackend("http://daemon.invalid", async () =>
     Response.json({ error: host }, { status: 500 }),
   );
   await expect(backend.detail(run.id)).rejects.toThrow("[withheld: private text]");
+  const disconnected = httpBackend("http://daemon.invalid", async () => {
+    throw new Error(`Cannot connect to ${host}`);
+  });
+  await expect(disconnected.detail(run.id)).rejects.toThrow("[withheld: private text]");
   const proxy = await connect(backend);
   try {
     const error = await proxy.client.callTool({ name: "limitless_get_run", arguments: { id: run.id } });
