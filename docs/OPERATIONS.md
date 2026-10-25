@@ -49,24 +49,25 @@ This installs exactly `@playwright/mcp@0.0.83` and its matching Chromium into
 must already be installed. A matching cache is reused. Runs never install packages or browsers;
 missing or incompatible tooling produces an invocation warning and continues without a browser.
 
-Live-preview verify calls and implement calls supplied a live preview request browser setup, but
-**the current pin is disabled**. Each eligible invocation records a no-browser warning even with a
-valid cache: its origin filter does not cover redirects or all browser connections, and explicit
-filenames on output tools bypass `--output-dir`, including writes through checkout symlinks. The
-factory must enforce both network and filesystem confinement before enabling this server. Installing
-the cache does not enable it. No unrestricted server or download is used as a fallback.
+Live-preview verify calls and implement calls supplied a live preview get the cached server over
+stdio: headless, with `--allowed-origins` set to exactly the preview origin, the cached Chromium,
+and profile and output directories in private invocation scratch. Only UI tools are granted; code
+execution, routing and raw network-request tools stay denied. Missing or incompatible tooling, a
+non-loopback preview URL or a scratch failure records a no-browser warning on the invocation and
+the call continues without a browser. No unrestricted server or download is used as a fallback.
 
 The pin's shipped `cli.js` delegates to `playwright-core@1.64.0-alpha-1790635538000`:
 `decorateMCPCommand`, `configFromCLIOptions` and `originOrHostGlob` were inspected. Supported options
 include `--headless`, `--user-data-dir`, `--output-dir` and `--allowed-origins`; `--allowed-hosts`
 instead controls MCP HTTP transport hosts. Upstream describes origin lists and file-access checks
 as convenience guardrails rather than security boundaries
-([configuration documentation](https://playwright.dev/mcp/configuration/options#access-control)).
+([configuration documentation](https://playwright.dev/mcp/configuration/options#access-control)):
+redirects and explicit output filenames are not fully confined by the server itself.
 
-Setup directories remain private invocation scratch directories, removed on completion or
-cancellation. Claude editors retain their outer confinement and record a no-browser warning;
-remote agents also receive no browser because the coordinator preview is host-local. Fake tests
-cover cache provisioning, exclusion, diagnostics and cleanup without starting a browser.
+Browser directories are removed with invocation scratch on completion or cancellation. Claude
+editors retain their outer confinement and record a no-browser warning; remote agents also receive
+no browser because the coordinator preview is host-local. Fake tests cover provisioning, generated
+configuration, diagnostics and cleanup without starting a browser.
 
 ## Reloading configuration
 

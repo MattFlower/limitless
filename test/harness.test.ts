@@ -54,7 +54,7 @@ const fixture = (name: string) =>
     .split("\n")
     .filter(Boolean);
 
-test("unsafe pinned browsers remain excluded by both harnesses despite a valid cache", async () => {
+test("both harnesses launch the pinned cached browser over stdio, restricted to the preview origin", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "harness-browser-")));
   const cwd = join(root, "checkout");
   const cache = join(root, "cache");
@@ -67,13 +67,36 @@ test("unsafe pinned browsers remain excluded by both harnesses despite a valid c
         ...browserSpec(cwd, scratchDir, cache),
         onEvent: (event: AgentEvent) => events.push(event),
       };
+      const scratch = realpathSync(scratchDir);
+      const expectServer = (server: { command: string; args: string[]; env: Record<string, string> }) => {
+        expect(server.command).toBe(realpathSync(Bun.which("node") ?? ""));
+        expect(server.args[0]).toBe(join(cache, "node_modules/@playwright/mcp/cli.js"));
+        expect(server.args).toContain("--headless");
+        const value = (flag: string) => server.args[server.args.indexOf(flag) + 1] ?? "";
+        expect(value("--allowed-origins")).toBe("http://127.0.0.1:43210");
+        expect(server.args.filter((arg) => arg.includes("127.0.0.1"))).toEqual(["http://127.0.0.1:43210"]);
+        expect(server.args).not.toContain("--allowed-hosts");
+        expect(value("--executable-path")).toBe(join(cache, "browsers/chromium"));
+        for (const flag of ["--user-data-dir", "--output-dir"]) {
+          expect(value(flag).startsWith(`${scratch}/browser-`)).toBe(true);
+          expect(existsSync(value(flag))).toBe(true);
+        }
+        expect(server.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD).toBe("1");
+      };
+      const claude = buildClaudeArgs(spec, "session");
+      expect(claude).toContain("--strict-mcp-config");
+      expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
+      const config = JSON.parse(claude[claude.indexOf("--mcp-config") + 1] ?? "{}");
+      expect(Object.keys(config.mcpServers)).toEqual(["playwright"]);
+      expect(config.mcpServers.playwright.type).toBe("stdio");
+      expectServer(config.mcpServers.playwright);
+      const allowed = claude.slice(claude.indexOf("--allowedTools"), claude.indexOf("--disallowedTools"));
+      expect(allowed).toContain("mcp__playwright__browser_navigate");
+      expect(allowed).not.toContain("mcp__playwright__browser_run_code_unsafe");
+      expect(claude.slice(claude.indexOf("--disallowedTools"))).toContain(
+        "mcp__playwright__browser_run_code_unsafe",
+      );
       for (const mode of ["readonly", "edit"] as const) {
-        const claude = buildClaudeArgs({ ...spec, mode }, "session");
-        expect(claude).toContain("--strict-mcp-config");
-        expect(claude[claude.indexOf("--setting-sources") + 1]).toBe("");
-        const config = JSON.parse(claude[claude.indexOf("--mcp-config") + 1] ?? "{}");
-        expect(config).toEqual({ mcpServers: {} });
-        expect(claude.some((arg) => arg.startsWith("mcp__playwright__"))).toBe(false);
         const codex = buildCodexArgs({ ...spec, mode });
         expect(codex).toContain("--ignore-user-config");
         expect(codex).toContain("--strict-config");
@@ -82,19 +105,12 @@ test("unsafe pinned browsers remain excluded by both harnesses despite a valid c
           ...codex.flatMap((arg, i) => (codex[i - 1] === "-c" ? [Bun.TOML.parse(arg)] : [])),
         );
         expect(overrides.orchestrator.mcp.enabled).toBe(false);
-        expect(overrides.mcp_servers).toBeUndefined();
+        expect(Object.keys(overrides.mcp_servers)).toEqual(["playwright"]);
+        expectServer(overrides.mcp_servers.playwright);
+        expect(overrides.mcp_servers.playwright.enabled_tools).toContain("browser_navigate");
+        expect(overrides.mcp_servers.playwright.enabled_tools).not.toContain("browser_run_code_unsafe");
       }
-      expect(events.filter((event) => event.type === "warning")).toHaveLength(4);
-      expect(
-        events.filter((event) => event.type === "warning" && event.text.includes("cannot confine redirects")),
-      ).toHaveLength(3);
-      expect(
-        events.filter(
-          (event) =>
-            event.type === "warning" && event.text.includes("filename tools can write outside scratch"),
-        ),
-      ).toHaveLength(3);
-      events.length = 0;
+      expect(events).toEqual([]);
       for (const variant of [{ browser: undefined }, { noTools: true }]) {
         const args = buildCodexArgs({ ...spec, ...variant });
         expect(args).toContain("orchestrator.mcp.enabled=false");
@@ -105,22 +121,17 @@ test("unsafe pinned browsers remain excluded by both harnesses despite a valid c
             mcpServers: {},
           });
         else expect(argsClaude[argsClaude.indexOf("--tools") + 1]).toBe("");
+        expect(argsClaude.some((arg) => arg.startsWith("mcp__playwright__browser_navigate"))).toBe(false);
       }
       expect(events).toEqual([]);
-      const warnings: string[] = [];
-      const editor = buildClaudeArgs(
-        {
-          ...spec,
-          mode: "edit",
-          onEvent: (event) => {
-            if (event.type === "warning") warnings.push(event.text);
-          },
-        },
-        "session",
-      );
+      const editor = buildClaudeArgs({ ...spec, mode: "edit" }, "session");
       expect(JSON.parse(editor[editor.indexOf("--mcp-config") + 1] ?? "{}")).toEqual({ mcpServers: {} });
-      expect(warnings).toEqual([expect.stringContaining("outer confinement")]);
-      expect(buildCodexArgs({ ...spec, mode: "edit" })).toContain("orchestrator.mcp.enabled=false");
+      expect(events).toEqual([
+        expect.objectContaining({
+          code: "browser_unavailable",
+          text: expect.stringContaining("outer confinement"),
+        }),
+      ]);
     });
   } finally {
     rmSync(root, { recursive: true, force: true });

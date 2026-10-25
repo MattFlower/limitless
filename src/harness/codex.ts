@@ -845,7 +845,7 @@ export function buildCodexArgs(spec: AgentSpec, executable?: string): string[] {
         ? readerProfile(spec, validateScratch(spec), executable)
         : editorProfile(spec, executable)),
       "-c",
-      `orchestrator.mcp.enabled=${!!browser}`,
+      "orchestrator.mcp.enabled=false",
       "--disable",
       "apps",
       "--disable",

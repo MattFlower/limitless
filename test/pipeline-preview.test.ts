@@ -82,7 +82,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(captured).toEqual([true, true, false, false, false]);
   });
 
-  test.each(["unsafe confinement", "missing cache", "incompatible cache", "invalid URL", "scratch failure"])(
+  test.each(["missing cache", "incompatible cache", "invalid URL", "scratch failure"])(
     "no browser persists an invocation diagnostic: %s",
     async (failure) => {
       const f = start((agent) => {
@@ -122,16 +122,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
           message: expect.stringMatching(/Browser disabled: .+/),
         }),
       ]);
-      if (failure === "unsafe confinement") {
-        const diagnostic = f.store
-          .listEvents(run.id)
-          .find(
-            (event) =>
-              event.invocationId === outcome.invocation.id && event.message.startsWith("Browser disabled:"),
-          );
-        expect(diagnostic?.message).toContain("cannot confine redirects");
-        expect(diagnostic?.message).toContain("filename tools can write outside scratch");
-      }
     },
   );
   test.each(["remote", "local", "local fallback", "local retry", "setup failure"] as const)(
@@ -324,7 +314,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
           expect(stage?.status).toBe("succeeded");
           const url = stage?.summary?.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
           expect(agent.browser?.previewUrl).toBe(url);
-          expect(browserMcp(agent, "codex")).toBeUndefined();
+          const browser = browserMcp(agent, "codex");
+          expect(browser?.args[(browser?.args.indexOf("--allowed-origins") ?? -2) + 1]).toBe(url);
           const response = await fetch(`${url}/health`);
           expect(await response.text()).toBe("seeded\n");
           const scratch = response.headers.get("x-scratch") ?? "";

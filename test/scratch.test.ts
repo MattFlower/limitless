@@ -91,7 +91,7 @@ const procResult: ProcResult = {
   durationMs: 1,
 };
 
-test("refused browser setup stays in private scratch and is cleaned on completion and cancel", async () => {
+test("browser profile and output stay in private scratch and are cleaned on completion and cancel", async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "browser-lifecycle-")));
   const cwd = join(root, "checkout"),
     cache = join(root, "cache");
@@ -105,12 +105,16 @@ test("refused browser setup stays in private scratch and is cleaned on completio
       const result = await runToolAgent(
         spec,
         fakeHarness((invocation) => {
-          expect(browserMcp(invocation, "codex")).toBeUndefined();
+          const args = browserMcp(invocation, "codex")?.args ?? [];
           const scratch = realpathSync(invocation.scratchDir ?? "");
           const directories = readdirSync(scratch).filter((name) => name.startsWith("browser-"));
           expect(directories).toHaveLength(1);
-          for (const name of ["profile", "output"]) {
-            const path = join(scratch, directories[0] ?? "", name);
+          for (const [flag, name] of [
+            ["--user-data-dir", "profile"],
+            ["--output-dir", "output"],
+          ]) {
+            const path = join(scratch, directories[0] ?? "", name ?? "");
+            expect(args[args.indexOf(flag ?? "") + 1]).toBe(path);
             expect(path.startsWith(`${scratch}/`)).toBe(true);
             expect(existsSync(path)).toBe(true);
             expect(statSync(path).mode & 0o777).toBe(0o700);
