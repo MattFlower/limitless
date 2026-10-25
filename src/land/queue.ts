@@ -889,7 +889,7 @@ export class LandQueue {
         for (const c of failed) {
           if (retries.has(c) && !skipped.has(c)) continue;
           const reason = run.setup.includes(c)
-            ? `setup failures are not retried; ${targetedRetrySkipReason(c, gates, cwd) ?? "setup failed"}`
+            ? `setup failures are not retried; ${targetedRetrySkipReason(undefined, c, gates, cwd) ?? "setup failed"}`
             : !selected.some((s) => s.original === c)
               ? "check does not match base configuration"
               : (skipped.get(c) ?? "targeted retry returned no check result");

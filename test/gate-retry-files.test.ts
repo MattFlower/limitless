@@ -464,6 +464,161 @@ test.each([
   }
 });
 
+test("a quoted retry placeholder cannot turn a failing test into a shell success", async () => {
+  const f = fixture();
+  try {
+    const file = 'test/x"; true #.test.ts';
+    writeFileSync(
+      join(f.cwd, file),
+      'import { test, expect } from "bun:test"; test("still fails", () => expect(1).toBe(2));',
+    );
+    const check = {
+      ...testCheck,
+      run: 'bun test --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"',
+    };
+    const cfg = { ...config, checks: [check], retryFiles: 'bun test "{files}"' };
+    await confinementScope.run(fakeConfinement, async () => {
+      const run = await runLocalGates(f.cwd, cfg, signal, { env: bunEnv });
+      const original = run.checks[0];
+      if (!original) throw new Error("Missing original check");
+      expect(original.ok).toBe(false);
+      expect(original.failureAttributionComplete).toBe(true);
+      expect(original.failedFiles).toEqual([file]);
+      let calls = 0;
+      const skipped: string[] = [];
+      const retries = await retryFailures(
+        [{ check, original }],
+        f.cwd,
+        cfg,
+        signal,
+        undefined,
+        (retry) => {
+          calls++;
+          return runLocalGates(f.cwd, retry, signal, { env: bunEnv });
+        },
+        true,
+        false,
+        (_original, reason) => skipped.push(reason),
+      );
+      expect(retries.get(original)?.ok ?? false).toBe(false);
+      expect(calls).toBe(0);
+      expect(skipped).toEqual(["retry_files must contain {files} once as an unquoted standalone argument"]);
+    });
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  "bun test '{files}'",
+  'bun test " {files} "',
+  "bun test \\{files}",
+  "bun test prefix{files}",
+  "bun test {files}suffix",
+  "bun test ''{files}",
+  'bun test {files}""',
+  "bun test prefix\\ {files}",
+  "bun test $(echo {files})",
+  'bun test "$(echo {files})"',
+  "bun test $(echo $(echo {files}))",
+  "bun test",
+  "bun test {files} {files}",
+])("targeted-only retries reject unsafe placeholder placement: %s", async (retryFiles) => {
+  const f = fixture();
+  try {
+    const original = { ...failed, failedFiles: ["test/a.test.ts"], failureAttributionComplete: true };
+    let calls = 0;
+    const skipped: string[] = [];
+    const retries = await retryFailures(
+      [{ check: testCheck, original }],
+      f.cwd,
+      { ...config, retryFiles },
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+      false,
+      (_original, reason) => skipped.push(reason),
+    );
+    expect(retries.size).toBe(0);
+    expect(calls).toBe(0);
+    expect(skipped).toEqual(["retry_files must contain {files} once as an unquoted standalone argument"]);
+  } finally {
+    f.close();
+  }
+});
+
+test.each([
+  ["configured", "bun test; security-scan", "bun test"],
+  ["returned", "bun test", "bun test; security-scan"],
+])("targeted-only retries validate the %s check command", async (_label, run, command) => {
+  const f = fixture();
+  try {
+    const check = { ...testCheck, run };
+    const original = {
+      ...failed,
+      command,
+      failedFiles: ["test/a.test.ts"],
+      failureAttributionComplete: true,
+    };
+    let calls = 0;
+    const skipped: string[] = [];
+    const retries = await retryFailures(
+      [{ check, original }],
+      f.cwd,
+      { ...config, checks: [check] },
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+      false,
+      (_original, reason) => skipped.push(reason),
+    );
+    expect(retries.size).toBe(0);
+    expect(calls).toBe(0);
+    expect(skipped).toEqual(["check is not a single bun test invocation"]);
+  } finally {
+    f.close();
+  }
+});
+
+test("targeted-only retries recognize the exact expanded command before execution", async () => {
+  const f = fixture();
+  try {
+    // The shared parser conservatively rejects backticks, even inside quoted filenames.
+    const file = "test/tick`.test.ts";
+    writeFileSync(join(f.cwd, file), "");
+    const original = { ...failed, failedFiles: [file], failureAttributionComplete: true };
+    let calls = 0;
+    const skipped: string[] = [];
+    const retries = await retryFailures(
+      [{ check: testCheck, original }],
+      f.cwd,
+      config,
+      signal,
+      undefined,
+      async () => {
+        calls++;
+        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      },
+      true,
+      false,
+      (_original, reason) => skipped.push(reason),
+    );
+    expect(retries.size).toBe(0);
+    expect(calls).toBe(0);
+    expect(skipped).toEqual(["expanded retry_files is not a single bun test invocation"]);
+  } finally {
+    f.close();
+  }
+});
+
 test.each(["bun test {files}; security-scan", "other-runner {files}"])(
   "targeted-only retries reject an ineligible retry_files invocation: %s",
   async (retryFiles) => {

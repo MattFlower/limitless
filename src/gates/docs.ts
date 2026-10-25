@@ -12,14 +12,27 @@ export interface DocsSelection {
   reason: string;
 }
 
-/** Recognize one invocation without evaluating shell content; unknown syntax keeps the full check. */
-export function singleBunTest(command: string): boolean {
+/** Recognize one invocation, optionally requiring an unquoted standalone argument, without evaluation. */
+export function singleBunTest(command: string, requiredArgument?: string): boolean {
   if (!/^[\t ]*bun[\t ]+test(?:[\t ]|$)/.test(command)) return false;
+  let foundArgument = requiredArgument === undefined;
+  let wordStart = true;
   const stack = [{ quote: "" }];
   for (let i = 0; i < command.length; i++) {
     const frame = stack.at(-1);
     const c = command[i];
     if (!frame || c === "`" || (stack.length === 1 && /[\r\n]/.test(c ?? ""))) return false;
+    if (stack.length === 1 && !frame.quote) {
+      if (
+        wordStart &&
+        requiredArgument &&
+        command.startsWith(requiredArgument, i) &&
+        (i + requiredArgument.length === command.length ||
+          /[\t ]/.test(command[i + requiredArgument.length] ?? ""))
+      )
+        foundArgument = true;
+      wordStart = /[\t ]/.test(c ?? "");
+    }
     if (c === "\\" && frame.quote !== "'") {
       const next = command[++i];
       if (!next || /[\r\n]/.test(next)) return false;
@@ -39,7 +52,7 @@ export function singleBunTest(command: string): boolean {
       if (c === ")") stack.pop();
     } else if (/[;&|<>()#]/.test(c ?? "")) return false;
   }
-  return stack.length === 1 && stack[0]?.quote === "";
+  return stack.length === 1 && stack[0]?.quote === "" && foundArgument;
 }
 
 /** Inspect committed data only; a rename contributes both its old and new paths. */
@@ -65,7 +78,7 @@ export async function docsOnlyGates(cwd: string, cfg: GateConfig, base: string, 
       selection.changedPaths.length &&
       selection.changedPaths.every((p) => patterns.some((r) => r.test(p)))
     ) {
-      if (![check.run, cfg.retryFiles].every(singleBunTest)) {
+      if (![check.run, cfg.retryFiles].every((command) => singleBunTest(command))) {
         selection.reason = `docs-only change; unrecognized test runner: ${check.run}; retry_files: ${cfg.retryFiles}`;
         return { gates, selection, annotate: (run: GateRun) => run };
       }

@@ -607,6 +607,26 @@ test("a compound land check cannot pass on its failing test files alone", async 
   expect(ghCalls("pr merge")).toEqual([]);
 });
 
+test("a redacted compound land command stays ineligible for a targeted retry", async () => {
+  const command = `bun test ${String.fromCharCode(27)}]0; security-scan #${String.fromCharCode(7)}`;
+  const { pr, head } = await retryLandFixture(undefined, "test", "prepare", command);
+  const fake = fakeLandGates((req, attempt) => {
+    const run = redactGateData(retryRun(req, attempt === 1 ? { test: testFailure } : {}));
+    expect(validRun(req, run)).toBe(true);
+    return run;
+  });
+  const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+  await settle();
+  const blocked = store.getLandEntry(entry.id);
+  expect(blocked?.state).toBe("blocked");
+  expect(fake.requests).toHaveLength(1);
+  expect(await remoteHead("pr-1")).toBe(head);
+  expect(ghCalls("pr merge")).toEqual([]);
+  expect(readFileSync(blocked?.logPath ?? "", "utf8")).toContain(
+    `Land ${entry.id} test: no targeted retry: check is not a single bun test invocation`,
+  );
+});
+
 test.each([false, true])("targeted land retries record flakes through CI (restart: %s)", async (restart) => {
   const { pr, head } = await retryLandFixture();
   const credential = "synthetic-targeted-land-secret";
@@ -915,7 +935,7 @@ test.each(ineligibleRetries)("an ineligible land failure blocks without retry: $
         : row.label.includes("confinement")
           ? "confinement failure"
           : row.label.includes("template") || row.label === "duplicate placeholder"
-            ? "unusable retry_files configuration"
+            ? "retry_files must contain {files} once as an unquoted standalone argument"
             : row.label === "null exit" || row.label === "missing exit"
               ? "missing exit status"
               : row.label === "zero exit"

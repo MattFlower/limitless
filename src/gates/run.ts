@@ -277,18 +277,29 @@ export const UNSLOTTED_RETRY_MAX_FILES = 5;
 export const UNSLOTTED_RETRY_MAX_SECONDS = 60;
 
 /** Share the targeted-only decision with land diagnostics; legacy evidence stays ineligible. */
-export function targetedRetrySkipReason(r: GateResult, cfg: GateConfig, cwd: string): string | undefined {
+export function targetedRetrySkipReason(
+  check: GateCommand | undefined,
+  r: GateResult,
+  cfg: GateConfig,
+  cwd: string,
+): string | undefined {
   if (confinementFailed(r)) return "confinement failure";
   if (r.timedOut) return "gate process timed out";
   if (r.exitCode == null) return "missing exit status";
   if (r.exitCode === 0) return "no nonzero exit status";
   if (r.failureAttributionComplete !== true)
     return `failure attribution incomplete: ${r.failureAttributionReason ?? "missing or inconsistent whole-stream/JUnit evidence"}`;
-  if (cfg.retryFiles?.split("{files}").length !== 2) return "unusable retry_files configuration";
+  const placeholderReason = "retry_files must contain {files} once as an unquoted standalone argument";
+  if (cfg.retryFiles?.split("{files}").length !== 2) return placeholderReason;
   if (!r.failedFiles?.length) return "absent retry files";
   if (!validRetryFiles(r.failedFiles, cwd)) return "invalid retry files";
-  if (!singleBunTest(r.command)) return "check is not a single bun test invocation";
+  if (!check || !singleBunTest(check.run) || !singleBunTest(r.command))
+    return "check is not a single bun test invocation";
   if (!singleBunTest(cfg.retryFiles)) return "retry_files is not a single bun test invocation";
+  if (!singleBunTest(cfg.retryFiles, "{files}")) return placeholderReason;
+  const quoted = quoteRetryFiles(r.failedFiles);
+  if (!singleBunTest(cfg.retryFiles.replace("{files}", () => quoted)))
+    return "expanded retry_files is not a single bun test invocation";
   return undefined;
 }
 
@@ -320,7 +331,7 @@ export async function retryFailures(
   for (const entry of failures) {
     if (signal.aborted) break;
     const { check, original } = entry;
-    const skip = targetedOnly ? targetedRetrySkipReason(original, cfg, cwd) : undefined;
+    const skip = targetedOnly ? targetedRetrySkipReason(check, original, cfg, cwd) : undefined;
     if (targetedOnly && (original.ok || skip)) {
       if (skip) onSkip?.(original, skip);
       continue;
