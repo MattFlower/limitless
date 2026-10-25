@@ -82,13 +82,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(captured).toEqual([true, true, false, false, false]);
   });
 
-  test.each(["missing cache", "incompatible cache", "invalid URL", "scratch failure"])(
+  test.each(["unconfined pin", "missing cache", "incompatible cache", "invalid URL", "scratch failure"])(
     "no browser persists an invocation diagnostic: %s",
     async (failure) => {
       const f = start((agent) => {
         const request =
           failure === "scratch failure" ? { ...agent, scratchDir: join(home, "missing-scratch") } : agent;
-        expect(browserMcp(request, "codex")).toBeUndefined();
+        // Other cases waive the confinement gate so only the injected failure disables the browser.
+        expect(browserMcp(request, "codex", failure === "unconfined pin" ? undefined : [])).toBeUndefined();
         return { text: "continued without browser" };
       });
       await f.stop();
@@ -119,7 +120,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
           invocationId: outcome.invocation.id,
           level: "warn",
           data: { code: "browser_unavailable", id: "browser-unavailable" },
-          message: expect.stringMatching(/Browser disabled: .+/),
+          message: expect.stringMatching(
+            failure === "unconfined pin"
+              ? /Browser disabled: .+ not confined: .+redirects/
+              : /Browser disabled: .+/,
+          ),
         }),
       ]);
     },
@@ -314,7 +319,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
           expect(stage?.status).toBe("succeeded");
           const url = stage?.summary?.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
           expect(agent.browser?.previewUrl).toBe(url);
-          const browser = browserMcp(agent, "codex");
+          expect(browserMcp(agent, "codex")).toBeUndefined();
+          const browser = browserMcp(agent, "codex", []);
           expect(browser?.args[(browser?.args.indexOf("--allowed-origins") ?? -2) + 1]).toBe(url);
           const response = await fetch(`${url}/health`);
           expect(await response.text()).toBe("seeded\n");

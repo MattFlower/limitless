@@ -2,7 +2,7 @@ import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
 import { agentEnv, idleWatchdog, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
-import { BROWSER_TOOLS, browserMcp } from "./browser-mcp.ts";
+import { BROWSER_TOOLS, type BrowserMcpServer, browserMcp } from "./browser-mcp.ts";
 import { homeReadPolicy } from "./read-policy.ts";
 import { ConfinementError, runSandboxed } from "./sandbox.ts";
 import {
@@ -173,6 +173,9 @@ export class ClaudeStreamParser {
   }
 }
 
+export const claudeMcpConfig = (browser?: BrowserMcpServer) =>
+  JSON.stringify({ mcpServers: browser ? { playwright: { type: "stdio", ...browser } } : {} });
+
 export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: string): string[] {
   const browser = browserMcp(spec, "claude");
   const t = spec.target;
@@ -244,7 +247,7 @@ export function buildClaudeArgs(spec: AgentSpec, sessionId: string, keyFile?: st
     args.push(
       "--strict-mcp-config",
       "--mcp-config",
-      JSON.stringify({ mcpServers: browser ? { playwright: { type: "stdio", ...browser } } : {} }),
+      claudeMcpConfig(browser),
       "--settings",
       JSON.stringify({
         ...fastSettings,

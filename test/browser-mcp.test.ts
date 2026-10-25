@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -56,7 +57,7 @@ test("provisioning pins the package and installs chromium once, then resolves on
   });
   const events: AgentEvent[] = [];
   spec.onEvent = (event) => events.push(event);
-  const server = browserMcp(spec, "codex");
+  const server = browserMcp(spec, "codex", []);
   expect(server?.command).toBe(realpathSync(Bun.which("node") ?? ""));
   expect(server?.args.slice(0, 2)).toEqual([
     join(cache, "node_modules/@playwright/mcp/cli.js"),
@@ -84,12 +85,29 @@ test.each([
   const { spec, scratch } = await fixture();
   if (!spec.browser) throw new Error("missing browser request");
   spec.browser.previewUrl = url;
-  const args = browserMcp(spec, "codex")?.args ?? [];
+  const args = browserMcp(spec, "codex", [])?.args ?? [];
   expect(args[args.indexOf("--allowed-origins") + 1]).toBe(origin);
   expect(args.filter((arg) => arg === "--allowed-origins")).toHaveLength(1);
   for (const flag of ["--user-data-dir", "--output-dir"])
     expect(args[args.indexOf(flag) + 1]?.startsWith(`${scratch}/browser-`)).toBe(true);
 });
+
+test.each(["claude", "codex"] as const)(
+  "%s gets no browser from the unconfined pin, even with a valid cache, preview and scratch",
+  async (harness) => {
+    const { spec, scratch } = await fixture();
+    const events: AgentEvent[] = [];
+    spec.onEvent = (event) => events.push(event);
+    expect(browserMcp(spec, harness)).toBeUndefined();
+    expect(events).toEqual([
+      expect.objectContaining({ code: "browser_unavailable", text: expect.stringContaining("not confined") }),
+    ]);
+    const text = events[0]?.type === "warning" ? events[0].text : "";
+    expect(text).toContain("redirects");
+    expect(text).toContain("filenames on output tools");
+    expect(readdirSync(scratch).filter((name) => name.startsWith("browser-"))).toEqual([]);
+  },
+);
 
 test.each([
   "missing",
@@ -150,7 +168,8 @@ test.each([
         })
       : undefined;
   try {
-    expect(browserMcp(spec, failure === "Claude editor" ? "claude" : "codex")).toBeUndefined();
+    // No confinement gaps, so each case fails only for its injected reason.
+    expect(browserMcp(spec, failure === "Claude editor" ? "claude" : "codex", [])).toBeUndefined();
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: "warning",
