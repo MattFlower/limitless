@@ -126,7 +126,10 @@ export async function runGateExecution(
     // A termination before attach leaves the durable identity available for resume.
     if (
       settled &&
-      !(["lan", "inplace"].includes(ctx.state.gateExecution?.handle.kind ?? "") && gateShutdown(ctx.signal))
+      !(
+        ["lan", "inplace", "github-actions"].includes(ctx.state.gateExecution?.handle.kind ?? "") &&
+        gateShutdown(ctx.signal)
+      )
     ) {
       ctx.state.gateExecution = undefined;
       await ctx.save("gate-result");

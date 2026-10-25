@@ -1,0 +1,68 @@
+name: limitless-gates
+run-name: limitless-gates/${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      checks:
+        required: true
+        type: string
+      setup:
+        required: true
+        type: string
+      request_id:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  gate:
+    name: gate-${{ strategy.job-index }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ matrix.check.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(inputs.checks) }}
+    steps:
+      - name: Validate revisions
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          [[ "$BASE_SHA" =~ ^[a-fA-F0-9]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[a-fA-F0-9]{40}$ ]]
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.head_sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - name: Setup gates
+        env:
+          SETUP: ${{ inputs.setup }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, time
+          for i, command in enumerate(json.loads(os.environ['SETUP'])):
+              start = time.monotonic()
+              result = subprocess.run(command, shell=True, capture_output=True, text=True)
+              output = (result.stdout + '\n' + result.stderr).strip()
+              print(output, flush=True)
+              print('LIMITLESS_SETUP_' + str(i) + '=' + json.dumps({
+                  'ok': result.returncode == 0, 'exitCode': result.returncode,
+                  'durationMs': round((time.monotonic() - start) * 1000), 'output': output[-6000:]
+              }), flush=True)
+              if result.returncode:
+                  raise SystemExit(result.returncode)
+          PY
+      - name: Check gate
+        env:
+          CHECK: ${{ matrix.check.run }}
+        run: sh -c "$CHECK"
