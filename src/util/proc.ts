@@ -763,6 +763,8 @@ export interface ProcOptions {
   idleNow?: () => number;
   /** Strip terminal controls and redact decoded streams before line framing and tail cuts. */
   redactOutput?: boolean;
+  /** Per-stream filter of raw decoded chunks, applied before redaction, framing and tail cuts. */
+  rawFilter?: () => (chunk: string, flush: boolean) => string;
   /** Raw decoded chunks for internal checks only; never retain or forward them. */
   onRawChunk?: (chunk: string, stream: "stdout" | "stderr") => void;
   onStdoutLine?: (line: string) => void;
@@ -1082,6 +1084,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     child.stderr.setEncoding("utf8");
     const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
       const redactor = terminalRedactor();
+      const filter = opts.rawFilter?.();
       const emit = (text: string) => {
         if (stream === "stdout") stdout = appendTail(stdout, text, stream);
         else stderr = appendTail(stderr, text, stream);
@@ -1091,10 +1094,12 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         push(chunk: string) {
           idle.reset();
           opts.onRawChunk?.(chunk, stream);
-          emit(opts.redactOutput ? redactor.push(chunk) : chunk);
+          const text = filter ? filter(chunk, false) : chunk;
+          emit(opts.redactOutput ? redactor.push(text) : text);
         },
         flush() {
-          emit(redactor.push("", true));
+          const rest = filter?.("", true) ?? "";
+          emit(opts.redactOutput ? redactor.push(rest, true) : rest);
         },
       };
     };

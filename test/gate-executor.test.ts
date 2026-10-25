@@ -1787,3 +1787,54 @@ test("privacy matching withholds live gate feedback whose credential capture alr
   expect(prompts[1]).not.toContain(".example");
   expect(JSON.stringify(events.filter((event) => event.type !== "gate"))).not.toContain("host-");
 });
+
+test("privacy matching checks raw local gate streams before overlapping credential redaction and cuts", async () => {
+  const secret = "synthetic/overlap-token-880";
+  const host = `host-${secret}.private-domain-880.example`;
+  registerCredential("INNER_GATE_PRIVACY_880", secret);
+  // A longer credential that overlaps the private value's start hides it from any later private check.
+  registerCredential("OVERLAP_GATE_PRIVACY_880", `prefix-host-${secret}`);
+  writeFileSync(
+    join(fixture.repoDir, ".limitless.toml"),
+    '[gates]\nchecks = [{ name = "no-bad", run = "cat farewell.txt; ! grep -q BAD farewell.txt" }]\n',
+  );
+  await sh(["git", "add", "."], { cwd: fixture.repoDir });
+  await sh(["git", "commit", "-qm", "gate output fixture"], { cwd: fixture.repoDir });
+  const prompts: string[] = [];
+  const f = start((s) => {
+    if (roleOf(s) !== "implement") return handler(s);
+    prompts.push(s.prompt);
+    // A diagnostic line clipped at 8,000 characters and a 6,000-character output tail each cut the host.
+    const bad = [
+      `BAD prefix-${host}`,
+      `${"x".repeat(7_990)}${host}`,
+      "(fail) synthetic overlap",
+      `${host}${"!".repeat(5_970)}`,
+    ].join("\n");
+    return { files: { "farewell.txt": prompts.length === 1 ? `${bad}\n` : "goodbye\n" } };
+  });
+  const configDir = f.deps.cfg.paths.configDir;
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(join(configDir, "private-strings.txt"), `${host}\n`);
+  const previous = process.env.LIMITLESS_CONFIG_DIR;
+  // Local gates read the policy from the daemon's configuration directory.
+  process.env.LIMITLESS_CONFIG_DIR = configDir;
+  let runId = "";
+  try {
+    runId = (await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell" })).id;
+    await waitFor(f, runId, ["succeeded", "failed", "needs_human"]);
+  } finally {
+    if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+    else process.env.LIMITLESS_CONFIG_DIR = previous;
+  }
+  expect(prompts).toHaveLength(2);
+  const failed = f.store
+    .listEvents(runId)
+    .find((event) => event.type === "gate" && event.message.startsWith("no-bad: FAIL"));
+  const stored = JSON.stringify(failed?.data);
+  expect(stored).toContain("BAD prefix-[redacted]");
+  expect(stored).toContain("(fail) synthetic overlap");
+  for (const text of [stored, prompts[1] ?? ""])
+    for (const fragment of ["private-domain", "host-syn", "overlap-token"])
+      expect(text).not.toContain(fragment);
+});

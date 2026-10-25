@@ -16,6 +16,7 @@ import {
   redactGateOutput,
   redactGateStreams,
 } from "./output.ts";
+import { loadPrivateStrings, type PrivateStrings, privateLiteralStream, redactLiteral } from "./private.ts";
 import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
@@ -131,6 +132,15 @@ async function runOne(
   };
   const scratch = invocationScratch.getStore();
   if (!scratch) throw new Error("Missing gate command scratch");
+  // Check private strings in the complete raw streams, before credential redaction and cuts can
+  // hide them. An unreadable policy leaves verdicts alone; sanitizers downstream fail closed.
+  const entries = ((): PrivateStrings => {
+    try {
+      return loadPrivateStrings();
+    } catch {
+      return [];
+    }
+  })();
   const report = join(scratch, `gate-report-${randomUUID()}.xml`);
   const res = await runConfined({
     command: cmd.run,
@@ -139,6 +149,7 @@ async function runOne(
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
     redactOutput: true,
+    ...(entries.length ? { rawFilter: () => privateLiteralStream(entries) } : {}),
     onRawChunk: launch.observe,
     onStdoutLine: observe,
     onStderrLine: observe,
@@ -162,8 +173,11 @@ async function runOne(
     failureAttributionComplete: evidence.agrees(attributedCounts),
     failureAttributionReason:
       redactGateOutput(
-        [...new Set([failureAttributionReason, evidence.reason(attributedCounts)].filter(Boolean))].join(
-          "; ",
+        redactLiteral(
+          [...new Set([failureAttributionReason, evidence.reason(attributedCounts)].filter(Boolean))].join(
+            "; ",
+          ),
+          entries,
         ),
       ) || undefined,
     ...(failures ? { failures } : {}),

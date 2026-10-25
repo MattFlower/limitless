@@ -32,6 +32,7 @@ import {
   canonical,
   checkPrivateText,
   loadPrivateStrings,
+  privateLiteralStream,
   privateMatches,
   redactPrivate,
 } from "../src/gates/private.ts";
@@ -3420,5 +3421,16 @@ test("privacy matching decodes JSON slashes and carries only applicable clipping
     if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
     else process.env.LIMITLESS_CONFIG_DIR = previous;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("privacy matching redacts private literals across raw stream chunks before credential redaction", () => {
+  const host = "host-synthetic/stream-token-880.private-domain-880.example";
+  const raw = `one ${host.toUpperCase()} two ${host}`;
+  for (let split = 0; split <= raw.length; split++) {
+    const filter = privateLiteralStream([{ value: host, entry: 1 }]);
+    expect(filter(raw.slice(0, split), false) + filter(raw.slice(split), false) + filter("", true)).toBe(
+      "one [redacted] two [redacted]",
+    );
   }
 });

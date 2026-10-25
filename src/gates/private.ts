@@ -237,6 +237,18 @@ export const redactLiteral = (text: string, entries: PrivateStrings) =>
         out.replace(new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "[redacted]"),
       text,
     );
+/** Redact literals in a raw stream before credential redaction or cuts can split them, holding back
+ * only what could still start one. */
+export function privateLiteralStream(entries: PrivateStrings) {
+  const hold = Math.max(0, ...entries.map(({ value }) => value.length - 1));
+  let pending = "";
+  return (chunk: string, flush: boolean) => {
+    const text = redactLiteral(pending + chunk, entries);
+    const cut = flush ? text.length : Math.max(0, text.length - hold);
+    pending = text.slice(cut);
+    return text.slice(0, cut);
+  };
+}
 export function redactPrivate(text: string, entries: PrivateStrings): string {
   text = redactLiteral(text, entries);
   return privateMatches(text, entries).length ? "[redacted diagnostic]" : text;
