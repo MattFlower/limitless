@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { agentEnv, sh } from "../src/util/proc.ts";
+import { agentEnv, sh, recoveryProcessStopped as stopped } from "../src/util/proc.ts";
 
 const wrapper = resolve("scripts/ci-check.sh");
 const linuxTest = test.skipIf(process.platform !== "linux");
@@ -49,16 +49,6 @@ linuxTest("CI timeout preserves success and ordinary failure (GNU timeout on Lin
     expect(result.stdout).not.toContain("CI check timed out");
   }
 });
-
-function stopped(pid: number): boolean {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-    throw error;
-  }
-}
 
 function stopFixture(pid: number): void {
   if (pid <= 1 || stopped(pid)) return;
