@@ -74,6 +74,35 @@ those protections. New empty-commit and race identity controls demonstrate the r
 The implementation exceeds the approximate 150-line source budget (about 220 net source lines,
 including the manual landing entry point and the additional eval transfer discovered in the audit).
 
+## Linux
+
+On Linux, `bwrapGit` enforces the Seatbelt profile's write, network and signal rules and also refuses
+Unix sockets; its execute rule is weaker, as the limitation below describes. Git runs in bubblewrap
+with new user, PID, IPC and network namespaces, a read-only root and private `/run` and `/tmp`, and
+read-write binds for exactly the write roots above. bwrap starts the factory's launcher
+(`src/harness/landlock.ts`) from `/` with only `PATH` and the payload's environment in one variable
+the launcher consumes, so nothing the payload's environment names (`LD_PRELOAD`, for example) loads
+into bwrap or the launcher. Inside, the launcher applies a Landlock `execute` rule that allows git,
+its `--exec-path` helpers and git's ELF interpreter (the kernel checks execute access on the loader
+too), and a seccomp filter that makes `socket(AF_UNIX, …)` and `socketpair(AF_UNIX, …)` fail and
+refuses x32 calls and io_uring. `--unshare-net` alone leaves pathname sockets on the host (a
+credential-cache daemon, for example) reachable. Only then does it enter the command's cwd and exec
+git with the payload's environment. Aliases that shell out, `core.fsmonitor`, credential helpers and
+other programs Git executes are refused, except through the loader (below), and transports fail
+without a network. A launch failure (stderr starting with `bwrap: ` or `landlock: `) is a
+`ConfinementError`, never a git result. It needs `/usr/bin/bwrap`, unprivileged user namespaces and
+Landlock (Linux 5.13 or later); see [OPERATIONS](OPERATIONS.md#linux-confinement). A confined command
+costs about 23 ms on the development host, where the earlier `setpriv` chain cost about 13 ms, because
+the launcher is a Bun process.
+
+**Known Linux limitation ([#867](https://github.com/MattFlower/limitless/issues/867)).** Landlock's
+`execute` rule on the ELF loader also lets the loader run any readable binary, because the loader maps
+it with ordinary reads. A program Git is configured to start, such as an `ext::` transport or a
+configured helper, can therefore run other programs through the loader, where Seatbelt refuses the exec
+of the program itself. The network, filesystem write and Unix-socket restrictions still apply to
+whatever runs. Closing this needs Git's program-launching routes disabled or a loader-proof exec
+restriction.
+
 ## Checks run in the worker
 
 The initial affected-suite run completed with 727 passes, 50 platform skips and one failure: the
