@@ -40,15 +40,13 @@ export async function confirmPostMerge(
     const original = c.firstAttempt ?? c.result.firstAttempt;
     if (c.result.ok && original && !original.ok) {
       const targeted = c.result.targetedRetry;
-      const validated = targeted?.ok
-        ? validateRetry(targeted, original, sha)
-        : undefined;
-      const restored = validated && !validated.ok
-        ? validated
-        : validateRetry(c.result, original, sha);
+      const validated = targeted?.ok ? validateRetry(targeted, original, sha) : undefined;
+      const restored = validated && !validated.ok ? validated : validateRetry(c.result, original, sha);
       if (!restored.ok) {
         c.result = { ...restored, retryAttempt: c.result, targetedRetry: targeted };
-        c.verdict = c.retryOriginal?.verdict ?? c.coordinatorConfirmation?.originalVerdict ??
+        c.verdict =
+          c.retryOriginal?.verdict ??
+          c.coordinatorConfirmation?.originalVerdict ??
           (original.docsOnly?.mode === "targeted" ? "targeted_failure" : "regressed");
         c.blocking = c.retryOriginal?.blocking ?? true;
         c.retryProvenanceRejected = true;

@@ -3371,10 +3371,15 @@ async function mergeForDelivery(
             const initial = compareGates(reference, after).map((c) => ({
               ...c,
               firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
-              ...(c.result.firstAttempt?.timedOut ? {
-                retryOriginal: compareGates(reference, { setupOk: true, setup: [], checks: [c.result.firstAttempt] })
-                  .map(({ verdict, blocking }) => ({ verdict, blocking }))[0],
-              } : {}),
+              ...(c.result.firstAttempt?.timedOut
+                ? {
+                    retryOriginal: compareGates(reference, {
+                      setupOk: true,
+                      setup: [],
+                      checks: [c.result.firstAttempt],
+                    }).map(({ verdict, blocking }) => ({ verdict, blocking }))[0],
+                  }
+                : {}),
             }));
             const events = gateEvents(ctx);
             const comparison = await retryRegressions(

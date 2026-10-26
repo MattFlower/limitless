@@ -338,7 +338,10 @@ export function validateRetry(
   onReject?: (original: GateResult, reason: string) => void,
 ): GateResult {
   const { sha: executedSha, trackedClean, provenanceError } = provenance ?? {};
-  const result = { ...attempt, executionProvenance: redactGateData({ sha: executedSha, trackedClean, provenanceError }) };
+  const result = {
+    ...attempt,
+    executionProvenance: redactGateData({ sha: executedSha, trackedClean, provenanceError }),
+  };
   if (!attempt.ok || confinementFailed(attempt)) return result;
   const reason =
     !sha || !executedSha

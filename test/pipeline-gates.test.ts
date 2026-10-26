@@ -506,7 +506,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
         const retries = ["mixed", "unflagged", "setup"].includes(scenario) ? 0 : 1;
         expect(state?.gateTimeoutReruns ?? 0).toBe(retries);
         expect(prompts).toHaveLength(
-          ["twice", "mixed", "unflagged", "setup", "retry setup failure", "dirty rerun"].includes(scenario) ? 2 : 1,
+          ["twice", "mixed", "unflagged", "setup", "retry setup failure", "dirty rerun"].includes(scenario)
+            ? 2
+            : 1,
         );
         if (scenario === "slot") {
           expect(state?.round).toBe(0);
@@ -533,9 +535,17 @@ describe("pipeline (fake agents, real git + gates)", () => {
         }
         if (scenario === "dirty rerun") {
           const evidence = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]");
-          expect(evidence[0]).toMatchObject({ verdict: "regressed", blocking: true,
-            result: { ok: false, timedOut: true, exitCode: 1, firstAttempt: { timedOut: true },
-              retryAttempt: { ok: true, executionProvenance: { trackedClean: false } } } });
+          expect(evidence[0]).toMatchObject({
+            verdict: "regressed",
+            blocking: true,
+            result: {
+              ok: false,
+              timedOut: true,
+              exitCode: 1,
+              firstAttempt: { timedOut: true },
+              retryAttempt: { ok: true, executionProvenance: { trackedClean: false } },
+            },
+          });
           expect(evidence[0]?.result.output).toContain("RUN slow acceptance test");
           expect(evidence[0]?.result.output).toContain('tracked files changed: ["greeting.txt"]');
           expect(prompts[1]).toContain("Retry rejected:");
@@ -895,8 +905,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         const reason = f.store.getRun(run.id)?.error ?? "";
         if (scenario === "twice" || scenario === "dirty rerun") {
           if (scenario === "dirty rerun") {
-            expect(evidence[0]).toMatchObject({ verdict: "regressed", blocking: true,
-              result: { ok: false, timedOut: true, retryAttempt: { ok: true } } });
+            expect(evidence[0]).toMatchObject({
+              verdict: "regressed",
+              blocking: true,
+              result: { ok: false, timedOut: true, retryAttempt: { ok: true } },
+            });
             expect(evidence[0]?.result.output).toContain('tracked files changed: ["greeting.txt"]');
           }
           expect(reason).toContain("post-merge gate timed out");

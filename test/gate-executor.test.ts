@@ -22,8 +22,8 @@ import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../src/harness/sandbox.ts";
 import { LandQueue } from "../src/land/queue.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
-import { confirmPostMerge } from "../src/pipeline/post-merge-confirmation.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
+import { confirmPostMerge } from "../src/pipeline/post-merge-confirmation.ts";
 import { formatGateFeedback } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import * as proc from "../src/util/proc.ts";
@@ -154,25 +154,46 @@ test.each([
   const retry = {
     ...passed,
     firstAttempt: original,
-    executionProvenance: evidence === "legacy" ? undefined : {
-      sha: evidence === "mismatched" ? "a".repeat(40) : sha,
-      trackedClean: evidence !== "dirty",
-      provenanceError: evidence === "dirty" ? `tracked files changed: ["${credential}.txt"]` : undefined,
-    },
+    executionProvenance:
+      evidence === "legacy"
+        ? undefined
+        : {
+            sha: evidence === "mismatched" ? "a".repeat(40) : sha,
+            trackedClean: evidence !== "dirty",
+            provenanceError:
+              evidence === "dirty" ? `tracked files changed: ["${credential}.txt"]` : undefined,
+          },
     ...(evidence === "targeted missing" ? { targetedRetry: passed } : {}),
   };
   ctx.state.postMergeGates = {
-    sha, base: sha, head: sha, round: ctx.state.round, deadline: Date.now() + 60_000,
+    sha,
+    base: sha,
+    head: sha,
+    round: ctx.state.round,
+    deadline: Date.now() + 60_000,
     result: {
-      setupOk: true, timedOut: false,
-      comparison: [{
-        name: "check", verdict: "flaky", blocking: false, postMergeWorker: "test-worker",
-        firstAttempt: original, result: retry,
-        ...(kind === "confirmation" ? { coordinatorConfirmation: {
-          worker: "test-worker", originalVerdict: "regressed" as const,
-          reason: "pass (worker-specific flake)", result: retry,
-        } } : {}),
-      }],
+      setupOk: true,
+      timedOut: false,
+      comparison: [
+        {
+          name: "check",
+          verdict: "flaky",
+          blocking: false,
+          postMergeWorker: "test-worker",
+          firstAttempt: original,
+          result: retry,
+          ...(kind === "confirmation"
+            ? {
+                coordinatorConfirmation: {
+                  worker: "test-worker",
+                  originalVerdict: "regressed" as const,
+                  reason: "pass (worker-specific flake)",
+                  result: retry,
+                },
+              }
+            : {}),
+        },
+      ],
     },
   };
   await ctx.save();
@@ -183,7 +204,9 @@ test.each([
   try {
     await confirmPostMerge(resumed, cwd, gates, comparisons, Date.now() + 60_000, sha, () => resumed.save());
     expect(comparisons[0]).toMatchObject({
-      blocking: true, verdict: "regressed", result: { ok: false, exitCode: 1, retryAttempt: { ok: true } },
+      blocking: true,
+      verdict: "regressed",
+      result: { ok: false, exitCode: 1, retryAttempt: { ok: true } },
     });
     expect(comparisons[0]?.result.output).toContain(original.output);
     expect(comparisons[0]?.result.output).toContain("Retry rejected:");
@@ -217,26 +240,63 @@ test.each(["confirmation", "regression retry"])(
       if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
       executions++;
       opts.onStdoutLine?.(opts.cmd[4] ?? "");
-      return { exitCode: 0, signal: null, cancelled: false, timedOut: false, idleTimedOut: false,
-        truncated: false, stdout: "pass", stderr: "", durationMs: 1 };
+      return {
+        exitCode: 0,
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        truncated: false,
+        stdout: "pass",
+        stderr: "",
+        durationMs: 1,
+      };
     });
     try {
-      let comparison: GateComparison[] = [{ name: "check", verdict: "regressed", blocking: true,
-        postMergeWorker: "test-worker", result: original }];
+      let comparison: GateComparison[] = [
+        {
+          name: "check",
+          verdict: "regressed",
+          blocking: true,
+          postMergeWorker: "test-worker",
+          result: original,
+        },
+      ];
       if (kind === "confirmation") {
         await confinementScope.run(fakeConfinement, () =>
-          confirmPostMerge(ctx, cwd, cfg, comparison, Date.now() + 60_000, sha, async () => {}));
+          confirmPostMerge(ctx, cwd, cfg, comparison, Date.now() + 60_000, sha, async () => {}),
+        );
       } else {
-        comparison = await retryRegressions(comparison, cwd, cfg, [], ctx.signal, undefined, async (retry) => {
-          executions++;
-          return { ...result({ ...request(cwd), gates: retry }), sha, trackedClean: true };
-        });
+        comparison = await retryRegressions(
+          comparison,
+          cwd,
+          cfg,
+          [],
+          ctx.signal,
+          undefined,
+          async (retry) => {
+            executions++;
+            return { ...result({ ...request(cwd), gates: retry }), sha, trackedClean: true };
+          },
+        );
       }
-      expect(comparison[0]).toMatchObject({ verdict: "flaky", blocking: false,
-        result: { ok: true, executionProvenance: { sha, trackedClean: true },
-          targetedRetry: { executionProvenance: { sha, trackedClean: true } } } });
-      ctx.state.postMergeGates = { sha, base: sha, head: sha, round: ctx.state.round,
-        deadline: Date.now() + 60_000, result: { setupOk: true, timedOut: false, comparison } };
+      expect(comparison[0]).toMatchObject({
+        verdict: "flaky",
+        blocking: false,
+        result: {
+          ok: true,
+          executionProvenance: { sha, trackedClean: true },
+          targetedRetry: { executionProvenance: { sha, trackedClean: true } },
+        },
+      });
+      ctx.state.postMergeGates = {
+        sha,
+        base: sha,
+        head: sha,
+        round: ctx.state.round,
+        deadline: Date.now() + 60_000,
+        result: { setupOk: true, timedOut: false, comparison },
+      };
       await ctx.save();
       const completed = executions;
       expect(completed).toBe(kind === "confirmation" ? 1 : 2);
@@ -244,8 +304,14 @@ test.each(["confirmation", "regression retry"])(
       const saved = resumed.state.postMergeGates;
       if (!saved?.result) throw new Error("Missing saved retry");
       expect(saved.result.comparison[0]?.result.executionProvenance).toEqual({ sha, trackedClean: true });
-      await confirmPostMerge(resumed, cwd, cfg, saved.result.comparison, saved.deadline, saved.sha, () => resumed.save());
-      expect(saved.result.comparison[0]).toMatchObject({ verdict: "flaky", blocking: false, result: { ok: true } });
+      await confirmPostMerge(resumed, cwd, cfg, saved.result.comparison, saved.deadline, saved.sha, () =>
+        resumed.save(),
+      );
+      expect(saved.result.comparison[0]).toMatchObject({
+        verdict: "flaky",
+        blocking: false,
+        result: { ok: true },
+      });
       expect(executions).toBe(completed);
     } finally {
       processSpy.mockRestore();
