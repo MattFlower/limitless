@@ -135,7 +135,8 @@ smoke results. It asks before registering MCP with Claude Code or Codex; `--yes`
 Without a terminal, questions use defaults and MCP changes are declined unless `--yes` is set.
 Init also fills a missing `[owners] github` using `gh api user`; interactively, you can override
 the discovered login. Without a usable login or supplied owner, it reports that Dependabot runs,
-issue-label triggers and `/limitless` comment triggers remain disabled. Re-running keeps existing
+issue-label triggers and owner-only webhook comment triggers remain disabled. Queue comment
+commands can use an explicitly configured trusted list. Re-running keeps existing
 settings and fills gaps. Existing TOML comments and unrelated settings are preserved, and changes
 create a timestamped backup. Converting to `[[providers]]` requires
 consent because the previous release cannot read it. If service startup, smoke checks, or MCP
@@ -182,7 +183,7 @@ persistently inside confined sessions. Older workers retain that same behavior.
 
 **Before upgrading:** installations relying on the former hardcoded GitHub owner must explicitly
 set `github = "<owner>"` under `[owners]` in `config.toml` before upgrading, or their Dependabot
-runs, issue-label triggers and `/limitless` comment triggers stop. Ordinary config loading never
+runs, issue-label triggers and owner-only webhook comment triggers stop. Ordinary config loading never
 discovers an owner.
 
 **`config.toml`** keys (all optional; defaults shown):
@@ -207,14 +208,14 @@ discovers an owner.
 | `[reserves] codex_five_hour` | `0.90` | Codex 5-hour window |
 | `[reserves] codex_weekly` | `0.90` | Codex weekly (`seven_day`) window |
 | `[reserves.windows.<provider>] <window>` | `1.0` | Reserve for any other provider or quota window, for example `[reserves.windows.my_provider] daily = 0.80` |
-| `[owners] github` | unset | The **only** GitHub login allowed to trigger runs by webhook. Set this to your own login (e.g. `"<owner>"`); Dependabot runs, issue-label triggers and `/limitless` comment triggers are disabled until set. `limitless doctor` warns when unset. |
+| `[owners] github` | unset | The owner allowed to trigger runs by webhook; queue repositories also trust `[github.queue] trusted` for comment commands. Set this to your own login (e.g. `"<owner>"`); Dependabot runs, issue-label triggers and owner-only webhook comments are disabled until set. `limitless doctor` warns when unset. |
 | `[owners] discord` | unset | The only Discord user ID allowed to use the bot |
 | `[discord] channel_id` | unset | Text channel for run threads and quota alerts |
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
 | `[github] poll` | `true` | Observe the factory's own PRs (CI, conflicts, reviews, comments, merges) with one GraphQL query per repository and write changes to the feed. `false` restores per-run `gh pr view` merge checks. Access problems show in `limitless doctor`. |
 | `[github] poll_seconds` | `45` | Polling interval (minimum 15); repositories with a delivered, unmerged PR poll every 15 s |
-| `[github.queue] repos` | `[]` (queue disabled) | Poll approved issues in these owner/name repositories. Enable only after Q0's token isolation probe; see [issue contract](ISSUES.md). Restart required for queue settings. |
-| `[github.queue] trusted` | Configured GitHub owner, or `[]` | Logins trusted to author, edit and approve queued issues; case-insensitive. Empty disables polling. |
+| `[github.queue] repos` | `[]` (queue disabled) | Poll approved issues and comment commands in these owner/name repositories; no webhook needed. Enable only after Q0's token isolation probe; see [issue contract](ISSUES.md). Restart required for queue settings. |
+| `[github.queue] trusted` | Configured GitHub owner, or `[]` | Logins trusted to author, edit and approve queued issues and submit comment commands; case-insensitive. Empty disables polling. |
 | `[github.queue] max_issue_runs` | `1` | Positive integer cap on active issue-sourced runs; priority 0 may exceed it by one, within the overall run limit. |
 | `[github.queue] poll_seconds` | `180` | Positive polling interval, minimum 15 seconds; low GraphQL budget defers until reset. |
 | `[github] repos` | `[]` | Setup repositories, e.g. `["<owner>/<repo>"]`; doctor reads the first to check access and SSO. This is not a run allowlist. |
@@ -527,7 +528,8 @@ By default, factory GitHub API calls use the owner's `gh` login. To give selecte
 an independent factory identity, create and install a GitHub App on those repositories. Give it
 repository permissions: **actions, contents, issues, pull requests and workflows read/write**;
 **checks, statuses and metadata read**. Disable its webhook; the App needs no webhook. The
-existing repository webhook below continues to handle triggers.
+repository webhook below handles issue-label and Dependabot triggers; comment commands also work
+through the [issue queue](ISSUES.md#comment-commands).
 
 Save the App's private key in the config directory and run `chmod 0600` on the key file. Configure
 its App ID, installation ID, key file path and repository list in `config.toml`:
@@ -561,15 +563,22 @@ and **Pull requests** events. See [the webhook tunnel](#webhook-tunnel) for expo
 Deliveries are HMAC-verified and deduplicated by delivery ID. Through the tunnel, the source IP
 must also be in GitHub's published hook ranges.
 
-Dependabot runs, issue-label triggers and `/limitless` comment triggers are disabled unless
-`[owners] github` is configured.
+Dependabot runs, issue-label triggers and owner-only webhook comment triggers are disabled unless
+`[owners] github` is configured. Queue comment commands instead use `[github.queue] trusted`.
 
 - **Issue label:** adding the `limitless` label creates a run. Both the person labelling and the
   issue author must be `[owners].github`, and the repository must belong to that account. The
   issue text is passed to the model as quoted, untrusted data. The resulting PR says
   `Closes #<n>`.
-- **Comment command:** an owner comment starting with `/limitless ` followed by a request runs that
-  request in the context of the issue.
+- **Comment command:** a comment starting with `/limitless ` and a non-empty request, or a resolved
+  `@<App bot login>` followed by whitespace and a request, runs in the issue's context. Queue
+  repositories poll these at `[github.queue] poll_seconds` without webhooks, trusting the queue's
+  case-insensitive `trusted` list for both transports. Outside queue repositories, webhook commands
+  remain owner-only. Factory comments and edits by other accounts are ignored; edited comments
+  require complete evidence. First enable starts at the current time, excluding older comments
+  even if later edited. Persistent comment ids deduplicate polling, webhooks and restarts. Only
+  the configured owner's command text grants `Allow:` directives; issue context cannot. See
+  [comment commands](ISSUES.md#comment-commands).
 - **Dependabot:** `opened`, `reopened` and `synchronize` events on Dependabot PRs from the same
   repository start a `quick` verification run on the Dependabot branch. Fixes are pushed to that
   branch only if its head has not moved. The factory never merges these PRs. If the run does not

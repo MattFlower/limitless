@@ -4,7 +4,12 @@ import type { Run } from "../core/types.ts";
 import { ISSUE_CLAIM_STATUSES } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { type GhRunner, issueRunRequest, runGh } from "./github.ts";
-import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
+import { pollIssueComments } from "./issue-comments.ts";
+import {
+  ISSUE_LIFECYCLE_CALL_CAP,
+  type IssueLifecycleOptions,
+  reconcileIssueLifecycle,
+} from "./issue-lifecycle.ts";
 
 const date = z.string().refine((s) => Number.isFinite(Date.parse(s)));
 const actor = z.object({ login: z.string() }).nullable();
@@ -153,10 +158,18 @@ export function startIssueQueue(
   const { gh = runGh, log = console.warn } = opts;
   const { now, set, clear } = opts.clock ?? { now: Date.now, set: setTimeout, clear: clearTimeout };
   const abort = new AbortController();
+  const commentCache = new Map<string, { key: string; etag: string }>();
   let stopped = false;
   let notBefore = 0;
   let limited = false;
   let timer: ReturnType<typeof setTimeout>;
+  const observeRate = (rate: { cost: number; remaining: number; resetAt: string }) => {
+    if (rate.remaining < Math.max(100, 10 * rate.cost)) {
+      limited = true;
+      notBefore = Math.max(notBefore, Date.parse(rate.resetAt));
+    }
+    return limited;
+  };
   const query = async (repo: string, fields: string) => {
     const [owner, name] = repo.split("/");
     const raw = await gh(
@@ -184,10 +197,7 @@ export function startIssueQueue(
       })
       .parse(JSON.parse(raw ?? ""));
     const rate = response.data.rateLimit;
-    if (rate.remaining < Math.max(100, 10 * rate.cost)) {
-      limited = true;
-      notBefore = Math.max(notBefore, Date.parse(rate.resetAt));
-    }
+    observeRate(rate);
     if (response.errors?.length) throw new Error("GraphQL issue query returned errors");
     return z.record(z.string(), z.unknown()).parse(response.data.repository);
   };
@@ -205,7 +215,13 @@ export function startIssueQueue(
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
     try {
-      await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log, opts.lifecycle);
+      const budget = { remaining: opts.lifecycle?.maxCalls ?? ISSUE_LIFECYCLE_CALL_CAP };
+      // Initialize every boundary before any network work, even if this poll exhausts its allowance.
+      for (const repo of q.repos) factory.store.commentStream(repo, now());
+      await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log, {
+        ...opts.lifecycle,
+        budget,
+      });
       for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
         try {
@@ -233,6 +249,20 @@ export function startIssueQueue(
               if (found) states.set(n, found.state);
             }
           }
+          if (!stopped && !limited && budget.remaining > 0)
+            await pollIssueComments(
+              factory,
+              repo,
+              gh,
+              abort.signal,
+              now(),
+              budget,
+              commentCache,
+              log,
+              opts.lifecycle?.identity,
+              observeRate,
+            );
+          if (stopped) break;
           for (const issue of issues.nodes) {
             const result = issueEligibility(issue, q.trusted, {
               blockers: states,

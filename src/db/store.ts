@@ -394,6 +394,9 @@ export const ISSUE_CLAIM_STATUSES: RunStatus[] = [
   "waiting_input",
   "needs_human",
 ];
+export class CommentProcessed extends Error {}
+export type CommentIdentity = { repo: string; id: number };
+
 export class IssueClaimed extends Error {
   constructor(repo: string, number: number, run: Run) {
     super(`Issue ${repo}#${number} is claimed by run ${run.id}`);
@@ -1220,10 +1223,12 @@ export class Store {
     req: CreateRunRequest,
     verifiedGitHubWebhook = false,
     admission?: () => string | null,
+    comment?: CommentIdentity,
   ): Run {
     if (req.sourceRef?.kind === "review-round")
       throw new Error("review rounds are created only by a review verdict");
     return this.transaction(() => {
+      if (comment && this.commentCommand(comment)) throw new CommentProcessed("comment already processed");
       const refusal = admission?.();
       if (refusal) throw new Error(`Run admission refused: ${refusal}`);
       if (req.sourceRef?.kind === "issue") {
@@ -1248,8 +1253,66 @@ export class Store {
         const run = this.issueClaim(claim.repo, claim.number);
         if (run) throw new IssueClaimed(claim.repo, claim.number, run);
       }
-      return this.insertRun(repo, req, verifiedGitHubWebhook);
+      const run = this.insertRun(repo, req, verifiedGitHubWebhook);
+      if (comment) this.finishCommentCommand(comment, "run created", run.id);
+      return run;
     });
+  }
+
+  commentStream(repo: string, now: number) {
+    const at = new Date(now).toISOString();
+    this.db
+      .query(`INSERT OR IGNORE INTO issue_comment_streams (repo, initialized_at, since, high)
+      VALUES (?, ?, ?, ?)`)
+      .run(repo, at, new Date(now - 1000).toISOString(), at);
+    return this.db
+      .query(`SELECT initialized_at AS initializedAt, since, page, high, pending
+      FROM issue_comment_streams WHERE repo = ?`)
+      .get(repo) as {
+      initializedAt: string;
+      since: string;
+      page: number;
+      high: string;
+      pending: string | null;
+    };
+  }
+
+  commentStreamBoundary(repo: string): string | null {
+    const row = this.db
+      .query("SELECT initialized_at AS at FROM issue_comment_streams WHERE repo = ?")
+      .get(repo) as { at: string } | null;
+    return row?.at ?? null;
+  }
+
+  advanceCommentStream(repo: string, since: string, page: number, high: string): void {
+    this.db
+      .query("UPDATE issue_comment_streams SET since = ?, page = ?, high = ?, pending = NULL WHERE repo = ?")
+      .run(since, page, high, repo);
+  }
+
+  saveCommentPage(repo: string, page: string): void {
+    this.db.query("UPDATE issue_comment_streams SET pending = ? WHERE repo = ?").run(page, repo);
+  }
+
+  commentCommand(comment: CommentIdentity) {
+    return this.db
+      .query("SELECT run_id AS runId, note FROM issue_comment_commands WHERE repo = ? AND comment_id = ?")
+      .get(comment.repo, comment.id) as { runId: string | null; note: string } | null;
+  }
+
+  finishCommentCommand(comment: CommentIdentity, note: string, runId: string | null = null): void {
+    this.db
+      .query(
+        "INSERT OR IGNORE INTO issue_comment_commands (repo, comment_id, run_id, note) VALUES (?, ?, ?, ?)",
+      )
+      .run(comment.repo, comment.id, runId, redactCredentials(note));
+  }
+
+  isFactoryComment(repo: string, id: number, body: string, author: string): boolean {
+    return !!this.db
+      .query(`SELECT 1 FROM issue_lifecycle_effects WHERE repo = ? COLLATE NOCASE
+      AND (comment_id = ? OR (body = ? AND login = ? COLLATE NOCASE)) LIMIT 1`)
+      .get(repo, id, body, author);
   }
 
   issueClaim(repo: string, number: number): Run | null {

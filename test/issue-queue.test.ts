@@ -9,9 +9,10 @@ import type { CreateRunRequest, RunStatus } from "../src/core/types.ts";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { ISSUE_CLAIM_STATUSES, IssueClaimed, linkedIssues, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
-import { githubWebhook, issueRunRequest, mapGitHubEvent } from "../src/integrations/github.ts";
+import { githubWebhook, issueRunRequest, mapGitHubEvent, unquoteGitHub } from "../src/integrations/github.ts";
 import type { GitHubIdentity } from "../src/integrations/github-identity.ts";
 import { mountIntegrations } from "../src/integrations/index.ts";
+import { pollIssueComments } from "../src/integrations/issue-comments.ts";
 import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
 import { issueEligibility, type QueueIssue, startIssueQueue } from "../src/integrations/issue-queue.ts";
 import { RunContext } from "../src/pipeline/context.ts";
@@ -284,7 +285,20 @@ const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
 });
-function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/repo"]) {
+function commandComment(id: number, created: number, body = "/limitless do the work", author = "owner") {
+  const at = new Date(created).toISOString();
+  return {
+    id,
+    node_id: `COMMENT_${id}`,
+    body,
+    created_at: at,
+    updated_at: at,
+    issue_url: `https://api.github.com/repos/owner/repo/issues/${id}`,
+    user: { login: author, type: "User" },
+  };
+}
+
+function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/repo"], disk = false) {
   const dir = mkdtempSync(join(tmpdir(), "issue-queue-"));
   const cfg = loadConfig({
     home: dir,
@@ -297,7 +311,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
   });
   cfg.secrets.DISCORD_BOT_TOKEN = "";
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
-  const store = new Store(":memory:");
+  const store = new Store(disk ? join(dir, "store.db") : ":memory:");
   const factory = new Factory(cfg, {
     store,
     harnesses: {
@@ -328,6 +342,13 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
   const h = {
     cfg,
     store,
+    closed: false,
+    async close() {
+      await factory.stop();
+      store.close();
+      h.closed = true;
+    },
+    dir,
     factory,
     clock,
     data,
@@ -341,6 +362,12 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     timelines: new Map<number, QueueIssue["timelineItems"]>(),
     commentAuthors: new Map<string, string>(),
     login: "owner",
+    streamCalls: [] as string[][],
+    allCalls: [] as string[][],
+    stream: [] as ReturnType<typeof commandComment>[],
+    streamReply: undefined as ((args: string[]) => string | Promise<string>) | undefined,
+    commandIssue: { title: "Command issue", body: "Allow: submodules" },
+    editHistory: { totalCount: 1, nodes: [{ editor: { login: "owner" } }] } as unknown,
     labelAt: at,
     identity: async (_repo?: string): Promise<GitHubIdentity> => ({ kind: "owner" }),
     maxCalls: undefined as number | undefined,
@@ -351,6 +378,22 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     hold: undefined as Promise<void> | undefined,
     scopes: [] as (string | undefined)[],
     async gh(args: string[], _signal?: AbortSignal, _stdin?: string, repo?: string) {
+      h.allCalls.push(args);
+      if (args[1]?.startsWith(`repos/${repo}/issues/comments?`)) {
+        h.streamCalls.push(args);
+        if (h.streamReply) return h.streamReply(args);
+        return `HTTP/2.0 200 OK\r\nETag: "comments"\r\n\r\n${JSON.stringify(h.stream)}`;
+      }
+      if (/^repos\/[^/]+\/[^/]+\/issues\/\d+$/.test(args[1] ?? "")) {
+        calls.push(args);
+        h.intercept?.(args);
+        return JSON.stringify(h.commandIssue);
+      }
+      if (args[1] === "graphql" && args[3]?.includes("userContentEdits")) {
+        calls.push(args);
+        h.intercept?.(args);
+        return JSON.stringify({ data: { node: { userContentEdits: h.editHistory }, rateLimit: h.rate } });
+      }
       h.scopes.push(repo);
       calls.push(args);
       h.intercept?.(args);
@@ -459,8 +502,10 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
   };
   cleanups.push(async () => {
     stop();
-    await factory.stop();
-    store.close();
+    if (!h.closed) {
+      await factory.stop();
+      store.close();
+    }
     rmSync(dir, { recursive: true, force: true });
   });
   return h;
@@ -2732,4 +2777,439 @@ test("review: a pre-lifecycle failed run can be re-approved after upgrading", as
     stop();
     store.close();
   }
+});
+
+function commandDelivery(
+  h: ReturnType<typeof harness>,
+  comment: ReturnType<typeof commandComment>,
+  id: string,
+  factory = h.factory,
+) {
+  const body = JSON.stringify({
+    action: "created",
+    repository: { full_name: "owner/repo" },
+    sender: comment.user,
+    comment,
+    issue: { number: comment.id, ...h.commandIssue },
+  });
+  return githubWebhook(
+    factory,
+    async () => null,
+    h.identity,
+  )(
+    new Request("http://localhost/webhooks/github", {
+      method: "POST",
+      body,
+      headers: {
+        "x-github-event": "issue_comment",
+        "x-github-delivery": id,
+        "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+      },
+    }),
+  );
+}
+function commandPoll(
+  h: ReturnType<typeof harness>,
+  cap = 50,
+  factory = h.factory,
+  cache = new Map<string, { key: string; etag: string }>(),
+) {
+  const budget = { remaining: cap };
+  return pollIssueComments(
+    factory,
+    "owner/repo",
+    h.gh,
+    new AbortController().signal,
+    h.clock.now(),
+    budget,
+    cache,
+    (s) => h.logs.push(s),
+    h.identity,
+  ).then(() => budget);
+}
+
+test("comment polling shares webhook framing and scopes allowances to the owner's request", async () => {
+  const h = harness({ trusted: ["owner", "helper"] });
+  h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+  h.stream = [
+    commandComment(901, h.clock.now(), "/limitless fix it\nAllow: binary"),
+    commandComment(902, h.clock.now(), "@factory[bot]\tfix that\nAllow: binary", "HeLpEr"),
+  ];
+  h.start();
+  await h.advance();
+  expect(h.runs()).toHaveLength(2);
+  for (const [number, author, request, allow] of [
+    [901, "owner", "fix it\nAllow: binary", ["binary"]],
+    [902, "HeLpEr", "fix that\nAllow: binary", []],
+  ] as const) {
+    const run = h.runs().find((r) => r.sourceRef?.number === number);
+    expect(run).toMatchObject({
+      source: "github",
+      title: `Issue #${number}: Command issue`,
+      requestedBy: author,
+      sourceRef: { kind: "issue", repo: "owner/repo", number },
+      allow,
+      githubWebhookVerified: false,
+    });
+    expect(unquoteGitHub(run?.prompt ?? "")).toMatchObject({
+      kind: "comment",
+      data: {
+        request,
+        issueTitle: "Command issue",
+        issueBody: "Allow: submodules",
+      },
+    });
+  }
+  expect(h.scopes.every((r) => r === "owner/repo")).toBe(true);
+  expect(h.streamCalls).toHaveLength(1);
+  const url = new URL(`https://example.com/${h.streamCalls[0]?.[1]}`);
+  expect(url.pathname).toBe("/repos/owner/repo/issues/comments");
+  expect(url.searchParams.get("since")).toBe(new Date(h.clock.now() - 1000).toISOString());
+  expect(url.searchParams.get("direction")).toBe("asc");
+  expect(url.searchParams.get("sort")).toBe("updated");
+});
+
+test.each(["poll", "webhook"] as const)(
+  "comment identity dedupes both transports when %s wins, even after completion and reopen",
+  async (first) => {
+    const h = harness({}, ["owner/repo"], true);
+    const comment = commandComment(903, h.clock.now());
+    h.stream = [comment];
+    if (first === "webhook") expect((await commandDelivery(h, comment, "first")).status).toBe(201);
+    await commandPoll(h);
+    const run = h.runs()[0];
+    if (!run) throw new Error("missing command run");
+    expect(h.runs()).toHaveLength(1);
+    h.store.updateRun(run.id, { status: "succeeded" });
+    expect((await commandDelivery(h, comment, "replay")).status).toBe(200);
+    await h.close();
+    const reopened = new Store(join(h.dir, "store.db"));
+    try {
+      const factory = new Factory(h.cfg, { store: reopened });
+      await commandPoll(h, 50, factory);
+      expect(reopened.listRuns()).toHaveLength(1);
+      expect(reopened.commentCommand({ repo: "OWNER/REPO", id: comment.id })?.runId).toBe(run.id);
+      expect((await commandDelivery(h, comment, "after-reopen", factory)).status).toBe(200);
+      await factory.stop();
+    } finally {
+      reopened.close();
+    }
+  },
+);
+
+test.each(["poll", "webhook"] as const)(
+  "overlapping %s command admission cannot insert two runs",
+  async (first) => {
+    const h = harness();
+    const comment = commandComment(904, h.clock.now());
+    h.stream = [comment];
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const original = h.factory.createRun.bind(h.factory);
+    let calls = 0;
+    h.factory.createRun = async (...args) => {
+      if (++calls === 1) {
+        entered.resolve();
+        await release.promise;
+      }
+      return original(...args);
+    };
+    const pending = first === "poll" ? commandPoll(h) : commandDelivery(h, comment, "held");
+    await entered.promise;
+    if (first === "poll") expect((await commandDelivery(h, comment, "wins")).status).toBe(201);
+    else await commandPoll(h);
+    const winner = h.runs()[0];
+    if (!winner) throw new Error("missing winning run");
+    h.store.updateRun(winner.id, { status: "succeeded" });
+    release.resolve();
+    await pending;
+    expect(h.runs()).toHaveLength(1);
+    expect(h.store.commentCommand({ repo: "owner/repo", id: comment.id })?.runId).toBe(h.runs()[0]?.id);
+  },
+);
+
+test.each(["before insertion", "after insertion"] as const)(
+  "an interruption %s leaves a recoverable command",
+  async (where) => {
+    const h = harness({}, ["owner/repo"], true);
+    h.stream = [commandComment(905, h.clock.now())];
+    const original = h.factory.createRun.bind(h.factory);
+    h.factory.createRun = async (...args) => {
+      if (where === "after insertion") await original(...args);
+      throw new Error("interrupted");
+    };
+    await commandPoll(h);
+    expect(h.runs()).toHaveLength(where === "after insertion" ? 1 : 0);
+    await h.close();
+    const reopened = new Store(join(h.dir, "store.db"));
+    const factory = new Factory(h.cfg, { store: reopened });
+    try {
+      await commandPoll(h, 50, factory);
+      expect(reopened.listRuns()).toHaveLength(1);
+      expect(reopened.commentCommand({ repo: "owner/repo", id: 905 })?.runId).toBe(
+        reopened.listRuns()[0]?.id,
+      );
+    } finally {
+      await factory.stop();
+      reopened.close();
+    }
+  },
+);
+
+test.each([
+  "untrusted",
+  "foreign editor",
+  "missing editor",
+  "incomplete edits",
+  "bot",
+  "factory id",
+  "factory pending",
+  "empty",
+  "non-leading",
+  "historical",
+  "unresolved mention",
+])("comment polling rejects %s with durable first-enable boundaries", async (reason) => {
+  const h = harness({ trusted: ["owner", "helper"] });
+  const boundary = h.clock.now();
+  h.store.commentStream("owner/repo", boundary);
+  const comment = commandComment(906, boundary);
+  if (reason === "untrusted") comment.user.login = "stranger";
+  if (reason.includes("editor") || reason === "incomplete edits") {
+    comment.updated_at = new Date(boundary + 1000).toISOString();
+    h.editHistory =
+      reason === "missing editor"
+        ? null
+        : {
+            totalCount: reason === "incomplete edits" ? 2 : 1,
+            nodes: [{ editor: { login: reason === "foreign editor" ? "helper" : "owner" } }],
+          };
+    if (reason === "foreign editor")
+      h.editHistory = {
+        totalCount: 2,
+        nodes: [{ editor: { login: "helper" } }, { editor: { login: "owner" } }],
+      };
+  }
+  if (reason === "bot") comment.user.type = "Bot";
+  if (reason.startsWith("factory")) {
+    const run = await h.factory.createRun({ repo: "owner/repo", prompt: "factory run" });
+    h.store.setIssueLifecycleEffect(
+      run.id,
+      "owner/repo",
+      906,
+      "comment:started",
+      "pending",
+      reason === "factory id" ? { commentId: 906 } : { body: comment.body, login: "owner" },
+    );
+  }
+  if (reason === "empty") comment.body = "/limitless \t\n";
+  if (reason === "non-leading") comment.body = "please /limitless work";
+  if (reason === "historical") {
+    comment.created_at = new Date(boundary - 1000).toISOString();
+    comment.updated_at = new Date(boundary + 1000).toISOString();
+  }
+  if (reason === "unresolved mention") comment.body = "@factory[bot] work";
+  const originalCount = h.runs().length;
+  h.stream = [comment];
+  await commandPoll(h);
+  expect(h.runs()).toHaveLength(originalCount);
+  expect(h.store.commentCommand({ repo: "owner/repo", id: 906 })?.runId).toBeNull();
+});
+
+test("an author-only edit has complete evidence and an owner human command still counts", async () => {
+  const h = harness();
+  const comment = commandComment(907, h.clock.now());
+  comment.updated_at = new Date(h.clock.now() + 1000).toISOString();
+  h.stream = [comment];
+  await commandPoll(h);
+  expect(h.runs()).toHaveLength(1);
+  expect(h.calls.filter((a) => a[3]?.includes("userContentEdits"))).toHaveLength(1);
+});
+
+test("first enable survives reopening and never executes a later edit of an older comment", async () => {
+  const h = harness({}, ["owner/repo"], true);
+  const boundary = h.clock.now();
+  await commandPoll(h);
+  await h.close();
+  await h.clock.advance(5000);
+  const comment = commandComment(908, boundary - 1000);
+  comment.updated_at = new Date(h.clock.now()).toISOString();
+  h.stream = [comment, commandComment(909, boundary + 1000)];
+  const reopened = new Store(join(h.dir, "store.db"));
+  const factory = new Factory(h.cfg, { store: reopened });
+  try {
+    await commandPoll(h, 50, factory);
+    expect(reopened.commentStream("owner/repo", h.clock.now()).initializedAt).toBe(
+      new Date(boundary).toISOString(),
+    );
+    expect(reopened.listRuns().map((r) => r.sourceRef?.number)).toEqual([909]);
+  } finally {
+    await factory.stop();
+    reopened.close();
+  }
+});
+
+test("304 costs one call, is conditional on the exact stream request, and mutates no command state", async () => {
+  const h = harness();
+  const cache = new Map<string, { key: string; etag: string }>();
+  await commandPoll(h, 50, h.factory, cache);
+  const state = h.store.commentStream("owner/repo", h.clock.now());
+  h.streamReply = () => 'HTTP/2.0 304 Not Modified\r\nETag: "comments"\r\n\r\n';
+  const before = h.allCalls.length;
+  expect((await commandPoll(h, 50, h.factory, cache)).remaining).toBe(49);
+  expect(h.allCalls).toHaveLength(before + 1);
+  expect(h.streamCalls.at(-1)).toContain('If-None-Match: "comments"');
+  expect(h.store.commentStream("owner/repo", h.clock.now())).toEqual(state);
+  expect(h.store.db.query("SELECT * FROM issue_comment_commands").all()).toEqual([]);
+  expect(h.runs()).toEqual([]);
+});
+
+test("pagination and timestamp ties survive a failed page and budget pauses without skipping commands", async () => {
+  const h = harness();
+  const comments = Array.from({ length: 103 }, (_, i) =>
+    commandComment(
+      1000 + i,
+      h.clock.now() + 1000,
+      i === 100 || i === 102 ? "/limitless work" : "ordinary comment",
+    ),
+  );
+  let fail = true;
+  h.streamReply = (args) => {
+    const page = Number(new URL(`https://example.com/${args[1]}`).searchParams.get("page"));
+    if (page === 2 && fail) throw new Error("page failed");
+    return `HTTP/2.0 200 OK\r\nETag: "page-${page}"\r\n\r\n${JSON.stringify(comments.slice((page - 1) * 100, page * 100))}`;
+  };
+  await commandPoll(h, 2);
+  expect(h.allCalls).toHaveLength(2);
+  expect(h.store.commentStream("owner/repo", h.clock.now()).page).toBe(2);
+  fail = false;
+  const count = h.allCalls.length;
+  await commandPoll(h, 2);
+  expect(h.allCalls.length - count).toBe(2);
+  expect(h.runs()).toHaveLength(1);
+  expect(h.store.commentStream("owner/repo", h.clock.now()).page).toBe(2);
+  await commandPoll(h, 2);
+  expect(h.runs()).toHaveLength(2);
+  expect(h.store.commentStream("owner/repo", h.clock.now()).page).toBe(1);
+  // A new arrival shares the boundary timestamp; the overlap must still discover it.
+  comments.push(commandComment(1103, h.clock.now() + 1000));
+  await commandPoll(h);
+  expect(h.runs()).toHaveLength(3);
+  expect(new Set(h.runs().map((r) => r.sourceRef?.number)).size).toBe(3);
+});
+
+test("claim refusal is processed, redacted and durable after claim release and reopen", async () => {
+  const h = harness({}, ["owner/repo"], true);
+  const claimant = await h.factory.createRun({ repo: "owner/repo", prompt: "Closes #910" });
+  h.stream = [commandComment(910, h.clock.now())];
+  const secret = `claim-${crypto.randomUUID()}`;
+  registerCredential("TEST_COMMENT_CLAIM", secret);
+  const original = h.store.issueClaim.bind(h.store);
+  h.store.issueClaim = (...args) => {
+    const run = original(...args);
+    return run ? { ...run, id: `${run.id}-${secret}` } : null;
+  };
+  await commandPoll(h);
+  expect(h.logs.join("\n")).toContain(claimant.id);
+  expect(h.logs.join("\n")).not.toContain(secret);
+  expect(h.store.commentCommand({ repo: "owner/repo", id: 910 })?.note).not.toContain(secret);
+  h.store.updateRun(claimant.id, { status: "succeeded" });
+  await h.close();
+  const reopened = new Store(join(h.dir, "store.db"));
+  const factory = new Factory(h.cfg, { store: reopened });
+  try {
+    await commandPoll(h, 50, factory);
+    expect(reopened.listRuns()).toHaveLength(1);
+  } finally {
+    await factory.stop();
+    reopened.close();
+  }
+});
+
+test("a one-call allowance resumes a fetched command and its edit evidence across reopen", async () => {
+  const h = harness({}, ["owner/repo"], true);
+  const comment = commandComment(911, h.clock.now());
+  comment.updated_at = new Date(h.clock.now() + 1000).toISOString();
+  h.stream = [comment];
+  for (let i = 0; i < 2; i++) {
+    const before = h.allCalls.length;
+    await commandPoll(h, 1);
+    expect(h.allCalls.length - before).toBe(1);
+    expect(h.runs()).toHaveLength(0);
+  }
+  await h.close();
+  const reopened = new Store(join(h.dir, "store.db"));
+  const factory = new Factory(h.cfg, { store: reopened });
+  try {
+    const before = h.allCalls.length;
+    await commandPoll(h, 1, factory);
+    expect(h.allCalls.length - before).toBe(1);
+    expect(h.streamCalls).toHaveLength(1);
+    expect(reopened.listRuns()).toHaveLength(1);
+    expect(reopened.commentStream("owner/repo", h.clock.now()).pending).toBeNull();
+  } finally {
+    await factory.stop();
+    reopened.close();
+  }
+});
+
+test("conditional headers never transfer to a changed since query or GitHub identity", async () => {
+  const h = harness();
+  const cache = new Map<string, { key: string; etag: string }>();
+  await commandPoll(h, 50, h.factory, cache);
+  h.identity = async () => ({ kind: "app", token: "fake-app", botLogin: "factory[bot]" });
+  await commandPoll(h, 50, h.factory, cache);
+  expect(h.streamCalls.at(-1)).not.toContain("-H");
+  h.stream = [commandComment(912, h.clock.now() + 5000)];
+  await commandPoll(h, 50, h.factory, cache);
+  expect(h.streamCalls.at(-1)).toContain("-H");
+  await commandPoll(h, 50, h.factory, cache);
+  expect(h.streamCalls.at(-1)).not.toContain("-H");
+});
+
+test("comment metadata calls and lifecycle delivery share the existing poll allowance", async () => {
+  const h = harness();
+  h.maxCalls = 2;
+  h.stream = [commandComment(913, h.clock.now())];
+  h.start();
+  await h.advance();
+  expect(h.allCalls.filter((a) => a[1] !== "graphql")).toHaveLength(2);
+  expect(h.runs()).toHaveLength(1);
+  const before = h.allCalls.length;
+  await h.advance(180_000);
+  const calls = h.allCalls.slice(before);
+  expect(calls.filter((a) => a[1] !== "graphql")).toHaveLength(2);
+  expect(h.streamCalls).toHaveLength(1);
+});
+
+test("edited-command metadata preserves the queue's GraphQL rate-limit deferral", async () => {
+  const h = harness({}, ["owner/repo", "owner/other"]);
+  const comment = commandComment(914, h.clock.now());
+  comment.updated_at = new Date(h.clock.now() + 1000).toISOString();
+  h.stream = [comment];
+  h.intercept = (args) => {
+    if (args[3]?.includes("userContentEdits")) h.rate.remaining = 0;
+  };
+  h.start();
+  await h.advance();
+  expect(h.runs()).toHaveLength(0);
+  expect(h.streamCalls).toHaveLength(1);
+  const before = h.allCalls.length;
+  await h.advance(180_000);
+  expect(h.allCalls).toHaveLength(before);
+  h.intercept = undefined;
+  h.rate.remaining = 5000;
+  await h.advance(3600_000);
+  expect(h.runs()).toHaveLength(1);
+});
+
+test("queue webhook commands share trusted authors and App mentions even without an owner", async () => {
+  const h = harness({ trusted: ["helper"] });
+  h.cfg.githubOwner = null;
+  h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+  const comment = commandComment(915, h.clock.now(), "@factory[bot] build it\nAllow: binary", "HeLpEr");
+  expect((await commandDelivery(h, comment, "helper")).status).toBe(201);
+  expect(h.runs()[0]).toMatchObject({ requestedBy: "HeLpEr", allow: [], githubWebhookVerified: true });
+  h.stream = [comment];
+  await commandPoll(h);
+  expect(h.runs()).toHaveLength(1);
 });

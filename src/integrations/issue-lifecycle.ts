@@ -14,7 +14,11 @@ export const lifecycleManaged = (cfg: Partial<Pick<Config, "githubQueue">>, repo
 const labels = ["limitless:in-progress", "limitless:needs-you", "limitless:failed"] as const;
 const eventOrder = ["started", "pr", "needs_human", "failed", "cancelled"] as const;
 export const ISSUE_LIFECYCLE_CALL_CAP = 50;
-export type IssueLifecycleOptions = { identity?: typeof githubIdentity; maxCalls?: number };
+export type IssueLifecycleOptions = {
+  identity?: typeof githubIdentity;
+  maxCalls?: number;
+  budget?: { remaining: number };
+};
 const cursors = new WeakMap<Store, { key: string; deferred: boolean }>();
 const sessions = new WeakMap<AbortSignal, Set<string>>();
 const exhausted = Symbol("lifecycle call budget exhausted");
@@ -41,9 +45,9 @@ export async function reconcileIssueLifecycle(
   opts: IssueLifecycleOptions = {},
 ): Promise<void> {
   const cap = opts.maxCalls ?? ISSUE_LIFECYCLE_CALL_CAP;
-  let remaining = cap;
+  const budget = opts.budget ?? { remaining: cap };
   const reserve = (calls: number) => {
-    if (remaining < calls) throw exhausted;
+    if (budget.remaining < calls) throw exhausted;
   };
   let freshLabels = sessions.get(signal);
   if (!freshLabels) {
@@ -51,8 +55,8 @@ export async function reconcileIssueLifecycle(
     sessions.set(signal, freshLabels);
   }
   const call = (repo: string | undefined, args: string[], before?: () => void) => {
-    if (signal.aborted || remaining <= 0) throw exhausted;
-    remaining--;
+    if (signal.aborted || budget.remaining <= 0) throw exhausted;
+    budget.remaining--;
     before?.();
     return gh(["api", ...args], signal, undefined, repo);
   };
@@ -138,7 +142,7 @@ export async function reconcileIssueLifecycle(
     return z.object({ login: z.string() }).parse(JSON.parse(String(await call(undefined, ["user"])))).login;
   };
   for (const { snapshot, repo, number, effect: task, key } of ordered) {
-    if (signal.aborted || remaining <= 0) return;
+    if (signal.aborted || budget.remaining <= 0) return;
     cursors.set(store, { key, deferred: false });
     const path = `repos/${repo}/issues/${number}`;
     const save = (effect: string, state: string, details = {}) =>

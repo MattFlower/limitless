@@ -3,10 +3,10 @@ import type { Factory } from "../app.ts";
 import { parseAllow } from "../core/allow.ts";
 import { isBranchName } from "../core/delivery.ts";
 import type { CreateRunRequest } from "../core/types.ts";
-import { IssueClaimed } from "../db/store.ts";
+import { type CommentIdentity, CommentProcessed, IssueClaimed } from "../db/store.ts";
 import { inAnyCidr } from "../util/cidr.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
-import { githubSh } from "./github-identity.ts";
+import { githubIdentity, githubSh } from "./github-identity.ts";
 
 type GitHubFactory = Pick<Factory, "cfg" | "store" | "createRun">;
 export type GhRunner = (
@@ -95,15 +95,72 @@ export function issueRunRequest(
   };
 }
 
-export function mapGitHubEvent(event: string, payload: unknown, owner: string | null): Mapped {
+export function commentRunRequest(
+  issue: { repo: string; number: number; title: string; body: string; author: string },
+  body: string,
+  owner: string | null,
+  trusted: string[],
+  botLogin?: string,
+): CreateRunRequest | null {
+  const { repo, number, title, author } = issue;
+  if (
+    !trusted.some((s) => s.toLowerCase() === author.toLowerCase()) ||
+    author.toLowerCase() === botLogin?.toLowerCase()
+  )
+    return null;
+  const mention = botLogin && `@${botLogin}`;
+  const request = body.startsWith("/limitless ")
+    ? body.slice(11)
+    : mention &&
+        body.slice(0, mention.length).toLowerCase() === mention.toLowerCase() &&
+        /^\s/.test(body.slice(mention.length))
+      ? body.slice(mention.length).replace(/^\s+/, "")
+      : "";
+  if (!request.trim()) return null;
+  return redactCredentialData({
+    repo,
+    source: "github",
+    title: `Issue #${number}: ${title}`,
+    requestedBy: author,
+    sourceRef: { kind: "issue", repo, number },
+    allow: author.toLowerCase() === owner?.toLowerCase() ? parseAllow(request) : [],
+    prompt: `${GITHUB_PREFACES.comment}\n\n${quoted(redactCredentialData({ request, issueTitle: title, issueBody: issue.body }))}`,
+  });
+}
+
+/** The Store checks the identity again alongside insertion, after createRun's asynchronous lookup. */
+export async function submitCommentCommand(
+  factory: GitHubFactory,
+  request: CreateRunRequest,
+  comment: CommentIdentity,
+  verified = false,
+  admission?: () => string | null,
+) {
+  if (factory.store.commentCommand(comment)) throw new CommentProcessed("comment already processed");
+  try {
+    return await factory.createRun(request, verified, undefined, true, admission, comment);
+  } catch (error) {
+    if (error instanceof IssueClaimed) factory.store.finishCommentCommand(comment, error.message);
+    throw error;
+  }
+}
+
+export function mapGitHubEvent(
+  event: string,
+  payload: unknown,
+  owner: string | null,
+  commands?: { trusted: string[]; botLogin?: string },
+): Mapped {
   const p = object(payload);
   const repo = object(p?.repository);
   const fullName = string(repo?.full_name);
   const action = string(p?.action);
   if (!p || !fullName || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(fullName))
     return { note: "malformed repository identity", error: true };
-  if (!owner) return { note: "GitHub owner is not configured" };
-  if (fullName.split("/")[0] !== owner) return { note: "repository owner is not configured owner" };
+  const queueCommand = commands && event === "issue_comment" && action === "created";
+  if (!owner && !queueCommand) return { note: "GitHub owner is not configured" };
+  if (!queueCommand && fullName.split("/")[0] !== owner)
+    return { note: "repository owner is not configured owner" };
   const base = { repo: fullName, source: "github" as const };
   const issue = object(p.issue);
   const pr = object(p.pull_request);
@@ -118,32 +175,36 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
     return {
       note: "owner issue labeled",
       request: issueRunRequest(
-        { repo: fullName, number: id, title, body: string(issue?.body) ?? "", author: owner },
+        {
+          repo: fullName,
+          number: id,
+          title,
+          body: string(issue?.body) ?? "",
+          author: login(issue?.user) ?? "",
+        },
         owner,
       ),
     };
   }
   if (event === "issue_comment" && action === "created") {
-    if (login(p.sender) !== owner || login(object(p.comment)?.user) !== owner)
+    const author = login(object(p.comment)?.user);
+    if (!author || login(p.sender) !== author || (!commands && author !== owner))
       return { note: "commenter is not owner" };
     const id = number(issue?.number);
     const title = string(issue?.title);
     const body = string(object(p.comment)?.body);
     if (!id || title === null || body === null || (issue?.body !== null && string(issue?.body) === null))
       return { note: "malformed comment or issue", error: true };
-    if (!body.startsWith("/limitless ") || !body.slice(11).trim()) return { note: "other comment" };
-    return {
-      note: "owner command",
-      request: {
-        ...base,
-        title: `Issue #${id}: ${title}`,
-        requestedBy: owner,
-        sourceRef: { kind: "issue", repo: fullName, number: id },
-        allow: parseAllow(body.slice(11)), // The owner's request only, never the quoted issue.
-        prompt: `${GITHUB_PREFACES.comment}\n\n${quoted({ request: body.slice(11), issueTitle: title, issueBody: issue?.body ?? "" })}`,
-      },
-    };
+    const request = commentRunRequest(
+      { repo: fullName, number: id, title, body: string(issue?.body) ?? "", author },
+      body,
+      owner,
+      commands?.trusted ?? (owner ? [owner] : []),
+      commands?.botLogin,
+    );
+    return request ? { note: "owner command", request } : { note: "other comment" };
   }
+
   if (event === "pull_request" && ["opened", "reopened", "synchronize"].includes(action ?? "")) {
     if (
       (login(p.sender) !== owner && login(p.sender) !== "dependabot[bot]") ||
@@ -220,6 +281,7 @@ const defaultRanges = githubHookRanges();
 export function githubWebhook(
   factory: GitHubFactory,
   ranges: HookRanges = defaultRanges,
+  identity: typeof githubIdentity = githubIdentity,
 ): (req: Request) => Promise<Response> {
   return async (req) => {
     if (req.method !== "POST")
@@ -286,17 +348,55 @@ export function githubWebhook(
         string(object(object(pr.base)?.repo)?.full_name) === repo
       )
         factory.store.reopenGithubPr(`https://github.com/${repo}/pull/${prNumber}`);
-      const mapped = mapGitHubEvent(event, payload, factory.cfg.githubOwner);
+      const queue = factory.cfg.githubQueue;
+      const managed =
+        event === "issue_comment" && repo && queue?.repos.some((r) => r.toLowerCase() === repo.toLowerCase());
+      const posting = managed ? await identity(repo) : null;
+      const comment = object(p?.comment);
+      const commentId = number(comment?.id);
+      const boundary = managed && repo ? factory.store.commentStreamBoundary(repo) : null;
+      if (
+        event === "issue_comment" &&
+        repo &&
+        ((commentId &&
+          factory.store.isFactoryComment(
+            repo,
+            commentId,
+            string(comment?.body) ?? "",
+            login(comment?.user) ?? "",
+          )) ||
+          (managed &&
+            (!commentId ||
+              !Number.isFinite(Date.parse(string(comment?.created_at) ?? "")) ||
+              (boundary && Date.parse(string(comment?.created_at) ?? "") < Date.parse(boundary)) ||
+              Date.parse(string(comment?.updated_at) ?? "") !==
+                Date.parse(string(comment?.created_at) ?? ""))))
+      ) {
+        factory.store.finishInbox(id, "ignored", "factory or edited comment");
+        return new Response("factory or edited comment");
+      }
+      const mapped = mapGitHubEvent(
+        event,
+        payload,
+        factory.cfg.githubOwner,
+        managed && queue
+          ? { trusted: queue.trusted, botLogin: posting?.kind === "app" ? posting.botLogin : undefined }
+          : undefined,
+      );
+
       if (!mapped.request) {
         factory.store.finishInbox(id, mapped.error ? "error" : "ignored", mapped.note);
         return new Response(mapped.note, { status: mapped.error ? 400 : 200 });
       }
-      const run = await factory.createRun(mapped.request, true);
+      const run =
+        event === "issue_comment" && repo && commentId
+          ? await submitCommentCommand(factory, mapped.request, { repo, id: commentId }, true)
+          : await factory.createRun(mapped.request, true);
       factory.store.finishInbox(id, "run_created", mapped.note, run.id);
       return Response.json({ runId: run.id }, { status: 201 });
     } catch (error) {
       const note = redactCredentials(error instanceof Error ? error.message : String(error));
-      if (error instanceof IssueClaimed) {
+      if (error instanceof IssueClaimed || error instanceof CommentProcessed) {
         factory.store.finishInbox(id, "ignored", note);
         return new Response(note, { status: 200 });
       }

@@ -31,7 +31,8 @@ open PR merges or closes unmerged. Discreet repositories receive labels without 
 Writes use the GitHub App identity where `[github.app]` covers the repository, otherwise
 `gh` credentials. Write failures are logged and retried next poll without blocking runs.
 SQL selects only outstanding lifecycle work, so completed history adds no per-run reads or GitHub
-calls. Each poll caps lifecycle GitHub calls at 50 and resumes deferred work next poll;
+calls. Each poll shares a 50-call allowance between lifecycle delivery and comment commands, including
+pagination, metadata lookups and 304 responses, and resumes deferred work next poll;
 queue admission still proceeds when the lifecycle budget is exhausted.
 
 An issue with GitHub sub-issues is an epic and is never built itself. Finish each epic
@@ -64,6 +65,30 @@ polling. `max_issue_runs` is a positive integer, default 1. `poll_seconds` is a 
 number, default 180, clamped to a minimum of 15 seconds. Changing these keys requires
 a restart. Older releases ignore `[github.queue]` because the `[github]` table is not
 checked for unknown keys, so rollback remains supported.
+
+## Comment commands
+
+Queue repositories also poll `repos/<repo>/issues/comments` at `poll_seconds`, using the
+repository's configured GitHub identity, `since`, ascending update order and conditional requests.
+No webhook is required. A new comment must begin with literal `/limitless ` and a non-empty
+request, or `@<App bot login>` followed by whitespace and a request when the App identity is
+resolved. Leading prose does not count. Both polling and webhooks use the queue's case-insensitive
+`trusted` list in these repositories; elsewhere webhook comments remain owner-only.
+
+Comments edited by another account, or lacking complete edit evidence, are ignored. Factory
+comments are ignored, including recorded comments posted with owner credentials; human owner
+commands still count. Commands are explicit requests and do not need priority labels or ordinary
+queue eligibility, but share the transactional issue claim check. A claim refusal is logged with
+credentials redacted and permanently recorded as processed, rather than retried after claim release.
+
+First enable persists the current time for each repository before fetching comments. Comments
+created earlier never execute, even if edited later. Stream pages and processed comment ids
+survive restarts; the same repository/comment id creates at most one run across webhook delivery,
+polling and replay after run completion. Unfinished pages resume within the existing call allowance.
+Requests use the webhook's quoted JSON framing, issue source reference and author. Only the
+configured owner's command text can grant `Allow:` directives; issue context and other trusted
+authors cannot. Polled commands have no verified-webhook provenance. Questions and approvals
+by comment remain outside this feature.
 
 ## Eligibility and ordering
 
