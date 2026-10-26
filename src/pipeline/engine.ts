@@ -234,15 +234,17 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
   if (ctx.state.phase !== "deliver") ctx.state.githubWait = undefined;
-  ctx.run = deps.store.updateRun(
-    runId,
-    {
-      status: "running",
-      error: null,
-      ...(run.startedAt ? {} : { startedAt: Date.now() }),
-    },
-    ctx.state,
-  );
+  // A recorded rejection is already terminal; resume only finishes its rollback.
+  if (!ctx.state.postMergeRejection)
+    ctx.run = deps.store.updateRun(
+      runId,
+      {
+        status: "running",
+        error: null,
+        ...(run.startedAt ? {} : { startedAt: Date.now() }),
+      },
+      ctx.state,
+    );
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
@@ -322,7 +324,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     return "succeeded";
   } catch (e) {
     const terminationError = processScope.getStore()?.terminationError;
-    if (terminationError && ctx.state.needsHumanReason !== terminationError.message) {
+    if (
+      terminationError &&
+      !ctx.state.postMergeRejection &&
+      ctx.state.needsHumanReason !== terminationError.message
+    ) {
       ctx.state.feedback = redactGateOutput(
         `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`,
       );
@@ -332,6 +338,10 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       deps.store.setRunState(runId, ctx.state);
     }
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
+    if (ctx.state.postMergeRejection && (signal.aborted || !(e instanceof NeedsHumanError))) {
+      ctx.log(`Rejected post-merge rollback interrupted: ${(e as Error).message}`, "warn");
+      return "needs_human";
+    }
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
       deps.store.updateRun(runId, { status: "queued", stage: null });
@@ -510,6 +520,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       deps.store.setRunState(runId, ctx.state);
     }
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
+    message = ctx.state.postMergeRejection?.reason ?? message;
     deps.store.updateRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
     return status;
   }
@@ -3248,6 +3259,7 @@ async function rollbackRejectedMerge(ctx: RunContext): Promise<never> {
   ctx.state.pendingRebaseSha = undefined;
   ctx.state.preRebaseGates = undefined;
   ctx.state.preRebaseHead = undefined;
+  ctx.state.needsHumanReason = rejected.reason;
   ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: rejected.head }, ctx.state);
   throw new NeedsHumanError(rejected.reason);
 }
@@ -3475,7 +3487,12 @@ async function mergeForDelivery(
       head: before,
       round: ctx.state.round,
     };
-    await ctx.save("post-merge-rejected");
+    ctx.state.needsHumanReason = ctx.state.postMergeRejection.reason;
+    ctx.run = ctx.store.updateRun(
+      ctx.run.id,
+      { status: "needs_human", error: ctx.state.needsHumanReason.slice(0, 2000), finishedAt: Date.now() },
+      ctx.state,
+    );
     return rollbackRejectedMerge(ctx);
   }
   const merged = await validateMerge(cwd, before, fetched);

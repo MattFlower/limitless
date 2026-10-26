@@ -161,139 +161,235 @@ describe("pipeline (fake agents, real git + gates)", () => {
     },
   );
 
-  test.each(["reset", "state save"])(
-    "rejected post-merge restart after %s never retries the attempt",
-    async (boundary) => {
-      writeFileSync(
-        join(repoDir, ".limitless.toml"),
-        '[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]\n',
-      );
-      await sh(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "rejection restart fixture"],
-        { cwd: repoDir },
-      );
-      const bare = await githubFixture();
-      const f = start(async (s) => {
-        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-        if (roleOf(s) === "review") {
-          await advanceBase(bare, "base.txt", "new base\n");
-          return { structured: approve };
-        }
-        return { files: { "farewell.txt": "goodbye\n" } };
-      });
-      await f.stop();
-      registerGithub(f, bare);
-      const fixture = postMergeWorkerFixture(f, "fail");
-      const executor = f.deps.gateExecutor;
-      if (!executor) throw new Error("Missing gate executor");
-      const gateStarts = spyOn(executor, "start");
-      const attach = executor.attach.bind(executor);
-      let resuming = false;
-      executor.attach = (handle, signal) => {
-        const execution = attach(handle, signal);
-        return {
-          ...execution,
-          result: execution.result.then((result) =>
-            resuming
-              ? { ...result, checks: result.checks.map((c) => ({ ...c, ok: true, exitCode: 0 })) }
-              : result,
-          ),
-        };
+  test.each(
+    ["before rejection", "rejection", "reset", "clean", "state save", "terminal status"].flatMap(
+      (boundary) => [
+        { boundary, compatibility: false },
+        { boundary, compatibility: true },
+      ],
+    ),
+  )("rejected post-merge restart %o never retries the attempt", async ({ boundary, compatibility }) => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]\n',
+    );
+    await sh(
+      ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "rejection restart fixture"],
+      { cwd: repoDir },
+    );
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") {
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    const fixture = postMergeWorkerFixture(f, "fail");
+    const executor = f.deps.gateExecutor;
+    if (!executor) throw new Error("Missing gate executor");
+    const gateStarts = spyOn(executor, "start");
+    const attach = executor.attach.bind(executor);
+    let resuming = false;
+    executor.attach = (handle, signal) => {
+      const execution = attach(handle, signal);
+      return {
+        ...execution,
+        result: execution.result.then((result) =>
+          resuming
+            ? { ...result, checks: result.checks.map((c) => ({ ...c, ok: true, exitCode: 0 })) }
+            : result,
+        ),
       };
-      const prepare = spyOn(merges, "prepareMerge");
-      const git = merges.mergeGit;
-      let runId = "";
-      let beforeRollback: RunState | undefined;
-      const reset = spyOn(merges, "mergeGit").mockImplementation(async (cwd, args, ...rest) => {
-        const state = f.store.getRunState<RunState>(runId);
-        const rollback = args[0] === "reset" && args[2] === state?.preRebaseHead;
-        if (rollback) beforeRollback = state ?? undefined;
-        const result = await git(cwd, args, ...rest);
-        if (rollback && boundary === "reset") throw new SimulatedTermination("after rollback reset");
-        return result;
-      });
-      const update = f.store.updateRun.bind(f.store);
-      const persist = spyOn(f.store, "updateRun").mockImplementation((...args) => {
-        const result = update(...args);
-        if (
-          boundary === "state save" &&
-          beforeRollback &&
-          args[1].headSha === beforeRollback.preRebaseHead &&
-          args[2] &&
-          !(args[2] as RunState).pendingRebaseSha
-        )
-          throw new SimulatedTermination("after rollback state save");
-        return result;
-      });
-      let reopened: Store | undefined;
+    };
+    const prepare = spyOn(merges, "prepareMerge");
+    const complete = spyOn(merges, "completeMerge");
+    const git = merges.mergeGit;
+    let runId = "";
+    let beforeRollback: RunState | undefined;
+    let originalBase: string | null | undefined;
+    let interruptedAt: string | undefined;
+    let rollbackStarted = false;
+    const snapshots: { run: ReturnType<Store["getRun"]>; state: RunState | null }[] = [];
+    const snapshot = () => {
+      const db = new Store(f.deps.cfg.paths.db);
       try {
-        const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-        runId = run.id;
-        expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
-        reset.mockRestore();
-        persist.mockRestore();
+        snapshots.push({ run: db.getRun(runId), state: db.getRunState<RunState>(runId) });
+      } finally {
+        db.close();
+      }
+    };
+    const interrupt = (point: string) => {
+      if (boundary !== point) return;
+      interruptedAt = point;
+      throw new SimulatedTermination(`at ${point}`);
+    };
+    const reset = spyOn(merges, "mergeGit").mockImplementation(async (cwd, args, ...rest) => {
+      const rollback = args[0] === "reset" && args[2] === beforeRollback?.preRebaseHead;
+      if (rollback) rollbackStarted = true;
+      const result = await git(cwd, args, ...rest);
+      if (rollback) interrupt("reset");
+      if (rollbackStarted && args[0] === "clean") interrupt("clean");
+      return result;
+    });
+    const interceptSave = <T>(save: () => T, state?: RunState, head?: string | null): T => {
+      const rejection = state?.postMergeRejection && !beforeRollback;
+      if (rejection) {
+        beforeRollback = JSON.parse(JSON.stringify(state)) as RunState;
+        originalBase = f.store.getRun(runId)?.baseSha;
+        if (!state.worktreePath) throw new Error("Missing rejection checkout");
+        writeFileSync(join(state.worktreePath, "rollback-junk"), "remove on rollback\n");
+        interrupt("before rejection");
+      }
+      const result = save();
+      if (state?.postMergeRejection) snapshot();
+      if (rejection) interrupt("rejection");
+      if (beforeRollback && head === beforeRollback.preRebaseHead && !state?.pendingRebaseSha)
+        interrupt("state save");
+      return result;
+    };
+    const update = f.store.updateRun.bind(f.store);
+    const persist = spyOn(f.store, "updateRun").mockImplementation((...args) => {
+      const result = interceptSave(() => update(...args), args[2] as RunState | undefined, args[1].headSha);
+      if (beforeRollback && args[1].status === "needs_human" && !args[2]) {
+        snapshot();
+        interrupt("terminal status");
+      }
+      return result;
+    });
+    const save = f.store.setRunState.bind(f.store);
+    const persistState = spyOn(f.store, "setRunState").mockImplementation((id, state) => {
+      interceptSave(() => save(id, state), state as RunState);
+    });
+    let reopened: Store | undefined;
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      runId = run.id;
+      const status = await executeRun(f.deps, run.id, new AbortController().signal).catch((error) => {
+        // The final status write is outside the engine's catch block.
+        expect(error).toBeInstanceOf(SimulatedTermination);
+        return "running";
+      });
+      expect(status).toBe("running");
+      expect(interruptedAt).toBe(boundary);
+      reset.mockRestore();
+      persist.mockRestore();
+      persistState.mockRestore();
+      reopened = new Store(f.deps.cfg.paths.db);
+      const interrupted = reopened.getRunState<RunState>(run.id);
+      const cwd = interrupted?.worktreePath;
+      const head = beforeRollback?.preRebaseHead;
+      if (!cwd || !head || !beforeRollback?.postMergeGates || !beforeRollback.pendingRebaseSha)
+        throw new Error("Missing rollback checkpoint");
+      const rejected = beforeRollback?.postMergeRejection;
+      const evidence = beforeRollback.postMergeGates;
+      const gates = gateStarts.mock.calls.length;
+      const mergesBeforeResume = prepare.mock.calls.length;
+      const completedMerges = complete.mock.calls.length;
+      expect(fixture.remote).toHaveLength(2);
+      expect(fixture.local).toHaveLength(1);
+      expect(interrupted?.pendingRebaseSha).toBe(
+        ["state save", "terminal status"].includes(boundary) ? undefined : beforeRollback.pendingRebaseSha,
+      );
+      if (boundary === "before rejection") {
+        expect(interrupted?.postMergeRejection).toBeUndefined();
+        expect(interrupted?.needsHumanReason).toBeUndefined();
+        expect(reopened.getRun(run.id)?.status).toBe("running");
+      } else {
+        expect(interrupted?.postMergeRejection).toEqual(rejected);
+      }
+      resuming = true;
+      if (compatibility) {
+        if (!interrupted) throw new Error("Missing interrupted state");
+        // Removing only the new field exercises the previous engine's needsHumanReason guard.
+        // Before persistence, both engines instead reclassify the saved gate evidence.
+        delete interrupted.postMergeRejection;
+        reopened.setRunState(run.id, interrupted);
+        reopened.close();
         reopened = new Store(f.deps.cfg.paths.db);
-        const originalBase = reopened.getRun(run.id)?.baseSha;
-        const interrupted = reopened.getRunState<RunState>(run.id);
-        const cwd = interrupted?.worktreePath;
-        const head = beforeRollback?.preRebaseHead;
-        if (!cwd || !head || !beforeRollback?.postMergeGates || !beforeRollback.pendingRebaseSha)
-          throw new Error("Missing rollback checkpoint");
-        const rejected = beforeRollback?.postMergeRejection;
-        const evidence = beforeRollback.postMergeGates;
-        const gates = gateStarts.mock.calls.length;
-        const mergesBeforeResume = prepare.mock.calls.length;
-        expect(fixture.remote).toHaveLength(2);
-        expect(fixture.local).toHaveLength(1);
-        expect(interrupted?.pendingRebaseSha).toBe(
-          boundary === "reset" ? beforeRollback?.pendingRebaseSha : undefined,
-        );
-        if (boundary === "state save") {
-          expect(interrupted?.preRebaseHead).toBeUndefined();
-          expect(interrupted?.preRebaseGates).toBeUndefined();
-        }
-        resuming = true;
         expect(await executeRun({ ...f.deps, store: reopened }, run.id, new AbortController().signal)).toBe(
           "needs_human",
         );
-        expect(rejected).toEqual({
-          reason: expect.stringContaining("post-merge gates regressed"),
-          sha: evidence.sha,
-          base: beforeRollback.pendingRebaseSha,
-          head,
-          round: 0,
+        expect(reopened.getRun(run.id)).toMatchObject({
+          status: "needs_human",
+          error: rejected?.reason.slice(0, 2000),
         });
-        expect(rejected?.reason).toContain("coordinator assertion detail");
-        expect(rejected?.reason).toEndWith(`after merging onto ${evidence?.base.slice(0, 8)}`);
-        expect(interrupted?.postMergeRejection).toEqual(rejected);
-        const finished = reopened.getRun(run.id);
-        expect(finished?.status).toBe("needs_human");
-        expect(finished?.error).toBe(rejected?.reason.slice(0, 2000));
-        expect(finished?.headSha).toBe(head);
-        expect(finished?.baseSha).toBe(originalBase);
-        expect(finished?.baseSha).not.toBe(rejected?.base);
-        expect((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(head);
-        const state = reopened.getRunState<RunState>(run.id);
-        expect(state?.postMergeRejection).toEqual(rejected);
-        expect(state?.postMergeGates).toEqual(evidence);
-        expect(state?.lastGates).toMatchObject(beforeRollback.preRebaseGates ?? []);
-        expect(state?.pendingRebaseSha).toBeUndefined();
-        expect(state?.preRebaseHead).toBeUndefined();
-        expect(state?.preRebaseGates).toBeUndefined();
-        expect(prepare.mock.calls).toHaveLength(mergesBeforeResume);
+        const legacy = reopened.getRunState<RunState>(run.id);
+        expect(legacy?.needsHumanReason).toBe(rejected?.reason);
         expect(gateStarts.mock.calls).toHaveLength(gates);
+        expect(complete.mock.calls).toHaveLength(completedMerges);
+        expect(prepare.mock.calls).toHaveLength(
+          mergesBeforeResume + (boundary === "before rejection" ? 1 : 0),
+        );
         expect(fixture.remote).toHaveLength(2);
         expect(fixture.local).toHaveLength(1);
-      } finally {
-        reset.mockRestore();
-        persist.mockRestore();
-        prepare.mockRestore();
-        gateStarts.mockRestore();
-        reopened?.close();
-        fixture.processSpy.mockRestore();
+        if (!legacy) throw new Error("Missing legacy state");
+        // Restore the ignored checkpoint so the current engine can finish any remaining cleanup.
+        legacy.postMergeRejection = rejected;
+        reopened.setRunState(run.id, legacy);
+        reopened.close();
+        reopened = new Store(f.deps.cfg.paths.db);
       }
-    },
-  );
+      expect(await executeRun({ ...f.deps, store: reopened }, run.id, new AbortController().signal)).toBe(
+        "needs_human",
+      );
+      if (boundary !== "before rejection") {
+        expect(snapshots.length).toBeGreaterThan(0);
+        for (const saved of snapshots) {
+          expect(saved.state?.postMergeRejection).toEqual(rejected);
+          expect(saved.state?.needsHumanReason).toBe(rejected?.reason);
+          expect(saved.run).toMatchObject({
+            status: "needs_human",
+            error: rejected?.reason.slice(0, 2000),
+            baseSha: originalBase,
+          });
+        }
+      }
+      expect(rejected).toEqual({
+        reason: expect.stringContaining("post-merge gates regressed"),
+        sha: evidence.sha,
+        base: beforeRollback.pendingRebaseSha,
+        head,
+        round: 0,
+      });
+      expect(rejected?.reason).toContain("coordinator assertion detail");
+      expect(rejected?.reason).toContain("test-worker");
+      expect(rejected?.reason).toEndWith(`after merging onto ${evidence?.base.slice(0, 8)}`);
+      const finished = reopened.getRun(run.id);
+      expect(finished?.status).toBe("needs_human");
+      expect(finished?.error).toBe(rejected?.reason.slice(0, 2000));
+      expect(finished?.headSha).toBe(head);
+      expect(finished?.baseSha).toBe(originalBase);
+      expect(finished?.baseSha).not.toBe(rejected?.base);
+      expect((await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim()).toBe(head);
+      const state = reopened.getRunState<RunState>(run.id);
+      expect(existsSync(join(cwd, "rollback-junk"))).toBe(false);
+      expect(state?.needsHumanReason).toBe(rejected?.reason);
+      expect(state?.postMergeRejection).toEqual(rejected);
+      expect(state?.postMergeGates).toEqual(evidence);
+      expect(state?.lastGates).toMatchObject(beforeRollback.preRebaseGates ?? []);
+      expect(state?.pendingRebaseSha).toBeUndefined();
+      expect(state?.preRebaseHead).toBeUndefined();
+      expect(state?.preRebaseGates).toBeUndefined();
+      expect(prepare.mock.calls).toHaveLength(mergesBeforeResume + (boundary === "before rejection" ? 1 : 0));
+      expect(complete.mock.calls).toHaveLength(completedMerges);
+      expect(gateStarts.mock.calls).toHaveLength(gates);
+      expect(fixture.remote).toHaveLength(2);
+      expect(fixture.local).toHaveLength(1);
+    } finally {
+      reset.mockRestore();
+      persist.mockRestore();
+      persistState.mockRestore();
+      prepare.mockRestore();
+      complete.mockRestore();
+      gateStarts.mockRestore();
+      reopened?.close();
+      fixture.processSpy.mockRestore();
+    }
+  });
 
   test("restart between coordinator confirmations keeps the completed first check", async () => {
     writeFileSync(
@@ -873,6 +969,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe(
         scenario === "block" ? "needs_human" : "succeeded",
       );
+      await wait(() => !resumed.scheduler.activeRunIds.includes(run.id), { timeoutMs: 20_000 });
       const stages = resumed.store.listStages(run.id).filter((s) => s.name === "gates");
       expect(stages.map((s) => s.status)).toEqual([
         "succeeded",

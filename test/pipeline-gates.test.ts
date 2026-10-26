@@ -17,7 +17,7 @@ import { waitClock } from "./wait-clock.ts";
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start, githubFixture, registerGithub, advanceBase } = pipelineSetup({
+const { start, wait, githubFixture, registerGithub, advanceBase } = pipelineSetup({
   get home() {
     return home;
   },
@@ -768,6 +768,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         else await clock.advance(900_000);
       }
       const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human", "cancelled"]);
+      // Rejection becomes terminal before rollback and draft reporting finish.
+      await wait(() => !f.scheduler.activeRunIds.includes(run.id), { timeoutMs: 20_000 });
       const state = f.store.getRunState<RunState>(run.id);
       const retries = [
         "slot",
