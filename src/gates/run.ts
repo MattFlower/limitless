@@ -14,6 +14,7 @@ import {
   findGateCounterpart,
   launchFailure,
   launchFailureScan,
+  redactGateData,
   redactGateOutput,
   redactGateStreams,
 } from "./output.ts";
@@ -21,6 +22,9 @@ import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
+  executionProvenance?: Pick<GateRun, "sha" | "trackedClean" | "provenanceError">;
+  /** Successful execution rejected as evidence; the failed result remains authoritative. */
+  retryAttempt?: GateResult;
   reused?: { executionId: string; treeHash: string; createdAt: number };
   name: string;
   command: string;
@@ -87,6 +91,8 @@ export interface GateComparison {
     reason: string;
     result?: GateResult;
   };
+  retryProvenanceRejected?: boolean;
+  retryOriginal?: { verdict: GateVerdict; blocking: boolean };
   /** The failing run that triggered a retry. */
   firstAttempt?: GateResult;
 }
@@ -323,6 +329,40 @@ function retrySetupFailure(original: GateResult, run: GateRun): GateResult {
   };
 }
 
+/** A retry can clear a failure only on the checked, unchanged tracked tree. */
+export function validateRetry(
+  attempt: GateResult,
+  original: GateResult,
+  sha: string | undefined,
+  provenance = attempt.executionProvenance,
+  onReject?: (original: GateResult, reason: string) => void,
+): GateResult {
+  const { sha: executedSha, trackedClean, provenanceError } = provenance ?? {};
+  const result = { ...attempt, executionProvenance: redactGateData({ sha: executedSha, trackedClean, provenanceError }) };
+  if (!attempt.ok || confinementFailed(attempt)) return result;
+  const reason =
+    !sha || !executedSha
+      ? "missing execution SHA provenance"
+      : executedSha !== sha
+        ? `execution SHA ${executedSha} does not match checked commit ${sha}`
+        : trackedClean !== true
+          ? "tracked checkout cleanliness was not confirmed"
+          : undefined;
+  if (!reason) return result;
+  const diagnostic = redactGateOutput(
+    `Retry rejected: ${reason}${provenanceError ? `; ${provenanceError}` : ""}`,
+  );
+  onReject?.(original, diagnostic);
+  return {
+    ...original,
+    firstAttempt: original,
+    retryAttempt: result,
+    confinementError: confinementFailed(original),
+    output: `${original.output}\n\n${diagnostic}`,
+    ...(original.failures ? { failures: `${original.failures}\n\n${diagnostic}` } : {}),
+  };
+}
+
 /** Confirm known failing files; factory gates also require a full-suite retry after a pass. */
 export async function retryFailures(
   failures: { check: GateCommand; original: GateResult }[],
@@ -339,28 +379,6 @@ export async function retryFailures(
   const sha = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal })
     .then((r) => r.stdout.trim())
     .catch(() => undefined);
-  const validate = (attempt: GateResult, run: GateRun, original: GateResult): GateResult => {
-    if (!attempt.ok || confinementFailed(attempt)) return attempt;
-    const reason =
-      !sha || !run.sha
-        ? "missing execution SHA provenance"
-        : run.sha !== sha
-          ? `execution SHA ${run.sha} does not match checked commit ${sha}`
-          : run.trackedClean !== true
-            ? "tracked checkout cleanliness was not confirmed"
-            : undefined;
-    if (!reason) return attempt;
-    const diagnostic = redactGateOutput(
-      `Retry rejected: ${reason}${run.provenanceError ? `; ${run.provenanceError}` : ""}`,
-    );
-    onSkip?.(original, diagnostic);
-    return {
-      ...original,
-      confinementError: confinementFailed(original),
-      output: `${original.output}\n\n${diagnostic}`,
-      ...(original.failures ? { failures: `${original.failures}\n\n${diagnostic}` } : {}),
-    };
-  };
   const targets = new Map<GateResult, GateResult>();
   const full: typeof failures = [];
   for (const entry of failures) {
@@ -398,17 +416,18 @@ export async function retryFailures(
       }
       const raw = retried.checks[0];
       if (!raw) continue;
-      targets.set(original, raw);
-      const attempt = validate(raw, retried, original);
+      const attempt = validateRetry(raw, original, sha, retried, onSkip);
+      const target = attempt.retryAttempt ?? attempt;
+      targets.set(original, target);
       if (targetedOnly) {
-        results.set(original, { ...attempt, firstAttempt: original, targetedRetry: raw });
+        results.set(original, { ...attempt, firstAttempt: original, targetedRetry: target });
         continue;
       }
-      if (attempt !== raw || confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
+      if ((raw.ok && !attempt.ok) || confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
         results.set(original, {
-          ...(attempt === raw ? original : attempt),
+          ...(raw.ok && !attempt.ok ? attempt : original),
           firstAttempt: original,
-          targetedRetry: raw,
+          targetedRetry: target,
         });
         continue;
       }
@@ -434,7 +453,7 @@ export async function retryFailures(
       const result = retried.checks[index];
       if (result)
         results.set(original, {
-          ...validate(result, retried, original),
+          ...validateRetry(result, original, sha, retried, onSkip),
           firstAttempt: original,
           targetedRetry: targets.get(original),
         });
@@ -590,6 +609,7 @@ export async function retryRegressions(
     const confinementError = confinementFailed(retry);
     return {
       ...c,
+      retryOriginal: c.retryOriginal ?? { verdict: c.verdict, blocking: c.blocking },
       verdict: confinementError ? "confinement_error" : retry.ok ? "flaky" : c.verdict,
       blocking: confinementError || !retry.ok,
       result: { ...retry, ...(c.result.docsOnly ? { docsOnly: c.result.docsOnly } : {}) },
