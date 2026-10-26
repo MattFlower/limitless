@@ -141,6 +141,21 @@ export interface RunState {
   /** Pinned delivery merge target (legacy field name); gates must pass before this becomes run.baseSha. */
   pendingRebaseSha?: string;
   preRebaseGates?: GateComparison[];
+  /** Coordinator confirmation is scoped to this merge attempt, including its original deadline. */
+  postMergeGates?: {
+    sha: string;
+    base: string;
+    head: string;
+    round: number;
+    deadline: number;
+    result?: {
+      setupOk: boolean;
+      timedOut: boolean;
+      comparison: GateComparison[];
+      /** Legacy attribution; normalized onto comparison entries on load. */
+      workers?: Record<string, string | null | undefined>;
+    };
+  };
   /** Expected first merge parent; also the fallback head if clean-merge gates regress. */
   preRebaseHead?: string;
   /** Completed, gated delivery merges; scoped to the run and review that authorized them. */
@@ -298,6 +313,30 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
   verify: 25 * 60_000,
 };
 
+/** Attach attribution before redaction; ambiguous sanitized names must never borrow a worker. */
+export function redactPostMergeComparisons(
+  checks: GateComparison[],
+  workers: Record<string, string | null | undefined> = {},
+): GateComparison[] {
+  const entries = Object.entries(workers);
+  return redactGateData(
+    checks.map((check) => {
+      const name = redactGateOutput(check.name);
+      const matches = entries.filter(([key]) => redactGateOutput(key) === name);
+      const worker =
+        matches.length === 1 && checks.filter((c) => redactGateOutput(c.name) === name).length === 1
+          ? matches[0]?.[1]
+          : matches.length
+            ? null
+            : undefined;
+      return {
+        ...check,
+        postMergeWorker: check.postMergeWorker !== undefined ? check.postMergeWorker : worker,
+      };
+    }),
+  );
+}
+
 export class RunContext {
   readonly deps: EngineDeps;
   private readonly stageConfig = new AsyncLocalStorage<Config>();
@@ -361,6 +400,9 @@ export class RunContext {
       checks.map((check) => ({
         ...check,
         result: redactGateDiagnostics(check.result),
+        ...(check.coordinatorConfirmation
+          ? { coordinatorConfirmation: redactGateData(check.coordinatorConfirmation) }
+          : {}),
         ...(check.firstAttempt ? { firstAttempt: redactGateDiagnostics(check.firstAttempt) } : {}),
       }));
     const baseline = this.state.baseline;
@@ -371,6 +413,12 @@ export class RunContext {
     for (const field of ["preRebaseGates", "lastGates"] as const) {
       const checks = this.state[field];
       if (checks) this.state[field] = comparisons(checks);
+    }
+    if (this.state.postMergeGates?.result) {
+      const result = this.state.postMergeGates.result;
+      result.comparison = redactPostMergeComparisons(result.comparison, result.workers);
+      delete result.workers;
+      this.state.postMergeGates.result = redactGateData(result);
     }
     if (this.state.gateEvidence) this.state.gateEvidence.checks = comparisons(this.state.gateEvidence.checks);
     if (this.state.lastVerifiedEvidence?.lastGates)

@@ -337,15 +337,44 @@ export interface AgentGateRecord {
   comparison: unknown;
 }
 
-/** Issue numbers named by standalone `Closes #N` directives. */
-export const closedIssues = (prompt: string) =>
-  new Set([...prompt.matchAll(/\bcloses\s+#([1-9][0-9]*)(?![\w#])/gi)].map((m) => Number(m[1])));
+/** Issue numbers named by standalone `Closes #N` directives outside fenced blocks. */
+export function closedIssues(prompt: string): Set<number> {
+  const issues = new Set<number>();
+  let fence: string | undefined;
+  for (const line of prompt.split(/\r?\n/)) {
+    const [, marker, suffix] = /^[^\S\r\n]*(`{3,}|~{3,})(.*)$/.exec(line) ?? [];
+    if (fence) {
+      if (
+        marker &&
+        marker[0] === fence[0] &&
+        marker.length >= fence.length &&
+        /^[^\S\r\n]*$/.test(suffix ?? "")
+      )
+        fence = undefined;
+      continue;
+    }
+    if (marker) {
+      fence = marker;
+      continue;
+    }
+    const directive = /^[^\S\r\n]*closes[^\S\r\n]+#([1-9][0-9]*)[^\S\r\n]*$/i.exec(line);
+    if (directive) {
+      const number = Number(directive[1]);
+      if (Number.isSafeInteger(number)) issues.add(number);
+    }
+  }
+  return issues;
+}
 
 /** Follow admission rules: GitHub prompt text cannot add issue links. */
 export function linkedIssues(
-  run: Pick<Run, "sourceRef" | "source" | "prompt" | "repoSlug">,
+  run: Pick<Run, "sourceRef" | "source" | "prompt" | "repoSlug"> & Partial<Pick<Run, "id">>,
+  store: Store,
 ): { repo: string; number: number }[] {
+  const owner = run.id && store.reviewRound(run.id)?.owner;
+  if (owner) return linkedIssues(owner, store);
   const ref = run.sourceRef;
+  if (ref?.kind === "review-round") return [];
   if (ref?.kind === "issue")
     return typeof ref.repo === "string" &&
       typeof ref.number === "number" &&
@@ -1197,7 +1226,6 @@ export class Store {
     return this.transaction(() => {
       const refusal = admission?.();
       if (refusal) throw new Error(`Run admission refused: ${refusal}`);
-      const claims: { repo: string; number: number }[] = [];
       if (req.sourceRef?.kind === "issue") {
         const { repo, number } = req.sourceRef;
         if (
@@ -1207,10 +1235,16 @@ export class Store {
           number <= 0
         )
           throw new Error("issue sourceRef requires a repository and positive issue number");
-        claims.push({ repo, number });
-      } else if (req.source !== "github")
-        claims.push(...[...closedIssues(req.prompt)].map((number) => ({ repo: repo.slug, number })));
-      for (const claim of claims) {
+      }
+      for (const claim of linkedIssues(
+        {
+          prompt: req.prompt,
+          source: req.source ?? "ui",
+          sourceRef: req.sourceRef ?? null,
+          repoSlug: repo.slug,
+        },
+        this,
+      )) {
         const run = this.issueClaim(claim.repo, claim.number);
         if (run) throw new IssueClaimed(claim.repo, claim.number, run);
       }
@@ -1225,15 +1259,14 @@ export class Store {
       WHERE runs.status IN (${ISSUE_CLAIM_STATUSES.map(() => "?").join(",")}) AND (
         (json_extract(runs.source_ref, '$.kind') = 'issue' AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
           AND json_extract(runs.source_ref, '$.number') = ?)
-        OR (lower(repos.slug) = lower(?) AND runs.prompt LIKE '%closes%'))`)
+        OR (lower(repos.slug) = lower(?) AND runs.prompt LIKE '%closes%')
+        OR runs.id IN (SELECT run_id FROM review_rounds))`)
       .all(...ISSUE_CLAIM_STATUSES, repo, number, repo) as Row[];
     return (
       candidates
         .map(toRun)
         .find((run) =>
-          run.sourceRef?.kind === "issue"
-            ? same(run.sourceRef.repo) && run.sourceRef.number === number
-            : run.source !== "github" && same(run.repoSlug) && closedIssues(run.prompt).has(number),
+          linkedIssues(run, this).some((issue) => same(issue.repo) && issue.number === number),
         ) ?? null
     );
   }
@@ -1327,12 +1360,13 @@ export class Store {
       AND ((json_extract(runs.source_ref, '$.kind') = 'issue'
         AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
         AND json_extract(runs.source_ref, '$.number') = ?)
-        OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%'))`)
+        OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%')
+        OR runs.id IN (SELECT run_id FROM review_rounds))`)
       .all(run.createdAt, run.createdAt, run.id, repo, number, repo) as Row[];
     return !rows
       .map(toRun)
       .some((candidate) =>
-        linkedIssues(candidate).some(
+        linkedIssues(candidate, this).some(
           (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
         ),
       );
@@ -1345,13 +1379,14 @@ export class Store {
         AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
         AND json_extract(runs.source_ref, '$.number') = ?)
       OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%')
+      OR runs.id IN (SELECT run_id FROM review_rounds)
       ORDER BY runs.created_at DESC, runs.rowid DESC`)
       .all(repo, number, repo) as Row[];
     return (
       rows
         .map(toRun)
         .find((run) =>
-          linkedIssues(run).some(
+          linkedIssues(run, this).some(
             (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
           ),
         ) ?? null
@@ -2215,15 +2250,20 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
 
   /** A merged run supersedes needs_human runs in its repository that close one of the same issues. */
   supersedeByIssue(merged: Run, exclude: readonly string[] = []): Run[] {
-    const issues = closedIssues(merged.prompt);
-    if (!issues.size) return [];
+    const issues = linkedIssues(merged, this);
+    if (!issues.length) return [];
     const input = { kind: "superseded", ref: merged.prUrl ?? merged.id, by: "system" } as const;
     return this.listRuns({ status: ["needs_human"], repoId: merged.repoId, limit: Number.MAX_SAFE_INTEGER })
       .filter(
         (r) =>
           r.id !== merged.id &&
           !exclude.includes(r.id) &&
-          [...closedIssues(r.prompt)].some((n) => issues.has(n)),
+          linkedIssues(r, this).some((issue) =>
+            issues.some(
+              (other) =>
+                other.repo.toLowerCase() === issue.repo.toLowerCase() && other.number === issue.number,
+            ),
+          ),
       )
       .flatMap((r) => this.resolveRun(r.id, input, { from: ["needs_human"] }) ?? []);
   }

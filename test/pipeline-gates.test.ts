@@ -2,6 +2,7 @@ import { describe, expect, spyOn } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import type { GateComparison } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
@@ -9,6 +10,7 @@ import * as proc from "../src/util/proc.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { postMergeWorkerFixture } from "./post-merge-worker-support.ts";
 import { test } from "./read-policy-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -37,6 +39,203 @@ const { start, githubFixture, registerGithub, advanceBase } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    "pass",
+    "fail",
+    "local",
+    "fallback",
+    "missing attribution",
+    "invalid files",
+    "unknown worker",
+    "mismatch",
+    "confinement",
+    "slot deadline",
+  ])("post-merge worker confirmation: %s", async (scenario) => {
+    const secret = "synthetic-confirmation-retry-credential";
+    registerCredential("confirmation-retry", secret);
+    const retry = `bun test {files}${["pass", "fail"].includes(scenario) ? ` '${secret}'` : ""}`;
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nretry_files = "${retry}"\nchecks = [{ name = "test", run = "bun test", timeoutSec = 37 }]\n`,
+    );
+    await sh(
+      ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "worker confirmation fixture"],
+      { cwd: repoDir },
+    );
+    const bare = await githubFixture();
+    let approved = "";
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") {
+        approved = (await sh(["git", "rev-parse", "HEAD"], { cwd: s.cwd })).stdout.trim();
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    const checkpoints: string[] = [];
+    const save = f.store.setRunState.bind(f.store);
+    const persist = spyOn(f.store, "setRunState").mockImplementation((id, state) => {
+      save(id, state);
+      const evidence = f.store.getRunState<RunState>(id)?.postMergeGates;
+      if (evidence) checkpoints.push(JSON.stringify(evidence));
+    });
+    const previous = gateSlots.limit;
+    gateSlots.setLimit(1);
+    const clock = waitClock();
+    const queued = deferred<void>();
+    let release: (() => void) | undefined;
+    let timeoutSpy: ReturnType<typeof spyOn<typeof AbortSignal, "timeout">> | undefined;
+    let admissionSpy: ReturnType<typeof spyOn<typeof gateSlots, "acquire">> | undefined;
+    if (scenario === "confinement")
+      f.deps.confinement = {
+        verify: async () => {
+          throw new Error("coordinator confinement unavailable");
+        },
+        wrap: (cmd) => cmd,
+      };
+    const fixture = postMergeWorkerFixture(f, scenario, () => {
+      if (scenario === "slot deadline") {
+        const deadline = new AbortController();
+        timeoutSpy = spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+          clock.timer.set(() => deadline.abort(new Error("deadline")), ms);
+          return deadline.signal;
+        });
+        const acquire = gateSlots.acquire.bind(gateSlots);
+        admissionSpy = spyOn(gateSlots, "acquire").mockImplementation((...args) => {
+          const result = acquire(...args);
+          queued.resolve();
+          return result;
+        });
+      }
+    });
+    try {
+      if (scenario === "slot deadline") release = await gateSlots.acquire(new AbortController().signal);
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      const execution = executeRun(f.deps, run.id, new AbortController().signal);
+      if (scenario === "slot deadline") {
+        await Promise.race([
+          queued.promise,
+          execution.then(() => {
+            throw new Error("coordinator confirmation never queued");
+          }),
+        ]);
+        await clock.advance(111_000);
+      }
+      expect(await execution).toBe(scenario === "pass" ? "succeeded" : "needs_human");
+      const saved = fixture.saved(run.id);
+      const evidence: GateComparison[] = JSON.parse(
+        f.store.getArtifact(run.id, "gates-rebase-0.json") ?? "[]",
+      );
+      const check = saved?.result?.comparison[0] ?? evidence[0];
+      expect(check?.blocking).toBe(scenario !== "pass");
+      expect(check?.verdict).toBe(scenario === "pass" ? "flaky" : "regressed");
+      expect(check?.result.ok).toBe(scenario === "pass");
+      expect(fixture.remote).toHaveLength(scenario === "mismatch" ? 1 : 2);
+      expect(fixture.local.map((c) => c.command)).toEqual(
+        ["pass", "fail"].includes(scenario) ? [retry.replace("{files}", "'./greeting.txt'")] : [],
+      );
+      if (scenario === "local" || scenario === "fallback")
+        expect(check?.coordinatorConfirmation).toBeUndefined();
+      else {
+        expect(check?.coordinatorConfirmation?.worker).toBe(
+          scenario === "unknown worker" ? undefined : "test-worker",
+        );
+        expect(typeof check?.coordinatorConfirmation?.reason).toBe("string");
+        expect(check?.coordinatorConfirmation?.originalVerdict).toBe("regressed");
+        expect(check?.result.output).not.toContain("worker diagnostic");
+        expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain('"coordinatorConfirmation"');
+      }
+      if (scenario === "pass" || scenario === "fail") {
+        expect(checkpoints.length).toBeGreaterThan(1);
+        for (const checkpoint of checkpoints) expect(checkpoint).not.toContain(secret);
+        expect(JSON.stringify(saved)).not.toContain(secret);
+        expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).not.toContain(secret);
+        expect(f.store.getRun(run.id)?.error ?? "").not.toContain(secret);
+        expect(check?.result.command).toContain("'[redacted]'");
+        expect(check?.result.targetedRetry?.command).toContain("'[redacted]'");
+        expect(check?.result.firstAttempt?.targetedRetry?.command).toStartWith("[withheld:");
+        expect(check?.coordinatorConfirmation?.result?.command).toContain("'[redacted]'");
+        expect(check?.firstAttempt?.ok).toBe(false);
+        expect(check?.result.firstAttempt?.targetedRetry?.ok).toBe(false);
+        expect(check?.result.firstAttempt?.output).toStartWith("[withheld:");
+        expect(check?.result.firstAttempt?.failures).toStartWith("[withheld:");
+        expect(check?.coordinatorConfirmation?.result?.ok).toBe(scenario === "pass");
+        expect(fixture.local[0]?.sha).toBe(saved?.sha);
+        expect(fixture.local[0]?.cwd).toBe(f.store.getRunState<RunState>(run.id)?.worktreePath);
+        if (scenario === "pass")
+          expect(f.store.getRunState<RunState>(run.id)?.lastGates?.[0]?.verdict).toBe("flaky");
+        else {
+          expect(f.store.getRun(run.id)?.error).toContain("coordinator assertion detail");
+          expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain(
+            "coordinator assertion detail",
+          );
+          expect(f.store.getRun(run.id)?.headSha).toBe(approved);
+          expect(f.store.getRunState<RunState>(run.id)?.lastGates?.[0]?.result.ok).toBe(true);
+        }
+      } else if (!["local", "fallback"].includes(scenario)) {
+        const reason = check?.coordinatorConfirmation?.reason ?? "";
+        expect(reason).toEqual(
+          expect.stringContaining(
+            (
+              {
+                "missing attribution": "attribution incomplete",
+                "invalid files": "invalid retry files",
+                "unknown worker": "attribution unavailable",
+                mismatch: "base configuration",
+                confinement: "confinement unavailable",
+                "slot deadline": "deadline expired",
+              } as Record<string, string>
+            )[scenario] ?? "missing diagnostic",
+          ),
+        );
+        expect(f.store.getRun(run.id)?.error).toContain(reason);
+      }
+    } finally {
+      persist.mockRestore();
+      timeoutSpy?.mockRestore();
+      admissionSpy?.mockRestore();
+      release?.();
+      await f.stop();
+      fixture.processSpy.mockRestore();
+      gateSlots.setLimit(previous);
+    }
+    expect(gateSlots.snapshot().occupied).toBe(0);
+  });
+
+  test("review: a compound check is refused before any coordinator confirmation runs", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test; fake-security-scan" }]\n`,
+    );
+    await sh(
+      ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "compound gate fixture"],
+      { cwd: repoDir },
+    );
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") {
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    const fixture = postMergeWorkerFixture(f);
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+      expect(f.deps.store.getRun(run.id)?.error ?? "").toContain("check is not a single bun test invocation");
+      expect(fixture.local).toHaveLength(0);
+    } finally {
+      fixture.processSpy.mockRestore();
+    }
+  });
+
   // Literal commands and escaped gate names across a gate-started restart are covered in
   // gate-executor.test.ts; this case covers package scripts named by gates.
   test("literal gate state survives restart: script names", async () => {
@@ -589,7 +788,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(status).toBe("cancelled");
         return;
       }
-      const evidence = JSON.parse(f.store.getArtifact(run.id, "gates-rebase-0.json") ?? "[]");
+      const evidence: GateComparison[] = JSON.parse(
+        f.store.getArtifact(run.id, "gates-rebase-0.json") ?? "[]",
+      );
       const stage = f.store
         .listStages(run.id)
         .filter((s) => s.name === "gates")
