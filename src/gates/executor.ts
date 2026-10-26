@@ -5,6 +5,7 @@ import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { GateConfig } from "./detect.ts";
+import type { ActionsProgress } from "./github-actions.ts";
 import { lanExecutor } from "./lan.ts";
 import { redactGateData, redactGateOutput } from "./output.ts";
 import {
@@ -27,7 +28,7 @@ export interface ExecutionHandle {
   id: string;
   startedAt: number;
   url?: string;
-  progress?: import("./github-actions.ts").ActionsProgress;
+  progress?: ActionsProgress;
 }
 export interface Execution<Res> {
   events: AsyncIterable<ExecutionEvent>;
@@ -97,6 +98,9 @@ export async function gateProvenance(cwd: string, signal: AbortSignal, checkedSh
   }
   return { trackedClean: false, provenanceError: "execution provenance could not be confirmed" };
 }
+
+/** Remote work may outlive a failed cleanup, so its durable handle is kept for another attempt. */
+export class GateCleanupError extends Error {}
 
 /** Shutdown detaches durable jobs; owner cancellation discards them. */
 export const gateShutdown = (signal: AbortSignal): boolean =>

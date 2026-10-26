@@ -1,0 +1,92 @@
+name: limitless-gates
+# Dispatched by the factory's github-actions gate executor from a per-run branch at the default
+# branch's tip, so this file is always the default branch's and any cache stays scoped to that branch.
+# The candidate is only checked out and run; it never defines this workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Candidate commit
+        required: true
+      setup:
+        description: JSON array of setup commands
+        required: true
+      setup_minutes:
+        description: Setup step timeout in minutes
+        required: true
+      checks:
+        description: JSON array of {index, run, timeoutSec, minutes}
+        required: true
+permissions:
+  contents: read
+jobs:
+  gate:
+    name: gate ${{ matrix.check.index }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(inputs.checks) }}
+    steps:
+      - name: Refuse the default branch
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CANDIDATE_SHA: ${{ inputs.sha }}
+        run: |
+          if [ -z "$DEFAULT_BRANCH" ] || [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo "limitless-gates never runs on the default branch" >&2
+            exit 1
+          fi
+          if ! [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "invalid candidate SHA" >&2
+            exit 1
+          fi
+      # The token is printed before any candidate code runs; records without it are candidate output.
+      - name: Token
+        id: token
+        run: |
+          token=$(openssl rand -hex 16)
+          echo "LIMITLESS_TOKEN $token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+          cat > "$RUNNER_TEMP/limitless-record.sh" <<'SCRIPT'
+          # Usage: limitless-record.sh INDEX TIMEOUT_SEC COMMAND
+          index=$1 limit=$2 command=$3 token=$LIMITLESS_TOKEN
+          echo "$token START $index"
+          start=$(date +%s%3N)
+          env -u LIMITLESS_TOKEN timeout --kill-after=10 "$limit" bash -c "$command"
+          code=$?
+          duration=$(( $(date +%s%3N) - start ))
+          timed=0
+          if { [ "$code" = 124 ] || [ "$code" = 137 ]; } && [ "$duration" -ge $(( limit * 1000 )) ]; then timed=1; fi
+          printf '\n%s END %s %s %s %s\n' "$token" "$index" "$code" "$duration" "$timed"
+          exit "$code"
+          SCRIPT
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+          no-cache: true
+      - run: git config --global user.email ci@example.com && git config --global user.name ci
+      - name: Setup
+        timeout-minutes: ${{ fromJSON(inputs.setup_minutes) }}
+        env:
+          LIMITLESS_TOKEN: ${{ steps.token.outputs.token }}
+          SETUP: ${{ inputs.setup }}
+        run: |
+          count=$(jq length <<<"$SETUP")
+          for ((i = 0; i < count; i++)); do
+            bash "$RUNNER_TEMP/limitless-record.sh" "$i" 900 "$(jq -r ".[$i]" <<<"$SETUP")" || exit 1
+          done
+      - name: Check
+        timeout-minutes: ${{ matrix.check.minutes }}
+        env:
+          LIMITLESS_TOKEN: ${{ steps.token.outputs.token }}
+          LIMITLESS_GATE_REPORT: ${{ runner.temp }}/limitless-gate-report.xml
+          SETUP: ${{ inputs.setup }}
+          CHECK_RUN: ${{ matrix.check.run }}
+          CHECK_TIMEOUT: ${{ matrix.check.timeoutSec }}
+        run: bash "$RUNNER_TEMP/limitless-record.sh" "$(jq length <<<"$SETUP")" "$CHECK_TIMEOUT" "$CHECK_RUN"

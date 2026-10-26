@@ -1707,6 +1707,31 @@ export async function remoteBranchSha(
   return remote.stdout.split("\t")[0] || null;
 }
 
+/**
+ * Delete a branch only while it still points at `expected`; a moved or missing branch is left alone.
+ * A delete transfers no objects, so `transport` is any factory-owned repository.
+ */
+export async function deleteBranchAt(
+  repo: Repo,
+  transport: string,
+  branch: string,
+  expected: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const url = repo.url;
+  if (!url) throw new Error("branch deletion requires a remote");
+  const ref = `refs/heads/${branch}`;
+  try {
+    await remoteSh([...BRANCH_PUSH, `--force-with-lease=${ref}:${expected}`, url, `:${ref}`], {
+      cwd: transport,
+      signal,
+    });
+  } catch (error) {
+    const remote = await remoteSh(["git", "ls-remote", url, ref], { cwd: transport, signal });
+    if (remote.stdout.split("\t")[0] === expected) throw error;
+  }
+}
+
 /** Update an existing PR head only if it still points at the commit we prepared from. */
 export async function pushExistingBranch(
   repo: Repo,

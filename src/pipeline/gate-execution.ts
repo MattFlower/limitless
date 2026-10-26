@@ -5,6 +5,7 @@ import {
   cancelGateExecution,
   type ExecutionHandle,
   executeGate,
+  GateCleanupError,
   type GateRequest,
   gateShutdown,
 } from "../gates/executor.ts";
@@ -95,6 +96,7 @@ export async function runGateExecution(
   const executor = ctx.deps.gateExecutor;
   const round = ctx.state.round;
   let settled = false;
+  let retain = false;
   try {
     const result = await executeGate(
       {
@@ -132,10 +134,14 @@ export async function runGateExecution(
     const handle = stored ?? ctx.state.gateExecution?.handle;
     if (handle) onExecuted?.(handle, result);
     return result;
+  } catch (error) {
+    retain = error instanceof GateCleanupError;
+    throw error;
   } finally {
-    // A termination before attach leaves the durable identity available for resume.
+    // A termination before attach, or remote work whose cleanup failed, keeps the durable identity.
     if (
       settled &&
+      !retain &&
       !(
         ["lan", "inplace", "github-actions"].includes(ctx.state.gateExecution?.handle.kind ?? "") &&
         gateShutdown(ctx.signal)
