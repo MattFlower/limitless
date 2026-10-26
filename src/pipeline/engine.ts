@@ -247,6 +247,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 
   try {
     await recoverScopedProcesses();
+    if (ctx.state.postMergeRejection) await rollbackRejectedMerge(ctx);
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
     if (
@@ -3237,6 +3238,20 @@ export type { RunState };
 
 class MergeRegressedError extends Error {}
 
+async function rollbackRejectedMerge(ctx: RunContext): Promise<never> {
+  const rejected = ctx.state.postMergeRejection;
+  const cwd = ctx.state.worktreePath;
+  if (!rejected || !cwd) throw new Error("Missing rejected post-merge rollback details");
+  await mergeGit(cwd, ["reset", "--hard", rejected.head]);
+  await mergeGit(cwd, ["clean", "-fdq"]);
+  ctx.state.lastGates = ctx.state.preRebaseGates ?? ctx.state.lastGates;
+  ctx.state.pendingRebaseSha = undefined;
+  ctx.state.preRebaseGates = undefined;
+  ctx.state.preRebaseHead = undefined;
+  ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: rejected.head }, ctx.state);
+  throw new NeedsHumanError(rejected.reason);
+}
+
 /** Merge the pinned base, retaining the previously gated head for regression fallback. */
 async function mergeForDelivery(
   ctx: RunContext,
@@ -3453,14 +3468,15 @@ async function mergeForDelivery(
     );
   } catch (error) {
     if (!(error instanceof MergeRegressedError)) throw error;
-    await mergeGit(cwd, ["reset", "--hard", before]);
-    await mergeGit(cwd, ["clean", "-fdq"]);
-    ctx.state.lastGates = previous;
-    ctx.state.pendingRebaseSha = undefined;
-    ctx.state.preRebaseGates = undefined;
-    ctx.state.preRebaseHead = undefined;
-    ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
-    throw new NeedsHumanError(`${error.message} after merging onto ${fetched.slice(0, 8)}`);
+    ctx.state.postMergeRejection = {
+      reason: redactGateOutput(`${error.message} after merging onto ${fetched.slice(0, 8)}`),
+      sha,
+      base: fetched,
+      head: before,
+      round: ctx.state.round,
+    };
+    await ctx.save("post-merge-rejected");
+    return rollbackRejectedMerge(ctx);
   }
   const merged = await validateMerge(cwd, before, fetched);
   if (ctx.state.reviewedSha) {
