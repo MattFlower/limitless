@@ -3,7 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import { repoSettings } from "../config.ts";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
-import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
+import { type ResolvedProfile, type Run, type RunStatus, TERMINAL_STATUSES } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import {
   BASELINE_CACHE_TTL_MS,
@@ -236,19 +236,22 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
   if (ctx.state.phase !== "deliver") ctx.state.githubWait = undefined;
-  ctx.run = deps.store.updateRun(
-    runId,
-    {
-      status: "running",
-      error: null,
-      ...(run.startedAt ? {} : { startedAt: Date.now() }),
-    },
-    ctx.state,
-  );
+  // A recorded rejection is already terminal; resume only finishes its rollback.
+  if (!ctx.state.postMergeRejection)
+    ctx.run = deps.store.updateRun(
+      runId,
+      {
+        status: "running",
+        error: null,
+        ...(run.startedAt ? {} : { startedAt: Date.now() }),
+      },
+      ctx.state,
+    );
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
     await recoverScopedProcesses();
+    if (ctx.state.postMergeRejection) await rollbackRejectedMerge(ctx);
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
     if (
@@ -323,7 +326,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     return "succeeded";
   } catch (e) {
     const terminationError = processScope.getStore()?.terminationError;
-    if (terminationError && ctx.state.needsHumanReason !== terminationError.message) {
+    if (
+      terminationError &&
+      !ctx.state.postMergeRejection &&
+      ctx.state.needsHumanReason !== terminationError.message
+    ) {
       ctx.state.feedback = redactGateOutput(
         `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`,
       );
@@ -333,12 +340,23 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       deps.store.setRunState(runId, ctx.state);
     }
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
+    if (ctx.state.postMergeRejection && (signal.aborted || !(e instanceof NeedsHumanError))) {
+      ctx.log(`Rejected post-merge rollback interrupted: ${(e as Error).message}`, "warn");
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
+    }
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
       deps.store.updateRun(runId, { status: "queued", stage: null });
       return "queued";
     }
     const cancelled = (): RunStatus => {
+      const rejected = ctx.state.postMergeRejection?.reason;
+      if (rejected) {
+        // A recorded rejection is terminal; shutdown during draft reporting must not requeue it.
+        const status = finalizePostMergeRejection(ctx, rejected);
+        ctx.log(`Draft reporting interrupted; rejected post-merge run stays ${status}`, "warn");
+        return status;
+      }
       const reason = ctx.state.terminalReason?.startsWith("superseded:")
         ? ctx.state.terminalReason
         : undefined;
@@ -510,6 +528,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       ctx.state.terminalReason = ctx.state.needsHumanReason;
       deps.store.setRunState(runId, ctx.state);
     }
+    if (ctx.state.postMergeRejection)
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
     deps.store.updateRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
     return status;
@@ -3262,6 +3282,34 @@ export type { RunState };
 
 class MergeRegressedError extends Error {}
 
+function finalizePostMergeRejection(ctx: RunContext, reason: string): RunStatus {
+  // Rollback and draft reporting await Git operations after publishing needs_human.
+  // Keep any terminal decision recorded meanwhile; the read and write must stay synchronous.
+  const current = ctx.store.getRun(ctx.run.id);
+  if (current && current.status !== "needs_human" && TERMINAL_STATUSES.includes(current.status))
+    return current.status;
+  return ctx.store.updateRun(ctx.run.id, {
+    status: "needs_human",
+    error: reason.slice(0, 2000),
+    finishedAt: Date.now(),
+  }).status;
+}
+
+async function rollbackRejectedMerge(ctx: RunContext): Promise<never> {
+  const rejected = ctx.state.postMergeRejection;
+  const cwd = ctx.state.worktreePath;
+  if (!rejected || !cwd) throw new Error("Missing rejected post-merge rollback details");
+  await mergeGit(cwd, ["reset", "--hard", rejected.head]);
+  await mergeGit(cwd, ["clean", "-fdq"]);
+  ctx.state.lastGates = ctx.state.preRebaseGates ?? ctx.state.lastGates;
+  ctx.state.pendingRebaseSha = undefined;
+  ctx.state.preRebaseGates = undefined;
+  ctx.state.preRebaseHead = undefined;
+  ctx.state.needsHumanReason = rejected.reason;
+  ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: rejected.head }, ctx.state);
+  throw new NeedsHumanError(rejected.reason);
+}
+
 /** Merge the pinned base, retaining the previously gated head for regression fallback. */
 async function mergeForDelivery(
   ctx: RunContext,
@@ -3285,7 +3333,9 @@ async function mergeForDelivery(
   if (!before) throw new Error("Missing pre-merge HEAD");
   const env = gateEnv();
   const resuming = (await resumeGateExecution(ctx, "gates", "rebase", cwd, env))?.kind === "inplace";
-  const conflicts = await prepareMerge(cwd, before, fetched);
+  // A merge committed before a restart is only validated below, never prepared again.
+  const merging = (await headSha(cwd)) === before;
+  const conflicts = merging ? await prepareMerge(cwd, before, fetched) : [];
   if (conflicts.length) {
     ctx.state.conflictFiles = conflicts;
     ctx.state.round++;
@@ -3300,8 +3350,7 @@ async function mergeForDelivery(
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
   }
-  if ((await headSha(cwd)) === before)
-    await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
+  if (merging) await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
   await validateMerge(cwd, before, fetched);
   if (!resuming) await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
@@ -3490,14 +3539,20 @@ async function mergeForDelivery(
     );
   } catch (error) {
     if (!(error instanceof MergeRegressedError)) throw error;
-    await mergeGit(cwd, ["reset", "--hard", before]);
-    await mergeGit(cwd, ["clean", "-fdq"]);
-    ctx.state.lastGates = previous;
-    ctx.state.pendingRebaseSha = undefined;
-    ctx.state.preRebaseGates = undefined;
-    ctx.state.preRebaseHead = undefined;
-    ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
-    throw new NeedsHumanError(`${error.message} after merging onto ${fetched.slice(0, 8)}`);
+    ctx.state.postMergeRejection = {
+      reason: redactGateOutput(`${error.message} after merging onto ${fetched.slice(0, 8)}`),
+      sha,
+      base: fetched,
+      head: before,
+      round: ctx.state.round,
+    };
+    ctx.state.needsHumanReason = ctx.state.postMergeRejection.reason;
+    ctx.run = ctx.store.updateRun(
+      ctx.run.id,
+      { status: "needs_human", error: ctx.state.needsHumanReason.slice(0, 2000), finishedAt: Date.now() },
+      ctx.state,
+    );
+    return rollbackRejectedMerge(ctx);
   }
   const merged = await validateMerge(cwd, before, fetched);
   if (ctx.state.reviewedSha) {
