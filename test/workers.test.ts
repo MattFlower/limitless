@@ -1766,6 +1766,8 @@ test.each(["dispatch", "reattach", "live"])(
       expect(gateSlots.snapshot().occupied).toBe(0);
       expect(
         workers.complete(retry.id, {
+          sha: req.headSha,
+          trackedClean: true,
           setupOk: true,
           setup: [],
           checks: [
