@@ -30,6 +30,8 @@ export interface GateResult {
   failures?: string;
   /** Set only when the process was killed for exceeding its timeout. */
   timedOut?: boolean;
+  /** Remote job never completed the command; no baseline can excuse it. */
+  incomplete?: boolean;
   confinementError?: boolean;
   /** The first attempt of a check that was re-run; targeted evidence is kept separately. */
   firstAttempt?: GateResult;
@@ -105,7 +107,7 @@ export interface GateHooks {
   onWait?: (slots: number) => void;
 }
 
-const OUTPUT_TAIL = 6_000;
+export const OUTPUT_TAIL = 6_000;
 export const confinementFailed = (r?: GateResult): boolean =>
   !!r &&
   ((r.confinementError ?? launchFailure(r.output)) ||
@@ -419,7 +421,7 @@ export async function retryBaselineFailures(
   freshCheckout = false,
 ): Promise<GateRun> {
   const selected = run.checks.flatMap((original) => {
-    if (original.ok || original.timedOut || confinementFailed(original)) return [];
+    if (original.ok || original.timedOut || original.incomplete || confinementFailed(original)) return [];
     const check = findGateCounterpart(original, run.checks, cfg.checks);
     return check?.run === original.command ? [{ check, original }] : [];
   });
@@ -464,6 +466,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     const baselineConfinementError = confinementFailed(before);
     let verdict: GateVerdict;
     if (confinementFailed(r)) verdict = "confinement_error";
+    else if (r.incomplete) verdict = "not_run";
     else if (r.docsOnly?.mode === "targeted") verdict = r.ok ? "targeted_pass" : "targeted_failure";
     // A skipped reference provides no evidence that a later failure already existed.
     else if (!before || before.docsOnly?.mode === "skipped" || baselineConfinementError)
@@ -478,6 +481,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
       blocking:
         verdict === "confinement_error" ||
         !!r.timedOut ||
+        !!r.incomplete ||
         verdict === "targeted_failure" ||
         verdict === "regressed" ||
         verdict === "new_failure",

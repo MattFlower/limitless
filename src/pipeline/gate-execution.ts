@@ -118,9 +118,10 @@ export async function runGateExecution(
       hooks,
       executor,
       stored,
-      async ({ kind, id, startedAt, url }) => {
-        ctx.state.gateExecution = { stage, round, purpose, sha, handle: { kind, id, startedAt, url } };
-        if (purpose === "timeout") ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
+      async (handle) => {
+        if (purpose === "timeout" && !ctx.state.gateExecution)
+          ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
+        ctx.state.gateExecution = { stage, round, purpose, sha, handle };
         await ctx.save("gate-started");
       },
       () => {
@@ -135,7 +136,10 @@ export async function runGateExecution(
     // A termination before attach leaves the durable identity available for resume.
     if (
       settled &&
-      !(["lan", "inplace"].includes(ctx.state.gateExecution?.handle.kind ?? "") && gateShutdown(ctx.signal))
+      !(
+        ["lan", "inplace", "github-actions"].includes(ctx.state.gateExecution?.handle.kind ?? "") &&
+        gateShutdown(ctx.signal)
+      )
     ) {
       ctx.state.gateExecution = undefined;
       await ctx.save("gate-result");

@@ -27,6 +27,7 @@ export interface ExecutionHandle {
   id: string;
   startedAt: number;
   url?: string;
+  progress?: import("./github-actions.ts").ActionsProgress;
 }
 export interface Execution<Res> {
   events: AsyncIterable<ExecutionEvent>;
@@ -52,6 +53,7 @@ export interface GateRequest {
   gates: GateConfig;
   checks?: string[];
   skipGateSlot?: boolean;
+  persist?: (handle: ExecutionHandle) => Promise<void>;
 }
 export type GateExecutor = Executor<GateRequest, GateRun> & {
   canResume?: (handle: ExecutionHandle, env?: Record<string, string>, daemonPort?: number) => boolean;
@@ -245,7 +247,7 @@ export async function executeGate(
   if (!stored) await persist(handle);
   let execution: Execution<GateRun>;
   try {
-    execution = executor.attach(handle, signal, req, hooks);
+    execution = executor.attach(handle, signal, { ...req, persist }, hooks);
   } catch (error) {
     onSettled();
     throw error;
