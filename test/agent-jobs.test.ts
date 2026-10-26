@@ -3,11 +3,12 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { Store } from "../src/db/store.ts";
 import { type AgentJobRequest, WorkerStore } from "../src/db/workers.ts";
 import { registerCredential } from "../src/util/proc.ts";
-import type { Capabilities } from "../src/workers/protocol.ts";
+import { type Capabilities, Heartbeat } from "../src/workers/protocol.ts";
 
 const releaseSha = "f".repeat(40);
 const request: AgentJobRequest = {
@@ -556,3 +557,32 @@ test.each(["match", "differs", "unknown"] as const)(
     if (parity !== "match") expect(workers.agentJob(id)?.state).toBe("queued");
   },
 );
+
+test("every stored capabilities row parses with the previous release's schema; Linux rows live in capabilities_ext", () => {
+  // The schema before Linux workers: darwin only, no confinement field.
+  const previous = Heartbeat.omit({ confinement: true })
+    .extend({ os: z.literal("darwin") })
+    .strict();
+  pair("mac");
+  beat("mac", { ...caps(), confinement: "seatbelt" });
+  pair("linux");
+  beat("linux", { ...caps(), os: "linux", confinement: "bwrap-landlock", freeSlots: 1 });
+  const rows = store.db
+    .query<{ name: string; capabilities: string | null; capabilities_ext: string | null }, []>(
+      "SELECT name,capabilities,capabilities_ext FROM workers ORDER BY name",
+    )
+    .all();
+  for (const row of rows) if (row.capabilities) previous.parse(JSON.parse(row.capabilities));
+  expect(rows.map((r) => [r.name, r.capabilities !== null, r.capabilities_ext !== null])).toEqual([
+    ["linux", false, true],
+    ["mac", true, false],
+  ]);
+  // This release still reads both: the Linux worker is available for gate jobs and reports its backend.
+  const linux = workers.worker("linux");
+  if (!linux) throw new Error("Missing worker");
+  expect(workers.available(linux)).toBe(true);
+  expect(workers.list().find((w) => w.name === "linux")?.capabilities).toMatchObject({
+    os: "linux",
+    confinement: "bwrap-landlock",
+  });
+});

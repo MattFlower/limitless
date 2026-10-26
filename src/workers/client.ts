@@ -626,6 +626,7 @@ export async function runWorker(
         delete body.updateWarning;
         delete body.agents;
         delete body.privateStringsDigest;
+        delete body.confinement;
         response = await call("/worker/heartbeat", body);
       }
       const reply = z

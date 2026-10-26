@@ -18,6 +18,7 @@ import {
 import { request as httpsRequest } from "node:https";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { z } from "zod";
 import { Factory } from "../src/app.ts";
 import { agentTestCommand, type WrapperConfig } from "../src/cli/agent-test.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
@@ -1872,7 +1873,7 @@ test("a Linux worker advertises its platform and backend, runs gate jobs and is 
       { name: "fail", ok: false, exitCode: 7 },
     ]);
     expect(workers.jobs("1=1")[0]).toMatchObject({ state: "done", worker: "loop-runner" });
-    expect(Heartbeat.parse(JSON.parse(workers.worker("loop-runner")?.capabilities ?? "{}"))).toMatchObject({
+    expect(workers.list().find((w) => w.name === "loop-runner")?.capabilities).toMatchObject({
       os: "linux",
       confinement: "bwrap-landlock",
     });
@@ -4573,9 +4574,67 @@ test("a target change during installation restores before attempting the latest 
   }
 });
 
+test("a macOS worker negotiates heartbeats with the coordinator before confinement metadata", async () => {
+  const server = await listen();
+  const legacy = Heartbeat.pick({
+    releaseSha: true,
+    bunVersion: true,
+    os: true,
+    osVersion: true,
+    cpuCount: true,
+    ramBytes: true,
+    freeSlots: true,
+    onAC: true,
+    idleSeconds: true,
+    jobs: true,
+    agents: true,
+    privateStringsDigest: true,
+    updateWarning: true,
+  }).strict();
+  const accepted = Promise.withResolvers<void>();
+  let rejected = 0;
+  const worker = await loop({
+    async request(...args) {
+      if (args[1] === "/worker/heartbeat" && !legacy.safeParse(args[2]).success) {
+        rejected++;
+        return {
+          status: 400,
+          data: Buffer.from("{}"),
+          fingerprint: server.tls.fingerprint,
+          json: () => ({ error: "Invalid heartbeat" }),
+        };
+      }
+      const reply = await workerRequest(...args);
+      if (args[1] === "/worker/heartbeat") accepted.resolve();
+      return reply;
+    },
+  });
+  try {
+    await Promise.race([
+      accepted.promise,
+      worker.task.then(() => {
+        throw new Error("Worker stopped before an accepted heartbeat");
+      }),
+    ]);
+    expect(rejected).toBeLessThanOrEqual(1);
+    expect(workers.worker("loop-runner")?.last_heartbeat_at).toBeNumber();
+  } finally {
+    worker.controller.abort();
+    await worker.task.catch(() => {});
+  }
+});
+
 test.each(["initial", "rollback"])("the worker survives a strict legacy coordinator on %s", async (kind) => {
   await listen();
-  const legacy = Heartbeat.omit({ updateWarning: true, agents: true, privateStringsDigest: true }).strict();
+  // The schema before optional worker metadata and Linux workers: darwin only, no confinement field.
+  const legacy = Heartbeat.omit({
+    updateWarning: true,
+    agents: true,
+    privateStringsDigest: true,
+    confinement: true,
+  })
+    .extend({ os: z.literal("darwin") })
+    .strict();
   const target = "a".repeat(40);
   let oldProtocol = kind === "initial",
     accepted = 0,
