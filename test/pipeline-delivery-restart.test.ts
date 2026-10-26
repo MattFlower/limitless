@@ -322,9 +322,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(legacy?.needsHumanReason).toBe(rejected?.reason);
         expect(gateStarts.mock.calls).toHaveLength(gates);
         expect(complete.mock.calls).toHaveLength(completedMerges);
-        expect(prepare.mock.calls).toHaveLength(
-          mergesBeforeResume + (boundary === "before rejection" ? 1 : 0),
-        );
+        expect(prepare.mock.calls).toHaveLength(mergesBeforeResume);
         expect(fixture.remote).toHaveLength(2);
         expect(fixture.local).toHaveLength(1);
         if (!legacy) throw new Error("Missing legacy state");
@@ -375,7 +373,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(state?.pendingRebaseSha).toBeUndefined();
       expect(state?.preRebaseHead).toBeUndefined();
       expect(state?.preRebaseGates).toBeUndefined();
-      expect(prepare.mock.calls).toHaveLength(mergesBeforeResume + (boundary === "before rejection" ? 1 : 0));
+      expect(prepare.mock.calls).toHaveLength(mergesBeforeResume);
       expect(complete.mock.calls).toHaveLength(completedMerges);
       expect(gateStarts.mock.calls).toHaveLength(gates);
       expect(fixture.remote).toHaveLength(2);

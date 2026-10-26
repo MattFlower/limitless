@@ -3298,7 +3298,9 @@ async function mergeForDelivery(
   if (!before) throw new Error("Missing pre-merge HEAD");
   const env = gateEnv();
   const resuming = (await resumeGateExecution(ctx, "gates", "rebase", cwd, env))?.kind === "inplace";
-  const conflicts = await prepareMerge(cwd, before, fetched);
+  // A merge committed before a restart is only validated below, never prepared again.
+  const merging = (await headSha(cwd)) === before;
+  const conflicts = merging ? await prepareMerge(cwd, before, fetched) : [];
   if (conflicts.length) {
     ctx.state.conflictFiles = conflicts;
     ctx.state.round++;
@@ -3313,8 +3315,7 @@ async function mergeForDelivery(
     ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
   }
-  if ((await headSha(cwd)) === before)
-    await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
+  if (merging) await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
   await validateMerge(cwd, before, fetched);
   if (!resuming) await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
