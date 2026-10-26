@@ -279,6 +279,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       persist.mockRestore();
       persistState.mockRestore();
       reopened = new Store(f.deps.cfg.paths.db);
+      snapshot();
       const interrupted = reopened.getRunState<RunState>(run.id);
       const cwd = interrupted?.worktreePath;
       const head = beforeRollback?.preRebaseHead;
