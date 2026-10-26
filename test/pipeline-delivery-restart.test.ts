@@ -478,56 +478,118 @@ describe("pipeline (fake agents, real git + gates)", () => {
     }
   });
 
-  test("shutdown during rejected post-merge draft reporting keeps the run needs_human", async () => {
-    writeFileSync(
-      join(repoDir, ".limitless.toml"),
-      '[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]\n',
-    );
-    await sh(
-      ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "rejection shutdown fixture"],
-      { cwd: repoDir },
-    );
-    const bare = await githubFixture();
-    const f = start(async (s) => {
-      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
-      if (roleOf(s) === "review") {
-        await advanceBase(bare, "base.txt", "new base\n");
-        return { structured: approve };
-      }
-      return { files: { "farewell.txt": "goodbye\n" } };
-    });
-    await f.stop();
-    registerGithub(f, bare);
-    const fixture = postMergeWorkerFixture(f, "fail");
-    const controller = new AbortController();
-    const addEvent = f.store.addEvent.bind(f.store);
-    // The draft-reporting branches start right after this log, once rollback has completed.
-    const events = spyOn(f.store, "addEvent").mockImplementation((event) => {
-      const added = addEvent(event);
-      if (event.message.startsWith("Run needs a human:")) controller.abort(new Error("shutdown"));
-      return added;
-    });
-    try {
-      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-      expect(await executeRun(f.deps, run.id, controller.signal)).toBe("needs_human");
-      expect(controller.signal.aborted).toBe(true);
-      const state = f.store.getRunState<RunState>(run.id);
-      const rejected = state?.postMergeRejection;
-      expect(rejected?.reason).toContain("post-merge gates regressed");
-      expect(state?.pendingRebaseSha).toBeUndefined();
-      expect(f.store.getRun(run.id)).toMatchObject({
-        status: "needs_human",
-        error: rejected?.reason.slice(0, 2000),
-        finishedAt: expect.any(Number),
+  test.each([
+    { resolveDuringRollback: false, shutdown: true },
+    { resolveDuringRollback: true, shutdown: false },
+    { resolveDuringRollback: true, shutdown: true },
+  ])(
+    "rejected post-merge finalization preserves terminal decisions %o",
+    async ({ resolveDuringRollback, shutdown }) => {
+      writeFileSync(
+        join(repoDir, ".limitless.toml"),
+        '[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]\n',
+      );
+      await sh(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "rejection shutdown fixture"],
+        { cwd: repoDir },
+      );
+      const bare = await githubFixture();
+      const f = start(async (s) => {
+        if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+        if (roleOf(s) === "review") {
+          await advanceBase(bare, "base.txt", "new base\n");
+          return { structured: approve };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
       });
-      const messages = f.store.listEvents(run.id).map((e) => e.message);
-      expect(messages).toContain("Draft reporting interrupted; rejected post-merge run stays needs_human");
-      expect(messages).not.toContain("Daemon shutdown; run re-queued to resume");
-    } finally {
-      events.mockRestore();
-      fixture.processSpy.mockRestore();
-    }
-  });
+      await f.stop();
+      registerGithub(f, bare);
+      const fixture = postMergeWorkerFixture(f, "fail");
+      const controller = new AbortController();
+      let runId = "";
+      let beforeRollback: RunState | null = null;
+      let resolved: ReturnType<Store["resolveRun"]> = null;
+      const git = merges.mergeGit;
+      const reset = spyOn(merges, "mergeGit").mockImplementation(async (cwd, args, ...rest) => {
+        const result = await git(cwd, args, ...rest);
+        const state = f.store.getRunState<RunState>(runId);
+        if (args[0] === "reset" && args[2] === state?.postMergeRejection?.head) {
+          // Pause rollback after the real reset, before clean and the rollback state save.
+          beforeRollback = state;
+          writeFileSync(join(cwd, "rollback-junk"), "remove on rollback\n");
+          if (resolveDuringRollback) {
+            resolved = f.store.resolveRun(runId, {
+              kind: "done_elsewhere",
+              by: "human",
+              ref: "replacement-run",
+              note: "Handled while rollback was finishing",
+              at: 1234,
+            });
+            expect(resolved?.status).toBe("resolved");
+          }
+        }
+        return result;
+      });
+      const addEvent = f.store.addEvent.bind(f.store);
+      // The draft-reporting branches start right after this log, once rollback has completed.
+      const events = spyOn(f.store, "addEvent").mockImplementation((event) => {
+        const added = addEvent(event);
+        if (shutdown && event.message.startsWith("Run needs a human:"))
+          controller.abort(new Error("shutdown"));
+        return added;
+      });
+      try {
+        const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+        runId = run.id;
+        const expectedStatus = resolveDuringRollback ? "resolved" : "needs_human";
+        expect(await executeRun(f.deps, run.id, controller.signal)).toBe(expectedStatus);
+        expect(controller.signal.aborted).toBe(shutdown);
+        const state = f.store.getRunState<RunState>(run.id);
+        const rejected = state?.postMergeRejection;
+        const checkpoint = beforeRollback as RunState | null;
+        if (!checkpoint?.postMergeRejection || !state?.worktreePath || !rejected)
+          throw new Error("Missing rejected rollback checkpoint");
+        expect(rejected?.reason).toContain("post-merge gates regressed");
+        expect(rejected).toEqual(checkpoint.postMergeRejection);
+        expect(state.postMergeGates).toEqual(checkpoint.postMergeGates);
+        expect(state.lastGates).toEqual(checkpoint.preRebaseGates);
+        expect(state.needsHumanReason).toBe(rejected?.reason);
+        expect(state?.pendingRebaseSha).toBeUndefined();
+        expect(state.preRebaseHead).toBeUndefined();
+        expect(state.preRebaseGates).toBeUndefined();
+        expect(existsSync(join(state.worktreePath, "rollback-junk"))).toBe(false);
+        expect((await sh(["git", "rev-parse", "HEAD"], { cwd: state.worktreePath })).stdout.trim()).toBe(
+          rejected.head,
+        );
+        const finished = f.store.getRun(run.id);
+        if (resolveDuringRollback) {
+          const resolution = resolved as ReturnType<Store["resolveRun"]>;
+          if (!resolution) throw new Error("Missing accepted resolution");
+          expect(finished?.resolution).toEqual(resolution.resolution);
+          expect(finished?.error).toBe(resolution.error);
+          expect(finished?.finishedAt).toBe(resolution.finishedAt);
+        }
+        expect(finished).toMatchObject({
+          status: expectedStatus,
+          error: rejected.reason.slice(0, 2000),
+          finishedAt: expect.any(Number),
+          headSha: rejected.head,
+        });
+        expect(fixture.remote).toHaveLength(2);
+        expect(fixture.local).toHaveLength(1);
+        const messages = f.store.listEvents(run.id).map((e) => e.message);
+        if (shutdown)
+          expect(messages).toContain(
+            `Draft reporting interrupted; rejected post-merge run stays ${expectedStatus}`,
+          );
+        expect(messages).not.toContain("Daemon shutdown; run re-queued to resume");
+      } finally {
+        reset.mockRestore();
+        events.mockRestore();
+        fixture.processSpy.mockRestore();
+      }
+    },
+  );
 
   test("restart between coordinator confirmations keeps the completed first check", async () => {
     writeFileSync(

@@ -3,7 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import { repoSettings } from "../config.ts";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
-import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
+import { type ResolvedProfile, type Run, type RunStatus, TERMINAL_STATUSES } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import {
   BASELINE_CACHE_TTL_MS,
@@ -341,7 +341,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
     if (ctx.state.postMergeRejection && (signal.aborted || !(e instanceof NeedsHumanError))) {
       ctx.log(`Rejected post-merge rollback interrupted: ${(e as Error).message}`, "warn");
-      return "needs_human";
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
     }
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
@@ -352,13 +352,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       const rejected = ctx.state.postMergeRejection?.reason;
       if (rejected) {
         // A recorded rejection is terminal; shutdown during draft reporting must not requeue it.
-        deps.store.updateRun(runId, {
-          status: "needs_human",
-          error: rejected.slice(0, 2000),
-          finishedAt: Date.now(),
-        });
-        ctx.log("Draft reporting interrupted; rejected post-merge run stays needs_human", "warn");
-        return "needs_human";
+        const status = finalizePostMergeRejection(ctx, rejected);
+        ctx.log(`Draft reporting interrupted; rejected post-merge run stays ${status}`, "warn");
+        return status;
       }
       const reason = ctx.state.terminalReason?.startsWith("superseded:")
         ? ctx.state.terminalReason
@@ -531,8 +527,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       ctx.state.terminalReason = ctx.state.needsHumanReason;
       deps.store.setRunState(runId, ctx.state);
     }
+    if (ctx.state.postMergeRejection)
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
-    message = ctx.state.postMergeRejection?.reason ?? message;
     deps.store.updateRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
     return status;
   }
@@ -3282,6 +3279,19 @@ function readPackageJson(dir: string): string | null {
 export type { RunState };
 
 class MergeRegressedError extends Error {}
+
+function finalizePostMergeRejection(ctx: RunContext, reason: string): RunStatus {
+  // Rollback and draft reporting await Git operations after publishing needs_human.
+  // Keep any terminal decision recorded meanwhile; the read and write must stay synchronous.
+  const current = ctx.store.getRun(ctx.run.id);
+  if (current && current.status !== "needs_human" && TERMINAL_STATUSES.includes(current.status))
+    return current.status;
+  return ctx.store.updateRun(ctx.run.id, {
+    status: "needs_human",
+    error: reason.slice(0, 2000),
+    finishedAt: Date.now(),
+  }).status;
+}
 
 async function rollbackRejectedMerge(ctx: RunContext): Promise<never> {
   const rejected = ctx.state.postMergeRejection;
