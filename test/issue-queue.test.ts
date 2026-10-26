@@ -3148,7 +3148,7 @@ test("a full page inside one second continues in a window overlapping the last h
   expect(h.streamCalls.map(windowOf)).toEqual(["100:1", "99:2"]);
 });
 
-test.each(["edited", "deleted"] as const)(
+test.each(["edited", "deleted", "edited with the anchor"] as const)(
   "a handled comment %s during a tie pause cannot push an unseen command past the window",
   async (change) => {
     const h = harness({}, ["owner/repo"], true);
@@ -3164,15 +3164,19 @@ test.each(["edited", "deleted"] as const)(
     expect(h.store.commentStream("owner/repo", h.clock.now())).toMatchObject({ covered: 100, lastId: 3099 });
     const handled = comments[5];
     if (!handled) throw new Error("missing comment");
-    if (change === "edited") handled.updated_at = new Date(h.clock.now() + 60_000).toISOString();
-    else comments.splice(5, 1);
+    const anchor = comments[99];
+    if (!anchor) throw new Error("missing anchor");
+    if (change === "deleted") comments.splice(5, 1);
+    else handled.updated_at = new Date(h.clock.now() + 60_000).toISOString();
+    // The anchor moves to the end too, so it is still inside the next window but at another offset.
+    if (change === "edited with the anchor") anchor.updated_at = handled.updated_at;
     await h.close();
     const reopened = new Store(join(h.dir, "store.db"));
     const factory = new Factory(h.cfg, { store: reopened });
     try {
       for (let i = 0; i < 3; i++) await commandPoll(h, 3, factory);
       expect(reopened.listRuns().map((r) => r.sourceRef?.number)).toEqual([3100]);
-      // The overlap check found 3099 gone from the next window and read the tie from page 1 again.
+      // The overlap check found 3099 off its offset in the next window and read the tie from page 1 again.
       expect(h.streamCalls.map(windowOf).slice(0, 3)).toEqual(["100:1", "99:2", "100:1"]);
     } finally {
       await factory.stop();

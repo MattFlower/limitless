@@ -42,7 +42,7 @@ type Cached = { key: string; etag: string };
 /**
  * The page after the first `covered` items of one since query that still contains item covered - 1.
  * Edits move a comment to the end of the stream, so offsets alone could skip whatever slid into an
- * earlier page; the overlap proves nothing before the window moved.
+ * earlier page; the anchor at its old offset proves nothing before the window moved.
  */
 function commentWindow(covered: number) {
   if (covered < 100) return { size: 100, page: 1 };
@@ -101,8 +101,9 @@ export async function pollIssueComments(
         comments = pageSchema.parse(redactCredentialData(JSON.parse(raw.slice(end + split.length))));
         const etag = /^etag:\s*(.+)$/im.exec(raw.slice(0, end))?.[1]?.trim();
         if (etag) cache.set(repo, { key, etag });
-        if (start > 0 && !comments.some((c) => c.id === state.lastId)) {
-          // Something before this window moved, so read the tie again from its first page.
+        if (start > 0 && comments[state.covered - 1 - start]?.id !== state.lastId) {
+          // Edits and deletions only remove comments from before the anchor, so an anchor still at its
+          // offset proves nothing slid out of view. Otherwise read the tie again from its first page.
           Object.assign(state, { covered: 0, lastId: null });
           store.advanceCommentStream(repo, state.since, 0, null);
           continue;
