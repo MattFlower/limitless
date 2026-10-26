@@ -141,6 +141,8 @@ export interface RunState {
   /** Pinned delivery merge target (legacy field name); gates must pass before this becomes run.baseSha. */
   pendingRebaseSha?: string;
   preRebaseGates?: GateComparison[];
+  /** Rejected delivery attempt; retained after rollback so resume cannot retry it. */
+  postMergeRejection?: { reason: string; sha: string; base: string; head: string; round: number };
   /** Coordinator confirmation is scoped to this merge attempt, including its original deadline. */
   postMergeGates?: {
     sha: string;
