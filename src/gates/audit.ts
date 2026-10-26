@@ -15,7 +15,7 @@ const TEST_FILE =
   /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rb)$|(^|\/)test_[^/]+\.py$|Test\.java$/;
 const TEST_CONFIG =
   /(^|\/)(jest|vitest|playwright|karma|mocha|ava)\.config\.|(^|\/)(pytest\.ini|conftest\.py|tox\.ini|\.mocharc[^/]*|bunfig\.toml)$/;
-const CI_CONFIG = /^\.github\/workflows\/|^\.gitlab-ci\.yml$|^\.circleci\//;
+export const CI_CONFIG = /^\.github\/workflows\/|^\.gitlab-ci\.yml$|^\.circleci\//;
 const LINT_CONFIG =
   /(^|\/)(biome\.jsonc?|\.eslintrc[^/]*|eslint\.config\.[cm]?[jt]s|\.golangci\.ya?ml|ruff\.toml|\.flake8)$/;
 const LOCKFILE =
@@ -350,8 +350,13 @@ export function auditDiff(
         file: f.path,
         detail: "Test runner config changed.",
       });
-    if (CI_CONFIG.test(f.path))
-      findings.push({ rule: "ci-config", severity: "warn", file: f.path, detail: "CI workflow changed." });
+    for (const file of touched.filter((path) => CI_CONFIG.test(path)))
+      findings.push({
+        rule: "ci-config",
+        severity: ctx.allow?.includes("workflows") ? "warn" : "block",
+        file,
+        detail: `CI workflow changed. ${allowHint("workflows")}`,
+      });
     if (LINT_CONFIG.test(f.path))
       findings.push({
         rule: "lint-config",

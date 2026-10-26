@@ -4,8 +4,13 @@ import { z } from "zod";
 import * as privacy from "../src/gates/private.ts";
 import { checkPublicationText } from "../src/gates/publication.ts";
 import { recordWorktree, worktreeGit } from "../src/git/command.ts";
-import { checkPrivatePublication, publicationRange, squashTitle } from "../src/git/repos.ts";
-import { processScope, sh } from "../src/util/proc.ts";
+import {
+  assertWorkflowPublication,
+  checkPrivatePublication,
+  publicationRange,
+  squashTitle,
+} from "../src/git/repos.ts";
+import { processScope, redactCredentials, sh } from "../src/util/proc.ts";
 
 const controller = new AbortController();
 for (const event of ["SIGTERM", "SIGINT"] as const) process.on(event, () => controller.abort());
@@ -80,6 +85,30 @@ try {
       squash: { base: data.baseRefOid, head: target, title: squashTitle(subject, pr), body: data.body },
       staged: true,
     });
+    // Only the landing script's explicit operator argument grants this allowance.
+    if (head) {
+      try {
+        await assertWorkflowPublication(
+          opts.cwd,
+          data.baseRefOid,
+          head,
+          process.argv[7] === "workflows" ? ["workflows"] : [],
+          undefined,
+          signal,
+        );
+      } catch (error) {
+        const reason =
+          error instanceof Error && error.message.startsWith("[ci-config]")
+            ? error.message
+            : "Cannot inspect CI configuration; refusing to land";
+        throw new privacy.PrivateError(
+          privacy.redactPrivate(
+            redactCredentials(`${reason}. Manual landing requires an explicit --allow workflows argument.`),
+            entries,
+          ),
+        );
+      }
+    }
   }
 } catch (error) {
   console.error(error instanceof privacy.PrivateError ? error.message : "Private check blocked");
