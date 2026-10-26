@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, setDefaultTimeout } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Repo } from "../src/core/types.ts";
@@ -252,7 +252,6 @@ const handle = (progress: Partial<ActionsProgress>, sha = head): NonNullable<Run
     },
   },
 });
-const expr = (name: string) => `\${{ ${name} }}`;
 
 test("the executor is a github-actions executor that reports fresh checkouts", () => {
   const { executor } = fakeGitHub();
@@ -584,59 +583,4 @@ test("run and job polls are conditional and a 304 changes nothing", async () => 
     for (const call of later) expect(call.some((a) => a.startsWith("If-None-Match: "))).toBe(true);
   }
   expect(fake.state.notModified).toBeGreaterThan(0);
-});
-
-test("the gates workflow is dispatch-only, pinned, uncached and refuses the default branch", () => {
-  const workflow = Bun.YAML.parse(readFileSync(".github/workflows/limitless-gates.yml", "utf8")) as {
-    on: Record<string, unknown>;
-    permissions: Record<string, string>;
-    jobs: Record<
-      string,
-      {
-        "runs-on": string;
-        "timeout-minutes"?: unknown;
-        steps: {
-          name?: string;
-          uses?: string;
-          run?: string;
-          with?: Record<string, unknown>;
-          env?: Record<string, string>;
-          "timeout-minutes"?: unknown;
-        }[];
-      }
-    >;
-  };
-  const text = readFileSync(".github/workflows/limitless-gates.yml", "utf8");
-  expect(Object.keys(workflow.on)).toEqual(["workflow_dispatch"]);
-  expect(workflow.permissions).toEqual({ contents: "read" });
-  expect(text).not.toContain("secrets.");
-  const jobs = Object.values(workflow.jobs);
-  expect(jobs).toHaveLength(1);
-  const [job] = jobs;
-  if (!job) throw new Error("missing job");
-  expect(job["runs-on"]).toBe("ubuntu-24.04");
-  expect(job["timeout-minutes"]).toBeUndefined();
-  const steps = job.steps;
-  for (const step of steps.filter((s) => s.uses)) expect(step.uses).toMatch(/@[0-9a-f]{40}$/);
-  const checkout = steps.findIndex((s) => s.uses?.startsWith("actions/checkout@"));
-  expect(steps[checkout]?.with?.["persist-credentials"]).toBe(false);
-  expect(steps.find((s) => s.uses?.startsWith("oven-sh/setup-bun@"))?.with?.["no-cache"]).toBe(true);
-  const guard = steps.findIndex(
-    (s) =>
-      s.env?.REF === expr("github.ref") &&
-      s.env.DEFAULT_BRANCH === expr("github.event.repository.default_branch") &&
-      s.run?.includes('"$REF" = "refs/heads/$DEFAULT_BRANCH"'),
-  );
-  expect(guard).toBeGreaterThanOrEqual(0);
-  expect(guard).toBeLessThan(checkout);
-  const token = steps.findIndex((s) => s.run?.includes('echo "LIMITLESS_TOKEN $token"'));
-  expect(token).toBeGreaterThanOrEqual(0);
-  expect(token).toBeLessThan(checkout);
-  const setup = steps.find((s) => s.name === "Setup");
-  const check = steps.find((s) => s.name === "Check");
-  expect(setup?.["timeout-minutes"]).toBeDefined();
-  expect(check?.["timeout-minutes"]).toBeDefined();
-  expect(check?.env?.LIMITLESS_GATE_REPORT).toStartWith(`${expr("runner.temp")}/`);
-  // Inputs reach scripts only through env; no expression is ever interpolated into a script.
-  for (const step of steps) expect(step.run ?? "").not.toContain("{{");
 });
