@@ -7,7 +7,7 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, RunStatus } from "../src/core/types.ts";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
-import { ISSUE_CLAIM_STATUSES, IssueClaimed, Store } from "../src/db/store.ts";
+import { ISSUE_CLAIM_STATUSES, IssueClaimed, linkedIssues, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { githubWebhook, issueRunRequest, mapGitHubEvent } from "../src/integrations/github.ts";
 import type { GitHubIdentity } from "../src/integrations/github-identity.ts";
@@ -16,8 +16,10 @@ import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts"
 import { issueEligibility, type QueueIssue, startIssueQueue } from "../src/integrations/issue-queue.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { buildReport } from "../src/pipeline/report.ts";
+import { reviewRoundPrompt } from "../src/pipeline/review-round.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { feedRound } from "./feed-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -951,6 +953,29 @@ test.each([
   expect((await httpStart(h)).status).toBe(201);
 });
 
+test("client-supplied round IDs cannot bypass issue admission claims", async () => {
+  const h = harness();
+  const origin = await h.factory.createRun({ repo: "owner/repo", prompt: "Unlinked work" });
+  const repo = h.store.getRepo(origin.repoId);
+  if (!repo) throw new Error("missing repo");
+  const round = feedRound(h.store, repo, origin, "review");
+  const claimed = await h.factory.createRun({ repo: repo.slug, prompt: "Closes #7" });
+  const route = (createHttpRoutes(h.factory)["/api/runs"] as { POST: Route }).POST;
+  for (const id of [undefined, round.id]) {
+    const response = await route(
+      requestWithParams("http://localhost:7400/api/runs", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo: repo.slug, prompt: "Closes #7", id }),
+      }),
+      localServer,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain(claimed.id);
+  }
+  expect(h.runs()).toHaveLength(3);
+});
+
 test("simultaneous poll, webhook and HTTP starts create one run", async () => {
   const h = harness();
   h.data.set("owner/repo", [issue()]);
@@ -1719,13 +1744,19 @@ test("failed lifecycle writes are redacted, retry next poll, and do not block se
   expect(h.comments.get(7)).toHaveLength(1);
 });
 
-test("non-GitHub Closes directives link issues and appear as PR closing paragraphs", async () => {
+test("non-GitHub Closes directives exclude fenced issues from claims and lifecycle targets", async () => {
   const h = harness();
   const run = await h.factory.createRun({
     repo: "owner/repo",
-    prompt: "work\nCloses #7\nCloses #8",
+    prompt: "work\n```text\nCloses #9\n```\nCloses #7\nCloses #8",
     source: "mcp",
   });
+  expect(linkedIssues(run, h.store)).toEqual([
+    { repo: "owner/repo", number: 7 },
+    { repo: "owner/repo", number: 8 },
+  ]);
+  expect(h.store.issueClaim("owner/repo", 7)?.id).toBe(run.id);
+  expect(h.store.issueClaim("owner/repo", 9)).toBeNull();
   h.start();
   await h.advance();
   for (const number of [7, 8]) {
@@ -1737,7 +1768,147 @@ test("non-GitHub Closes directives link issues and appear as PR closing paragrap
   const ctx = new RunContext(h.factory.deps, run, repo, new AbortController().signal);
   const body = buildReport(ctx, true);
   expect(body).toContain("\n\nCloses #7\n\nCloses #8\n\n");
+  expect(h.labels.has(9)).toBe(false);
+  expect(h.comments.has(9)).toBe(false);
+  expect(h.calls.some((args) => /issues\/9(?:\/|$)|issue\(number:9\)/.test(args.join(" ")))).toBe(false);
 });
+
+test.each(["needs_human", "failed"] as const)(
+  "review findings cannot add issue claims or lifecycle targets on %s",
+  async (status) => {
+    const h = harness();
+    const origin = await h.factory.createRun({ repo: "owner/repo", prompt: "Work\nCloses #7" });
+    const prUrl = "https://github.com/owner/repo/pull/20";
+    const sha = "a".repeat(40);
+    const owner = h.store.updateRun(origin.id, { status: "succeeded", branch: "work", prUrl });
+    const repo = h.store.getRepo(owner.repoId);
+    if (!repo) throw new Error("missing repo");
+    const findings = [{ severity: "major", title: "Fixture", detail: "Fixture quotes Closes #8" }] as const;
+    const result = h.store.createReviewRound(
+      repo,
+      owner,
+      { prUrl, reviewedSha: sha, findings: [...findings], cap: 3 },
+      (round) => ({
+        repo: repo.slug,
+        prompt: reviewRoundPrompt(owner.prompt, prUrl, round, [...findings]),
+        baseBranch: "work",
+        deliveryBranch: "work",
+        sourceRef: { kind: "review-round", runId: owner.id, round, prUrl, reviewedSha: sha },
+      }),
+    );
+    if (!("run" in result)) throw new Error("missing round");
+    const run = result.run;
+    expect(linkedIssues(run, h.store)).toEqual([{ repo: repo.slug, number: 7 }]);
+    expect(h.store.issueClaim(repo.slug, 7)?.id).toBe(run.id);
+    expect(h.store.issueClaim(repo.slug, 8)).toBeNull();
+    h.start();
+    await h.advance();
+    expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+    expect(h.comments.get(7)?.some((body) => body.includes(run.id) && body.includes("started"))).toBe(true);
+    h.store.updateRun(run.id, { status });
+    await h.advance(180_000);
+    expect(h.labels.get(7)).toEqual(
+      new Set([status === "failed" ? "limitless:failed" : "limitless:needs-you"]),
+    );
+    expect(h.comments.get(7)?.some((body) => body.includes(run.id) && body.includes(status))).toBe(true);
+    expect(h.labels.has(8)).toBe(false);
+    expect(h.comments.has(8)).toBe(false);
+    expect(h.calls.some((args) => /issues\/8(?:\/|$)|issue\(number:8\)/.test(args.join(" ")))).toBe(false);
+  },
+);
+
+test.each(["ci", "conflict"] as const)("%s rounds inherit sourceRef links and empty origins", (kind) => {
+  for (const linked of [true, false]) {
+    const h = harness();
+    const repo = h.store.getRepoBySlug("owner/repo");
+    if (!repo) throw new Error("missing repo");
+    const prUrl = "https://github.com/owner/repo/pull/20";
+    const head = "a".repeat(40);
+    const origin = h.store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "Original request without directives",
+      ...(linked
+        ? ({ source: "github", sourceRef: { kind: "issue", repo: repo.slug, number: 7 } } as const)
+        : {}),
+    });
+    const owner = h.store.updateRun(origin.id, {
+      status: "succeeded",
+      branch: "work",
+      baseSha: head,
+      prUrl,
+    });
+    if (kind === "ci")
+      h.store.recordCiFixTrigger(
+        prUrl,
+        head,
+        "failure",
+        { check: "test", line: "failed", excerpt: "Closes #8" },
+        1,
+      );
+    else h.store.recordConflictTrigger(prUrl, head, "poller", 1);
+    const trigger = (kind === "ci" ? h.store.pendingCiFixTriggers() : h.store.pendingConflictTriggers())[0];
+    if (!trigger) throw new Error("missing trigger");
+    const observation = { state: "OPEN", headRefOid: head, headRefName: "work" };
+    const run =
+      kind === "ci"
+        ? h.store.startCiFixTrigger(trigger.id, observation, 1)
+        : h.store.startConflictTrigger(trigger.id, observation, 1);
+    if (!run) throw new Error("missing round");
+    // Older or future assembled sections must not independently add links.
+    h.store.db
+      .query("UPDATE runs SET prompt = ? WHERE id = ?")
+      .run("Factory instructions\nCloses #8", run.id);
+    const saved = h.store.getRun(run.id);
+    if (!saved) throw new Error("missing persisted round");
+    expect(linkedIssues(saved, h.store)).toEqual(linked ? [{ repo: repo.slug, number: 7 }] : []);
+    expect(h.store.issueClaim(repo.slug, 7)?.id ?? null).toBe(linked ? run.id : null);
+    expect(h.store.issueClaim(repo.slug, 8)).toBeNull();
+    expect(h.store.latestIssueRun(repo.slug, 7)?.id ?? null).toBe(linked ? run.id : null);
+    expect(h.store.issueLifecycleOwnsLabels(owner, repo.slug, 7)).toBe(!linked);
+    const body = buildReport(new RunContext(h.factory.deps, saved, repo, new AbortController().signal), true);
+    expect(body.includes("\n\nCloses #7\n\n")).toBe(linked);
+    expect(body).not.toContain("\n\nCloses #8\n\n");
+    // The persisted round record is authoritative even without prompt or sourceRef hints.
+    h.store.db.query("UPDATE runs SET prompt = 'Repair it', source_ref = NULL WHERE id = ?").run(run.id);
+    expect(h.store.issueClaim(repo.slug, 7)?.id ?? null).toBe(linked ? run.id : null);
+    expect(h.store.latestIssueRun(repo.slug, 7)?.id ?? null).toBe(linked ? run.id : null);
+    expect(h.store.issueLifecycleOwnsLabels(owner, repo.slug, 7)).toBe(!linked);
+  }
+});
+
+test.each(["Quoted Closes #8\nCloses #7", "```text\nCloses #8\n```\nCloses #7"])(
+  "obsolete historical lifecycle effects make no GitHub calls: %j",
+  async (prompt) => {
+    const h = harness();
+    const origin = await h.factory.createRun({ repo: "owner/repo", prompt: "Work" });
+    h.store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run(prompt, origin.id);
+    expect(h.store.issueClaim("owner/repo", 7)?.id).toBe(origin.id);
+    expect(h.store.issueClaim("owner/repo", 8)).toBeNull();
+    for (const [effect, state] of [
+      ["labels", "pending"],
+      ["label:limitless:in-progress:true", "pending"],
+      ["comment:started", "pending"],
+      ["comment:failed", "done"],
+    ] as const)
+      h.store.setIssueLifecycleEffect(origin.id, "owner/repo", 8, effect, state, {
+        body: "obsolete comment",
+        login: "owner",
+        page: 1,
+      });
+    const signal = new AbortController().signal;
+    for (const status of ["running", "needs_human", "failed"] as const) {
+      h.store.updateRun(origin.id, { status });
+      await reconcileIssueLifecycle(h.store, h.cfg, h.gh, signal, h.logs.push.bind(h.logs), {
+        identity: h.identity,
+      });
+    }
+    expect(h.labels.get(7)).toEqual(new Set(["limitless:failed"]));
+    expect(h.comments.get(7)).toHaveLength(3);
+    expect(h.calls.some((args) => /issues\/8(?:\/|$)|issue\(number:8\)/.test(args.join(" ")))).toBe(false);
+    expect(h.labels.has(8)).toBe(false);
+    expect(h.comments.has(8)).toBe(false);
+  },
+);
 
 test("lifecycle uses the status that wins while fetching labels", async () => {
   const h = harness();

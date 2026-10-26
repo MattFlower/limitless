@@ -577,6 +577,24 @@ Dependabot runs, issue-label triggers and `/limitless` comment triggers are disa
 - The factory comments on the issue or PR when a run is created and when it finishes (status, PR,
   cost).
 
+For [issue queue and lifecycle](ISSUES.md) claims, labels and comments, link an issue from a
+CLI, UI or other non-GitHub request with a directive on a line of its own:
+
+```text
+Closes #123
+```
+
+`Closes` is case-insensitive; horizontal whitespace (including Unicode no-break and em spaces)
+may surround the directive and must separate `Closes` from `#`, without crossing a line break.
+The number must be positive, with nothing else on that line. Inline mentions, quotes, blockquotes,
+trailing prose and fenced code blocks do not link issues. Fences use at least three backticks or
+tildes, with optional indentation and an opening info string; a closing fence uses the same
+character, at least the opening length, and only surrounding horizontal whitespace. An unclosed
+fence excludes the rest of the prompt. Issue-created runs link through their
+recorded issue reference; GitHub prompt text cannot add links. Review, CI-fix and conflict rounds
+inherit exactly their original run's issues, including no issues. Factory-added findings,
+CI excerpts and instructions never add links, even when they contain a standalone directive.
+
 If a delivery is ignored, GitHub's delivery log shows the reason in the response body, for example
 `actor or issue author is not owner` or `repository owner is not configured owner`.
 
