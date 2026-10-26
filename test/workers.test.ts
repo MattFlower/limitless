@@ -48,7 +48,7 @@ import * as gitCommand from "../src/git/command.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { runClaude } from "../src/harness/claude.ts";
-import { fakeHarness } from "../src/harness/fake.ts";
+import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { confinementScope, seatbeltProfile } from "../src/harness/sandbox.ts";
 import * as scratchPolicy from "../src/harness/scratch.ts";
@@ -4714,6 +4714,7 @@ test("gate-first leases preserve both payload fields, agent inputs and cancellat
     branch: "change/agent",
     baseSha: releaseSha,
     commit: publicationCommit,
+    allow: ["workflows"],
     privateStringsDigest: privateStringsDigest([]),
     repoUrl: "https://github.com/example/repository.git",
     expectedRemoteSha: null,
@@ -6664,6 +6665,8 @@ test("invalid publication metadata fails only its job while another session stay
 
 test.each([
   "create",
+  "workflows",
+  "allowed workflows",
   "replace",
   "clean discreet",
   "unchanged",
@@ -6727,6 +6730,7 @@ test.each([
           : undefined,
       ...(!kind.includes("legacy") && kind !== "readonly"
         ? {
+            ...(kind === "allowed workflows" ? { allow: ["workflows"] as const } : {}),
             privateStringsDigest:
               kind === "missing digest"
                 ? undefined
@@ -6892,7 +6896,7 @@ test.each([
           return workerRequest(...args);
         },
         harnesses: {
-          claude: fakeHarness(async (spec) => {
+          claude: fakeHarness(async (spec): Promise<FakeReply> => {
             expect(lookups).toBe(0);
             session = JSON.stringify({ spec, env: proc.agentEnv() });
             expect(session).not.toContain(token);
@@ -6912,7 +6916,9 @@ test.each([
             return {
               files: ["unchanged", "legacy", "session committed"].includes(kind)
                 ? undefined
-                : { edited: kind === "private diff" || kind === "credential" ? secret : "new bytes\n" },
+                : kind.includes("workflows")
+                  ? { ".github/workflows/worker.yml": "on: push\njobs: {}\n" }
+                  : { edited: kind === "private diff" || kind === "credential" ? secret : "new bytes\n" },
               text: token,
               status: "error",
               error: token,
@@ -6930,6 +6936,7 @@ test.each([
       const job = workers.agentJob(id);
       const published = [
         "create",
+        "allowed workflows",
         "replace",
         "clean discreet",
         "private published ancestor",
@@ -6968,28 +6975,32 @@ test.each([
               originalRequest.privateStringsDigest,
             );
         } else {
-          const reason = ["missing digest", "different digest", "list changed during session"].includes(kind)
-            ? "Worker private-strings list differs from the coordinator's; publication blocked"
-            : kind.startsWith("private")
-              ? "private string"
-              : kind.startsWith("discreet")
-                ? "factory-marked"
-                : kind.startsWith("credential")
-                  ? "credential"
-                  : kind.includes("existing") || kind === "moved"
-                    ? "branch moved"
-                    : kind === "legacy changed" || kind.startsWith("missing")
-                      ? "publication metadata"
-                      : kind === "HEAD inspection failure"
-                        ? "Cannot inspect worker HEAD"
-                        : kind.startsWith("session committed")
-                          ? "session moved HEAD"
-                          : kind === "unknown remote"
-                            ? "Coordinator refused worker request (400)"
-                            : kind === "auth failure"
-                              ? "gh auth token failed: non-zero exit"
-                              : "withheld";
+          const reason =
+            kind === "workflows"
+              ? "Allow: workflows"
+              : ["missing digest", "different digest", "list changed during session"].includes(kind)
+                ? "Worker private-strings list differs from the coordinator's; publication blocked"
+                : kind.startsWith("private")
+                  ? "private string"
+                  : kind.startsWith("discreet")
+                    ? "factory-marked"
+                    : kind.startsWith("credential")
+                      ? "credential"
+                      : kind.includes("existing") || kind === "moved"
+                        ? "branch moved"
+                        : kind === "legacy changed" || kind.startsWith("missing")
+                          ? "publication metadata"
+                          : kind === "HEAD inspection failure"
+                            ? "Cannot inspect worker HEAD"
+                            : kind.startsWith("session committed")
+                              ? "session moved HEAD"
+                              : kind === "unknown remote"
+                                ? "Coordinator refused worker request (400)"
+                                : kind === "auth failure"
+                                  ? "gh auth token failed: non-zero exit"
+                                  : "withheld";
           expect(job?.failure_reason).toContain(reason);
+          if (kind === "workflows") expect(job?.failure_reason).toContain(".github/workflows/worker.yml");
           if (kind === "credential branch") {
             expect(job?.failure_reason).toBe("Registered worker credential in publication; push blocked");
             expect(remoteRef.exitCode).not.toBe(0);

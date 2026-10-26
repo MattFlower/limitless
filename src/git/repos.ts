@@ -7,10 +7,17 @@ import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import { type Config, type Paths, repoSettings } from "../config.ts";
 import { isBranchName } from "../core/delivery.ts";
-import type { Repo } from "../core/types.ts";
+import type { AuditAllowance, Repo } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import type { AgentJobRequest } from "../db/workers.ts";
-import { attributeRules, INERT_MEDIA_PATH, newlyHidden, SOURCE_PATH, unquote } from "../gates/audit.ts";
+import {
+  attributeRules,
+  auditDiff,
+  INERT_MEDIA_PATH,
+  newlyHidden,
+  SOURCE_PATH,
+  unquote,
+} from "../gates/audit.ts";
 import { isForbiddenFormat, isInertMedia, MEDIA_LIMIT } from "../gates/media.ts";
 import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
@@ -1508,6 +1515,27 @@ export function parseNameStatus(text: string): DiffFile[] {
       const [status = "", a = "", b] = l.split("\t").map((p) => (p.startsWith('"') ? (unquote(p) ?? p) : p));
       return b !== undefined ? { status, path: b, from: a } : { status, path: a };
     });
+}
+
+/** Inspect the exact candidate independently of missing or stale round audit evidence. */
+export async function assertWorkflowPublication(
+  cwd: string,
+  base: string,
+  sha: string,
+  allow: readonly AuditAllowance[] = [],
+  configDir?: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (allow.includes("workflows")) return;
+  const names = await worktreeGit(["git", "diff", "--name-status", "--no-renames", base, sha, "--"], {
+    cwd,
+    signal,
+  });
+  const finding = auditDiff(
+    { files: parseNameStatus(names.stdout), patch: "", stat: "", added: 0, removed: 0 },
+    { configDir, taskClass: null, protectedPaths: [] },
+  ).find((finding) => finding.rule === "ci-config");
+  if (finding) throw new Error(`[ci-config] ${finding.file}: ${finding.detail}`);
 }
 
 /** Export exact commits without executing a transport in the candidate repository. */
