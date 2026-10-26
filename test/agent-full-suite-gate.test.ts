@@ -578,6 +578,8 @@ test.each([
   { flaky: true, kind: "lan" as const, invalid: "retry-missing" },
   { flaky: true, kind: "lan" as const, invalid: "retry-mismatch" },
 ])("failure, retry classification and provenance survive (%j)", async ({ flaky, kind, invalid }) => {
+  const rejected = ["first-rewrite", "retry-commit", "retry-missing", "retry-mismatch"].includes(invalid);
+  const earlyRejection = rejected && invalid !== "first-rewrite";
   await configure();
   const configPath = join(fixture.repoDir, ".limitless.toml");
   writeFileSync(
@@ -689,9 +691,10 @@ test.each([
         env: agentEnv(),
         allowFail: true,
       });
-      expect(result.exitCode).toBe(flaky ? 0 : 3);
+      expect(result.exitCode).toBe(flaky && !rejected ? 0 : 3);
       expect(result.stdout).not.toContain(secret);
-      expect(result.stdout).toContain(flaky ? "pass on retry" : "failure excerpt [redacted]");
+      expect(result.stdout).toContain(flaky && !rejected ? "pass on retry" : "failure excerpt [redacted]");
+      if (rejected) expect(result.stdout).toContain("Retry rejected:");
       const stored = f.store.db.query("SELECT * FROM agent_gate_executions").all();
       expect(stored).toHaveLength(invalid ? 0 : 1);
       if (invalid) {
@@ -727,7 +730,7 @@ test.each([
     expect(testCheck?.result.ok).toBe(true);
     expect(roundZeroTests).toBe(1);
     expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual([]);
-    expect(calls).toBe(flaky ? 3 : 2);
+    expect(calls).toBe(flaky && !earlyRejection ? 3 : 2);
     return;
   }
   expect(testCheck).toMatchObject({

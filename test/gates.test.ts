@@ -59,6 +59,13 @@ import { resolveTestWorkers } from "../src/util/test-workers.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { truncationEncodings } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
+import { seeded } from "./seeded.ts";
+
+const retrySeed = seeded(async (cwd) => {
+  await sh(["git", "init", "-q"], { cwd });
+  await sh(["git", "commit", "-qm", "retry fixture", "--allow-empty"], { cwd });
+  return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+});
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -980,6 +987,7 @@ describe("gate slots and flaky retry", () => {
   /** Baseline passed (or not), then the check ran after the change and maybe once more. */
   async function retried(run: string, baselineOk = true) {
     const dir = tempDir({});
+    await retrySeed(dir);
     const cfg = config(run);
     const base = { name: "test", command: run, ok: baselineOk, exitCode: 0, durationMs: 1, output: "" };
     const cmp = compareGates({ setupOk: true, setup: [], checks: [base] }, await runGates(dir, cfg, signal));
@@ -1072,6 +1080,7 @@ describe("gate slots and flaky retry", () => {
 
   /** Baseline run plus its one retry; `runs` counts check invocations. */
   async function baseline(cfg: GateConfig, dir: string, abort = new AbortController()) {
+    await retrySeed(dir);
     const run = await retryBaselineFailures(await runGates(dir, cfg, signal), dir, cfg, abort.signal);
     const log = join(dir, "runs");
     const runs = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").length : 0;
@@ -2059,6 +2068,7 @@ const retryRegressions: typeof productionRetry = (cmp, cwd, cfg, changed, signal
 
 test.each([true, false])("docs-targeted regression retry retains its scope (ok=%s)", async (ok) => {
   const cwd = tempDir({ "doc_test.ts": "" });
+  const { value: sha } = await retrySeed(cwd);
   const command = "bun test './doc_test.ts'";
   const original: GateResult = {
     name: "test",
@@ -2097,6 +2107,8 @@ test.each([true, false])("docs-targeted regression retry retains its scope (ok=%
         return {
           setupOk: true,
           setup: [],
+          sha,
+          trackedClean: true,
           checks: [{ ...original, ok, exitCode: ok ? 0 : 1, docsOnly: undefined }],
         };
       },
@@ -2115,6 +2127,7 @@ test.each([true, false])("docs-targeted regression retry retains its scope (ok=%
 
 test.each(["baseline", "regression"])("standalone %s retries own scratch per check", async (kind) => {
   const cwd = tempDir({});
+  await retrySeed(cwd);
   const signal = new AbortController().signal;
   const cfg: GateConfig = {
     setup: [],
@@ -2530,6 +2543,7 @@ test.skipIf(seatbeltSkip !== null)(
 
 test("signal confinement covers setup, checks and baseline/regression retries; failure never becomes a pass", async () => {
   const cwd = tempDir({});
+  await retrySeed(cwd);
   const { backend, calls } = recordingConfinement();
   const signal = new AbortController().signal;
   const cfg: GateConfig = {

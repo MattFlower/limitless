@@ -42,6 +42,7 @@ import {
   retryBaselineFailures,
   retryRegressions,
   runLocalGates,
+  validateRetry,
 } from "../gates/run.ts";
 import { gateSlotScope } from "../gates/slots.ts";
 import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
@@ -1654,12 +1655,13 @@ async function oneRound(
               ctx.checkCancelled();
               after = {
                 ...after,
-                checks: after.checks.map((r) => ({
-                  ...r,
-                  firstAttempt: r.reused
-                    ? r.firstAttempt
-                    : findGateCounterpart(r, after.checks, first.checks),
-                })),
+                checks: after.checks.map((r) => {
+                  const original = findGateCounterpart(r, after.checks, first.checks);
+                  return {
+                    ...(original?.timedOut && !r.reused ? validateRetry(r, original, checkedSha, after) : r),
+                    firstAttempt: r.reused ? r.firstAttempt : original,
+                  };
+                }),
               };
             }
             const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
@@ -3424,10 +3426,13 @@ async function mergeForDelivery(
               await checkoutCommitted(cwd);
               after = await execute("timeout", docs.gates);
               ctx.checkCancelled();
-              after.checks = after.checks.map((r) => ({
-                ...r,
-                firstAttempt: findGateCounterpart(r, after.checks, first.checks),
-              }));
+              after.checks = after.checks.map((r) => {
+                const original = findGateCounterpart(r, after.checks, first.checks);
+                return {
+                  ...(original?.timedOut ? validateRetry(r, original, sha, after) : r),
+                  firstAttempt: original,
+                };
+              });
             }
             // A check fixed by the implementation must stay fixed after merging, even when
             // it failed on the original base. Persist that regression in the evidence too.
@@ -3438,6 +3443,15 @@ async function mergeForDelivery(
             const initial = compareGates(reference, after).map((c) => ({
               ...c,
               firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
+              ...(c.result.firstAttempt?.timedOut
+                ? {
+                    retryOriginal: compareGates(reference, {
+                      setupOk: true,
+                      setup: [],
+                      checks: [c.result.firstAttempt],
+                    }).map(({ verdict, blocking }) => ({ verdict, blocking }))[0],
+                  }
+                : {}),
             }));
             const events = gateEvents(ctx);
             const comparison = await retryRegressions(

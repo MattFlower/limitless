@@ -11,6 +11,7 @@ import { redactGateData } from "../src/gates/output.ts";
 import {
   compareGates,
   confinementFailed,
+  type GateComparison,
   type GateRun,
   retryBaselineFailures,
   retryRegressions,
@@ -22,6 +23,7 @@ import { type ConfinementBackend, confinementScope } from "../src/harness/sandbo
 import { LandQueue } from "../src/land/queue.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
+import { confirmPostMerge } from "../src/pipeline/post-merge-confirmation.ts";
 import { formatGateFeedback } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import * as proc from "../src/util/proc.ts";
@@ -81,6 +83,7 @@ const result = (req: GateRequest, ok = true): GateRun => ({
 function fake(
   onAttach: (h: ExecutionHandle, req: GateRequest) => Promise<GateRun>,
   kind: GateExecutor["kind"] = "lan",
+  inspect = true,
 ) {
   const requests = new Map<string, GateRequest>();
   const starts: ExecutionHandle[] = [];
@@ -98,7 +101,7 @@ function fake(
       const req = rebuilt ?? requests.get(h.id) ?? request(fixture.repoDir);
       const completed = onAttach(h, req).then(async (run) => ({
         ...run,
-        ...(await gateProvenance(req.cwd, _signal, req.headSha)),
+        ...(inspect ? await gateProvenance(req.cwd, _signal, req.headSha) : {}),
       }));
       return {
         result: completed,
@@ -132,6 +135,276 @@ async function context(executor?: GateExecutor) {
   return { f, ctx, restore: () => new RunContext(f.deps, run, repo, new AbortController().signal) };
 }
 
+test.each([
+  ["confirmation", "legacy"],
+  ["regression retry", "legacy"],
+  ["confirmation", "dirty"],
+  ["regression retry", "mismatched"],
+  ["regression retry", "targeted missing"],
+])("saved %s success rejects %s provenance after restart", async (kind, evidence) => {
+  const { ctx, restore } = await context();
+  const cwd = fixture.repoDir;
+  const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+  const req = { ...request(cwd), headSha: sha };
+  const original = result(req, false).checks[0];
+  const passed = result(req).checks[0];
+  if (!original || !passed) throw new Error("Missing fixture check");
+  ctx.state.baseline = result(req);
+  const credential = ["synthetic", "checkpoint", "credential"].join("-");
+  registerCredential("checkpoint-path", credential);
+  const retry = {
+    ...passed,
+    firstAttempt: original,
+    executionProvenance:
+      evidence === "legacy"
+        ? undefined
+        : {
+            sha: evidence === "mismatched" ? "a".repeat(40) : sha,
+            trackedClean: evidence !== "dirty",
+            provenanceError:
+              evidence === "dirty" ? `tracked files changed: ["${credential}.txt"]` : undefined,
+          },
+    ...(evidence === "targeted missing" ? { targetedRetry: passed } : {}),
+  };
+  ctx.state.postMergeGates = {
+    sha,
+    base: sha,
+    head: sha,
+    round: ctx.state.round,
+    deadline: Date.now() + 60_000,
+    result: {
+      setupOk: true,
+      timedOut: false,
+      comparison: [
+        {
+          name: "check",
+          verdict: "flaky",
+          blocking: false,
+          postMergeWorker: "test-worker",
+          firstAttempt: original,
+          result: retry,
+          ...(kind === "confirmation"
+            ? {
+                coordinatorConfirmation: {
+                  worker: "test-worker",
+                  originalVerdict: "regressed" as const,
+                  reason: "pass (worker-specific flake)",
+                  result: retry,
+                },
+              }
+            : {}),
+        },
+      ],
+    },
+  };
+  await ctx.save();
+  const resumed = restore();
+  const comparisons = resumed.state.postMergeGates?.result?.comparison;
+  if (!comparisons) throw new Error("Missing restored comparison");
+  const executions = spyOn(proc, "runProcess");
+  try {
+    await confirmPostMerge(resumed, cwd, gates, comparisons, Date.now() + 60_000, sha, () => resumed.save());
+    expect(comparisons[0]).toMatchObject({
+      blocking: true,
+      verdict: "regressed",
+      result: { ok: false, exitCode: 1, retryAttempt: { ok: true } },
+    });
+    expect(comparisons[0]?.result.output).toContain(original.output);
+    expect(comparisons[0]?.result.output).toContain("Retry rejected:");
+    if (evidence === "dirty") expect(comparisons[0]?.result.output).toContain('["[redacted].txt"]');
+    expect(JSON.stringify(comparisons)).not.toContain(credential);
+    const again = restore();
+    const saved = again.state.postMergeGates?.result?.comparison;
+    if (!saved) throw new Error("Missing second restored comparison");
+    await confirmPostMerge(again, cwd, gates, saved, Date.now() + 60_000, sha, async () => {});
+    expect(saved[0]).toMatchObject({ blocking: true, verdict: "regressed", result: { ok: false } });
+    expect(executions).not.toHaveBeenCalled();
+  } finally {
+    executions.mockRestore();
+  }
+});
+
+test.each([
+  ["pre-merge failure", "still_failing"],
+  ["baseline failure", "still_failing"],
+  ["missing counterpart", "new_failure"],
+  ["missing reference", "new_failure"],
+  ["skipped reference", "new_failure"],
+  ["unusable reference", "new_failure"],
+] as const)("legacy timeout retry restores %s classification", async (reference, verdict) => {
+  const { ctx, restore } = await context();
+  const cwd = fixture.repoDir;
+  const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+  const req = { ...request(cwd), headSha: sha };
+  const failed = result(req, false).checks[0];
+  const passed = result(req).checks[0];
+  if (!failed || !passed) throw new Error("Missing fixture check");
+  const original = { ...failed, timedOut: true, exitCode: null, output: "original check timed out" };
+  ctx.state.preRebaseGates = [];
+  ctx.state.baseline = result(req, false);
+  if (reference === "pre-merge failure") {
+    ctx.state.preRebaseGates = [
+      { name: failed.name, verdict: "still_failing", blocking: false, result: failed },
+    ];
+    ctx.state.baseline = result(req);
+  } else if (reference === "missing counterpart") {
+    ctx.state.preRebaseGates = [
+      { name: "other", verdict: "pass", blocking: false, result: { ...passed, name: "other" } },
+    ];
+  } else if (reference === "missing reference") {
+    ctx.state.baseline = null;
+  } else if (reference === "skipped reference") {
+    ctx.state.baseline.checks = [
+      { ...failed, docsOnly: { mode: "skipped", reason: "docs-only", files: [], changedPaths: [] } },
+    ];
+  } else if (reference === "unusable reference") {
+    ctx.state.baseline.checks = [{ ...failed, confinementError: true }];
+  }
+  ctx.state.postMergeGates = {
+    sha,
+    base: sha,
+    head: sha,
+    round: ctx.state.round,
+    deadline: Date.now() + 60_000,
+    result: {
+      setupOk: true,
+      timedOut: false,
+      comparison: [
+        {
+          name: failed.name,
+          verdict: "fixed",
+          blocking: false,
+          firstAttempt: original,
+          result: { ...passed, firstAttempt: original },
+        },
+      ],
+    },
+  };
+  await ctx.save();
+  const executions = spyOn(proc, "runProcess");
+  try {
+    let corrected: GateComparison[] | undefined;
+    for (let restart = 0; restart < 2; restart++) {
+      const resumed = restore();
+      const saved = resumed.state.postMergeGates;
+      if (!saved?.result) throw new Error("Missing restored timeout comparison");
+      await confirmPostMerge(resumed, cwd, gates, saved.result.comparison, saved.deadline, sha, () =>
+        resumed.save(),
+      );
+      expect(saved.result.comparison[0]).toMatchObject({
+        verdict,
+        blocking: true,
+        retryProvenanceRejected: true,
+        firstAttempt: original,
+        result: { ok: false, timedOut: true, exitCode: null, retryAttempt: { ok: true } },
+      });
+      expect(saved.result.comparison[0]?.result.output).toContain(original.output);
+      expect(saved.result.comparison[0]?.result.output).toContain("Retry rejected:");
+      if (corrected) expect(saved.result.comparison).toEqual(corrected);
+      corrected = saved.result.comparison;
+    }
+    expect(executions).not.toHaveBeenCalled();
+  } finally {
+    executions.mockRestore();
+  }
+});
+
+test.each(["confirmation", "regression retry"])(
+  "clean %s attestation survives restart without replaying execution",
+  async (kind) => {
+    const { ctx, restore } = await context();
+    const cwd = fixture.repoDir;
+    const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const cfg = { ...gates, retryFiles: "bun test {files}", checks: [{ name: "check", run: "bun test" }] };
+    const original = result({ ...request(cwd), gates: cfg }, false).checks[0];
+    if (!original) throw new Error("Missing fixture check");
+    original.failedFiles = ["greeting.txt"];
+    original.failureAttributionComplete = true;
+    let executions = 0;
+    const realProcess = proc.runProcess;
+    const processSpy = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd[0] !== "/bin/sh") return realProcess(opts);
+      executions++;
+      opts.onStdoutLine?.(opts.cmd[4] ?? "");
+      return {
+        exitCode: 0,
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        truncated: false,
+        stdout: "pass",
+        stderr: "",
+        durationMs: 1,
+      };
+    });
+    try {
+      let comparison: GateComparison[] = [
+        {
+          name: "check",
+          verdict: "regressed",
+          blocking: true,
+          postMergeWorker: "test-worker",
+          result: original,
+        },
+      ];
+      if (kind === "confirmation") {
+        await confinementScope.run(fakeConfinement, () =>
+          confirmPostMerge(ctx, cwd, cfg, comparison, Date.now() + 60_000, sha, async () => {}),
+        );
+      } else {
+        comparison = await retryRegressions(
+          comparison,
+          cwd,
+          cfg,
+          [],
+          ctx.signal,
+          undefined,
+          async (retry) => {
+            executions++;
+            return { ...result({ ...request(cwd), gates: retry }), sha, trackedClean: true };
+          },
+        );
+      }
+      expect(comparison[0]).toMatchObject({
+        verdict: "flaky",
+        blocking: false,
+        result: {
+          ok: true,
+          executionProvenance: { sha, trackedClean: true },
+          targetedRetry: { executionProvenance: { sha, trackedClean: true } },
+        },
+      });
+      ctx.state.postMergeGates = {
+        sha,
+        base: sha,
+        head: sha,
+        round: ctx.state.round,
+        deadline: Date.now() + 60_000,
+        result: { setupOk: true, timedOut: false, comparison },
+      };
+      await ctx.save();
+      const completed = executions;
+      expect(completed).toBe(kind === "confirmation" ? 1 : 2);
+      const resumed = restore();
+      const saved = resumed.state.postMergeGates;
+      if (!saved?.result) throw new Error("Missing saved retry");
+      expect(saved.result.comparison[0]?.result.executionProvenance).toEqual({ sha, trackedClean: true });
+      await confirmPostMerge(resumed, cwd, cfg, saved.result.comparison, saved.deadline, saved.sha, () =>
+        resumed.save(),
+      );
+      expect(saved.result.comparison[0]).toMatchObject({
+        verdict: "flaky",
+        blocking: false,
+        result: { ok: true },
+      });
+      expect(executions).toBe(completed);
+    } finally {
+      processSpy.mockRestore();
+    }
+  },
+);
+
 test.each(["assume-unchanged", "skip-worktree"])(
   "passing gates cannot hide tracked rewrites with %s",
   async (flag) => {
@@ -163,6 +436,73 @@ test.each(["assume-unchanged", "skip-worktree"])(
     expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("changed\n");
     expect(run.trackedClean).toBe(false);
     expect(run.provenanceError).toContain('"greeting.txt"');
+  },
+);
+
+test("a passing baseline retry that rewrites a tracked credential path retains the failure", async () => {
+  const cwd = fixture.repoDir;
+  const credential = ["synthetic", "retry", "path", "credential"].join("-");
+  registerCredential("retry-path", credential);
+  const file = `${credential}.txt`;
+  writeFileSync(join(cwd, file), "original");
+  await sh(["git", "add", file], { cwd });
+  await sh(["git", "commit", "-qm", "tracked credential path"], { cwd });
+  const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+  const cfg = {
+    ...gates,
+    checks: [
+      {
+        name: "check",
+        run: `if test -f attempted; then echo rewritten > '${file}'; else touch attempted; echo baseline-failure; exit 1; fi`,
+      },
+    ],
+  };
+  await confinementScope.run(fakeConfinement, async () => {
+    const req = { ...request(cwd), headSha, gates: cfg };
+    const signal = new AbortController().signal;
+    const original = await executeGate(req, signal);
+    const retried = await retryBaselineFailures(original, cwd, cfg, signal);
+    expect(retried.checks[0]).toMatchObject({ ok: false, exitCode: 1, firstAttempt: { ok: false } });
+    expect(retried.checks[0]?.output).toContain("baseline-failure");
+    expect(retried.checks[0]?.output).toContain('tracked files changed: ["[redacted].txt"]');
+    expect(retried.checks[0]?.output).not.toContain(credential);
+    expect(compareGates(original, retried)[0]).toMatchObject({ verdict: "still_failing", blocking: false });
+    expect(confinementFailed(retried.checks[0])).toBe(false);
+  });
+});
+
+test.each(["clean", "missing SHA", "missing cleanliness", "dirty", "mismatched SHA"])(
+  "baseline retries use LAN-reported provenance: %s",
+  async (scenario) => {
+    const cwd = fixture.repoDir;
+    const signal = new AbortController().signal;
+    const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const req = { ...request(cwd), headSha };
+    const original = result(req, false);
+    const remote = fake(
+      async (_handle, retry) => ({
+        ...result(retry),
+        sha:
+          scenario === "missing SHA" ? undefined : scenario === "mismatched SHA" ? "a".repeat(40) : headSha,
+        trackedClean: scenario === "missing cleanliness" ? undefined : scenario !== "dirty",
+        provenanceError: scenario === "dirty" ? 'tracked files changed: ["remote.txt"]' : undefined,
+      }),
+      "lan",
+      false,
+    );
+    // Coordinator bytes cannot establish whether the worker execution was clean.
+    writeFileSync(join(cwd, "greeting.txt"), "coordinator edits\n");
+    const retried = await retryBaselineFailures(original, cwd, gates, signal, undefined, (selected) =>
+      executeGate({ ...req, gates: selected }, signal, {}, remote.executor),
+    );
+    expect(retried.checks[0]).toMatchObject({
+      ok: scenario === "clean",
+      exitCode: scenario === "clean" ? 0 : 1,
+      firstAttempt: { ok: false },
+    });
+    if (scenario !== "clean") expect(retried.checks[0]?.output).toContain("Retry rejected:");
+    if (scenario === "dirty")
+      expect(retried.checks[0]?.output).toContain('tracked files changed: ["remote.txt"]');
   },
 );
 
@@ -776,7 +1116,10 @@ test("formatted gate identities keep baseline verdicts after gate-started restar
   if (!baseline) throw new Error("missing baseline");
   const retry: GateRunner = async (selected) => {
     expect(selected.checks).toEqual(cfg.checks);
-    return result({ ...request(fixture.repoDir), gates: selected });
+    return {
+      ...result({ ...request(fixture.repoDir), gates: selected }),
+      ...(await gateProvenance(fixture.repoDir, signal)),
+    };
   };
   const signal = new AbortController().signal;
   const retried = await retryBaselineFailures(baseline, fixture.repoDir, cfg, signal, undefined, retry);

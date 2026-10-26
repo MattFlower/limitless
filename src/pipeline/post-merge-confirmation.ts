@@ -3,11 +3,13 @@ import type { GateConfig } from "../gates/detect.ts";
 import { type ExecutionHandle, executeGate, localExecutor } from "../gates/executor.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import {
+  compareGates,
   confinementFailed,
   type GateComparison,
   type GateResult,
   gateEnv,
   retryFailures,
+  validateRetry,
 } from "../gates/run.ts";
 import type { RunContext } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
@@ -36,7 +38,35 @@ export async function confirmPostMerge(
   ]);
   const local = localExecutor();
   for (const c of comparisons) {
-    if (c.coordinatorConfirmation) continue;
+    const original = c.firstAttempt ?? c.result.firstAttempt;
+    if (c.result.ok && original && !original.ok) {
+      const targeted = c.result.targetedRetry;
+      const validated = targeted?.ok ? validateRetry(targeted, original, sha) : undefined;
+      const restored = validated && !validated.ok ? validated : validateRetry(c.result, original, sha);
+      if (!restored.ok) {
+        c.result = { ...restored, retryAttempt: c.result, targetedRetry: targeted };
+        const previous = ctx.state.preRebaseGates ?? [];
+        const reference = previous.length
+          ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
+          : (ctx.state.baseline ?? null);
+        const comparison = compareGates(reference, {
+          setupOk: true,
+          setup: [],
+          checks: comparisons.map((c) => c.result),
+        }).find((restored) => restored.result === c.result);
+        if (!comparison) throw new Error("Missing restored gate comparison");
+        c.verdict =
+          c.retryOriginal?.verdict ?? c.coordinatorConfirmation?.originalVerdict ?? comparison.verdict;
+        c.blocking =
+          c.retryOriginal?.blocking ??
+          (c.coordinatorConfirmation?.originalVerdict ? true : comparison.blocking);
+        c.retryProvenanceRejected = true;
+        if (c.coordinatorConfirmation) c.coordinatorConfirmation.reason = c.result.output;
+        await save();
+        continue;
+      }
+    }
+    if (c.coordinatorConfirmation || c.retryProvenanceRejected) continue;
     if (!c.blocking || !["regressed", "targeted_failure"].includes(c.verdict)) continue;
     const worker = c.postMergeWorker;
     if (worker === undefined) continue;
@@ -105,6 +135,7 @@ export async function confirmPostMerge(
       result,
     });
     if (result) {
+      c.retryOriginal ??= { verdict: c.verdict, blocking: c.blocking };
       c.firstAttempt ??= c.result;
       c.result = redactGateData({
         ...result,

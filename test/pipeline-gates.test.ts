@@ -41,6 +41,7 @@ const { start, githubFixture, registerGithub, advanceBase } = pipelineSetup({
 describe("pipeline (fake agents, real git + gates)", () => {
   test.each([
     "pass",
+    "dirty",
     "fail",
     "local",
     "fallback",
@@ -135,7 +136,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(check?.result.ok).toBe(scenario === "pass");
       expect(fixture.remote).toHaveLength(scenario === "mismatch" ? 1 : 2);
       expect(fixture.local.map((c) => c.command)).toEqual(
-        ["pass", "fail"].includes(scenario) ? [retry.replace("{files}", "'./greeting.txt'")] : [],
+        ["pass", "dirty", "fail"].includes(scenario) ? [retry.replace("{files}", "'./greeting.txt'")] : [],
       );
       if (scenario === "local" || scenario === "fallback")
         expect(check?.coordinatorConfirmation).toBeUndefined();
@@ -148,7 +149,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(check?.result.output).not.toContain("worker diagnostic");
         expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).toContain('"coordinatorConfirmation"');
       }
-      if (scenario === "pass" || scenario === "fail") {
+      if (scenario === "dirty") {
+        expect(check?.coordinatorConfirmation?.reason).toContain("Retry rejected:");
+        expect(check?.coordinatorConfirmation?.reason).toContain('tracked files changed: ["greeting.txt"]');
+        expect(check?.result.targetedRetry).toMatchObject({ ok: true, exitCode: 0 });
+        expect(check?.result.firstAttempt?.ok).toBe(false);
+        expect(f.store.getRun(run.id)?.error).toContain("tracked files changed");
+        expect(f.store.getRun(run.id)?.headSha).toBe(approved);
+      } else if (scenario === "pass" || scenario === "fail") {
         expect(checkpoints.length).toBeGreaterThan(1);
         for (const checkpoint of checkpoints) expect(checkpoint).not.toContain(secret);
         expect(JSON.stringify(saved)).not.toContain(secret);
@@ -322,6 +330,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "retry-lint",
     "retry clean once",
     "retry clean persists",
+    "dirty rerun",
   ])("gate timeout: %s", async (scenario) => {
     const retryClean = scenario.startsWith("retry clean");
     const limit = scenario === "twice" ? 37 : 900;
@@ -377,6 +386,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const command = opts.cmd.at(-1) ?? "";
       opts.onStdoutLine?.(opts.cmd[4] ?? "");
       commands.push(command);
+      if (scenario === "dirty rerun" && attempt === 2)
+        writeFileSync(join(opts.cwd ?? repoDir, "greeting.txt"), "rewritten by timeout rerun\n");
       const isLint = command === "fake-lint";
       const timeout =
         scenario === "base"
@@ -495,7 +506,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
         const retries = ["mixed", "unflagged", "setup"].includes(scenario) ? 0 : 1;
         expect(state?.gateTimeoutReruns ?? 0).toBe(retries);
         expect(prompts).toHaveLength(
-          ["twice", "mixed", "unflagged", "setup", "retry setup failure"].includes(scenario) ? 2 : 1,
+          ["twice", "mixed", "unflagged", "setup", "retry setup failure", "dirty rerun"].includes(scenario)
+            ? 2
+            : 1,
         );
         if (scenario === "slot") {
           expect(state?.round).toBe(0);
@@ -520,6 +533,24 @@ describe("pipeline (fake agents, real git + gates)", () => {
             result: { ok: true },
           });
         }
+        if (scenario === "dirty rerun") {
+          const evidence = JSON.parse(f.store.getArtifact(run.id, "gates-0.json") ?? "[]");
+          expect(evidence[0]).toMatchObject({
+            verdict: "regressed",
+            blocking: true,
+            result: {
+              ok: false,
+              timedOut: true,
+              exitCode: 1,
+              firstAttempt: { timedOut: true },
+              retryAttempt: { ok: true, executionProvenance: { trackedClean: false } },
+            },
+          });
+          expect(evidence[0]?.result.output).toContain("RUN slow acceptance test");
+          expect(evidence[0]?.result.output).toContain('tracked files changed: ["greeting.txt"]');
+          expect(prompts[1]).toContain("Retry rejected:");
+          expect(prompts[1]).toContain("greeting.txt");
+        }
         if (scenario === "twice") {
           expect(prompts[1]).toContain("Check `test` timed out after 37 s twice");
           expect(prompts[1]).toContain("the last test running was slow acceptance test");
@@ -533,7 +564,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
             expect(prompts[1]).toContain("Check `setup` now FAILS");
             expect(f.store.getArtifact(run.id, "gates-timeout-0.json")).toContain('"timedOut":true');
           } else expect(evidence[0]?.firstAttempt?.timedOut).toBe(true);
-          expect(evidence[0]?.result.timedOut ?? false).toBe(scenario === "twice");
+          expect(evidence[0]?.result.timedOut ?? false).toBe(["twice", "dirty rerun"].includes(scenario));
           expect(f.store.getArtifact(run.id, "report.md")).toContain("Timeout-caused gate re-runs: 1");
           expect(
             f.store
@@ -565,6 +596,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "cancel slot",
     "cancel retry",
     "slow pass",
+    "slow dirty",
+    "dirty rerun",
     "slow twice",
     "slow changed file",
     "slow confinement",
@@ -668,6 +701,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
             });
         }
       }
+      if (scenario === "slow dirty" && postMerge && command === "fake-test" && testAttempts === 2)
+        writeFileSync(join(cwd, "greeting.txt"), "rewritten by regression retry\n");
+      if (scenario === "dirty rerun" && postMerge && command === "fake-test" && attempts === 2)
+        writeFileSync(join(cwd, "greeting.txt"), "rewritten by timeout rerun\n");
       const timeout =
         postMerge &&
         !slow &&
@@ -776,6 +813,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         "retry failure",
         "retry setup",
         "cancel retry",
+        "dirty rerun",
       ].includes(scenario);
       expect(attempts).toBe(targeted ? 3 : retries ? 2 : 1);
       if (slow || scenario === "retry failure") expect(testAttempts).toBe(2);
@@ -802,13 +840,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
           expect(evidence[0]?.firstAttempt).toMatchObject({ timedOut: true, exitCode: null });
       }
       if (slow) {
-        const recovered = !["slow twice", "slow confinement"].includes(scenario);
+        const recovered = !["slow twice", "slow confinement", "slow dirty"].includes(scenario);
         expect(evidence[0]).toMatchObject({
           verdict: recovered ? "flaky" : scenario === "slow confinement" ? "confinement_error" : "regressed",
           blocking: !recovered,
           firstAttempt: { ok: false, durationMs: 400_000 },
           result: { ok: recovered, firstAttempt: { ok: false, durationMs: 400_000 } },
         });
+        if (scenario === "slow dirty")
+          expect(evidence[0]?.result.output).toContain('tracked files changed: ["greeting.txt"]');
         if (targeted) {
           expect(evidence[0]?.result.targetedRetry).toMatchObject({
             ok: true,
@@ -835,7 +875,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
           },
         ]);
       }
-      if (scenario === "slot" || (slow && !["slow twice", "slow confinement"].includes(scenario))) {
+      if (
+        scenario === "slot" ||
+        (slow && !["slow twice", "slow confinement", "slow dirty"].includes(scenario))
+      ) {
         expect(status).toBe("succeeded");
         expect(stage?.status).toBe("succeeded");
         if (slow) {
@@ -860,7 +903,15 @@ describe("pipeline (fake agents, real git + gates)", () => {
       } else {
         expect(status).toBe("needs_human");
         const reason = f.store.getRun(run.id)?.error ?? "";
-        if (scenario === "twice") {
+        if (scenario === "twice" || scenario === "dirty rerun") {
+          if (scenario === "dirty rerun") {
+            expect(evidence[0]).toMatchObject({
+              verdict: "regressed",
+              blocking: true,
+              result: { ok: false, timedOut: true, retryAttempt: { ok: true } },
+            });
+            expect(evidence[0]?.result.output).toContain('tracked files changed: ["greeting.txt"]');
+          }
           expect(reason).toContain("post-merge gate timed out");
           expect(reason).not.toContain("regressed");
           expect(stage).toMatchObject({ status: "failed", summary: "post-merge gate timed out" });

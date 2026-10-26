@@ -91,6 +91,7 @@ export function postMergeWorkerFixture(
       opts.env?.LIMITLESS_RUN_ID ?? f.store.listRuns()[0]?.id ?? "missing run",
     );
     local.push({ command, cwd, sha });
+    if (scenario === "dirty") writeFileSync(join(cwd, "greeting.txt"), "rewritten by confirmation\n");
     const failed = scenario === "fail" || scenario === "restart fail";
     const lines = failed
       ? ["error: coordinator assertion detail", "(fail) confirmation case", "0 pass", "1 fail"]
