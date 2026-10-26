@@ -3,7 +3,6 @@ CREATE TABLE issue_comment_streams (
   initialized_at TEXT NOT NULL,
   since TEXT NOT NULL,
   page INTEGER NOT NULL DEFAULT 1,
-  high TEXT NOT NULL,
   pending TEXT
 );
 CREATE TABLE issue_comment_commands (
@@ -13,3 +12,4 @@ CREATE TABLE issue_comment_commands (
   note TEXT NOT NULL,
   PRIMARY KEY (repo, comment_id)
 );
+CREATE INDEX issue_comment_commands_run ON issue_comment_commands(run_id);

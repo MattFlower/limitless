@@ -392,7 +392,14 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
       if (args[1] === "graphql" && args[3]?.includes("userContentEdits")) {
         calls.push(args);
         h.intercept?.(args);
-        return JSON.stringify({ data: { node: { userContentEdits: h.editHistory }, rateLimit: h.rate } });
+        const comment = h.stream.find((c) => `id=${c.node_id}` === args[5]);
+        const node = comment && {
+          body: comment.body,
+          createdAt: comment.created_at,
+          lastEditedAt: comment.updated_at === comment.created_at ? null : comment.updated_at,
+          userContentEdits: h.editHistory,
+        };
+        return JSON.stringify({ data: { node: node ?? null, rateLimit: h.rate } });
       }
       h.scopes.push(repo);
       calls.push(args);
@@ -3063,38 +3070,81 @@ test("304 costs one call, is conditional on the exact stream request, and mutate
   expect(h.runs()).toEqual([]);
 });
 
-test("pagination and timestamp ties survive a failed page and budget pauses without skipping commands", async () => {
-  const h = harness();
-  const comments = Array.from({ length: 103 }, (_, i) =>
-    commandComment(
-      1000 + i,
-      h.clock.now() + 1000,
-      i === 100 || i === 102 ? "/limitless work" : "ordinary comment",
-    ),
-  );
-  let fail = true;
-  h.streamReply = (args) => {
-    const page = Number(new URL(`https://example.com/${args[1]}`).searchParams.get("page"));
-    if (page === 2 && fail) throw new Error("page failed");
-    return `HTTP/2.0 200 OK\r\nETag: "page-${page}"\r\n\r\n${JSON.stringify(comments.slice((page - 1) * 100, page * 100))}`;
+/** GitHub's comment stream: updated after since, ascending by update, offset pages of per_page. */
+function githubStream(comments: ReturnType<typeof commandComment>[], fail?: () => boolean) {
+  return (args: string[]) => {
+    if (fail?.()) throw new Error("page failed");
+    const query = new URL(`https://example.com/${args[1]}`).searchParams;
+    const since = Date.parse(query.get("since") ?? "");
+    const [page, size] = [Number(query.get("page")), Number(query.get("per_page"))];
+    const matching = comments
+      .filter((c) => Date.parse(c.updated_at) > since)
+      .sort((x, y) => Date.parse(x.updated_at) - Date.parse(y.updated_at) || x.id - y.id);
+    return `HTTP/2.0 200 OK\r\nETag: "${since}-${page}"\r\n\r\n${JSON.stringify(matching.slice((page - 1) * size, page * size))}`;
   };
+}
+const budgeted = (calls: string[][]) =>
+  calls.filter((a) => a[1] !== "graphql" || a[3]?.includes("userContentEdits"));
+
+test("pagination tolerates edits, ties, a failed page and budget pauses without skipping commands", async () => {
+  const h = harness();
+  const at = (i: number) => new Date(h.clock.now() + 1000 + 2000 * Math.min(i, 99)).toISOString();
+  h.stream = Array.from({ length: 103 }, (_, i) => ({
+    ...commandComment(1000 + i, 0, i === 100 || i === 102 ? "/limitless work" : "ordinary comment"),
+    created_at: at(i),
+    updated_at: at(i),
+  }));
+  let fetches = 0;
+  h.streamReply = githubStream(h.stream, () => ++fetches === 2);
   await commandPoll(h, 2);
   expect(h.allCalls).toHaveLength(2);
-  expect(h.store.commentStream("owner/repo", h.clock.now()).page).toBe(2);
-  fail = false;
-  const count = h.allCalls.length;
+  expect(h.logs.join("\n")).toContain("page failed");
+  // Editing a handled comment moves it to the end, shifting the unseen command 1100 into page 1.
+  const edited = h.stream[0];
+  if (!edited) throw new Error("missing comment");
+  edited.updated_at = new Date(h.clock.now() + 900_000).toISOString();
+  let count = h.allCalls.length;
   await commandPoll(h, 2);
-  expect(h.allCalls.length - count).toBe(2);
-  expect(h.runs()).toHaveLength(1);
-  expect(h.store.commentStream("owner/repo", h.clock.now()).page).toBe(2);
+  expect(h.allCalls.length - count).toBe(1);
+  expect(h.runs()).toHaveLength(0);
+  await commandPoll(h, 2);
+  expect(h.runs().map((r) => r.sourceRef?.number)).toEqual([1100]);
   await commandPoll(h, 2);
   expect(h.runs()).toHaveLength(2);
-  expect(h.store.commentStream("owner/repo", h.clock.now()).page).toBe(1);
-  // A new arrival shares the boundary timestamp; the overlap must still discover it.
-  comments.push(commandComment(1103, h.clock.now() + 1000));
+  expect(h.store.commentStream("owner/repo", h.clock.now())).toMatchObject({
+    page: 1,
+    pending: null,
+    since: new Date(Date.parse(edited.updated_at) - 1000).toISOString(),
+  });
+  // A new arrival shares the cursor's timestamp; the overlap must still discover it.
+  h.stream.push({ ...commandComment(1103, 0), created_at: edited.updated_at, updated_at: edited.updated_at });
+  count = h.allCalls.length;
   await commandPoll(h);
-  expect(h.runs()).toHaveLength(3);
-  expect(new Set(h.runs().map((r) => r.sourceRef?.number)).size).toBe(3);
+  expect(h.allCalls.length - count).toBe(3);
+  expect(
+    h
+      .runs()
+      .map((r) => r.sourceRef?.number)
+      .sort(),
+  ).toEqual([1100, 1102, 1103]);
+});
+
+test("a full page inside one second falls back to page offsets instead of stalling", async () => {
+  const h = harness();
+  const at = new Date(h.clock.now() + 1000).toISOString();
+  h.stream = Array.from({ length: 101 }, (_, i) => ({
+    ...commandComment(2000 + i, 0, i === 100 ? "/limitless work" : "ordinary comment"),
+    created_at: at,
+    updated_at: at,
+  }));
+  h.streamReply = githubStream(h.stream);
+  await commandPoll(h);
+  expect(h.runs().map((r) => r.sourceRef?.number)).toEqual([2100]);
+  expect(h.streamCalls.map((a) => new URL(`https://example.com/${a[1]}`).searchParams.get("page"))).toEqual([
+    "1",
+    "1",
+    "2",
+  ]);
 });
 
 test("claim refusal is processed, redacted and durable after claim release and reopen", async () => {
@@ -3125,32 +3175,40 @@ test("claim refusal is processed, redacted and durable after claim release and r
   }
 });
 
-test("a one-call allowance resumes a fetched command and its edit evidence across reopen", async () => {
-  const h = harness({}, ["owner/repo"], true);
-  const comment = commandComment(911, h.clock.now());
-  comment.updated_at = new Date(h.clock.now() + 1000).toISOString();
-  h.stream = [comment];
-  for (let i = 0; i < 2; i++) {
-    const before = h.allCalls.length;
+test.each(["unchanged", "foreign edit", "deleted"] as const)(
+  "a budget pause re-reads a %s command before it runs, across reopen",
+  async (change) => {
+    const h = harness({ trusted: ["owner", "helper"] }, ["owner/repo"], true);
+    const comment = commandComment(911, h.clock.now());
+    h.stream = [comment];
     await commandPoll(h, 1);
-    expect(h.allCalls.length - before).toBe(1);
+    expect(h.allCalls).toHaveLength(1);
     expect(h.runs()).toHaveLength(0);
-  }
-  await h.close();
-  const reopened = new Store(join(h.dir, "store.db"));
-  const factory = new Factory(h.cfg, { store: reopened });
-  try {
-    const before = h.allCalls.length;
-    await commandPoll(h, 1, factory);
-    expect(h.allCalls.length - before).toBe(1);
-    expect(h.streamCalls).toHaveLength(1);
-    expect(reopened.listRuns()).toHaveLength(1);
-    expect(reopened.commentStream("owner/repo", h.clock.now()).pending).toBeNull();
-  } finally {
-    await factory.stop();
-    reopened.close();
-  }
-});
+    if (change === "foreign edit") {
+      comment.updated_at = new Date(h.clock.now() + 60_000).toISOString();
+      h.editHistory = {
+        totalCount: 2,
+        nodes: [{ editor: { login: "helper" } }, { editor: { login: "owner" } }],
+      };
+    }
+    if (change === "deleted") h.stream = [];
+    await h.close();
+    const reopened = new Store(join(h.dir, "store.db"));
+    const factory = new Factory(h.cfg, { store: reopened });
+    try {
+      await commandPoll(h, 2, factory);
+      expect(h.allCalls).toHaveLength(3);
+      expect(h.streamCalls).toHaveLength(1);
+      expect(h.allCalls.at(-1)).toContain("id=COMMENT_911");
+      expect(reopened.listRuns()).toHaveLength(change === "unchanged" ? 1 : 0);
+      expect(reopened.commentCommand({ repo: "owner/repo", id: 911 })).not.toBeNull();
+      expect(reopened.commentStream("owner/repo", h.clock.now()).pending).toBeNull();
+    } finally {
+      await factory.stop();
+      reopened.close();
+    }
+  },
+);
 
 test("conditional headers never transfer to a changed since query or GitHub identity", async () => {
   const h = harness();
@@ -3172,13 +3230,25 @@ test("comment metadata calls and lifecycle delivery share the existing poll allo
   h.stream = [commandComment(913, h.clock.now())];
   h.start();
   await h.advance();
-  expect(h.allCalls.filter((a) => a[1] !== "graphql")).toHaveLength(2);
-  expect(h.runs()).toHaveLength(1);
-  const before = h.allCalls.length;
+  expect(budgeted(h.allCalls)).toHaveLength(1);
+  expect(h.runs()).toHaveLength(0);
+  let before = h.allCalls.length;
   await h.advance(180_000);
-  const calls = h.allCalls.slice(before);
-  expect(calls.filter((a) => a[1] !== "graphql")).toHaveLength(2);
+  expect(budgeted(h.allCalls.slice(before))).toHaveLength(2);
+  expect(h.runs()).toHaveLength(1);
   expect(h.streamCalls).toHaveLength(1);
+  before = h.allCalls.length;
+  await h.advance(180_000);
+  // Lifecycle delivery for the new run spends the whole allowance, so the stream waits.
+  expect(budgeted(h.allCalls.slice(before))).toHaveLength(2);
+  expect(h.streamCalls).toHaveLength(1);
+  for (let i = 0; i < 5 && h.streamCalls.length === 1; i++) {
+    before = h.allCalls.length;
+    await h.advance(180_000);
+    expect(budgeted(h.allCalls.slice(before)).length).toBeLessThanOrEqual(2);
+  }
+  expect(h.streamCalls).toHaveLength(2);
+  expect(h.runs()).toHaveLength(1);
 });
 
 test("edited-command metadata preserves the queue's GraphQL rate-limit deferral", async () => {

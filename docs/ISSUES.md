@@ -84,7 +84,11 @@ credentials redacted and permanently recorded as processed, rather than retried 
 First enable persists the current time for each repository before fetching comments. Comments
 created earlier never execute, even if edited later. Stream pages and processed comment ids
 survive restarts; the same repository/comment id creates at most one run across webhook delivery,
-polling and replay after run completion. Unfinished pages resume within the existing call allowance.
+polling and replay after run completion. Each next request starts one second before the last
+update seen, so edits that reorder earlier results cannot hide unseen comments; page offsets are
+used only when a full page shares one second. A fetched page waiting on the call allowance
+survives restarts, but each command's issue, current body and edit history are read again just
+before it runs, so a later foreign edit or deletion withdraws it. A command needs two calls.
 Requests use the webhook's quoted JSON framing, issue source reference and author. Only the
 configured owner's command text can grant `Allow:` directives; issue context and other trusted
 authors cannot. Polled commands have no verified-webhook provenance. Questions and approvals
