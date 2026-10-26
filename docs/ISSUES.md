@@ -81,14 +81,17 @@ commands still count. Commands are explicit requests and do not need priority la
 queue eligibility, but share the transactional issue claim check. A claim refusal is logged with
 credentials redacted and permanently recorded as processed, rather than retried after claim release.
 
-First enable persists the current time for each repository before fetching comments. Comments
-created earlier never execute, even if edited later. Stream pages and processed comment ids
-survive restarts; the same repository/comment id creates at most one run across webhook delivery,
-polling and replay after run completion. Each next request starts one second before the last
-update seen, so edits that reorder earlier results cannot hide unseen comments; page offsets are
-used only when a full page shares one second. A fetched page waiting on the call allowance
-survives restarts, but each command's issue, current body and edit history are read again just
-before it runs, so a later foreign edit or deletion withdraws it. A command needs two calls.
+First enable persists the current time for each repository and starts the stream there, before
+fetching comments. Comments created earlier never execute, even if edited later. Stream pages and
+processed comment ids survive restarts; the same repository/comment id creates at most one run
+across webhook delivery, polling and replay after run completion. Each next request starts one
+second before the last update seen, so edits that reorder earlier results cannot hide unseen
+comments. When a full page shares one second, later pages of that query are sized to overlap the
+last comment handled; if that comment moved or vanished, the query is read again from its first
+page. A fetched page waiting on the call allowance survives restarts, but each command's issue,
+current body and edit history are read again just before it runs, so a later foreign edit or
+deletion withdraws it. A command needs two calls. Resolving the App token and bot login costs up
+to two more and is charged to the same allowance.
 Requests use the webhook's quoted JSON framing, issue source reference and author. Only the
 configured owner's command text can grant `Allow:` directives; issue context and other trusted
 authors cannot. Polled commands have no verified-webhook provenance. Questions and approvals

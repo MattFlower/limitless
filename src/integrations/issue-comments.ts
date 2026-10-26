@@ -3,7 +3,7 @@ import type { Factory } from "../app.ts";
 import { CommentProcessed, IssueClaimed } from "../db/store.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import { commentRunRequest, type GhRunner, submitCommentCommand } from "./github.ts";
-import { githubIdentity } from "./github-identity.ts";
+import { githubIdentity, githubIdentityRequests } from "./github-identity.ts";
 
 const date = z.string().refine((s) => Number.isFinite(Date.parse(s)));
 const pageSchema = z.array(
@@ -39,6 +39,21 @@ const CURRENT_QUERY = `query($id: ID!) { node(id: $id) { ... on IssueComment { b
 type QueueFactory = Pick<Factory, "cfg" | "store" | "scheduler" | "createRun">;
 type Cached = { key: string; etag: string };
 
+/**
+ * The page after the first `covered` items of one since query that still contains item covered - 1.
+ * Edits move a comment to the end of the stream, so offsets alone could skip whatever slid into an
+ * earlier page; the overlap proves nothing before the window moved.
+ */
+function commentWindow(covered: number) {
+  if (covered < 100) return { size: 100, page: 1 };
+  let best = { size: 1, page: covered };
+  for (let size = 100; size > 1; size--) {
+    const page = Math.floor((covered - 1) / size) + 1;
+    if (page * size > best.page * best.size) best = { size, page };
+  }
+  return best;
+}
+
 /** A fetched page survives budget pauses; each command is re-read before it runs. */
 export async function pollIssueComments(
   factory: QueueFactory,
@@ -55,6 +70,10 @@ export async function pollIssueComments(
   const { store, cfg } = factory;
   const state = store.commentStream(repo, now);
   const boundary = Date.parse(state.initializedAt);
+  // Resolving the App token is part of this poll, and the stream request must still fit after it.
+  const lookups = githubIdentityRequests(repo);
+  if (budget.remaining <= lookups) return;
+  budget.remaining -= lookups;
   const posting = await identity(repo);
   const bot = posting.kind === "app" ? posting.botLogin : undefined;
   const exhausted = Symbol();
@@ -65,9 +84,11 @@ export async function pollIssueComments(
   };
   try {
     while (!signal.aborted) {
+      const { size, page } = commentWindow(state.covered);
+      const start = (page - 1) * size;
       let comments = state.pending ? pageSchema.parse(JSON.parse(state.pending)) : null;
       if (!comments) {
-        const path = `repos/${repo}/issues/comments?since=${encodeURIComponent(state.since)}&sort=updated&direction=asc&per_page=100&page=${state.page}`;
+        const path = `repos/${repo}/issues/comments?since=${encodeURIComponent(state.since)}&sort=updated&direction=asc&per_page=${size}&page=${page}`;
         const key = `${posting.kind === "app" ? posting.token : "owner"}:${path}`;
         const cached = cache.get(repo)?.key === key ? cache.get(repo) : undefined;
         const raw = String(
@@ -80,6 +101,12 @@ export async function pollIssueComments(
         comments = pageSchema.parse(redactCredentialData(JSON.parse(raw.slice(end + split.length))));
         const etag = /^etag:\s*(.+)$/im.exec(raw.slice(0, end))?.[1]?.trim();
         if (etag) cache.set(repo, { key, etag });
+        if (start > 0 && !comments.some((c) => c.id === state.lastId)) {
+          // Something before this window moved, so read the tie again from its first page.
+          Object.assign(state, { covered: 0, lastId: null });
+          store.advanceCommentStream(repo, state.since, 0, null);
+          continue;
+        }
         store.saveCommentPage(repo, JSON.stringify(comments));
       }
       for (const comment of comments) {
@@ -152,16 +179,16 @@ export async function pollIssueComments(
       }
       // Anything unseen sorts at or after the last update, even if edits reorder earlier results.
       // Timestamps are whole seconds and can tie, so overlap one second; processed ids absorb repeats.
-      // Only a full page inside that second needs a page offset.
+      // Only a tie the cursor cannot pass needs an overlapping window further into the same query.
       const since = Math.max(
         Date.parse(state.since),
         Date.parse(comments.at(-1)?.updated_at ?? "") - 1000 || 0,
       );
-      const full = comments.length === 100;
-      const page = full && since === Date.parse(state.since) ? state.page + 1 : 1;
-      Object.assign(state, { since: new Date(since).toISOString(), page, pending: null });
-      store.advanceCommentStream(repo, state.since, page);
-      if (!full) return;
+      const covered = since === Date.parse(state.since) ? start + comments.length : 0;
+      const lastId = covered ? (comments.at(-1)?.id ?? null) : null;
+      Object.assign(state, { since: new Date(since).toISOString(), covered, lastId, pending: null });
+      store.advanceCommentStream(repo, state.since, covered, lastId);
+      if (comments.length < size) return;
     }
   } catch (error) {
     if (error !== exhausted && !signal.aborted)

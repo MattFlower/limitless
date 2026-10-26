@@ -1260,13 +1260,20 @@ export class Store {
   }
 
   commentStream(repo: string, now: number) {
+    const at = new Date(now).toISOString();
     this.db
       .query("INSERT OR IGNORE INTO issue_comment_streams (repo, initialized_at, since) VALUES (?, ?, ?)")
-      .run(repo, new Date(now).toISOString(), new Date(now - 1000).toISOString());
+      .run(repo, at, at);
     return this.db
-      .query(`SELECT initialized_at AS initializedAt, since, page, pending
+      .query(`SELECT initialized_at AS initializedAt, since, covered, last_id AS lastId, pending
       FROM issue_comment_streams WHERE repo = ?`)
-      .get(repo) as { initializedAt: string; since: string; page: number; pending: string | null };
+      .get(repo) as {
+      initializedAt: string;
+      since: string;
+      covered: number;
+      lastId: number | null;
+      pending: string | null;
+    };
   }
 
   commentStreamBoundary(repo: string): string | null {
@@ -1276,10 +1283,11 @@ export class Store {
     return row?.at ?? null;
   }
 
-  advanceCommentStream(repo: string, since: string, page: number): void {
+  advanceCommentStream(repo: string, since: string, covered: number, lastId: number | null): void {
     this.db
-      .query("UPDATE issue_comment_streams SET since = ?, page = ?, pending = NULL WHERE repo = ?")
-      .run(since, page, repo);
+      .query(`UPDATE issue_comment_streams SET since = ?, covered = ?, last_id = ?, pending = NULL
+      WHERE repo = ?`)
+      .run(since, covered, lastId, repo);
   }
 
   saveCommentPage(repo: string, page: string): void {

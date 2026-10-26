@@ -2,7 +2,8 @@ CREATE TABLE issue_comment_streams (
   repo TEXT PRIMARY KEY COLLATE NOCASE,
   initialized_at TEXT NOT NULL,
   since TEXT NOT NULL,
-  page INTEGER NOT NULL DEFAULT 1,
+  covered INTEGER NOT NULL DEFAULT 0,
+  last_id INTEGER,
   pending TEXT
 );
 CREATE TABLE issue_comment_commands (

@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { createHmac } from "node:crypto";
+import { createHmac, generateKeyPairSync } from "node:crypto";
 import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,7 @@ import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { ISSUE_CLAIM_STATUSES, IssueClaimed, linkedIssues, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { githubWebhook, issueRunRequest, mapGitHubEvent, unquoteGitHub } from "../src/integrations/github.ts";
-import type { GitHubIdentity } from "../src/integrations/github-identity.ts";
+import { configureGitHubIdentity, type GitHubIdentity } from "../src/integrations/github-identity.ts";
 import { mountIntegrations } from "../src/integrations/index.ts";
 import { pollIssueComments } from "../src/integrations/issue-comments.ts";
 import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
@@ -2871,7 +2871,7 @@ test("comment polling shares webhook framing and scopes allowances to the owner'
   expect(h.streamCalls).toHaveLength(1);
   const url = new URL(`https://example.com/${h.streamCalls[0]?.[1]}`);
   expect(url.pathname).toBe("/repos/owner/repo/issues/comments");
-  expect(url.searchParams.get("since")).toBe(new Date(h.clock.now() - 1000).toISOString());
+  expect(url.searchParams.get("since")).toBe(new Date(h.clock.now()).toISOString());
   expect(url.searchParams.get("direction")).toBe("asc");
   expect(url.searchParams.get("sort")).toBe("updated");
 });
@@ -3083,6 +3083,10 @@ function githubStream(comments: ReturnType<typeof commandComment>[], fail?: () =
     return `HTTP/2.0 200 OK\r\nETag: "${since}-${page}"\r\n\r\n${JSON.stringify(matching.slice((page - 1) * size, page * size))}`;
   };
 }
+const windowOf = (args: string[]) => {
+  const query = new URL(`https://example.com/${args[1]}`).searchParams;
+  return `${query.get("per_page")}:${query.get("page")}`;
+};
 const budgeted = (calls: string[][]) =>
   calls.filter((a) => a[1] !== "graphql" || a[3]?.includes("userContentEdits"));
 
@@ -3112,7 +3116,8 @@ test("pagination tolerates edits, ties, a failed page and budget pauses without 
   await commandPoll(h, 2);
   expect(h.runs()).toHaveLength(2);
   expect(h.store.commentStream("owner/repo", h.clock.now())).toMatchObject({
-    page: 1,
+    covered: 0,
+    lastId: null,
     pending: null,
     since: new Date(Date.parse(edited.updated_at) - 1000).toISOString(),
   });
@@ -3129,7 +3134,7 @@ test("pagination tolerates edits, ties, a failed page and budget pauses without 
   ).toEqual([1100, 1102, 1103]);
 });
 
-test("a full page inside one second falls back to page offsets instead of stalling", async () => {
+test("a full page inside one second continues in a window overlapping the last handled comment", async () => {
   const h = harness();
   const at = new Date(h.clock.now() + 1000).toISOString();
   h.stream = Array.from({ length: 101 }, (_, i) => ({
@@ -3140,11 +3145,81 @@ test("a full page inside one second falls back to page offsets instead of stalli
   h.streamReply = githubStream(h.stream);
   await commandPoll(h);
   expect(h.runs().map((r) => r.sourceRef?.number)).toEqual([2100]);
-  expect(h.streamCalls.map((a) => new URL(`https://example.com/${a[1]}`).searchParams.get("page"))).toEqual([
-    "1",
-    "1",
-    "2",
-  ]);
+  expect(h.streamCalls.map(windowOf)).toEqual(["100:1", "99:2"]);
+});
+
+test.each(["edited", "deleted"] as const)(
+  "a handled comment %s during a tie pause cannot push an unseen command past the window",
+  async (change) => {
+    const h = harness({}, ["owner/repo"], true);
+    const at = new Date(h.clock.now() + 1000).toISOString();
+    h.stream = Array.from({ length: 101 }, (_, i) => ({
+      ...commandComment(3000 + i, 0, i === 100 ? "/limitless work" : "ordinary comment"),
+      created_at: at,
+      updated_at: at,
+    }));
+    const comments = h.stream;
+    h.streamReply = (args) => githubStream(comments)(args);
+    await commandPoll(h, 1);
+    expect(h.store.commentStream("owner/repo", h.clock.now())).toMatchObject({ covered: 100, lastId: 3099 });
+    const handled = comments[5];
+    if (!handled) throw new Error("missing comment");
+    if (change === "edited") handled.updated_at = new Date(h.clock.now() + 60_000).toISOString();
+    else comments.splice(5, 1);
+    await h.close();
+    const reopened = new Store(join(h.dir, "store.db"));
+    const factory = new Factory(h.cfg, { store: reopened });
+    try {
+      for (let i = 0; i < 3; i++) await commandPoll(h, 3, factory);
+      expect(reopened.listRuns().map((r) => r.sourceRef?.number)).toEqual([3100]);
+      // The overlap check found 3099 gone from the next window and read the tie from page 1 again.
+      expect(h.streamCalls.map(windowOf).slice(0, 3)).toEqual(["100:1", "99:2", "100:1"]);
+    } finally {
+      await factory.stop();
+      reopened.close();
+    }
+  },
+);
+
+test("App token and slug lookups for comment polling are charged to the poll allowance", async () => {
+  const h = harness({ trusted: ["owner"] });
+  const key = join(h.dir, "app.pem");
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  writeFileSync(key, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+  const requests: string[] = [];
+  configureGitHubIdentity(
+    { appId: 1, installationId: 2, privateKeyPath: key, repos: ["owner/repo"] },
+    {
+      fetch: async (url) => {
+        requests.push(url);
+        if (url.endsWith("/app")) return Response.json({ slug: "factory" });
+        return Response.json({
+          token: "test-comment-token",
+          expires_at: new Date(Date.now() + 3600_000).toISOString(),
+        });
+      },
+    },
+  );
+  try {
+    const poll = (cap: number) => {
+      const budget = { remaining: cap };
+      const signal = new AbortController().signal;
+      return pollIssueComments(h.factory, "owner/repo", h.gh, signal, h.clock.now(), budget, new Map(), (s) =>
+        h.logs.push(s),
+      ).then(() => budget.remaining);
+    };
+    expect(await poll(2)).toBe(2);
+    expect(requests).toEqual([]);
+    expect(h.streamCalls).toHaveLength(0);
+    expect(await poll(3)).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(h.streamCalls).toHaveLength(1);
+    expect(await poll(1)).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(h.streamCalls).toHaveLength(2);
+  } finally {
+    configureGitHubIdentity(null);
+  }
 });
 
 test("claim refusal is processed, redacted and durable after claim release and reopen", async () => {

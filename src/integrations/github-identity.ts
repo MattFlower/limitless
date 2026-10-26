@@ -118,7 +118,14 @@ export function createGitHubIdentity(app: App, deps: IdentityDeps = {}) {
       flight = undefined;
     }
   };
-  return identity;
+  /** GitHub requests the next resolution for repo makes: none while the token is cached. */
+  const requests = (repo?: string) =>
+    !app || !repo || !repos.has(repo.toLowerCase()) || (cached && now() < cached.expires - 300_000)
+      ? 0
+      : botLogin
+        ? 1
+        : 2;
+  return Object.assign(identity, { requests });
 }
 
 let provider = createGitHubIdentity(null);
@@ -126,6 +133,7 @@ export function configureGitHubIdentity(app: App, deps: IdentityDeps = {}) {
   provider = createGitHubIdentity(app, deps);
 }
 export const githubIdentity = (repo?: string) => provider(repo);
+export const githubIdentityRequests = (repo?: string) => provider.requests(repo);
 
 /** Parse a single repository/PR URL, never arbitrary command text. */
 export const githubUrlRepo = (url: string): string | undefined =>
