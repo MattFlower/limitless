@@ -284,6 +284,10 @@ after ten minutes. The coordinator creates and reuses a self-signed certificate 
 Changing the coordinator's certificate requires pairing again. Keep both machines on the same
 release SHA and Bun version; mismatches show as `needs update`. Upgrade the coordinator before
 its workers: older coordinators reject the new `failureAttributionComplete` worker result metadata.
+A Linux worker pairs and starts the same way and runs gate jobs only, under bubblewrap and Landlock
+([OPERATIONS](OPERATIONS.md#linux-confinement)). It refuses to start unless that confinement passes
+its preflight, and the coordinator never leases it agent jobs. Coordinators from before Linux
+workers reject its heartbeats, so upgrade the coordinator first.
 Workers send heartbeats every ten seconds and show as offline after thirty seconds without a
 heartbeat. Opted-in gates run from git bundles at the requested commit, without GitHub credentials
 on the worker. Leases renew with

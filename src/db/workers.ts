@@ -54,6 +54,7 @@ export interface WorkerRow {
   pairing_expires_at: number;
   last_heartbeat_at: number | null;
   capabilities: string | null;
+  capabilities_ext: string | null;
   agent_capabilities: string | null;
   setup_warning: string | null;
 }
@@ -219,8 +220,13 @@ export class WorkerStore {
       .query("UPDATE workers SET state='revoked',token_hash=NULL,revoked_at=? WHERE name=?")
       .run(this.now(), name);
   }
+  /** A Linux worker's capabilities, which the previous release can't parse, are in `capabilities_ext`. */
+  private capabilities(w: WorkerRow): string | null {
+    return w.capabilities ?? w.capabilities_ext;
+  }
   available(w: WorkerRow, agent = false) {
-    const c = w.capabilities ? Heartbeat.parse(JSON.parse(w.capabilities)) : null;
+    const raw = this.capabilities(w);
+    const c = raw ? Heartbeat.parse(JSON.parse(raw)) : null;
     return (
       w.state === "approved" &&
       w.last_heartbeat_at !== null &&
@@ -228,7 +234,8 @@ export class WorkerStore {
       !!this.releaseSha &&
       c?.releaseSha === this.releaseSha &&
       c.bunVersion === Bun.version &&
-      (agent || c.freeSlots > 0)
+      // Agent rounds stay on macOS workers until Linux editors are confined (#839).
+      (agent ? c.os === "darwin" : c.freeSlots > 0)
     );
   }
   private agentCapabilities(w: WorkerRow) {
@@ -245,7 +252,8 @@ export class WorkerStore {
       )
       .all(this.now())
       .map((w) => {
-        const c: Capabilities | null = w.capabilities ? JSON.parse(w.capabilities) : null;
+        const raw = this.capabilities(w);
+        const c: Capabilities | null = raw ? JSON.parse(raw) : null;
         const { agents, privateStrings } = this.agentCapabilities(w);
         const result = this.sanitize({
           name: w.name,
@@ -301,11 +309,20 @@ export class WorkerStore {
     this.sweep();
     this.sweepAgentJobs();
     if (c.updateWarning !== undefined) c = { ...c, updateWarning: this.sanitize(c.updateWarning) };
+    // The previous release reads `capabilities` with a strict schema that knows only darwin and no
+    // confinement field: a Linux worker's row goes to `capabilities_ext` and leaves it null.
+    const { confinement: _confinement, ...darwin } = c;
     this.store.db
       .query(
-        "UPDATE workers SET last_heartbeat_at=?,capabilities=?,agent_capabilities=? WHERE name=? AND state='approved'",
+        "UPDATE workers SET last_heartbeat_at=?,capabilities=?,capabilities_ext=?,agent_capabilities=? WHERE name=? AND state='approved'",
       )
-      .run(this.now(), JSON.stringify(c), JSON.stringify({ agents, privateStrings }), w.name);
+      .run(
+        this.now(),
+        c.os === "darwin" ? JSON.stringify(darwin) : null,
+        c.os === "darwin" ? null : JSON.stringify(c),
+        JSON.stringify({ agents, privateStrings }),
+        w.name,
+      );
     const cancelled: string[] = [];
     for (const id of c.jobs) {
       const gate = this.job(id);
@@ -342,7 +359,7 @@ export class WorkerStore {
       if (sweep) this.sweep();
       const w = this.worker(name);
       if (!w || !this.available(w)) return null;
-      const c: Capabilities = JSON.parse(w.capabilities ?? "{}");
+      const c: Capabilities = JSON.parse(this.capabilities(w) ?? "{}");
       const unreported = this.jobs("state='leased' AND worker=?", name).filter((j) => !c.jobs.includes(j.id));
       if (unreported.length >= c.freeSlots) return null;
       const j = this.jobs("state='queued' AND in_place=0").find(
