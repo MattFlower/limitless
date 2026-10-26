@@ -22,7 +22,7 @@ export const ChatProposalSchema = z.strictObject({
   prompt: text,
   profile: z.enum(["auto", "quick", "standard", "deep"]),
   title: text.max(200),
-  allow: z.array(z.enum(["submodules", "gitattributes", "binary"])).default([]),
+  allow: z.array(z.enum(["submodules", "gitattributes", "binary", "workflows"])).default([]),
 });
 export const ChatRequestSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("text"), text }),

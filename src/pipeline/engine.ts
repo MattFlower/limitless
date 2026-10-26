@@ -48,6 +48,7 @@ import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/comman
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   adoptWorkerCommit,
+  assertWorkflowPublication,
   checkoutCommitted,
   checkPrivateRange,
   commitAll,
@@ -1259,6 +1260,7 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
       const request: AgentPublication = {
         parentSha,
         baseSha: ctx.run.baseSha as string,
+        allow: ctx.run.allow,
         branch,
         commit: {
           message: `${commitMessage(ctx, round)}\n`,
@@ -1763,7 +1765,8 @@ async function oneRound(
     async () => {
       const findings = auditDiff(diff, {
         configDir: ctx.deps.cfg.paths.configDir,
-        allow: ctx.run.allow ?? [],
+        // Already-pushed author edits are advisory; repairs are audited independently below.
+        allow: ctx.state.verification ? [...(ctx.run.allow ?? []), "workflows"] : (ctx.run.allow ?? []),
         taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
         toolCommands: ctx.state.toolCommands,
@@ -2606,6 +2609,24 @@ function githubUnavailable(error: unknown): boolean {
   );
 }
 
+async function checkWorkflowPublication(ctx: RunContext, sha: string): Promise<void> {
+  const base = ctx.state.verification?.headSha ?? ctx.run.baseSha;
+  if (!base) throw new DeliveryHeadError("Workflow publication check requires a recorded base");
+  try {
+    await assertWorkflowPublication(
+      ctx.state.worktreePath as string,
+      base,
+      sha,
+      ctx.run.allow,
+      ctx.deps.cfg.paths.configDir,
+      ctx.signal,
+    );
+  } catch (error) {
+    ctx.checkCancelled();
+    throw new DeliveryHeadError((error as Error).message);
+  }
+}
+
 /** Check outgoing and visible text; `pr` also checks the title, branch and published range. */
 async function checkPublication(
   ctx: RunContext,
@@ -2614,6 +2635,7 @@ async function checkPublication(
   location = pr ? "PR body" : "PR comment",
 ) {
   const cwd = ctx.state.worktreePath as string;
+  if (pr) await checkWorkflowPublication(ctx, pr.sha);
   try {
     const entries = privateEntries(ctx, cwd);
     if (repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet) {
@@ -3068,6 +3090,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         ? null
         : await commitAll(cwd, commitMessage(ctx));
     let head = sha ?? (await headSha(cwd));
+    await checkWorkflowPublication(ctx, head);
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
     ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review) {

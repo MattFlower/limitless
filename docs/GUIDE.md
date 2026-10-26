@@ -72,11 +72,19 @@ Each stage and what it guarantees:
 | holdout | no | yes | yes | A model, preferably from a different vendor than the spec author, writes concrete acceptance scenarios from the prompt and spec. It can read and search a private, read-only snapshot of the base commit (never the implementer's worktree, home or temporary directories), so its steps use real commands and config. The implementer never sees these scenarios. |
 | implement | yes | yes | yes | An agent edits the worktree and each round is committed. Routing depends on task complexity. |
 | gates | yes | yes | yes | The factory reruns every check. A check that passed on the base branch and now fails, or a new check that fails, blocks. Pre-existing failures do not. A failed setup step always blocks. |
-| audit | yes | yes | yes | Deterministic checks on the diff. These block: an empty diff, edits to existing protected paths, new `skip`/`only` markers, tests moved out of test paths, secrets, changed gate scripts, nested repositories (gitlinks) and attribute changes that hide text diffs (`-diff`, `binary`, `filter`, custom `diff` drivers, `linguist-generated`). To allow the last two, put `Allow: submodules` or `Allow: gitattributes` on a line of its own in the request, or pass `limitless run --allow submodules|gitattributes` (API: `allow`); quoted GitHub content never counts. Deleted tests, config or CI edits, lockfile edits, suppressions, removed assertions and `--no-verify` produce warnings. |
+| audit | yes | yes | yes | Deterministic checks on the diff. These block: an empty diff, edits to existing protected paths, new `skip`/`only` markers, tests moved out of test paths, secrets, changed gate scripts, CI configuration changes, binary content, nested repositories (gitlinks) and attribute changes that hide text diffs (`-diff`, `binary`, `filter`, custom `diff` drivers, `linguist-generated`). Allowances are `submodules`, `gitattributes`, `binary` and `workflows`: put `Allow: <kind>` on a line of its own in the request, or pass `limitless run --allow <kind>` (repeatable; API: `allow: ["workflows"]`). An older daemon rejects `--allow workflows` submitted by a newer CLI. Quoted GitHub content never grants an allowance. Deleted tests, test/lint config edits, lockfile edits, suppressions, removed assertions and `--no-verify` produce warnings. |
 | review | yes | yes | yes (frontier cell) | A reviewer from a different vendor than the implementer applies a rubric. It falls back to the same vendor, with a logged warning, only when nothing else is available. In the first review, blocker and major findings block. In later rounds, only regressions, unaddressed earlier blocking findings, and new blockers or security issues block. Everything else becomes a follow-up. |
 | preview | no | if configured | if configured | For UI changes, builds, seeds and serves the app on loopback before verify (see `[preview]` in the [README](../README.md#configuration)). |
 | verify | no | yes | yes | A separate, private session checks every acceptance criterion and holdout scenario by running things. It prefers a different vendor than the implementer. The result is a pass only when every criterion is `met`. |
 | deliver | yes | yes | yes | Commit, rebase onto the latest base and rerun the checks, push, and open a PR with an evidence report. The PR is then merged or left open according to the merge policy. |
+
+CI configuration covers `.github/workflows/**`, root `.gitlab-ci.yml` and `.circleci/**`, including deletions and rename endpoints. Ungranted factory edits are refused before any delivery push, including needs-human drafts and review or CI-fix updates. In verify-change runs, the PR author's already-pushed CI edits remain warnings; factory repairs are checked against the original PR head and require `workflows`, even when repairing the same file.
+
+For manual landing, `scripts/land-pr.sh <pr-number> "<squash subject>" [worktree-dir] [--allow workflows]`
+checks the exact commit it pushes against the PR base, including local commits newer than the PR head.
+Only the operator's explicit `--allow workflows` argument grants permission; PR text never grants it.
+For example: `scripts/land-pr.sh 123 "Update CI" ./merge-worktree --allow workflows`.
+The option bypasses only the workflow guard; privacy, clean-worktree and landing checks still apply.
 
 A few more details:
 
@@ -84,7 +92,7 @@ A few more details:
   a new implement round. After two failing rounds on one model, the implementer escalates to a
   stronger tier (or to any model not yet tried). The total number of rounds is
   `[limits].max_rounds + 2`, which is 5 by default. When the rounds run out, the run ends as
-  `needs_human` and opens a draft PR titled `[needs human] ...`.
+  `needs_human` and opens a draft PR titled `[needs human] ...` when publication checks permit it.
 - **Profiles today.** `quick` skips spec, holdout and verify. `deep` differs from `standard` in
   routing review to the `large` policy cell, which puts frontier models first, and in panel review
   mode it adds the repository's review lenses (see [Review configuration](#review-configuration-and-lenses)).

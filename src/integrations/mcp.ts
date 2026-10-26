@@ -374,7 +374,7 @@ export function createMcpServer(backend: McpBackend): Server {
           prompt: nonblank,
           title: nonblank.optional(),
           consumer: FeedQuerySchema.shape.consumer,
-          allow: z.array(z.enum(["submodules", "gitattributes", "binary"])).optional(),
+          allow: z.array(z.enum(["submodules", "gitattributes", "binary", "workflows"])).optional(),
           models: z.partialRecord(z.enum(RUN_ROLES), z.array(z.string()).min(1)).optional(),
           dependsOn: z.array(nonblank).optional(),
           profile: profile.default("auto"),

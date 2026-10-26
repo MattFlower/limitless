@@ -699,7 +699,7 @@ test.each(["unmet", "unclear"] as const)(
   },
 );
 
-test.each(["amended round", "unchanged round", "amended existing branch"])(
+test.each(["amended round", "unchanged round", "amended existing branch", "stale workflow audit"])(
   "delivery restart checks the reviewed HEAD: %s",
   async (scenario) => {
     const original = await delivered();
@@ -732,18 +732,27 @@ test.each(["amended round", "unchanged round", "amended existing branch"])(
             true,
           ).id
         : ((await changes(original.id)).body.round?.id as string);
+    if (scenario === "stale workflow audit") {
+      onImplement = async () => ({ ".github/workflows/repair.yml": "on: push\njobs: {}\n" });
+      factory.store.db.query("UPDATE runs SET audit_allow = '[\"workflows\"]' WHERE id = ?").run(id);
+    }
     await settle(id, (run) => run.status === "running");
     const state = factory.store.getRunState<RunState>(id);
     if (!state?.worktreePath || !state.reviewedSha) throw new Error("missing checked round");
     expect(state.phase).toBe("deliver");
     const expected = state.reviewedSha;
     const cwd = state.worktreePath;
-    if (scenario !== "unchanged round") {
+    if (scenario === "stale workflow audit") {
+      state.lastAudit = [];
+      factory.store.setRunState(id, state);
+      factory.store.db.query("UPDATE runs SET audit_allow = '[]' WHERE id = ?").run(id);
+    } else if (scenario !== "unchanged round") {
       writeFileSync(join(cwd, "fix.txt"), "unreviewed amendment\n");
       await sh(["git", "add", "fix.txt"], { cwd });
       await sh(["git", "commit", "--amend", "--no-edit", "-q"], { cwd });
     }
     const actual = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const pushed = spyOn(repos, "pushExistingBranch");
     await restart();
     const finished = await settle(id);
     if (scenario === "unchanged round") {
@@ -753,6 +762,13 @@ test.each(["amended round", "unchanged round", "amended existing branch"])(
       expect(kinds().filter((kind) => kind === "review.round_delivered")).toHaveLength(1);
       expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(1);
       expect(factory.store.getRunState<RunState>(id)?.reviewedSha).toBe(expected);
+    } else if (scenario === "stale workflow audit") {
+      expect(finished.status).toBe("needs_human");
+      expect(finished.error).toContain(".github/workflows/repair.yml");
+      expect(finished.error).toContain("Allow: workflows");
+      expect(pushed).not.toHaveBeenCalled();
+      expect(await remoteHead()).toBe(originalHead);
+      expect(kinds()).not.toContain("review.round_delivered");
     } else {
       expect(actual).not.toBe(expected);
       expect(finished.status).toBe("needs_human");
@@ -793,27 +809,50 @@ test("a push to the PR during the round is never overwritten", async () => {
   expect(pr.calls.some((args) => args[1] === "edit")).toBe(false);
 });
 
-test("a PR behind its base gets a factory merge commit before the round's work", async () => {
-  const original = await delivered();
-  const reviewed = await remoteHead();
-  const tip = await push("main", "notes.txt", "base moved on\n");
-  const round = await settle((await changes(original.id)).body.round?.id as string);
-  expect(round.status).toBe("succeeded");
-  const head = await remoteHead();
-  const parents = async (rev: string) =>
-    (await sh(["git", "rev-list", "--parents", "-n", "1", rev], { cwd: remote })).stdout
-      .trim()
-      .split(" ")
-      .slice(1);
-  const [merge] = await parents(head);
-  expect(await parents(merge as string)).toEqual([reviewed, tip]);
-  expect(
-    (await sh(["git", "log", "-1", "--format=%an", merge as string], { cwd: remote })).stdout.trim(),
-  ).toBe("Limitless");
-  // The round's own change is measured from the merge: the base's commit is not part of it.
-  const changed = await sh(["git", "diff", "--name-only", merge as string, head], { cwd: remote });
-  expect(changed.stdout.trim()).toBe("fix.txt");
-});
+test.each([
+  { baseFile: "notes.txt", repairFile: "fix.txt" },
+  { baseFile: ".github/workflows/check.yml", repairFile: "fix.txt" },
+  { baseFile: ".github/workflows/check.yml", repairFile: ".github/workflows/check.yml" },
+])(
+  "a PR behind its base imports $baseFile before repairing $repairFile",
+  async ({ baseFile, repairFile }) => {
+    const original = await delivered();
+    const reviewed = await remoteHead();
+    mkdirSync(join(work, ".github/workflows"), { recursive: true });
+    const tip = await push("main", baseFile, "base moved on\n");
+    onImplement = async () => ({ [repairFile]: "fixed\n" });
+    const pushed = spyOn(repos, "pushExistingBranch");
+    const round = await settle((await changes(original.id)).body.round?.id as string);
+    if (repairFile === baseFile) {
+      expect(round.status).toBe("needs_human");
+      expect(round.error).toContain(`[ci-config] ${repairFile}`);
+      expect(round.error).toContain("Allow: workflows");
+      expect(pushed).not.toHaveBeenCalled();
+      expect(await remoteHead()).toBe(reviewed);
+      return;
+    }
+    expect(round.status).toBe("succeeded");
+    const head = await remoteHead();
+    const parents = async (rev: string) =>
+      (await sh(["git", "rev-list", "--parents", "-n", "1", rev], { cwd: remote })).stdout
+        .trim()
+        .split(" ")
+        .slice(1);
+    const [merge] = await parents(head);
+    expect(await parents(merge as string)).toEqual([reviewed, tip]);
+    expect(round.baseSha).toBe(merge as string);
+    expect(pushed).toHaveBeenCalledTimes(1);
+    expect((await sh(["git", "show", `${head}:${baseFile}`], { cwd: remote })).stdout).toBe(
+      "base moved on\n",
+    );
+    expect(
+      (await sh(["git", "log", "-1", "--format=%an", merge as string], { cwd: remote })).stdout.trim(),
+    ).toBe("Limitless");
+    // The round's own change is measured from the merge: the base's commit is not part of it.
+    const changed = await sh(["git", "diff", "--name-only", merge as string, head], { cwd: remote });
+    expect(changed.stdout.trim()).toBe(repairFile);
+  },
+);
 
 test("a round that changes nothing ends needs_human without touching the PR", async () => {
   const original = await delivered();

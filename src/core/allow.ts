@@ -1,10 +1,17 @@
 import type { AuditAllowance } from "./types.ts";
 
-export const AUDIT_ALLOWANCES: readonly AuditAllowance[] = ["submodules", "gitattributes", "binary"];
+export const AUDIT_ALLOWANCES: readonly AuditAllowance[] = [
+  "submodules",
+  "gitattributes",
+  "binary",
+  "workflows",
+];
 
-/** `Allow: submodules` or `Allow: gitattributes` on a line of its own in requester-authored text. */
+/** `Allow: <kind>` on a line of its own in requester-authored text. */
 export function parseAllow(text: string): AuditAllowance[] {
-  const lines = [...text.matchAll(/^[ \t]*allow:[ \t]*(submodules|gitattributes|binary)[ \t]*\r?$/gim)];
+  const lines = [
+    ...text.matchAll(/^[ \t]*allow:[ \t]*(submodules|gitattributes|binary|workflows)[ \t]*\r?$/gim),
+  ];
   return AUDIT_ALLOWANCES.filter((kind) => lines.some((m) => m[1]?.toLowerCase() === kind));
 }
 
