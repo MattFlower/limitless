@@ -80,6 +80,12 @@ Each stage and what it guarantees:
 
 CI configuration covers `.github/workflows/**`, root `.gitlab-ci.yml` and `.circleci/**`, including deletions and rename endpoints. Ungranted factory edits are refused before any delivery push, including needs-human drafts and review or CI-fix updates. In verify-change runs, the PR author's already-pushed CI edits remain warnings; factory repairs are checked against the original PR head and require `workflows`, even when repairing the same file.
 
+For manual landing, `scripts/land-pr.sh <pr-number> "<squash subject>" [worktree-dir] [--allow workflows]`
+checks the exact commit it pushes against the PR base, including local commits newer than the PR head.
+Only the operator's explicit `--allow workflows` argument grants permission; PR text never grants it.
+For example: `scripts/land-pr.sh 123 "Update CI" ./merge-worktree --allow workflows`.
+The option bypasses only the workflow guard; privacy, clean-worktree and landing checks still apply.
+
 A few more details:
 
 - **Rounds and escalation.** Any failing gate, audit, review or verify sends structured feedback to

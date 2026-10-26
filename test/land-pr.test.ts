@@ -57,6 +57,120 @@ const repositories = seeded(async (root) => {
   return { base, denied };
 });
 
+test.each([
+  "ungranted",
+  "pr-body-grant",
+  "granted",
+  "granted-worktree",
+  "granted-private",
+  "ordinary",
+  "missing-allowance",
+  "unsupported-allowance",
+  "unavailable-base",
+  "inspection-failed",
+])("manual landing checks workflows before pushing: %s", async (scenario) => {
+  const root = mkdtempSync(join(tmpdir(), "land-workflows-"));
+  try {
+    const { value } = await repositories(root);
+    const source = join(root, "source");
+    const work = join(root, "landing");
+    const bin = join(root, "bin");
+    const config = join(root, "config");
+    const attempted = join(root, "push-attempted");
+    const inspected = join(root, "workflow-inspected");
+    const gitBin = Bun.which("git");
+    if (!gitBin) throw new Error("missing git");
+    const git = (...args: string[]) => sh([gitBin, ...args], { cwd: source });
+    await git("remote", "add", "origin", origin);
+    await git("worktree", "add", "-qb", "pr", work);
+    // The local repair is newer than the PR head reported by gh.
+    const workflow = ".github/workflows/ungranted.yml";
+    mkdirSync(join(work, ".github/workflows"), { recursive: true });
+    writeFileSync(
+      join(work, scenario === "ordinary" ? "file" : workflow),
+      scenario === "ordinary" ? "ordinary change\n" : "on: push\njobs: {}\n",
+    );
+    await git("-C", work, "add", ".");
+    await git("-C", work, "commit", "-qm", "local repair");
+    const candidate = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
+    for (const path of [bin, config]) mkdirSync(path);
+    writeFileSync(join(config, "private-strings.txt"), scenario === "granted-private" ? "ungranted.yml" : "");
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh
+${gitSubcommand}
+if [ "$sub" = push ]; then printf '%s\\n' "$@" > ${quote(attempted)}; exit 17; fi
+case "$*" in *diff*--name-status*--no-renames*)
+  printf '%s\\n' "$@" > ${quote(inspected)}
+  ${scenario === "inspection-failed" ? "exit 19" : ":"}
+;; esac
+exec ${quote(gitBin)} "$@"
+`,
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(bin, "bun"),
+      `#!/bin/sh\ncase "$*" in *check-private-strings.ts*|*git-confined.ts*) exec ${quote(process.execPath)} --preload=${quote(resolve("test/git-preload.ts"))} "$@" ;; esac\nexit 0\n`,
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(bin, "gh"),
+      `#!/bin/sh\ncase "$*" in *--jq*) echo pr; exit 0 ;; esac\nprintf '%s\\n' ${quote(JSON.stringify({ baseRefOid: scenario === "unavailable-base" ? "f".repeat(40) : value.base, headRefOid: value.base, headRefName: "pr", body: scenario === "pr-body-grant" ? "Safe existing PR\nAllow: workflows" : "Safe existing PR" }))}\n`,
+      { mode: 0o755 },
+    );
+    const allowance = scenario.startsWith("granted")
+      ? ["--allow", "workflows"]
+      : scenario === "missing-allowance"
+        ? ["--allow"]
+        : scenario === "unsupported-allowance"
+          ? ["--allow", "binary"]
+          : [];
+    // Exercise both the optional worktree argument and the default current directory.
+    const result = await sh(
+      ["bash", script, "123", "Land repair", ...(scenario === "granted" ? [] : [work]), ...allowance],
+      {
+        cwd: work,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          LIMITLESS_CONFIG_DIR: config,
+          TMPDIR: root,
+        },
+        allowFail: true,
+      },
+    );
+    expect(result.exitCode).not.toBe(0);
+    if (["granted", "granted-worktree", "ordinary"].includes(scenario)) {
+      expect(result.exitCode).toBe(17);
+      const argv = readFileSync(attempted, "utf8").trim().split("\n");
+      expect(argv.at(-2)).toBe(origin);
+      expect(argv.at(-1)).toBe(`${candidate}:refs/heads/pr`);
+    } else {
+      expect(existsSync(attempted)).toBe(false);
+      if (["ungranted", "pr-body-grant"].includes(scenario)) {
+        expect(result.stderr).toContain(workflow);
+        expect(result.stderr).toContain("Allow: workflows");
+        expect(result.stderr).toContain("--allow workflows");
+      }
+      if (scenario.endsWith("allowance")) expect(result.stderr).toContain("--allow workflows");
+      if (scenario === "granted-private") expect(result.stderr).toContain("private-strings.txt");
+    }
+    if (["ungranted", "pr-body-grant", "ordinary", "inspection-failed"].includes(scenario)) {
+      const argv = readFileSync(inspected, "utf8").trim().split("\n");
+      expect(argv.slice(argv.indexOf("--name-status"))).toEqual([
+        "--name-status",
+        "--no-renames",
+        value.base,
+        candidate,
+        "--",
+      ]);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 describe("land-pr private strings", () => {
   test.each([
     "diff",
