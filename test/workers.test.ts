@@ -1886,8 +1886,8 @@ test.each([true, false, undefined])(
     const req = await request();
     mkdirSync(join(req.cwd, "test"));
     writeFileSync(join(req.cwd, "test/a.test.ts"), "");
-    const check = { name: "test", run: "full-test" };
-    req.gates = { ...req.gates, setup: [], checks: [check], retryFiles: "base-retry {files}" };
+    const check = { name: "test", run: "bun test" };
+    req.gates = { ...req.gates, setup: [], checks: [check], retryFiles: "bun test --isolate {files}" };
     await listen();
     const token = await paired();
     await call("/worker/heartbeat", caps(), token);
@@ -1947,7 +1947,7 @@ test.each([true, false, undefined])(
       },
       true,
     );
-    expect(calls).toEqual(complete === true ? ["base-retry './test/a.test.ts'"] : []);
+    expect(calls).toEqual(complete === true ? ["bun test --isolate './test/a.test.ts'"] : []);
     expect(retried.size).toBe(complete === true ? 1 : 0);
   },
 );
