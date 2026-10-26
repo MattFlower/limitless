@@ -110,13 +110,13 @@ export async function reconcileIssueLifecycle(
   // Persist every observation before any delivery, even when the call budget is exhausted.
   for (const run of runs) {
     store.transaction(() => {
-      for (const { repo, number } of linkedIssues(run))
+      for (const { repo, number } of linkedIssues(run, store))
         if (lifecycleManaged(cfg, repo)) observe(run, repo, number);
       store.observeIssueLifecycle(run);
     });
   }
   const work = runs.flatMap((snapshot) =>
-    linkedIssues(snapshot)
+    linkedIssues(snapshot, store)
       .filter(({ repo }) => lifecycleManaged(cfg, repo))
       .flatMap((issue) =>
         ["labels", ...eventOrder].map((effect) => ({
@@ -150,7 +150,13 @@ export async function reconcileIssueLifecycle(
         save("labels", target);
       });
     let run = store.getRun(snapshot.id);
-    if (!run) continue;
+    if (
+      !run ||
+      !linkedIssues(run, store).some(
+        (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
+      )
+    )
+      continue;
     if (task !== "labels") observe(run, repo, number);
     const effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
     if (task === "labels") {
