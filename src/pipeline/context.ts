@@ -45,6 +45,7 @@ import {
   runToolAgent,
 } from "./agent-executor.ts";
 import { runAgentGate } from "./agent-gate.ts";
+import type { CoveringTestRun } from "./covering-tests.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import type { PreviewConfig } from "./preview.ts";
@@ -178,6 +179,8 @@ export interface RunState {
   feedback: string | null;
   lastGates?: GateComparison[];
   gateEvidence?: GateEvidence;
+  coveringTestRuns?: CoveringTestRun[];
+  pendingVerify?: { round: number; attempt: number; sha: string; modelOutput: Verify; modelId: string };
   gateTimeoutReruns?: number;
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };

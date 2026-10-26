@@ -21,7 +21,8 @@ export function singleBunTest(command: string, requiredArgument?: string): boole
   for (let i = 0; i < command.length; i++) {
     const frame = stack.at(-1);
     const c = command[i];
-    if (!frame || c === "`" || (stack.length === 1 && /[\r\n]/.test(c ?? ""))) return false;
+    if (!frame || (c === "`" && frame.quote !== "'") || (stack.length === 1 && /[\r\n]/.test(c ?? "")))
+      return false;
     if (stack.length === 1 && !frame.quote) {
       if (
         wordStart &&

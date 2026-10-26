@@ -1,6 +1,7 @@
 import { redactGateOutput } from "../gates/output.ts";
 import { confinementFailed, type GateComparison, type GateRun } from "../gates/run.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../gates/test-coverage.ts";
+import { type CoveringTestRun, coveringTestRefusal, selectCoveringTests } from "./covering-tests.ts";
 import type { Holdout, Spec, Verify } from "./schemas.ts";
 
 /** Factory provenance, saved with the completed candidate gate stage (never baseline checks). */
@@ -164,15 +165,55 @@ export function applyGateEvidence(
   sha: string,
   gates?: GateEvidence,
   baseline?: GateRun | null,
+  coveringTests?: { runs: CoveringTestRun[]; succeededStageIds: number[] },
 ): Verify {
+  const selected = selectCoveringTests(verify);
   return {
     ...verify,
-    criteria: verify.criteria.map((blocked) => {
+    criteria: verify.criteria.map((blocked, index) => {
       if (blocked.status !== "blocked" || blocked.blockedReason !== "sandbox") return blocked;
-      const refuse = (reason: string) => ({
-        ...blocked,
-        evidence: redactGateOutput(`Factory gate substitution unavailable: ${reason}.`),
-      });
+      const refuse = (reason: string) => {
+        const selection = selected[index];
+        const runs =
+          selection?.tests.map((test) =>
+            coveringTests?.runs.find(
+              (r) => r.verifiedSha === sha && r.file === test.file && r.name === test.name,
+            ),
+          ) ?? [];
+        const failures = runs.map((run, i) => {
+          const failure = coveringTestRefusal(run, sha, coveringTests?.succeededStageIds ?? []);
+          return failure ? `covering test ${selection?.tests[i]?.file}: ${failure}` : undefined;
+        });
+        const failure = selection?.reason ?? failures.find(Boolean);
+        if (!failure && runs.length) {
+          const first = runs[0];
+          if (first?.result)
+            return {
+              ...blocked,
+              status: "met" as const,
+              evidence: redactGateOutput(
+                runs
+                  .map(
+                    (r) =>
+                      `Factory covering test ${r?.file} › ${r?.name} passed at ${sha} (stage ${r?.stageId}); command: ${r?.result?.command}`,
+                  )
+                  .join("; "),
+              ),
+              gateEvidence: {
+                stageId: first.stageId,
+                sha,
+                check: redactGateOutput(`${first.file} › ${first.name}`),
+                command: redactGateOutput(first.result.command),
+              },
+            };
+        }
+        return {
+          ...blocked,
+          evidence: redactGateOutput(
+            `Factory gate substitution unavailable: ${reason}${failure ? `; ${failure}` : ""}.`,
+          ),
+        };
+      };
       if (!gates) return refuse("no completed candidate gate stage for this run");
       if (gates.sha !== sha || !/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha))
         return refuse("candidate gates did not check the exact verified SHA");
