@@ -425,8 +425,18 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
       const query = args[3] ?? "";
       const owner = query.match(/owner:"([^"]+)"/)?.[1];
       const name = query.match(/name:"([^"]+)"/)?.[1];
+      const offset = Number(query.match(/after:"issues:(\d+)"/)?.[1] ?? 0);
+      const issues = data.get(`${owner}/${name}`) ?? [];
       const repository = query.includes("issues(first:")
-        ? { issues: { nodes: data.get(`${owner}/${name}`), pageInfo: { hasNextPage: false } } }
+        ? {
+            issues: {
+              nodes: issues.slice(offset, offset + 100),
+              pageInfo: {
+                hasNextPage: issues.length > offset + 100,
+                endCursor: `issues:${offset + 100}`,
+              },
+            },
+          }
         : Object.fromEntries(
             [...query.matchAll(/i(\d+):issue/g)].map((m) => [
               `i${m[1]}`,
@@ -2913,7 +2923,10 @@ test.each(badCommentResponses)("%s consumes no command or initial boundary", asy
   h.intercept = fail;
   h.data.set("owner/repo", [i]);
   const response = {
-    data: { repository: { issues: { nodes: [i], pageInfo: { hasNextPage: false } } }, rateLimit: h.rate },
+    data: {
+      repository: { issues: { nodes: [i], pageInfo: { hasNextPage: false, endCursor: null } } },
+      rateLimit: h.rate,
+    },
     ...(mode === "graphql errors" ? { errors: [{ message: "partial" }] } : {}),
   };
   const damage = () => {
@@ -3045,6 +3058,83 @@ test.each([false, true])("queue webhook is only a poll hint; delayed edited stat
   expect(h.runs()).toHaveLength(edited ? 0 : 1);
   expect(records(h)).toHaveLength(edited ? 0 : 1);
 });
+
+test("webhook hints find commands beyond the oldest 100 open issues", async () => {
+  const h = harness();
+  const issues = Array.from({ length: 201 }, (_, n) => commentIssue(n + 1));
+  const target = issues[200];
+  if (!target) throw new Error("missing last-page issue");
+  h.data.set("owner/repo", issues);
+  h.start();
+  await h.advance();
+  expect(h.store.githubCommentBoundary("owner/repo")).toBe(at);
+  target.comments = { totalCount: 1, nodes: [commandComment()] };
+  const handle = githubWebhook(h.factory, undefined, h.pollNow);
+  expect((await handle(commentDelivery(target))).status).toBe(200);
+  expect(h.runs()).toEqual([]);
+  await h.advance();
+  expect(h.runs()).toHaveLength(1);
+  expect(h.calls).toHaveLength(6);
+  expect(h.runs()[0]?.sourceRef).toEqual({
+    kind: "issue",
+    repo: "owner/repo",
+    number: 201,
+    via: "queue",
+  });
+  expect(records(h)).toHaveLength(1);
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(1);
+});
+
+test("the first poll boundary includes later issue pages", async () => {
+  const h = harness();
+  const issues = Array.from({ length: 101 }, (_, n) => commentIssue(n + 1));
+  const target = issues[100];
+  if (!target) throw new Error("missing last-page issue");
+  target.comments = { totalCount: 1, nodes: [commandComment()] };
+  h.data.set("owner/repo", issues);
+  h.start();
+  await h.advance();
+  expect(h.store.githubCommentBoundary("owner/repo")).toBe(commandAt);
+  await pollComments(h);
+  expect(h.runs()).toEqual([]);
+  expect(records(h)).toEqual([]);
+});
+
+test.each(["gh failure", "schema mismatch", "rate limit"])(
+  "a later issue page %s leaves the whole repository retryable",
+  async (failure) => {
+    const h = harness();
+    const issues = Array.from({ length: 101 }, (_, n) => commentIssue(n + 1));
+    const first = issues[0];
+    if (!first) throw new Error("missing first-page issue");
+    h.data.set("owner/repo", issues);
+    h.intercept = (args) => {
+      if (!args[3]?.includes('after:"issues:100"')) return;
+      if (failure === "gh failure") throw new Error("second page unavailable");
+      if (failure === "schema mismatch") h.response = { data: { repository: null, rateLimit: h.rate } };
+    };
+    if (failure === "rate limit") h.rate.remaining = 0;
+    h.start();
+    await h.advance();
+    expect(h.store.githubCommentBoundary("owner/repo")).toBeNull();
+    h.intercept = undefined;
+    h.response = undefined;
+    h.rate.remaining = 5000;
+    await h.advance(3600_000);
+    expect(h.store.githubCommentBoundary("owner/repo")).toBe(at);
+    first.comments = { totalCount: 1, nodes: [commandComment()] };
+    h.intercept = (args) => {
+      if (args[3]?.includes('after:"issues:100"')) throw new Error("second page unavailable");
+    };
+    await pollComments(h);
+    expect(h.runs()).toEqual([]);
+    expect(records(h)).toEqual([]);
+    h.intercept = undefined;
+    await pollComments(h);
+    expect(h.runs()).toHaveLength(1);
+  },
+);
 
 test("non-queue webhook records its comment transactionally before repository joins queue", async () => {
   const h = harness({ repos: [] });

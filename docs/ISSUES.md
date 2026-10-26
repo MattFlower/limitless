@@ -88,7 +88,9 @@ An issue is eligible only when:
   Without that timestamp or fresh approval, it is not picked again.
 
 Issues across repositories sort by priority, creation time, then issue number. Each poll
-reads at most the oldest 100 open issues per repository and logs truncation. It reads the
+reads all open issues per repository in pages of 100, including their latest comments. Every
+page must validate before the repository's boundary is set or commands are processed; a failed
+page or a rate-limit pause leaves the repository for the next poll. It reads the
 latest 100 label applications and title renames together. An incomplete timeline makes
 the issue ineligible, as do incomplete label, blocker or closing-PR connections. Body
 dependencies use additional aliased issue lookups. Low remaining GraphQL budget stops further queries and

@@ -226,15 +226,31 @@ export function startIssueQueue(
       for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
         try {
-          const data = await query(
-            repo,
-            `issues(first:100, states:OPEN, orderBy:{field:CREATED_AT,direction:ASC}) { pageInfo { hasNextPage } nodes { ${ISSUE_FIELDS} } }`,
-          );
-          const issues = z
-            .object({ nodes: z.array(issueSchema), pageInfo: z.object({ hasNextPage: z.boolean() }) })
-            .parse(data.issues);
-          if (issues.pageInfo.hasNextPage)
-            log(redactCredentials(`Issue queue ${repo}: open issues truncated at 100`));
+          const issues = { nodes: [] as QueueIssue[] };
+          const cursors = new Set<string>();
+          let after: string | null = null;
+          // Validate every page before establishing the boundary or consuming commands.
+          do {
+            const data = await query(
+              repo,
+              `issues(first:100, states:OPEN, orderBy:{field:CREATED_AT,direction:ASC}${after ? `, after:${JSON.stringify(after)}` : ""}) { pageInfo { hasNextPage endCursor } nodes { ${ISSUE_FIELDS} } }`,
+            );
+            const page = z
+              .object({
+                nodes: z.array(issueSchema),
+                pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+              })
+              .parse(data.issues);
+            issues.nodes.push(...page.nodes);
+            after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+            if (page.pageInfo.hasNextPage && (!after || cursors.has(after)))
+              throw new Error("Open issue pagination did not advance");
+            if (after) {
+              cursors.add(after);
+              if (stopped || limited || now() < notBefore)
+                throw new Error("Open issue pagination interrupted");
+            }
+          } while (after);
           const states = new Map<number, string>();
           const numbers = [...new Set(issues.nodes.flatMap((i) => blockers(i.body)))];
           if (numbers.length && !stopped && !limited && now() >= notBefore) {
