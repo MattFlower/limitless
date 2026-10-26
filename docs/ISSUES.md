@@ -113,6 +113,31 @@ Queue runs use the same quoted issue request as an owner-labelled webhook. Only 
 issues parse `Allow:` lines; polling does not confer signed-webhook provenance. Issue source
 references and non-GitHub `Closes #n` directives produce closing directives in PR bodies.
 The queue adds the optional, additive `via: "queue"` marker, ignored by older releases.
+
+The same poll reads each issue's last 20 comments without an extra GraphQL call. A trusted
+author can post `/limitless <request>` on any open issue, without priority labels or queue
+capacity admission. With an App identity, `@<slug> <request>` and `@<slug>[bot] <request>`
+also work. Commands must be unedited; factory authors and `<!-- limitless-` markers are
+excluded. Only the owner's request text can grant `Allow:` exemptions.
+
+The first successful repository poll establishes a fixed enable boundary from the newest
+GitHub issue `updatedAt` or comment `createdAt` timestamp it reads. That poll starts no comment
+runs. Comments at or before the boundary never run, even after an issue reopens. An empty
+repository waits for a later poll with timestamps. This uses GitHub time, independent of the
+daemon's clock. Malformed responses and API errors neither set a boundary nor consume commands.
+
+Each command is recorded by repository and comment id in the run-creation transaction, so
+restarts, repeated polls and overlapping webhook deliveries cannot start it twice. A claim
+refusal is final and recorded too: post a new command after the claiming run finishes.
+Other errors remain retryable. Skipped comments are never recorded.
+
+This assumes a command remains among the last 20 comments at some poll (normally every 180 s).
+More than 20 comments between polls can hide a command; there is no comment pagination or
+cursor. Large comment counts do not affect label eligibility. Webhooks are optional for these
+commands: a trusted `issue_comment.created` delivery requests an immediate poll, coalesced
+with any poll already running, and is recorded as ignored. Outside queue repositories,
+owner comment webhooks still start runs directly and record the same comment id.
+
 Managed issue runs use polling lifecycle comments instead of legacy notifier comments.
 Marked queue runs outside managed repositories keep suppressing legacy comments. GitHub
 questions and approvals remain later slices.

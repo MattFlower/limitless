@@ -1,9 +1,10 @@
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import type { Run } from "../core/types.ts";
-import { ISSUE_CLAIM_STATUSES } from "../db/store.ts";
+import { CommentProcessed, ISSUE_CLAIM_STATUSES } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
-import { type GhRunner, issueRunRequest, runGh } from "./github.ts";
+import { commentRunRequest, type GhRunner, issueRunRequest, runGh } from "./github.ts";
+import { githubIdentity } from "./github-identity.ts";
 import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
 
 const date = z.string().refine((s) => Number.isFinite(Date.parse(s)));
@@ -18,6 +19,16 @@ const issueSchema = z.object({
   title: z.string(),
   body: z.string(),
   createdAt: date,
+  updatedAt: date,
+  comments: connection(
+    z.object({
+      databaseId: z.number().int().positive(),
+      body: z.string(),
+      createdAt: date,
+      lastEditedAt: date.nullable(),
+      author: actor,
+    }),
+  ),
   state: z.enum(["OPEN", "CLOSED"]),
   author: actor,
   editor: actor,
@@ -125,7 +136,8 @@ export function issueEligibility(
     : { eligible: true, priority: Math.min(...approved.map((l) => Number(l.name.slice(9)))) };
 }
 
-const ISSUE_FIELDS = `number title body createdAt state author { login } editor { login } lastEditedAt
+const ISSUE_FIELDS = `number title body createdAt updatedAt state author { login } editor { login } lastEditedAt
+  comments(last: 20) { totalCount nodes { databaseId body createdAt lastEditedAt author { login } } }
   labels(first:100) { totalCount nodes { name } } subIssuesSummary { total }
   blockedBy(first:100) { totalCount nodes { state } }
   closedByPullRequestsReferences(first:100) { totalCount nodes { state } }
@@ -147,15 +159,17 @@ export function startIssueQueue(
     log?: (s: string) => void;
     lifecycle?: IssueLifecycleOptions;
   } = {},
-): () => void {
+): (() => void) & { pollNow: () => void } {
   const q = factory.cfg.githubQueue;
-  if (!q?.repos.length || !q.trusted.length) return () => {};
+  if (!q?.repos.length || !q.trusted.length) return Object.assign(() => {}, { pollNow: () => {} });
   const { gh = runGh, log = console.warn } = opts;
   const { now, set, clear } = opts.clock ?? { now: Date.now, set: setTimeout, clear: clearTimeout };
   const abort = new AbortController();
   let stopped = false;
   let notBefore = 0;
   let limited = false;
+  let inFlight = false;
+  let pending = false;
   let timer: ReturnType<typeof setTimeout>;
   const query = async (repo: string, fields: string) => {
     const [owner, name] = repo.split("/");
@@ -201,6 +215,9 @@ export function startIssueQueue(
     return { latest, failureBoundary: Number.isInteger(boundary) && boundary >= 0 ? boundary : null };
   };
   const tick = async () => {
+    if (stopped) return;
+    inFlight = true;
+    pending = false;
     limited = false;
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
@@ -233,7 +250,68 @@ export function startIssueQueue(
               if (found) states.set(n, found.state);
             }
           }
+          if (stopped) break;
+          const boundary = factory.store.githubCommentBoundary(repo);
+          if (!boundary) {
+            const newest = issues.nodes
+              .flatMap((i) => [i.updatedAt, ...i.comments.nodes.map((c) => c.createdAt)])
+              .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+            if (newest) factory.store.githubCommentBoundary(repo, newest);
+          }
+          const identity = boundary
+            ? await (opts.lifecycle?.identity ?? githubIdentity)(repo).catch(() => null)
+            : null;
+          const bot = identity?.kind === "app" ? identity.botLogin.toLowerCase() : null;
           for (const issue of issues.nodes) {
+            for (const c of boundary && issue.state === "OPEN" ? issue.comments.nodes : []) {
+              const author = c.author?.login;
+              const command = c.body.startsWith("/limitless ")
+                ? c.body.slice(11)
+                : bot && c.body.match(/^@(\S+)\s+([\s\S]*)$/)?.slice(1);
+              const request =
+                typeof command === "string"
+                  ? command
+                  : command && [bot, bot?.replace(/\[bot\]$/, "")].includes(command[0]?.toLowerCase())
+                    ? command[1]
+                    : null;
+              const comment = { repo, id: c.databaseId };
+              if (
+                !request?.trim() ||
+                !author ||
+                c.lastEditedAt ||
+                author.toLowerCase() === bot ||
+                c.body.includes("<!-- limitless-") ||
+                !q.trusted.some((t) => t.toLowerCase() === author.toLowerCase()) ||
+                Date.parse(c.createdAt) <= Date.parse(boundary ?? "") ||
+                factory.store.githubCommentProcessed(comment)
+              )
+                continue;
+              try {
+                const req = commentRunRequest(
+                  {
+                    repo,
+                    number: issue.number,
+                    issueTitle: issue.title,
+                    issueBody: issue.body,
+                    request,
+                    author,
+                  },
+                  factory.cfg.githubOwner,
+                );
+                req.sourceRef = { ...req.sourceRef, via: "queue" };
+                await factory.createRun(
+                  req,
+                  false,
+                  undefined,
+                  true,
+                  () => (stopped ? "queue stopped" : null),
+                  comment,
+                );
+              } catch (error) {
+                if (!(error instanceof CommentProcessed))
+                  log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${String(error)}`));
+              }
+            }
             const result = issueEligibility(issue, q.trusted, {
               blockers: states,
               claim: factory.store.issueClaim(repo, issue.number),
@@ -309,21 +387,33 @@ export function startIssueQueue(
     } catch (e) {
       if (!stopped) log(redactCredentials(`Issue queue: ${String(e)}`));
     } finally {
-      const deadline = Math.max(now() + q.pollSeconds * 1000, notBefore);
-      const schedule = () => {
-        if (!stopped)
-          timer = set(
-            () => (now() < deadline ? schedule() : void tick()),
-            Math.min(3_600_000, Math.max(0, deadline - now())),
-          );
-      };
-      schedule();
+      inFlight = false;
+      schedule(Math.max(now() + (pending ? 0 : q.pollSeconds * 1000), notBefore));
     }
   };
-  timer = set(() => void tick(), 0);
-  return () => {
-    stopped = true;
-    abort.abort();
-    clear(timer);
+  const schedule = (deadline: number) => {
+    if (!stopped)
+      timer = set(
+        () => (now() < deadline ? schedule(deadline) : void tick()),
+        Math.min(3_600_000, Math.max(0, deadline - now())),
+      );
   };
+  timer = set(() => void tick(), 0);
+  return Object.assign(
+    () => {
+      stopped = true;
+      abort.abort();
+      clear(timer);
+    },
+    {
+      pollNow: () => {
+        if (stopped) return;
+        if (inFlight) pending = true;
+        else {
+          clear(timer);
+          schedule(Math.max(now(), notBefore));
+        }
+      },
+    },
+  );
 }

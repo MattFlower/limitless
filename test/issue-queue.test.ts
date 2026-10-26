@@ -9,7 +9,12 @@ import type { CreateRunRequest, RunStatus } from "../src/core/types.ts";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { ISSUE_CLAIM_STATUSES, IssueClaimed, linkedIssues, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
-import { githubWebhook, issueRunRequest, mapGitHubEvent } from "../src/integrations/github.ts";
+import {
+  commentRunRequest,
+  githubWebhook,
+  issueRunRequest,
+  mapGitHubEvent,
+} from "../src/integrations/github.ts";
 import type { GitHubIdentity } from "../src/integrations/github-identity.ts";
 import { mountIntegrations } from "../src/integrations/index.ts";
 import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
@@ -32,6 +37,8 @@ function issue(number = 1, p = 1): QueueIssue {
     title: `Issue ${number}`,
     body: "Implement it.\nAllow: submodules",
     createdAt: at,
+    updatedAt: at,
+    comments: { totalCount: 0, nodes: [] },
     state: "OPEN",
     author: { login: "owner" },
     editor: null,
@@ -325,6 +332,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
   const logs: string[] = [];
   const requests: CreateRunRequest[] = [];
   let stop = () => {};
+  let pollNow = () => {};
   const h = {
     cfg,
     store,
@@ -348,6 +356,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     afterWrite: undefined as ((args: string[]) => void) | undefined,
     rate: { cost: 1, remaining: 5000, resetAt: new Date(clock.now() + 3600_000).toISOString() },
     response: undefined as unknown,
+    rawResponse: undefined as string | undefined,
     hold: undefined as Promise<void> | undefined,
     scopes: [] as (string | undefined)[],
     async gh(args: string[], _signal?: AbortSignal, _stdin?: string, repo?: string) {
@@ -411,6 +420,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
           data: { repository: { issue: { timelineItems: { totalCount: timeline?.totalCount ?? 0 } } } },
         });
       }
+      if (h.rawResponse !== undefined) return h.rawResponse;
       if (h.response !== undefined) return JSON.stringify(h.response);
       const query = args[3] ?? "";
       const owner = query.match(/owner:"([^"]+)"/)?.[1];
@@ -429,7 +439,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
       stop = startIssueQueue(factory, {
         gh: h.gh,
         lifecycle: {
-          identity: h.identity,
+          identity: (repo) => h.identity(repo),
           get maxCalls() {
             return h.maxCalls;
           },
@@ -444,8 +454,10 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
         },
         log: (s) => logs.push(s),
       });
+      pollNow = (stop as ReturnType<typeof startIssueQueue>).pollNow;
     },
     stop: () => stop(),
+    pollNow: () => pollNow(),
     async advance(ms = 0) {
       await clock.advance(ms);
       for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
@@ -667,6 +679,10 @@ test("poll query reads title evidence and looks up all body blockers", async () 
   expect(h.calls[0]?.[3]).toContain("itemTypes:[LABELED_EVENT, RENAMED_TITLE_EVENT]");
   expect(h.calls[0]?.[3]).toContain("{ totalCount nodes { __typename");
   expect(h.calls[0]?.[3]).toContain("... on RenamedTitleEvent { actor { login } createdAt }");
+  expect(h.calls[0]?.[3]).toContain("createdAt updatedAt");
+  expect(h.calls[0]?.[3]).toContain(
+    "comments(last: 20) { totalCount nodes { databaseId body createdAt lastEditedAt author { login } } }",
+  );
   expect(h.calls[1]?.[3]).toContain("i12:issue(number:12)");
   expect(h.calls[1]?.[3]).toContain("i13:issue(number:13)");
   expect(h.runs()).toHaveLength(1);
@@ -782,6 +798,9 @@ test("far-future rate reset caps every timer and queries nothing before the dead
   h.start();
   await h.advance();
   expect(h.delays).toEqual([0, 3_600_000]);
+  h.pollNow();
+  await h.advance();
+  expect(h.calls).toHaveLength(1);
   await h.advance(3_600_000);
   expect(h.calls).toHaveLength(1);
   expect(h.delays.at(-1)).toBe(3_600_000);
@@ -811,6 +830,7 @@ test("stopping during an intermediate rate-limit wait clears the timer", async (
   expect(h.calls).toHaveLength(1);
   expect(h.clock.pending).toBe(1);
   h.stop();
+  h.pollNow();
   expect(h.clock.pending).toBe(0);
   await h.advance(40 * 24 * 3_600_000);
   expect(h.calls).toHaveLength(1);
@@ -2731,5 +2751,454 @@ test("review: a pre-lifecycle failed run can be re-approved after upgrading", as
   } finally {
     stop();
     store.close();
+  }
+});
+
+const commandAt = "2026-01-01T00:00:01Z";
+function commandComment(databaseId = 1): QueueIssue["comments"]["nodes"][number] {
+  return {
+    databaseId,
+    body: "/limitless do it\nAllow: workflows",
+    createdAt: commandAt,
+    lastEditedAt: null,
+    author: { login: "owner" },
+  };
+}
+function commentIssue(number = 1): QueueIssue {
+  return { ...issue(number), labels: { totalCount: 0, nodes: [] } };
+}
+const records = (h: ReturnType<typeof harness>) =>
+  h.store.db.query("SELECT * FROM github_processed_comments").all();
+async function pollComments(h: ReturnType<typeof harness>) {
+  h.pollNow();
+  await h.advance();
+}
+async function enableComments(h: ReturnType<typeof harness>) {
+  const i = commentIssue();
+  h.data.set("owner/repo", [i]);
+  h.start();
+  await h.advance();
+  expect(h.store.githubCommentBoundary("OWNER/REPO")).toBe(at);
+  return i;
+}
+function commentDelivery(i: QueueIssue, id = "command", author = "owner") {
+  const body = JSON.stringify({
+    action: "created",
+    repository: { full_name: "OWNER/REPO" },
+    sender: { login: author },
+    issue: { ...i, user: i.author },
+    comment: { id: 1, body: commandComment().body, user: { login: author } },
+  });
+  return new Request("http://localhost/webhooks/github", {
+    method: "POST",
+    body,
+    headers: {
+      "x-github-event": "issue_comment",
+      "x-github-delivery": id,
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+    },
+  });
+}
+
+test.each(["owner", "collaborator", "mention"])(
+  "polled %s command uses the shared builder and bypasses label admission",
+  async (mode) => {
+    const h = harness({ trusted: ["OWNER", "collaborator"] });
+    const i = await enableComments(h);
+    h.cfg.maxConcurrentRuns = 0;
+    h.factory.scheduler.drain();
+    const c = commandComment();
+    if (mode === "collaborator") c.author = { login: "collaborator" };
+    if (mode === "mention") {
+      h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+      c.body = "@FACTORY[bot] do it\nAllow: workflows";
+    }
+    i.comments = { totalCount: 1, nodes: [c] };
+    await pollComments(h);
+    const expected = commentRunRequest(
+      {
+        repo: "owner/repo",
+        number: 1,
+        issueTitle: i.title,
+        issueBody: i.body,
+        request: "do it\nAllow: workflows",
+        author: c.author?.login ?? "",
+      },
+      "owner",
+    );
+    expect(h.requests).toEqual([{ ...expected, sourceRef: { ...expected.sourceRef, via: "queue" } }]);
+    expect(h.requests[0]?.allow).toEqual(mode === "collaborator" ? [] : ["workflows"]);
+    expect(h.runs()).toHaveLength(1);
+    expect(h.runs()[0]?.githubWebhookVerified).toBe(false);
+    await pollComments(h);
+    h.stop();
+    h.start();
+    await h.advance();
+    expect(h.runs()).toHaveLength(1);
+    expect(records(h)).toHaveLength(1);
+  },
+);
+
+test("comment transaction rolls back the run when recording fails, then retries once", async () => {
+  const h = harness();
+  const i = await enableComments(h);
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  const record = spyOn(h.store, "recordGitHubComment").mockImplementation(() => {
+    throw new Error("crash after run insert");
+  });
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(0);
+  expect(records(h)).toHaveLength(0);
+  record.mockRestore();
+  await pollComments(h);
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(1);
+  expect(records(h)).toHaveLength(1);
+});
+
+test("in-flight hints coalesce into one follow-up poll without concurrent gh calls", async () => {
+  const h = harness();
+  const i = await enableComments(h);
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  let release = () => {};
+  h.hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const before = h.calls.length;
+  await pollComments(h);
+  expect(h.calls.length).toBe(before + 1);
+  h.pollNow();
+  h.pollNow();
+  h.pollNow();
+  await h.advance();
+  expect(h.calls.length).toBe(before + 1);
+  // The next tick has no lifecycle writes, so its only call is the issues query.
+  const lifecycle = spyOn(h.store, "issueLifecycleRuns").mockReturnValue([]);
+  h.hold = undefined;
+  release();
+  await h.advance();
+  await h.advance();
+  expect(h.calls.length).toBe(before + 2);
+  expect(h.runs()).toHaveLength(1);
+  expect(h.clock.pending).toBe(1);
+  lifecycle.mockRestore();
+});
+
+test("claim refusal is recorded and redacted once even after the claim is released", async () => {
+  const h = harness();
+  const i = await enableComments(h);
+  const run = await h.factory.createRun({ repo: "owner/repo", prompt: "Closes #1" });
+  registerCredential("CLAIM_RUN_TEST", run.id);
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(1);
+  expect(records(h)).toMatchObject([
+    { outcome: "refused", run_id: null, note: expect.stringContaining("is claimed by run [redacted]") },
+  ]);
+  expect(h.logs.join("\n")).toContain("Issue owner/repo#1 is claimed by run [redacted]");
+  h.store.updateRun(run.id, { status: "succeeded", finishedAt: h.clock.now() });
+  const attempts = h.requests.length;
+  await pollComments(h);
+  expect(h.requests).toHaveLength(attempts);
+  expect(h.runs()).toHaveLength(1);
+});
+
+const badCommentResponses = ["graphql errors", "null node", "schema mismatch", "invalid JSON", "gh failure"];
+test.each(badCommentResponses)("%s consumes no command or initial boundary", async (mode) => {
+  const h = harness();
+  const i = commentIssue();
+  const fail = () => {
+    if (mode === "gh failure") throw new Error("gh failed");
+  };
+  h.intercept = fail;
+  h.data.set("owner/repo", [i]);
+  const response = {
+    data: { repository: { issues: { nodes: [i], pageInfo: { hasNextPage: false } } }, rateLimit: h.rate },
+    ...(mode === "graphql errors" ? { errors: [{ message: "partial" }] } : {}),
+  };
+  const damage = () => {
+    i.comments = { totalCount: 1, nodes: [commandComment()] };
+    if (mode === "null node") (i.comments.nodes as unknown[])[0] = null;
+    if (mode === "schema mismatch")
+      delete (i.comments.nodes[0] as Partial<ReturnType<typeof commandComment>>).databaseId;
+    h.response = response;
+    h.rawResponse = mode === "invalid JSON" ? "{" : undefined;
+  };
+  damage();
+  h.start();
+  await h.advance();
+  expect(h.store.githubCommentBoundary("owner/repo")).toBeNull();
+  expect(records(h)).toEqual([]);
+  h.intercept = undefined;
+  h.response = undefined;
+  h.rawResponse = undefined;
+  i.comments = { totalCount: 0, nodes: [] };
+  await pollComments(h);
+  expect(h.store.githubCommentBoundary("owner/repo")).toBe(at);
+  h.intercept = fail;
+  damage();
+  await pollComments(h);
+  expect(h.runs()).toEqual([]);
+  expect(records(h)).toEqual([]);
+  h.intercept = undefined;
+  h.response = undefined;
+  h.rawResponse = undefined;
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(1);
+});
+
+test.each(["edited", "untrusted", "factory author", "marker", "empty", "whitespace", "null author"])(
+  "%s comments never run or get recorded",
+  async (mode) => {
+    const h = harness({ trusted: ["owner", "factory[bot]"] });
+    h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+    const i = await enableComments(h);
+    const c = commandComment();
+    if (mode === "edited") c.lastEditedAt = commandAt;
+    if (mode === "untrusted") c.author = { login: "stranger" };
+    if (mode === "factory author") c.author = { login: "FACTORY[bot]" };
+    if (mode === "null author") c.author = null;
+    if (mode === "marker") c.body += "\n<!-- limitless-status -->";
+    if (mode === "empty") c.body = "/limitless";
+    if (mode === "whitespace") c.body = "/limitless \n \t";
+    i.comments = { totalCount: 1, nodes: [c] };
+    await pollComments(h);
+    await pollComments(h);
+    expect(h.runs()).toEqual([]);
+    expect(records(h)).toEqual([]);
+  },
+);
+
+test.each([-60_000, 60_000])(
+  "GitHub boundary ignores local clock offset %i and survives reopened issues",
+  async (offset) => {
+    const h = harness();
+    await h.clock.advance(Date.parse(at) + offset - h.clock.now());
+    const i = commentIssue();
+    i.comments = { totalCount: 1, nodes: [{ ...commandComment(), createdAt: at }] };
+    h.data.set("owner/repo", [i]);
+    h.start();
+    await h.advance();
+    await pollComments(h);
+    expect(h.runs()).toEqual([]);
+    const reopened = commentIssue(2);
+    reopened.updatedAt = "2026-01-01T01:00:00Z";
+    reopened.comments = {
+      totalCount: 1,
+      nodes: [{ ...commandComment(2), createdAt: "2025-12-31T23:59:59Z" }],
+    };
+    h.data.set("owner/repo", [i, reopened]);
+    await pollComments(h);
+    expect(h.runs()).toEqual([]);
+    i.comments.nodes.push(commandComment(3));
+    i.comments.totalCount++;
+    await pollComments(h);
+    expect(h.runs()).toHaveLength(1);
+    expect(h.store.githubCommentBoundary("owner/repo")).toBe(at);
+  },
+);
+
+test("first boundary includes comment timestamps, and an empty repository stays uninitialized", async () => {
+  const h = harness();
+  h.start();
+  await h.advance();
+  expect(h.store.githubCommentBoundary("owner/repo")).toBeNull();
+  const i = commentIssue();
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  h.data.set("owner/repo", [i]);
+  await pollComments(h);
+  expect(h.store.githubCommentBoundary("owner/repo")).toBe(commandAt);
+  await pollComments(h);
+  expect(h.runs()).toEqual([]);
+});
+
+test("20 returned comments out of 25 leave label eligibility intact and include newest commands", async () => {
+  const h = harness();
+  const i = await enableComments(h);
+  i.comments = {
+    totalCount: 25,
+    nodes: Array.from({ length: 19 }, (_, n) => ({ ...commandComment(n + 2), body: "discussion" })).concat(
+      commandComment(),
+    ),
+  };
+  expect(issueEligibility({ ...issue(), comments: i.comments }, ["owner"])).toEqual({
+    eligible: true,
+    priority: 1,
+  });
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(1);
+});
+
+test.each([false, true])("queue webhook is only a poll hint; delayed edited state: %s", async (edited) => {
+  const h = harness();
+  const i = await enableComments(h);
+  i.comments = { totalCount: 1, nodes: [{ ...commandComment(), lastEditedAt: edited ? commandAt : null }] };
+  const handle = githubWebhook(h.factory, undefined, h.pollNow);
+  expect((await handle(commentDelivery(i))).status).toBe(200);
+  expect(h.runs()).toEqual([]);
+  expect(h.store.db.query("SELECT status, note FROM inbox WHERE id = 'command'").get()).toEqual({
+    status: "ignored",
+    note: "Issue queue poll requested",
+  });
+  await h.advance();
+  expect(h.runs()).toHaveLength(edited ? 0 : 1);
+  expect(records(h)).toHaveLength(edited ? 0 : 1);
+});
+
+test("non-queue webhook records its comment transactionally before repository joins queue", async () => {
+  const h = harness({ repos: [] });
+  const i = commentIssue();
+  const payload = commentDelivery(i);
+  // Non-queue owner matching retains its existing case-sensitive repository policy.
+  const body = (await payload.text()).replace("OWNER/REPO", "owner/repo");
+  const send = (id: string) =>
+    new Request(payload.url, {
+      method: "POST",
+      body,
+      headers: {
+        ...Object.fromEntries(payload.headers),
+        "x-github-delivery": id,
+        "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+      },
+    });
+  const handle = githubWebhook(h.factory);
+  expect((await handle(send("first"))).status).toBe(201);
+  expect(h.requests[0]).toEqual(
+    commentRunRequest(
+      {
+        repo: "owner/repo",
+        number: 1,
+        issueTitle: i.title,
+        issueBody: i.body,
+        request: "do it\nAllow: workflows",
+        author: "owner",
+      },
+      "owner",
+    ),
+  );
+  const run = h.runs()[0];
+  if (!run || !h.cfg.githubQueue) throw new Error("missing run or queue");
+  h.store.updateRun(run.id, { status: "succeeded", finishedAt: h.clock.now() });
+  expect((await handle(send("second"))).status).toBe(200);
+  expect(h.runs()).toHaveLength(1);
+  h.cfg.githubQueue.repos = ["owner/repo"];
+  h.data.set("owner/repo", [i]);
+  h.start();
+  await h.advance();
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(1);
+  expect(records(h)).toMatchObject([{ outcome: "run", run_id: run.id }]);
+});
+
+test("identity failure leaves mentions retryable while slash commands still work", async () => {
+  const h = harness();
+  const i = await enableComments(h);
+  h.identity = async () => {
+    throw new Error("identity unavailable");
+  };
+  const mention = commentIssue(2);
+  mention.comments = { totalCount: 1, nodes: [{ ...commandComment(2), body: "@FACTORY do it" }] };
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  h.data.set("owner/repo", [i, mention]);
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(1);
+  expect(h.store.githubCommentProcessed({ repo: "owner/repo", id: 2 })).toBe(false);
+  h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+  await pollComments(h);
+  expect(h.runs()).toHaveLength(2);
+});
+
+test("stopping during comment repository resolution leaves it retryable", async () => {
+  const h = harness();
+  const i = await enableComments(h);
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  const create = h.store.createRun.bind(h.store);
+  const spy = spyOn(h.store, "createRun").mockImplementation((...args) => {
+    h.stop();
+    return create(...args);
+  });
+  await pollComments(h);
+  expect(h.runs()).toEqual([]);
+  expect(records(h)).toEqual([]);
+  expect(h.clock.pending).toBe(0);
+  spy.mockRestore();
+  h.start();
+  await h.advance();
+  expect(h.runs()).toHaveLength(1);
+});
+
+test("concurrent queues recheck the comment inside the transaction after a claim is released", async () => {
+  const h = harness();
+  const i = await enableComments(h);
+  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  const create = h.store.createRun.bind(h.store);
+  const spy = spyOn(h.store, "createRun").mockImplementation((...args) => {
+    const run = create(...args);
+    h.store.updateRun(run.id, { status: "succeeded", finishedAt: h.clock.now() });
+    return run;
+  });
+  const second = startIssueQueue(h.factory, {
+    gh: h.gh,
+    clock: {
+      now: h.clock.now,
+      set: h.clock.timer.set as unknown as typeof setTimeout,
+      clear: h.clock.timer.clear,
+    },
+  });
+  try {
+    await pollComments(h);
+    expect(h.requests).toHaveLength(2);
+    expect(h.runs()).toHaveLength(1);
+    expect(records(h)).toHaveLength(1);
+  } finally {
+    second();
+    spy.mockRestore();
+  }
+});
+
+test("mounted webhook requests a queue poll only for verified trusted created deliveries", async () => {
+  const h = harness({ trusted: ["owner", "collaborator"] });
+  const i = commentIssue();
+  h.data.set("owner/repo", [i]);
+  const integrations = await mountIntegrations(h.factory, {
+    toolVersions: async () => [],
+    gh: h.gh,
+    prClient: async () => null,
+    issueClock: {
+      now: h.clock.now,
+      set: h.clock.timer.set as unknown as typeof setTimeout,
+      clear: h.clock.timer.clear,
+    },
+  });
+  try {
+    await h.advance();
+    const route = integrations.routes["/webhooks/github"];
+    if (!route) throw new Error("missing webhook");
+    i.comments = { totalCount: 1, nodes: [{ ...commandComment(), author: { login: "collaborator" } }] };
+    const calls = h.calls.length;
+    for (const [action, author, valid] of [
+      ["edited", "owner", true],
+      ["created", "stranger", true],
+      ["created", "owner", false],
+    ] as const) {
+      const delivery = commentDelivery(i, `${action}-${author}-${valid}`, author);
+      const body = (await delivery.text()).replace('"action":"created"', `"action":"${action}"`);
+      const headers = Object.fromEntries(delivery.headers);
+      headers["x-hub-signature-256"] = valid
+        ? `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`
+        : `sha256=${"0".repeat(64)}`;
+      await route(new Request(delivery.url, { method: "POST", body, headers }), localServer);
+      await h.advance();
+    }
+    expect(h.calls).toHaveLength(calls);
+    expect(h.runs()).toEqual([]);
+    expect((await route(commentDelivery(i, "hint", "COLLABORATOR"), localServer)).status).toBe(200);
+    expect(h.runs()).toEqual([]);
+    await h.advance();
+    expect(h.runs()).toHaveLength(1);
+  } finally {
+    await integrations.stop();
   }
 });

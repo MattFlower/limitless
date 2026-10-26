@@ -143,7 +143,7 @@ smoke results. It asks before registering MCP with Claude Code or Codex; `--yes`
 Without a terminal, questions use defaults and MCP changes are declined unless `--yes` is set.
 Init also fills a missing `[owners] github` using `gh api user`; interactively, you can override
 the discovered login. Without a usable login or supplied owner, it reports that Dependabot runs,
-issue-label triggers and `/limitless` comment triggers remain disabled. Re-running keeps existing
+issue-label triggers and webhook-only `/limitless` comment triggers remain disabled. Re-running keeps existing
 settings and fills gaps. Existing TOML comments and unrelated settings are preserved, and changes
 create a timestamped backup. Converting to `[[providers]]` requires
 consent because the previous release cannot read it. If service startup, smoke checks, or MCP
@@ -190,7 +190,7 @@ persistently inside confined sessions. Older workers retain that same behavior.
 
 **Before upgrading:** installations relying on the former hardcoded GitHub owner must explicitly
 set `github = "<owner>"` under `[owners]` in `config.toml` before upgrading, or their Dependabot
-runs, issue-label triggers and `/limitless` comment triggers stop. Ordinary config loading never
+runs, issue-label triggers and webhook-only `/limitless` comment triggers stop. Ordinary config loading never
 discovers an owner.
 
 **`config.toml`** keys (all optional; defaults shown):
@@ -215,7 +215,7 @@ discovers an owner.
 | `[reserves] codex_five_hour` | `0.90` | Codex 5-hour window |
 | `[reserves] codex_weekly` | `0.90` | Codex weekly (`seven_day`) window |
 | `[reserves.windows.<provider>] <window>` | `1.0` | Reserve for any other provider or quota window, for example `[reserves.windows.my_provider] daily = 0.80` |
-| `[owners] github` | unset | The **only** GitHub login allowed to trigger runs by webhook. Set this to your own login (e.g. `"<owner>"`); Dependabot runs, issue-label triggers and `/limitless` comment triggers are disabled until set. `limitless doctor` warns when unset. |
+| `[owners] github` | unset | The **only** GitHub login allowed to trigger runs by webhook. Set this to your own login (e.g. `"<owner>"`); Dependabot runs, issue-label triggers and webhook-only `/limitless` comment triggers are disabled until set. `limitless doctor` warns when unset. |
 | `[owners] discord` | unset | The only Discord user ID allowed to use the bot |
 | `[discord] channel_id` | unset | Text channel for run threads and quota alerts |
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
@@ -467,7 +467,7 @@ Git LFS objects are not copied into the factory clone.
 | CLI | `limitless run "<prompt>" --repo <repo> [--profile auto\|quick\|standard\|deep] [--title <t>] [-f]` (prompt can come from stdin) | anyone with loopback access to the daemon |
 | UI | **New run** (`/new`): repo, prompt, optional title, profile. **Chat** (`/chat`): describe the work; the concierge proposes a run and you confirm or edit it. | same |
 | Discord | `/build repo:<repo> prompt:<text> [profile:...]`, `/runs [status]`, `/show id:`, `/cancel id:`; or mention the bot to chat | `[owners].discord` only |
-| GitHub | Label an issue `limitless`; comment `/limitless <request>`; Dependabot PRs | `[owners].github` (and `dependabot[bot]`) |
+| GitHub | Label an issue `limitless`; comment `/limitless <request>`; Dependabot PRs | Webhooks: `[owners].github` (and `dependabot[bot]`); [polled comments](ISSUES.md): `[github.queue].trusted` |
 | MCP | `limitless_create_run` and related tools from Claude Code or Codex | local agents |
 
 Use `limitless run "<prompt>" --repo <owner>/<repo> --after <run-id>` to wait for a
@@ -567,21 +567,27 @@ repository the installation does not cover. Tokens stay in memory and are withhe
 and gates. These settings require a daemon restart when changed. Older releases ignore these
 keys because the `[github]` table isn't checked for unknown keys.
 
-Create a repository webhook pointing at `https://<your-host>/webhooks/github`. Use content type
+For issue-label and Dependabot triggers, or comment commands outside queue repositories,
+create a repository webhook pointing at `https://<your-host>/webhooks/github`. Use content type
 `application/json` and the `GITHUB_WEBHOOK_SECRET`, and select the **Issues**, **Issue comments**
 and **Pull requests** events. See [the webhook tunnel](#webhook-tunnel) for exposing the endpoint.
 Deliveries are HMAC-verified and deduplicated by delivery ID. Through the tunnel, the source IP
 must also be in GitHub's published hook ranges.
 
-Dependabot runs, issue-label triggers and `/limitless` comment triggers are disabled unless
-`[owners] github` is configured.
+Dependabot runs, issue-label triggers and webhook-only `/limitless` comment triggers are disabled
+unless `[owners] github` is configured. [Issue queue](ISSUES.md) repositories also accept trusted,
+unedited comment commands by polling, without webhooks. The poll reads the last 20 comments
+every 180 s by default, ignores commands predating its first successful poll's GitHub timestamp
+boundary, and records each command transactionally exactly once. A webhook for a queue comment
+only requests an immediate poll.
 
 - **Issue label:** adding the `limitless` label creates a run. Both the person labelling and the
   issue author must be `[owners].github`, and the repository must belong to that account. The
   issue text is passed to the model as quoted, untrusted data. The resulting PR says
   `Closes #<n>`.
 - **Comment command:** an owner comment starting with `/limitless ` followed by a request runs that
-  request in the context of the issue.
+  request in the context of the issue. Queue repositories use `[github.queue].trusted` and also
+  accept `@<slug>` or `@<slug>[bot]` commands when served by a GitHub App identity.
 - **Dependabot:** `opened`, `reopened` and `synchronize` events on Dependabot PRs from the same
   repository start a `quick` verification run on the Dependabot branch. Fixes are pushed to that
   branch only if its head has not moved. The factory never merges these PRs. If the run does not
