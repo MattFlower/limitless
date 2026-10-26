@@ -65,7 +65,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
       registerCredential("confirmation-restart", secret);
       writeFileSync(
         join(repoDir, ".limitless.toml"),
-        `[gates]\nretry_files = "fake-targeted {files} # ${secret}"\nchecks = [{ name = "test", run = "fake-suite" }]\n`,
+        `[gates]\nretry_files = "bun test {files} '${secret}'"\nchecks = [{ name = "test", run = "bun test" }]\n`,
       );
       await sh(
         [
@@ -163,7 +163,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
   test("restart between coordinator confirmations keeps the completed first check", async () => {
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      `[gates]\nretry_files = "fake-targeted {files}"\nchecks = [{ name = "test-a", run = "fake-suite-a" }, { name = "test-b", run = "fake-suite-b" }]\n`,
+      `[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test-a", run = "bun test --test-name-pattern suite-a" }, { name = "test-b", run = "bun test --test-name-pattern suite-b" }]\n`,
     );
     await sh(
       [
@@ -200,10 +200,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
     let reopened: Store | undefined;
     const remoteCommands = [
-      "fake-suite-a",
-      "fake-suite-b",
-      "fake-targeted './greeting.txt'",
-      "fake-targeted './greeting.txt'",
+      "bun test --test-name-pattern suite-a",
+      "bun test --test-name-pattern suite-b",
+      "bun test './greeting.txt'",
+      "bun test './greeting.txt'",
     ];
     try {
       const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
@@ -224,8 +224,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       );
       expect(fixture.local).toHaveLength(2);
       expect(fixture.local.map((c) => c.command)).toEqual([
-        "fake-targeted './greeting.txt'",
-        "fake-targeted './greeting.txt'",
+        "bun test './greeting.txt'",
+        "bun test './greeting.txt'",
       ]);
       expect(fixture.remote).toEqual(remoteCommands);
       const resumed = reopened.getRunState<RunState>(run.id)?.postMergeGates;
@@ -250,10 +250,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const secrets = [crypto.randomUUID(), crypto.randomUUID()];
     const collision = scenario.includes("collision");
     const names = secrets.slice(0, collision ? 2 : 1).map((secret) => `test-${secret}`);
-    const checks = names.map((name, index) => ({ name, run: `fake-suite-${index}` }));
+    const checks = names.map((name, index) => ({ name, run: `bun test --test-name-pattern suite-${index}` }));
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      `[gates]\nretry_files = "fake-targeted {files}"\nchecks = [${checks.map((c) => `{ name = "${c.name}", run = "${c.run}" }`).join(", ")}]\n`,
+      `[gates]\nretry_files = "bun test {files}"\nchecks = [${checks.map((c) => `{ name = "${c.name}", run = "${c.run}" }`).join(", ")}]\n`,
     );
     await sh(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "pending fixture"], {
       cwd: repoDir,
@@ -319,8 +319,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(saved?.result?.comparison[0]?.coordinatorConfirmation).toBeUndefined();
       expect(fixture.local).toHaveLength(0);
       const remote = collision
-        ? ["fake-suite-0", "fake-suite-1", "fake-targeted './greeting.txt'", "fake-targeted './greeting.txt'"]
-        : ["fake-suite-0", "fake-targeted './greeting.txt'"];
+        ? [
+            "bun test --test-name-pattern suite-0",
+            "bun test --test-name-pattern suite-1",
+            "bun test './greeting.txt'",
+            "bun test './greeting.txt'",
+          ]
+        : ["bun test --test-name-pattern suite-0", "bun test './greeting.txt'"];
       expect(fixture.remote).toEqual(remote);
       if (scenario.startsWith("legacy") && saved?.result) {
         for (const c of saved.result.comparison) delete c.postMergeWorker;

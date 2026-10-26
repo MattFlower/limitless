@@ -53,10 +53,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
   ])("post-merge worker confirmation: %s", async (scenario) => {
     const secret = "synthetic-confirmation-retry-credential";
     registerCredential("confirmation-retry", secret);
-    const retry = `fake-targeted {files}${["pass", "fail"].includes(scenario) ? ` # ${secret}` : ""}`;
+    const retry = `bun test {files}${["pass", "fail"].includes(scenario) ? ` '${secret}'` : ""}`;
     writeFileSync(
       join(repoDir, ".limitless.toml"),
-      `[gates]\nretry_files = "${retry}"\nchecks = [{ name = "test", run = "fake-suite", timeoutSec = 37 }]\n`,
+      `[gates]\nretry_files = "${retry}"\nchecks = [{ name = "test", run = "bun test", timeoutSec = 37 }]\n`,
     );
     await sh(
       ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "worker confirmation fixture"],
@@ -154,10 +154,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(JSON.stringify(saved)).not.toContain(secret);
         expect(f.store.getArtifact(run.id, "gates-rebase-0.json")).not.toContain(secret);
         expect(f.store.getRun(run.id)?.error ?? "").not.toContain(secret);
-        expect(check?.result.command).toContain("# [redacted]");
-        expect(check?.result.targetedRetry?.command).toContain("# [redacted]");
+        expect(check?.result.command).toContain("'[redacted]'");
+        expect(check?.result.targetedRetry?.command).toContain("'[redacted]'");
         expect(check?.result.firstAttempt?.targetedRetry?.command).toStartWith("[withheld:");
-        expect(check?.coordinatorConfirmation?.result?.command).toContain("# [redacted]");
+        expect(check?.coordinatorConfirmation?.result?.command).toContain("'[redacted]'");
         expect(check?.firstAttempt?.ok).toBe(false);
         expect(check?.result.firstAttempt?.targetedRetry?.ok).toBe(false);
         expect(check?.result.firstAttempt?.output).toStartWith("[withheld:");
@@ -203,6 +203,37 @@ describe("pipeline (fake agents, real git + gates)", () => {
       gateSlots.setLimit(previous);
     }
     expect(gateSlots.snapshot().occupied).toBe(0);
+  });
+
+  test("review: a compound check is refused before any coordinator confirmation runs", async () => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      `[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test; fake-security-scan" }]\n`,
+    );
+    await sh(
+      ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "compound gate fixture"],
+      { cwd: repoDir },
+    );
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") {
+        await advanceBase(bare, "base.txt", "new base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    const fixture = postMergeWorkerFixture(f);
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
+      expect(f.deps.store.getRun(run.id)?.error ?? "").toContain("check is not a single bun test invocation");
+      expect(fixture.local).toHaveLength(0);
+    } finally {
+      fixture.processSpy.mockRestore();
+    }
   });
 
   // Literal commands and escaped gate names across a gate-started restart are covered in
