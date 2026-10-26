@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import { detectGates, readRetryFiles } from "../src/gates/detect.ts";
-import { executeGate, type GateRunner } from "../src/gates/executor.ts";
+import { executeGate, type GateRunner, gateProvenance } from "../src/gates/executor.ts";
 import { extractFailures } from "../src/gates/failures.ts";
 import { MAX_RETRY_FILES, parseJUnit, readJUnit } from "../src/gates/junit.ts";
 import {
   type GateResult,
+  type GateRun,
   retryFailures,
   retryRegressions,
   runGates,
@@ -16,9 +17,10 @@ import {
 } from "../src/gates/run.ts";
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
-import { sh } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
+import { seeded } from "./seeded.ts";
 
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), "gate-retry-files-"));
@@ -26,6 +28,18 @@ function fixture() {
   for (const file of ["a.test.ts", "b.test.ts", "space ' quote.test.ts"])
     writeFileSync(join(cwd, "test", file), "");
   return { cwd, close: () => rmSync(cwd, { recursive: true, force: true }) };
+}
+const retrySeed = seeded(async (cwd) => {
+  await sh(["git", "init", "-q"], { cwd });
+  writeFileSync(join(cwd, "tracked.txt"), "original");
+  await sh(["git", "add", "."], { cwd });
+  await sh(["git", "commit", "-qm", "retry fixture"], { cwd });
+  return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+});
+async function retryFixture() {
+  const f = fixture();
+  const { value: sha } = await retrySeed(f.cwd);
+  return { ...f, sha };
 }
 const suite = (file = "test/a.test.ts", attrs = 'failures="1" time="2"', body = "") =>
   `<testsuite file="${file}" ${attrs}>${body}</testsuite>`;
@@ -94,7 +108,7 @@ describe("JUnit failure files", () => {
       `<testsuites>${Array.from({ length: MAX_RETRY_FILES + 1 }, (_, i) => suite(`test/${i}.test.ts`)).join("")}</testsuites>`,
     ],
   ])("%s falls back to exactly one full retry", async (_kind, xml) => {
-    const f = fixture();
+    const f = await retryFixture();
     try {
       for (let i = 0; i <= MAX_RETRY_FILES; i++) writeFileSync(join(f.cwd, `test/${i}.test.ts`), "");
       const report = join(f.cwd, "report.xml");
@@ -104,7 +118,13 @@ describe("JUnit failure files", () => {
       const calls: string[] = [];
       const runner: GateRunner = async (cfg) => {
         calls.push(...cfg.checks.map((c) => c.run));
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true }],
+        };
       };
       const [result] = await retryRegressions(
         [{ name: "test", result: { ...failed, ...files }, verdict: "regressed", blocking: true }],
@@ -174,8 +194,114 @@ const failed: GateResult = {
   durationMs: 10,
 };
 
+test.each(["targeted only", "targeted", "full"])(
+  "%s retries require clean provenance at the pinned commit",
+  async (branch) => {
+    const f = await retryFixture();
+    try {
+      const credential = ["synthetic", "retry", "diagnostic", "credential"].join("-");
+      registerCredential("retry-diagnostic", credential);
+      const cases: { provenance: Partial<GateRun>; reason?: string }[] = [
+        { provenance: {}, reason: "missing execution SHA" },
+        { provenance: { trackedClean: true }, reason: "missing execution SHA" },
+        { provenance: { sha: f.sha }, reason: "cleanliness was not confirmed" },
+        {
+          provenance: {
+            sha: f.sha,
+            trackedClean: false,
+            provenanceError: `tracked files changed: ["${credential}.txt"]`,
+          },
+          reason: "[redacted].txt",
+        },
+        {
+          provenance: { trackedClean: false, provenanceError: "execution provenance could not be confirmed" },
+          reason: "could not be confirmed",
+        },
+        { provenance: { sha: "a".repeat(40), trackedClean: true }, reason: "does not match checked commit" },
+        { provenance: { sha: f.sha, trackedClean: true } },
+      ];
+      const original = {
+        ...failed,
+        failures: "original assertion",
+        failedFiles: ["test/a.test.ts"],
+        failureAttributionComplete: true,
+      };
+      for (const { provenance, reason } of cases) {
+        const calls: boolean[] = [];
+        const skipped: string[] = [];
+        const retries = await retryFailures(
+          [{ check: testCheck, original }],
+          f.cwd,
+          config,
+          signal,
+          undefined,
+          async (_cfg, options) => {
+            calls.push(options?.targeted ?? false);
+            return {
+              setupOk: true,
+              setup: [],
+              checks: [{ ...failed, ok: true, exitCode: 0 }],
+              ...(branch === "full" && options?.targeted ? { sha: f.sha, trackedClean: true } : provenance),
+            };
+          },
+          branch === "targeted only",
+          false,
+          (_original, why) => skipped.push(why),
+        );
+        const result = retries.get(original);
+        expect(result).toMatchObject({ ok: !reason, exitCode: reason ? 1 : 0, firstAttempt: original });
+        expect(calls).toEqual(
+          branch === "full" || (!reason && branch === "targeted") ? [true, false] : [true],
+        );
+        if (reason) {
+          expect(result?.output).toContain(reason);
+          expect(result?.failures).toContain(reason);
+          expect(result?.failures).toContain("original assertion");
+          expect(skipped[0]).toContain(reason);
+          expect(result?.confinementError).toBe(false);
+        } else expect(skipped).toEqual([]);
+        expect(result?.output).not.toContain(credential);
+      }
+    } finally {
+      f.close();
+    }
+  },
+);
+
+test.each(["tracked", "untracked"])("standalone regression retry writing %s files", async (kind) => {
+  const f = await retryFixture();
+  try {
+    const check = {
+      name: "test",
+      run: `echo retry-output > ${kind === "tracked" ? "tracked.txt" : "build-output.txt"}`,
+    };
+    const original = { ...failed, command: check.run };
+    const [comparison] = await confinementScope.run(fakeConfinement, () =>
+      retryRegressions(
+        [{ name: "test", verdict: "regressed", blocking: true, result: original }],
+        f.cwd,
+        { ...config, checks: [check] },
+        [],
+        signal,
+      ),
+    );
+    expect(readFileSync(join(f.cwd, kind === "tracked" ? "tracked.txt" : "build-output.txt"), "utf8")).toBe(
+      "retry-output\n",
+    );
+    expect(comparison).toMatchObject({
+      verdict: kind === "tracked" ? "regressed" : "flaky",
+      blocking: kind === "tracked",
+      result: { ok: kind === "untracked", firstAttempt: original },
+    });
+    if (kind === "tracked")
+      expect(comparison?.result.output).toContain('tracked files changed: ["tracked.txt"]');
+  } finally {
+    f.close();
+  }
+});
+
 test.each([false, true])("local retries preserve setup output (executor: %s)", async (executor) => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     const check = {
       name: "test",
@@ -218,7 +344,7 @@ test.each([false, true])("local retries preserve setup output (executor: %s)", a
 test.each(["targeted", "full", "targeted only"])(
   "a failed %s retry setup preserves the original failure and setup evidence",
   async (kind) => {
-    const f = fixture();
+    const f = await retryFixture();
     try {
       const original = {
         ...failed,
@@ -368,7 +494,7 @@ test.each([
     complete: false,
   },
 ])("land failure evidence: $label", async (row) => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     const junit = parseJUnit(row.xml ?? attributedSuite, f.cwd);
     const evidence = new RunnerFailureEvidence();
@@ -384,7 +510,13 @@ test.each([
       undefined,
       async () => {
         calls++;
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true, exitCode: 0 }],
+        };
       },
       true,
     );
@@ -421,7 +553,7 @@ test.each([
   ["node_modules", "at node_modules/pkg/test.ts:3:92", "node_modules/pkg/test.ts", true],
   ["node_modules symlink", "at node_modules/pkg/alias.ts:3:92", "test/b.test.ts", true],
 ] as const)("JUnit stack attribution: %s", async (_label, frame, passingFile, complete) => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     writeFileSync(join(f.cwd, "helper.ts"), "");
     writeFileSync(join(f.cwd, "test/space (quote).test.ts"), "");
@@ -454,7 +586,13 @@ test.each([
       undefined,
       async () => {
         calls++;
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true, exitCode: 0 }],
+        };
       },
       true,
     );
@@ -465,7 +603,7 @@ test.each([
 });
 
 test("a quoted retry placeholder cannot turn a failing test into a shell success", async () => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     const file = 'test/x"; true #.test.ts';
     writeFileSync(
@@ -492,9 +630,12 @@ test("a quoted retry placeholder cannot turn a failing test into a shell success
         cfg,
         signal,
         undefined,
-        (retry) => {
+        async (retry) => {
           calls++;
-          return runLocalGates(f.cwd, retry, signal, { env: bunEnv });
+          return {
+            ...(await runLocalGates(f.cwd, retry, signal, { env: bunEnv })),
+            ...(await gateProvenance(f.cwd, signal)),
+          };
         },
         true,
         false,
@@ -524,7 +665,7 @@ test.each([
   "bun test",
   "bun test {files} {files}",
 ])("targeted-only retries reject unsafe placeholder placement: %s", async (retryFiles) => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     const original = { ...failed, failedFiles: ["test/a.test.ts"], failureAttributionComplete: true };
     let calls = 0;
@@ -537,7 +678,13 @@ test.each([
       undefined,
       async () => {
         calls++;
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true, exitCode: 0 }],
+        };
       },
       true,
       false,
@@ -555,7 +702,7 @@ test.each([
   ["configured", "bun test; security-scan", "bun test"],
   ["returned", "bun test", "bun test; security-scan"],
 ])("targeted-only retries validate the %s check command", async (_label, run, command) => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     const check = { ...testCheck, run };
     const original = {
@@ -574,7 +721,13 @@ test.each([
       undefined,
       async () => {
         calls++;
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true, exitCode: 0 }],
+        };
       },
       true,
       false,
@@ -589,7 +742,7 @@ test.each([
 });
 
 test("targeted-only retries recognize the exact expanded command before execution", async () => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     // The shared parser conservatively rejects backticks, even inside quoted filenames.
     const file = "test/tick`.test.ts";
@@ -605,7 +758,13 @@ test("targeted-only retries recognize the exact expanded command before executio
       undefined,
       async () => {
         calls++;
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true, exitCode: 0 }],
+        };
       },
       true,
       false,
@@ -622,7 +781,7 @@ test("targeted-only retries recognize the exact expanded command before executio
 test.each(["bun test {files}; security-scan", "other-runner {files}"])(
   "targeted-only retries reject an ineligible retry_files invocation: %s",
   async (retryFiles) => {
-    const f = fixture();
+    const f = await retryFixture();
     try {
       const original = {
         ...failed,
@@ -634,7 +793,13 @@ test.each(["bun test {files}; security-scan", "other-runner {files}"])(
       const skipped: { original: GateResult; reason: string }[] = [];
       const runner: GateRunner = async (retry) => {
         calls.push(...retry.checks.map((c) => c.run));
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true, exitCode: 0 }],
+        };
       };
       const selected = [{ check: testCheck, original }];
       const results = await retryFailures(
@@ -665,13 +830,19 @@ test.each(["bun test {files}; security-scan", "other-runner {files}"])(
 );
 
 test("incomplete land evidence preserves factory targeted and full retries", async () => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     const original = { ...failed, ...parseJUnit(suite(), f.cwd), failureAttributionComplete: false };
     const calls: boolean[] = [];
     const runner: GateRunner = async (_cfg, options) => {
       calls.push(options?.targeted ?? false);
-      return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+      return {
+        sha: f.sha,
+        trackedClean: true,
+        setupOk: true,
+        setup: [],
+        checks: [{ ...failed, ok: true, exitCode: 0 }],
+      };
     };
     const selected = [{ check: testCheck, original }];
     expect((await retryFailures(selected, f.cwd, config, signal, undefined, runner, true)).size).toBe(0);
@@ -688,7 +859,7 @@ test("incomplete land evidence preserves factory targeted and full retries", asy
 test.each(["runner error count", "JUnit error count"])(
   "gate capture retains %s before the diagnostic tail",
   async (kind) => {
-    const f = fixture();
+    const f = await retryFixture();
     try {
       writeFileSync(
         join(f.cwd, "runner.ts"),
@@ -719,7 +890,7 @@ process.exit(1);`,
 );
 
 test("a completed attributed test timeout retries once with a slot and keeps its evidence", async () => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     const xml = suite(
       "test/a.test.ts",
@@ -755,7 +926,13 @@ process.exit(1);`,
       async (cfg, options) => {
         expect(options).toEqual({ targeted: true, skipGateSlot: false });
         calls.push(...cfg.checks.map((c) => c.run));
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true, exitCode: 0 }],
+        };
       },
       true,
     );
@@ -794,7 +971,7 @@ test("the repository test check retains worker, timeout and structured report se
 });
 
 test("targeted Bun arguments select exact paths and safely quote filenames", async () => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     for (const file of ["a.test.ts", "test/space ' quote.test.ts"])
       writeFileSync(
@@ -824,7 +1001,7 @@ test("targeted Bun arguments select exact paths and safely quote filenames", asy
           calls.push(cfg.checks[0]?.run ?? "");
           return options?.targeted
             ? runGates(f.cwd, cfg, signal)
-            : { setupOk: true, setup: [], checks: [{ ...failed, ok: true }] };
+            : { sha: f.sha, trackedClean: true, setupOk: true, setup: [], checks: [{ ...failed, ok: true }] };
         },
       ),
     );
@@ -840,7 +1017,7 @@ test("targeted Bun arguments select exact paths and safely quote filenames", asy
 });
 
 test("the repository retry template isolates globals across reported files before the full retry", async () => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     for (const file of ["test/a.test.ts", "test/b.test.ts"])
       writeFileSync(
@@ -892,7 +1069,7 @@ test("the repository retry template isolates globals across reported files befor
 });
 
 test("real Bun bail blocks targeted land retry despite matching counters", async () => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     writeFileSync(
       join(f.cwd, "test/a.test.ts"),
@@ -943,7 +1120,13 @@ test("fails once", () => { const seen = existsSync("marker"); writeFileSync("mar
       undefined,
       async () => {
         calls++;
-        return { setupOk: true, setup: [], checks: [{ ...original, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...original, ok: true, exitCode: 0 }],
+        };
       },
       true,
     );
@@ -957,7 +1140,7 @@ test("fails once", () => { const seen = existsSync("marker"); writeFileSync("mar
 test.each(["poll", "poll (leak)"])(
   "real Bun asynchronous %s failure in a passing file blocks targeted land retry",
   async (pollName) => {
-    const f = fixture();
+    const f = await retryFixture();
     try {
       writeFileSync(
         join(f.cwd, "test/a.test.ts"),
@@ -1002,7 +1185,13 @@ test("arms leak", () => {
         undefined,
         async () => {
           calls++;
-          return { setupOk: true, setup: [], checks: [{ ...original, ok: true, exitCode: 0 }] };
+          return {
+            sha: f.sha,
+            trackedClean: true,
+            setupOk: true,
+            setup: [],
+            checks: [{ ...original, ok: true, exitCode: 0 }],
+          };
         },
         true,
       );
@@ -1021,7 +1210,7 @@ test.each([
 ])(
   "real Bun own-file failure in $file with helper=$helper permits one targeted land retry",
   async ({ helper, file }) => {
-    const f = fixture();
+    const f = await retryFixture();
     try {
       writeFileSync(join(f.cwd, "helper.ts"), 'export function fail() { throw new Error("own failure"); }');
       writeFileSync(
@@ -1058,7 +1247,10 @@ test("fails once", () => {
           async (retry, options) => {
             expect(options?.targeted).toBe(true);
             calls.push(...retry.checks.map((c) => c.run));
-            return runLocalGates(f.cwd, retry, signal, { env: bunEnv });
+            return {
+              ...(await runLocalGates(f.cwd, retry, signal, { env: bunEnv })),
+              ...(await gateProvenance(f.cwd, signal)),
+            };
           },
           true,
         );
@@ -1073,7 +1265,7 @@ test("fails once", () => {
 );
 
 test("real Bun JUnit capture keeps failing files, console excerpts and coverage", async () => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     // This standalone fixture must not inherit this repository's test root/preload.
     writeFileSync(
@@ -1119,7 +1311,7 @@ test("real Bun JUnit capture keeps failing files, console excerpts and coverage"
 test.each(["small", "six files", "over duration", "unknown duration"])(
   "targeted local executor slot policy: %s",
   async (size) => {
-    const f = fixture();
+    const f = await retryFixture();
     const previous = gateSlots.limit;
     gateSlots.setLimit(1);
     const release = await gateSlots.acquire(signal);
@@ -1217,7 +1409,7 @@ test.each([
   { label: "infinite duration", count: 1, time: Infinity, skip: false, timeout: 300 },
   { label: "NaN duration", count: 1, time: NaN, skip: false, timeout: 300 },
 ])("targeted-only retries preserve bounds: $label", async (row) => {
-  const f = fixture();
+  const f = await retryFixture();
   try {
     const files = Array.from({ length: row.count }, (_, i) => `test/${i}.test.ts`);
     for (const file of files) writeFileSync(join(f.cwd, file), "");
@@ -1246,7 +1438,13 @@ test.each([
         expect(cfg.setup).toEqual([]);
         expect(cfg.checks[0]?.timeoutSec).toBe(row.timeout);
         expect(cfg.checks[0]?.run).toBe(`bun test ${files.map((file) => `'./${file}'`).join(" ")}`);
-        return { setupOk: true, setup: [], checks: [{ ...failed, ok: true, exitCode: 0 }] };
+        return {
+          sha: f.sha,
+          trackedClean: true,
+          setupOk: true,
+          setup: [],
+          checks: [{ ...failed, ok: true, exitCode: 0 }],
+        };
       },
       true,
     );

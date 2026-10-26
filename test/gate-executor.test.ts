@@ -81,6 +81,7 @@ const result = (req: GateRequest, ok = true): GateRun => ({
 function fake(
   onAttach: (h: ExecutionHandle, req: GateRequest) => Promise<GateRun>,
   kind: GateExecutor["kind"] = "lan",
+  inspect = true,
 ) {
   const requests = new Map<string, GateRequest>();
   const starts: ExecutionHandle[] = [];
@@ -98,7 +99,7 @@ function fake(
       const req = rebuilt ?? requests.get(h.id) ?? request(fixture.repoDir);
       const completed = onAttach(h, req).then(async (run) => ({
         ...run,
-        ...(await gateProvenance(req.cwd, _signal, req.headSha)),
+        ...(inspect ? await gateProvenance(req.cwd, _signal, req.headSha) : {}),
       }));
       return {
         result: completed,
@@ -163,6 +164,73 @@ test.each(["assume-unchanged", "skip-worktree"])(
     expect(readFileSync(join(cwd, "greeting.txt"), "utf8")).toBe("changed\n");
     expect(run.trackedClean).toBe(false);
     expect(run.provenanceError).toContain('"greeting.txt"');
+  },
+);
+
+test("a passing baseline retry that rewrites a tracked credential path retains the failure", async () => {
+  const cwd = fixture.repoDir;
+  const credential = ["synthetic", "retry", "path", "credential"].join("-");
+  registerCredential("retry-path", credential);
+  const file = `${credential}.txt`;
+  writeFileSync(join(cwd, file), "original");
+  await sh(["git", "add", file], { cwd });
+  await sh(["git", "commit", "-qm", "tracked credential path"], { cwd });
+  const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+  const cfg = {
+    ...gates,
+    checks: [
+      {
+        name: "check",
+        run: `if test -f attempted; then echo rewritten > '${file}'; else touch attempted; echo baseline-failure; exit 1; fi`,
+      },
+    ],
+  };
+  await confinementScope.run(fakeConfinement, async () => {
+    const req = { ...request(cwd), headSha, gates: cfg };
+    const signal = new AbortController().signal;
+    const original = await executeGate(req, signal);
+    const retried = await retryBaselineFailures(original, cwd, cfg, signal);
+    expect(retried.checks[0]).toMatchObject({ ok: false, exitCode: 1, firstAttempt: { ok: false } });
+    expect(retried.checks[0]?.output).toContain("baseline-failure");
+    expect(retried.checks[0]?.output).toContain('tracked files changed: ["[redacted].txt"]');
+    expect(retried.checks[0]?.output).not.toContain(credential);
+    expect(compareGates(original, retried)[0]).toMatchObject({ verdict: "still_failing", blocking: false });
+    expect(confinementFailed(retried.checks[0])).toBe(false);
+  });
+});
+
+test.each(["clean", "missing SHA", "missing cleanliness", "dirty", "mismatched SHA"])(
+  "baseline retries use LAN-reported provenance: %s",
+  async (scenario) => {
+    const cwd = fixture.repoDir;
+    const signal = new AbortController().signal;
+    const headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const req = { ...request(cwd), headSha };
+    const original = result(req, false);
+    const remote = fake(
+      async (_handle, retry) => ({
+        ...result(retry),
+        sha:
+          scenario === "missing SHA" ? undefined : scenario === "mismatched SHA" ? "a".repeat(40) : headSha,
+        trackedClean: scenario === "missing cleanliness" ? undefined : scenario !== "dirty",
+        provenanceError: scenario === "dirty" ? 'tracked files changed: ["remote.txt"]' : undefined,
+      }),
+      "lan",
+      false,
+    );
+    // Coordinator bytes cannot establish whether the worker execution was clean.
+    writeFileSync(join(cwd, "greeting.txt"), "coordinator edits\n");
+    const retried = await retryBaselineFailures(original, cwd, gates, signal, undefined, (selected) =>
+      executeGate({ ...req, gates: selected }, signal, {}, remote.executor),
+    );
+    expect(retried.checks[0]).toMatchObject({
+      ok: scenario === "clean",
+      exitCode: scenario === "clean" ? 0 : 1,
+      firstAttempt: { ok: false },
+    });
+    if (scenario !== "clean") expect(retried.checks[0]?.output).toContain("Retry rejected:");
+    if (scenario === "dirty")
+      expect(retried.checks[0]?.output).toContain('tracked files changed: ["remote.txt"]');
   },
 );
 
@@ -776,7 +844,10 @@ test("formatted gate identities keep baseline verdicts after gate-started restar
   if (!baseline) throw new Error("missing baseline");
   const retry: GateRunner = async (selected) => {
     expect(selected.checks).toEqual(cfg.checks);
-    return result({ ...request(fixture.repoDir), gates: selected });
+    return {
+      ...result({ ...request(fixture.repoDir), gates: selected }),
+      ...(await gateProvenance(fixture.repoDir, signal)),
+    };
   };
   const signal = new AbortController().signal;
   const retried = await retryBaselineFailures(baseline, fixture.repoDir, cfg, signal, undefined, retry);

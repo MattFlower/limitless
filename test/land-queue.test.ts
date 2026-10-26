@@ -16,7 +16,7 @@ import { loadConfig, type Paths } from "../src/config.ts";
 import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
-import type { GateExecutor, GateRequest } from "../src/gates/executor.ts";
+import { type GateExecutor, type GateRequest, gateProvenance } from "../src/gates/executor.ts";
 import { parseJUnit } from "../src/gates/junit.ts";
 import { redactGateData } from "../src/gates/output.ts";
 import { type GateResult, type GateRun, runLocalGates } from "../src/gates/run.ts";
@@ -430,6 +430,8 @@ function gateResult(name: string, command: string, overrides: Partial<GateResult
 
 function retryRun(req: GateRequest, failures: Record<string, Partial<GateResult>> = {}): GateRun {
   return {
+    sha: req.headSha,
+    trackedClean: true,
     setupOk: true,
     setup: req.gates.setup.map((command) => gateResult("setup", command)),
     checks: req.gates.checks.map((c) => gateResult(c.name, c.run, failures[c.name])),
@@ -627,6 +629,40 @@ test("a redacted compound land command stays ineligible for a targeted retry", a
   );
 });
 
+test("a passing LAN land retry that rewrites tracked files remains blocked", async () => {
+  const { pr, head } = await retryLandFixture();
+  const remote = join(root, "dirty-retry-checkout");
+  const fake = fakeLandGates(async (req, attempt, signal) => {
+    if (attempt === 1) return retryRun(req, { test: testFailure });
+    await sh(["git", "clone", "-q", "--no-hardlinks", req.cwd, remote], { cwd: root });
+    const run = await confinementScope.run(fakeConfinement, () =>
+      runLocalGates(
+        remote,
+        {
+          ...req.gates,
+          setup: [],
+          checks: [{ name: "test", run: "echo rewritten > README.md" }],
+        },
+        signal,
+      ),
+    );
+    expect(run.checks[0]).toMatchObject({ ok: true, exitCode: 0 });
+    return { ...run, ...(await gateProvenance(remote, signal, req.headSha)) };
+  });
+  const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+  await settle();
+  const completed = store.getLandEntry(entry.id);
+  expect(completed).toMatchObject({ state: "blocked", pushedSha: null });
+  expect(completed?.reason).not.toContain("flaky");
+  const log = readFileSync(completed?.logPath ?? "", "utf8");
+  expect(log).toContain("Retry rejected:");
+  expect(log).toContain('tracked files changed: ["README.md"]');
+  expect(log).toContain("initial test failure");
+  expect(ghCalls("pr merge")).toEqual([]);
+  expect(ghCalls("git push")).toEqual([]);
+  expect((await sh(["git", "rev-parse", "pr-1"], { cwd: bare })).stdout.trim()).toBe(head);
+});
+
 test.each([false, true])("targeted land retries record flakes through CI (restart: %s)", async (restart) => {
   const { pr, head } = await retryLandFixture();
   const credential = "synthetic-targeted-land-secret";
@@ -797,16 +833,16 @@ test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)",
   const template = "bun test {files}";
   const { pr, head } = await retryLandFixture(template, "test", setup);
   const fresh = join(root, "retry-checkout");
-  const fake = fakeLandGates((req, attempt, signal) => {
+  const fake = fakeLandGates(async (req, attempt, signal) => {
     if (attempt === 1) return retryRun(req, { test: testFailure });
-    mkdirSync(fresh);
-    writeFileSync(join(fresh, retryFile), readFileSync(join(req.cwd, retryFile)));
+    await sh(["git", "clone", "-q", "--no-hardlinks", req.cwd, fresh], { cwd: root });
     expect(existsSync(join(fresh, "node_modules"))).toBe(false);
-    return confinementScope.run(fakeConfinement, () =>
+    const run = await confinementScope.run(fakeConfinement, () =>
       runLocalGates(fresh, req.gates, signal, {
         env: { PATH: `${dirname(process.execPath)}:${process.env.PATH ?? ""}` },
       }),
     );
+    return { ...run, ...(await gateProvenance(fresh, signal, req.headSha)) };
   });
   const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
   await settle();

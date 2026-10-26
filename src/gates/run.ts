@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
+import { worktreeGit } from "../git/command.ts";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { type DocsSelection, quoteRetryFiles, singleBunTest } from "./docs.ts";
-import { executeGate, type GateRunner } from "./executor.ts";
+import { executeGate, type GateRunner, gateProvenance } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
 import { type FailedTestFiles, readJUnit, readJUnitSkips, validRetryFiles } from "./junit.ts";
 import {
@@ -219,7 +220,7 @@ export function runGates(
   hooks: GateHooks = {},
 ): Promise<GateRun> {
   return executeGate(
-    { repo: cwd, cwd, baseSha: "", headSha: "", gates: cfg, priority: hooks.priority },
+    { repo: cwd, cwd, baseSha: "", headSha: "HEAD", gates: cfg, priority: hooks.priority },
     signal,
     hooks,
   );
@@ -271,7 +272,7 @@ async function retryChecks(
       if (signal.aborted) break;
       checks.push(await withCommandScratch(cwd, () => runOne(check, cwd, signal)));
     }
-    return { setupOk: true, setup: [], checks };
+    return { setupOk: true, setup: [], checks, ...(await gateProvenance(cwd, signal)) };
   } finally {
     release();
   }
@@ -335,6 +336,31 @@ export async function retryFailures(
   onSkip?: (original: GateResult, reason: string) => void,
 ): Promise<Map<GateResult, GateResult>> {
   const results = new Map<GateResult, GateResult>();
+  const sha = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal })
+    .then((r) => r.stdout.trim())
+    .catch(() => undefined);
+  const validate = (attempt: GateResult, run: GateRun, original: GateResult): GateResult => {
+    if (!attempt.ok || confinementFailed(attempt)) return attempt;
+    const reason =
+      !sha || !run.sha
+        ? "missing execution SHA provenance"
+        : run.sha !== sha
+          ? `execution SHA ${run.sha} does not match checked commit ${sha}`
+          : run.trackedClean !== true
+            ? "tracked checkout cleanliness was not confirmed"
+            : undefined;
+    if (!reason) return attempt;
+    const diagnostic = redactGateOutput(
+      `Retry rejected: ${reason}${run.provenanceError ? `; ${run.provenanceError}` : ""}`,
+    );
+    onSkip?.(original, diagnostic);
+    return {
+      ...original,
+      confinementError: confinementFailed(original),
+      output: `${original.output}\n\n${diagnostic}`,
+      ...(original.failures ? { failures: `${original.failures}\n\n${diagnostic}` } : {}),
+    };
+  };
   const targets = new Map<GateResult, GateResult>();
   const full: typeof failures = [];
   for (const entry of failures) {
@@ -370,15 +396,20 @@ export async function retryFailures(
         results.set(original, retrySetupFailure(original, retried));
         continue;
       }
-      const attempt = retried.checks[0];
-      if (!attempt) continue;
-      targets.set(original, attempt);
+      const raw = retried.checks[0];
+      if (!raw) continue;
+      targets.set(original, raw);
+      const attempt = validate(raw, retried, original);
       if (targetedOnly) {
-        results.set(original, { ...attempt, firstAttempt: original, targetedRetry: attempt });
+        results.set(original, { ...attempt, firstAttempt: original, targetedRetry: raw });
         continue;
       }
-      if (confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
-        results.set(original, { ...original, firstAttempt: original, targetedRetry: attempt });
+      if (attempt !== raw || confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
+        results.set(original, {
+          ...(attempt === raw ? original : attempt),
+          firstAttempt: original,
+          targetedRetry: raw,
+        });
         continue;
       }
     }
@@ -402,7 +433,11 @@ export async function retryFailures(
       }
       const result = retried.checks[index];
       if (result)
-        results.set(original, { ...result, firstAttempt: original, targetedRetry: targets.get(original) });
+        results.set(original, {
+          ...validate(result, retried, original),
+          firstAttempt: original,
+          targetedRetry: targets.get(original),
+        });
     }
   }
   return results;
