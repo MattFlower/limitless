@@ -3,12 +3,12 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { z } from "zod";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { Store } from "../src/db/store.ts";
 import { type AgentJobRequest, WorkerStore } from "../src/db/workers.ts";
 import { registerCredential } from "../src/util/proc.ts";
-import { type Capabilities, Heartbeat } from "../src/workers/protocol.ts";
+import type { Capabilities } from "../src/workers/protocol.ts";
+import { PreviousHeartbeat } from "./previous-heartbeat.ts";
 
 const releaseSha = "f".repeat(40);
 const request: AgentJobRequest = {
@@ -559,10 +559,6 @@ test.each(["match", "differs", "unknown"] as const)(
 );
 
 test("every stored capabilities row parses with the previous release's schema; Linux rows live in capabilities_ext", () => {
-  // The schema before Linux workers: darwin only, no confinement field.
-  const previous = Heartbeat.omit({ confinement: true })
-    .extend({ os: z.literal("darwin") })
-    .strict();
   pair("mac");
   beat("mac", { ...caps(), confinement: "seatbelt" });
   pair("linux");
@@ -572,7 +568,7 @@ test("every stored capabilities row parses with the previous release's schema; L
       "SELECT name,capabilities,capabilities_ext FROM workers ORDER BY name",
     )
     .all();
-  for (const row of rows) if (row.capabilities) previous.parse(JSON.parse(row.capabilities));
+  for (const row of rows) if (row.capabilities) PreviousHeartbeat.parse(JSON.parse(row.capabilities));
   expect(rows.map((r) => [r.name, r.capabilities !== null, r.capabilities_ext !== null])).toEqual([
     ["linux", false, true],
     ["mac", true, false],

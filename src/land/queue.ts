@@ -889,7 +889,7 @@ export class LandQueue {
         for (const c of failed) {
           if (retries.has(c) && !skipped.has(c)) continue;
           const reason = run.setup.includes(c)
-            ? `setup failures are not retried; ${targetedRetrySkipReason(c, gates, cwd) ?? "setup failed"}`
+            ? `setup failures are not retried; ${targetedRetrySkipReason(undefined, c, gates, cwd) ?? "setup failed"}`
             : !selected.some((s) => s.original === c)
               ? "check does not match base configuration"
               : (skipped.get(c) ?? "targeted retry returned no check result");
@@ -1279,7 +1279,7 @@ export class LandQueue {
             freeFirstRouting:
               run.requestedBy === "dependabot[bot]" && this.deps.cfg?.dependabotRouting === "free_first",
             signalWarnings: this.store.countEvents(run.id, "signal_attempt"),
-            closesIssues: linkedIssues(run)
+            closesIssues: linkedIssues(run, this.store)
               .filter((i) => i.repo.toLowerCase() === repo?.slug.toLowerCase())
               .map((i) => i.number),
           },

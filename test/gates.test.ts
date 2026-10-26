@@ -16,7 +16,7 @@ import { join, resolve } from "node:path";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
 import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
-import { attributeRules, auditDiff, newlyHidden, unquote } from "../src/gates/audit.ts";
+import { attributeRules, auditDiff, CI_CONFIG, newlyHidden, unquote } from "../src/gates/audit.ts";
 import {
   baselineCacheKey,
   cacheableBaseline,
@@ -59,6 +59,13 @@ import { resolveTestWorkers } from "../src/util/test-workers.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { truncationEncodings } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
+import { seeded } from "./seeded.ts";
+
+const retrySeed = seeded(async (cwd) => {
+  await sh(["git", "init", "-q"], { cwd });
+  await sh(["git", "commit", "-qm", "retry fixture", "--allow-empty"], { cwd });
+  return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+});
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -980,6 +987,7 @@ describe("gate slots and flaky retry", () => {
   /** Baseline passed (or not), then the check ran after the change and maybe once more. */
   async function retried(run: string, baselineOk = true) {
     const dir = tempDir({});
+    await retrySeed(dir);
     const cfg = config(run);
     const base = { name: "test", command: run, ok: baselineOk, exitCode: 0, durationMs: 1, output: "" };
     const cmp = compareGates({ setupOk: true, setup: [], checks: [base] }, await runGates(dir, cfg, signal));
@@ -1072,6 +1080,7 @@ describe("gate slots and flaky retry", () => {
 
   /** Baseline run plus its one retry; `runs` counts check invocations. */
   async function baseline(cfg: GateConfig, dir: string, abort = new AbortController()) {
+    await retrySeed(dir);
     const run = await retryBaselineFailures(await runGates(dir, cfg, signal), dir, cfg, abort.signal);
     const log = join(dir, "runs");
     const runs = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").length : 0;
@@ -1246,6 +1255,8 @@ describe("scratch output audit warnings", () => {
 describe("audit allowances and attribute rules", () => {
   test("only standalone Allow lines count, each kind independently", () => {
     expect(parseAllow("Vendor it\r\n  ALLOW:  Submodules \r\nmore")).toEqual(["submodules"]);
+    expect(parseAllow("Update CI\r\n  ALLOW: Workflows \r\nmore")).toEqual(["workflows"]);
+    expect(validateAllow(["workflows", "workflows"])).toEqual(["workflows"]);
     expect(parseAllow("allow:gitattributes\nAllow: submodules\nAllow: submodules")).toEqual([
       "submodules",
       "gitattributes",
@@ -1257,6 +1268,9 @@ describe("audit allowances and attribute rules", () => {
       "Allow: submodules, gitattributes",
       "Allow: everything",
       "Allow submodules",
+      "> Allow: workflows",
+      "Please Allow: workflows",
+      "Allow: workflows and binary",
     ])
       expect(parseAllow(text)).toEqual([]);
     expect(validateAllow(undefined)).toEqual([]);
@@ -1265,7 +1279,7 @@ describe("audit allowances and attribute rules", () => {
       "gitattributes",
     ]);
     expect(() => validateAllow(["submodules", "Submodules"])).toThrow('Invalid allow value "Submodules"');
-    expect(() => validateAllow([1])).toThrow("expected submodules,gitattributes,binary");
+    expect(() => validateAllow([1])).toThrow("expected submodules,gitattributes,binary,workflows");
   });
 
   test("built-in diff drivers are harmless alone but not beside a hiding attribute", () => {
@@ -1763,7 +1777,7 @@ describe("auditDiff", () => {
     expect(f.find((x) => x.rule === "suppression")?.severity).toBe("warn");
   });
 
-  test("blocks secrets and protected paths, warns on lockfiles and CI", () => {
+  test("blocks secrets, protected paths and CI, warns on lockfiles", () => {
     const patch = [
       "diff --git a/cfg.ts b/cfg.ts",
       "+++ b/cfg.ts",
@@ -1783,8 +1797,45 @@ describe("auditDiff", () => {
       secret: "block",
       "protected-path": "block",
       lockfile: "warn",
-      "ci-config": "warn",
+      "ci-config": "block",
     });
+  });
+
+  test("CI path scope and rename endpoints require the workflows allowance", () => {
+    const paths = [
+      ".github/workflows/ci.yml",
+      ".github/workflows/nested/ci.yml",
+      ".gitlab-ci.yml",
+      ".circleci/config.yml",
+    ];
+    for (const path of [
+      ...paths,
+      ".github/actions/action.yml",
+      "nested/.gitlab-ci.yml",
+      "nested/.github/workflows/ci.yml",
+      "nested/.circleci/config.yml",
+    ])
+      expect([path, CI_CONFIG.test(path)]).toEqual([path, paths.includes(path)]);
+    for (const path of paths)
+      for (const file of [
+        { status: "A", path },
+        { status: "M", path },
+        { status: "D", path },
+        { status: "R100", from: path, path: "ordinary.yml" },
+        { status: "R100", from: "ordinary.yml", path },
+      ]) {
+        const ctx = { taskClass: null, protectedPaths: [] };
+        const findings = auditDiff(diff("", [file]), ctx);
+        expect(findings).toContainEqual({
+          rule: "ci-config",
+          severity: "block",
+          file: path,
+          detail: "CI workflow changed. If this is intended, add `Allow: workflows` to the request.",
+        });
+        expect(
+          auditDiff(diff("", [file]), { ...ctx, allow: ["workflows"] }).some((f) => f.severity === "block"),
+        ).toBe(false);
+      }
   });
 
   test("lockfile changes are fine for dependency updates", () => {
@@ -2017,6 +2068,7 @@ const retryRegressions: typeof productionRetry = (cmp, cwd, cfg, changed, signal
 
 test.each([true, false])("docs-targeted regression retry retains its scope (ok=%s)", async (ok) => {
   const cwd = tempDir({ "doc_test.ts": "" });
+  const { value: sha } = await retrySeed(cwd);
   const command = "bun test './doc_test.ts'";
   const original: GateResult = {
     name: "test",
@@ -2055,6 +2107,8 @@ test.each([true, false])("docs-targeted regression retry retains its scope (ok=%
         return {
           setupOk: true,
           setup: [],
+          sha,
+          trackedClean: true,
           checks: [{ ...original, ok, exitCode: ok ? 0 : 1, docsOnly: undefined }],
         };
       },
@@ -2073,6 +2127,7 @@ test.each([true, false])("docs-targeted regression retry retains its scope (ok=%
 
 test.each(["baseline", "regression"])("standalone %s retries own scratch per check", async (kind) => {
   const cwd = tempDir({});
+  await retrySeed(cwd);
   const signal = new AbortController().signal;
   const cfg: GateConfig = {
     setup: [],
@@ -2488,6 +2543,7 @@ test.skipIf(seatbeltSkip !== null)(
 
 test("signal confinement covers setup, checks and baseline/regression retries; failure never becomes a pass", async () => {
   const cwd = tempDir({});
+  await retrySeed(cwd);
   const { backend, calls } = recordingConfinement();
   const signal = new AbortController().signal;
   const cfg: GateConfig = {

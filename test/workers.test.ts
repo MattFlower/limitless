@@ -18,7 +18,6 @@ import {
 import { request as httpsRequest } from "node:https";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { z } from "zod";
 import { Factory } from "../src/app.ts";
 import { agentTestCommand, type WrapperConfig } from "../src/cli/agent-test.ts";
 import { startDaemon } from "../src/cli/daemon.ts";
@@ -49,7 +48,7 @@ import * as gitCommand from "../src/git/command.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
 import { runClaude } from "../src/harness/claude.ts";
-import { fakeHarness } from "../src/harness/fake.ts";
+import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { ConfinementError, readPolicyScope } from "../src/harness/read-policy.ts";
 import { confinementScope, seatbeltProfile } from "../src/harness/sandbox.ts";
 import * as scratchPolicy from "../src/harness/scratch.ts";
@@ -87,6 +86,7 @@ import { certificate, fingerprint, workerRequest } from "../src/workers/tls.ts";
 import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { bwrapSkip, fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { PreviousHeartbeat } from "./previous-heartbeat.ts";
 import { test } from "./read-policy-support.ts";
 import {
   captureSetupEnv,
@@ -1781,6 +1781,8 @@ test.each(["dispatch", "reattach", "live"])(
       expect(gateSlots.snapshot().occupied).toBe(0);
       expect(
         workers.complete(retry.id, {
+          sha: req.headSha,
+          trackedClean: true,
           setupOk: true,
           setup: [],
           checks: [
@@ -1985,8 +1987,8 @@ test.each([true, false, undefined])(
     const req = await request();
     mkdirSync(join(req.cwd, "test"));
     writeFileSync(join(req.cwd, "test/a.test.ts"), "");
-    const check = { name: "test", run: "full-test" };
-    req.gates = { ...req.gates, setup: [], checks: [check], retryFiles: "base-retry {files}" };
+    const check = { name: "test", run: "bun test" };
+    req.gates = { ...req.gates, setup: [], checks: [check], retryFiles: "bun test --isolate {files}" };
     await listen();
     const token = await paired();
     await call("/worker/heartbeat", caps(), token);
@@ -2046,7 +2048,7 @@ test.each([true, false, undefined])(
       },
       true,
     );
-    expect(calls).toEqual(complete === true ? ["base-retry './test/a.test.ts'"] : []);
+    expect(calls).toEqual(complete === true ? ["bun test --isolate './test/a.test.ts'"] : []);
     expect(retried.size).toBe(complete === true ? 1 : 0);
   },
 );
@@ -4576,21 +4578,7 @@ test("a target change during installation restores before attempting the latest 
 
 test("a macOS worker negotiates heartbeats with the coordinator before confinement metadata", async () => {
   const server = await listen();
-  const legacy = Heartbeat.pick({
-    releaseSha: true,
-    bunVersion: true,
-    os: true,
-    osVersion: true,
-    cpuCount: true,
-    ramBytes: true,
-    freeSlots: true,
-    onAC: true,
-    idleSeconds: true,
-    jobs: true,
-    agents: true,
-    privateStringsDigest: true,
-    updateWarning: true,
-  }).strict();
+  const legacy = PreviousHeartbeat;
   const accepted = Promise.withResolvers<void>();
   let rejected = 0;
   const worker = await loop({
@@ -4626,15 +4614,12 @@ test("a macOS worker negotiates heartbeats with the coordinator before confineme
 
 test.each(["initial", "rollback"])("the worker survives a strict legacy coordinator on %s", async (kind) => {
   await listen();
-  // The schema before optional worker metadata and Linux workers: darwin only, no confinement field.
-  const legacy = Heartbeat.omit({
+  // A coordinator from before optional worker metadata.
+  const legacy = PreviousHeartbeat.omit({
     updateWarning: true,
     agents: true,
     privateStringsDigest: true,
-    confinement: true,
-  })
-    .extend({ os: z.literal("darwin") })
-    .strict();
+  }).strict();
   const target = "a".repeat(40);
   let oldProtocol = kind === "initial",
     accepted = 0,
@@ -4877,6 +4862,7 @@ test("gate-first leases preserve both payload fields, agent inputs and cancellat
     branch: "change/agent",
     baseSha: releaseSha,
     commit: publicationCommit,
+    allow: ["workflows"],
     privateStringsDigest: privateStringsDigest([]),
     repoUrl: "https://github.com/example/repository.git",
     expectedRemoteSha: null,
@@ -6831,6 +6817,8 @@ test("invalid publication metadata fails only its job while another session stay
 
 test.each([
   "create",
+  "workflows",
+  "allowed workflows",
   "replace",
   "clean discreet",
   "unchanged",
@@ -6894,6 +6882,7 @@ test.each([
           : undefined,
       ...(!kind.includes("legacy") && kind !== "readonly"
         ? {
+            ...(kind === "allowed workflows" ? { allow: ["workflows"] as const } : {}),
             privateStringsDigest:
               kind === "missing digest"
                 ? undefined
@@ -7059,7 +7048,7 @@ test.each([
           return workerRequest(...args);
         },
         harnesses: {
-          claude: fakeHarness(async (spec) => {
+          claude: fakeHarness(async (spec): Promise<FakeReply> => {
             expect(lookups).toBe(0);
             session = JSON.stringify({ spec, env: proc.agentEnv() });
             expect(session).not.toContain(token);
@@ -7079,7 +7068,9 @@ test.each([
             return {
               files: ["unchanged", "legacy", "session committed"].includes(kind)
                 ? undefined
-                : { edited: kind === "private diff" || kind === "credential" ? secret : "new bytes\n" },
+                : kind.includes("workflows")
+                  ? { ".github/workflows/worker.yml": "on: push\njobs: {}\n" }
+                  : { edited: kind === "private diff" || kind === "credential" ? secret : "new bytes\n" },
               text: token,
               status: "error",
               error: token,
@@ -7097,6 +7088,7 @@ test.each([
       const job = workers.agentJob(id);
       const published = [
         "create",
+        "allowed workflows",
         "replace",
         "clean discreet",
         "private published ancestor",
@@ -7135,28 +7127,32 @@ test.each([
               originalRequest.privateStringsDigest,
             );
         } else {
-          const reason = ["missing digest", "different digest", "list changed during session"].includes(kind)
-            ? "Worker private-strings list differs from the coordinator's; publication blocked"
-            : kind.startsWith("private")
-              ? "private string"
-              : kind.startsWith("discreet")
-                ? "factory-marked"
-                : kind.startsWith("credential")
-                  ? "credential"
-                  : kind.includes("existing") || kind === "moved"
-                    ? "branch moved"
-                    : kind === "legacy changed" || kind.startsWith("missing")
-                      ? "publication metadata"
-                      : kind === "HEAD inspection failure"
-                        ? "Cannot inspect worker HEAD"
-                        : kind.startsWith("session committed")
-                          ? "session moved HEAD"
-                          : kind === "unknown remote"
-                            ? "Coordinator refused worker request (400)"
-                            : kind === "auth failure"
-                              ? "gh auth token failed: non-zero exit"
-                              : "withheld";
+          const reason =
+            kind === "workflows"
+              ? "Allow: workflows"
+              : ["missing digest", "different digest", "list changed during session"].includes(kind)
+                ? "Worker private-strings list differs from the coordinator's; publication blocked"
+                : kind.startsWith("private")
+                  ? "private string"
+                  : kind.startsWith("discreet")
+                    ? "factory-marked"
+                    : kind.startsWith("credential")
+                      ? "credential"
+                      : kind.includes("existing") || kind === "moved"
+                        ? "branch moved"
+                        : kind === "legacy changed" || kind.startsWith("missing")
+                          ? "publication metadata"
+                          : kind === "HEAD inspection failure"
+                            ? "Cannot inspect worker HEAD"
+                            : kind.startsWith("session committed")
+                              ? "session moved HEAD"
+                              : kind === "unknown remote"
+                                ? "Coordinator refused worker request (400)"
+                                : kind === "auth failure"
+                                  ? "gh auth token failed: non-zero exit"
+                                  : "withheld";
           expect(job?.failure_reason).toContain(reason);
+          if (kind === "workflows") expect(job?.failure_reason).toContain(".github/workflows/worker.yml");
           if (kind === "credential branch") {
             expect(job?.failure_reason).toBe("Registered worker credential in publication; push blocked");
             expect(remoteRef.exitCode).not.toBe(0);

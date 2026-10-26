@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
 # Land a factory PR from a merge worktree: check committed work, push, wait for CI, squash-merge.
-# Usage: scripts/land-pr.sh <pr-number> "<squash subject>" [worktree-dir]
+# Usage: scripts/land-pr.sh <pr-number> "<squash subject>" [worktree-dir] [--allow workflows]
 # Every step checks its own exit status; nothing is piped, so a failure always stops the merge.
 set -euo pipefail
 
+usage() { echo 'Usage: scripts/land-pr.sh <pr-number> "<squash subject>" [worktree-dir] [--allow workflows]' >&2; exit 1; }
+[ "$#" -ge 2 ] || usage
 pr="$1"
 subject="$2"
-dir="${3:-.}"
+shift 2
+dir="."
+have_dir=""
+workflow_allowance=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --allow)
+      [ "${2:-}" = workflows ] || usage
+      workflow_allowance=(workflows)
+      shift 2 ;;
+    -*) usage ;;
+    *) [ -z "$have_dir" ] || usage; dir="$1"; have_dir=1; shift ;;
+  esac
+done
 repo="MattFlower/limitless"
 private_check="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-private-strings.ts"
 [[ "${LIMITLESS_CONFIG_DIR-/}" = /* ]] || export LIMITLESS_CONFIG_DIR="$PWD/$LIMITLESS_CONFIG_DIR"
@@ -115,7 +130,7 @@ check_dir="$push_repo"
 export LIMITLESS_LAND_SOURCE_DIR="$clone" LIMITLESS_LAND_SOURCE_COMMON_DIR="$common"
 check_private "$pr" "$repo" "$subject"
 head_ref="$(gh pr view "$pr" -R "$repo" --json headRefName --jq .headRefName)"
-check_private "$pr" "$repo" "$subject" "$head_ref" "$sha"
+check_private "$pr" "$repo" "$subject" "$head_ref" "$sha" ${workflow_allowance[@]+"${workflow_allowance[@]}"}
 if ! dirty="$(safe_git --git-dir="$push_repo" --work-tree="$clone" status --ignore-submodules=dirty --porcelain --untracked-files=normal --ignored=no 2>/dev/null)"; then
   echo "Cannot inspect worktree; refusing to land" >&2
   exit 1

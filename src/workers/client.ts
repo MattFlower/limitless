@@ -122,6 +122,7 @@ const WireRequest = z.object({
 });
 const AgentRequest = z.object({
   // Validate publication metadata per job so a malformed lease cannot stop the worker.
+  allow: z.unknown().optional(),
   privateStringsDigest: z.unknown().optional(),
   commit: z.unknown().optional(),
   repoUrl: z.unknown().optional(),
@@ -862,6 +863,7 @@ export async function runWorker(
         if (!publication.success) throw new Error("Invalid agent publication metadata");
         const req = {
           ...request,
+          allow: publication.data.allow,
           privateStringsDigest: publication.data.privateStringsDigest,
           commit: publication.data.commit,
           repoUrl: publication.data.repoUrl,

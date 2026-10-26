@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import type { Role } from "../core/types.ts";
+import type { AuditAllowance, Role } from "../core/types.ts";
 import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { GateRun } from "../gates/run.ts";
@@ -114,6 +114,7 @@ export interface AgentJobRequest
   repoUrl?: string;
   expectedRemoteSha?: string | null;
   privateStringsDigest?: string;
+  allow?: AuditAllowance[];
   discreet?: boolean;
   uiUrl?: string;
 }

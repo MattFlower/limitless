@@ -474,7 +474,7 @@ export function buildReportArtifacts(
       runUrl: `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`,
       freeFirstRouting: ctx.freeFirstRouting,
       models: ctx.run.models,
-      closesIssues: linkedIssues(ctx.run)
+      closesIssues: linkedIssues(ctx.run, ctx.store)
         .filter((i) => i.repo.toLowerCase() === ctx.repo.slug.toLowerCase())
         .map((i) => i.number),
     },

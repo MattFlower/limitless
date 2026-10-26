@@ -1,11 +1,12 @@
 import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
 import type { Config } from "../config.ts";
+import { AUDIT_ALLOWANCES } from "../core/allow.ts";
 import type { AgentJobRequest } from "../db/workers.ts";
 import { loadPrivateStrings, PrivateError, privateStringsDigest } from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { cacheGit, stageAll, worktreeGit } from "../git/command.ts";
-import { checkPrivateRange, commitAll, publicationRange } from "../git/repos.ts";
+import { assertWorkflowPublication, checkPrivateRange, commitAll, publicationRange } from "../git/repos.ts";
 import { githubToken } from "../integrations/github-token.ts";
 import { checkDiscreetBranch, checkDiscreetCommits } from "../pipeline/markers.ts";
 import { agentEnv, registerCredential, registeredCredentials } from "../util/proc.ts";
@@ -18,6 +19,7 @@ const identity = z
   );
 const email = identity.refine((s) => /^[^\s@]+@[^\s@]+$/.test(s));
 export const publicationFields = {
+  allow: z.array(z.enum(AUDIT_ALLOWANCES)).optional(),
   privateStringsDigest: z
     .string()
     .regex(/^[a-f0-9]{64}$/)
@@ -97,6 +99,7 @@ export async function publishAgentChanges(
   if (!sha) return req.parentSha;
   const parents = await worktreeGit(["git", "rev-list", "--parents", "-n", "1", sha], { cwd, signal });
   if (parents.stdout.trim() !== `${sha} ${req.parentSha}`) throw new Error("Worker commit parent mismatch");
+  await assertWorkflowPublication(cwd, baseSha, sha, req.allow, cfg.paths.configDir, signal);
   const entries = loadPrivateStrings(cfg.paths.configDir, [cwd]);
   checkPublicationText(branch, "Branch name", entries);
   if (discreet) checkDiscreetBranch(branch, req.runId, expectedRemoteSha !== null);
