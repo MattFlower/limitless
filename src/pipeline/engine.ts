@@ -348,6 +348,17 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       return "queued";
     }
     const cancelled = (): RunStatus => {
+      const rejected = ctx.state.postMergeRejection?.reason;
+      if (rejected) {
+        // A recorded rejection is terminal; shutdown during draft reporting must not requeue it.
+        deps.store.updateRun(runId, {
+          status: "needs_human",
+          error: rejected.slice(0, 2000),
+          finishedAt: Date.now(),
+        });
+        ctx.log("Draft reporting interrupted; rejected post-merge run stays needs_human", "warn");
+        return "needs_human";
+      }
       const reason = ctx.state.terminalReason?.startsWith("superseded:")
         ? ctx.state.terminalReason
         : undefined;
