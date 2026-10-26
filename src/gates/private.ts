@@ -186,6 +186,24 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
   }
   return null;
 }
+function stripPartialEscapes(text: string): string {
+  let end = text.length;
+  while (end > 0) {
+    const last = text[end - 1];
+    if (last === "%" || last === "\\" || last === "\ufffd") {
+      end--;
+      continue;
+    }
+    // Look behind at most three hex digits; consume backslashes individually to avoid ambiguity.
+    let start = end;
+    while (start > 0 && end - start < 3 && "0123456789abcdefABCDEF".includes(text.charAt(start - 1))) start--;
+    if (end - start <= 1 && text[start - 1] === "%") end = start - 1;
+    else if ((text[start - 1] === "u" || text[start - 1] === "U") && text[start - 2] === "\\")
+      end = start - 2;
+    else break;
+  }
+  return text.slice(0, end);
+}
 /** A clipped value also protects any trailing fragment of a private string. */
 export function privateMatches(text: string, entries: PrivateStrings, truncated = false): PrivateStrings {
   const normalized = normalizedLayers(text, entries);
@@ -196,7 +214,7 @@ export function privateMatches(text: string, entries: PrivateStrings, truncated 
         if (layer.includes(protectedText)) return true;
         if (!truncated) return false;
         // A cutoff can split an escape or a UTF-8 percent sequence, hiding the decoded tail.
-        const tails = [layer, layer.replace(/(?:%[0-9a-f]?|\\+u[0-9a-f]{0,3}|\\+|\ufffd)+$/i, "")];
+        const tails = [layer, stripPartialEscapes(layer)];
         return tails.some((tail) => {
           for (let length = 1; length < protectedText.length && length <= tail.length; length++)
             if (tail.endsWith(protectedText.slice(0, length))) return true;
