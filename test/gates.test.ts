@@ -1569,6 +1569,42 @@ describe("private strings", () => {
   });
 
   test.each([
+    "%",
+    "%4",
+    "%A",
+    "\\",
+    "\\".repeat(4),
+    "\\u",
+    "\\u0",
+    "\\u00",
+    "\\u002",
+    "\\\\u002",
+    "\\UabF",
+    "\ufffd",
+    "%4\\u00\ufffd",
+  ])("protects a clipped prefix before partial escape tail %j", (tail) => {
+    const entries = [{ value: ["synthetic", "protected", "value"].join("-"), entry: 3 }];
+    const text = `Public: synthetic-pro${tail}`;
+    expect(privateMatches(text, entries, true)).toEqual(entries);
+    expect(privateMatches(text, entries, false)).toEqual([]);
+  });
+
+  test.each(["!", "u12", "%zz", "%44", "\\u0000"])("does not strip non-partial escape tail %j", (tail) => {
+    const entries = [{ value: ["synthetic", "protected", "value"].join("-"), entry: 3 }];
+    const text = `Public: synthetic-pro${tail}`;
+    expect(privateMatches(text, entries, true)).toEqual([]);
+    expect(privateMatches(text, entries, false)).toEqual([]);
+  });
+
+  test("clipped diagnostic with 64 backslashes before a non-escape has no private match", () => {
+    const entries = ["alpha", "bravo", "charlie", "echo"].map((part, entry) => ({
+      value: ["synthetic", part, "value"].join("-"),
+      entry: entry + 1,
+    }));
+    expect(privateMatches(`diagnostic ${"\\".repeat(64)}!`, entries, true)).toEqual([]);
+  });
+
+  test.each([
     ["double URL", "%2573ecret-host.example"],
     ["Unicode-escaped percent", "\\u002573ecret-host.example"],
     ["URL of Unicode", "%5Cu0073ecret-host.example"],
