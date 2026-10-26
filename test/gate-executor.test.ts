@@ -149,6 +149,7 @@ test.each([
   const original = result(req, false).checks[0];
   const passed = result(req).checks[0];
   if (!original || !passed) throw new Error("Missing fixture check");
+  ctx.state.baseline = result(req);
   const credential = ["synthetic", "checkpoint", "credential"].join("-");
   registerCredential("checkpoint-path", credential);
   const retry = {
@@ -217,6 +218,91 @@ test.each([
     if (!saved) throw new Error("Missing second restored comparison");
     await confirmPostMerge(again, cwd, gates, saved, Date.now() + 60_000, sha, async () => {});
     expect(saved[0]).toMatchObject({ blocking: true, verdict: "regressed", result: { ok: false } });
+    expect(executions).not.toHaveBeenCalled();
+  } finally {
+    executions.mockRestore();
+  }
+});
+
+test.each([
+  ["pre-merge failure", "still_failing"],
+  ["baseline failure", "still_failing"],
+  ["missing counterpart", "new_failure"],
+  ["missing reference", "new_failure"],
+  ["skipped reference", "new_failure"],
+  ["unusable reference", "new_failure"],
+] as const)("legacy timeout retry restores %s classification", async (reference, verdict) => {
+  const { ctx, restore } = await context();
+  const cwd = fixture.repoDir;
+  const sha = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+  const req = { ...request(cwd), headSha: sha };
+  const failed = result(req, false).checks[0];
+  const passed = result(req).checks[0];
+  if (!failed || !passed) throw new Error("Missing fixture check");
+  const original = { ...failed, timedOut: true, exitCode: null, output: "original check timed out" };
+  ctx.state.preRebaseGates = [];
+  ctx.state.baseline = result(req, false);
+  if (reference === "pre-merge failure") {
+    ctx.state.preRebaseGates = [
+      { name: failed.name, verdict: "still_failing", blocking: false, result: failed },
+    ];
+    ctx.state.baseline = result(req);
+  } else if (reference === "missing counterpart") {
+    ctx.state.preRebaseGates = [
+      { name: "other", verdict: "pass", blocking: false, result: { ...passed, name: "other" } },
+    ];
+  } else if (reference === "missing reference") {
+    ctx.state.baseline = null;
+  } else if (reference === "skipped reference") {
+    ctx.state.baseline.checks = [
+      { ...failed, docsOnly: { mode: "skipped", reason: "docs-only", files: [], changedPaths: [] } },
+    ];
+  } else if (reference === "unusable reference") {
+    ctx.state.baseline.checks = [{ ...failed, confinementError: true }];
+  }
+  ctx.state.postMergeGates = {
+    sha,
+    base: sha,
+    head: sha,
+    round: ctx.state.round,
+    deadline: Date.now() + 60_000,
+    result: {
+      setupOk: true,
+      timedOut: false,
+      comparison: [
+        {
+          name: failed.name,
+          verdict: "fixed",
+          blocking: false,
+          firstAttempt: original,
+          result: { ...passed, firstAttempt: original },
+        },
+      ],
+    },
+  };
+  await ctx.save();
+  const executions = spyOn(proc, "runProcess");
+  try {
+    let corrected: GateComparison[] | undefined;
+    for (let restart = 0; restart < 2; restart++) {
+      const resumed = restore();
+      const saved = resumed.state.postMergeGates;
+      if (!saved?.result) throw new Error("Missing restored timeout comparison");
+      await confirmPostMerge(resumed, cwd, gates, saved.result.comparison, saved.deadline, sha, () =>
+        resumed.save(),
+      );
+      expect(saved.result.comparison[0]).toMatchObject({
+        verdict,
+        blocking: true,
+        retryProvenanceRejected: true,
+        firstAttempt: original,
+        result: { ok: false, timedOut: true, exitCode: null, retryAttempt: { ok: true } },
+      });
+      expect(saved.result.comparison[0]?.result.output).toContain(original.output);
+      expect(saved.result.comparison[0]?.result.output).toContain("Retry rejected:");
+      if (corrected) expect(saved.result.comparison).toEqual(corrected);
+      corrected = saved.result.comparison;
+    }
     expect(executions).not.toHaveBeenCalled();
   } finally {
     executions.mockRestore();

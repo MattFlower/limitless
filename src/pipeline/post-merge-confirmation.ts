@@ -3,6 +3,7 @@ import type { GateConfig } from "../gates/detect.ts";
 import { type ExecutionHandle, executeGate, localExecutor } from "../gates/executor.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import {
+  compareGates,
   confinementFailed,
   type GateComparison,
   type GateResult,
@@ -44,11 +45,21 @@ export async function confirmPostMerge(
       const restored = validated && !validated.ok ? validated : validateRetry(c.result, original, sha);
       if (!restored.ok) {
         c.result = { ...restored, retryAttempt: c.result, targetedRetry: targeted };
+        const previous = ctx.state.preRebaseGates ?? [];
+        const reference = previous.length
+          ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
+          : (ctx.state.baseline ?? null);
+        const comparison = compareGates(reference, {
+          setupOk: true,
+          setup: [],
+          checks: comparisons.map((c) => c.result),
+        }).find((restored) => restored.result === c.result);
+        if (!comparison) throw new Error("Missing restored gate comparison");
         c.verdict =
-          c.retryOriginal?.verdict ??
-          c.coordinatorConfirmation?.originalVerdict ??
-          (original.docsOnly?.mode === "targeted" ? "targeted_failure" : "regressed");
-        c.blocking = c.retryOriginal?.blocking ?? true;
+          c.retryOriginal?.verdict ?? c.coordinatorConfirmation?.originalVerdict ?? comparison.verdict;
+        c.blocking =
+          c.retryOriginal?.blocking ??
+          (c.coordinatorConfirmation?.originalVerdict ? true : comparison.blocking);
         c.retryProvenanceRejected = true;
         if (c.coordinatorConfirmation) c.coordinatorConfirmation.reason = c.result.output;
         await save();
