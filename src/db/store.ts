@@ -399,6 +399,8 @@ export class IssueClaimed extends Error {
     super(`Issue ${repo}#${number} is claimed by run ${run.id}`);
   }
 }
+export type GitHubComment = { repo: string; id: number };
+export class CommentProcessed extends Error {}
 
 const RUN_SELECT = "SELECT runs.*, repos.slug AS repo_slug FROM runs JOIN repos ON repos.id = runs.repo_id";
 
@@ -1220,10 +1222,13 @@ export class Store {
     req: CreateRunRequest,
     verifiedGitHubWebhook = false,
     admission?: () => string | null,
+    comment?: GitHubComment,
   ): Run {
     if (req.sourceRef?.kind === "review-round")
       throw new Error("review rounds are created only by a review verdict");
-    return this.transaction(() => {
+    const result = this.transaction(() => {
+      if (comment && this.githubCommentProcessed(comment))
+        throw new CommentProcessed("Comment already processed");
       const refusal = admission?.();
       if (refusal) throw new Error(`Run admission refused: ${refusal}`);
       if (req.sourceRef?.kind === "issue") {
@@ -1246,10 +1251,47 @@ export class Store {
         this,
       )) {
         const run = this.issueClaim(claim.repo, claim.number);
-        if (run) throw new IssueClaimed(claim.repo, claim.number, run);
+        if (run) {
+          const error = new IssueClaimed(claim.repo, claim.number, run);
+          if (!comment) throw error;
+          this.recordGitHubComment(comment, null, redactCredentials(error.message));
+          return error;
+        }
       }
-      return this.insertRun(repo, req, verifiedGitHubWebhook);
+      const run = this.insertRun(repo, req, verifiedGitHubWebhook);
+      if (comment) this.recordGitHubComment(comment, run.id, null);
+      return run;
     });
+    // A final refusal must commit its record before surfacing the existing claim error.
+    if (result instanceof IssueClaimed) throw result;
+    return result;
+  }
+
+  githubCommentProcessed(comment: GitHubComment): boolean {
+    return !!this.db
+      .query("SELECT 1 FROM github_processed_comments WHERE repo = ? AND comment_id = ?")
+      .get(comment.repo.toLowerCase(), comment.id);
+  }
+
+  recordGitHubComment(comment: GitHubComment, run: string | null, note: string | null): void {
+    this.db
+      .query(`INSERT ${run ? "" : "OR IGNORE "}INTO github_processed_comments
+      (repo, comment_id, outcome, run_id, note, processed_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(comment.repo.toLowerCase(), comment.id, run ? "run" : "refused", run, note, Date.now());
+  }
+
+  githubCommentBoundary(repo: string, initial?: string): string | null {
+    if (initial)
+      this.db
+        .query("INSERT OR IGNORE INTO github_comment_boundaries VALUES (?, ?)")
+        .run(repo.toLowerCase(), initial);
+    return (
+      (
+        this.db
+          .query("SELECT github_at FROM github_comment_boundaries WHERE repo = ?")
+          .get(repo.toLowerCase()) as { github_at: string } | null
+      )?.github_at ?? null
+    );
   }
 
   issueClaim(repo: string, number: number): Run | null {
