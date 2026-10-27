@@ -5,7 +5,7 @@ import { type Config, loadConfig } from "./config.ts";
 import { type ConfigReload, reloadedConfig } from "./config-reload.ts";
 import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { TERMINAL_STATUSES } from "./core/types.ts";
-import { Store } from "./db/store.ts";
+import { type GitHubComment, Store } from "./db/store.ts";
 import { WorkerStore } from "./db/workers.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
@@ -381,6 +381,7 @@ export class Factory {
     chat?: { conversationId: string; proposalId: string },
     validateOrigins = true,
     admission?: () => string | null,
+    comment?: GitHubComment,
   ): Promise<Run> {
     if (!req.prompt?.trim()) throw new Error("prompt is required");
     if (!req.repo?.trim()) throw new Error("repo is required");
@@ -397,7 +398,7 @@ export class Factory {
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
     const run = chat
       ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
-      : this.store.createRun(repo, req, verifiedGitHubWebhook, admission);
+      : this.store.createRun(repo, req, verifiedGitHubWebhook, admission, comment);
     this.store.addEvent({
       runId: run.id,
       type: "log",

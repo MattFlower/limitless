@@ -64,7 +64,8 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
     cleanups.push(stopPoller);
     const queue = factory.cfg.githubQueue;
     const issueQueueEnabled = !!queue?.repos.length && !!queue.trusted.length;
-    if (issueQueueEnabled) cleanups.push(startIssueQueue(factory, { gh: deps.gh, clock: deps.issueClock }));
+    const issueQueue = startIssueQueue(factory, { gh: deps.gh, clock: deps.issueClock });
+    cleanups.push(issueQueue);
     cleanups.push(() => factory.land.stop());
     // The land queue resumes whatever the last daemon left in flight, and waits for new requests.
     factory.land.start();
@@ -75,7 +76,7 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
           server.timeout(req, 90);
           return mcp.handle(req, server.requestIP(req)?.address ?? null);
         },
-        "/webhooks/github": githubWebhook(factory),
+        "/webhooks/github": githubWebhook(factory, undefined, issueQueue.pollNow),
       },
       notes: [
         ...(await (deps.toolVersions ?? toolVersions)()),
