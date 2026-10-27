@@ -3469,6 +3469,15 @@ test("percent-decoded private values retain literal backslashes before slashes",
   expect(privateMatches("host%5c/path.example", entries)).toEqual(entries);
 });
 
+test.each([
+  String.raw`host\/p\u0061th.example`,
+  String.raw`h\u006fst%5c/p%61th.example`,
+  String.raw`host%5c/p\u0061th.example`,
+])("Unicode-decoded private values retain literal backslashes before slashes: %s", (text) => {
+  const entries = [{ value: String.raw`host\/path.example`, entry: 1 }];
+  expect(privateMatches(text, entries)).toEqual(entries);
+});
+
 test("JSON slash runs match private entries and are withheld in output data", () => {
   const root = mkdtempSync(join(tmpdir(), "private-slash-"));
   const previous = process.env.LIMITLESS_CONFIG_DIR;
@@ -3489,12 +3498,16 @@ test("JSON slash runs match private entries and are withheld in output data", ()
     writeFileSync(join(root, "private-strings.txt"), String.raw`host\/path.example`);
     const literalPrivacy = loadOutputPrivacy();
     if (!literalPrivacy) throw new Error("Missing output privacy filter");
-    expect(
-      privateOutputData(
-        { output: "host%5c/path.example", ordinary: "completed successfully" },
-        literalPrivacy,
-      ),
-    ).toEqual({ output: "[withheld: private text]", ordinary: "completed successfully" });
+    for (const output of [
+      "host%5c/path.example",
+      String.raw`host\/p\u0061th.example`,
+      String.raw`h\u006fst%5c/p%61th.example`,
+      String.raw`host%5c/p\u0061th.example`,
+    ])
+      expect(privateOutputData({ output, ordinary: "completed successfully" }, literalPrivacy)).toEqual({
+        output: "[withheld: private text]",
+        ordinary: "completed successfully",
+      });
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
     else process.env.LIMITLESS_CONFIG_DIR = previous;
@@ -3542,14 +3555,29 @@ test("private matching retains main's matches across short percent and backslash
     }
     return [{ value: "", entry: 0 }];
   };
-  const visit = (middle: string, remaining: number) => {
-    const text = `host${middle}path.example`;
+  const check = (text: string) => {
     const expected = referenceMatches(text);
     const actual = privateMatches(text, entries);
     for (const entry of expected) expect(actual).toContainEqual(entry);
+  };
+  const visit = (middle: string, remaining: number) => {
+    check(`host${middle}path.example`);
     if (remaining) for (const char of "%5c\\/u0ah") visit(middle + char, remaining - 1);
   };
   visit("", 5);
+  // A full Unicode escape cannot occur in the five-character exhaustive family.
+  for (const prefix of ["host", String.raw`h\u006fst`, "h%6fst"])
+    for (const middle of [
+      String.raw`\/`,
+      "%5c/",
+      String.raw`\u005c/`,
+      String.raw`\u005c%2f`,
+      "%5cu005c/",
+      String.raw`\u0025`,
+      String.raw`\u00255c/`,
+    ])
+      for (const suffix of ["path.example", String.raw`p\u0061th.example`, "p%61th.example"])
+        check(`${prefix}${middle}${suffix}`);
 });
 
 test("backslash decoder agrees with independent regex reference exhaustively and on seeded samples", () => {

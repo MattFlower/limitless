@@ -148,14 +148,14 @@ export function privateStringsDigest(entries: PrivateStrings): string {
 }
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
 /** Exported for decoder equivalence tests. Each backslash run is consumed once. */
-export function decodeBackslashes(text: string): string {
+export function decodeBackslashes(text: string, slashes = true): string {
   const pieces: string[] = [];
   let cursor = 0;
   for (let start = text.indexOf("\\"); start !== -1; ) {
     let end = start + 1;
     while (text[end] === "\\") end++;
     const unicode = /^[uU]([0-9a-f]{4})/i.exec(text.slice(end, end + 5));
-    if (text[end] === "/" || unicode) {
+    if ((slashes && text[end] === "/") || unicode) {
       pieces.push(
         text.slice(cursor, start),
         unicode ? String.fromCharCode(Number.parseInt(unicode[1] ?? "", 16)) : "/",
@@ -201,9 +201,9 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
   for (let round = 0; round < 5; round++) {
     // Unrelated runs must not change decoding convergence or cause a refusal.
     // Keep the text before HTML decoding too, since a protected value can contain a literal reference.
-    // A private value may contain a literal backslash before a slash.
+    // Preserve main's Unicode-decoded spelling when a private value contains a literal backslash-slash.
     const percentDecoded = decodePercent(text);
-    layers.push(percentDecoded);
+    layers.push(percentDecoded, decodeBackslashes(percentDecoded, false));
     const unescaped = decodeBackslashes(percentDecoded);
     const expanded = decodeHTML(unescaped);
     // Keep line breaks too: report quotations and multiline credentials depend on them.
