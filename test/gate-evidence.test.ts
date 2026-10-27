@@ -1501,11 +1501,12 @@ test("covering commands validate trusted configuration and tracked, contained te
       expect(await coveringTestCommand({ file: "x.test.ts", name }, coveringConfig, cwd, checkedSha)).toEqual(
         { reason: "invalid test name" },
       );
-    for (const name of ["$(x)", "`x`", "a.*b", "'", '"', ";"]) {
+    for (const name of ["$(x)", "`x`", "a.*b", "'", '"', ";", "'`x`", "' -t '`x`"]) {
       const built = await coveringTestCommand({ file: "x.test.ts", name }, coveringConfig, cwd, checkedSha);
       expect(built.command).toBeDefined();
       expect(singleBunTest(built.command ?? "")).toBe(true);
       expect(built.command).toContain(" -t '(?:^| )");
+      expect(singleBunTest(`${built.command} './tick\u0060.test.ts'`)).toBe(false);
     }
     for (const name of ["a.*b", "$(touch pwned)"]) {
       const built = await coveringTestCommand({ file: "x.test.ts", name }, coveringConfig, cwd, checkedSha);
