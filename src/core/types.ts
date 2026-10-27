@@ -183,7 +183,7 @@ export interface RunResolution {
 }
 
 /** Blocking audit rules a requester may explicitly allow. */
-export type AuditAllowance = "submodules" | "gitattributes" | "binary";
+export type AuditAllowance = "submodules" | "gitattributes" | "binary" | "workflows";
 
 export interface Stage {
   id: number;

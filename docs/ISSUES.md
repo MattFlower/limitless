@@ -88,7 +88,9 @@ An issue is eligible only when:
   Without that timestamp or fresh approval, it is not picked again.
 
 Issues across repositories sort by priority, creation time, then issue number. Each poll
-reads at most the oldest 100 open issues per repository and logs truncation. It reads the
+reads all open issues per repository in pages of 100, including their latest comments. Every
+page must validate before commands are processed; a failed page or a rate-limit pause leaves
+the repository for the next poll. It reads the
 latest 100 label applications and title renames together. An incomplete timeline makes
 the issue ineligible, as do incomplete label, blocker or closing-PR connections. Body
 dependencies use additional aliased issue lookups. Low remaining GraphQL budget stops further queries and
@@ -113,6 +115,39 @@ Queue runs use the same quoted issue request as an owner-labelled webhook. Only 
 issues parse `Allow:` lines; polling does not confer signed-webhook provenance. Issue source
 references and non-GitHub `Closes #n` directives produce closing directives in PR bodies.
 The queue adds the optional, additive `via: "queue"` marker, ignored by older releases.
+
+The same poll reads each issue's last 20 comments without an extra GraphQL call. A trusted
+human author (no `[bot]` suffix, case-insensitively) can post `/limitless <request>` on any open
+issue, without priority labels or queue capacity admission. With an App identity,
+`@<slug> <request>` and `@<slug>[bot] <request>`
+also work. If identity lookup fails, mentions wait for a later poll; slash commands still work.
+Commands must be unedited. Leading factory markers cannot be commands, but a request may
+mention a marker. Only the owner's request text can grant `Allow:` exemptions.
+
+Before querying issues for a repository without a boundary, the poll calls
+`gh api --include rate_limit` with that repository's identity and saves its valid HTTP `Date`
+header as the fixed enable boundary. This request does not count against GitHub's rate limit.
+That initialization poll does no further work for the repository, including when it has no open
+issues. A failed request or missing or invalid header leaves it uninitialized until a later poll.
+Comments must be strictly newer than the boundary, even after an issue reopens. The boundary
+uses GitHub time, independent of issue activity and the daemon's clock. Malformed issue responses
+and API errors never consume commands. Existing stored boundaries remain fixed.
+
+Each command is recorded by repository and comment id in the run-creation transaction, so
+restarts, repeated polls and overlapping webhook deliveries cannot start it twice. A claim
+refusal is final and recorded too: post a new command after the claiming run finishes.
+Other errors remain retryable. Skipped comments are never recorded.
+
+This assumes a command remains among the last 20 comments at some poll (normally every 180 s).
+More than 20 comments between polls can hide a command; there is no comment pagination or
+cursor. Large comment counts do not affect label eligibility. Webhooks are optional for these
+commands: a trusted issue `issue_comment.created` delivery hints a poll, coalesced with any poll
+already running, and is recorded as ignored. Hints wait at least 30 seconds from the previous
+tick's start and honor rate-limit reset deadlines. After an API failure, hints cannot shorten
+the regular polling retry delay. Owner comments on pull requests, including in queue repositories,
+and issue comments outside queue repositories still start runs directly through webhooks and
+record the same comment id.
+
 Managed issue runs use polling lifecycle comments instead of legacy notifier comments.
 Marked queue runs outside managed repositories keep suppressing legacy comments. GitHub
 questions and approvals remain later slices.

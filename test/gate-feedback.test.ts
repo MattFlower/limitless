@@ -23,12 +23,13 @@ import { formatGateFeedback, implementPrompt, reviewPrompt, verifyPrompt } from 
 import { renderReport } from "../src/pipeline/report.ts";
 import type { Spec } from "../src/pipeline/schemas.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { registerCredential } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { credentialGate, gateCredential } from "./gate-output-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { providerFixture } from "./provider-config-support.ts";
 import { test } from "./read-policy-support.ts";
+import { seeded } from "./seeded.ts";
 
 test.each([
   { kind: "JSON", secret: 'synthetic-gate-json-"quoted"-\\slash', padding: "" },
@@ -510,9 +511,9 @@ test.each([
   { targeted: "timeout", fullOk: true },
   { targeted: "confinement", fullOk: true },
 ])("regression retry: targeted $targeted / full ok $fullOk", async ({ targeted, fullOk }) => {
-  const f = retryFixture();
+  const f = await retryFixture();
   try {
-    const { runner, calls } = recordingRetry(targeted, fullOk);
+    const { runner, calls } = recordingRetry(targeted, fullOk, f.sha);
     const [comparison] = await retryRegressions(
       [{ name: "test", verdict: "regressed", blocking: true, result: f.original }],
       f.cwd,
@@ -553,9 +554,9 @@ test.each([
   { targeted: "timeout", fullOk: true },
   { targeted: "confinement", fullOk: true },
 ])("baseline retry: targeted $targeted / full ok $fullOk", async ({ targeted, fullOk }) => {
-  const f = retryFixture();
+  const f = await retryFixture();
   try {
-    const { runner, calls } = recordingRetry(targeted, fullOk);
+    const { runner, calls } = recordingRetry(targeted, fullOk, f.sha);
     const result = await retryBaselineFailures(
       { setupOk: true, setup: [], checks: [f.original] },
       f.cwd,
@@ -579,9 +580,9 @@ test.each([
 });
 
 test("known files without retry_files still use the full retry", async () => {
-  const f = retryFixture();
+  const f = await retryFixture();
   try {
-    const { runner, calls } = recordingRetry("pass", true);
+    const { runner, calls } = recordingRetry("pass", true, f.sha);
     await retryRegressions(
       [{ name: "test", verdict: "regressed", blocking: true, result: f.original }],
       f.cwd,
@@ -602,7 +603,7 @@ test.each([
   { timeoutSec: undefined, knownTimes: true, skipGateSlot: true, expected: 120 },
   { timeoutSec: 1800, knownTimes: false, skipGateSlot: false, expected: 1800 },
 ])("targeted timeout policy: %j", async ({ timeoutSec, knownTimes, skipGateSlot, expected }) => {
-  const f = retryFixture();
+  const f = await retryFixture();
   try {
     if (!knownTimes) f.original.failedFileTimes = undefined;
     const calls: number[] = [];
@@ -627,13 +628,13 @@ test.each([
 });
 
 test("file substitution shell-quotes apostrophes and literal replacement syntax", async () => {
-  const f = retryFixture();
+  const f = await retryFixture();
   try {
     const file = "test/space ' $&.test.ts";
     writeFileSync(join(f.cwd, file), "");
     f.original.failedFiles = [file];
     f.original.failedFileTimes = { [file]: 1 };
-    const { runner, calls } = recordingRetry("fail", false);
+    const { runner, calls } = recordingRetry("fail", false, f.sha);
     await retryBaselineFailures(
       { setupOk: true, setup: [], checks: [f.original] },
       f.cwd,
@@ -648,10 +649,16 @@ test("file substitution shell-quotes apostrophes and literal replacement syntax"
   }
 });
 
-function retryFixture() {
+const retrySeed = seeded(async (cwd) => {
+  await sh(["git", "init", "-q"], { cwd });
+  await sh(["git", "commit", "-qm", "retry fixture", "--allow-empty"], { cwd });
+  return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+});
+async function retryFixture() {
   const cwd = mkdtempSync(join(tmpdir(), "gate-feedback-retry-"));
   mkdirSync(join(cwd, "test"));
   for (const file of ["a.test.ts", "b.test.ts"]) writeFileSync(join(cwd, "test", file), "");
+  const { value: sha } = await retrySeed(cwd);
   const cfg: GateConfig = {
     setup: [],
     checks: [{ name: "test", run: "full-test", timeoutSec: 1800 }],
@@ -669,10 +676,10 @@ function retryFixture() {
     failedFiles: ["test/a.test.ts", "test/b.test.ts"],
     failedFileTimes: { "test/a.test.ts": 1, "test/b.test.ts": 2 },
   };
-  return { cwd, cfg, original, close: () => rmSync(cwd, { recursive: true, force: true }) };
+  return { cwd, sha, cfg, original, close: () => rmSync(cwd, { recursive: true, force: true }) };
 }
 
-function recordingRetry(targeted: string, fullOk: boolean) {
+function recordingRetry(targeted: string, fullOk: boolean, sha: string) {
   const calls: string[] = [];
   const runner: GateRunner = async (cfg, options) => {
     expect(cfg.setup).toEqual([]);
@@ -684,6 +691,8 @@ function recordingRetry(targeted: string, fullOk: boolean) {
     expect(check.timeoutSec).toBe(isTarget ? 2 * UNSLOTTED_RETRY_MAX_SECONDS : 1800);
     const ok = isTarget ? targeted === "pass" : fullOk;
     return {
+      sha,
+      trackedClean: true,
       setupOk: true,
       setup: [],
       checks: [
@@ -704,7 +713,7 @@ function recordingRetry(targeted: string, fullOk: boolean) {
 }
 
 test("structured failure filenames and timing keys are redacted at gate callbacks", async () => {
-  const f = retryFixture();
+  const f = await retryFixture();
   const secret = "synthetic-junit-file-credential-480";
   registerCredential("JUNIT_FILE_TOKEN", secret);
   try {

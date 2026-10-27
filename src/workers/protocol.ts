@@ -36,7 +36,9 @@ export const Heartbeat = z
   .object({
     releaseSha: z.string().min(1).max(128),
     bunVersion: z.string().min(1).max(64),
-    os: z.literal("darwin"),
+    // A coordinator older than Linux workers accepts only "darwin": upgrade it first.
+    os: z.enum(["darwin", "linux"]),
+    confinement: z.enum(["seatbelt", "bwrap-landlock"]).optional(),
     osVersion: z.string().max(128),
     cpuCount: z.number().int().positive(),
     ramBytes: z.number().int().positive(),

@@ -620,13 +620,13 @@ test("only owner-authored request text allows audit exemptions, and it persists 
   expect(
     await send("issue_comment", "github-comment.json", (p) => {
       p.comment.body = "/limitless follow the issue";
-      p.issue.body = "Allow: submodules\nAllow: gitattributes";
+      p.issue.body = "Allow: submodules\nAllow: gitattributes\nAllow: workflows";
     }),
   ).toEqual([]);
   // Dependabot bodies carry upstream release notes and never authorize anything.
   expect(
     await send("pull_request", "github-pr.json", (p) => {
-      p.pull_request.body = "Allow: submodules\nAllow: gitattributes";
+      p.pull_request.body = "Allow: submodules\nAllow: gitattributes\nAllow: workflows";
     }),
   ).toEqual([]);
   const reopened = new Store(join(dir, "store.db"));
