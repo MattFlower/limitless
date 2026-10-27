@@ -31,6 +31,7 @@ import { readJUnitSkips } from "../src/gates/junit.ts";
 import {
   canonical,
   checkPrivateText,
+  decodeBackslashes,
   loadPrivateStrings,
   privateMatches,
   redactPrivate,
@@ -53,6 +54,7 @@ import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
 import { ConfinementError } from "../src/harness/sandbox.ts";
 import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts.ts";
+import { loadOutputPrivacy, privateOutputData } from "../src/util/private-output.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { resolveTestWorkers } from "../src/util/test-workers.ts";
@@ -1596,12 +1598,14 @@ describe("private strings", () => {
     expect(privateMatches(text, entries, false)).toEqual([]);
   });
 
-  test("clipped diagnostic with 64 backslashes before a non-escape has no private match", () => {
+  test("diagnostic backslash runs and malformed escapes have no private match", () => {
     const entries = ["alpha", "bravo", "charlie", "echo"].map((part, entry) => ({
       value: ["synthetic", part, "value"].join("-"),
       entry: entry + 1,
     }));
-    expect(privateMatches(`diagnostic ${"\\".repeat(64)}!`, entries, true)).toEqual([]);
+    for (const n of [64, 25_000, 100_000, 400_000])
+      for (const suffix of ["!", "u12", "u00xz", ""])
+        expect(privateMatches(`diagnostic ${"\\".repeat(n)}${suffix}`, entries, true)).toEqual([]);
   });
 
   test.each([
@@ -3457,4 +3461,61 @@ test.each([
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+test("JSON slash runs match private entries and are withheld in output data", () => {
+  const root = mkdtempSync(join(tmpdir(), "private-slash-"));
+  const previous = process.env.LIMITLESS_CONFIG_DIR;
+  const entries = [{ value: "host/path.example", entry: 1 }];
+  try {
+    writeFileSync(join(root, "private-strings.txt"), entries[0]?.value ?? "");
+    process.env.LIMITLESS_CONFIG_DIR = root;
+    const privacy = loadOutputPrivacy();
+    if (!privacy) throw new Error("Missing output privacy filter");
+    for (const count of [1, 2, 3, 8]) {
+      const text = `host${"\\".repeat(count)}/path.example`;
+      expect(privateMatches(text, entries)).toEqual(entries);
+      expect(privateOutputData({ output: text, ordinary: "completed successfully" }, privacy)).toEqual({
+        output: "[withheld: private text]",
+        ordinary: "completed successfully",
+      });
+    }
+  } finally {
+    if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+    else process.env.LIMITLESS_CONFIG_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backslash decoder agrees with independent regex reference exhaustively and on seeded samples", () => {
+  // One replacement pass: output that itself spells an escape is not rescanned.
+  const reference = (text: string) =>
+    text.replace(/\\+(?:u([0-9a-f]{4})|\/)/gi, (_match, hex: string | undefined) =>
+      hex === undefined ? "/" : String.fromCharCode(Number.parseInt(hex, 16)),
+    );
+  const alphabet = "\\u/0afz!";
+  const visit = (text: string, remaining: number) => {
+    expect(decodeBackslashes(text)).toBe(reference(text));
+    if (remaining) for (const char of alphabet) visit(text + char, remaining - 1);
+  };
+  visit("", 6);
+  let seed = 880;
+  const random = (n: number) => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return Math.floor((seed / 2 ** 32) * n);
+  };
+  for (let i = 0; i < 2000; i++) {
+    let text = "";
+    for (let length = 7 + random(250); length > 0; length--) text += alphabet.charAt(random(alphabet.length));
+    expect(decodeBackslashes(text)).toBe(reference(text));
+  }
+  for (const text of [
+    String.raw`\U00AF\u0041`,
+    String.raw`\u005cu0041`,
+    String.raw`\u002f\u005c/`,
+    String.raw`\\u0000\uD800\uDC00`,
+    String.raw`\u00xz\u123`,
+    "trailing\\\\",
+  ])
+    expect(decodeBackslashes(text)).toBe(reference(text));
 });

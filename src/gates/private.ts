@@ -147,11 +147,30 @@ export function privateStringsDigest(entries: PrivateStrings): string {
     .digest("hex");
 }
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
+/** Exported for decoder equivalence tests. Each backslash run is consumed once. */
+export function decodeBackslashes(text: string): string {
+  const pieces: string[] = [];
+  let cursor = 0;
+  for (let start = text.indexOf("\\"); start !== -1; ) {
+    let end = start + 1;
+    while (text[end] === "\\") end++;
+    const unicode = /^[uU]([0-9a-f]{4})/i.exec(text.slice(end, end + 5));
+    if (text[end] === "/" || unicode) {
+      pieces.push(
+        text.slice(cursor, start),
+        unicode ? String.fromCharCode(Number.parseInt(unicode[1] ?? "", 16)) : "/",
+      );
+      cursor = end + (unicode ? 5 : 1);
+      end = cursor;
+    }
+    start = text.indexOf("\\", end);
+  }
+  return pieces.length ? pieces.join("") + text.slice(cursor) : text;
+}
 const decoded = (text: string) =>
-  text
-    .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
-    // Diagnostics may JSON-quote a field's literal Unicode escapes.
-    .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
+  decodeBackslashes(
+    text.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString()),
+  );
 export const base64Runs = /[A-Za-z0-9+/]+=*/g;
 /** The decoded text of a base64 run that holds a protected value; undefined for unrelated runs. */
 export function base64Match(run: string, entries: PrivateStrings): string | undefined {
@@ -170,8 +189,16 @@ export function base64Match(run: string, entries: PrivateStrings): string | unde
 /** Raw and successively decoded forms, NFKC-normalized and lowercased; null when decoding never settles. */
 export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
   const layers = [text];
-  const decodeBase64 = (layer: string) =>
-    layer.replace(base64Runs, (run) => base64Match(run, entries) ?? run);
+  // Escapes can add a convergence round without changing the text inspected for base64.
+  const base64Cache = new Map<string, string>();
+  const decodeBase64 = (layer: string) => {
+    let decoded = base64Cache.get(layer);
+    if (decoded === undefined) {
+      decoded = layer.replace(base64Runs, (run) => base64Match(run, entries) ?? run);
+      base64Cache.set(layer, decoded);
+    }
+    return decoded;
+  };
   for (let round = 0; round < 5; round++) {
     // Unrelated runs must not change decoding convergence or cause a refusal.
     // Keep the text before HTML decoding too, since a protected value can contain a literal reference.
@@ -180,7 +207,11 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
     // Keep line breaks too: report quotations and multiline credentials depend on them.
     layers.push(unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
     const next = decodeBase64(expanded);
-    if (next === text) return [...layers, next].map(normalize);
+    if (next === text) {
+      const all = [...layers, next];
+      const normalized = new Map([...new Set(all)].map((layer) => [layer, normalize(layer)]));
+      return all.map((layer) => normalized.get(layer) ?? "");
+    }
     layers.push(next);
     text = next;
   }
