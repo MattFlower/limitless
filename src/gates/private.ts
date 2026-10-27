@@ -189,16 +189,17 @@ export function base64Match(run: string, entries: PrivateStrings): string | unde
 /** Raw and successively decoded forms, NFKC-normalized and lowercased; null when decoding never settles. */
 export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
   const layers = [text];
-  // Escapes can add a convergence round without changing the text inspected for base64.
+  // Repeated log fields and convergence rounds share the same base64 checks.
   const base64Cache = new Map<string, string>();
-  const decodeBase64 = (layer: string) => {
-    let decoded = base64Cache.get(layer);
-    if (decoded === undefined) {
-      decoded = layer.replace(base64Runs, (run) => base64Match(run, entries) ?? run);
-      base64Cache.set(layer, decoded);
-    }
-    return decoded;
-  };
+  const decodeBase64 = (layer: string) =>
+    layer.replace(base64Runs, (run) => {
+      let decoded = base64Cache.get(run);
+      if (decoded === undefined) {
+        decoded = base64Match(run, entries) ?? run;
+        base64Cache.set(run, decoded);
+      }
+      return decoded;
+    });
   for (let round = 0; round < 5; round++) {
     // Unrelated runs must not change decoding convergence or cause a refusal.
     // Keep the text before HTML decoding too, since a protected value can contain a literal reference.
