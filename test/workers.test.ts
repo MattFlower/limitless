@@ -264,6 +264,17 @@ async function request(bundle = false): Promise<GateRequest> {
 }
 const fields = (run: GateRun) => run.checks.map(({ name, ok, exitCode }) => ({ name, ok, exitCode }));
 
+test("gate lease captures OS independently of later worker heartbeats", async () => {
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const id = workers.enqueue(await request());
+  expect((await call("/worker/lease", {}, token)).json()).toMatchObject({ job: { id } });
+  expect(workers.job(id)?.worker_os).toBe("darwin");
+  await call("/worker/heartbeat", { ...caps([id]), os: "linux" }, token);
+  expect(workers.job(id)?.worker_os).toBe("darwin");
+});
+
 async function failedWorkerSetup(req: GateRequest, afterLease = () => {}, previousFailure = false) {
   await listen();
   const token = await paired();
@@ -1330,13 +1341,16 @@ test.each([
     const worker = await loop();
     const stage = kind === "baseline" ? "prepare" : "gates";
     try {
-      const first = await runGateExecution(
-        ctx,
-        stage,
-        kind === "baseline" ? "baseline" : "initial",
-        req.cwd,
-        req.gates,
-      );
+      const first = await ctx.stage(stage, async () => ({
+        summary: "initial gates",
+        value: await runGateExecution(
+          ctx,
+          stage,
+          kind === "baseline" ? "baseline" : "initial",
+          req.cwd,
+          req.gates,
+        ),
+      }));
       expect(first.checks[0]).toMatchObject({ ok: false, exitCode: 1 });
       expect(first.checks[0]?.output).toContain("transient");
       expect(existsSync(join(req.cwd, "node_modules", "ready"))).toBe(false);

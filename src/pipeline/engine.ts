@@ -1764,6 +1764,12 @@ async function oneRound(
         }),
       )(),
     round,
+    false,
+    true,
+    (comparisons, stage, sha) => {
+      if (!sha) throw new Error("Missing gates completion SHA");
+      ctx.store.observations.finalize(ctx.run.id, { round, sha, stageId: stage.id, comparisons });
+    },
   );
   const comparison = await checks.catch(async (error: unknown) => {
     ctx.checkCancelled();

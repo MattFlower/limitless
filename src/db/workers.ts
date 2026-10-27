@@ -66,6 +66,7 @@ export interface JobRow {
   request: string;
   state: "queued" | "leased" | "done" | "failed" | "cancelled";
   worker: string | null;
+  worker_os: string | null;
   attempt: number;
   lease_expires_at: number | null;
   attempt_deadline_at: number | null;
@@ -119,7 +120,7 @@ export interface AgentJobRequest
   uiUrl?: string;
 }
 export interface AgentJobRow
-  extends Omit<JobRow, "setup_fallback" | "setup_order" | "events" | "in_place" | "stopped"> {
+  extends Omit<JobRow, "setup_fallback" | "setup_order" | "events" | "in_place" | "stopped" | "worker_os"> {
   invocation_id: number;
   parent_sha: string;
   result_sha: string | null;
@@ -369,9 +370,17 @@ export class WorkerStore {
       const deadline = this.now() + attemptBudget(JSON.parse(j.request));
       const changed = this.store.db
         .query(
-          "UPDATE gate_jobs SET state='leased',worker=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=?,setup_order=(SELECT setup_order+1 FROM workers WHERE name=?) WHERE id=? AND state='queued'",
+          "UPDATE gate_jobs SET state='leased',worker=?,worker_os=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=?,setup_order=(SELECT setup_order+1 FROM workers WHERE name=?) WHERE id=? AND state='queued'",
         )
-        .run(name, Math.min(this.now() + this.times.lease, deadline), deadline, this.now(), name, j.id);
+        .run(
+          name,
+          c.os ?? null,
+          Math.min(this.now() + this.times.lease, deadline),
+          deadline,
+          this.now(),
+          name,
+          j.id,
+        );
       if (changed.changes === 1)
         this.store.db.query("UPDATE workers SET setup_order=setup_order+1 WHERE name=?").run(name);
       return changed.changes === 1 ? this.job(j.id) : null;

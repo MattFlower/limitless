@@ -53,6 +53,7 @@ import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schem
 import { renderSpec } from "./schemas.ts";
 
 export interface EngineDeps {
+  loadSource?: () => number;
   gateExecutor?: GateExecutor;
   agentExecutor?: AgentExecutor;
   confinement?: import("../harness/sandbox.ts").ConfinementBackend;
@@ -346,7 +347,7 @@ export class RunContext {
   readonly signal: AbortSignal;
   termination?: SimulatedTermination;
   private readonly stageContext = new AsyncLocalStorage<Stage>();
-  private readonly faults: FaultInjector;
+  readonly faults: FaultInjector;
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   private foregroundStageDepth = 0;
   /** Defer shared-worktree cleanup until the review/verify pair has settled. */
@@ -500,7 +501,11 @@ export class RunContext {
     return [this.run.prompt, this.state.spec ? renderSpec(this.state.spec) : "", ...identifiers].join("\n");
   }
 
-  async save(checkpoint?: string): Promise<void> {
+  get stageId(): number | undefined {
+    return this.stageContext.getStore()?.id;
+  }
+
+  async save(checkpoint?: string, onComplete?: () => void): Promise<void> {
     if (this.state.phase !== "deliver" || this.state.deliveryComplete) this.state.githubWait = undefined;
     if (this.deps.faults) {
       const stage = this.stageContext.getStore();
@@ -511,7 +516,12 @@ export class RunContext {
       );
       this.checkCancelled();
     }
-    this.store.setRunState(this.run.id, this.state);
+    if (onComplete)
+      this.store.transaction(() => {
+        onComplete();
+        this.store.setRunState(this.run.id, this.state);
+      }, true);
+    else this.store.setRunState(this.run.id, this.state);
   }
 
   async setPhase(phase: Phase): Promise<void> {
@@ -544,9 +554,10 @@ export class RunContext {
     round = 0,
     background = false,
     parkOnDrain = true,
+    onComplete?: (value: T, stage: Stage, sha?: string) => void,
   ): Promise<T> {
     return this.stageConfig.run(this.liveDeps.cfg, () =>
-      this.runStage(name, fn, round, background, parkOnDrain),
+      this.runStage(name, fn, round, background, parkOnDrain, onComplete),
     );
   }
 
@@ -556,6 +567,7 @@ export class RunContext {
     round: number,
     background: boolean,
     parkOnDrain: boolean,
+    onComplete?: (value: T, stage: Stage, sha?: string) => void,
   ): Promise<T> {
     this.checkCancelled();
     const cacheable =
@@ -587,7 +599,10 @@ export class RunContext {
           if (this.state.completedChecks?.round !== round || this.state.completedChecks.sha !== checkSha)
             this.state.completedChecks = { round, sha: checkSha, values: {} };
           this.state.completedChecks.values[name] = output.value;
-          await this.save();
+          await this.save(
+            undefined,
+            onComplete ? () => onComplete(output.value, stage, checkSha) : undefined,
+          );
         }
         return output;
       });

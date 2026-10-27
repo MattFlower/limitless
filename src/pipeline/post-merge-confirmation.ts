@@ -1,4 +1,3 @@
-import { WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import { type ExecutionHandle, executeGate, localExecutor } from "../gates/executor.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
@@ -13,13 +12,13 @@ import {
 } from "../gates/run.ts";
 import type { RunContext } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
+import { executionLocation } from "./gate-execution.ts";
 
 /** A LAN handle alone does not prove remote execution: failed jobs can finish locally. */
 export function postMergeWorker(ctx: RunContext, handle: ExecutionHandle): string | null | undefined {
   if (handle.kind !== "lan") return undefined;
-  const job = new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id);
-  if (job?.failure_reason || job?.setup_fallback) return undefined;
-  return job?.state === "done" && job.run_id === ctx.run.id && !job.in_place ? job.worker : null;
+  const location = executionLocation(ctx, handle);
+  return location === "coordinator" ? undefined : location;
 }
 
 export async function confirmPostMerge(

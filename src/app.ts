@@ -192,6 +192,7 @@ export class Factory {
       confinement: opts.confinement ?? platformConfinement(cfg.port),
       cfg: shadowOk ? cfg : { ...cfg, reviewShadow: "off" },
       faults: opts.faults,
+      loadSource: opts.loadSource,
       store: this.store,
       buildSha: opts.bootSha,
       router: this.router,
