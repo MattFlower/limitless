@@ -243,6 +243,9 @@ detection, per-invocation budget, process-group kill on cancel.
 
 ## 6. Isolation & git
 
+The [privacy-boundary design](privacy-boundaries.md) inventories text storage/publication paths
+and proposes complete decoded checks before credential redaction and truncation.
+
 - Bare repo cache `~/.limitless/repos/<owner>__<name>.git`, fetched before each run.
 - One worktree per run at `~/.limitless/work/<run-id>` on branch `limitless/<run-id>-<slug>`; discreet repositories use `<branch_prefix><slug>` (default `change/`), with numeric suffixes for collisions.
 - Local-only (non-GitHub) repos use a factory-owned bare clone with independent objects, created
