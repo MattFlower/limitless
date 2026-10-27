@@ -22,6 +22,7 @@ const handler: Parameters<typeof start>[0] = (s) =>
       ? { structured: approve }
       : { files: { "farewell.txt": "goodbye\n" } };
 const auditFault = { "stage:audit:before": { action: "kill" } } satisfies FaultPlan;
+let load = 3.25;
 const result = (req: GateRequest, changes: Partial<GateResult> = {}): GateRun => ({
   setupOk: true,
   setup: [],
@@ -43,6 +44,7 @@ function executor(
   make: (req: GateRequest, attempt: number) => GateRun,
 ) {
   const workers = new WorkerStore(f.store, f.deps.buildSha);
+  workers.loadSource = () => load;
   const starts: ExecutionHandle[] = [],
     attaches: string[] = [];
   let attempts = 0;
@@ -64,10 +66,12 @@ function executor(
         : f.store.getRun(req.runId ?? "")?.stage === "gates"
           ? make(req, ++attempts)
           : result(req);
-      if (job && !job.result)
+      if (job && !job.result) {
         f.store.db
-          .query("UPDATE gate_jobs SET state='done',worker='worker-a',worker_os='linux',result=? WHERE id=?")
-          .run(JSON.stringify(gates), h.id);
+          .query("UPDATE gate_jobs SET state='leased',worker='worker-a',worker_os='linux' WHERE id=?")
+          .run(h.id);
+        workers.complete(h.id, gates);
+      }
       return {
         result: Promise.resolve(gates),
         cancel: async () => {},
@@ -79,7 +83,8 @@ function executor(
   return { starts, attaches };
 }
 async function fixture(faults: FaultPlan = { ...auditFault }) {
-  const f = start(handler, false, false, { faults, loadSource: () => 3.25 });
+  load = 3.25;
+  const f = start(handler, false, false, { faults, loadSource: () => load });
   await f.stop();
   const run = await f.createRun({ repo: state.repoDir, prompt: "Add farewell", profile: "quick" });
   return { f, run, execute: (signal = new AbortController().signal) => executeRun(f.deps, run.id, signal) };
@@ -207,6 +212,8 @@ for (const kind of ["local", "lan", "inplace"] as const) {
     const handle = f.store.getRunState<RunState>(run.id)?.gateExecution?.handle;
     expect(handle).toBeDefined();
     expect(f.store.failureObservations({})).toEqual([]);
+    // A replay keeps the load measured at completion; only a fresh local execution samples anew.
+    load = 8;
     const resumed = executor(f, kind, (req) =>
       result(req, { ok: false, exitCode: 1, output: "farewell.txt:1: failed" }),
     );
@@ -214,6 +221,7 @@ for (const kind of ["local", "lan", "inplace"] as const) {
     const rows = f.store.failureObservations({});
     expect(rows).toHaveLength(1);
     expect(rows[0]?.handle_kind).toBe(kind);
+    expect(rows[0]?.load_per_core).toBe({ local: 8, lan: null, inplace: 3.25 }[kind]);
     if (kind === "local") {
       expect(resumed.starts).toHaveLength(1);
       expect(rows[0]?.handle_id).not.toBe(handle?.id);
@@ -298,10 +306,14 @@ test.each(["remote", "legacy", "fallback", "unknown"])("execution attribution: %
         const h = f.store.getRunState<RunState>(c.runId)?.gateExecution?.handle;
         if (!h) throw new Error("missing execution handle");
         if (where === "legacy") f.store.db.query("UPDATE gate_jobs SET worker_os=NULL WHERE id=?").run(h.id);
-        if (where === "fallback")
-          f.store.db
-            .query("UPDATE gate_jobs SET failure_reason='local fallback',setup_fallback=1 WHERE id=?")
-            .run(h.id);
+        if (where === "fallback") {
+          // The real fallback path: the coordinator re-runs the job and records its own load.
+          const workers = new WorkerStore(f.store, f.deps.buildSha);
+          workers.loadSource = () => 4.5;
+          const job = workers.job(h.id);
+          expect(workers.fallbackSetup(h.id, "setup")).toBe(true);
+          expect(workers.complete(h.id, JSON.parse(job?.result ?? "null"), true)).toBe(true);
+        }
         if (where === "unknown") f.store.db.query("UPDATE gate_jobs SET worker=NULL WHERE id=?").run(h.id);
       },
     },
@@ -311,7 +323,7 @@ test.each(["remote", "legacy", "fallback", "unknown"])("execution attribution: %
   expect(f.store.failureObservations({})[0]).toMatchObject({
     location: where === "fallback" ? "coordinator" : where === "unknown" ? null : "worker-a",
     os: where === "fallback" ? process.platform : where === "remote" ? "linux" : null,
-    load_per_core: where === "fallback" ? 3.25 : null,
+    load_per_core: where === "fallback" ? 4.5 : null,
   });
 });
 

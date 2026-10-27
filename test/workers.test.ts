@@ -273,6 +273,18 @@ test("gate lease captures OS independently of later worker heartbeats", async ()
   expect(workers.job(id)?.worker_os).toBe("darwin");
   await call("/worker/heartbeat", { ...caps([id]), os: "linux" }, token);
   expect(workers.job(id)?.worker_os).toBe("darwin");
+  // Coordinator load is captured when the coordinator completes the job, never for remote results.
+  let load = 6.5;
+  workers.loadSource = () => load;
+  const setup = [
+    { name: "setup:0", command: "missing", ok: false, exitCode: 127, durationMs: 1, output: "" },
+  ];
+  expect(workers.complete(id, { setupOk: false, setup, checks: [] })).toBe(true);
+  expect(workers.job(id)?.load_per_core).toBeNull();
+  expect(workers.fallbackSetup(id, "missing")).toBe(true);
+  expect(workers.complete(id, { setupOk: true, setup: [], checks: [] }, true)).toBe(true);
+  load = 9;
+  expect(workers.job(id)?.load_per_core).toBe(6.5);
 });
 
 async function failedWorkerSetup(req: GateRequest, afterLease = () => {}, previousFailure = false) {

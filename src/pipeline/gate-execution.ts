@@ -1,6 +1,5 @@
-import { availableParallelism, loadavg } from "node:os";
 import type { StageName } from "../core/types.ts";
-import { WorkerStore } from "../db/workers.ts";
+import { hostLoadPerCore, WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import {
   cancelGateExecution,
@@ -39,11 +38,14 @@ function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha:
   if (stageId === undefined) return;
   const location = executionLocation(ctx, handle);
   const coordinator = location === "coordinator";
-  const job = handle.kind === "lan" ? new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id) : null;
+  const job = handle.kind === "local" ? null : new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id);
   const os = coordinator ? process.platform : location ? (job?.worker_os ?? null) : null;
-  const load = coordinator
-    ? (ctx.deps.loadSource ?? (() => (loadavg()[0] ?? 0) / availableParallelism()))()
-    : null;
+  // Only a live local execution is never replayed; a durable job keeps its completion-time load.
+  const load = !coordinator
+    ? null
+    : handle.kind === "local"
+      ? (ctx.deps.loadSource ?? hostLoadPerCore)()
+      : (job?.load_per_core ?? null);
   ctx.store.transaction(() => {
     for (const phase of ["setup", "check"] as const) {
       for (const r of phase === "setup" ? result.setup : result.checks) {
