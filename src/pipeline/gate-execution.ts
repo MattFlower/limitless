@@ -19,14 +19,24 @@ import { ciSignature } from "../integrations/ci-classifier.ts";
 import { invocationScratch } from "../util/proc.ts";
 import type { RunContext } from "./context.ts";
 
-/** A LAN identity alone does not prove remote execution: it can finish locally. */
+/**
+ * A LAN identity alone does not prove remote execution: it can finish locally.
+ * Locality is structural, never inferred from the name: a worker may be called "coordinator".
+ */
+export function executionSite(ctx: RunContext, handle: ExecutionHandle) {
+  const job = handle.kind === "local" ? null : new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id);
+  const coordinator = { location: "coordinator", remote: false, job } as const;
+  if (handle.kind === "local" || handle.kind === "inplace") return coordinator;
+  const unknown = { location: null, remote: false, job } as const;
+  if (handle.kind !== "lan" || !job || job.run_id !== ctx.run.id) return unknown;
+  if (job.failure_reason || job.setup_fallback) return coordinator;
+  return job.state === "done" && !job.in_place && job.worker
+    ? ({ location: job.worker, remote: true, job } as const)
+    : unknown;
+}
+
 export function executionLocation(ctx: RunContext, handle: ExecutionHandle): string | null {
-  if (handle.kind === "local" || handle.kind === "inplace") return "coordinator";
-  if (handle.kind !== "lan") return null;
-  const job = new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id);
-  if (!job || job.run_id !== ctx.run.id) return null;
-  if (job.failure_reason || job.setup_fallback) return "coordinator";
-  return job.state === "done" && !job.in_place ? job.worker : null;
+  return executionSite(ctx, handle).location;
 }
 
 function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha: string): void {
@@ -36,10 +46,9 @@ function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha:
   // Only a run's gates stage is observed; a direct call outside one has no stage to attribute.
   const stageId = ctx.stageId;
   if (stageId === undefined) return;
-  const location = executionLocation(ctx, handle);
-  const coordinator = location === "coordinator";
-  const job = handle.kind === "local" ? null : new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id);
-  const os = coordinator ? process.platform : location ? (job?.worker_os ?? null) : null;
+  const { location, remote, job } = executionSite(ctx, handle);
+  const coordinator = !remote && location !== null;
+  const os = coordinator ? process.platform : remote ? (job?.worker_os ?? null) : null;
   // Only a live local execution is never replayed; a durable job keeps its completion-time load.
   const load = !coordinator
     ? null

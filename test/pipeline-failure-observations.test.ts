@@ -296,36 +296,49 @@ test.each(["cancel", "shutdown"])(
   },
 );
 
-test.each(["remote", "legacy", "fallback", "unknown"])("execution attribution: %s", async (where) => {
-  const { f, execute } = await fixture({
-    ...auditFault,
-    "gate:executed": {
-      action: "continue",
-      when: (c) => c.stage === "gates",
-      onHit: (c) => {
-        const h = f.store.getRunState<RunState>(c.runId)?.gateExecution?.handle;
-        if (!h) throw new Error("missing execution handle");
-        if (where === "legacy") f.store.db.query("UPDATE gate_jobs SET worker_os=NULL WHERE id=?").run(h.id);
-        if (where === "fallback") {
-          // The real fallback path: the coordinator re-runs the job and records its own load.
-          const workers = new WorkerStore(f.store, f.deps.buildSha);
-          workers.loadSource = () => 4.5;
-          const job = workers.job(h.id);
-          expect(workers.fallbackSetup(h.id, "setup")).toBe(true);
-          expect(workers.complete(h.id, JSON.parse(job?.result ?? "null"), true)).toBe(true);
-        }
-        if (where === "unknown") f.store.db.query("UPDATE gate_jobs SET worker=NULL WHERE id=?").run(h.id);
+test.each(["remote", "named coordinator", "legacy", "fallback", "unknown"])(
+  "execution attribution: %s",
+  async (where) => {
+    const { f, execute } = await fixture({
+      ...auditFault,
+      "gate:executed": {
+        action: "continue",
+        when: (c) => c.stage === "gates",
+        onHit: (c) => {
+          const h = f.store.getRunState<RunState>(c.runId)?.gateExecution?.handle;
+          if (!h) throw new Error("missing execution handle");
+          if (where === "legacy")
+            f.store.db.query("UPDATE gate_jobs SET worker_os=NULL WHERE id=?").run(h.id);
+          if (where === "fallback") {
+            // The real fallback path: the coordinator re-runs the job and records its own load.
+            const workers = new WorkerStore(f.store, f.deps.buildSha);
+            workers.loadSource = () => 4.5;
+            const job = workers.job(h.id);
+            expect(workers.fallbackSetup(h.id, "setup")).toBe(true);
+            expect(workers.complete(h.id, JSON.parse(job?.result ?? "null"), true)).toBe(true);
+          }
+          if (where === "unknown") f.store.db.query("UPDATE gate_jobs SET worker=NULL WHERE id=?").run(h.id);
+          // A worker's name is not evidence of locality.
+          if (where === "named coordinator")
+            f.store.db.query("UPDATE gate_jobs SET worker='coordinator' WHERE id=?").run(h.id);
+        },
       },
-    },
-  });
-  executor(f, "lan", (req) => result(req, { ok: false, exitCode: 1, output: "farewell.txt:1: failed" }));
-  expect(await execute()).toBe("running");
-  expect(f.store.failureObservations({})[0]).toMatchObject({
-    location: where === "fallback" ? "coordinator" : where === "unknown" ? null : "worker-a",
-    os: where === "fallback" ? process.platform : where === "remote" ? "linux" : null,
-    load_per_core: where === "fallback" ? 4.5 : null,
-  });
-});
+    });
+    executor(f, "lan", (req) => result(req, { ok: false, exitCode: 1, output: "farewell.txt:1: failed" }));
+    expect(await execute()).toBe("running");
+    const remote = where === "remote" || where === "named coordinator";
+    expect(f.store.failureObservations({})[0]).toMatchObject({
+      location:
+        where === "unknown"
+          ? null
+          : where === "named coordinator" || where === "fallback"
+            ? "coordinator"
+            : "worker-a",
+      os: where === "fallback" ? process.platform : remote ? "linux" : null,
+      load_per_core: where === "fallback" ? 4.5 : null,
+    });
+  },
+);
 
 test("completion checkpoint rolls classification back when its state write fails", async () => {
   const { f, run, execute } = await fixture();

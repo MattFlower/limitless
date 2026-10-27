@@ -12,13 +12,13 @@ import {
 } from "../gates/run.ts";
 import type { RunContext } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
-import { executionLocation } from "./gate-execution.ts";
+import { executionSite } from "./gate-execution.ts";
 
 /** A LAN handle alone does not prove remote execution: failed jobs can finish locally. */
 export function postMergeWorker(ctx: RunContext, handle: ExecutionHandle): string | null | undefined {
   if (handle.kind !== "lan") return undefined;
-  const location = executionLocation(ctx, handle);
-  return location === "coordinator" ? undefined : location;
+  const { location, remote } = executionSite(ctx, handle);
+  return remote || location === null ? location : undefined;
 }
 
 export async function confirmPostMerge(
