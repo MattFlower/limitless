@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { decodeHTML } from "entities";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
 import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
@@ -3463,6 +3464,11 @@ test.each([
   }
 });
 
+test("percent-decoded private values retain literal backslashes before slashes", () => {
+  const entries = [{ value: String.raw`host\/path.example`, entry: 1 }];
+  expect(privateMatches("host%5c/path.example", entries)).toEqual(entries);
+});
+
 test("JSON slash runs match private entries and are withheld in output data", () => {
   const root = mkdtempSync(join(tmpdir(), "private-slash-"));
   const previous = process.env.LIMITLESS_CONFIG_DIR;
@@ -3480,11 +3486,70 @@ test("JSON slash runs match private entries and are withheld in output data", ()
         ordinary: "completed successfully",
       });
     }
+    writeFileSync(join(root, "private-strings.txt"), String.raw`host\/path.example`);
+    const literalPrivacy = loadOutputPrivacy();
+    if (!literalPrivacy) throw new Error("Missing output privacy filter");
+    expect(
+      privateOutputData(
+        { output: "host%5c/path.example", ordinary: "completed successfully" },
+        literalPrivacy,
+      ),
+    ).toEqual({ output: "[withheld: private text]", ordinary: "completed successfully" });
   } finally {
     if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
     else process.env.LIMITLESS_CONFIG_DIR = previous;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("private matching retains main's matches across short percent and backslash spellings", () => {
+  const entries = ["", "\\/", "%", "%5c/", "\\", "/", "a", "h"].map((middle, i) => ({
+    value: `host${middle}path.example`,
+    entry: i + 1,
+  }));
+  // Frozen from c06bce4946f2f9ccb37670638966dc4c8b292e7f; independent of production helpers.
+  const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
+  const decoded = (text: string) =>
+    text
+      .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
+      .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) =>
+        String.fromCharCode(Number.parseInt(hex, 16)),
+      );
+  const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
+  const decodeBase64 = (text: string) =>
+    text.replace(/[A-Za-z0-9+/]+=*/g, (run) => {
+      if (run.replace(/=+$/, "").length < minimum) return run;
+      for (let offset = 0; offset < 4; offset++) {
+        const plain = Buffer.from(run.slice(offset), "base64").toString();
+        const found = normalize(plain);
+        if (entries.some(({ value }) => found.includes(normalize(value)))) return plain;
+      }
+      return run;
+    });
+  const referenceMatches = (text: string) => {
+    const layers = [text];
+    for (let round = 0; round < 5; round++) {
+      const unescaped = decoded(text);
+      const expanded = decodeHTML(unescaped);
+      layers.push(unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
+      const next = decodeBase64(expanded);
+      if (next === text) {
+        const normalized = [...layers, next].map(normalize);
+        return entries.filter(({ value }) => normalized.some((layer) => layer.includes(normalize(value))));
+      }
+      layers.push(next);
+      text = next;
+    }
+    return [{ value: "", entry: 0 }];
+  };
+  const visit = (middle: string, remaining: number) => {
+    const text = `host${middle}path.example`;
+    const expected = referenceMatches(text);
+    const actual = privateMatches(text, entries);
+    for (const entry of expected) expect(actual).toContainEqual(entry);
+    if (remaining) for (const char of "%5c\\/u0ah") visit(middle + char, remaining - 1);
+  };
+  visit("", 5);
 });
 
 test("backslash decoder agrees with independent regex reference exhaustively and on seeded samples", () => {

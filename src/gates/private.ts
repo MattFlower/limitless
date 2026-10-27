@@ -167,10 +167,8 @@ export function decodeBackslashes(text: string): string {
   }
   return pieces.length ? pieces.join("") + text.slice(cursor) : text;
 }
-const decoded = (text: string) =>
-  decodeBackslashes(
-    text.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString()),
-  );
+const decodePercent = (text: string) =>
+  text.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString());
 export const base64Runs = /[A-Za-z0-9+/]+=*/g;
 /** The decoded text of a base64 run that holds a protected value; undefined for unrelated runs. */
 export function base64Match(run: string, entries: PrivateStrings): string | undefined {
@@ -203,7 +201,10 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
   for (let round = 0; round < 5; round++) {
     // Unrelated runs must not change decoding convergence or cause a refusal.
     // Keep the text before HTML decoding too, since a protected value can contain a literal reference.
-    const unescaped = decoded(text);
+    // A private value may contain a literal backslash before a slash.
+    const percentDecoded = decodePercent(text);
+    layers.push(percentDecoded);
+    const unescaped = decodeBackslashes(percentDecoded);
     const expanded = decodeHTML(unescaped);
     // Keep line breaks too: report quotations and multiline credentials depend on them.
     layers.push(unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
