@@ -299,9 +299,19 @@ The plan is built from many host lookups, so it is checked as a whole before lau
 mount at or above every denied path must be a tmpfs or a mask, and nothing may be mounted inside a
 missing denied path's first missing name. A plan that fails is refused, never retried. The launcher
 then opens every bind source without following a symlink and has bwrap mount the descriptors, so a
-rename or symlink swap after that point cannot change what is mounted. Like a Seatbelt path rule, a
-mask hides whatever is at its path when bwrap mounts it, so a host that moves a credential to an
-allowed path exposes it on both platforms.
+rename or symlink swap after that point cannot change the source. Source pinning does not secure
+mount destinations, so Linux refuses two policies with a `ConfinementError` naming the deny and reason:
+a denied pathname containing a symlink (including an absent deny's existing ancestors), and a hiding
+mount whose destination depends on an intermediate host directory beneath a live bind. Those parents
+can be renamed or replaced with symlinks before bwrap mounts the mask or tmpfs. The destination check
+also traces earlier binds the hiding mount depends on, including a tmpfs destination that is itself a
+parent of the deny. Direct file masks beneath a pinned bind remain supported.
+
+Host check: **no symlink along any denied path, and no credential store relocated into the checkout,
+scratch or a toolchain directory**. Canonical home/config deny paths work with checkout and scratch
+paths under a symlinked TMPDIR; the TMPDIR alias itself must not appear in the deny paths. These
+restrictions apply only to Linux. A host that moves credentials to allowed paths after launch is still
+outside the launch-time guarantee.
 The daemon port is refused on every address (Landlock rules are per port), and other egress is
 allowed as on macOS. Launching costs about 5 ms for bwrap and about 70 ms for the 65,535 Landlock
 port rules a daemon port needs.

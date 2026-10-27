@@ -1,5 +1,6 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -11,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { type ProcOptions, type ProcResult, runProcess } from "../util/proc.ts";
 import { bwrapOptions, ENV_FD, ENV_FILE, landlockCommand, PAYLOAD_ENV } from "./landlock.ts";
 import { ancestorReadPolicy, ConfinementError, specificReadDenies } from "./read-policy.ts";
@@ -40,12 +41,12 @@ function canonical(paths: readonly string[] = []): string[] {
 }
 
 /** The existing ancestor a not-yet-existing deny would be created under, and the name it would start as. */
-function creatableUnder(path: string): { dir: string; name: string } {
+function creatableUnder(path: string): { dir: string; name: string; spelling: string } {
   for (let child = path, dir = dirname(path); ; child = dir, dir = dirname(dir)) {
     try {
-      return { dir: realpathSync(dir), name: basename(child) };
+      return { dir: realpathSync(dir), name: basename(child), spelling: dir };
     } catch {
-      if (dir === dirname(dir)) return { dir, name: basename(child) };
+      if (dir === dirname(dir)) return { dir, name: basename(child), spelling: dir };
     }
   }
 }
@@ -99,7 +100,7 @@ type Hidden = { path: string; at: string; absent: boolean };
  * Refuses a plan in which a later mount re-exposes a denied path. The last mount at or above each existing
  * deny, and at or above each absent deny's first missing name, must be a tmpfs or a mask, and nothing may
  * be mounted inside a missing name. It reads only the plan, so host lookups that disagreed while the plan
- * was built cannot get past it; the launcher pins every bind source, so later renames cannot either.
+ * was built cannot bypass the ordering check. Host-backed destination parents are checked below.
  */
 function assertHidden(args: string[], sources: { dir: string; file: string }, denies: Hidden[]): void {
   const mounts = bwrapOptions([...args, "--"]).options.flatMap(([option = "", ...values]) =>
@@ -108,6 +109,11 @@ function assertHidden(args: string[], sources: { dir: string; file: string }, de
       : [
           {
             at: values.at(-1) ?? "",
+            tmpfs: option === "--tmpfs",
+            live:
+              ["--bind", "--bind-try", "--ro-bind", "--ro-bind-try"].includes(option) &&
+              values[0] !== "/" &&
+              ![sources.dir, sources.file].includes(values[0] ?? ""),
             hides:
               option === "--tmpfs" ||
               (option.includes("bind") && [sources.dir, sources.file].includes(values[0] ?? "")),
@@ -118,6 +124,18 @@ function assertHidden(args: string[], sources: { dir: string; file: string }, de
     const last = mounts.findLastIndex((m) => within(m.at, at));
     if (!mounts[last]?.hides || (absent && mounts.slice(last).some((m) => !m.hides && within(at, m.at))))
       throw new ConfinementError(`Cannot confine ${path}: the mount plan would expose it`);
+    // A direct child has a pinned parent. An intermediate host directory can redirect this mount,
+    // or any earlier bind it depends on; follow the parent chain back through the finished plan.
+    for (let i = last; i >= 0; ) {
+      const mount = mounts[i];
+      const parent = mount?.tmpfs ? mount.at : dirname(mount?.at ?? "/");
+      i = mounts.findLastIndex((m, n) => n < i && within(m.at, parent));
+      const covering = mounts[i];
+      if (covering?.live && covering.at !== parent)
+        throw new ConfinementError(
+          `Cannot confine ${path}: destination parent ${parent} beneath live bind ${covering.at} can be replaced by the host`,
+        );
+    }
   }
 }
 /**
@@ -153,6 +171,18 @@ export function bwrapArgs(
   // directory; a write root under a deny without an allowance, or inside a protected path, would be
   // bound over its ancestor's rule. Seatbelt's pathname rules cover these; bind mounts cannot.
   const absent = denied.flatMap(({ path, real }) => (real ? [] : [{ path, ...creatableUnder(path) }]));
+  for (const { path, real } of denied) {
+    const missing = absent.find((d) => d.path === path);
+    // Keep evidence from the resolving lookup even if the host removed the symlink afterwards.
+    if ((real && real !== resolve(path)) || (missing && missing.dir !== resolve(missing.spelling)))
+      throw new ConfinementError(`Cannot confine ${path}: denied pathname resolves through a symlink`);
+    let at = "/";
+    for (const part of path.split("/")) {
+      at = join(at, part);
+      if (lstatSync(at, { throwIfNoEntry: false })?.isSymbolicLink())
+        throw new ConfinementError(`Cannot confine ${path}: denied pathname goes through a symlink at ${at}`);
+    }
+  }
   for (const { path, dir } of absent)
     if (bound.some((b) => within(b, dir)))
       throw new ConfinementError(`Cannot confine a denied path that does not exist yet: ${path}`);
@@ -199,10 +229,15 @@ export function bwrapArgs(
     ...["--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"],
     // Before the private tmpfs mounts and every mask, which must cover what the shadows bind back.
     ...shadowed.flatMap((dir) => shadow(dir, unbound)),
-    ...["--perms", "0755", "--tmpfs", "/run", ...resolv.flatMap((p) => ["--ro-bind", p, p])],
-    ...(envFd === undefined ? [] : ["--ro-bind-data", String(envFd), ENV_FILE]),
     // Private and writable: Codex's own bubblewrap keeps its mount registry in /tmp.
-    ...["--perms", "1777", "--tmpfs", "/tmp", "--perms", "1777", "--tmpfs", "/var/tmp"],
+    ...hidden.flatMap((p) => [
+      "--perms",
+      ["/tmp", "/var/tmp"].includes(p) ? "1777" : "0755",
+      "--tmpfs",
+      p,
+      ...(p === "/run" ? resolv.flatMap((r) => ["--ro-bind", r, r]) : []),
+      ...(p !== "/run" || envFd === undefined ? [] : ["--ro-bind-data", String(envFd), ENV_FILE]),
+    ]),
     ...outer.flatMap((d) => (traversable.includes(d) ? ["--perms", "0111", "--tmpfs", d] : mask(d))),
     ...[...allow, ...literals]
       .filter((p) => masked.some((m) => within(m, p)))
@@ -217,7 +252,12 @@ export function bwrapArgs(
     // Other invocations' command capabilities: hidden; this invocation's own: readable, not writable.
     ...commandRoots.flatMap((r) => ["--perms", "0111", "--tmpfs", r]),
     ...own.flatMap((p) => ["--ro-bind", p, p]),
-    ...["/run", ...shadowed, ...traversable, ...commandRoots].flatMap((p) => ["--remount-ro", p]),
+    ...[
+      ...hidden.filter((p) => !["/tmp", "/var/tmp"].includes(p)),
+      ...shadowed,
+      ...traversable,
+      ...commandRoots,
+    ].flatMap((p) => ["--remount-ro", p]),
   ];
   assertHidden(args, sources, [
     ...denied.flatMap(({ path, real }) => (real ? [{ path, at: real, absent: false }] : [])),
