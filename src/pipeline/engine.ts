@@ -103,6 +103,7 @@ import {
   prepareReaderCheckout,
 } from "./agent-executor.ts";
 import { reusableAgentGate } from "./agent-gate.ts";
+import { statedBudget } from "./budget.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
   CancelledError,
@@ -173,6 +174,7 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
+import { measureSize } from "./size.ts";
 import { createSnapshotParent } from "./snapshots.ts";
 import { outOfRunCriteria, specCriteriaRange } from "./spec-criteria.ts";
 import { specScopeViolation } from "./spec-scope.ts";
@@ -2732,6 +2734,30 @@ async function reconcilePublication(ctx: RunContext, cwd: string, budget: GitHub
   await ctx.save("delivery-reconciled");
 }
 
+export async function renderDeliveryReport(
+  ...[ctx, success, verifiedFailure]: Parameters<typeof buildReportArtifacts>
+) {
+  const cwd = ctx.state.worktreePath,
+    base = ctx.state.verification?.baseSha ?? ctx.run.baseSha;
+  const mode = ctx.state.flow === "verify-change" ? "merge-base" : "two-dot";
+  let head = "HEAD",
+    redact = redactCredentials;
+  if (!cwd || !base) ctx.state.sizeReport = { unavailable: !cwd ? "No worktree" : "No base SHA" };
+  else
+    try {
+      const entries = privateEntries(ctx, cwd);
+      redact = (text) => redactPrivate(text, entries);
+      head = await headSha(cwd);
+      const measured = await measureSize(cwd, base, head, mode, ctx.state.gatesConfig?.docs);
+      const stated = statedBudget(ctx.run.prompt, redact);
+      ctx.state.sizeReport = redactGateData({ ...measured, stated });
+    } catch (error) {
+      ctx.state.sizeReport = { base, head, mode, error: redact(redactCredentials(String(error))) };
+    }
+  ctx.store.setRunState(ctx.run.id, ctx.state);
+  return buildReportArtifacts(ctx, success, verifiedFailure);
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -2745,7 +2771,7 @@ async function deliverVerifiedDraft(
   const branch = ctx.run.branch;
   const base = ctx.run.baseBranch;
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
-  const rendered = buildReportArtifacts(ctx, false, { sha, stage, reason, base });
+  const rendered = await renderDeliveryReport(ctx, false, { sha, stage, reason, base });
   const body = publicationText(ctx, stripReportManifest(rendered.report));
   saveReport(ctx, rendered);
   ctx.checkCancelled();
@@ -2984,7 +3010,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
           throw new Error("Merged PR lookup did not return a URL");
         ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: pr.url, merged: true });
-        saveReport(ctx, buildReportArtifacts(ctx, true));
+        saveReport(ctx, await renderDeliveryReport(ctx, true));
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `PR ${pr.url} — merged`, value: undefined };
@@ -3000,7 +3026,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (ctx.state.verification) {
       await discardChanges(cwd);
       if (!success) {
-        saveReport(ctx, buildReportArtifacts(ctx, false));
+        saveReport(ctx, await renderDeliveryReport(ctx, false));
         return { summary: "PR verification needs human review; no push", value: undefined };
       }
       if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
@@ -3008,7 +3034,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           headSha: await headSha(cwd),
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef?.number}`,
         });
-        const rendered = buildReportArtifacts(ctx, true);
+        const rendered = await renderDeliveryReport(ctx, true);
         const report = rendered.report;
         if (!ctx.state.verdictCommentPosted) {
           const { marker, includes: hasMarker } = deliveryMarker(
@@ -3073,7 +3099,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               if (reason) {
                 ctx.state.terminalReason = reason;
                 ctx.state.needsHumanReason = undefined;
-                saveReport(ctx, buildReportArtifacts(ctx, false));
+                saveReport(ctx, await renderDeliveryReport(ctx, false));
                 await ctx.save("verification-stale");
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
@@ -3090,7 +3116,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
             ctx.state.needsHumanReason = undefined;
-            saveReport(ctx, buildReportArtifacts(ctx, false));
+            saveReport(ctx, await renderDeliveryReport(ctx, false));
             await ctx.save("verification-stale");
             throw new Error(reason);
           });
@@ -3141,7 +3167,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       if (!ctx.state.rebaseNote && !(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
         note("the branch does not contain the recorded base");
     }
-    const rendered = buildReportArtifacts(ctx, success);
+    const rendered = await renderDeliveryReport(ctx, success);
     const body = publicationText(ctx, stripReportManifest(rendered.report));
     const title = success ? ctx.run.title : draftTitle(ctx);
     // Failed existing-branch rounds only retain a local report; they publish no commits or PR text.
