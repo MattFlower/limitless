@@ -8,7 +8,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { resolveBootSha } from "../src/cli/boot-sha.ts";
 import {
@@ -1511,4 +1511,185 @@ test("deploy leases the entire suite, including already-deployed smoke, and rele
       expect(held).toBe(false);
     }
   }
+});
+
+function executorSetup() {
+  const f = setup();
+  mkdirSync(f.opts.agentsDir);
+  mkdirSync(join(f.opts.releaseDir, "src/cli"), { recursive: true });
+  writeFileSync(join(f.opts.releaseDir, "src/cli/main.ts"), "");
+  const label = "custom.gate-executor",
+    service = `gui/${userInfo().uid}/${label}`;
+  const path = join(f.opts.agentsDir, "executor.plist");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      Label: label,
+      ProgramArguments: ["bun", join(f.opts.releaseDir, "src/cli/main.ts"), "executor"],
+    }),
+  );
+  let loaded = true,
+    disabled = false;
+  const command = f.opts.command;
+  f.opts.command = async (args, opts) => {
+    if (args[0] === "plutil")
+      return { exitCode: 0, stdout: readFileSync(args.at(-1) ?? "", "utf8"), stderr: "" };
+    if (args[0] !== "launchctl") return command(args, opts);
+    f.calls.push(args.join(" "));
+    let exitCode = 0;
+    if (args[1] === "print") exitCode = loaded ? 0 : 1;
+    if (args[1] === "bootout") loaded = false;
+    if (args[1] === "disable") disabled = true;
+    if (args[1] === "enable") disabled = false;
+    if (args[1] === "bootstrap") {
+      if (disabled) exitCode = 1;
+      else loaded = true;
+    }
+    return { exitCode, stdout: "", stderr: exitCode ? "refused" : "" };
+  };
+  return {
+    ...f,
+    label,
+    service,
+    path,
+    intent: join(f.opts.releaseDir, "executor-intent.json"),
+    loaded: () => loaded,
+    disabled: () => disabled,
+  };
+}
+
+for (const mode of ["new", "same", "now"])
+  for (const executor of [true, false]) {
+    test(`deploy reconciles executor (${mode}, ${executor})`, async () => {
+      const f = executorSetup();
+      // Recovery must switch a disabled, unloaded executor back on only after health.
+      writeFileSync(
+        f.intent,
+        JSON.stringify({
+          phase: "rollback",
+          label: f.label,
+          path: f.path,
+          previous: "previous",
+          target: "next",
+        }),
+      );
+      const command = f.opts.command;
+      f.opts.command = async (args, opts) => {
+        const result = await command(args, opts);
+        return mode === "same" && args[1] === "rev-parse" && args[2] !== "HEAD"
+          ? { ...result, stdout: "previous" }
+          : result;
+      };
+      await deploy(7400, "feature", false, { ...f.opts, executor, now: mode === "now" });
+      expect(f.loaded()).toBe(executor);
+      expect(f.disabled()).toBe(!executor);
+      expect(existsSync(f.intent)).toBe(false);
+      const off = f.calls.indexOf(`launchctl disable ${f.service}`);
+      expect(off).toBeGreaterThan(-1);
+      expect(off).toBeLessThan(f.calls.indexOf("git rev-parse HEAD"));
+      if (executor)
+        expect(f.calls.indexOf(`launchctl enable ${f.service}`)).toBeLessThan(
+          f.calls.indexOf(`launchctl bootstrap gui/${userInfo().uid} ${f.path}`),
+        );
+    });
+  }
+for (const failure of ["gate", "health", "restart", "bootout", "stuck", "disable"]) {
+  test(`rollback confirms executor off before restoring (${failure})`, async () => {
+    const f = executorSetup(),
+      command = f.opts.command;
+    f.opts.command = async (args, opts) => {
+      if (args[0] === "bun" && args[1] === "run" && !["restart", "health"].includes(failure))
+        throw new Error("gate failed");
+      if (args[0] === "launchctl" && ["bootout", "disable"].includes(args[1] ?? "") && args[1] === failure) {
+        f.calls.push(args.join(" "));
+        return { exitCode: 1, stdout: "", stderr: "denied" };
+      }
+      const result = await command(args, opts);
+      if (failure === "stuck" && args[1] === "print") return { ...result, exitCode: 0 };
+      return result;
+    };
+    if (failure === "health") {
+      const health = f.client.health;
+      f.client.health = async (signal) => {
+        if (f.calls.includes("restart")) throw new Error("unhealthy target");
+        return health(signal);
+      };
+    }
+    if (failure === "restart")
+      f.opts.restart = async () => {
+        f.calls.push("restart");
+        throw new Error("restart failed");
+      };
+    const error = String(
+      await deploy(7400, "feature", false, { ...f.opts, executor: true, now: true }).catch((e) => e),
+    );
+    expect(JSON.parse(readFileSync(f.intent, "utf8")).phase).toBe("rollback");
+    const restored = f.calls.indexOf("git checkout -q --detach previous");
+    if (["bootout", "stuck", "disable"].includes(failure)) {
+      expect(restored).toBe(-1);
+      expect(error).toContain(`launchctl bootout ${f.service}`);
+      expect(error).toContain(`launchctl disable ${f.service}`);
+      expect(error).toContain("next");
+      expect(error).toContain("previous");
+      f.calls.length = 0;
+      await expect(deploy(7400, "feature", false, f.opts)).rejects.toThrow("rerun the command");
+      expect(f.calls.some((c) => c.startsWith("git "))).toBe(false);
+    } else {
+      expect(f.calls.indexOf(`launchctl disable ${f.service}`)).toBeLessThan(restored);
+      expect(restored).toBeGreaterThan(-1);
+      expect(f.loaded()).toBe(false);
+      expect(f.disabled()).toBe(true);
+    }
+  });
+}
+
+test("interruption after restart retains deploying intent for the next invocation", async () => {
+  const f = executorSetup();
+  f.opts.restart = async () => {
+    f.calls.push("restart");
+    process.emit("SIGINT");
+  };
+  await expect(deploy(7400, "feature", false, { ...f.opts, executor: true, now: true })).rejects.toThrow(
+    "interrupted",
+  );
+  expect(JSON.parse(readFileSync(f.intent, "utf8"))).toMatchObject({
+    phase: "deploying",
+    label: f.label,
+    previous: "previous",
+    target: "next",
+  });
+  expect(f.calls).not.toContain(`launchctl disable ${f.service}`);
+  expect(f.calls).not.toContain("git checkout -q --detach previous");
+});
+
+test("a shutdown interrupted during rollback is recovered before the next deploy touches git", async () => {
+  const f = executorSetup(),
+    command = f.opts.command;
+  let gateFails = true,
+    shutdownFails = true;
+  f.opts.command = async (args, opts) => {
+    if (gateFails && args[0] === "bun" && args[1] === "run") {
+      gateFails = false;
+      throw new Error("gate failed");
+    }
+    if (shutdownFails && args[0] === "launchctl" && args[1] === "bootout") {
+      shutdownFails = false;
+      expect(JSON.parse(readFileSync(f.intent, "utf8")).phase).toBe("rollback");
+      throw new Error("interrupted shutdown");
+    }
+    return command(args, opts);
+  };
+  await expect(deploy(7400, "feature", false, { ...f.opts, executor: true })).rejects.toThrow(
+    "interrupted shutdown",
+  );
+  expect(f.selected()).toBe("next");
+  expect(existsSync(f.intent)).toBe(true);
+  f.calls.length = 0;
+  await deploy(7400, "feature", false, { ...f.opts, executor: true });
+  const disabled = f.calls.indexOf(`launchctl disable ${f.service}`);
+  expect(disabled).toBeGreaterThan(-1);
+  expect(disabled).toBeLessThan(f.calls.findIndex((c) => c.startsWith("git ")));
+  expect(f.loaded()).toBe(true);
+  expect(f.disabled()).toBe(false);
+  expect(existsSync(f.intent)).toBe(false);
 });

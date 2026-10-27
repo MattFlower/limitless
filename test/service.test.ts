@@ -37,10 +37,13 @@ test("installation selects only explicitly requested rollback and tunnel agents"
     }
 });
 
-test("service CLI dispatches opt-in mtplx and advertises the new flag", async () => {
+test("service CLI dispatches configured executor and opt-in mtplx", async () => {
   // A temporary config, never the user's: --tunnel reads [server] public_url from it.
   const configDir = mkdtempSync(join(tmpdir(), "limitless-service-cli-"));
-  writeFileSync(join(configDir, "config.toml"), '[server]\npublic_url = "https://hooks.example.test"\n');
+  writeFileSync(
+    join(configDir, "config.toml"),
+    '[server]\npublic_url = "https://hooks.example.test"\n[executor]\nenabled = true\n',
+  );
   const env = { ...process.env, LIMITLESS_CONFIG_DIR: configDir, LIMITLESS_HOME: join(configDir, "home") };
   for (const flags of [[], ["--mtplx", "--tunnel"], ["--help"]]) {
     const child = Bun.spawn(
@@ -63,7 +66,7 @@ test("service CLI dispatches opt-in mtplx and advertises the new flag", async ()
     } else {
       const on = flags.length > 0;
       const publicUrl = on ? "https://hooks.example.test" : null;
-      expect(output).toContain(JSON.stringify({ tunnel: on, mtplx: on, publicUrl }));
+      expect(output).toContain(JSON.stringify({ tunnel: on, mtplx: on, publicUrl, executor: true }));
     }
   }
   rmSync(configDir, { recursive: true, force: true });
@@ -76,7 +79,10 @@ afterEach(() => {
 
 type MigrationResult = {
   firstCalls: string[];
+  recoveries: { error: string; phase: string; retained: boolean }[];
   discovered: string[];
+  discoveredUnits: { label: string; path: string; kind: string }[];
+  intent: boolean;
   original: string;
   stable: string;
   executable: string;
@@ -105,6 +111,7 @@ type MigrationResult = {
   lock: boolean;
   calls: string[];
   loaded: string[];
+  disabled: string[];
   draining: boolean;
   old: string;
   time: number;
@@ -132,7 +139,7 @@ async function migration(
 }
 
 for (const mode of ["source", "packaged"]) {
-  for (const kind of ["daemon", "mtplx", "tunnel"]) {
+  for (const kind of ["daemon", "mtplx", "tunnel", "executor"]) {
     test(`${mode} ${kind} discovery rejects a mismatched Program`, async () => {
       const { result: r } = await migration(`${mode}-program-mismatch`, kind);
       expect(r.error).toBe("");
@@ -938,3 +945,137 @@ for (const phase of ["prepared", "restored", "stopping", "unhealthy", "restore-f
     }
   });
 }
+
+for (const executor of [undefined, false, true]) {
+  for (const packaged of [false, true]) {
+    test(`executor unit arguments and environment (${packaged}, ${executor})`, () => {
+      const units = installationUnits({
+        executor,
+        execPath: "/opt/bin/limitless",
+        release: packaged
+          ? { kind: "packaged", sha: "a".repeat(40), version: "1", bun: Bun.version }
+          : { kind: "source", root: "/app", version: "1", bun: Bun.version },
+      });
+      const content = units.find(([label]) => label === "dev.limitless.executor")?.[1];
+      if (!executor) {
+        expect(content).toBeUndefined();
+        return;
+      }
+      expect(content).toContain("<key>KeepAlive</key><true/>");
+      expect(content).toContain("<string>executor</string>");
+      expect(content).toContain(
+        packaged
+          ? "<string>/opt/bin/limitless</string>"
+          : `<string>${join(homedir(), ".bun/bin/bun")}</string>`,
+      );
+      expect(content?.match(/<key>EnvironmentVariables<\/key>.*?<\/dict>/s)?.[0]).toBe(
+        units[0]?.[1].match(/<key>EnvironmentVariables<\/key>.*?<\/dict>/s)?.[0],
+      );
+    });
+  }
+}
+for (const scenario of ["migration", "contradictory", "duplicate", "unselected", "bootstrap"]) {
+  test(`executor install: ${scenario}`, async () => {
+    const { result: r } = await migration(scenario, "executor");
+    if (scenario === "contradictory") {
+      expect(r.error).toBe("");
+      expect(r.loaded).toContain("arbitrary.installed.executor");
+      return;
+    }
+    if (scenario === "duplicate") {
+      expect(r.error).toContain("multiple installed executor agents");
+      return;
+    }
+    if (scenario === "bootstrap") {
+      expect(r.error).toContain("replacement bootstrap failed");
+      expect(r.files["executor-original.plist"]).toBe(r.old);
+      expect(r.phase).toBe("restored");
+      expect(r.loaded).not.toContain("arbitrary.installed.executor");
+      expect(r.disabled).toContain("arbitrary.installed.executor");
+      expect(r.calls).not.toContain("bootstrap arbitrary.installed.executor");
+      return;
+    }
+    expect(r.error).toBe("");
+    expect(r.calls).toContain("disable arbitrary.installed.executor");
+    if (scenario === "unselected") {
+      expect(r.files["executor-original.plist"]).toBeUndefined();
+    } else {
+      expect(r.calls.indexOf("enable dev.limitless.executor")).toBeLessThan(
+        r.calls.indexOf("bootstrap dev.limitless.executor"),
+      );
+      expect(r.loaded).toContain("dev.limitless.executor");
+    }
+  });
+}
+
+for (const stuck of [false, true]) {
+  test(`restored executor journal survives two recoveries until reconciliation (stuck: ${stuck})`, async () => {
+    const { result: r } = await migration(`executor-recovery${stuck ? "-stuck" : ""}`, "executor");
+    expect(r.error).toBe("");
+    expect(r.firstError).toContain("replacement bootstrap failed");
+    expect(r.firstCalls).not.toContain("enable arbitrary.installed.executor");
+    expect(r.firstCalls).not.toContain("bootstrap arbitrary.installed.executor");
+    expect(r.recoveries).toHaveLength(2);
+    for (const recovery of r.recoveries) {
+      expect(recovery.retained).toBe(true);
+      expect(recovery.phase).toBe("restored");
+      expect(recovery.error).not.toContain("retry installation");
+      expect(recovery.error).toContain(stuck ? "launchctl disable gui/" : "stopped after recovery");
+    }
+    expect(r.state).toBe(stuck);
+    if (!stuck) {
+      expect(r.loaded).toContain("arbitrary.installed.executor");
+      expect(r.disabled).not.toContain("arbitrary.installed.executor");
+    }
+  });
+}
+for (const mode of ["source", "packaged"]) {
+  test(`${mode} executor discovery returns its actual label and path`, async () => {
+    const { result: r } = await migration(`${mode}-program-absent`, "executor");
+    expect(r.error).toBe("");
+    expect(r.discovered).toEqual(["executor"]);
+    expect(r.discoveredUnits).toEqual([
+      {
+        label: "arbitrary.installed.executor",
+        kind: "executor",
+        path: join(
+          migrationDirs.at(-1) ?? "",
+          mode === "packaged" ? "isolated-agents" : "Library/LaunchAgents",
+          "executor-original.plist",
+        ),
+      },
+    ]);
+  });
+}
+
+test("install recovers a deploying intent before installing and reconciles after health", async () => {
+  const { result: r } = await migration("intent-install", "executor");
+  expect(r.error).toBe("");
+  expect(r.intent).toBe(false);
+  const disabled = r.commands.findIndex((args) => args[0] === "launchctl" && args[1] === "disable");
+  const installed = r.commands.findIndex((args) => args[0] === "bun" && args[1] === "install");
+  expect(disabled).toBeGreaterThan(-1);
+  expect(disabled).toBeLessThan(installed);
+  expect(r.calls.indexOf("enable dev.limitless.executor")).toBeLessThan(
+    r.calls.indexOf("bootstrap dev.limitless.executor"),
+  );
+  expect(r.loaded).toContain("dev.limitless.executor");
+});
+
+test("packaged executor installation uses the stable binary and daemon working directory", async () => {
+  const { result: r } = await migration("packaged-fresh", "executor");
+  expect(r.error).toBe("");
+  const executor = r.parsedUnits["dev.limitless.executor.plist"];
+  expect(executor?.ProgramArguments).toEqual([r.stable, "executor"]);
+  expect(executor?.WorkingDirectory).toBe(r.parsedUnits["dev.limitless.daemon.plist"]?.WorkingDirectory);
+  expect(r.loaded).toContain("dev.limitless.executor");
+});
+
+for (const mode of ["source", "packaged"])
+  for (const scenario of ["marker", "duplicate"]) {
+    test(`${mode} executor discovery rejects ${scenario}`, async () => {
+      const { result: r } = await migration(`${mode}-program-${scenario}`, "executor");
+      expect(r.discovered).toEqual([]);
+      expect(r.error).toBe(scenario === "duplicate" ? "Error: multiple installed executor agents" : "");
+    });
+  }

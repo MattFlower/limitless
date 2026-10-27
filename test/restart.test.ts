@@ -27,6 +27,13 @@ function setup() {
       ProgramArguments: ["bun", join(dir, "src", "cli", "main.ts"), "serve"],
     }),
   );
+  writeFileSync(
+    join(agentsDir, "executor.plist"),
+    JSON.stringify({
+      Label: "custom.executor",
+      ProgramArguments: ["bun", join(dir, "src/cli/main.ts"), "executor"],
+    }),
+  );
   const calls: string[] = [],
     logs: string[] = [],
     sleeps: number[] = [];
@@ -108,7 +115,13 @@ for (const now of [false, true]) {
       }
       return state;
     };
+    const intent = join(f.opts.releaseDir, "executor-intent.json");
+    writeFileSync(intent, "pending deploy");
     await restart(7400, { ...f.opts, now });
+    expect(readFileSync(intent, "utf8")).toBe("pending deploy");
+    expect(f.calls.some((call) => call.startsWith("launchctl") && call.includes("custom.executor"))).toBe(
+      false,
+    );
     expect(f.calls.filter((call) => !call.startsWith("plutil"))).toEqual([
       "health",
       "drain",
@@ -152,6 +165,7 @@ test("restart refuses a held deploy lock before doing any work", async () => {
 test("restart refuses without an installed daemon agent", async () => {
   const f = setup();
   rmSync(join(f.opts.agentsDir, "installed.plist"));
+  rmSync(join(f.opts.agentsDir, "executor.plist"));
   await expect(restart(7400, f.opts)).rejects.toThrow(
     "no installed daemon agent; run limitless service install",
   );
@@ -256,6 +270,9 @@ for (const resumeFails of [false, true]) {
     } else {
       expect((await f.client.health(new AbortController().signal)).draining).toBe(false);
     }
+    expect(f.calls.some((call) => call.startsWith("launchctl") && call.includes("custom.executor"))).toBe(
+      false,
+    );
     expect(f.logs).toContain("custom.daemon: loaded");
     expect(existsSync(f.opts.lockPath)).toBe(false);
   });
@@ -281,6 +298,9 @@ for (const failure of ["old boot", "wrong SHA", "missing SHA", "unreachable"]) {
     expect(f.calls).toContain(`launchctl print gui/${userInfo().uid}/custom.daemon`);
     expect(f.calls).toContain("git log -1 --format=%h %s");
     expect(f.calls.filter((call) => call === "resume")).toHaveLength(failure === "old boot" ? 1 : 0);
+    expect(f.calls.some((call) => call.startsWith("launchctl") && call.includes("custom.executor"))).toBe(
+      false,
+    );
     expect(f.logs).toContain("custom.daemon: loaded");
     expect(f.logs).toContain("release: release subject");
     expect(f.logs).toContain(`health: ${failure === "unreachable" ? "unreachable" : "ok"}`);
