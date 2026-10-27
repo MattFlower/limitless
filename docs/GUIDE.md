@@ -567,27 +567,35 @@ repository the installation does not cover. Tokens stay in memory and are withhe
 and gates. These settings require a daemon restart when changed. Older releases ignore these
 keys because the `[github]` table isn't checked for unknown keys.
 
-For issue-label and Dependabot triggers, or comment commands outside queue repositories,
-create a repository webhook pointing at `https://<your-host>/webhooks/github`. Use content type
+For issue-label and Dependabot triggers, PR comment commands in any repository, or issue
+comment commands outside queue repositories, create a repository webhook pointing at
+`https://<your-host>/webhooks/github`. Use content type
 `application/json` and the `GITHUB_WEBHOOK_SECRET`, and select the **Issues**, **Issue comments**
 and **Pull requests** events. See [the webhook tunnel](#webhook-tunnel) for exposing the endpoint.
 Deliveries are HMAC-verified and deduplicated by delivery ID. Through the tunnel, the source IP
 must also be in GitHub's published hook ranges.
 
 Dependabot runs, issue-label triggers and webhook-only `/limitless` comment triggers are disabled
-unless `[owners] github` is configured. [Issue queue](ISSUES.md) repositories also accept trusted,
-unedited comment commands by polling, without webhooks. The poll reads the last 20 comments
-every 180 s by default, ignores commands predating its first successful poll's GitHub timestamp
-boundary, and records each command transactionally exactly once. A webhook for a queue comment
-only requests an immediate poll.
+unless `[owners] github` is configured. [Issue queue](ISSUES.md) repositories also accept trusted
+human authors' unedited issue comment commands by polling, without webhooks; logins ending in
+`[bot]` are excluded case-insensitively. Before its first issue query, the queue saves the valid
+`Date` header from `gh api --include rate_limit` as its fixed boundary and does no further work
+for that repository in that poll. This also initializes empty repositories; missing or invalid
+headers and failed requests retry on a later poll. The poll reads the last 20 comments every
+180 s by default, admits only commands strictly after the boundary, and records each command
+transactionally exactly once. A webhook for a queue issue comment only hints a poll, coalesced
+with any in-flight poll and at least 30 seconds after the previous tick started. Hints honor
+rate-limit reset deadlines and cannot shorten the regular retry delay after API failures.
+PR comments keep their direct owner-authorized webhook behavior in every repository.
 
 - **Issue label:** adding the `limitless` label creates a run. Both the person labelling and the
   issue author must be `[owners].github`, and the repository must belong to that account. The
   issue text is passed to the model as quoted, untrusted data. The resulting PR says
   `Closes #<n>`.
 - **Comment command:** an owner comment starting with `/limitless ` followed by a request runs that
-  request in the context of the issue. Queue repositories use `[github.queue].trusted` and also
-  accept `@<slug>` or `@<slug>[bot]` commands when served by a GitHub App identity.
+  request in the context of the issue or PR. Queue issue comments use `[github.queue].trusted`
+  and also accept `@<slug>` or `@<slug>[bot]` commands when served by a GitHub App identity. If identity
+  lookup fails, mention commands wait for a later poll while human slash commands still work.
 - **Dependabot:** `opened`, `reopened` and `synchronize` events on Dependabot PRs from the same
   repository start a `quick` verification run on the Dependabot branch. Fixes are pushed to that
   branch only if its head has not moved. The factory never merges these PRs. If the run does not

@@ -291,7 +291,7 @@ const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
 });
-function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/repo"]) {
+function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/repo"], fresh = false) {
   const dir = mkdtempSync(join(tmpdir(), "issue-queue-"));
   const cfg = loadConfig({
     home: dir,
@@ -322,6 +322,8 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
       defaultBranch: "main",
       mergePolicy: "pr",
     });
+  // Policy tests start with an enabled queue; initialization is exercised separately below.
+  if (!fresh) for (const repo of repos) store.githubCommentBoundary(repo, at);
   const clock = waitClock();
   const data = new Map(repos.map((r) => [r, [] as QueueIssue[]]));
   const states = new Map<number, string | null>();
@@ -357,6 +359,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     rate: { cost: 1, remaining: 5000, resetAt: new Date(clock.now() + 3600_000).toISOString() },
     response: undefined as unknown,
     rawResponse: undefined as string | undefined,
+    boundaryResponse: `HTTP/2.0 200 OK\r\ndAtE: ${new Date(at).toUTCString()}\r\n\r\n{}`,
     hold: undefined as Promise<void> | undefined,
     scopes: [] as (string | undefined)[],
     async gh(args: string[], _signal?: AbortSignal, _stdin?: string, repo?: string) {
@@ -364,6 +367,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
       calls.push(args);
       h.intercept?.(args);
       if (h.hold) await h.hold;
+      if (args.includes("rate_limit")) return h.boundaryResponse;
       if (args[1] !== "graphql") {
         const path = args[1] ?? "";
         if (path === "user") return JSON.stringify({ login: h.login });
@@ -881,26 +885,30 @@ test.each([
   expect(h.runs()).toHaveLength(1);
 });
 
-test("stopping during an in-flight query prevents a late run or timer", async () => {
-  const h = harness();
-  const held = Promise.withResolvers<void>();
-  h.hold = held.promise;
-  h.data.set("owner/repo", [issue()]);
-  const stop = startIssueQueue(h.factory, {
-    gh: h.gh,
-    clock: {
-      now: h.clock.now,
-      set: h.clock.timer.set as unknown as typeof setTimeout,
-      clear: h.clock.timer.clear,
-    },
-  });
-  await h.advance();
-  stop();
-  held.resolve();
-  await h.advance();
-  expect(h.runs()).toHaveLength(0);
-  expect(h.clock.pending).toBe(0);
-});
+test.each([false, true])(
+  "stopping during an in-flight query prevents a late run or timer (initializing: %s)",
+  async (fresh) => {
+    const h = harness({}, ["owner/repo"], fresh);
+    const held = Promise.withResolvers<void>();
+    h.hold = held.promise;
+    h.data.set("owner/repo", [issue()]);
+    const stop = startIssueQueue(h.factory, {
+      gh: h.gh,
+      clock: {
+        now: h.clock.now,
+        set: h.clock.timer.set as unknown as typeof setTimeout,
+        clear: h.clock.timer.clear,
+      },
+    });
+    await h.advance();
+    stop();
+    held.resolve();
+    await h.advance();
+    expect(h.runs()).toHaveLength(0);
+    if (fresh) expect(h.store.githubCommentBoundary("owner/repo")).toBeNull();
+    expect(h.clock.pending).toBe(0);
+  },
+);
 
 function webhook(h: ReturnType<typeof harness>, id: string) {
   const i = issue();
@@ -2781,22 +2789,22 @@ const records = (h: ReturnType<typeof harness>) =>
   h.store.db.query("SELECT * FROM github_processed_comments").all();
 async function pollComments(h: ReturnType<typeof harness>) {
   h.pollNow();
-  await h.advance();
+  await h.advance(30_000);
 }
 async function enableComments(h: ReturnType<typeof harness>) {
   const i = commentIssue();
   h.data.set("owner/repo", [i]);
   h.start();
   await h.advance();
-  expect(h.store.githubCommentBoundary("OWNER/REPO")).toBe(at);
+  expect(Date.parse(h.store.githubCommentBoundary("OWNER/REPO") ?? "")).toBe(Date.parse(at));
   return i;
 }
-function commentDelivery(i: QueueIssue, id = "command", author = "owner") {
+function commentDelivery(i: QueueIssue, id = "command", author = "owner", pr = false) {
   const body = JSON.stringify({
     action: "created",
-    repository: { full_name: "OWNER/REPO" },
+    repository: { full_name: pr ? "owner/repo" : "OWNER/REPO" },
     sender: { login: author },
-    issue: { ...i, user: i.author },
+    issue: { ...i, user: i.author, ...(pr ? { pull_request: { url: "https://example.com/pr" } } : {}) },
     comment: { id: 1, body: commandComment().body, user: { login: author } },
   });
   return new Request("http://localhost/webhooks/github", {
@@ -2841,22 +2849,83 @@ test.each(["owner", "collaborator", "mention"])(
     expect(h.runs()).toHaveLength(1);
     expect(h.runs()[0]?.githubWebhookVerified).toBe(false);
     await pollComments(h);
-    h.stop();
-    h.start();
-    await h.advance();
     expect(h.runs()).toHaveLength(1);
     expect(records(h)).toHaveLength(1);
   },
 );
 
+test("comment run, processed record and boundary survive closing and reopening the database", async () => {
+  const h = harness();
+  const path = join(h.cfg.paths.home, "comments.db");
+  let store = new Store(path);
+  const makeFactory = () =>
+    new Factory(h.cfg, {
+      store,
+      harnesses: {
+        fake: fakeHarness(() => {
+          throw new Error("must not execute stages");
+        }),
+      },
+    });
+  let factory = makeFactory();
+  const repo = h.store.getRepoBySlug("owner/repo");
+  if (!repo) throw new Error("missing repo");
+  store.upsertRepo(repo);
+  const i = commentIssue();
+  h.data.set(repo.slug, [i]);
+  const start = () =>
+    startIssueQueue(factory, {
+      gh: h.gh,
+      lifecycle: { identity: h.identity },
+      clock: {
+        now: h.clock.now,
+        set: h.clock.timer.set as unknown as typeof setTimeout,
+        clear: h.clock.timer.clear,
+      },
+    });
+  let stop = start();
+  try {
+    await h.advance();
+    const boundary = new Date(at).toISOString();
+    expect(store.githubCommentBoundary(repo.slug)).toBe(boundary);
+    i.comments = { totalCount: 1, nodes: [commandComment()] };
+    stop.pollNow();
+    await h.advance(30_000);
+    const run = store.listRuns()[0];
+    if (!run) throw new Error("missing command run");
+    stop();
+    await factory.stop();
+    store.close();
+    store = new Store(path);
+    factory = makeFactory();
+    expect(store.githubCommentBoundary(repo.slug)).toBe(boundary);
+    expect(
+      store.db.query("SELECT repo, comment_id, outcome, run_id FROM github_processed_comments").all(),
+    ).toEqual([{ repo: repo.slug, comment_id: 1, outcome: "run", run_id: run.id }]);
+    stop = start();
+    await h.advance();
+    stop.pollNow();
+    await h.advance(30_000);
+    expect(store.listRuns().map((r) => r.id)).toEqual([run.id]);
+    expect(store.db.query("SELECT count(*) AS n FROM github_processed_comments").get()).toEqual({ n: 1 });
+  } finally {
+    stop();
+    await factory.stop();
+    store.close();
+  }
+});
+
 test("comment transaction rolls back the run when recording fails, then retries once", async () => {
   const h = harness();
   const i = await enableComments(h);
   i.comments = { totalCount: 1, nodes: [commandComment()] };
-  const record = spyOn(h.store, "recordGitHubComment").mockImplementation(() => {
+  let inserted = false;
+  const record = spyOn(h.store, "recordGitHubComment").mockImplementation((_comment, run) => {
+    inserted = !!run && h.store.getRun(run) !== null;
     throw new Error("crash after run insert");
   });
   await pollComments(h);
+  expect(inserted).toBe(true);
   expect(h.runs()).toHaveLength(0);
   expect(records(h)).toHaveLength(0);
   record.mockRestore();
@@ -2886,13 +2955,107 @@ test("in-flight hints coalesce into one follow-up poll without concurrent gh cal
   const lifecycle = spyOn(h.store, "issueLifecycleRuns").mockReturnValue([]);
   h.hold = undefined;
   release();
-  await h.advance();
-  await h.advance();
+  await h.advance(29_999);
+  expect(h.calls.length).toBe(before + 1);
+  await h.advance(1);
   expect(h.calls.length).toBe(before + 2);
   expect(h.runs()).toHaveLength(1);
   expect(h.clock.pending).toBe(1);
   lifecycle.mockRestore();
 });
+
+test.each(["HTTP 429 Too Many Requests", "HTTP 503 Service Unavailable"])(
+  "%s keeps regular retry deadlines despite hint bursts",
+  async (message) => {
+    const h = harness();
+    const starts: number[] = [];
+    h.intercept = () => {
+      starts.push(h.clock.now());
+      throw new Error(message);
+    };
+    h.start();
+    await h.advance();
+    const initial = h.clock.now();
+    for (let step = 1; step <= 36; step++) {
+      h.pollNow();
+      await h.advance(10_000);
+      expect(starts).toEqual(
+        Array.from({ length: 1 + Math.floor(step / 18) }, (_, n) => initial + n * 180_000),
+      );
+    }
+    h.stop();
+    h.pollNow();
+    await h.advance(180_000);
+    expect(starts).toHaveLength(3);
+  },
+);
+
+test("hints during an unresolved HTTP failure cannot accelerate its regular retry", async () => {
+  const h = harness();
+  const held = Promise.withResolvers<void>();
+  const gh = h.gh;
+  const starts: number[] = [];
+  h.gh = async (...args) => {
+    starts.push(h.clock.now());
+    await held.promise;
+    return gh(...args);
+  };
+  h.intercept = () => {
+    throw new Error("HTTP 429");
+  };
+  h.start();
+  await h.advance();
+  const initial = h.clock.now();
+  h.pollNow();
+  h.pollNow();
+  await h.advance(30_000);
+  expect(starts).toEqual([initial]);
+  held.resolve();
+  await h.advance();
+  h.pollNow();
+  await h.advance(179_999);
+  expect(starts).toEqual([initial]);
+  await h.advance(1);
+  expect(starts).toEqual([initial, initial + 210_000]);
+});
+
+test("healthy hints wait 30 seconds from tick start and do not postpone an eligible hint", async () => {
+  const h = harness();
+  const starts: number[] = [];
+  h.intercept = () => {
+    starts.push(h.clock.now());
+  };
+  h.start();
+  await h.advance();
+  const initial = h.clock.now();
+  for (let step = 0; step < 3; step++) {
+    h.pollNow();
+    await h.advance(9_999);
+    expect(starts).toEqual([initial]);
+  }
+  h.pollNow();
+  await h.advance(2);
+  expect(starts).toEqual([initial]);
+  await h.advance(1);
+  expect(starts).toEqual([initial, initial + 30_000]);
+});
+
+test.each([false, true])(
+  "hints preserve a shorter regular polling cadence (HTTP failure: %s)",
+  async (fail) => {
+    const h = harness({ poll_seconds: 15 });
+    h.intercept = () => {
+      if (fail) throw new Error("HTTP 429");
+    };
+    h.start();
+    await h.advance();
+    h.pollNow();
+    await h.advance(14_999);
+    expect(h.calls).toHaveLength(1);
+    await h.advance(1);
+    expect(h.calls).toHaveLength(2);
+  },
+);
 
 test("claim refusal is recorded and redacted once even after the claim is released", async () => {
   const h = harness();
@@ -2914,7 +3077,7 @@ test("claim refusal is recorded and redacted once even after the claim is releas
 });
 
 const badCommentResponses = ["graphql errors", "null node", "schema mismatch", "invalid JSON", "gh failure"];
-test.each(badCommentResponses)("%s consumes no command or initial boundary", async (mode) => {
+test.each(badCommentResponses)("%s consumes no command and remains retryable", async (mode) => {
   const h = harness();
   const i = commentIssue();
   const fail = () => {
@@ -2940,13 +3103,13 @@ test.each(badCommentResponses)("%s consumes no command or initial boundary", asy
   damage();
   h.start();
   await h.advance();
-  expect(h.store.githubCommentBoundary("owner/repo")).toBeNull();
+  expect(h.store.githubCommentBoundary("owner/repo")).toBe(at);
   expect(records(h)).toEqual([]);
   h.intercept = undefined;
   h.response = undefined;
   h.rawResponse = undefined;
   i.comments = { totalCount: 0, nodes: [] };
-  await pollComments(h);
+  await h.advance(180_000);
   expect(h.store.githubCommentBoundary("owner/repo")).toBe(at);
   h.intercept = fail;
   damage();
@@ -2957,42 +3120,51 @@ test.each(badCommentResponses)("%s consumes no command or initial boundary", asy
   h.response = undefined;
   h.rawResponse = undefined;
   i.comments = { totalCount: 1, nodes: [commandComment()] };
-  await pollComments(h);
+  await h.advance(180_000);
   expect(h.runs()).toHaveLength(1);
 });
 
-test.each(["edited", "untrusted", "factory author", "marker", "empty", "whitespace", "null author"])(
-  "%s comments never run or get recorded",
-  async (mode) => {
-    const h = harness({ trusted: ["owner", "factory[bot]"] });
-    h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
-    const i = await enableComments(h);
-    const c = commandComment();
-    if (mode === "edited") c.lastEditedAt = commandAt;
-    if (mode === "untrusted") c.author = { login: "stranger" };
-    if (mode === "factory author") c.author = { login: "FACTORY[bot]" };
-    if (mode === "null author") c.author = null;
-    if (mode === "marker") c.body += "\n<!-- limitless-status -->";
-    if (mode === "empty") c.body = "/limitless";
-    if (mode === "whitespace") c.body = "/limitless \n \t";
-    i.comments = { totalCount: 1, nodes: [c] };
-    await pollComments(h);
-    await pollComments(h);
-    expect(h.runs()).toEqual([]);
-    expect(records(h)).toEqual([]);
-  },
-);
+test.each([
+  "edited",
+  "untrusted",
+  "factory author",
+  "leading marker",
+  "empty",
+  "whitespace",
+  "null author",
+  "closed",
+])("%s comments never run or get recorded", async (mode) => {
+  const h = harness({ trusted: ["owner", "factory[bot]"] });
+  h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+  const i = await enableComments(h);
+  const c = commandComment();
+  if (mode === "edited") c.lastEditedAt = commandAt;
+  if (mode === "untrusted") c.author = { login: "stranger" };
+  if (mode === "factory author") c.author = { login: "FACTORY[bot]" };
+  if (mode === "null author") c.author = null;
+  if (mode === "leading marker") c.body = `<!-- limitless-status -->\n${c.body}`;
+  if (mode === "closed") i.state = "CLOSED";
+  if (mode === "empty") c.body = "/limitless";
+  if (mode === "whitespace") c.body = "/limitless \n \t";
+  i.comments = { totalCount: 1, nodes: [c] };
+  await pollComments(h);
+  await pollComments(h);
+  expect(h.runs()).toEqual([]);
+  expect(records(h)).toEqual([]);
+});
 
 test.each([-60_000, 60_000])(
   "GitHub boundary ignores local clock offset %i and survives reopened issues",
   async (offset) => {
-    const h = harness();
+    const h = harness({}, ["owner/repo"], true);
     await h.clock.advance(Date.parse(at) + offset - h.clock.now());
     const i = commentIssue();
-    i.comments = { totalCount: 1, nodes: [{ ...commandComment(), createdAt: at }] };
+    i.updatedAt = "2025-01-01T00:00:00Z";
     h.data.set("owner/repo", [i]);
     h.start();
     await h.advance();
+    expect(h.store.githubCommentBoundary("owner/repo")).toBe(new Date(at).toISOString());
+    i.comments = { totalCount: 1, nodes: [{ ...commandComment(), createdAt: at }] };
     await pollComments(h);
     expect(h.runs()).toEqual([]);
     const reopened = commentIssue(2);
@@ -3008,23 +3180,73 @@ test.each([-60_000, 60_000])(
     i.comments.totalCount++;
     await pollComments(h);
     expect(h.runs()).toHaveLength(1);
-    expect(h.store.githubCommentBoundary("owner/repo")).toBe(at);
+    expect(h.store.githubCommentBoundary("owner/repo")).toBe(new Date(at).toISOString());
   },
 );
 
-test("first boundary includes comment timestamps, and an empty repository stays uninitialized", async () => {
-  const h = harness();
+test("an empty repository saves GitHub time before any issue query and later accepts commands", async () => {
+  const h = harness({}, ["owner/repo"], true);
   h.start();
   await h.advance();
-  expect(h.store.githubCommentBoundary("owner/repo")).toBeNull();
+  expect(h.calls).toEqual([["api", "--include", "rate_limit"]]);
+  expect(h.scopes).toEqual(["owner/repo"]);
+  expect(h.store.githubCommentBoundary("owner/repo")).toBe(new Date(at).toISOString());
   const i = commentIssue();
   i.comments = { totalCount: 1, nodes: [commandComment()] };
   h.data.set("owner/repo", [i]);
   await pollComments(h);
-  expect(h.store.githubCommentBoundary("owner/repo")).toBe(commandAt);
   await pollComments(h);
-  expect(h.runs()).toEqual([]);
+  expect(h.calls[1]?.[1]).toBe("graphql");
+  expect(h.runs()).toHaveLength(1);
+  expect(records(h)).toHaveLength(1);
 });
+
+test("initializing one repository leaves an already enabled repository actionable", async () => {
+  const h = harness({}, ["owner/a", "owner/b"], true);
+  h.store.githubCommentBoundary("owner/b", at);
+  for (const repo of ["owner/a", "owner/b"]) h.data.set(repo, [issue()]);
+  h.start();
+  await h.advance();
+  expect(h.calls[0]).toEqual(["api", "--include", "rate_limit"]);
+  expect(h.calls[1]?.[1]).toBe("graphql");
+  expect(h.scopes).toEqual(["owner/a", "owner/b"]);
+  expect(h.runs()).toHaveLength(1);
+  expect(h.runs()[0]?.sourceRef?.repo).toBe("owner/b");
+});
+
+test.each(["missing", "invalid", "body only", "http error", "request failed"])(
+  "%s GitHub Date leaves initialization retryable and starts no work",
+  async (mode) => {
+    const h = harness({}, ["owner/repo"], true);
+    h.data.set("owner/repo", [issue()]);
+    h.boundaryResponse =
+      mode === "missing"
+        ? "HTTP/2.0 200 OK\r\n\r\n{}"
+        : mode === "invalid"
+          ? "HTTP/2.0 200 OK\r\nDate: nonsense\r\n\r\n{}"
+          : mode === "body only"
+            ? `HTTP/2.0 200 OK\r\n\r\nDate: ${new Date(at).toUTCString()}`
+            : `HTTP/2.0 429 Too Many Requests\r\nDate: ${new Date(at).toUTCString()}\r\n\r\n{}`;
+    if (mode === "request failed")
+      h.intercept = () => {
+        throw new Error("HTTP 503");
+      };
+    h.start();
+    await h.advance();
+    expect(h.calls).toEqual([["api", "--include", "rate_limit"]]);
+    expect(h.store.githubCommentBoundary("owner/repo")).toBeNull();
+    expect(h.runs()).toEqual([]);
+    expect(records(h)).toEqual([]);
+    h.intercept = undefined;
+    h.boundaryResponse = `HTTP/2.0 200 OK\nDATE: ${new Date(at).toUTCString()}\n\n{}`;
+    await h.advance(180_000);
+    expect(h.store.githubCommentBoundary("owner/repo")).toBe(new Date(at).toISOString());
+    expect(h.calls).toHaveLength(2);
+    expect(h.runs()).toEqual([]);
+    await pollComments(h);
+    expect(h.runs()).toHaveLength(1);
+  },
+);
 
 test("20 returned comments out of 25 leave label eligibility intact and include newest commands", async () => {
   const h = harness();
@@ -3054,10 +3276,57 @@ test.each([false, true])("queue webhook is only a poll hint; delayed edited stat
     status: "ignored",
     note: "Issue queue poll requested",
   });
-  await h.advance();
+  await h.advance(30_000);
   expect(h.runs()).toHaveLength(edited ? 0 : 1);
   expect(records(h)).toHaveLength(edited ? 0 : 1);
 });
+
+test("PR comment webhooks in queue repositories retain provenance and comment deduplication", async () => {
+  const h = harness();
+  const i = commentIssue();
+  let hints = 0;
+  const handle = githubWebhook(h.factory, undefined, () => {
+    hints++;
+  });
+  expect((await handle(commentDelivery(i, "pr-first", "owner", true))).status).toBe(201);
+  const run = h.runs()[0];
+  if (!run) throw new Error("missing PR command run");
+  expect(run.githubWebhookVerified).toBe(true);
+  expect(run.sourceRef).toEqual({ kind: "issue", repo: "owner/repo", number: 1 });
+  expect(h.requests[0]?.allow).toEqual(["workflows"]);
+  h.store.updateRun(run.id, { status: "succeeded", finishedAt: h.clock.now() });
+  expect((await handle(commentDelivery(i, "pr-first", "owner", true))).status).toBe(200);
+  expect((await handle(commentDelivery(i, "pr-second", "owner", true))).status).toBe(200);
+  expect(h.runs()).toHaveLength(1);
+  expect(records(h)).toMatchObject([{ outcome: "run", run_id: run.id }]);
+  expect(hints).toBe(0);
+  expect((await handle(commentDelivery(i, "issue-hint"))).status).toBe(200);
+  expect(hints).toBe(1);
+  expect(h.runs()).toHaveLength(1);
+});
+
+test.each([false, true])(
+  "trusted bot authors are excluded even when identity fails: %s",
+  async (failIdentity) => {
+    const h = harness({ trusted: ["owner", "factory[bot]", "dependabot[bot]"] });
+    const i = await enableComments(h);
+    h.identity = async () => {
+      if (failIdentity) throw new Error("identity unavailable");
+      return { kind: "app", token: "fake", botLogin: "factory[bot]" };
+    };
+    i.comments = {
+      totalCount: 2,
+      nodes: [
+        { ...commandComment(), author: { login: "FACTORY[BoT]" } },
+        { ...commandComment(2), author: { login: "Dependabot[BOT]" } },
+      ],
+    };
+    await pollComments(h);
+    await pollComments(h);
+    expect(h.runs()).toEqual([]);
+    expect(records(h)).toEqual([]);
+  },
+);
 
 test("webhook hints find commands beyond the oldest 100 open issues", async () => {
   const h = harness();
@@ -3072,7 +3341,7 @@ test("webhook hints find commands beyond the oldest 100 open issues", async () =
   const handle = githubWebhook(h.factory, undefined, h.pollNow);
   expect((await handle(commentDelivery(target))).status).toBe(200);
   expect(h.runs()).toEqual([]);
-  await h.advance();
+  await h.advance(30_000);
   expect(h.runs()).toHaveLength(1);
   expect(h.calls).toHaveLength(6);
   expect(h.runs()[0]?.sourceRef).toEqual({
@@ -3086,19 +3355,22 @@ test("webhook hints find commands beyond the oldest 100 open issues", async () =
   expect(h.runs()).toHaveLength(1);
 });
 
-test("the first poll boundary includes later issue pages", async () => {
-  const h = harness();
+test("initialization skips all issue pages and pre-enable commands on later pages", async () => {
+  const h = harness({}, ["owner/repo"], true);
   const issues = Array.from({ length: 101 }, (_, n) => commentIssue(n + 1));
   const target = issues[100];
   if (!target) throw new Error("missing last-page issue");
-  target.comments = { totalCount: 1, nodes: [commandComment()] };
+  target.comments = { totalCount: 1, nodes: [{ ...commandComment(), createdAt: at }] };
   h.data.set("owner/repo", issues);
   h.start();
   await h.advance();
-  expect(h.store.githubCommentBoundary("owner/repo")).toBe(commandAt);
+  expect(h.store.githubCommentBoundary("owner/repo")).toBe(new Date(at).toISOString());
+  expect(h.calls).toEqual([["api", "--include", "rate_limit"]]);
+  expect(h.runs()).toEqual([]);
   await pollComments(h);
   expect(h.runs()).toEqual([]);
   expect(records(h)).toEqual([]);
+  expect(h.calls).toHaveLength(3);
 });
 
 test.each(["gh failure", "schema mismatch", "rate limit"])(
@@ -3117,7 +3389,7 @@ test.each(["gh failure", "schema mismatch", "rate limit"])(
     if (failure === "rate limit") h.rate.remaining = 0;
     h.start();
     await h.advance();
-    expect(h.store.githubCommentBoundary("owner/repo")).toBeNull();
+    expect(h.store.githubCommentBoundary("owner/repo")).toBe(at);
     h.intercept = undefined;
     h.response = undefined;
     h.rate.remaining = 5000;
@@ -3131,7 +3403,7 @@ test.each(["gh failure", "schema mismatch", "rate limit"])(
     expect(h.runs()).toEqual([]);
     expect(records(h)).toEqual([]);
     h.intercept = undefined;
-    await pollComments(h);
+    await h.advance(180_000);
     expect(h.runs()).toHaveLength(1);
   },
 );
@@ -3190,13 +3462,19 @@ test("identity failure leaves mentions retryable while slash commands still work
   };
   const mention = commentIssue(2);
   mention.comments = { totalCount: 1, nodes: [{ ...commandComment(2), body: "@FACTORY do it" }] };
-  i.comments = { totalCount: 1, nodes: [commandComment()] };
+  i.comments = {
+    totalCount: 1,
+    nodes: [{ ...commandComment(), body: "/limitless Fix <!-- limitless-lifecycle: marker" }],
+  };
   h.data.set("owner/repo", [i, mention]);
   await pollComments(h);
   expect(h.runs()).toHaveLength(1);
   expect(h.store.githubCommentProcessed({ repo: "owner/repo", id: 2 })).toBe(false);
   h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
   await pollComments(h);
+  expect(h.runs()).toHaveLength(2);
+  await pollComments(h);
+  expect(records(h)).toHaveLength(2);
   expect(h.runs()).toHaveLength(2);
 });
 
@@ -3231,6 +3509,7 @@ test("concurrent queues recheck the comment inside the transaction after a claim
   });
   const second = startIssueQueue(h.factory, {
     gh: h.gh,
+    lifecycle: { identity: h.identity },
     clock: {
       now: h.clock.now,
       set: h.clock.timer.set as unknown as typeof setTimeout,
@@ -3286,7 +3565,7 @@ test("mounted webhook requests a queue poll only for verified trusted created de
     expect(h.runs()).toEqual([]);
     expect((await route(commentDelivery(i, "hint", "COLLABORATOR"), localServer)).status).toBe(200);
     expect(h.runs()).toEqual([]);
-    await h.advance();
+    await h.advance(30_000);
     expect(h.runs()).toHaveLength(1);
   } finally {
     await integrations.stop();

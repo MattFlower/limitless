@@ -302,6 +302,7 @@ export function githubWebhook(
       const queue = factory.cfg.githubQueue;
       if (
         event === "issue_comment" &&
+        !object(p?.issue)?.pull_request &&
         repo &&
         queue?.trusted.length &&
         queue.repos.some((r) => r.toLowerCase() === repo.toLowerCase())

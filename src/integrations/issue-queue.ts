@@ -170,6 +170,9 @@ export function startIssueQueue(
   let limited = false;
   let inFlight = false;
   let pending = false;
+  let startedAt = -Infinity;
+  let retryNotBefore = 0;
+  let nextTickAt = Infinity;
   let timer: ReturnType<typeof setTimeout>;
   const query = async (repo: string, fields: string) => {
     const [owner, name] = repo.split("/");
@@ -216,9 +219,11 @@ export function startIssueQueue(
   };
   const tick = async () => {
     if (stopped) return;
+    startedAt = now();
     inFlight = true;
     pending = false;
     limited = false;
+    let failed = false;
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
     try {
@@ -226,10 +231,20 @@ export function startIssueQueue(
       for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
         try {
+          const boundary = factory.store.githubCommentBoundary(repo);
+          if (!boundary) {
+            const raw = await gh(["api", "--include", "rate_limit"], abort.signal, undefined, repo);
+            const headers = (raw ?? "").split(/\r?\n\r?\n/)[0] ?? "";
+            const githubAt = Date.parse(headers.match(/^date:[\t ]*(.+)$/im)?.[1] ?? "");
+            if (!/^HTTP\/\S+ 2\d\d\b/.test(headers) || !Number.isFinite(githubAt))
+              throw new Error("GitHub enable boundary requires a successful response with a Date header");
+            if (!stopped) factory.store.githubCommentBoundary(repo, new Date(githubAt).toISOString());
+            continue;
+          }
           const issues = { nodes: [] as QueueIssue[] };
           const cursors = new Set<string>();
           let after: string | null = null;
-          // Validate every page before establishing the boundary or consuming commands.
+          // Validate every page before consuming commands.
           do {
             const data = await query(
               repo,
@@ -267,16 +282,7 @@ export function startIssueQueue(
             }
           }
           if (stopped) break;
-          const boundary = factory.store.githubCommentBoundary(repo);
-          if (!boundary) {
-            const newest = issues.nodes
-              .flatMap((i) => [i.updatedAt, ...i.comments.nodes.map((c) => c.createdAt)])
-              .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
-            if (newest) factory.store.githubCommentBoundary(repo, newest);
-          }
-          const identity = boundary
-            ? await (opts.lifecycle?.identity ?? githubIdentity)(repo).catch(() => null)
-            : null;
+          const identity = await (opts.lifecycle?.identity ?? githubIdentity)(repo).catch(() => null);
           const bot = identity?.kind === "app" ? identity.botLogin.toLowerCase() : null;
           for (const issue of issues.nodes) {
             for (const c of boundary && issue.state === "OPEN" ? issue.comments.nodes : []) {
@@ -295,8 +301,7 @@ export function startIssueQueue(
                 !request?.trim() ||
                 !author ||
                 c.lastEditedAt ||
-                author.toLowerCase() === bot ||
-                c.body.includes("<!-- limitless-") ||
+                /\[bot\]$/i.test(author) ||
                 !q.trusted.some((t) => t.toLowerCase() === author.toLowerCase()) ||
                 Date.parse(c.createdAt) <= Date.parse(boundary ?? "") ||
                 factory.store.githubCommentProcessed(comment)
@@ -338,6 +343,7 @@ export function startIssueQueue(
               log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${result.reason}`));
           }
         } catch (e) {
+          failed = true;
           if (!stopped) log(redactCredentials(`Issue queue ${repo}: ${String(e)}`));
         }
       }
@@ -401,13 +407,18 @@ export function startIssueQueue(
         }
       }
     } catch (e) {
+      failed = true;
       if (!stopped) log(redactCredentials(`Issue queue: ${String(e)}`));
     } finally {
       inFlight = false;
-      schedule(Math.max(now() + (pending ? 0 : q.pollSeconds * 1000), notBefore));
+      const regular = now() + q.pollSeconds * 1000;
+      retryNotBefore = failed ? regular : 0;
+      const hinted = pending && !failed ? Math.max(now(), startedAt + 30_000) : Infinity;
+      schedule(Math.max(Math.min(regular, hinted), notBefore));
     }
   };
   const schedule = (deadline: number) => {
+    nextTickAt = deadline;
     if (!stopped)
       timer = set(
         () => (now() < deadline ? schedule(deadline) : void tick()),
@@ -427,7 +438,8 @@ export function startIssueQueue(
         if (inFlight) pending = true;
         else {
           clear(timer);
-          schedule(Math.max(now(), notBefore));
+          const hinted = Math.max(now(), startedAt + 30_000, retryNotBefore, notBefore);
+          schedule(Math.min(nextTickAt, hinted));
         }
       },
     },
