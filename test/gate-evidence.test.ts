@@ -21,7 +21,9 @@ import { confinementScope } from "../src/harness/sandbox.ts";
 import {
   type CoveringTestRun,
   coveringTestCommand,
+  matchingSkips,
   selectCoveringTests,
+  skipMatches,
 } from "../src/pipeline/covering-tests.ts";
 import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
@@ -1522,5 +1524,80 @@ test("covering commands validate trusted configuration and tracked, contained te
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("skip identities are compared in Bun's space-joined filter form", () => {
+  expect(skipMatches("passes", "outer > passes")).toBe(true);
+  expect(skipMatches("outer passes", "outer > passes")).toBe(true);
+  expect(skipMatches("passes", "a > b > passes")).toBe(true);
+  // A component containing ` > ` cannot hide a match; ambiguity counts as a skip.
+  expect(skipMatches("a > b passes", "a > b > passes")).toBe(true);
+  expect(skipMatches("passes", "outer > bypasses")).toBe(false);
+  expect(skipMatches("outer passes", "passes")).toBe(false);
+  expect(skipMatches("passes", "outer > passes > inner")).toBe(false);
+});
+
+test("a nested skipped match refuses binding even when another suffix match passed", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-nested-skip-"));
+  try {
+    const seed = seeded(async (dir) => {
+      await sh(["git", "init", "-q"], { cwd: dir });
+      writeFileSync(
+        join(dir, "x.test.ts"),
+        `import { describe, expect, test } from "bun:test";
+test("outer passes", () => expect(true).toBe(true));
+describe("outer", () => {
+  test.skip("passes", () => expect(true).toBe(true));
+  test("other", () => expect(true).toBe(true));
+});
+`,
+      );
+      await sh(["git", "add", "."], { cwd: dir });
+      await sh(["git", "commit", "-qm", "nested skip fixture"], { cwd: dir });
+      return (await sh(["git", "rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
+    });
+    const { value: checkedSha } = await seed(cwd);
+    // Bun's filter sees both `outer passes` tests; the skipped one is reported as `outer > passes`.
+    const test = { file: "x.test.ts", name: "outer passes" };
+    const built = await coveringTestCommand(test, coveringConfig, cwd, checkedSha);
+    if (!built.command) throw new Error(built.reason);
+    const command = built.command.replace(/^bun /, `${process.execPath} `);
+    for (const run of [command, `${command} --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"`]) {
+      const gate = await confinementScope.run(fakeConfinement, () =>
+        runLocalGates(
+          cwd,
+          { source: "detected", setup: [], checks: [{ name: "test", run }], protectedPaths: [] },
+          new AbortController().signal,
+        ),
+      );
+      const check = gate.checks[0];
+      if (!check) throw new Error("missing covering check");
+      expect(check.testCoverage?.summary).toEqual({ passed: 1, failed: 0 });
+      const result = { ...check, executionProvenance: { sha, trackedClean: true } };
+      const record: CoveringTestRun = {
+        ...coveringRun(),
+        ...test,
+        result,
+        skipped: matchingSkips(test, result),
+      };
+      expect(record.skipped).toBe(1);
+      const nested: Verify = {
+        ...requested,
+        criteria: requested.criteria.map((c) => ({ ...c, covering_tests: [test] })),
+      };
+      const verdict = bindCovering(nested, [record]).criteria[0];
+      expect(verdict).toMatchObject({ status: "blocked", blockedReason: "sandbox" });
+      expect(verdict?.evidence).toContain("named test skipped");
+      // A JUnit identity in ` > ` form, without the console count, also refuses.
+      const junit = structuredClone(record);
+      junit.skipped = 0;
+      if (!junit.result?.testCoverage) throw new Error("missing coverage");
+      junit.result.testCoverage.skippedTests = [{ file: "x.test.ts", name: "outer > passes", line: 4 }];
+      delete junit.result.testCoverage.skippedTestsIncomplete;
+      expect(bindCovering(nested, [junit]).criteria[0]?.evidence).toContain("named test skipped");
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });

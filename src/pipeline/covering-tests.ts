@@ -22,22 +22,34 @@ export interface CoveringTestRun extends Test {
 }
 export const coveringPattern = (name: string): string =>
   `(?:^| )${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+/**
+ * Bun's `-t` sees describe/test names joined by spaces; skip rows join them with ` > `. Dropping
+ * `>` tokens makes both identical, so a suffix comparison over-approximates a filter match.
+ */
+export function skipMatches(name: string, identity: string): boolean {
+  const tokens = (text: string) => text.split(" ").filter((token) => token !== ">");
+  const wanted = tokens(name);
+  const skipped = tokens(identity);
+  return (
+    wanted.length <= skipped.length &&
+    wanted.every((t, i) => t === skipped[skipped.length - wanted.length + i])
+  );
+}
 const controls = (text: string) =>
   [...text].some((c) => c.charCodeAt(0) < 32 || (c.charCodeAt(0) >= 127 && c.charCodeAt(0) <= 159));
 
-function matchingSkips(test: Test, result: GateResult): number {
-  const pattern = new RegExp(coveringPattern(test.name));
+export function matchingSkips(test: Test, result: GateResult): number {
   let file = "";
   let count = 0;
   for (const line of result.output.split(/\r?\n/).map((line) => line.trim())) {
     if (/\.(?:test|spec)\.[cm]?[jt]sx?:$/.test(line)) file = line.slice(0, -1).replace(/^\.\//, "");
     const title = /^\((?:skip|todo)\) (.*?)(?:\s+\[[\d.]+m?s\])?$/.exec(line)?.[1];
-    if (file === test.file.replace(/^\.\//, "") && title && pattern.test(title)) count++;
+    if (file === test.file.replace(/^\.\//, "") && title && skipMatches(test.name, title)) count++;
   }
   return Math.max(
     count,
     result.testCoverage?.skippedTests?.filter(
-      (t) => t.file === test.file.replace(/^\.\//, "") && pattern.test(t.name),
+      (t) => t.file === test.file.replace(/^\.\//, "") && skipMatches(test.name, t.name),
     ).length ?? 0,
   );
 }
@@ -124,7 +136,7 @@ export function coveringTestRefusal(
   if (
     run.skipped ||
     coverage?.skippedTests?.some(
-      (t) => t.file === run.file.replace(/^\.\//, "") && new RegExp(coveringPattern(run.name)).test(t.name),
+      (t) => t.file === run.file.replace(/^\.\//, "") && skipMatches(run.name, t.name),
     )
   )
     return "named test skipped";
