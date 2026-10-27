@@ -5,6 +5,7 @@
  * git show <base>:src/gates/private.ts > "$TMPDIR/baseline/src/gates/private.ts"
  * bun scripts/benchmark-credential-redaction.ts "$TMPDIR/baseline"
  * Each version/count/workload uses a fresh process, identical seeded inputs, two warmups and five trials.
+ * Seven such processes per version alternate with the other version's; the table reports the median.
  * Fixture generation, registration and matcher compilation are outside the measured calls.
  */
 import { createHash } from "node:crypto";
@@ -16,6 +17,7 @@ import { agentEnv, runProcess } from "../src/util/proc.ts";
 
 const counts = [0, 50, 200, 600];
 const workloads = ["plain", "escaped slashes"] as const;
+const rounds = 7;
 type Measurement = { median: number; stall: number };
 type Measurements = Record<"redactCredentials" | "privateMatches", Measurement>;
 
@@ -119,7 +121,7 @@ if (process.argv[2] === "--worker") {
       await writeFile(join(scratch, file), `export * from "../${file.replaceAll("/", "-")}";\n`);
     }
     console.log(
-      `Bun ${Bun.version}; 5 MiB ASCII logs + JSON; 8 private entries; median of 5 after 2 warmups`,
+      `Bun ${Bun.version}; 5 MiB ASCII logs + JSON; 8 private entries; median of 5 after 2 warmups, median of ${rounds} alternating processes`,
     );
     console.log("Times and worst queued-callback event-loop stalls in ms; generation/registration excluded.");
     console.log(
@@ -131,21 +133,37 @@ if (process.argv[2] === "--worker") {
     console.log("|---|---|---:|---:|---:|---:|---:|---:|");
     for (const workload of workloads) {
       for (const count of counts) {
-        const results: Measurements[] = [];
-        for (const root of [pathToFileURL(scratch).href, new URL("../src", import.meta.url).href]) {
-          const result = await runProcess({
-            cmd: [process.execPath, import.meta.path, "--worker", root, String(count), workload],
-            cwd: process.cwd(),
-            env: agentEnv(),
-          });
-          if (result.exitCode !== 0) throw new Error(result.stderr);
-          results.push(JSON.parse(result.stdout));
+        const roots = [pathToFileURL(scratch).href, new URL("../src", import.meta.url).href];
+        const results: Measurements[][] = [[], []];
+        // Alternate which version runs first so drifting machine load affects both versions alike.
+        for (let round = 0; round < rounds; round++) {
+          for (const version of round % 2 ? [1, 0] : [0, 1]) {
+            const result = await runProcess({
+              cmd: [
+                process.execPath,
+                import.meta.path,
+                "--worker",
+                roots[version] ?? "",
+                String(count),
+                workload,
+              ],
+              cwd: process.cwd(),
+              env: agentEnv(),
+            });
+            if (result.exitCode !== 0) throw new Error(result.stderr);
+            results[version]?.push(JSON.parse(result.stdout));
+          }
         }
-        const [before, after] = results;
-        if (!before || !after) throw new Error("Missing benchmark results");
+        const combine = (runs: Measurements[] | undefined, kind: keyof Measurements): Measurement => {
+          const medians = (runs ?? []).map((run) => run[kind].median).sort((a, b) => a - b);
+          return {
+            median: medians[Math.floor(medians.length / 2)] ?? 0,
+            stall: Math.max(...(runs ?? []).map((run) => run[kind].stall)),
+          };
+        };
         for (const kind of ["redactCredentials", "privateMatches"] as const) {
-          const b = before[kind];
-          const a = after[kind];
+          const b = combine(results[0], kind);
+          const a = combine(results[1], kind);
           const change = ((a.median / b.median - 1) * 100).toFixed(1);
           console.log(
             `| ${kind} | ${workload} | ${count} | ${b.median.toFixed(6)} | ${a.median.toFixed(6)} | ${change}% | ${b.stall.toFixed(3)} | ${a.stall.toFixed(3)} |`,
