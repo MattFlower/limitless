@@ -16,7 +16,7 @@ type Options = Parameters<typeof sh>[1];
 
 /** What `worktreeGit` adds to a command: hooks to blank and the empty tree for `--attr-source`. */
 export interface Hardening {
-  /** Every config-defined hook and filter-driver key git sees, to blank. */
+  /** Config-defined hooks, filters and (on Linux) textconv commands to blank. */
   hooks: string[];
   /** The empty tree's id in the repository's object format; null when it must be hashed. */
   emptyTree: string | null;
@@ -282,7 +282,13 @@ async function list(
     const [origin = "", entry = ""] = [fields[i + 1], fields[i + 2]];
     const name = entry.split("\n", 1)[0] ?? "";
     const value = entry.includes("\n") ? entry.slice(name.length + 1) : undefined;
-    if (name.startsWith("hook.") || name.startsWith("filter.")) hooks.add(name);
+    // Linux's allowed ELF loader could run a blob passed to any textconv-capable command.
+    if (
+      name.startsWith("hook.") ||
+      name.startsWith("filter.") ||
+      (process.platform === "linux" && /^diff\..*\.textconv$/.test(name))
+    )
+      hooks.add(name);
     const file = origin.startsWith("file:") ? resolve(opts.cwd, origin.slice(5)) : undefined;
     if (file) sources.add(file);
     else if (origin !== "command line:") pinned = false;

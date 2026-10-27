@@ -44,8 +44,8 @@ The [Git configuration reference](https://git-scm.com/docs/git-config) and
 | `gpg.program`, `commit.gpgSign` | Signing profile probe. A nested dirty check does not commit inside the nested repository. |
 | `core.askPass`, credential helpers, `core.sshCommand` | Authentication/transport paths; checkout operations do not request them. Confined operations have no network or shell transport. |
 | hooks | Existing hook tests; bundle delivery plants pre-push, pre-receive, update and reference-transaction hooks at both ends and checks that none runs. Tags and notes remain absent at the destination. |
-| external diff / textconv | Existing hardening disables them on inspection. |
-| pager / editor / sequence editor / merge tools | Factory captures output and supplies commit messages, uses noninteractive rebase, and does not invoke external diff/merge tools. Any attempted execution is denied. |
+| external diff / textconv | Inspection disables them; Linux also covers `show` and blanks configured textconv drivers for every command, including `cat-file --textconv`, blame and grep. |
+| pager / editor / sequence editor / merge tools | Factory captures output and supplies commit messages, uses noninteractive rebase, and does not invoke external diff/merge tools. Linux overrides editors with `/dev/null`; see the loader limitation below. |
 | shell aliases / remote helpers / upload-pack / receive-pack | Alias execution probe; local delivery and candidate-to-grader transfer use bundles. Remote transports remain outside this boundary. |
 | maintenance / gc / alternate-ref commands | Executions outside the Git installation are denied; destination bundle fetch disables automatic maintenance/gc. |
 
@@ -100,16 +100,35 @@ the launcher is a Bun process.
 it with ordinary reads. So any program Git starts with a path-like first argument could run another
 binary through the loader, where Seatbelt refuses the exec of the program itself. Confined Git
 therefore runs with `GIT_ALLOW_PROTOCOL=file`, whatever the command line or repository config says.
-That refuses exec transports (`ext::`), the one route that takes such a program and its arguments from
-configuration without a shell; with the network unshared, only local repositories and bundles work
-anyway. The other configured programs either go through `sh`, which the execute rule refuses
-(aliases, `core.fsmonitor`, `uploadpack`, and any value with arguments), or are overridden
-(`GIT_SSH_COMMAND`, an empty `credential.helper`, signing turned off by `worktreeGit`). Those left get
-no program from the repository: the loader receives only an option it rejects, a bare name it looks up
-on the library path, or a file Git itself writes, such as an editor's message file. The network, filesystem write
-and Unix-socket restrictions still apply to whatever runs. Because `git-upload-pack` starts through
+That refuses exec transports (`ext::`); with the network unshared, only local repositories and bundles
+work anyway. Other shell-free routes also need overrides: an editor's message file can contain an ELF
+copied from `commit.template`, and textconv can receive an ELF blob. Linux assigns `GIT_EDITOR`,
+`GIT_SEQUENCE_EDITOR`, `GIT_ASKPASS` and `SSH_ASKPASS` to `/dev/null` after the caller's environment.
+These take precedence over repository settings and cannot name an executable. `worktreeGit` blanks
+every configured textconv driver on Linux in both config-discovery paths, so explicit textconv
+requests cannot start a converter. It also suppresses textconv and repository attributes for `show`,
+`diff` and `log`, and overrides `gpg.ssh.defaultKeyCommand` with `/dev/null`: disabling routine
+signing alone does not protect explicit `-S` requests.
+
+`core.fsmonitor` can execute a bare program without `sh`; the wrapper disables it with
+`core.fsmonitor=false`. Aliases, `uploadpack` and shell command strings are refused by the execute
+rule. `agentEnv` overrides `GIT_SSH_COMMAND` and empties `credential.helper`. These Linux overrides
+do not change macOS behavior or remove the loader's underlying execute allowance. The network,
+filesystem write and Unix-socket restrictions still apply. Because `git-upload-pack` starts through
 `sh`, confined Git on Linux can fetch from a bundle but not from a local repository path; workers
 only fetch bundles.
+
+The Linux regressions exercise editor templates, `show` and `cat-file` textconv, and explicitly
+requested SSH signing with ELF marker payloads. They run both through the real backend behind
+`bwrapSkip` and through the generated payload launch without namespaces. The latter verifies Git's
+override behavior, not confinement. Portable launch assertions also cover both askpass variables and
+the sequence editor.
+
+The editor probe supplies an explicit Git identity: bubblewrap's private `/tmp` hides the temporary
+global config installed by `test/setup.ts`. Without that identity, commit fails before creating
+`COMMIT_EDITMSG` or launching the editor, so the absent marker does not test the override. The probe
+also checks that the message file contains the ELF template and that Git reports the `/dev/null`
+editor failure. Landlock permits the loader to map this file; the editor override closes that route.
 
 ## Checks run in the worker
 
