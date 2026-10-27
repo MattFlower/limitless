@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { worktreeGit } from "../git/command.ts";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
@@ -9,7 +10,14 @@ import type { GateCommand, GateConfig } from "./detect.ts";
 import { type DocsSelection, quoteRetryFiles, singleBunTest } from "./docs.ts";
 import { executeGate, type GateRunner, gateProvenance } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
-import { type FailedTestFiles, readJUnit, readJUnitSkips, validRetryFiles } from "./junit.ts";
+import {
+  type CoveringTestEvidence,
+  type FailedTestFiles,
+  readCoveringJUnit,
+  readJUnit,
+  readJUnitSkips,
+  validRetryFiles,
+} from "./junit.ts";
 import {
   findGateCounterpart,
   launchFailure,
@@ -22,6 +30,9 @@ import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
+  coveringTest?: CoveringTestEvidence;
+  /** Configured command plus factory-supplied arguments, when execution adds any. */
+  executedCommand?: string;
   executionProvenance?: Pick<GateRun, "sha" | "trackedClean" | "provenanceError">;
   /** Successful execution rejected as evidence; the failed result remains authoritative. */
   retryAttempt?: GateResult;
@@ -148,8 +159,12 @@ async function runOne(
   const scratch = invocationScratch.getStore();
   if (!scratch) throw new Error("Missing gate command scratch");
   const report = join(scratch, `gate-report-${randomUUID()}.xml`);
+  const existed = existsSync(report);
+  const startedAt = Date.now();
+  const args = cmd.coveringTest ? ["--reporter=junit", `--reporter-outfile=${report}`] : undefined;
   const res = await runConfined({
     command: cmd.run,
+    args,
     cwd,
     env: { ...env, LIMITLESS_GATE_REPORT: report },
     signal,
@@ -170,6 +185,12 @@ async function runOne(
   return {
     name: cmd.name,
     command: cmd.run,
+    ...(args
+      ? { executedCommand: `${cmd.run} ${args.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}` }
+      : {}),
+    ...(cmd.coveringTest
+      ? { coveringTest: readCoveringJUnit(report, cwd, cmd.coveringTest, startedAt, existed) }
+      : {}),
     ok,
     exitCode: res.exitCode,
     durationMs: res.durationMs,

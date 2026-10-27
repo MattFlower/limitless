@@ -195,7 +195,7 @@ export function applyGateEvidence(
                 runs
                   .map(
                     (r) =>
-                      `Factory covering test ${r?.file} › ${r?.name} passed at ${sha} (stage ${r?.stageId}); command: ${r?.result?.command}`,
+                      `Factory covering test ${r?.file} › ${r?.name} passed at ${sha} (stage ${r?.stageId}); command: ${r?.result?.executedCommand ?? r?.result?.command}`,
                   )
                   .join("; "),
               ),
@@ -203,7 +203,7 @@ export function applyGateEvidence(
                 stageId: first.stageId,
                 sha,
                 check: redactGateOutput(`${first.file} › ${first.name}`),
-                command: redactGateOutput(first.result.command),
+                command: redactGateOutput(first.result.executedCommand ?? first.result.command),
               },
             };
         }

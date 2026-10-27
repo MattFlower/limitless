@@ -1255,6 +1255,7 @@ test.each([
   "resume",
   "resume-retry",
   "inflight",
+  "recorded",
   "skip",
   "round-limit",
   "retry-limit",
@@ -1339,14 +1340,19 @@ test.each([
     false,
     { gateExecutor: executor },
   );
-  if (mode === "resume" || mode === "resume-retry" || mode === "inflight")
+  if (mode === "resume" || mode === "resume-retry" || mode === "inflight" || mode === "recorded")
     f.deps.faults = {
       "store:save": {
         action: "kill",
         when: (c) =>
           c.stage === "verify" &&
           targeted > 0 &&
-          c.checkpoint === (mode === "inflight" ? "gate-result" : "verify-result"),
+          c.checkpoint ===
+            (mode === "inflight"
+              ? "gate-result"
+              : mode === "recorded"
+                ? "covering-test-recorded"
+                : "verify-result"),
       },
     };
   const interrupted = deferred<void>();
@@ -1358,7 +1364,7 @@ test.each([
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
     let terminal: RunStatus;
     let saved: RunState["coveringTestRuns"];
-    if (mode === "resume" || mode === "resume-retry" || mode === "inflight") {
+    if (mode === "resume" || mode === "resume-retry" || mode === "inflight" || mode === "recorded") {
       await interrupted.promise;
       await f.stop();
       saved = f.store.getRunState<RunState>(run.id)?.coveringTestRuns;
@@ -1366,6 +1372,13 @@ test.each([
       if (mode === "inflight") {
         expect(saved?.[0]?.result).toBeUndefined();
         expect(f.store.getRunState<RunState>(run.id)?.gateExecution?.purpose).toStartWith("covering-test:");
+      }
+      if (mode === "recorded") {
+        const record = saved?.[0];
+        expect(record?.result?.coveringTest).toEqual({ file: "x.test.ts", name: "passes 0" });
+        const report = /--reporter-outfile=([^']+)/.exec(record?.result?.executedCommand ?? "")?.[1];
+        if (!report) throw new Error("missing report path");
+        expect(existsSync(report)).toBe(false); // Execution scratch has already been removed.
       }
       if (mode === "resume-retry")
         expect(f.store.getRunState<RunState>(run.id)?.verifyResults).toHaveLength(1);
@@ -1407,11 +1420,14 @@ test.each([
         stageId: record?.stageId,
         sha: state?.lastVerifiedSha,
         check: "x.test.ts › passes 0",
-        command: commands[0],
+        command: record?.result?.executedCommand,
       });
+      expect(record?.result?.executedCommand).toContain(
+        `${commands[0]} '--reporter=junit' '--reporter-outfile=`,
+      );
       expect(commands[0]).toBe("bun test -t '(?:^| )passes 0$' './x.test.ts'");
-      if (mode === "inflight") expect(record?.stageId).toBe(saved?.[0]?.stageId);
-      if (mode === "resume" || mode === "resume-retry") {
+      if (mode === "inflight" || mode === "recorded") expect(record?.stageId).toBe(saved?.[0]?.stageId);
+      if (mode === "resume" || mode === "resume-retry" || mode === "recorded") {
         expect(verifierCalls).toBe(mode === "resume-retry" ? 2 : 1);
         expect(record).toEqual(saved?.[0]);
       }

@@ -17,42 +17,12 @@ export interface CoveringTestRun extends Test {
   stageId: number;
   result?: GateResult;
   command?: string;
-  skipped?: number;
   reason?: string;
 }
 export const coveringPattern = (name: string): string =>
   `(?:^| )${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
-/**
- * Bun's `-t` sees describe/test names joined by spaces; skip rows join them with ` > `. Dropping
- * `>` tokens makes both identical, so a suffix comparison over-approximates a filter match.
- */
-export function skipMatches(name: string, identity: string): boolean {
-  const tokens = (text: string) => text.split(" ").filter((token) => token !== ">");
-  const wanted = tokens(name);
-  const skipped = tokens(identity);
-  return (
-    wanted.length <= skipped.length &&
-    wanted.every((t, i) => t === skipped[skipped.length - wanted.length + i])
-  );
-}
 const controls = (text: string) =>
   [...text].some((c) => c.charCodeAt(0) < 32 || (c.charCodeAt(0) >= 127 && c.charCodeAt(0) <= 159));
-
-export function matchingSkips(test: Test, result: GateResult): number {
-  let file = "";
-  let count = 0;
-  for (const line of result.output.split(/\r?\n/).map((line) => line.trim())) {
-    if (/\.(?:test|spec)\.[cm]?[jt]sx?:$/.test(line)) file = line.slice(0, -1).replace(/^\.\//, "");
-    const title = /^\((?:skip|todo)\) (.*?)(?:\s+\[[\d.]+m?s\])?$/.exec(line)?.[1];
-    if (file === test.file.replace(/^\.\//, "") && title && skipMatches(test.name, title)) count++;
-  }
-  return Math.max(
-    count,
-    result.testCoverage?.skippedTests?.filter(
-      (t) => t.file === test.file.replace(/^\.\//, "") && skipMatches(test.name, t.name),
-    ).length ?? 0,
-  );
-}
 
 export function selectCoveringTests(verify: Verify) {
   let count = 0;
@@ -80,9 +50,7 @@ export async function coveringTestCommand(test: Test, cfg: GateConfig | undefine
     !singleBunTest(cfg.checks[0].run) ||
     !retry ||
     retry.split("{files}").length !== 2 ||
-    !singleBunTest(retry, "{files}") ||
-    // A template's own name filter would override the appended one.
-    /(?:^|[\t ])(?:-t|--test-name-pattern)(?:[\t =]|$)/.test(retry)
+    !singleBunTest(retry, "{files}")
   )
     return { reason: "targeted retries not configured" };
   if (!validRetryFiles([test.file], cwd)) return { reason: "file outside repository or invalid retry file" };
@@ -129,32 +97,11 @@ export function coveringTestRefusal(
   if (!/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha) || r.executionProvenance?.sha !== sha)
     return "run executed at a different SHA";
   if (r.executionProvenance.trackedClean !== true) return "run changed tracked files";
-  if (
-    !r.ok ||
-    r.exitCode !== 0 ||
-    r.timedOut ||
-    confinementFailed(r) ||
-    r.testCoverage?.summary?.failed ||
-    /^\s*\(fail\)/m.test(r.output)
-  )
-    return "test failed";
-  const coverage = r.testCoverage;
-  if (
-    run.skipped ||
-    coverage?.skippedTests?.some(
-      (t) => t.file === run.file.replace(/^\.\//, "") && skipMatches(run.name, t.name),
-    )
-  )
-    return "named test skipped";
-  if (
-    !coverage?.summary ||
-    coverage.summary.passed < 1 ||
-    !coverage.passedFiles.includes(run.file.replace(/^\.\//, ""))
-  )
-    return "name matched no tests";
-  if (coverage.summary.failed !== 0) return "test failed";
-  if (coverage.skippedTestsIncomplete) return "named test skip evidence incomplete";
-  return undefined;
+  if (!r.ok || r.exitCode !== 0 || r.timedOut || confinementFailed(r)) return "test failed";
+  const evidence = r.coveringTest;
+  if (!evidence || evidence.file !== run.file.replace(/^\.\//, "") || evidence.name !== run.name)
+    return "missing exact testcase JUnit evidence";
+  return evidence.reason;
 }
 
 /** Save the result before clearing the durable execution handle, including on restart. */
@@ -211,7 +158,6 @@ export async function runCoveringTests(
             : undefined,
         );
         if (!current.result) current.reason = "missing check result";
-        else current.skipped = matchingSkips(test, current.result);
         ctx.store.finishStage(stage.id, "succeeded", "covering-test execution recorded");
       };
       try {
@@ -224,7 +170,7 @@ export async function runCoveringTests(
             {
               ...cfg,
               setup: ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug) ? cfg.setup : [],
-              checks: [{ ...check, run: built.command }],
+              checks: [{ ...check, run: built.command, coveringTest: test }],
             },
             { fallbackSetup: cfg.setup },
             undefined,
