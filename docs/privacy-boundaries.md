@@ -111,8 +111,18 @@ For each new cap compare source length **before that cut**, in its declared U/B/
 equality is not clipping. Propagate prior true; a later cut cannot clear it. Prior unknown
 remains unknown unless a new actual cut establishes true. Withholding is separate from clipping.
 
-Cuts consume BoundaryText and preserve its proof; they do not rerun P on every tail or line.
-Concatenation tracks all component provenance and checks the full new rendering before a cut.
+Cuts consume BoundaryText but preserve only evidence about the complete source, **not proof
+that the cut rendering is safe**. NFKC is sensitive to cuts: with policy `host.example`,
+`"host.example\u0301"` has no match, but `.slice(0, 12)` removes the combining acute accent
+and exposes `host.example`. Every changed rendering (including line selection, trim, prefix,
+tail, byte cut and omission-marker joins) must pass P on its exact bytes before storage or
+emission, in addition to the complete-source check before C and cuts. Pass actual clipping
+provenance to P's partial-prefix check; false stays false for a complete exact-limit message.
+A match/refusal withholds the whole candidate; do not repeatedly shorten it until it passes.
+Concatenation tracks component provenance and checks the full new rendering before its cut,
+then validates the cut result. Further rewriting/C also requires exact-output validation.
+Only byte-identical output with the same policy/credential version may reuse a rendering
+receipt. A cut never transfers that receipt, even when the source receipt remains available.
 Arrays/objects use one recursive adapter for values, string keys and numeric display strings;
 key collisions after withholding replace the containing diagnostic object rather than overwrite
 another field. Parse complete JSON before field sanitization, and check complete raw fallback
@@ -131,7 +141,7 @@ to factory-written bytes, not an arbitrary model object's claim. Credentials add
 changed invalidate reuse; unavailable originals then require withholding. Do not persist raw
 sources merely to recheck them later. Cached receipts contain no private text or credentials.
 
-## Streams: check once at completion
+## Streams: complete capture before publication
 
 Choose complete capture, not a sliding window. The actual decoder accepts arbitrarily long
 backslash runs, base64 runs and whitespace sequences; NFKC can depend on combining sequences.
@@ -148,6 +158,8 @@ an oversized line. Gate classification must not depend on releasing free text fo
 At both EOFs, check each complete stream, plus the complete joined diagnostic rendering, before
 C, line framing, excerpts or the 6,000-U tail. Avoid an extra joined scan when one stream is
 empty and joining/trim adds no new text. Then release sanitized BoundaryText to those consumers.
+Consumers validate each changed excerpt/tail/line rendering before releasing it in turn;
+stream completion alone does not certify a normalization-sensitive cut.
 If a process times out/cancels before a complete logical value, mark provenance unknown and
 withhold its free text; retain typed exit/timeout/confinement facts. Decode failures do likewise.
 If the cap is exceeded, discard retained free text, drain the rest without buffering, record
@@ -178,15 +190,21 @@ For 5 MiB mostly ASCII stdout, eight entries and 600 synthetic credentials, budg
 raw check; a second full visible-form check only if terminal stripping changes text; and one
 terminal/credential pass after acceptance. With nonempty stderr the joined view adds a check.
 Each “check” can visit up to 16 forms across five rounds; it is not one byte scan. Base64 can
-try four alignments per relevant run. Reuse the resulting proof for all excerpts, tails, events
-and prompt fragments; only new assemblies/policy changes need new checks. Never scan each
-growing stream prefix or run a 600-entry regex loop on every output chunk.
+try four alignments per relevant run. Reuse complete-source evidence across consumers, but
+check each distinct cut/rendering; reuse exact safe bytes for repeated events/prompt fragments.
+Never scan each growing stream prefix or run a 600-entry regex loop on every output chunk.
 
 Estimate for unchanged decoder cost: ~1.3 s private work with one form source, ~2.6 s with
 raw plus different visible source, and up to ~3.9 s with another joined source, plus roughly
 0.1–0.6 s for normalization/credential/output handling. These are planning estimates only;
 prepared policies may improve them, and escape-heavy output can cost more. Measure the
 combined path, including decoded credential checks, before accepting a c2 performance claim.
+Add work proportional to the sum of distinct rendering lengths, not just captured bytes:
+an 8,000-U excerpt plus a 6,000-U tail adds about 3.5 ms at the reported ASCII baseline rate
+per validation pass (estimate, not measurement). Line/excerpt selection, final C'd output and
+prompt assemblies add further checks; one extra full 5-MiB rendering adds about 1.3 s.
+Cache only exact renderings under policy/credential version; record lengths/scan counts and
+bound cache retention within the checker budget. Check cut candidates serially.
 
 Five MiB ASCII uses ≤10 MiB per UTF-16 text copy; capture, visible/output and several current
 decoder forms suggest ~60–120 MiB peak text storage, plus matcher/object overhead. The capture
@@ -206,7 +224,8 @@ Reproduce locally in c2, without network, models or owner configuration:
    Feed 32-KiB chunks, then single-byte splits around escapes/UTF-8. Include cap+1 overflow.
 3. In fresh processes for base and c2, use two warmups and five timed trials; report medians,
    Bun/OS/architecture, total bytes, scan counts, compilation time separately, retained capture,
-   peak RSS and receipts reused. Instrument synthetic consumers for events/excerpts/prompts.
+   peak RSS and receipts reused. Instrument synthetic consumers for events/excerpts/prompts,
+   counting post-cut checks too; include combining-mark cuts and many distinct excerpts.
    Report full before/after timings and verify identical safe output across chunkings.
 4. `bun scripts/benchmark-credential-redaction.ts <baseline-proc.ts>` supplies a separate
    credential-only comparison (see its header for snapshot setup); it does not measure P.
@@ -223,6 +242,7 @@ Observe final bytes and stored fields, not a model's assertion that checking hap
 | A/B: emit `host.exam\\u0070le` in chunks; register `host.exam` as overlapping credential, then also test literal prefix plus escaped remainder and Unicode-normalized variants. | GateResult, stored gate event and implement prompt withhold the complete affected diagnostic; neither escaped remainder nor private prefix survives. Raw confinement detection still works. | `test/proc.test.ts`, `test/gates.test.ts`, `test/gate-feedback.test.ts`. |
 | A/B/C: place a private value so last-6,000-U selection starts inside `\\u002e` or `%2e`; exceed process tail too. | Tail is derived only after full-source withholding; process/gate flags remain true even if marker is short. Exactly-at-limit clean streams retain false. | `test/gates.test.ts`, `test/proc.test.ts`. |
 | C/E: place host.example across the 8,000-U line/excerpt and formatter cuts; also exceed row/excerpt count. | Excerpts and formatted feedback cannot leak a prefix; real omissions propagate true through formatGateOutput to saved prompts. Legacy excerpts without source are withheld, not certified complete. | `test/gate-feedback.test.ts`, `test/pipeline-gates.test.ts`. |
+| All cut adapters: policy `host.example`, source `"host.example\u0301"`, then `.slice(0, 12)`; place the same combining sequence at excerpt, tail, byte/CP and field caps, including a second cut of checked output. | Assert source P has zero matches and candidate P has one; every stored/emitted cut withholds, keeps actual truncated:true and gains no safety receipt from its source. Uncut safe control remains visible. | `test/publication-text.test.ts`, `test/gate-feedback.test.ts`, `test/proc.test.ts`; table-driven shared-contract checks in c2. |
 | D/T/U: complete message of exactly 4,000 U ending `host.` with policy host.example; compare 4,001-U source cut to same limit, and old row with missing metadata. | Complete exact-limit safe text remains visible with false; actually cut text has true; unchecked cut/legacy text is withheld. Data preview and live SSE never bypass checks. | `test/pipeline-gates.test.ts`, `test/proc.test.ts`; temporary Store plus route fixture. |
 | D/G/H: tool result >20,000 U, thinking >2,000 U, malformed JSON/status, nested credential key/number and error cause; private value crosses each cap or message delta. | Logs, AgentResult, event message/data and invocation error contain safe text/markers; no raw early append. Auth/decision error caps preserve provenance; incomplete delta is withheld. | `test/harness.test.ts`, `test/decisions.test.ts`, `test/browser-mcp.test.ts`. |
 | E/F: full diagnostic/report/patch includes private entry just beyond 3,000/4,000/40,000-U cuts; concierge history/decision field similarly crosses its cap. | Inspect captured AgentSpec prompt/system/decision payload: private source withheld before selection, all final dispatch paths covered. | `test/gate-feedback.test.ts`, `test/triage-decisions.test.ts`, `test/concierge.test.ts`; fake harness. |
@@ -262,13 +282,12 @@ comments just to obtain source text. Completed old results can be withheld diagn
 only genuinely interrupted work uses its existing resume path. Persist proofs with their
 diagnostic value atomically; an interrupted capture has no complete-source proof to recover.
 
-c2 estimate: **about 870 changed lines**, including meaningful tests, well above 250. Count
-deletions as well as additions; this is a planning budget, not permission for one oversized PR.
-Use dependency-ordered slices, each reporting exactly which classes it protects:
+c2 estimate: **about 900 changed lines**, including tests and counting additions/deletions.
+Use these dependency-ordered slices, each reporting its protected classes, rather than one PR:
 
 | Slice / dependency | Scope and changed-line budget | Verification before claiming coverage |
 | --- | --- | --- |
-| c2.1 / slice (a) | Contract/prepared policy/provenance + recursive adapter, ~100 implementation + 70 tests = 170. | publication-text/credential tests and synthetic scan/memory benchmark; no universal protection claim yet. |
+| c2.1 / slice (a) | Contract/prepared policy/provenance + recursive adapter and post-cut validation, ~115 implementation + 85 tests = 200. | publication-text/credential tests including combining-mark cuts, synthetic scan/memory benchmark; no universal protection claim yet. |
 | c2.2 / c2.1 | Complete bounded gate capture, excerpts/tail and gate metadata, ~100 + 70 = 170. | proc/gates/feedback tests; split/overlap/cap cases and whole gate benchmark. Other producers remain explicitly unaudited. |
 | c2.3 / c2.2 | Harness logs/results/events, prompts and post-merge/worker persistence, ~110 + 70 = 180. | harness/pipeline/workers restart tests; no unchecked log append, flags survive persistence. |
 | c2.4 / c2.3 | MCP transport/results, REST/SSE, privateOutputData, feed/digest/change/report adapters and optional metadata storage, ~120 + 80 = 200. | MCP/feed/digest/report/HTTP tests plus old-writer/new-reader and rollback migration fixtures. |
