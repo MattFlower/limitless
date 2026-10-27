@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Factory } from "../app.ts";
-import type { Run } from "../core/types.ts";
+import type { EpicAttention, Run } from "../core/types.ts";
 import { CommentProcessed, ISSUE_CLAIM_STATUSES } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { commentRunRequest, type GhRunner, issueRunRequest, runGh } from "./github.ts";
@@ -35,7 +35,14 @@ const issueSchema = z.object({
   lastEditedAt: date.nullable(),
   labels: connection(z.object({ name: z.string() })),
   subIssuesSummary: z.object({ total: z.number().int().nonnegative() }),
-  blockedBy: connection(z.object({ state: z.enum(["OPEN", "CLOSED"]) })),
+  subIssues: connection(
+    z.object({
+      number: z.number().int().positive(),
+      state: z.enum(["OPEN", "CLOSED"]),
+      labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }),
+    }),
+  ),
+  blockedBy: connection(z.object({ number: z.number().int().positive(), state: z.enum(["OPEN", "CLOSED"]) })),
   closedByPullRequestsReferences: connection(z.object({ state: z.enum(["OPEN", "CLOSED", "MERGED"]) })),
   timelineItems: connection(
     z.discriminatedUnion("__typename", [
@@ -56,6 +63,77 @@ const blockers = (body: string) =>
     .split(/\r?\n/)
     .filter((line) => /^[\t ]*(?:(?:[-*+]|\d+[.)])[\t ]+)?blocked by\b:?/i.test(line))
     .flatMap((line) => [...line.matchAll(/#([1-9][0-9]*)\b/g)].map((m) => Number(m[1])));
+
+/** Undefined means incomplete evidence: preserve the saved observation. */
+export function epicAttention(
+  epic: QueueIssue,
+  trusted: string[],
+  issues: ReadonlyMap<number, QueueIssue>,
+  claimed: (number: number) => boolean,
+): EpicAttention | null | undefined {
+  if (epic.state !== "OPEN") return null;
+  const children = epic.subIssues;
+  if (
+    children.totalCount > 50 ||
+    children.totalCount !== children.nodes.length ||
+    children.totalCount !== epic.subIssuesSummary.total ||
+    new Set(children.nodes.map((c) => c.number)).size !== children.totalCount
+  )
+    return undefined;
+  if (!children.totalCount) return null;
+  const trusts = (login: string | undefined) =>
+    !!login && trusted.some((t) => t.toLowerCase() === login.toLowerCase());
+  const lines: { line: string; text: string }[] = [];
+  let slices = false;
+  let fence: string | undefined;
+  if (trusts(epic.author?.login) && (!epic.lastEditedAt || trusts(epic.editor?.login))) {
+    for (const line of epic.body.split(/\r?\n/)) {
+      const marker = line.match(/^ {0,3}(`{3,}|~{3,})/)?.[1];
+      if (fence) {
+        if (marker && marker[0] === fence[0] && marker.length >= fence.length && line.trim() === marker)
+          fence = undefined;
+        continue;
+      }
+      if (marker) {
+        fence = marker;
+        continue;
+      }
+      if (/^ {0,3}#{1,2}(?:\s|$)/.test(line)) slices = /^ {0,3}## Slices\s*$/.test(line);
+      const text = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.*)$/)?.[1];
+      if (slices && text !== undefined) lines.push({ line, text });
+    }
+  }
+  const refs = (text: string) =>
+    [...text.matchAll(/(?<![\w/])#([1-9][0-9]*)\b/g)]
+      .map((m) => Number(m[1]))
+      .filter((n) => children.nodes.some((c) => c.number === n));
+  const unfiled = lines.filter((l) => !refs(l.text).length).map((l) => l.line);
+  if (unfiled.length) return { state: "unfiled", items: unfiled };
+  const open = children.nodes.filter((c) => c.state === "OPEN");
+  if (!open.length) return null;
+  const records = open.map((c) => issues.get(c.number));
+  if (records.some((i) => i?.state !== "OPEN" || i.labels.totalCount !== i.labels.nodes.length))
+    return undefined;
+  if (!open.some((c, n) => records[n]?.labels.nodes.some((l) => priority(l.name)) || claimed(c.number)))
+    return { state: "needs_approval", items: open.map((c) => `#${c.number}`) };
+  if (open.length !== 1) return null;
+  const candidate = open[0];
+  const record = records[0];
+  if (!candidate || !record) return undefined;
+  const acceptance = lines.filter((l) => /^Acceptance:/.test(l.text));
+  if (acceptance.length) {
+    const numbers = new Set(acceptance.flatMap((l) => refs(l.text)));
+    return acceptance.length === 1 && numbers.size === 1 && numbers.has(candidate.number)
+      ? { state: "ready_for_acceptance", items: [`#${candidate.number}`] }
+      : null;
+  }
+  if (record.blockedBy.totalCount !== record.blockedBy.nodes.length) return undefined;
+  return children.nodes.every(
+    (c) => c.number === candidate.number || record.blockedBy.nodes.some((b) => b.number === c.number),
+  )
+    ? { state: "ready_for_acceptance", items: [`#${candidate.number}`] }
+    : null;
+}
 
 /** Policy only: callers supply observed dependency and local run state. Missing evidence never approves. */
 export function issueEligibility(
@@ -139,7 +217,8 @@ export function issueEligibility(
 const ISSUE_FIELDS = `number title body createdAt updatedAt state author { login } editor { login } lastEditedAt
   comments(last: 20) { totalCount nodes { databaseId body createdAt lastEditedAt author { login } } }
   labels(first:100) { totalCount nodes { name } } subIssuesSummary { total }
-  blockedBy(first:100) { totalCount nodes { state } }
+  subIssues(first:50) { totalCount nodes { number state labels(first:20) { nodes { name } } } }
+  blockedBy(first:100) { totalCount nodes { number state } }
   closedByPullRequestsReferences(first:100) { totalCount nodes { state } }
   timelineItems(last:100, itemTypes:[LABELED_EVENT, RENAMED_TITLE_EVENT]) { totalCount nodes { __typename
     ... on LabeledEvent { label { name } actor { login } createdAt }
@@ -283,6 +362,17 @@ export function startIssueQueue(
           }
           if (stopped) break;
           const identity = await (opts.lifecycle?.identity ?? githubIdentity)(repo).catch(() => null);
+          if (stopped) break;
+          const observed = new Map(issues.nodes.map((i) => [i.number, i]));
+          factory.store.reconcileEpicAttention(
+            repo,
+            new Map(
+              issues.nodes.map((i) => [
+                i.number,
+                epicAttention(i, q.trusted, observed, (n) => !!factory.store.issueClaim(repo, n)),
+              ]),
+            ),
+          );
           const bot = identity?.kind === "app" ? identity.botLogin.toLowerCase() : null;
           for (const issue of issues.nodes) {
             for (const c of boundary && issue.state === "OPEN" ? issue.comments.nodes : []) {
