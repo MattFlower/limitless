@@ -11,7 +11,7 @@ import {
 } from "../gates/executor.ts";
 import { lanExecutor } from "../gates/lan.ts";
 import { redactGateOutput } from "../gates/output.ts";
-import type { GateHooks, GateRun } from "../gates/run.ts";
+import type { GateHooks, GateResult, GateRun } from "../gates/run.ts";
 import { confinementFailed, gateEnv } from "../gates/run.ts";
 import { checkoutCommitted, headSha } from "../git/repos.ts";
 import { withCommandScratch } from "../harness/sandbox.ts";
@@ -31,12 +31,9 @@ export function executionLocation(ctx: RunContext, handle: ExecutionHandle): str
 }
 
 function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha: string): void {
-  if (
-    ![...result.setup, ...result.checks].some(
-      (r) => !r.reused && r.docsOnly?.mode !== "skipped" && (!r.ok || r.timedOut || confinementFailed(r)),
-    )
-  )
-    return;
+  const failed = (r: GateResult) =>
+    !r.reused && r.docsOnly?.mode !== "skipped" && (!r.ok || r.timedOut || confinementFailed(r));
+  if (![...result.setup, ...result.checks].some(failed)) return;
   const stageId = ctx.stageId;
   if (stageId === undefined) throw new Error("Missing gates stage attribution");
   const location = executionLocation(ctx, handle);
@@ -50,7 +47,7 @@ function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha:
     for (const phase of ["setup", "check"] as const) {
       for (const r of phase === "setup" ? result.setup : result.checks) {
         const confinement = confinementFailed(r);
-        if (r.reused || r.docsOnly?.mode === "skipped" || (r.ok && !r.timedOut && !confinement)) continue;
+        if (!failed(r)) continue;
         const name = redactGateOutput(r.name),
           command = redactGateOutput(r.command);
         const output = redactGateOutput(r.output).slice(-6000);

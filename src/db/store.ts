@@ -2168,8 +2168,14 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   ): Run {
     const terminal = patch.status && TERMINAL_STATUSES.includes(patch.status);
     if ((patch.merged || terminal) && !this.pendingPublications)
-      return this.transaction(() => this.updateRun(id, patch, state, excludeFromSupersession), true);
-    if (terminal) this.observations.finalize(id);
+      return this.transaction(() => this.applyRunUpdate(id, patch, state, excludeFromSupersession), true);
+    return this.applyRunUpdate(id, patch, state, excludeFromSupersession);
+  }
+
+  private applyRunUpdate(
+    ...[id, patch, state, excludeFromSupersession = []]: Parameters<Store["updateRun"]>
+  ): Run {
+    if (patch.status && TERMINAL_STATUSES.includes(patch.status)) this.observations.finalize(id);
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);
     if (state !== undefined) {
       sets.push("state_json = ?");

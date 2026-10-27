@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -130,6 +130,41 @@ test("terminal finalization is interim and completion can replace it", () => {
     expect(store.failureObservations({})[0]).toMatchObject({ history: "no_retry", interim: 0 });
   } finally {
     store.close();
+  }
+});
+
+test("terminal persistence hooks see committed status and observations together", () => {
+  const dir = mkdtempSync(join(tmpdir(), "failure-terminal-"));
+  const store = new Store(join(dir, "store.db"));
+  const reader = new Store(join(dir, "store.db"));
+  const repo = store.upsertRepo({
+    slug: "test/repo",
+    kind: "local",
+    localPath: ".",
+    url: null,
+    defaultBranch: "main",
+    mergePolicy: "none",
+  });
+  const run = store.createRun(repo, { repo: repo.slug, prompt: "test" });
+  insert(store, row(run.id, "coordinator", 0));
+  const snapshots: { status: string | undefined; history: string | null | undefined }[] = [];
+  const update = store.updateRun.bind(store);
+  const persist = spyOn(store, "updateRun").mockImplementation((...args) => {
+    const result = update(...args);
+    snapshots.push({
+      status: reader.getRun(run.id)?.status,
+      history: reader.failureObservations({})[0]?.history,
+    });
+    return result;
+  });
+  try {
+    store.updateRun(run.id, { status: "cancelled" });
+    expect(snapshots).toEqual([{ status: "cancelled", history: "interrupted" }]);
+  } finally {
+    persist.mockRestore();
+    reader.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
