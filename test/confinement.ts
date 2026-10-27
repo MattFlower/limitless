@@ -35,26 +35,27 @@ export const seatbeltSkip =
           }),
         );
 
-/** Real bwrap needs Linux, usable user namespaces (AppArmor may restrict them) and Landlock ABI 6. */
-export const bwrapSkip =
-  process.platform !== "linux"
-    ? "requires Linux bubblewrap"
-    : (
-          await runProcess({
-            cmd: [
-              ...landlockCommand(0),
-              "--",
-              BWRAP,
-              "--unshare-user",
-              "--unshare-pid",
-              "--ro-bind",
-              "/",
-              "/",
-              "/bin/true",
-            ],
-            cwd: process.cwd(),
-            env: agentEnv(),
-          })
-        ).exitCode !== 0
-      ? "bubblewrap with user namespaces and Landlock ABI 6 unavailable"
-      : null;
+/** Exercise the launcher's fd-bind mode, including distribution backports. */
+export async function bwrapProbeSkip(bwrap = BWRAP): Promise<string | null> {
+  const probe = await runProcess({
+    cmd: [
+      ...landlockCommand(0),
+      "--bwrap",
+      bwrap,
+      "--unshare-user",
+      "--unshare-pid",
+      "--ro-bind",
+      "/",
+      "/",
+      "--",
+      "/bin/true",
+    ],
+    cwd: process.cwd(),
+    env: agentEnv(),
+  });
+  return probe.exitCode !== 0
+    ? "bubblewrap with --ro-bind-fd, user namespaces and Landlock ABI 6 unavailable"
+    : null;
+}
+
+export const bwrapSkip = process.platform !== "linux" ? "requires Linux bubblewrap" : await bwrapProbeSkip();
