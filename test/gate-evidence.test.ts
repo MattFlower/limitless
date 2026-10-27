@@ -1545,13 +1545,15 @@ test("a nested skipped match refuses binding even when another suffix match pass
       await sh(["git", "init", "-q"], { cwd: dir });
       writeFileSync(
         join(dir, "x.test.ts"),
-        `import { describe, expect, test } from "bun:test";
-test("outer passes", () => expect(true).toBe(true));
-describe("outer", () => {
-  test.skip("passes", () => expect(true).toBe(true));
-  test("other", () => expect(true).toBe(true));
-});
-`,
+        [
+          'import { describe, expect, test } from "bun:test";',
+          'test("outer passes", () => expect(true).toBe(true));',
+          'describe("outer", () => {',
+          '  test.skip("passes", () => expect(true).toBe(true));',
+          '  test("other", () => expect(true).toBe(true));',
+          "});",
+          "",
+        ].join("\n"),
       );
       await sh(["git", "add", "."], { cwd: dir });
       await sh(["git", "commit", "-qm", "nested skip fixture"], { cwd: dir });
