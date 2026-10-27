@@ -12,12 +12,14 @@ Checking an already-redacted or clipped rendering cannot establish that invarian
 For example, removing a credential overlapping `host.example` can erase the evidence
 needed to recognize the rest of that private value, including an escaped remainder.
 
-Supported means `src/gates/private.ts:normalizedLayers`: raw text; successive percent-byte,
-backslash-Unicode and HTML-entity decoding; relevant standard-base64 runs at four alignments;
+Supported means whatever `src/gates/private.ts:normalizedLayers` does at c2's base: currently
+raw text; successive percent-byte, backslash-Unicode and HTML-entity decoding; relevant
+standard-base64 runs at four alignments;
 whitespace-collapsed variants; NFKC and lowercase matching, with five convergence rounds.
 Preserve those semantics, including literal HTML references and line breaks. Nonconvergence
-withholds text even with an empty policy. This does not add slash-escape decoding (#917),
-implement the ReDoS fix (#916), cover adversarial encodings (#335), or join credentials
+withholds text even with an empty policy. Include #917's `\/` decoding once it lands (with
+#923's layer caching); implementing it remains outside this slice. This does not implement
+the ReDoS fix (#916), cover adversarial encodings (#335), or join credentials
 across lines. Retain slice (a)'s ReDoS regression without changing that fix here.
 
 ## Reproducible inventory
@@ -95,6 +97,8 @@ Introduce `protectText` and its opaque result `BoundaryText` in `src/util/privac
 It uses the decoder/matcher in `src/gates/private.ts`, the compiled credential matcher in
 `src/util/credential-matcher.ts` and terminal handling without importing proc.ts back into itself.
 No boundary invents a second private matcher. Existing APIs become adapters to this contract.
+`protectText` is asynchronous; await its result before storage/emission. Synchronous Store
+methods consume already-protected projections rather than running complete checks inline.
 
 Input: `{text, provenance, policy, cut?, terminal?}`. Provenance is a tagged union:
 `complete`, `cut` with `truncated:true`, or `legacy-unknown`. Only the capture/reader that
@@ -183,8 +187,20 @@ This adds conservative withholding, not a second harness execution or a control-
 ## Cost, retained state and c2 benchmark
 
 No performance measurement was made for this documentation change. The issue reports about
-1.3 s for privateMatches on 5 MiB with eight private entries. That is a baseline observation,
-not a guarantee, and cannot be multiplied by 600 to predict a compiled credential scan.
+1.3 s for privateMatches on 5 MiB with eight private entries. Review reports newer measurements
+of about 110–260 ms after #921, with #923's decoding/layer caching pending. Plan from that
+measured range, retaining 1.3 s only as the issue's historical figure; remeasure at c2's base.
+Neither figure predicts the additional compiled scan against 600 credentials.
+
+Run every complete-source and changed-rendering check in a worker thread through protectText,
+including terminal normalization, C and cuts. Use a bounded checker pool, not a worker per
+event: this keeps synchronous decoder/regex work off the daemon without changing its semantics.
+The daemon-thread budget is **no synchronous slice over 50 ms for any input size**, including
+capture, queueing, transfer, result handling and serialization. Transfer bounded byte chunks
+with yields between batches; assemble/decode full text in the worker, not in a giant main-thread
+copy. Apply caps before queueing and bound pending bytes as well as active checkers; overflow
+or worker failure withholds text, never falls back to synchronous checking. Measure transfer
+and output handling too: moving only privateMatches to a worker does not establish this budget.
 
 Prepare normalized entries, minimum base64 candidate length and literal search structures once
 per policy digest; reuse the credential automaton across all 600 registrations. Decode each
@@ -201,15 +217,16 @@ try four alignments per relevant run. Reuse complete-source evidence across cons
 check each distinct cut/rendering; reuse exact safe bytes for repeated events/prompt fragments.
 Never scan each growing stream prefix or run a 600-entry regex loop on every output chunk.
 
-Estimate for unchanged decoder cost: ~1.3 s private work with one form source, ~2.6 s with
-raw plus different visible source, and up to ~3.9 s with another joined source, plus roughly
+Estimate from the newer range: ~110–260 ms private work with one form source, ~220–520 ms with
+raw plus different visible source, and ~330–780 ms with another joined source, plus roughly
 0.1–0.6 s for normalization/credential/output handling. These are planning estimates only;
 prepared policies may improve them, and escape-heavy output can cost more. Measure the
 combined path, including decoded credential checks, before accepting a c2 performance claim.
 Add work proportional to the sum of distinct rendering lengths, not just captured bytes:
-an 8,000-U excerpt plus a 6,000-U tail adds about 3.5 ms at the reported ASCII baseline rate
+an 8,000-U excerpt plus a 6,000-U tail adds about 0.3–0.7 ms at the newer ASCII baseline rate
 per validation pass (estimate, not measurement). Line/excerpt selection, final C'd output and
-prompt assemblies add further checks; one extra full 5-MiB rendering adds about 1.3 s.
+prompt assemblies add further checks; one extra full 5-MiB rendering adds about 110–260 ms.
+These are worker CPU estimates, not permitted daemon event-loop stalls.
 Cache only exact renderings under policy/credential version; record lengths/scan counts and
 bound cache retention within the checker budget. Check cut candidates serially.
 
@@ -234,6 +251,10 @@ Reproduce locally in c2, without network, models or owner configuration:
    peak RSS and receipts reused. Instrument synthetic consumers for events/excerpts/prompts,
    counting post-cut checks too; include combining-mark cuts and many distinct excerpts.
    Report full before/after timings and verify identical safe output across chunkings.
+   Beside medians, report worst daemon event-loop stall across all trials (including warmups),
+   using a short-interval heartbeat plus maximum synchronous-slice instrumentation. Include
+   queue/transfer/result handling, concurrent gates and cap+1 refusal. c2.1's checker and c2.2's
+   whole gate path must meet the 50-ms slice budget; timing assertions stay out of unit tests.
 4. `bun scripts/benchmark-credential-redaction.ts <baseline-proc.ts>` supplies a separate
    credential-only comparison (see its header for snapshot setup); it does not measure P.
    Keep all drivers/snapshots/output in scratch and remove them. Tests never assert timings.
@@ -295,8 +316,8 @@ Use these dependency-ordered slices, each reporting its protected classes, rathe
 
 | Slice / dependency | Scope and changed-line budget | Verification before claiming coverage |
 | --- | --- | --- |
-| c2.1 / slice (a) | Contract/prepared policy/provenance + recursive adapter and post-cut validation, ~115 implementation + 85 tests = 200. | publication-text/credential tests including combining-mark cuts, synthetic scan/memory benchmark; no universal protection claim yet. |
-| c2.2 / c2.1 | Complete bounded gate capture, excerpts/tail and gate metadata, ~100 + 70 = 170. | proc/gates/feedback tests; split/overlap/cap cases and whole gate benchmark. Other producers remain explicitly unaudited. |
+| c2.1 / slice (a) | Contract/prepared policy/provenance + bounded worker checker, recursive adapter and post-cut validation, ~115 implementation + 85 tests = 200. | publication-text/credential tests including combining-mark cuts, synthetic scan/memory benchmark with worst daemon stall beside medians; meet the 50-ms synchronous-slice budget. No universal protection claim yet. |
+| c2.2 / c2.1 | Complete bounded gate capture, excerpts/tail and gate metadata, ~100 + 70 = 170. | proc/gates/feedback tests; split/overlap/cap cases and whole gate benchmark reporting worst daemon stall beside medians; meet the 50-ms synchronous-slice budget including concurrent gates and transfers. Other producers remain explicitly unaudited. |
 | c2.3 / c2.2 | Harness logs/results/events, prompts and post-merge/worker persistence, ~110 + 70 = 180. | harness/pipeline/workers restart tests; no unchecked log append, flags survive persistence. |
 | c2.4 / c2.3 | MCP transport/results, REST/SSE, privateOutputData, feed/digest/change/report adapters and optional metadata storage, ~120 + 80 = 200. | MCP/feed/digest/report/HTTP tests plus old-writer/new-reader and rollback migration fixtures. |
 | c2.5 / c2.4 | PR/commit/Discord/deploy/eval/log/script adapters and remaining audit, ~90 + 60 = 150. | Publication/delivery/Discord/deploy/eval tests and repeat inventory search; claim universal coverage only when every row is accounted for. |
