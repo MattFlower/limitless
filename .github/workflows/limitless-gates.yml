@@ -1,0 +1,105 @@
+name: limitless-gates
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        required: true
+        type: string
+      candidate:
+        required: true
+        type: string
+      setup:
+        required: true
+        type: string
+      checks:
+        required: true
+        type: string
+      setup_minutes:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  gate:
+    if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+    name: gate-${{ matrix.check.index }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(inputs.checks) }}
+    steps:
+      - name: Token
+        id: token
+        shell: bash
+        run: |
+          token=$(openssl rand -hex 16)
+          echo "LIMITLESS_TOKEN $token"
+          echo "frame=$token" >> "$GITHUB_OUTPUT"
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - name: Verify commit
+        env:
+          EXPECTED_SHA: ${{ inputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.3
+          no-cache: true
+      - name: Setup
+        timeout-minutes: ${{ fromJSON(inputs.setup_minutes) }}
+        env:
+          FRAME: ${{ steps.token.outputs.frame }}
+          COMMANDS: ${{ inputs.setup }}
+        run: |
+          python3 - <<'PY'
+          import json, os, signal, subprocess, time
+          token = os.environ.pop('FRAME')
+          commands = json.loads(os.environ.pop('COMMANDS'))
+          for index, command in enumerate(commands):
+              started = time.monotonic()
+              process = subprocess.Popen(['/bin/sh', '-c', command['run']], start_new_session=True)
+              timed_out = False
+              try:
+                  code = process.wait(timeout=command.get('timeoutSec', 900))
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  os.killpg(process.pid, signal.SIGKILL)
+                  code = process.wait()
+              code = code if code >= 0 else 128 - code
+              duration = int((time.monotonic() - started) * 1000)
+              print(f'LIMITLESS:{token}:{index}:{code}:{duration}:{str(timed_out).lower()}', flush=True)
+              if code or timed_out:
+                  raise SystemExit(1)
+          PY
+      - name: Check
+        timeout-minutes: ${{ matrix.check.minutes }}
+        env:
+          FRAME: ${{ steps.token.outputs.frame }}
+          COMMANDS: ${{ format('[{0}]', toJSON(matrix.check)) }}
+          LIMITLESS_GATE_REPORT: ${{ runner.temp }}/limitless-gate-report.xml
+        run: |
+          python3 - <<'PY'
+          import json, os, signal, subprocess, time
+          token = os.environ.pop('FRAME')
+          commands = json.loads(os.environ.pop('COMMANDS'))
+          for index, command in enumerate(commands):
+              started = time.monotonic()
+              process = subprocess.Popen(['/bin/sh', '-c', command['run']], start_new_session=True)
+              timed_out = False
+              try:
+                  code = process.wait(timeout=command.get('timeoutSec', 900))
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  os.killpg(process.pid, signal.SIGKILL)
+                  code = process.wait()
+              code = code if code >= 0 else 128 - code
+              duration = int((time.monotonic() - started) * 1000)
+              print(f'LIMITLESS:{token}:{index}:{code}:{duration}:{str(timed_out).lower()}', flush=True)
+              if code or timed_out:
+                  raise SystemExit(1)
+          PY

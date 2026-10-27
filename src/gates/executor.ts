@@ -5,6 +5,7 @@ import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { GateConfig } from "./detect.ts";
+import type { ActionsProgress } from "./github-actions.ts";
 import { lanExecutor } from "./lan.ts";
 import { redactGateData, redactGateOutput } from "./output.ts";
 import {
@@ -19,7 +20,13 @@ import { bindGateSlotScope, type GatePriority } from "./slots.ts";
 export interface Executor<Req, Res> {
   readonly kind: "local" | "github-actions" | "lan" | "inplace" | "claude-cloud";
   start(req: Req, signal: AbortSignal): Promise<ExecutionHandle>;
-  attach(handle: ExecutionHandle, signal: AbortSignal, req?: Req, hooks?: GateHooks): Execution<Res>;
+  attach(
+    handle: ExecutionHandle,
+    signal: AbortSignal,
+    req?: Req,
+    hooks?: GateHooks,
+    persist?: (handle: ExecutionHandle) => Promise<void>,
+  ): Execution<Res>;
   discard?(handle: ExecutionHandle): void | Promise<void>;
 }
 export interface ExecutionHandle {
@@ -27,6 +34,7 @@ export interface ExecutionHandle {
   id: string;
   startedAt: number;
   url?: string;
+  githubActions?: ActionsProgress;
 }
 export interface Execution<Res> {
   events: AsyncIterable<ExecutionEvent>;
@@ -245,7 +253,7 @@ export async function executeGate(
   if (!stored) await persist(handle);
   let execution: Execution<GateRun>;
   try {
-    execution = executor.attach(handle, signal, req, hooks);
+    execution = executor.attach(handle, signal, req, hooks, persist);
   } catch (error) {
     onSettled();
     throw error;

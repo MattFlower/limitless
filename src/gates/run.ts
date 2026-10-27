@@ -22,6 +22,8 @@ import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
+  /** Infrastructure stopped this command before a complete execution could be observed. */
+  incomplete?: string;
   executionProvenance?: Pick<GateRun, "sha" | "trackedClean" | "provenanceError">;
   /** Successful execution rejected as evidence; the failed result remains authoritative. */
   retryAttempt?: GateResult;
@@ -513,6 +515,10 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     return out;
   }
   for (const r of after.checks) {
+    if (r.incomplete) {
+      out.push({ name: r.name, verdict: "not_run", blocking: true, result: r });
+      continue;
+    }
     if (r.docsOnly?.mode === "skipped") {
       out.push({ name: r.name, verdict: "not_run", blocking: false, result: r });
       continue;
