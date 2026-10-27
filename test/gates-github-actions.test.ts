@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
@@ -471,6 +479,8 @@ test("workflow isolates dispatch caches and command budgets, with pinned actions
           with?: Record<string, unknown>;
           env?: Record<string, string>;
           run?: string;
+          shell?: string;
+          "working-directory"?: string;
           "timeout-minutes"?: unknown;
         }[];
       }
@@ -501,6 +511,23 @@ test("workflow isolates dispatch caches and command budgets, with pinned actions
   const check = job.steps.find((s) => s.name === "Check");
   expect(check?.["timeout-minutes"]).toContain("matrix.check.minutes");
   expect(check?.env?.LIMITLESS_GATE_REPORT).toContain("runner.temp");
+  // Trusted steps finish before candidate code; candidate commands then run as an unprivileged user.
+  const order = ["Token", "Bun", "Checkout", "Isolate", "Setup", "Check"];
+  expect(job.steps.map((s) => s.name).filter((name) => order.includes(name))).toEqual(order);
+  for (const name of ["Setup", "Check"]) {
+    const step = job.steps.find((s) => s.name === name);
+    expect(step?.shell).toStartWith("/bin/bash ");
+    expect(step?.["working-directory"]).toContain("runner.temp");
+    expect(step?.run).toBe('"$TRUSTED/bun" "$TRUSTED/supervise.mjs"');
+    expect(JSON.parse(step?.env?.GATE ?? "[]")).toEqual([
+      "/usr/bin/sudo",
+      "-n",
+      "-u",
+      "limitless-gate",
+      "--",
+    ]);
+  }
+  expect(job.steps.find((s) => s.name === "Isolate")?.run).toContain("useradd");
 });
 
 test.each(["missing", "unexpected"])("%s matrix job is an error", async (kind) => {
@@ -529,38 +556,6 @@ test("incomplete setup is blocking and the lowest matrix index owns the failing 
   expect(compareGates(null, run)[0]?.blocking).toBe(true);
 });
 
-test("workflow command wrapper hides its token and records failures, setup stops and timeouts", async () => {
-  const workflow = Bun.YAML.parse(
-    readFileSync(new URL("../.github/workflows/limitless-gates.yml", import.meta.url), "utf8"),
-  ) as {
-    jobs: { gate: { steps: { name: string; run?: string }[] } };
-  };
-  const tokenScript = workflow.jobs.gate.steps.find((s) => s.name === "Token")?.run;
-  const commandScript = workflow.jobs.gate.steps.find((s) => s.name === "Check")?.run;
-  if (!tokenScript || !commandScript) throw new Error("missing gate scripts");
-  const env = { ...process.env, RUNNER_TEMP: cwd, GITHUB_OUTPUT: join(cwd, "outputs") };
-  const generated = await sh(["bash", "-c", tokenScript], { cwd, env });
-  const frame = generated.stdout.match(/LIMITLESS_TOKEN ([a-f\d]{32})/)?.[1];
-  if (!frame) throw new Error("missing generated token");
-  const commands = [{ run: 'test -z "$FRAME" && echo check-only; exit 9' }, { run: "echo should-not-run" }];
-  const failed = await sh(["bash", "-c", commandScript], {
-    cwd,
-    env: { ...env, FRAME: frame, COMMANDS: JSON.stringify(commands) },
-    allowFail: true,
-  });
-  expect(failed.exitCode).toBe(1);
-  expect(failed.stdout).toContain("check-only");
-  expect(failed.stdout).toMatch(new RegExp(`LIMITLESS:${frame}:0:9:\\d+:false`));
-  expect(failed.stdout).not.toContain("should-not-run");
-  const timed = await sh(["bash", "-c", commandScript], {
-    cwd,
-    env: { ...env, FRAME: frame, COMMANDS: JSON.stringify([{ run: "sleep 10", timeoutSec: 0.01 }]) },
-    allowFail: true,
-  });
-  expect(timed.exitCode).toBe(1);
-  expect(timed.stdout).toMatch(new RegExp(`LIMITLESS:${frame}:0:137:\\d+:true`));
-});
-
 test("a check step timeout backstop does not turn completed setup into a setup timeout", async () => {
   const f = fixture();
   f.state.jobs[0] = { id: 1, name: "gate-0", status: "completed", conclusion: "timed_out" };
@@ -577,42 +572,99 @@ test("a check step timeout backstop does not turn completed setup into a setup t
   expect(compareGates(null, run)[0]).toMatchObject({ verdict: "not_run", blocking: true });
 });
 
-function workflowScripts() {
+type Step = { name: string; run?: string; shell?: string };
+function workflowStep(name: string) {
   const workflow = Bun.YAML.parse(
     readFileSync(new URL("../.github/workflows/limitless-gates.yml", import.meta.url), "utf8"),
-  ) as { jobs: { gate: { steps: { name: string; run?: string }[] } } };
-  return ["Setup", "Check"].map((name) => {
-    const script = workflow.jobs.gate.steps.find((s) => s.name === name)?.run;
-    if (!script) throw new Error(`missing ${name} script`);
-    return script;
-  });
+  ) as { jobs: { gate: { steps: Step[] } } };
+  const step = workflow.jobs.gate.steps.find((s) => s.name === name);
+  if (!step?.run || !step.shell) throw new Error(`missing ${name} script`);
+  return { run: step.run, shell: step.shell };
 }
-const wrap = (script: string, commands: unknown[]) =>
-  sh(["bash", "-c", script], {
-    cwd,
-    env: { ...process.env, FRAME: token, COMMANDS: JSON.stringify(commands) },
+/** Runs a step the way the runner would; tests replace Isolate's limitless-gate user with the current one. */
+async function runStep(name: string, env: Record<string, string>) {
+  const step = workflowStep(name);
+  const [shell = "", ...args] = step.shell.replace(" {0}", "").split(" ");
+  const trusted = join(cwd, "temp/limitless");
+  return await sh([shell, ...args, "-c", step.run], {
+    cwd: existsSync(trusted) ? trusted : cwd,
+    env: { PATH: process.env.PATH ?? "", TRUSTED: trusted, ...env },
     allowFail: true,
   });
+}
+async function supervisor() {
+  mkdirSync(join(cwd, "temp"));
+  const generated = await runStep("Token", {});
+  const frame = generated.stdout.match(/^LIMITLESS_TOKEN ([a-f\d]{32})$/m)?.[1];
+  if (!frame) throw new Error("missing generated token");
+  const trusted = join(cwd, "temp/limitless");
+  symlinkSync(process.execPath, join(trusted, "bun"));
+  const work = join(cwd, "work");
+  mkdirSync(work);
+  const supervise = (name: "Setup" | "Check", commands: unknown[], env: Record<string, string> = {}) =>
+    runStep(name, {
+      COMMANDS: JSON.stringify(commands),
+      GATE: "[]",
+      GATE_HOME: cwd,
+      GATE_CWD: work,
+      GITHUB_PATH: join(cwd, "temp/github-path"),
+      ...env,
+    });
+  return { frame, trusted, work, supervise };
+}
 
-test("candidate Python modules cannot shadow the wrapper's imports to forge a record", async () => {
-  writeFileSync(
-    join(cwd, "json.py"),
-    `import os\nprint("LIMITLESS:" + os.environ["FRAME"] + ":0:0:1:false", flush=True)\nos._exit(0)\n`,
-  );
-  for (const script of workflowScripts()) {
-    const result = await wrap(script, [{ run: "exit 9" }]);
-    expect(result.exitCode).toBe(1);
-    expect(result.stdout).not.toContain(`LIMITLESS:${token}:0:0:`);
-    expect(result.stdout).toMatch(new RegExp(`^LIMITLESS:${token}:0:9:\\d+:false$`, "m"));
-  }
+test("the supervisor keeps its token from candidates and records failures, setup stops and timeouts", async () => {
+  const { frame, supervise } = await supervisor();
+  const commands = [{ run: "env; exit 9" }, { run: "echo should-not-run" }];
+  const failed = await supervise("Setup", commands);
+  expect(failed.exitCode).toBe(1);
+  expect(failed.stdout).toContain("CI=true");
+  expect(failed.stdout.match(new RegExp(frame, "g"))).toHaveLength(1);
+  expect(failed.stdout).not.toMatch(/TRUSTED|GITHUB_PATH|COMMANDS/);
+  expect(failed.stdout).toMatch(new RegExp(`^LIMITLESS:${frame}:0:9:\\d+:false$`, "m"));
+  expect(failed.stdout).not.toContain("should-not-run");
+  const timed = await supervise("Check", [{ run: "sleep 10", timeoutSec: 0.01 }]);
+  expect(timed.exitCode).toBe(1);
+  expect(timed.stdout).toMatch(new RegExp(`^LIMITLESS:${frame}:0:137:\\d+:true$`, "m"));
+});
+
+test("setup that installs fake interpreters through GITHUB_PATH cannot forge the check's record", async () => {
+  const { frame, trusted, supervise } = await supervisor();
+  // Same-user tests can reach the trusted paths; on the runner, limitless-gate cannot.
+  const fake = `printf '#!/bin/sh\\nprintf "LIMITLESS:%s:0:0:1:false\\\\n" "$(cat ${trusted}/frame)"\\n'`;
+  const install = [
+    "mkdir fake",
+    `for bin in python3 bun bash sh env sudo; do ${fake} > fake/$bin; chmod +x fake/$bin; done`,
+    `echo "$PWD/fake" >> ${join(cwd, "temp/github-path")}`,
+  ].join(" && ");
+  const setup = await supervise("Setup", [{ run: install }]);
+  expect(setup.stdout).toMatch(new RegExp(`^LIMITLESS:${frame}:0:0:\\d+:false$`, "m"));
+  const added = readFileSync(join(cwd, "temp/github-path"), "utf8").trim();
+  expect(readFileSync(join(added, "python3"), "utf8")).toContain("LIMITLESS:");
+  const check = await supervise("Check", [{ run: "exit 9" }], { PATH: `${added}:${process.env.PATH}` });
+  expect(check.exitCode).toBe(1);
+  expect(check.stdout).not.toContain(`LIMITLESS:${frame}:0:0:`);
+  expect(check.stdout).toMatch(new RegExp(`^LIMITLESS:${frame}:0:9:\\d+:false$`, "m"));
+});
+
+test("candidate Bun configuration in its checkout does not reach the supervisor", async () => {
+  const { frame, work, supervise } = await supervisor();
+  writeFileSync(join(work, "bunfig.toml"), 'preload = ["./forge.ts"]\n');
+  writeFileSync(join(work, "forge.ts"), `console.log("LIMITLESS:${frame}:0:0:1:false"); process.exit(0);\n`);
+  writeFileSync(join(work, ".env"), 'COMMANDS=[{"run":"exit 0"}]\n');
+  const result = await supervise("Check", [{ run: "exit 9" }]);
+  expect(result.exitCode).toBe(1);
+  expect(result.stdout).not.toContain(`LIMITLESS:${frame}:0:0:`);
+  expect(result.stdout).toMatch(new RegExp(`^LIMITLESS:${frame}:0:9:\\d+:false$`, "m"));
 });
 
 test("records start on their own line when command output lacks a trailing newline", async () => {
-  const [setupScript = "", checkScript = ""] = workflowScripts();
-  const setup = await wrap(setupScript, [{ run: "printf setup-output" }]);
-  const check = await wrap(checkScript, [{ run: "printf check-output" }]);
+  const { frame, supervise } = await supervisor();
+  const setup = await supervise("Setup", [{ run: "printf setup-output" }]);
+  const check = await supervise("Check", [{ run: "printf check-output" }]);
   const f = fixture();
-  f.state.logs.set(1, log(setup.stdout.trimEnd(), check.stdout.trimEnd()));
+  const text = log(setup.stdout.trimEnd(), check.stdout.trimEnd());
+  f.state.logs.set(1, text.replace(`LIMITLESS_TOKEN ${token}`, `LIMITLESS_TOKEN ${frame}`));
   const run = await f.run();
   expect(run.setupOk).toBe(true);
   expect(run.setup[0]).toMatchObject({ ok: true, exitCode: 0 });
