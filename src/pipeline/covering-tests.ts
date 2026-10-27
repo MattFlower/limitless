@@ -80,7 +80,9 @@ export async function coveringTestCommand(test: Test, cfg: GateConfig | undefine
     !singleBunTest(cfg.checks[0].run) ||
     !retry ||
     retry.split("{files}").length !== 2 ||
-    !singleBunTest(retry, "{files}")
+    !singleBunTest(retry, "{files}") ||
+    // A template's own name filter would override the appended one.
+    /(?:^|[\t ])(?:-t|--test-name-pattern)(?:[\t =]|$)/.test(retry)
   )
     return { reason: "targeted retries not configured" };
   if (!validRetryFiles([test.file], cwd)) return { reason: "file outside repository or invalid retry file" };
@@ -105,7 +107,11 @@ export async function coveringTestCommand(test: Test, cfg: GateConfig | undefine
   if (tracked.exitCode !== 0 || !tracked.stdout.split("\0").includes(test.file.replace(/^\.\//, "")))
     return { reason: "file not tracked at verified SHA" };
 
-  const command = `${retry.replace("{files}", () => quoteRetryFiles([test.file]))} -t '${coveringPattern(test.name).replaceAll("'", "'\\''")}'`;
+  // Place the filter directly after `bun test`, ahead of any `--` in the template, so Bun parses it as an option.
+  const filter = ` -t '${coveringPattern(test.name).replaceAll("'", "'\\''")}'`;
+  const command = retry
+    .replace("{files}", () => quoteRetryFiles([test.file]))
+    .replace(/^[\t ]*bun[\t ]+test(?=[\t ]|$)/, (prefix) => prefix + filter);
   return singleBunTest(command)
     ? { command }
     : { reason: "expanded command is not a single bun test invocation" };

@@ -1409,7 +1409,7 @@ test.each([
         check: "x.test.ts › passes 0",
         command: commands[0],
       });
-      expect(commands[0]).toBe("bun test './x.test.ts' -t '(?:^| )passes 0$'");
+      expect(commands[0]).toBe("bun test -t '(?:^| )passes 0$' './x.test.ts'");
       if (mode === "inflight") expect(record?.stageId).toBe(saved?.[0]?.stageId);
       if (mode === "resume" || mode === "resume-retry") {
         expect(verifierCalls).toBe(mode === "resume-retry" ? 2 : 1);

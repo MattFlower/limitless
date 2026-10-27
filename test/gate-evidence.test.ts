@@ -21,6 +21,7 @@ import { confinementScope } from "../src/harness/sandbox.ts";
 import {
   type CoveringTestRun,
   coveringTestCommand,
+  coveringTestRefusal,
   matchingSkips,
   selectCoveringTests,
   skipMatches,
@@ -1278,7 +1279,7 @@ function coveringRun(): CoveringTestRun {
     stageId: 13,
     result: {
       name: "test",
-      command: "bun test './x.test.ts' -t '(?:^| )passes$'",
+      command: "bun test -t '(?:^| )passes$' './x.test.ts'",
       ok: true,
       exitCode: 0,
       durationMs: 1,
@@ -1524,6 +1525,48 @@ test("covering commands validate trusted configuration and tracked, contained te
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("an option terminator in retry_files cannot turn the name filter into a positional argument", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-terminator-"));
+  try {
+    const { value: checkedSha } = await coveringSeed(cwd);
+    writeFileSync(join(cwd, "y.test.ts"), 'import { test } from "bun:test";\ntest("unrelated", () => {});\n');
+    await sh(["git", "add", "."], { cwd });
+    await sh(["git", "commit", "-qm", "unrelated passing test"], { cwd });
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const cfg = { ...coveringConfig, retryFiles: "bun test {files} --" };
+    const test = { file: "y.test.ts", name: "missing" };
+    const built = await coveringTestCommand(test, cfg, cwd, head);
+    expect(built.command).toBe("bun test -t '(?:^| )missing$' './y.test.ts' --");
+    if (!built.command) throw new Error(built.reason);
+    const command = built.command.replace(/^bun /, `${process.execPath} `);
+    const gate = await confinementScope.run(fakeConfinement, () =>
+      runLocalGates(
+        cwd,
+        { source: "detected", setup: [], checks: [{ name: "test", run: command }], protectedPaths: [] },
+        new AbortController().signal,
+      ),
+    );
+    const check = gate.checks[0];
+    if (!check) throw new Error("missing covering check");
+    const result = { ...check, executionProvenance: { sha: head, trackedClean: true } };
+    const refusal = coveringTestRefusal(
+      { ...coveringRun(), ...test, verifiedSha: head, result, skipped: matchingSkips(test, result) },
+      head,
+      [coveringRun().stageId],
+    );
+    // Bun exits non-zero when the filter matches nothing; either way the unrelated pass is not evidence.
+    expect(["name matched no tests", "test failed"]).toContain(refusal ?? "accepted");
+    expect(check.testCoverage?.passedFiles ?? []).not.toContain("y.test.ts");
+    // A template that carries its own name filter would override the appended one.
+    for (const retryFiles of ["bun test -t x {files}", "bun test {files} --test-name-pattern=x"])
+      expect(await coveringTestCommand(test, { ...coveringConfig, retryFiles }, cwd, checkedSha)).toEqual({
+        reason: "targeted retries not configured",
+      });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 
