@@ -53,6 +53,15 @@ export async function coveringTestCommand(test: Test, cfg: GateConfig | undefine
     !singleBunTest(retry, "{files}")
   )
     return { reason: "targeted retries not configured" };
+  const words = retry.match(/(?:[^\s"'\\]|\\[\s\S]|"(?:\\.|[^"\\])*"|'[^']*')+/g) ?? [];
+  const literal = (word: string) =>
+    word.replace(
+      /'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
+      (_match: string, single?: string, double?: string, escaped?: string) =>
+        single ?? double?.replace(/\\([$`"\\])/g, "$1") ?? escaped ?? "",
+    );
+  if (words.some((word) => literal(word) === "--"))
+    return { reason: "covering tests do not support an option terminator (--) in retry_files" };
   if (!validRetryFiles([test.file], cwd)) return { reason: "file outside repository or invalid retry file" };
   if (!/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(test.file)) return { reason: "file is not a test file" };
   if (!test.name.trim() || test.name.length > MAX_TEST_IDENTITY_LENGTH || controls(test.name))
@@ -75,7 +84,7 @@ export async function coveringTestCommand(test: Test, cfg: GateConfig | undefine
   if (tracked.exitCode !== 0 || !tracked.stdout.split("\0").includes(test.file.replace(/^\.\//, "")))
     return { reason: "file not tracked at verified SHA" };
 
-  // Place the filter directly after `bun test`, ahead of any `--` in the template, so Bun parses it as an option.
+  // Place the literal filter directly after `bun test`.
   const filter = ` -t '${coveringPattern(test.name).replaceAll("'", "'\\''")}'`;
   const command = retry
     .replace("{files}", () => quoteRetryFiles([test.file]))
@@ -94,11 +103,17 @@ export function coveringTestRefusal(
   if (run.reason) return run.reason;
   const r = run.result;
   if (!r || !succeeded.includes(run.stageId)) return "no succeeded covering-test stage";
-  if (!/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha) || r.executionProvenance?.sha !== sha)
+  if (
+    !/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha) ||
+    run.verifiedSha !== sha ||
+    r.executionProvenance?.sha !== sha
+  )
     return "run executed at a different SHA";
   if (r.executionProvenance.trackedClean !== true) return "run changed tracked files";
   if (!r.ok || r.exitCode !== 0 || r.timedOut || confinementFailed(r)) return "test failed";
   const evidence = r.coveringTest;
+  // Tests can forge or replay their in-process JUnit report; filesystem checks cannot authenticate
+  // its producer. As with existing trust in test exit status, code review is the defense.
   if (!evidence || evidence.file !== run.file.replace(/^\.\//, "") || evidence.name !== run.name)
     return "missing exact testcase JUnit evidence";
   return evidence.reason;

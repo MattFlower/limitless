@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { worktreeGit } from "../git/command.ts";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
@@ -160,7 +160,12 @@ async function runOne(
   if (!scratch) throw new Error("Missing gate command scratch");
   const report = join(scratch, `gate-report-${randomUUID()}.xml`);
   const existed = existsSync(report);
-  const startedAt = Date.now();
+  let reportBaseline = 0;
+  if (cmd.coveringTest) {
+    const sentinel = `${report}.sentinel`;
+    writeFileSync(sentinel, "", { flag: "wx" });
+    reportBaseline = statSync(sentinel).mtimeMs;
+  }
   const args = cmd.coveringTest ? ["--reporter=junit", `--reporter-outfile=${report}`] : undefined;
   const res = await runConfined({
     command: cmd.run,
@@ -189,7 +194,7 @@ async function runOne(
       ? { executedCommand: `${cmd.run} ${args.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}` }
       : {}),
     ...(cmd.coveringTest
-      ? { coveringTest: readCoveringJUnit(report, cwd, cmd.coveringTest, startedAt, existed) }
+      ? { coveringTest: readCoveringJUnit(report, cwd, cmd.coveringTest, reportBaseline, existed) }
       : {}),
     ok,
     exitCode: res.exitCode,

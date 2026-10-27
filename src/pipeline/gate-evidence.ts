@@ -157,6 +157,65 @@ function refusal(
   return undefined;
 }
 
+const coveringCitation = (run: CoveringTestRun, sha: string): string =>
+  `Factory covering test ${run.file} › ${run.name} passed at ${sha} (stage ${run.stageId}); command: ${run.result?.executedCommand ?? run.result?.command}`;
+const factoryClaim = /Factory (?:gate(?! substitution unavailable:)|covering test)\b/gi;
+
+function citationRefusal(
+  row: Verify["criteria"][number],
+  sha: string,
+  covering: { runs: CoveringTestRun[]; succeededStageIds: number[] } | undefined,
+  eligibleGate: () => Verify["criteria"][number] | undefined,
+): string | undefined {
+  const validate = (citation: NonNullable<typeof row.gateEvidence>) => {
+    if (citation.sha !== sha) return "citation is for a different verified SHA";
+    const run = covering?.runs.find((r) => r.stageId === citation.stageId);
+    if (run) {
+      const reason = coveringTestRefusal(run, sha, covering?.succeededStageIds ?? []);
+      if (reason) return reason;
+      if (
+        citation.check !== redactGateOutput(`${run.file} › ${run.name}`) ||
+        citation.command !== redactGateOutput(run.result?.executedCommand ?? run.result?.command ?? "")
+      )
+        return "covering-test identity or command does not match the factory record";
+      return undefined;
+    }
+    const gate = eligibleGate()?.gateEvidence;
+    if (!gate) return "no eligible factory gate record for this criterion at the verified SHA";
+    return citation.stageId === gate.stageId &&
+      citation.check === gate.check &&
+      citation.command === gate.command
+      ? undefined
+      : "gate stage, check or command does not match the factory record";
+  };
+  if (row.gateEvidence) {
+    const reason = validate(row.gateEvidence);
+    if (reason) return reason;
+  }
+  const gate = eligibleGate();
+  const supported = [
+    ...(gate?.gateEvidence ? [gate.evidence] : []),
+    ...(covering?.runs ?? [])
+      .filter((run) => !coveringTestRefusal(run, sha, covering?.succeededStageIds ?? []))
+      .map((run) => redactGateOutput(coveringCitation(run, sha))),
+  ];
+  let remaining = row.evidence;
+  for (let start = remaining.search(factoryClaim); start >= 0; start = remaining.search(factoryClaim)) {
+    remaining = remaining.slice(start);
+    // Consume complete factory-issued citations, including literal claim-like text inside test names.
+    const citation = supported.find(
+      (text) =>
+        remaining.startsWith(text) &&
+        (remaining.length === text.length ||
+          remaining.slice(text.length).startsWith("; Factory ") ||
+          /^(?:\.(?:$|\s)|[\r\n])/.test(remaining.slice(text.length))),
+    );
+    if (!citation) return "no factory record eligible for the cited stage, SHA, identity and command";
+    remaining = remaining.slice(citation.length);
+  }
+  return undefined;
+}
+
 /** Only structured sandbox blocks qualify; provenance and coverage come from factory records. */
 export function applyGateEvidence(
   verify: Verify,
@@ -171,6 +230,42 @@ export function applyGateEvidence(
   return {
     ...verify,
     criteria: verify.criteria.map((blocked, index) => {
+      if (blocked.gateEvidence || blocked.evidence.search(factoryClaim) >= 0) {
+        const reason = citationRefusal(
+          blocked,
+          sha,
+          coveringTests,
+          () =>
+            // Reuse the substitution eligibility checks without trusting any of the claimed evidence.
+            applyGateEvidence(
+              {
+                ...verify,
+                criteria: [
+                  {
+                    ...blocked,
+                    status: "blocked",
+                    blockedReason: "sandbox",
+                    evidence: "",
+                    gateEvidence: undefined,
+                    covering_tests: undefined,
+                  },
+                ],
+              },
+              spec,
+              holdout,
+              sha,
+              gates,
+              baseline,
+            ).criteria[0],
+        );
+        if (reason)
+          return {
+            ...blocked,
+            status: "blocked" as const,
+            gateEvidence: undefined,
+            evidence: redactGateOutput(`Factory citation unavailable: ${reason}.`),
+          };
+      }
       if (blocked.status !== "blocked" || blocked.blockedReason !== "sandbox") return blocked;
       const refuse = (reason: string) => {
         const selection = selected[index];
@@ -191,14 +286,7 @@ export function applyGateEvidence(
             return {
               ...blocked,
               status: "met" as const,
-              evidence: redactGateOutput(
-                runs
-                  .map(
-                    (r) =>
-                      `Factory covering test ${r?.file} › ${r?.name} passed at ${sha} (stage ${r?.stageId}); command: ${r?.result?.executedCommand ?? r?.result?.command}`,
-                  )
-                  .join("; "),
-              ),
+              evidence: redactGateOutput(runs.map((r) => (r ? coveringCitation(r, sha) : "")).join("; ")),
               gateEvidence: {
                 stageId: first.stageId,
                 sha,

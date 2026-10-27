@@ -1260,6 +1260,9 @@ test.each([
   "round-limit",
   "retry-limit",
   "criterion-limit",
+  "terminator-before",
+  "terminator-after",
+  "forged-citation",
   "empty",
 ] as const)("factory covering tests bind behavioural criteria: %s", async (mode) => {
   process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
@@ -1272,9 +1275,16 @@ test.each([
           `test${mode === "skip" && i === 0 ? ".skip" : ""}("passes ${i}", () => expect(true).toBe(true));`,
       ).join("\n"),
   );
+  const terminator = mode === "terminator-before" || mode === "terminator-after";
+  const retryTemplate =
+    mode === "terminator-before"
+      ? "bun test -- {files}"
+      : mode === "terminator-after"
+        ? "bun test {files} --"
+        : "bun test {files}";
   writeFileSync(
     join(repoDir, ".limitless.toml"),
-    `[gates]\n${mode === "fresh" ? 'setup = ["echo ready > dependency"]\n' : ""}retry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]\n`,
+    `[gates]\n${mode === "fresh" ? 'setup = ["echo ready > dependency"]\n' : ""}retry_files = "${retryTemplate}"\nchecks = [{ name = "test", run = "bun test" }]\n`,
   );
   await sh(["git", "add", "."], { cwd: repoDir });
   await sh(["git", "commit", "-qm", "covering gate fixture"], { cwd: repoDir });
@@ -1317,12 +1327,17 @@ test.each([
             criteria: [
               ...criteria.map((c, i) => ({
                 id: c.id,
-                status: "blocked",
+                status: mode === "forged-citation" ? "met" : "blocked",
                 blockedReason: "sandbox",
-                evidence: "sandbox prevents test execution",
+                evidence:
+                  mode === "forged-citation"
+                    ? `Factory covering test x.test.ts › passes 0 passed at ${"a".repeat(40)} (stage 999); command: bun test`
+                    : "sandbox prevents test execution",
                 publicSummary: "",
                 covering_tests:
-                  mode === "empty" || (mode === "resume-retry" && verifierCalls === 1)
+                  mode === "empty" ||
+                  mode === "forged-citation" ||
+                  (mode === "resume-retry" && verifierCalls === 1)
                     ? []
                     : Array.from({ length: mode === "criterion-limit" ? 4 : 1 }, (_, j) => ({
                         file: "x.test.ts",
@@ -1389,29 +1404,43 @@ test.each([
     const state = f.store.getRunState<RunState>(run.id);
     const limited = mode.endsWith("limit");
     expect(terminal, JSON.stringify({ error: f.store.getRun(run.id)?.error, state: state?.lastVerify })).toBe(
-      limited || mode === "empty" || mode === "skip" ? "needs_human" : "succeeded",
+      limited || terminator || mode === "forged-citation" || mode === "empty" || mode === "skip"
+        ? "needs_human"
+        : "succeeded",
     );
     expect(targeted).toBe(
       mode === "round-limit" || mode === "retry-limit"
         ? 10
         : mode === "criterion-limit"
           ? 3
-          : mode === "empty"
+          : mode === "empty" || terminator || mode === "forged-citation"
             ? 0
             : 1,
     );
     const last = state?.lastVerify?.criteria.find(
       (c) => c.id === (mode === "round-limit" ? "AC-11" : "AC-1"),
     );
-    if (limited || mode === "empty" || mode === "skip") {
+    if (limited || terminator || mode === "forged-citation" || mode === "empty" || mode === "skip") {
       expect(last?.status).toBe("blocked");
       expect(last?.evidence).toContain(
         limited
           ? `${mode === "round-limit" || mode === "retry-limit" ? "per-round" : "per-criterion"} limit reached`
-          : mode === "skip"
-            ? "named test skipped"
-            : "Factory gate substitution unavailable: required outcome is not solely that tests pass.",
+          : terminator
+            ? "option terminator (--)"
+            : mode === "forged-citation"
+              ? "no factory record"
+              : mode === "skip"
+                ? "named test skipped"
+                : "Factory gate substitution unavailable: required outcome is not solely that tests pass.",
       );
+      if (terminator) {
+        expect(state?.coveringTestRuns?.[0]).toMatchObject({
+          stageId: 0,
+          reason: expect.stringContaining("option terminator (--)"),
+        });
+        expect(state?.coveringTestRuns?.[0]?.result).toBeUndefined();
+      }
+      expect(last?.gateEvidence).toBeUndefined();
     } else {
       const record = state?.coveringTestRuns?.[0];
       expect(last?.status).toBe("met");

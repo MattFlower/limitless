@@ -134,7 +134,7 @@ export function parseJUnit(xml: string, cwd: string): FailedTestFiles | undefine
   }
 }
 
-function readReport(path: string, startedAt?: number): string | undefined {
+function readReport(path: string, filesystemBaseline?: number): string | undefined {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -142,7 +142,7 @@ function readReport(path: string, startedAt?: number): string | undefined {
     if (
       !stat.isFile() ||
       stat.size > MAX_REPORT_BYTES ||
-      (startedAt !== undefined && stat.mtimeMs < startedAt)
+      (filesystemBaseline !== undefined && stat.mtimeMs < filesystemBaseline)
     )
       return undefined;
     const xml = readFileSync(fd, "utf8");
@@ -199,13 +199,13 @@ export function readCoveringJUnit(
   path: string,
   cwd: string,
   test: { file: string; name: string },
-  startedAt: number,
+  filesystemBaseline: number,
   existed: boolean,
 ): CoveringTestEvidence {
   const evidence: CoveringTestEvidence = { file: test.file.replace(/^\.\//, ""), name: test.name };
   if (existed) return { ...evidence, reason: "JUnit report existed before execution" };
   try {
-    const xml = readReport(path, startedAt);
+    const xml = readReport(path, filesystemBaseline);
     if (xml === undefined) return { ...evidence, reason: "JUnit report missing, stale or unsafe" };
     if (/<!DOCTYPE/i.test(xml)) throw new Error("Unsafe XML");
     const root = Bun.XML.parse(xml, { compact: false });
