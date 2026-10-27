@@ -3,7 +3,7 @@ import type { Factory } from "../app.ts";
 import { parseAllow } from "../core/allow.ts";
 import { isBranchName } from "../core/delivery.ts";
 import type { CreateRunRequest } from "../core/types.ts";
-import { IssueClaimed } from "../db/store.ts";
+import { CommentProcessed, IssueClaimed } from "../db/store.ts";
 import { inAnyCidr } from "../util/cidr.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import { githubSh } from "./github-identity.ts";
@@ -79,6 +79,29 @@ export function unquoteGitHub(
 
 type Mapped = { request?: CreateRunRequest; note: string; error?: boolean };
 
+export function commentRunRequest(
+  comment: {
+    repo: string;
+    number: number;
+    issueTitle: string;
+    issueBody: string;
+    request: string;
+    author: string;
+  },
+  owner: string | null,
+): CreateRunRequest {
+  const { repo, number, issueTitle, issueBody, request, author } = comment;
+  return {
+    repo,
+    source: "github",
+    title: `Issue #${number}: ${issueTitle}`,
+    requestedBy: author,
+    sourceRef: { kind: "issue", repo, number },
+    allow: author.toLowerCase() === owner?.toLowerCase() ? parseAllow(request) : [],
+    prompt: `${GITHUB_PREFACES.comment}\n\n${quoted({ request, issueTitle, issueBody })}`,
+  };
+}
+
 export function issueRunRequest(
   issue: { repo: string; number: number; title: string; body: string; author: string },
   owner: string | null,
@@ -134,14 +157,17 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
     if (!body.startsWith("/limitless ") || !body.slice(11).trim()) return { note: "other comment" };
     return {
       note: "owner command",
-      request: {
-        ...base,
-        title: `Issue #${id}: ${title}`,
-        requestedBy: owner,
-        sourceRef: { kind: "issue", repo: fullName, number: id },
-        allow: parseAllow(body.slice(11)), // The owner's request only, never the quoted issue.
-        prompt: `${GITHUB_PREFACES.comment}\n\n${quoted({ request: body.slice(11), issueTitle: title, issueBody: issue?.body ?? "" })}`,
-      },
+      request: commentRunRequest(
+        {
+          repo: fullName,
+          number: id,
+          issueTitle: title,
+          issueBody: string(issue?.body) ?? "",
+          request: body.slice(11),
+          author: owner,
+        },
+        owner,
+      ),
     };
   }
   if (event === "pull_request" && ["opened", "reopened", "synchronize"].includes(action ?? "")) {
@@ -220,6 +246,7 @@ const defaultRanges = githubHookRanges();
 export function githubWebhook(
   factory: GitHubFactory,
   ranges: HookRanges = defaultRanges,
+  pollNow?: () => void,
 ): (req: Request) => Promise<Response> {
   return async (req) => {
     if (req.method !== "POST")
@@ -272,6 +299,24 @@ export function githubWebhook(
     try {
       const p = object(payload);
       const repo = string(object(p?.repository)?.full_name);
+      const queue = factory.cfg.githubQueue;
+      if (
+        event === "issue_comment" &&
+        !object(p?.issue)?.pull_request &&
+        repo &&
+        queue?.trusted.length &&
+        queue.repos.some((r) => r.toLowerCase() === repo.toLowerCase())
+      ) {
+        const author = login(object(p?.comment)?.user);
+        const hint =
+          p?.action === "created" &&
+          !!author &&
+          queue.trusted.some((t) => t.toLowerCase() === author.toLowerCase());
+        if (hint) pollNow?.();
+        const note = hint ? "Issue queue poll requested" : "Issue queue comment ignored";
+        factory.store.finishInbox(id, "ignored", note);
+        return new Response(note, { status: 200 });
+      }
       const pr = object(p?.pull_request);
       const prNumber = number(pr?.number) ?? number(p?.number);
       if (
@@ -291,12 +336,20 @@ export function githubWebhook(
         factory.store.finishInbox(id, mapped.error ? "error" : "ignored", mapped.note);
         return new Response(mapped.note, { status: mapped.error ? 400 : 200 });
       }
-      const run = await factory.createRun(mapped.request, true);
+      const commentId = event === "issue_comment" ? number(object(p?.comment)?.id) : null;
+      const run = await factory.createRun(
+        mapped.request,
+        true,
+        undefined,
+        true,
+        undefined,
+        repo && commentId ? { repo, id: commentId } : undefined,
+      );
       factory.store.finishInbox(id, "run_created", mapped.note, run.id);
       return Response.json({ runId: run.id }, { status: 201 });
     } catch (error) {
       const note = redactCredentials(error instanceof Error ? error.message : String(error));
-      if (error instanceof IssueClaimed) {
+      if (error instanceof IssueClaimed || error instanceof CommentProcessed) {
         factory.store.finishInbox(id, "ignored", note);
         return new Response(note, { status: 200 });
       }
