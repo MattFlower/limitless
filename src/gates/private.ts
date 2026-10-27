@@ -169,7 +169,6 @@ export function decodeBackslashes(text: string, slashes = true): string {
 }
 const decodePercent = (text: string) =>
   text.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString());
-export const base64Runs = /[A-Za-z0-9+/]+=*/g;
 /** The decoded text of a base64 run that holds a protected value; undefined for unrelated runs. */
 export function base64Match(run: string, entries: PrivateStrings): string | undefined {
   const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
@@ -186,38 +185,49 @@ export function base64Match(run: string, entries: PrivateStrings): string | unde
 }
 /** Raw and successively decoded forms, NFKC-normalized and lowercased; null when decoding never settles. */
 export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
-  const layers = [text];
   // Repeated log fields and convergence rounds share the same base64 checks.
   const base64Cache = new Map<string, string>();
+  // base64Match leaves runs too short to hold a protected value unchanged, so the regex skips them.
+  const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
+  const candidates = entries.length
+    ? new RegExp(`(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{${Math.max(1, minimum)},}=*`, "g")
+    : undefined;
   const decodeBase64 = (layer: string) =>
-    layer.replace(base64Runs, (run) => {
-      let decoded = base64Cache.get(run);
-      if (decoded === undefined) {
-        decoded = base64Match(run, entries) ?? run;
-        base64Cache.set(run, decoded);
-      }
-      return decoded;
-    });
-  for (let round = 0; round < 5; round++) {
-    // Unrelated runs must not change decoding convergence or cause a refusal.
-    // Keep the text before HTML decoding too, since a protected value can contain a literal reference.
-    // Preserve main's Unicode-decoded spelling when a private value contains a literal backslash-slash.
-    const percentDecoded = decodePercent(text);
-    layers.push(percentDecoded, decodeBackslashes(percentDecoded, false));
-    const unescaped = decodeBackslashes(percentDecoded);
-    const expanded = decodeHTML(unescaped);
-    // Keep line breaks too: report quotations and multiline credentials depend on them.
-    layers.push(unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
-    const next = decodeBase64(expanded);
-    if (next === text) {
-      const all = [...layers, next];
-      const normalized = new Map([...new Set(all)].map((layer) => [layer, normalize(layer)]));
-      return all.map((layer) => normalized.get(layer) ?? "");
+    candidates
+      ? layer.replace(candidates, (run) => {
+          let decoded = base64Cache.get(run);
+          if (decoded === undefined) {
+            decoded = base64Match(run, entries) ?? run;
+            base64Cache.set(run, decoded);
+          }
+          return decoded;
+        })
+      : layer;
+  const rounds = (current: string, slashes: boolean): string[] | null => {
+    const layers = [current];
+    for (let round = 0; round < 5; round++) {
+      // Unrelated runs must not change decoding convergence or cause a refusal.
+      // Keep the text before backslash and HTML decoding too, since a protected value can contain either.
+      const percentDecoded = decodePercent(current);
+      const unescaped = decodeBackslashes(percentDecoded, slashes);
+      const expanded = decodeHTML(unescaped);
+      // Keep line breaks too: report quotations and multiline credentials depend on them.
+      layers.push(percentDecoded, unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
+      const next = decodeBase64(expanded);
+      if (next === current) return [...layers, next];
+      layers.push(next);
+      current = next;
     }
-    layers.push(next);
-    text = next;
-  }
-  return null;
+    return null;
+  };
+  // A protected value can contain a literal backslash-slash, so the rounds that keep "\/" still run. The
+  // rounds that decode it differ only once a layer holds "\/".
+  const kept = rounds(text, false);
+  const slashed = kept?.some((layer) => layer.includes("\\/")) ? rounds(text, true) : kept;
+  if (!kept || !slashed) return null;
+  const all = kept === slashed ? kept : [...kept, ...slashed];
+  const normalized = new Map([...new Set(all)].map((layer) => [layer, normalize(layer)]));
+  return all.map((layer) => normalized.get(layer) ?? "");
 }
 function stripPartialEscapes(text: string): string {
   let end = text.length;

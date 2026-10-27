@@ -3473,6 +3473,10 @@ test.each([
   String.raw`host\/p\u0061th.example`,
   String.raw`h\u006fst%5c/p%61th.example`,
   String.raw`host%5c/p\u0061th.example`,
+  String.raw`host\/p\u005cu0061th.example`,
+  String.raw`host\/p%255cu0061th.example`,
+  "host%5c/p%2561th.example",
+  String.raw`host\/p&amp;#x61;th.example`,
 ])("Unicode-decoded private values retain literal backslashes before slashes: %s", (text) => {
   const entries = [{ value: String.raw`host\/path.example`, entry: 1 }];
   expect(privateMatches(text, entries)).toEqual(entries);
@@ -3503,6 +3507,8 @@ test("JSON slash runs match private entries and are withheld in output data", ()
       String.raw`host\/p\u0061th.example`,
       String.raw`h\u006fst%5c/p%61th.example`,
       String.raw`host%5c/p\u0061th.example`,
+      String.raw`host\/p\u005cu0061th.example`,
+      String.raw`host\/p%255cu0061th.example`,
     ])
       expect(privateOutputData({ output, ordinary: "completed successfully" }, literalPrivacy)).toEqual({
         output: "[withheld: private text]",
@@ -3516,10 +3522,10 @@ test("JSON slash runs match private entries and are withheld in output data", ()
 });
 
 test("private matching retains main's matches across short percent and backslash spellings", () => {
-  const entries = ["", "\\/", "%", "%5c/", "\\", "/", "a", "h"].map((middle, i) => ({
-    value: `host${middle}path.example`,
-    entry: i + 1,
-  }));
+  const entries = [
+    ...["", "\\/", "%", "%5c/", "\\", "/", "a", "h"].map((middle) => `host${middle}path.example`),
+    String.raw`host\/path example`,
+  ].map((value, i) => ({ value, entry: i + 1 }));
   // Frozen from c06bce4946f2f9ccb37670638966dc4c8b292e7f; independent of production helpers.
   const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
   const decoded = (text: string) =>
@@ -3576,7 +3582,18 @@ test("private matching retains main's matches across short percent and backslash
       String.raw`\u0025`,
       String.raw`\u00255c/`,
     ])
-      for (const suffix of ["path.example", String.raw`p\u0061th.example`, "p%61th.example"])
+      for (const suffix of [
+        "path.example",
+        String.raw`p\u0061th.example`,
+        "p%61th.example",
+        // Later rounds decode these nested escapes after a literal backslash-slash survives the first.
+        String.raw`p\u005cu0061th.example`,
+        "p%255cu0061th.example",
+        "p%2561th.example",
+        "p&amp;#x61;th.example",
+        "path\n\texample",
+        String.raw`path\u000aexample`,
+      ])
         check(`${prefix}${middle}${suffix}`);
 });
 
