@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import type { CreateRunRequest, RunStatus } from "../src/core/types.ts";
+import type { CreateRunRequest, FeedPage, RunStatus } from "../src/core/types.ts";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { ISSUE_CLAIM_STATUSES, IssueClaimed, linkedIssues, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
@@ -36,8 +36,9 @@ import { waitClock } from "./wait-clock.ts";
 const at = "2026-01-01T00:00:00Z";
 const beforeLifecycle = (path: string) =>
   !path.endsWith("-issue-lifecycle.sql") && !path.endsWith("-issue-lifecycle-history.sql");
-function issue(number = 1, p = 1): QueueIssue {
+function issue(number = 1, p = 1): QueueIssue & { repository: { nameWithOwner: string } } {
   return {
+    repository: { nameWithOwner: "owner/repo" },
     number,
     title: `Issue ${number}`,
     body: "Implement it.\nAllow: submodules",
@@ -118,7 +119,10 @@ const exclusions: [string, (i: QueueIssue) => void][] = [
   [
     "native blocker",
     (i) => {
-      i.blockedBy = { totalCount: 1, nodes: [{ number: 9, state: "OPEN" }] };
+      i.blockedBy = {
+        totalCount: 1,
+        nodes: [{ number: 9, state: "OPEN", repository: { nameWithOwner: "owner/repo" } }],
+      };
     },
   ],
   [
@@ -174,7 +178,10 @@ test("closed dependencies and merged PRs allow a trusted, edited issue", () => {
   i.editor = { login: "OWNER" };
   i.lastEditedAt = at;
   i.body = "Blocked by #9\r\nBlocked by #10";
-  i.blockedBy = { totalCount: 1, nodes: [{ number: 9, state: "CLOSED" }] };
+  i.blockedBy = {
+    totalCount: 1,
+    nodes: [{ number: 9, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+  };
   i.closedByPullRequestsReferences = { totalCount: 1, nodes: [{ state: "MERGED" }] };
   expect(
     issueEligibility(i, ["owner"], {
@@ -3589,6 +3596,133 @@ function attentionEpic() {
   return { epic, open, closed };
 }
 
+test.each(["approval", "local claim", "missing record", "native acceptance", "foreign claim"] as const)(
+  "epic attention does not substitute a local issue for a foreign child during %s",
+  async (kind) => {
+    const h = harness();
+    const { epic, open, closed } = attentionEpic();
+    epic.body = "";
+    const foreign = {
+      ...(kind === "native acceptance" ? closed : open),
+      repository: { nameWithOwner: "other/repo" },
+      labels: kind === "missing record" ? open.labels : { totalCount: 0, nodes: [] },
+    };
+    epic.subIssues.nodes = kind === "native acceptance" ? [foreign, open] : [closed, foreign];
+    if (kind === "native acceptance") {
+      open.blockedBy = {
+        totalCount: 1,
+        nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+      };
+    }
+    if (kind === "local claim" || kind === "foreign claim") {
+      open.labels = { totalCount: 0, nodes: [] };
+      const repo = h.store.getRepoBySlug("owner/repo");
+      if (!repo) throw new Error("missing repo");
+      h.store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "Local issue",
+        sourceRef: {
+          kind: "issue",
+          repo: kind === "foreign claim" ? "OTHER/REPO" : "OWNER/REPO",
+          number: 3,
+        },
+      });
+      h.maxCalls = 0;
+    }
+    h.data.set("owner/repo", kind === "missing record" ? [epic] : [epic, open]);
+    h.start();
+    await h.advance();
+    expect(
+      h.store
+        .readFeed()
+        .items.filter((item) => item.kind === "queue.epic_attention")
+        .map((item) => item.data.state),
+    ).toEqual(kind === "native acceptance" || kind === "foreign claim" ? [] : ["needs_approval"]);
+  },
+);
+
+test("native acceptance covers an exact foreign sibling even when its number equals the candidate's", () => {
+  const { epic, open, closed } = attentionEpic();
+  epic.body = "";
+  closed.repository.nameWithOwner = "OTHER/REPO";
+  open.repository.nameWithOwner = "OWNER/REPO";
+  open.number = closed.number;
+  const check = () =>
+    epicAttention("Owner/Repo", epic, ["owner"], new Map([["owner/repo#2", open]]), () => false);
+  expect(check()).toBeNull();
+  open.blockedBy = {
+    totalCount: 1,
+    nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "other/repo" } }],
+  };
+  expect(check()).toEqual({ state: "ready_for_acceptance", items: ["#2"] });
+  // The same repository and number in different casing really is a duplicate.
+  closed.repository.nameWithOwner = "owner/repo";
+  expect(check()).toBeUndefined();
+});
+
+test("bare slice references cannot name a foreign child or acceptance candidate", () => {
+  const { epic, open, closed } = attentionEpic();
+  open.repository.nameWithOwner = "OWNER/REPO";
+  expect(
+    epicAttention("Owner/Repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({ state: "ready_for_acceptance", items: ["#3"] });
+  closed.repository.nameWithOwner = "other/repo";
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({ state: "unfiled", items: ["- Build: #2"] });
+
+  closed.repository.nameWithOwner = "owner/repo";
+  open.repository.nameWithOwner = "other/repo";
+  open.number = closed.number;
+  epic.body = "## Slices\n- Acceptance: #2";
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["other/repo#2", open]]), () => false),
+  ).toBeNull();
+});
+
+test("queue-produced epic and existing feed items preserve HTTP acknowledgement cursors", async () => {
+  const h = harness();
+  const { epic, open } = attentionEpic();
+  epic.body += "\n- Later";
+  h.data.set("owner/repo", [epic, open]);
+  h.start();
+  await h.advance();
+  const repo = h.store.getRepoBySlug("owner/repo");
+  if (!repo) throw new Error("missing repo");
+  const run = h.store.createRun(repo, { repo: repo.slug, prompt: "Existing work" });
+  h.store.updateRun(run.id, { status: "failed" });
+  const routes = createHttpRoutes(h.factory);
+  const feed = (routes["/api/feed"] as { GET: Route }).GET;
+  const ack = (routes["/api/feed/ack"] as { POST: Route }).POST;
+  const read = async () =>
+    (await (
+      await feed(requestWithParams("http://localhost:7400/api/feed?consumer=legacy"), localServer)
+    ).json()) as FeedPage;
+  const mixed = await read();
+  expect(mixed.items.map((i) => i.kind)).toEqual(["queue.epic_attention", "run.failed"]);
+  expect(mixed.items[0]?.data).toEqual({
+    repo: "owner/repo",
+    epic: 1,
+    state: "unfiled",
+    items: ["- Later"],
+  });
+  const cursor = mixed.nextAfter;
+  expect(mixed.items[1]?.id).toBe(cursor);
+  const response = await ack(
+    requestWithParams("http://localhost:7400/api/feed/ack", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ consumer: "legacy", id: cursor }),
+    }),
+    localServer,
+  );
+  expect(response.status).toBe(200);
+  h.store.updateRun(run.id, { status: "cancelled" });
+  const next = await read();
+  expect(next.items.map((i) => i.kind)).toEqual(["run.cancelled"]);
+  expect(next.items[0]?.id).toBeGreaterThan(cursor);
+});
+
 test.each([
   [
     "unrelated reference",
@@ -3620,7 +3754,10 @@ test.each([
     "native acceptance with closed sibling",
     (e: QueueIssue, o: QueueIssue) => {
       e.body = "";
-      o.blockedBy = { totalCount: 1, nodes: [{ number: 2, state: "CLOSED" }] };
+      o.blockedBy = {
+        totalCount: 1,
+        nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+      };
     },
     "ready_for_acceptance",
     ["#3"],
@@ -3628,7 +3765,9 @@ test.each([
 ] as const)("epic attention: %s", (_name, change, state, items) => {
   const { epic, open } = attentionEpic();
   change(epic, open);
-  expect(epicAttention(epic, ["OWNER"], new Map([[3, open]]), () => false)).toEqual({
+  expect(
+    epicAttention("owner/repo", epic, ["OWNER"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({
     state,
     items: [...items],
   });
@@ -3638,7 +3777,9 @@ test("Slices parsing excludes fences and other sections, counts closed children,
   const { epic, open } = attentionEpic();
   epic.body =
     "- Outside\n## Slices\n```md\n- Ignored\n```\n1. Build #2\n2) Acceptance: #3\n  continuation\n### Notes\n+ Future\n## Tests\n- Outside";
-  expect(epicAttention(epic, ["owner"], new Map([[3, open]]), () => false)).toEqual({
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({
     state: "unfiled",
     items: ["+ Future"],
   });
@@ -3654,12 +3795,18 @@ test.each(["author", "editor", "missing editor"])(
       epic.lastEditedAt = at;
       epic.editor = kind === "editor" ? { login: "stranger" } : null;
     }
-    const check = () => epicAttention(epic, ["owner"], new Map([[3, open]]), () => false);
+    const check = () =>
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false);
     expect(check()).toBeNull();
     open.labels = { totalCount: 0, nodes: [] };
     expect(check()).toEqual({ state: "needs_approval", items: ["#3"] });
-    open.blockedBy = { totalCount: 1, nodes: [{ number: 2, state: "CLOSED" }] };
-    expect(epicAttention(epic, ["owner"], new Map([[3, open]]), () => true)).toEqual({
+    open.blockedBy = {
+      totalCount: 1,
+      nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+    };
+    expect(
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => true),
+    ).toEqual({
       state: "ready_for_acceptance",
       items: ["#3"],
     });
@@ -3670,7 +3817,7 @@ test.each(["children", "51 children", "labels", "missing open record", "blockers
   "incomplete %s preserves attention",
   (kind) => {
     const { epic, open } = attentionEpic();
-    const records = new Map([[3, open]]);
+    const records = new Map([["owner/repo#3", open]]);
     if (kind === "children") epic.subIssues.nodes.pop();
     if (kind === "51 children") epic.subIssues.totalCount = epic.subIssuesSummary.total = 51;
     if (kind === "labels") open.labels.totalCount++;
@@ -3679,7 +3826,7 @@ test.each(["children", "51 children", "labels", "missing open record", "blockers
       epic.body = "";
       open.blockedBy.totalCount++;
     }
-    expect(epicAttention(epic, ["owner"], records, () => false)).toBeUndefined();
+    expect(epicAttention("owner/repo", epic, ["owner"], records, () => false)).toBeUndefined();
   },
 );
 
@@ -3688,7 +3835,8 @@ test("fifty complete children report; closed, childless, approved and claimed sl
   epic.body = "";
   epic.subIssues.nodes = [...Array.from({ length: 49 }, (_, n) => ({ ...closed, number: n + 4 })), open];
   epic.subIssues.totalCount = epic.subIssuesSummary.total = 50;
-  const check = (claim = false) => epicAttention(epic, ["owner"], new Map([[3, open]]), () => claim);
+  const check = (claim = false) =>
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => claim);
   expect(check()).toBeNull();
   open.labels = { totalCount: 0, nodes: [] };
   expect(check()?.state).toBe("needs_approval");
@@ -3712,7 +3860,9 @@ test("ambiguous acceptance or blockers missing a closed sibling do not establish
     "## Slices\n- Acceptance: #2\n- Acceptance: #3",
   ]) {
     epic.body = body;
-    expect(epicAttention(epic, ["owner"], new Map([[3, open]]), () => false)).toBeNull();
+    expect(
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+    ).toBeNull();
   }
 });
 
@@ -3746,7 +3896,12 @@ test("poll redacts attention before storage and publication without creating run
   expect(h.calls).toHaveLength(1);
   expect(h.calls[0]?.[1]).toBe("graphql");
   expect(h.calls[0]?.[3]).toContain("subIssues(first:50)");
-  expect(h.calls[0]?.[3]).toContain("nodes { number state }");
+  expect(h.calls[0]?.[3]).toContain(
+    "subIssues(first:50) { totalCount nodes { number state repository { nameWithOwner }",
+  );
+  expect(h.calls[0]?.[3]).toContain(
+    "blockedBy(first:100) { totalCount nodes { number state repository { nameWithOwner }",
+  );
 });
 
 test("epic episodes survive reopen, change A to B to A, clear silently and re-enter A", async () => {
@@ -3856,7 +4011,10 @@ test.each(["needs_approval", "ready_for_acceptance", "native", "claim"] as const
     if (kind === "needs_approval" || kind === "claim") open.labels = { totalCount: 0, nodes: [] };
     if (kind === "native") {
       epic.body = "";
-      open.blockedBy = { totalCount: 1, nodes: [{ number: 2, state: "CLOSED" }] };
+      open.blockedBy = {
+        totalCount: 1,
+        nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+      };
     }
     if (kind === "claim") {
       const repo = h.store.getRepoBySlug("owner/repo");
@@ -3936,9 +4094,12 @@ test("attention uses full open-issue labels when the child preview omits priorit
     { name: "priority:10" },
   ];
   open.labels.totalCount = 21;
-  expect(epicAttention(epic, ["owner"], new Map([[3, open]]), () => false)?.state).toBe(
-    "ready_for_acceptance",
-  );
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false)?.state,
+  ).toBe("ready_for_acceptance");
   open.labels = { totalCount: 0, nodes: [] };
-  expect(epicAttention(epic, ["owner"], new Map([[3, open]]), (n) => n === 2)?.state).toBe("needs_approval");
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), (_repo, n) => n === 2)
+      ?.state,
+  ).toBe("needs_approval");
 });

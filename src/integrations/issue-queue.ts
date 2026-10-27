@@ -14,6 +14,11 @@ const connection = <T extends z.ZodType>(node: T) =>
     nodes: z.array(node),
     totalCount: z.number().int().nonnegative(),
   });
+const issueReference = z.object({
+  number: z.number().int().positive(),
+  state: z.enum(["OPEN", "CLOSED"]),
+  repository: z.object({ nameWithOwner: z.string() }),
+});
 const issueSchema = z.object({
   number: z.number().int().positive(),
   title: z.string(),
@@ -36,13 +41,11 @@ const issueSchema = z.object({
   labels: connection(z.object({ name: z.string() })),
   subIssuesSummary: z.object({ total: z.number().int().nonnegative() }),
   subIssues: connection(
-    z.object({
-      number: z.number().int().positive(),
-      state: z.enum(["OPEN", "CLOSED"]),
+    issueReference.extend({
       labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }),
     }),
   ),
-  blockedBy: connection(z.object({ number: z.number().int().positive(), state: z.enum(["OPEN", "CLOSED"]) })),
+  blockedBy: connection(issueReference),
   closedByPullRequestsReferences: connection(z.object({ state: z.enum(["OPEN", "CLOSED", "MERGED"]) })),
   timelineItems: connection(
     z.discriminatedUnion("__typename", [
@@ -57,6 +60,7 @@ const issueSchema = z.object({
   ),
 });
 export type QueueIssue = z.infer<typeof issueSchema>;
+const issueKey = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
 const priority = (s: string) => /^priority:(10|[0-9])$/.test(s);
 const blockers = (body: string) =>
   body
@@ -66,18 +70,21 @@ const blockers = (body: string) =>
 
 /** Undefined means incomplete evidence: preserve the saved observation. */
 export function epicAttention(
+  repo: string,
   epic: QueueIssue,
   trusted: string[],
-  issues: ReadonlyMap<number, QueueIssue>,
-  claimed: (number: number) => boolean,
+  issues: ReadonlyMap<string, QueueIssue>,
+  claimed: (repo: string, number: number) => boolean,
 ): EpicAttention | null | undefined {
   if (epic.state !== "OPEN") return null;
   const children = epic.subIssues;
+  const key = (c: z.infer<typeof issueReference>) => issueKey(c.repository.nameWithOwner, c.number);
+  const childKeys = new Set(children.nodes.map(key));
   if (
     children.totalCount > 50 ||
     children.totalCount !== children.nodes.length ||
     children.totalCount !== epic.subIssuesSummary.total ||
-    new Set(children.nodes.map((c) => c.number)).size !== children.totalCount
+    childKeys.size !== children.totalCount
   )
     return undefined;
   if (!children.totalCount) return null;
@@ -105,16 +112,29 @@ export function epicAttention(
   }
   const refs = (text: string) =>
     [...text.matchAll(/(?<![\w/])#([1-9][0-9]*)\b/g)]
-      .map((m) => Number(m[1]))
-      .filter((n) => children.nodes.some((c) => c.number === n));
+      .map((m) => issueKey(repo, Number(m[1])))
+      .filter((k) => childKeys.has(k));
   const unfiled = lines.filter((l) => !refs(l.text).length).map((l) => l.line);
   if (unfiled.length) return { state: "unfiled", items: unfiled };
   const open = children.nodes.filter((c) => c.state === "OPEN");
   if (!open.length) return null;
-  const records = open.map((c) => issues.get(c.number));
-  if (records.some((i) => i?.state !== "OPEN" || i.labels.totalCount !== i.labels.nodes.length))
+  const records = open.map((c) => issues.get(key(c)));
+  if (
+    open.some((c, n) => {
+      const i = records[n];
+      // Local records must be complete; unobserved foreign children lack priority evidence.
+      if (!i) return c.repository.nameWithOwner.toLowerCase() === repo.toLowerCase();
+      return i.state !== "OPEN" || i.labels.totalCount !== i.labels.nodes.length;
+    })
+  )
     return undefined;
-  if (!open.some((c, n) => records[n]?.labels.nodes.some((l) => priority(l.name)) || claimed(c.number)))
+  if (
+    !open.some(
+      (c, n) =>
+        records[n]?.labels.nodes.some((l) => priority(l.name)) ||
+        claimed(c.repository.nameWithOwner, c.number),
+    )
+  )
     return { state: "needs_approval", items: open.map((c) => `#${c.number}`) };
   if (open.length !== 1) return null;
   const candidate = open[0];
@@ -122,15 +142,14 @@ export function epicAttention(
   if (!candidate || !record) return undefined;
   const acceptance = lines.filter((l) => /^Acceptance:/.test(l.text));
   if (acceptance.length) {
-    const numbers = new Set(acceptance.flatMap((l) => refs(l.text)));
-    return acceptance.length === 1 && numbers.size === 1 && numbers.has(candidate.number)
+    const references = new Set(acceptance.flatMap((l) => refs(l.text)));
+    return acceptance.length === 1 && references.size === 1 && references.has(key(candidate))
       ? { state: "ready_for_acceptance", items: [`#${candidate.number}`] }
       : null;
   }
   if (record.blockedBy.totalCount !== record.blockedBy.nodes.length) return undefined;
-  return children.nodes.every(
-    (c) => c.number === candidate.number || record.blockedBy.nodes.some((b) => b.number === c.number),
-  )
+  const covered = new Set([key(candidate), ...record.blockedBy.nodes.map(key)]);
+  return children.nodes.every((c) => covered.has(key(c)))
     ? { state: "ready_for_acceptance", items: [`#${candidate.number}`] }
     : null;
 }
@@ -217,8 +236,8 @@ export function issueEligibility(
 const ISSUE_FIELDS = `number title body createdAt updatedAt state author { login } editor { login } lastEditedAt
   comments(last: 20) { totalCount nodes { databaseId body createdAt lastEditedAt author { login } } }
   labels(first:100) { totalCount nodes { name } } subIssuesSummary { total }
-  subIssues(first:50) { totalCount nodes { number state labels(first:20) { nodes { name } } } }
-  blockedBy(first:100) { totalCount nodes { number state } }
+  subIssues(first:50) { totalCount nodes { number state repository { nameWithOwner } labels(first:20) { nodes { name } } } }
+  blockedBy(first:100) { totalCount nodes { number state repository { nameWithOwner } } }
   closedByPullRequestsReferences(first:100) { totalCount nodes { state } }
   timelineItems(last:100, itemTypes:[LABELED_EVENT, RENAMED_TITLE_EVENT]) { totalCount nodes { __typename
     ... on LabeledEvent { label { name } actor { login } createdAt }
@@ -363,13 +382,13 @@ export function startIssueQueue(
           if (stopped) break;
           const identity = await (opts.lifecycle?.identity ?? githubIdentity)(repo).catch(() => null);
           if (stopped) break;
-          const observed = new Map(issues.nodes.map((i) => [i.number, i]));
+          const observed = new Map(issues.nodes.map((i) => [issueKey(repo, i.number), i]));
           factory.store.reconcileEpicAttention(
             repo,
             new Map(
               issues.nodes.map((i) => [
                 i.number,
-                epicAttention(i, q.trusted, observed, (n) => !!factory.store.issueClaim(repo, n)),
+                epicAttention(repo, i, q.trusted, observed, (r, n) => !!factory.store.issueClaim(r, n)),
               ]),
             ),
           );
