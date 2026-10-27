@@ -134,13 +134,15 @@ export async function runGateExecution(
     if (handle) onExecuted?.(handle, result);
     return result;
   } finally {
-    // A termination before attach leaves the durable identity available for resume.
+    // A termination before attach leaves the durable identity available for resume; so does
+    // failed remote cleanup, so a later resume or discard retries it.
     if (
       settled &&
       !(
         ["lan", "inplace", "github-actions"].includes(ctx.state.gateExecution?.handle.kind ?? "") &&
         gateShutdown(ctx.signal)
-      )
+      ) &&
+      !ctx.state.gateExecution?.handle.githubActions?.cleanupFailed
     ) {
       ctx.state.gateExecution = undefined;
       await ctx.save("gate-result");

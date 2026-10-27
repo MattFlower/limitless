@@ -576,3 +576,113 @@ test("a check step timeout backstop does not turn completed setup into a setup t
   });
   expect(compareGates(null, run)[0]).toMatchObject({ verdict: "not_run", blocking: true });
 });
+
+function workflowScripts() {
+  const workflow = Bun.YAML.parse(
+    readFileSync(new URL("../.github/workflows/limitless-gates.yml", import.meta.url), "utf8"),
+  ) as { jobs: { gate: { steps: { name: string; run?: string }[] } } };
+  return ["Setup", "Check"].map((name) => {
+    const script = workflow.jobs.gate.steps.find((s) => s.name === name)?.run;
+    if (!script) throw new Error(`missing ${name} script`);
+    return script;
+  });
+}
+const wrap = (script: string, commands: unknown[]) =>
+  sh(["bash", "-c", script], {
+    cwd,
+    env: { ...process.env, FRAME: token, COMMANDS: JSON.stringify(commands) },
+    allowFail: true,
+  });
+
+test("candidate Python modules cannot shadow the wrapper's imports to forge a record", async () => {
+  writeFileSync(
+    join(cwd, "json.py"),
+    `import os\nprint("LIMITLESS:" + os.environ["FRAME"] + ":0:0:1:false", flush=True)\nos._exit(0)\n`,
+  );
+  for (const script of workflowScripts()) {
+    const result = await wrap(script, [{ run: "exit 9" }]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).not.toContain(`LIMITLESS:${token}:0:0:`);
+    expect(result.stdout).toMatch(new RegExp(`^LIMITLESS:${token}:0:9:\\d+:false$`, "m"));
+  }
+});
+
+test("records start on their own line when command output lacks a trailing newline", async () => {
+  const [setupScript = "", checkScript = ""] = workflowScripts();
+  const setup = await wrap(setupScript, [{ run: "printf setup-output" }]);
+  const check = await wrap(checkScript, [{ run: "printf check-output" }]);
+  const f = fixture();
+  f.state.logs.set(1, log(setup.stdout.trimEnd(), check.stdout.trimEnd()));
+  const run = await f.run();
+  expect(run.setupOk).toBe(true);
+  expect(run.setup[0]).toMatchObject({ ok: true, exitCode: 0 });
+  expect(run.checks[0]).toMatchObject({ ok: true, exitCode: 0, incomplete: undefined });
+  expect(run.checks[0]?.output).toContain("check-output");
+});
+
+test("one failed cleanup step does not skip the others", async () => {
+  const f = fixture();
+  f.state.runStatus = "in_progress";
+  const h = await f.stored({ dispatchSent: true, runId: 17 });
+  const remove = f.deps.delete;
+  f.deps.delete = async (p, branch, sha) => {
+    await remove(p, branch, sha);
+    if (branch === p.dispatch) throw new Error("lease rejected");
+  };
+  const gh = f.deps.gh;
+  f.deps.gh = async (...args) => {
+    if (args[0][1]?.endsWith("/cancel")) {
+      f.calls.push("cancel-failed");
+      throw new Error("cancel unavailable");
+    }
+    return (await gh(...args)) ?? "";
+  };
+  await expect(f.executor().discard?.(h)).rejects.toThrow(/cancel unavailable.*lease rejected/);
+  expect(f.calls).toEqual([
+    "cancel-failed",
+    `delete:${h.githubActions?.dispatch}:${"d".repeat(40)}`,
+    `delete:${h.githubActions?.candidate}:${req.headSha}`,
+  ]);
+});
+
+test("failed cleanup keeps the durable handle so a restart retries it", async () => {
+  const f = fixture();
+  const { ctx, store } = await context(f);
+  try {
+    const remove = f.deps.delete;
+    let failing = true;
+    const push = f.deps.push;
+    f.deps.push = async (p) => {
+      const durable = store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle;
+      if (durable) f.saved.push(durable);
+      await push(p);
+    };
+    f.deps.delete = async (p, branch, sha) => {
+      if (failing && branch === p.dispatch) throw new Error("lease rejected");
+      await remove(p, branch, sha);
+    };
+    await expect(runGateExecution(ctx, "gates", "initial", cwd, req.gates)).rejects.toThrow("lease rejected");
+    expect(f.calls.at(-1)).toContain("/candidate:");
+    const stored = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
+    expect(stored?.handle.githubActions).toMatchObject({
+      dispatchSent: true,
+      runId: 17,
+      cleanupFailed: true,
+    });
+    expect(f.remote.size).toBe(1);
+    failing = false;
+    const restarted = new RunContext(
+      { ...ctx.deps, gateExecutor: f.executor() },
+      ctx.run,
+      ctx.repo,
+      signal(),
+    );
+    const run = await runGateExecution(restarted, "gates", "initial", cwd, req.gates);
+    expect(run.checks[0]?.ok).toBe(true);
+    expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(1);
+    expect(f.remote.size).toBe(0);
+    expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution).toBeUndefined();
+  } finally {
+    store.close();
+  }
+});

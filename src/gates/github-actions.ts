@@ -18,12 +18,14 @@ export interface ActionsProgress {
   pushed?: boolean;
   dispatchSent?: boolean;
   runId?: number;
+  /** Cancellation or branch deletion failed; keep this identity durable so cleanup is retried. */
+  cleanupFailed?: boolean;
 }
 interface Dependencies {
   gh: GhRunner;
   /** Ensure both refs point at these SHAs, atomically; refuse refs at other SHAs. */
   push: (progress: ActionsProgress) => Promise<void>;
-  /** Delete only while the ref still points at sha (a remote force-with-lease). */
+  /** Delete only while the ref still points at sha (a remote force-with-lease); an absent or moved ref resolves. */
   delete: (progress: ActionsProgress, branch: string, sha: string) => Promise<void>;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
@@ -65,19 +67,33 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     const p = handle.githubActions;
     if (!p) throw new Error("Missing GitHub Actions progress");
     const deadline = deps.now() + deps.discardVisibilityMs;
-    if (p.dispatchSent && !p.runId) {
-      do {
-        p.runId = await discover(p);
-        if (p.runId || deps.now() >= deadline) break;
-        await deps.sleep(Math.min(deps.pollMs, deadline - deps.now()));
-      } while (!p.runId && deps.now() <= deadline);
-    }
-    if (p.runId) {
-      const run = await api<Run>(p, `actions/runs/${p.runId}`);
-      if (run.status !== "completed") await api(p, `actions/runs/${p.runId}/cancel`, "POST");
-    }
-    if (p.dispatchSha) await deps.delete(p, p.dispatch, p.dispatchSha);
-    await deps.delete(p, p.candidate, p.headSha);
+    const failures: Error[] = [];
+    // Each step is independent: one failure must not leave the others undone.
+    const attempt = (step: () => Promise<unknown>) =>
+      step().catch((error) => {
+        failures.push(error instanceof Error ? error : new Error(String(error)));
+      });
+    if (p.dispatchSent && !p.runId)
+      await attempt(async () => {
+        do {
+          p.runId = await discover(p);
+          if (p.runId || deps.now() >= deadline) break;
+          await deps.sleep(Math.min(deps.pollMs, deadline - deps.now()));
+        } while (!p.runId && deps.now() <= deadline);
+      });
+    const { runId, dispatchSha } = p;
+    if (runId)
+      await attempt(async () => {
+        const run = await api<Run>(p, `actions/runs/${runId}`);
+        if (run.status !== "completed") await api(p, `actions/runs/${runId}/cancel`, "POST");
+      });
+    if (dispatchSha) await attempt(() => deps.delete(p, p.dispatch, dispatchSha));
+    await attempt(() => deps.delete(p, p.candidate, p.headSha));
+    if (failures.length)
+      throw new AggregateError(
+        failures,
+        `GitHub Actions gate cleanup failed: ${failures.map((e) => e.message).join("; ")}`,
+      );
   };
   return {
     kind: "github-actions",
@@ -239,9 +255,18 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           }
         } finally {
           signal.removeEventListener("abort", abort);
-          if (!gateShutdown(controller.signal)) await discard(handle);
         }
-      })();
+      })().finally(async () => {
+        if (gateShutdown(controller.signal)) return;
+        try {
+          await discard(handle);
+          p.cleanupFailed = undefined;
+        } catch (error) {
+          p.cleanupFailed = true;
+          await checkpoint();
+          throw error;
+        }
+      });
       return {
         result,
         cancel: async (reason) => {

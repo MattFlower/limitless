@@ -56,7 +56,8 @@ jobs:
           FRAME: ${{ steps.token.outputs.frame }}
           COMMANDS: ${{ inputs.setup }}
         run: |
-          python3 - <<'PY'
+          # Isolated mode: modules in the candidate checkout must not shadow the wrapper's imports.
+          python3 -I - <<'PY'
           import json, os, signal, subprocess, time
           token = os.environ.pop('FRAME')
           commands = json.loads(os.environ.pop('COMMANDS'))
@@ -72,7 +73,7 @@ jobs:
                   code = process.wait()
               code = code if code >= 0 else 128 - code
               duration = int((time.monotonic() - started) * 1000)
-              print(f'LIMITLESS:{token}:{index}:{code}:{duration}:{str(timed_out).lower()}', flush=True)
+              print(f'\nLIMITLESS:{token}:{index}:{code}:{duration}:{str(timed_out).lower()}', flush=True)
               if code or timed_out:
                   raise SystemExit(1)
           PY
@@ -83,7 +84,8 @@ jobs:
           COMMANDS: ${{ format('[{0}]', toJSON(matrix.check)) }}
           LIMITLESS_GATE_REPORT: ${{ runner.temp }}/limitless-gate-report.xml
         run: |
-          python3 - <<'PY'
+          # Isolated mode: modules in the candidate checkout must not shadow the wrapper's imports.
+          python3 -I - <<'PY'
           import json, os, signal, subprocess, time
           token = os.environ.pop('FRAME')
           commands = json.loads(os.environ.pop('COMMANDS'))
@@ -99,7 +101,7 @@ jobs:
                   code = process.wait()
               code = code if code >= 0 else 128 - code
               duration = int((time.monotonic() - started) * 1000)
-              print(f'LIMITLESS:{token}:{index}:{code}:{duration}:{str(timed_out).lower()}', flush=True)
+              print(f'\nLIMITLESS:{token}:{index}:{code}:{duration}:{str(timed_out).lower()}', flush=True)
               if code or timed_out:
                   raise SystemExit(1)
           PY
