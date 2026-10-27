@@ -311,7 +311,8 @@ Host check: **no symlink along any denied path, and no credential store relocate
 scratch or a toolchain directory**. Canonical home/config deny paths work with checkout and scratch
 paths under a symlinked TMPDIR; the TMPDIR alias itself must not appear in the deny paths. These
 restrictions apply only to Linux. A host that moves credentials to allowed paths after launch is still
-outside the launch-time guarantee.
+outside the launch-time guarantee, and so is a host process that renames or replaces a deny's parent
+directories while a sandbox is launching.
 The daemon port is refused on every address (Landlock rules are per port), and other egress is
 allowed as on macOS. Launching costs about 5 ms for bwrap and about 70 ms for the 65,535 Landlock
 port rules a daemon port needs.

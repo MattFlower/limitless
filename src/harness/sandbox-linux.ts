@@ -112,6 +112,8 @@ function assertHidden(args: string[], sources: { dir: string; file: string }, de
             tmpfs: option === "--tmpfs",
             live:
               ["--bind", "--bind-try", "--ro-bind", "--ro-bind-try"].includes(option) &&
+              // Not the root bind: only an unconfined host process can change the host's own tree,
+              // which is outside the launch-time guarantee.
               values[0] !== "/" &&
               ![sources.dir, sources.file].includes(values[0] ?? ""),
             hides:
