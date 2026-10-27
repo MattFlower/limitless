@@ -34,8 +34,9 @@ function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha:
   const failed = (r: GateResult) =>
     !r.reused && r.docsOnly?.mode !== "skipped" && (!r.ok || r.timedOut || confinementFailed(r));
   if (![...result.setup, ...result.checks].some(failed)) return;
+  // Only a run's gates stage is observed; a direct call outside one has no stage to attribute.
   const stageId = ctx.stageId;
-  if (stageId === undefined) throw new Error("Missing gates stage attribution");
+  if (stageId === undefined) return;
   const location = executionLocation(ctx, handle);
   const coordinator = location === "coordinator";
   const job = handle.kind === "lan" ? new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id) : null;

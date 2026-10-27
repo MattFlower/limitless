@@ -1341,16 +1341,13 @@ test.each([
     const worker = await loop();
     const stage = kind === "baseline" ? "prepare" : "gates";
     try {
-      const first = await ctx.stage(stage, async () => ({
-        summary: "initial gates",
-        value: await runGateExecution(
-          ctx,
-          stage,
-          kind === "baseline" ? "baseline" : "initial",
-          req.cwd,
-          req.gates,
-        ),
-      }));
+      const first = await runGateExecution(
+        ctx,
+        stage,
+        kind === "baseline" ? "baseline" : "initial",
+        req.cwd,
+        req.gates,
+      );
       expect(first.checks[0]).toMatchObject({ ok: false, exitCode: 1 });
       expect(first.checks[0]?.output).toContain("transient");
       expect(existsSync(join(req.cwd, "node_modules", "ready"))).toBe(false);
