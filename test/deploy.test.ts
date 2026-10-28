@@ -1537,7 +1537,12 @@ function executorSetup() {
     if (args[0] !== "launchctl") return command(args, opts);
     f.calls.push(args.join(" "));
     let exitCode = 0;
-    if (args[1] === "print") exitCode = loaded ? 0 : 1;
+    if (args[1] === "print")
+      return {
+        exitCode: loaded ? 0 : 1,
+        stdout: "",
+        stderr: loaded ? "" : `Could not find service "${label}" in domain for user gui: ${userInfo().uid}`,
+      };
     if (args[1] === "bootout") loaded = false;
     if (args[1] === "disable") disabled = true;
     if (args[1] === "enable") disabled = false;
@@ -1557,6 +1562,67 @@ function executorSetup() {
     disabled: () => disabled,
   };
 }
+
+for (const recovery of [false, true]) {
+  test(`executor inspection failure refuses checkout changes (recovery: ${recovery})`, async () => {
+    const f = executorSetup();
+    if (recovery)
+      writeFileSync(
+        f.intent,
+        JSON.stringify({
+          phase: "rollback",
+          label: f.label,
+          path: f.path,
+          previous: "previous",
+          target: "next",
+        }),
+      );
+    const command = f.opts.command;
+    f.opts.command = async (args, opts) => {
+      if (args[0] === "launchctl" && args[1] === "print") {
+        f.calls.push(args.join(" "));
+        return { exitCode: 1, stdout: "", stderr: "Operation not permitted" };
+      }
+      if (args[0] === "bun" && args[1] === "run") throw new Error("gate failed");
+      return command(args, opts);
+    };
+    const error = String(await deploy(7400, "feature", false, { ...f.opts, executor: true }).catch((e) => e));
+    expect(f.calls).not.toContain("git checkout -q --detach previous");
+    if (recovery) expect(f.calls.some((call) => call.startsWith("git "))).toBe(false);
+    expect(error).toContain("Operation not permitted");
+    expect(error).toContain(`launchctl bootout ${f.service}`);
+    expect(error).toContain(`launchctl disable ${f.service}`);
+    if (!recovery) {
+      expect(error).toContain("next");
+      expect(error).toContain("previous");
+    }
+    expect(existsSync(f.intent)).toBe(true);
+  });
+}
+
+test("executor inspection failure after bootout refuses checkout changes", async () => {
+  const f = executorSetup(),
+    command = f.opts.command;
+  let bootedOut = false;
+  f.opts.command = async (args, opts) => {
+    if (args[0] === "bun" && args[1] === "run") throw new Error("gate failed");
+    if (args[0] === "launchctl" && args[1] === "print" && bootedOut) {
+      f.calls.push(args.join(" "));
+      return { exitCode: 1, stdout: "", stderr: "Operation not permitted" };
+    }
+    const result = await command(args, opts);
+    if (args[0] === "launchctl" && args[1] === "bootout") bootedOut = true;
+    return result;
+  };
+  const error = String(await deploy(7400, "feature", false, { ...f.opts, executor: true }).catch((e) => e));
+  expect(f.calls).toContain(`launchctl bootout ${f.service}`);
+  expect(f.calls).not.toContain("git checkout -q --detach previous");
+  expect(f.calls).not.toContain("restart");
+  expect(error).toContain("Operation not permitted");
+  expect(error).toContain(`launchctl bootout ${f.service}`);
+  expect(error).toContain(`launchctl disable ${f.service}`);
+  expect(JSON.parse(readFileSync(f.intent, "utf8")).phase).toBe("rollback");
+});
 
 for (const mode of ["new", "same", "now"])
   for (const executor of [true, false]) {

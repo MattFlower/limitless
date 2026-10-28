@@ -186,7 +186,9 @@ const command: typeof sh = async (argv) => {
       loaded.delete(stopping);
       stopping = "";
     }
-    return ok("", loaded.has(label) ? 0 : 1);
+    return loaded.has(label)
+      ? ok()
+      : ok("", 1, `Could not find service "${label}" in domain for user gui: ${os.userInfo().uid}`);
   }
   if (argv[1] === "enable" || argv[1] === "disable") {
     calls.push(`${argv[1]} ${label}`);

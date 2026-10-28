@@ -319,8 +319,20 @@ function executorControl(opts: ServiceOptions) {
   const intentPath = join(opts.lockPath ?? deployLock, "..", "executor-intent.json");
   const directory = join(opts.lockPath ?? deployLock, "..", "service-backup");
   const ctl = (args: string[]) => command(["launchctl", ...args], { cwd: home, allowFail: true });
-  const isLoaded = async (unit: ExecutorUnit) =>
-    (await ctl(["print", `gui/${uid}/${unit.label}`])).exitCode === 0;
+  const isLoaded = async (unit: ExecutorUnit) => {
+    const service = `gui/${uid}/${unit.label}`;
+    const result = await ctl(["print", service]);
+    if (result.exitCode === 0) return true;
+    if (
+      result.stderr
+        .split("\n")
+        .includes(`Could not find service "${unit.label}" in domain for user gui: ${uid}`)
+    )
+      return false;
+    throw new Error(
+      `launchctl print ${service} failed (${result.exitCode}): ${result.stderr || result.stdout}`,
+    );
+  };
   const shutdownExecutor = async (unit: ExecutorUnit) => {
     const service = `gui/${uid}/${unit.label}`;
     try {
