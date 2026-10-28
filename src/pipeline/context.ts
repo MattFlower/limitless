@@ -38,7 +38,7 @@ import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
-import type { AcceptanceSnapshot } from "./acceptance.ts";
+import type { AcceptanceState } from "./acceptance.ts";
 import {
   type AgentExecutor,
   type AgentPublicationHooks,
@@ -74,14 +74,14 @@ export interface EngineDeps {
   reviewSystem?: ReviewSystem;
 }
 
-export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "deliver" | "done";
+export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "deliver" | "accept" | "done";
 
 /** Everything a run needs to resume after a restart. Persisted as runs.state_json. */
 export interface RunState {
   sizeReport?: SizeReport;
   parked?: boolean;
   flow?: "build" | "verify-change" | "acceptance";
-  acceptance?: { snapshot: AcceptanceSnapshot };
+  acceptance?: AcceptanceState;
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
   /** A review round's chosen base tip, saved before it is merged into the PR branch. */
   reviewBaseSha?: string;

@@ -14,6 +14,7 @@ const STATIONS = [
   { stage: "review" },
   { stage: "preview", optional: true },
   { stage: "verify" },
+  { stage: "accept", optional: true },
   { stage: "deliver" },
 ] as const satisfies readonly { stage: StageName; optional?: true }[];
 

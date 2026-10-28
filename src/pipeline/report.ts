@@ -74,6 +74,7 @@ export interface ReportInput {
   state: Pick<
     RunState,
     | "flow"
+    | "acceptance"
     | "implementerReport"
     | "spec"
     | "holdout"

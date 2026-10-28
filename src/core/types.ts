@@ -53,6 +53,7 @@ export type StageName =
   | "review"
   | "preview"
   | "verify"
+  | "accept"
   | "deliver";
 
 export type StageStatus = "running" | "succeeded" | "failed" | "skipped" | "cancelled";
