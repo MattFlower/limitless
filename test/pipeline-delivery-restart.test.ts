@@ -1306,6 +1306,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const cwd = state.worktreePath;
     if (scenario === "completed clean merge") {
       state.deliveryMerges = undefined;
+      state.sizeReport = undefined;
       f.store.setRunState(run.id, state);
     }
     if (scenario === "amended HEAD") {
@@ -1331,6 +1332,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(actual).not.toBe(expected);
       expect(state.pendingRebaseSha).toBeUndefined();
       expect(finished?.headSha).toBe(actual);
+      expect(resumed.store.getRunState<RunState>(run.id)?.sizeReport).toMatchObject({
+        base: finished?.baseSha,
+        head: actual,
+        source: { added: 1, removed: 0 },
+      });
+      expect(resumed.store.getArtifact(run.id, "report.md")?.match(/^## Size$/gm)).toHaveLength(1);
       expect((await sh(["git", "rev-parse", `${actual}^1`], { cwd: bare })).stdout.trim()).toBe(expected);
       expect(
         (await sh(["git", "rev-parse", `refs/heads/${finished?.branch}`], { cwd: bare })).stdout.trim(),
@@ -1504,6 +1511,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
       const finished = resumed.store.getRun(run.id);
       expect(finished?.baseSha).toBe(baseTip);
+      expect(resumed.store.getRunState<RunState>(run.id)?.sizeReport).toMatchObject({
+        base: baseTip,
+        head: finished?.headSha,
+        mode: "two-dot",
+      });
+      expect(resumed.store.getArtifact(run.id, "report.md")?.match(/^## Size$/gm)).toHaveLength(1);
       expect(resumed.store.getRunState<RunState>(run.id)?.pendingRebaseSha).toBeUndefined();
       expect(implementsCount).toBe(conflict ? (checkpoint === "conflict-implement" ? 3 : 2) : 1);
       expect(reviews).toBe(conflict ? 2 : 1);
