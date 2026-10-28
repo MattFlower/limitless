@@ -1,19 +1,38 @@
-import { expect } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { expect, spyOn } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
-import { readJUnitSkips } from "../src/gates/junit.ts";
+import type { GateConfig } from "../src/gates/detect.ts";
+import { singleBunTest } from "../src/gates/docs.ts";
+import { readCoveringJUnit, readJUnitSkips } from "../src/gates/junit.ts";
 import { redactGateData, redactGateDiagnostics } from "../src/gates/output.ts";
 import { compareGates, type GateRun, runGates, runLocalGates } from "../src/gates/run.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS } from "../src/gates/test-coverage.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
+import {
+  type CoveringTestRun,
+  coveringTestCommand,
+  coveringTestRefusal,
+  selectCoveringTests,
+} from "../src/pipeline/covering-tests.ts";
 import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
 import { normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
-import { registerCredential } from "../src/util/proc.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
+import { seeded } from "./seeded.ts";
 
 const sha = "a".repeat(40);
 const spec: Spec = {
@@ -1235,5 +1254,773 @@ test("redaction collisions cannot authorize inherited skips at cache or resume b
     expect(result.criteria[0]?.status).toBe("blocked");
     expect(result.criteria[0]?.evidence).toContain("baseline skip identities unavailable");
     expect(JSON.stringify(result)).not.toContain(secret);
+  }
+});
+
+const behaviouralSpec: Spec = {
+  ...spec,
+  acceptance_criteria: [
+    { id: "AC-1", criterion: "A restart preserves the original reason", how_to_verify: "restart" },
+  ],
+};
+const requested: Verify = {
+  ...blocked,
+  criteria: blocked.criteria.map((c) => ({
+    ...c,
+    covering_tests: [{ file: "x.test.ts", name: "passes" }],
+  })),
+};
+function coveringRun(): CoveringTestRun {
+  return {
+    file: "x.test.ts",
+    name: "passes",
+    verifiedSha: sha,
+    round: 0,
+    stageId: 13,
+    result: {
+      name: "test",
+      command: "bun test -t '(?:^| )passes$' './x.test.ts'",
+      ok: true,
+      exitCode: 0,
+      durationMs: 1,
+      output: "1 pass\n0 fail",
+      executionProvenance: { sha, trackedClean: true },
+      coveringTest: { file: "x.test.ts", name: "passes" },
+      testCoverage: { passedFiles: ["x.test.ts"], skippedFiles: [], summary: { passed: 1, failed: 0 } },
+    },
+  };
+}
+const bindCovering = (value: Verify, runs: CoveringTestRun[], succeededStageIds = [13]) =>
+  applyGateEvidence(value, behaviouralSpec, holdout, sha, gates(), undefined, { runs, succeededStageIds });
+
+test("behavioural coverage binds only the factory record and cites its exact command", () => {
+  const run = coveringRun();
+  if (!run.result) throw new Error("missing result");
+  run.result.executedCommand = `${run.result.command} --reporter=junit --reporter-outfile=report.xml`;
+  const result = bindCovering(requested, [run]).criteria[0];
+  expect(result).toMatchObject({
+    status: "met",
+    gateEvidence: {
+      stageId: 13,
+      sha,
+      check: "x.test.ts › passes",
+      command: run.result?.executedCommand,
+    },
+  });
+  expect(result?.evidence).toBe(
+    `Factory covering test x.test.ts › passes passed at ${sha} (stage 13); command: ${run.result?.executedCommand}`,
+  );
+});
+
+test("quoted factory-like test titles do not prevent covering-test binding", () => {
+  const run = coveringRun();
+  run.name = "Factory gate literal title";
+  if (!run.result) throw new Error("missing result");
+  run.result.command = "bun test -t 'Factory gate literal title' './x.test.ts'";
+  run.result.coveringTest = { file: run.file, name: run.name };
+  const value = {
+    ...requested,
+    criteria: requested.criteria.map((c) => ({
+      ...c,
+      evidence: "Attempted bun test -t 'Factory gate literal title' x.test.ts: EPERM in sandbox",
+      covering_tests: [{ file: run.file, name: run.name }],
+    })),
+  };
+  expect(bindCovering(value, [run]).criteria[0]?.status).toBe("met");
+});
+
+test.each([
+  {
+    label: "zero matches",
+    reason: "name matched no tests",
+    change: { coveringTest: { file: "x.test.ts", name: "passes", reason: "name matched no tests" } },
+  },
+  { label: "failure", reason: "test failed", change: { ok: false, exitCode: 1 } },
+  {
+    label: "failed testcase",
+    reason: "test failed",
+    change: { coveringTest: { file: "x.test.ts", name: "passes", reason: "test failed" } },
+  },
+  {
+    label: "missing JUnit evidence in legacy record",
+    reason: "missing exact testcase JUnit evidence",
+    change: { coveringTest: undefined },
+  },
+  {
+    label: "skip",
+    reason: "named test skipped",
+    change: { coveringTest: { file: "x.test.ts", name: "passes", reason: "named test skipped" } },
+  },
+  {
+    label: "dirty tree",
+    reason: "run changed tracked files",
+    change: { executionProvenance: { sha, trackedClean: false } },
+  },
+  {
+    label: "different SHA",
+    reason: "run executed at a different SHA",
+    change: { executionProvenance: { sha: "b".repeat(40), trackedClean: true } },
+  },
+  {
+    label: "short SHA",
+    reason: "run executed at a different SHA",
+    change: { executionProvenance: { sha: "abcd", trackedClean: true } },
+  },
+  { label: "timeout", reason: "test failed", change: { timedOut: true } },
+  { label: "confinement", reason: "test failed", change: { confinementError: true } },
+  {
+    label: "wrong JUnit identity",
+    reason: "missing exact testcase JUnit evidence",
+    change: { coveringTest: { file: "other.test.ts", name: "passes" } },
+  },
+])("covering-test binding refuses $label", ({ reason, change }) => {
+  const run = coveringRun();
+  if (!run.result) throw new Error("missing result");
+  Object.assign(run.result, change);
+  const result = bindCovering(requested, [run]).criteria[0];
+  expect(result).toMatchObject({ status: "blocked", blockedReason: "sandbox" });
+  expect(result?.evidence).toStartWith(
+    "Factory gate substitution unavailable: required outcome is not solely that tests pass;",
+  );
+  expect(result?.evidence).toContain(reason);
+  expect(result?.gateEvidence).toBeUndefined();
+});
+
+test.each(["file not tracked at verified SHA", "file outside repository", "targeted retries not configured"])(
+  "covering-test preflight refusal is retained: %s",
+  (reason) => {
+    expect(
+      bindCovering(requested, [{ ...coveringRun(), result: undefined, reason }]).criteria[0],
+    ).toMatchObject({
+      status: "blocked",
+      blockedReason: "sandbox",
+      evidence: expect.stringContaining(reason),
+    });
+  },
+);
+
+test("a covering record needs a succeeded stage, while unrelated console evidence is harmless", () => {
+  expect(bindCovering(requested, [coveringRun()], []).criteria[0]?.status).toBe("blocked");
+  const run = coveringRun();
+  if (!run.result?.testCoverage) throw new Error("missing coverage");
+  run.result.testCoverage = { passedFiles: [], skippedFiles: [], skippedTestsIncomplete: true };
+  run.result.output = "(fail) unrelated";
+  expect(bindCovering(requested, [run]).criteria[0]?.status).toBe("met");
+});
+
+test("fabricated covering citations and provenance cannot replace factory records", () => {
+  for (const evidence of [
+    "Read the implementation",
+    `Factory covering test x.test.ts › passes passed at ${sha} (stage 13)`,
+  ]) {
+    for (const status of ["met", "blocked"] as const) {
+      const value = VerifySchema.parse({
+        ...requested,
+        criteria: requested.criteria.map((c) => ({
+          ...c,
+          status,
+          evidence,
+          gateEvidence: { stageId: 13, sha, check: "test", command: "bun test" },
+        })),
+      });
+      const result = bindCovering(value, []).criteria[0];
+      expect(result?.status).toBe("blocked");
+      expect(result?.gateEvidence).toBeUndefined();
+      expect(result?.evidence).toContain("no factory record");
+      expect(normalizeVerify(bindCovering(value, []), behaviouralSpec, holdout).overall).toBe("fail");
+    }
+  }
+});
+
+test("genuine factory gate citations are revalidated before accepting met rows", () => {
+  const genuine = resolve(blocked, gates());
+  expect(genuine.criteria[0]?.status).toBe("met");
+  expect(resolve(genuine, gates()).overall).toBe("pass");
+  const textual = VerifySchema.parse(genuine);
+  expect(textual.criteria[0]).not.toHaveProperty("gateEvidence");
+  expect(resolve(textual, gates()).overall).toBe("pass");
+  expect(
+    resolve(
+      {
+        ...textual,
+        criteria: textual.criteria.map((c) => ({
+          ...c,
+          evidence: `Observed: ${c.evidence}.\nAdditional inspection.`,
+        })),
+      },
+      gates(),
+    ).overall,
+  ).toBe("pass");
+  // Prose without structured provenance remains a model judgment, never factory evidence.
+  expect(resolve(textual).criteria[0]?.status).toBe("met");
+  expect(resolve(textual).criteria[0]?.gateEvidence).toBeUndefined();
+  expect(resolve(genuine).criteria[0]).toMatchObject({
+    status: "blocked",
+    gateEvidence: undefined,
+    evidence: expect.stringContaining("no eligible factory gate record"),
+  });
+  const badGates = gates();
+  const check = badGates.checks[0];
+  if (!check) throw new Error("missing check");
+  check.result.ok = false;
+  expect(resolve(genuine, badGates).overall).toBe("fail");
+  expect(resolve(genuine, gates(), spec, "b".repeat(40)).overall).toBe("fail");
+  for (const change of [
+    { stageId: 999 },
+    { sha: "b".repeat(40) },
+    { check: "other" },
+    { command: "bun test fake" },
+  ]) {
+    const invalid = {
+      ...genuine,
+      criteria: genuine.criteria.map((c) => ({
+        ...c,
+        evidence: "asserted structured provenance",
+        gateEvidence: { ...c.gateEvidence, ...change },
+      })),
+    } as Verify;
+    const result = resolve(invalid, gates());
+    expect(result.overall).toBe("fail");
+    expect(result.criteria[0]).toMatchObject({ status: "blocked", gateEvidence: undefined });
+    expect(result.criteria[0]?.evidence).toContain("Factory citation unavailable:");
+  }
+  for (const [from, to] of [
+    ["stage 12", "stage 999"],
+    [sha, "b".repeat(40)],
+    ["gate tests", "gate fake"],
+    ["bun run test", "bun test fake"],
+  ]) {
+    const descriptive = {
+      ...genuine,
+      criteria: genuine.criteria.map((c) => ({
+        ...c,
+        evidence: c.evidence.replace(from ?? "", to ?? ""),
+      })),
+    };
+    expect(resolve(descriptive, gates()).criteria[0]).toMatchObject({
+      status: "met",
+      gateEvidence: genuine.criteria[0]?.gateEvidence,
+    });
+    expect(resolve(descriptive).criteria[0]?.status).toBe("blocked");
+  }
+  expect(
+    resolve({
+      ...textual,
+      criteria: textual.criteria.map((c) => ({
+        ...c,
+        evidence: "Read the implementation and observed the result",
+      })),
+    }).overall,
+  ).toBe("pass");
+});
+
+test("structured covering provenance requires every requested factory record", () => {
+  const first = coveringRun();
+  const second = coveringRun();
+  second.stageId = 14;
+  second.name = "Factory gate literal title";
+  if (!second.result) throw new Error("missing result");
+  second.result.command = "bun test -t 'Factory gate literal title' './x.test.ts'";
+  second.result.coveringTest = { file: second.file, name: second.name };
+  const both = {
+    ...requested,
+    criteria: requested.criteria.map((c) => ({
+      ...c,
+      covering_tests: [
+        { file: first.file, name: first.name },
+        { file: second.file, name: second.name },
+      ],
+    })),
+  };
+  const genuine = bindCovering(both, [first, second], [13, 14]);
+  expect(genuine.criteria[0]?.status).toBe("met");
+  const textual = VerifySchema.parse(genuine);
+  expect(bindCovering(textual, [first, second], [13, 14]).criteria[0]?.status).toBe("met");
+  for (const value of [genuine, textual]) {
+    for (const records of [[first], [second], []]) {
+      const result = bindCovering(value, records, [13, 14]);
+      expect(result.criteria[0]?.status).toBe("blocked");
+      expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+      expect(normalizeVerify(result, behaviouralSpec, holdout).overall).toBe("fail");
+    }
+  }
+  for (const change of [
+    { stageId: 99 },
+    { sha: "b".repeat(40) },
+    { check: "wrong.test.ts › passes" },
+    { command: "bun test fake" },
+  ]) {
+    const invalid = {
+      ...genuine,
+      criteria: genuine.criteria.map((c) => ({
+        ...c,
+        evidence: "structured covering citation",
+        gateEvidence: { ...c.gateEvidence, ...change },
+      })),
+    } as Verify;
+    expect(bindCovering(invalid, [first, second], [13, 14]).criteria[0]).toMatchObject({
+      status: "blocked",
+      gateEvidence: undefined,
+    });
+  }
+  const mixed = {
+    ...textual,
+    criteria: textual.criteria.map((c) => ({
+      ...c,
+      evidence:
+        c.evidence +
+        `; Factory covering test x.test.ts › fake passed at ${sha} (stage 999); command: bun test`,
+    })),
+  };
+  expect(bindCovering(mixed, [first, second], [13, 14]).criteria[0]?.status).toBe("met");
+  expect(bindCovering(mixed, [first], [13, 14]).criteria[0]?.status).toBe("blocked");
+  for (const change of [
+    { verifiedSha: "b".repeat(40) },
+    { result: { ...first.result, executionProvenance: { sha, trackedClean: false } } },
+    { result: { ...first.result, ok: false } },
+    {
+      result: {
+        ...first.result,
+        coveringTest: { file: first.file, name: first.name, reason: "named test skipped" },
+      },
+    },
+    { result: { ...first.result, coveringTest: { file: "wrong.test.ts", name: first.name } } },
+  ]) {
+    expect(
+      bindCovering(textual, [{ ...first, ...change } as CoveringTestRun, second], [13, 14]).criteria[0]
+        ?.status,
+    ).toBe("blocked");
+  }
+  expect(bindCovering(textual, [first, second], [13]).criteria[0]?.status).toBe("blocked");
+});
+
+test("covering selection enforces both limits and never accepts a partial criterion", () => {
+  const eleven: Verify = {
+    ...requested,
+    criteria: Array.from({ length: 11 }, (_, i) => ({
+      ...requested.criteria[0],
+      id: `AC-${i + 1}`,
+      status: "blocked",
+      blockedReason: "sandbox",
+      evidence: "sandbox",
+      publicSummary: "",
+      covering_tests: [{ file: "x.test.ts", name: `test ${i}` }],
+    })),
+  };
+  const selected = selectCoveringTests(eleven);
+  expect(selected.flatMap((s) => s.tests)).toHaveLength(10);
+  expect(selected[10]?.reason).toBe("per-round limit reached");
+  expect(bindCovering(eleven, []).criteria[10]?.evidence).toContain("per-round limit reached");
+  const four: Verify = {
+    ...requested,
+    criteria: requested.criteria.map((c) => ({
+      ...c,
+      covering_tests: Array.from({ length: 4 }, () => ({ file: "x.test.ts", name: "passes" })),
+    })),
+  };
+  expect(selectCoveringTests(four)[0]?.tests).toHaveLength(3);
+  expect(bindCovering(four, [coveringRun()]).criteria[0]).toMatchObject({
+    status: "blocked",
+    evidence: expect.stringContaining("per-criterion limit reached"),
+  });
+});
+
+const coveringConfig: GateConfig = {
+  setup: [],
+  checks: [{ name: "test", run: "bun test" }],
+  retryFiles: "bun test {files}",
+  source: ".limitless.toml",
+  protectedPaths: [],
+};
+const coveringSeed = seeded(async (cwd) => {
+  await sh(["git", "init", "-q"], { cwd });
+  writeFileSync(
+    join(cwd, "x.test.ts"),
+    `import {test, expect, describe} from 'bun:test';
+test('a.*b', () => expect(true).toBe(true));
+test('aXXb', () => { throw new Error('wrong test ran'); });
+test('$(touch pwned)', () => expect(true).toBe(true));
+test(${JSON.stringify('it\'s "literal"')}, () => expect(true).toBe(true));
+describe('outer', () => describe('inner', () => test('passes', () => expect(true).toBe(true))));
+`,
+  );
+  await sh(["git", "add", "."], { cwd });
+  await sh(["git", "commit", "-qm", "covering fixture"], { cwd });
+  return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+});
+
+test("covering commands validate trusted configuration and tracked, contained test files before running", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-commands-"));
+  const outside = mkdtempSync(join(tmpdir(), "covering-outside-"));
+  try {
+    const { value: checkedSha } = await coveringSeed(cwd);
+    writeFileSync(join(cwd, "untracked.test.ts"), "");
+    writeFileSync(join(outside, "escape.test.ts"), "");
+    symlinkSync(join(outside, "escape.test.ts"), join(cwd, "escape.test.ts"));
+    for (const cfg of [
+      undefined,
+      { ...coveringConfig, retryFiles: undefined },
+      { ...coveringConfig, retryFiles: "bun test" },
+      { ...coveringConfig, retryFiles: "bun test '{files}'" },
+      { ...coveringConfig, retryFiles: "bun test {files} {files}" },
+      { ...coveringConfig, checks: [{ name: "test", run: "npm test" }] },
+      { ...coveringConfig, checks: [...coveringConfig.checks, ...coveringConfig.checks] },
+    ])
+      expect(await coveringTestCommand({ file: "x.test.ts", name: "passes" }, cfg, cwd, checkedSha)).toEqual({
+        reason: "targeted retries not configured",
+      });
+    for (const file of ["../x.test.ts", join(cwd, "x.test.ts"), "escape.test.ts", "bad\n.test.ts"])
+      expect(
+        await coveringTestCommand({ file, name: "passes" }, coveringConfig, cwd, checkedSha),
+      ).toMatchObject({ reason: expect.stringContaining("outside repository") });
+    expect(
+      await coveringTestCommand(
+        { file: "untracked.test.ts", name: "passes" },
+        coveringConfig,
+        cwd,
+        checkedSha,
+      ),
+    ).toEqual({ reason: "file not tracked at verified SHA" });
+    for (const name of ["", "bad\nname", "x".repeat(2001)])
+      expect(await coveringTestCommand({ file: "x.test.ts", name }, coveringConfig, cwd, checkedSha)).toEqual(
+        { reason: "invalid test name" },
+      );
+    expect(
+      (
+        await coveringTestCommand(
+          { file: "x.test.ts", name: "passes" },
+          { ...coveringConfig, retryFiles: `bun test '"--"' {files}` },
+          cwd,
+          checkedSha,
+        )
+      ).command,
+    ).toBeDefined();
+    for (const name of ["$(x)", "`x`", "a.*b", "'", '"', ";", "'`x`", "' -t '`x`"]) {
+      const built = await coveringTestCommand({ file: "x.test.ts", name }, coveringConfig, cwd, checkedSha);
+      expect(built.command).toBeDefined();
+      expect(singleBunTest(built.command ?? "")).toBe(true);
+      expect(built.command).toContain(" -t '(?:^| )");
+      expect(singleBunTest(`${built.command} './tick\u0060.test.ts'`)).toBe(false);
+    }
+    for (const name of ["a.*b", "$(touch pwned)", `it's "literal"`, "outer inner passes"]) {
+      const built = await coveringTestCommand({ file: "x.test.ts", name }, coveringConfig, cwd, checkedSha);
+      if (!built.command) throw new Error(built.reason);
+      const clock = spyOn(Date, "now").mockReturnValue(Date.UTC(2100, 0, 1));
+      let gate: GateRun;
+      try {
+        gate = await confinementScope.run(fakeConfinement, () =>
+          runLocalGates(
+            cwd,
+            {
+              ...coveringConfig,
+              checks: [
+                {
+                  name: "test",
+                  run: built.command.replace(/^bun /, `${process.execPath} `),
+                  coveringTest: { file: "x.test.ts", name },
+                },
+              ],
+            },
+            new AbortController().signal,
+          ),
+        );
+      } finally {
+        clock.mockRestore();
+      }
+      const result = gate.checks[0];
+      expect(result?.ok, result?.output).toBe(true);
+      expect(result?.testCoverage?.summary).toEqual({ passed: 1, failed: 0 });
+      expect(result?.coveringTest).toEqual({ file: "x.test.ts", name, reason: undefined });
+      expect(existsSync(join(cwd, "pwned"))).toBe(false);
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("covering launcher accepts a fresh report with wall time 60 seconds ahead of filesystem time", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-clock-skew-"));
+  try {
+    const { value: checkedSha } = await coveringSeed(cwd);
+    const test = { file: "x.test.ts", name: "a.*b" };
+    const built = await coveringTestCommand(test, coveringConfig, cwd, checkedSha);
+    if (!built.command) throw new Error(built.reason);
+    const probe = join(cwd, "clock-probe");
+    writeFileSync(probe, "");
+    const clock = spyOn(Date, "now").mockReturnValue(statSync(probe).mtimeMs + 60_000);
+    let gate: GateRun;
+    try {
+      gate = await confinementScope.run(fakeConfinement, () =>
+        runLocalGates(
+          cwd,
+          {
+            ...coveringConfig,
+            checks: [
+              {
+                name: "test",
+                run: built.command.replace(/^bun /, `${process.execPath} `),
+                coveringTest: test,
+              },
+            ],
+          },
+          new AbortController().signal,
+        ),
+      );
+    } finally {
+      clock.mockRestore();
+    }
+    const result = gate.checks[0];
+    if (!result) throw new Error("missing covering check");
+    expect(result.ok, result.output).toBe(true);
+    expect(result.testCoverage?.summary).toEqual({ passed: 1, failed: 0 });
+    expect(result.coveringTest).toEqual({ ...test, reason: undefined });
+    const record: CoveringTestRun = {
+      ...coveringRun(),
+      ...test,
+      result: { ...result, executionProvenance: { sha, trackedClean: true } },
+    };
+    const value = {
+      ...requested,
+      criteria: requested.criteria.map((c) => ({ ...c, covering_tests: [test] })),
+    };
+    expect(bindCovering(value, [record]).criteria[0]?.status).toBe("met");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  "bun test {files} --",
+  "bun test -- {files}",
+  "bun test '--' {files}",
+  'bun test "--" {files}',
+  "bun test \"-\"'-' {files}",
+  "bun test \\-- {files}",
+])("covering preflight refuses an option terminator: %s", async (retryFiles) => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-terminator-"));
+  try {
+    const { value: head } = await coveringSeed(cwd);
+    const built = await coveringTestCommand(
+      { file: "x.test.ts", name: "passes" },
+      { ...coveringConfig, retryFiles },
+      cwd,
+      head,
+    );
+    expect(built.command).toBeUndefined();
+    expect(built.reason).toContain("option terminator (--)");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a nested skipped match refuses binding even when another exact full-name match passed", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-nested-skip-"));
+  try {
+    const seed = seeded(async (dir) => {
+      await sh(["git", "init", "-q"], { cwd: dir });
+      writeFileSync(
+        join(dir, "x.test.ts"),
+        [
+          'import { describe, expect, test } from "bun:test";',
+          'test("outer passes", () => expect(true).toBe(true));',
+          'describe("outer", () => {',
+          '  test.skip("passes", () => expect(true).toBe(true));',
+          '  test("other", () => expect(true).toBe(true));',
+          "});",
+          "",
+        ].join("\n"),
+      );
+      await sh(["git", "add", "."], { cwd: dir });
+      await sh(["git", "commit", "-qm", "nested skip fixture"], { cwd: dir });
+      return (await sh(["git", "rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
+    });
+    const { value: checkedSha } = await seed(cwd);
+    // Bun's filter sees both `outer passes` tests; the skipped one is reported as `outer > passes`.
+    const test = { file: "x.test.ts", name: "outer passes" };
+    const built = await coveringTestCommand(test, coveringConfig, cwd, checkedSha);
+    if (!built.command) throw new Error(built.reason);
+    const command = built.command.replace(/^bun /, `${process.execPath} `);
+    for (const run of [command, `${command} --reporter=junit --reporter-outfile="$LIMITLESS_GATE_REPORT"`]) {
+      const gate = await confinementScope.run(fakeConfinement, () =>
+        runLocalGates(
+          cwd,
+          {
+            source: "detected",
+            setup: [],
+            checks: [{ name: "test", run, coveringTest: test }],
+            protectedPaths: [],
+          },
+          new AbortController().signal,
+        ),
+      );
+      const check = gate.checks[0];
+      if (!check) throw new Error("missing covering check");
+      expect(check.testCoverage?.summary).toEqual({ passed: 1, failed: 0 });
+      const result = { ...check, executionProvenance: { sha, trackedClean: true } };
+      const record: CoveringTestRun = {
+        ...coveringRun(),
+        ...test,
+        result,
+      };
+      const nested: Verify = {
+        ...requested,
+        criteria: requested.criteria.map((c) => ({ ...c, covering_tests: [test] })),
+      };
+      const verdict = bindCovering(nested, [record]).criteria[0];
+      expect(verdict).toMatchObject({ status: "blocked", blockedReason: "sandbox" });
+      expect(verdict?.evidence).toContain("named test skipped");
+    }
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["exact", undefined],
+  ["equal", undefined],
+  ["clock-lag", undefined],
+  ["canonical", undefined],
+  ["nested", undefined],
+  ["other-file", "name matched no tests"],
+  ["suffix", "name matched no tests"],
+  ["skipped", "named test skipped"],
+  ["failed", "test failed"],
+  ["errored", "test failed"],
+  ["missing", "JUnit report missing, stale or unsafe"],
+  ["stale", "JUnit report missing, stale or unsafe"],
+  ["symlink", "JUnit report missing, stale or unsafe"],
+  ["pre-existing", "JUnit report existed before execution"],
+  ["malformed", "unparseable JUnit report"],
+] as const)("covering JUnit requires fresh exact testcase evidence: %s", (mode, reason) => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-junit-"));
+  try {
+    writeFileSync(join(cwd, "x.test.ts"), "");
+    writeFileSync(join(cwd, "other.test.ts"), "");
+    const path = join(cwd, "report.xml");
+    const sentinel = join(cwd, "sentinel");
+    writeFileSync(sentinel, "");
+    // A filesystem clock can lag wall time arbitrarily; no wall-clock tolerance is involved.
+    if (mode === "clock-lag") utimesSync(sentinel, 100, 100);
+    if (mode === "equal") {
+      // Whole seconds round-trip exactly through utimes even on nanosecond-resolution filesystems.
+      const seconds = Math.floor(statSync(sentinel).mtimeMs / 1000);
+      utimesSync(sentinel, seconds, seconds);
+    }
+    const filesystemBaseline = statSync(sentinel).mtimeMs;
+    const name = mode === "nested" ? "outer inner passes" : "passes";
+    const file =
+      mode === "other-file"
+        ? "other.test.ts"
+        : mode === "canonical"
+          ? realpathSync(join(cwd, "x.test.ts"))
+          : "x.test.ts";
+    const title = mode === "suffix" ? "outer passes" : "passes";
+    const outcomes: Record<string, string> = { skipped: "skipped", failed: "failure", errored: "error" };
+    const outcome = outcomes[mode];
+    // Duplicate identities must all pass, regardless of their ordering.
+    const cases =
+      `<testcase name="${title}"/>` +
+      (outcome ? `<testcase name="${title}"><${outcome}/></testcase><testcase name="${title}"/>` : "");
+    const xml = `<testsuites><testsuite file="${file}">${mode === "nested" ? `<testsuite name="outer"><testsuite name="inner">${cases}</testsuite></testsuite>` : cases}</testsuite></testsuites>`;
+    if (mode !== "missing") writeFileSync(path, mode === "malformed" ? "<testsuites><oops>" : xml);
+    if (mode === "equal" || mode === "clock-lag") {
+      utimesSync(path, filesystemBaseline / 1000, filesystemBaseline / 1000);
+      expect(statSync(path).mtimeMs).toBe(filesystemBaseline);
+    }
+    if (mode === "clock-lag") expect(statSync(path).mtimeMs).toBeLessThan(Date.now());
+    if (mode === "stale") utimesSync(path, 1, 1);
+    if (mode === "symlink") {
+      const target = join(cwd, "target.xml");
+      writeFileSync(target, xml);
+      rmSync(path);
+      symlinkSync(target, path);
+    }
+    if (mode === "pre-existing") {
+      // An earlier execution's report at this exact path is unusable even if its mtime looks fresh.
+      expect(
+        readCoveringJUnit(path, cwd, { file: "x.test.ts", name }, filesystemBaseline, false).reason,
+      ).toBeUndefined();
+    }
+    const junit = readCoveringJUnit(
+      path,
+      cwd,
+      { file: "./x.test.ts", name },
+      filesystemBaseline,
+      mode === "pre-existing",
+    );
+    expect(junit.reason).toBe(reason);
+    const run = coveringRun();
+    if (!run.result) throw new Error("missing result");
+    run.name = name;
+    run.result.coveringTest = junit;
+    const value = {
+      ...requested,
+      criteria: requested.criteria.map((c) => ({ ...c, covering_tests: [{ file: "x.test.ts", name }] })),
+    };
+    const criterion = bindCovering(value, [run]).criteria[0];
+    expect(criterion?.status).toBe(reason ? "blocked" : "met");
+    if (reason) expect(criterion?.evidence).toContain(reason);
+    else expect(criterion?.gateEvidence).toMatchObject({ stageId: 13, sha, command: run.result.command });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  "bun test -tunrelated {files}",
+  "bun test '-t' unrelated {files}",
+  "bun test {files} --test-name-pattern=unrelated",
+  "bun test {files} --reporter=dot --reporter-outfile=unused.xml --",
+])("covering evidence refuses filter or reporter overrides: %s", async (retryFiles) => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-overrides-"));
+  try {
+    const { value: checkedSha } = await coveringSeed(cwd);
+    // Filter overrides run an unrelated title; the reporter override suppresses proof of a real pass.
+    const test = { file: "y.test.ts", name: retryFiles.includes("--reporter") ? "unrelated" : "missing" };
+    writeFileSync(join(cwd, test.file), 'import { test } from "bun:test"; test("unrelated", () => {});');
+    await sh(["git", "add", "."], { cwd });
+    await sh(["git", "commit", "-qm", "override fixture"], { cwd });
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    expect(head).not.toBe(checkedSha);
+    const built = await coveringTestCommand(test, { ...coveringConfig, retryFiles }, cwd, head);
+    if (retryFiles.endsWith(" --")) {
+      expect(built.command).toBeUndefined();
+      expect(built.reason).toContain("option terminator (--)");
+      expect(
+        bindCovering(requested, [{ ...coveringRun(), result: undefined, reason: built.reason }]).criteria[0],
+      ).toMatchObject({ status: "blocked", evidence: expect.stringContaining("option terminator (--)") });
+      return;
+    }
+    if (!built.command) throw new Error(built.reason);
+    const gate = await confinementScope.run(fakeConfinement, () =>
+      runLocalGates(
+        cwd,
+        {
+          ...coveringConfig,
+          checks: [
+            { name: "test", run: built.command.replace(/^bun /, `${process.execPath} `), coveringTest: test },
+          ],
+        },
+        new AbortController().signal,
+      ),
+    );
+    const result = gate.checks[0];
+    if (!result) throw new Error("missing result");
+    expect(result.coveringTest?.reason).toBeDefined();
+    expect(result.ok, result.output).toBe(true);
+    expect(result.testCoverage?.summary?.passed).toBe(1);
+    if (!retryFiles.includes("--reporter")) {
+      expect(result.coveringTest?.reason).toBe("name matched no tests");
+    } else expect(result.coveringTest?.reason).toBe("JUnit report missing, stale or unsafe");
+    const record = {
+      ...coveringRun(),
+      ...test,
+      verifiedSha: head,
+      result: { ...result, executionProvenance: { sha: head, trackedClean: true } },
+    };
+    expect(coveringTestRefusal(record, head, [13])).toBeDefined();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });

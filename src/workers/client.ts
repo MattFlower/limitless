@@ -112,7 +112,12 @@ const WireRequest = z.object({
   gates: z.object({
     setup: z.array(z.string()),
     checks: z.array(
-      z.object({ name: z.string(), run: z.string(), timeoutSec: z.number().positive().optional() }),
+      z.object({
+        name: z.string(),
+        run: z.string(),
+        timeoutSec: z.number().positive().optional(),
+        coveringTest: z.object({ file: z.string(), name: z.string() }).strict().optional(),
+      }),
     ),
     source: z.enum([".limitless.toml", "detected", "none"]),
     protectedPaths: z.array(z.string()),

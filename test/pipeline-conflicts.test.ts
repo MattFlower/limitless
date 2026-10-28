@@ -164,6 +164,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const fallback = kind.endsWith("regressed") || kind === "rewritten";
       expect(status).toBe(kind.endsWith("regressed") ? "needs_human" : "succeeded");
       const finished = f.store.getRun(run.id);
+      const size = f.store.getRunState<RunState>(run.id)?.sizeReport;
+      const sizeBody = f.store.getArtifact(run.id, "report.md");
+      expect(sizeBody?.match(/^## Size$/gm)).toHaveLength(1);
+      expect(size).toMatchObject({ base: finished?.baseSha, head: finished?.headSha, mode: "two-dot" });
+      if (kind === "clean") {
+        expect(size).toMatchObject({ source: { added: 1, removed: 0 } });
+        expect(sizeBody).toContain(`Range: \`${baseTip.slice(0, 8)}..${finished?.headSha?.slice(0, 8)}\``);
+      }
       const stages = f.store.listStages(run.id).map((s) => s.name);
       const gates = stages.filter((s) => s === "gates").length;
       expect(gates).toBe(kind === "unchanged" || kind === "rewritten" ? 1 : 2);

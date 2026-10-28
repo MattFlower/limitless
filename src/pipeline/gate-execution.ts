@@ -56,7 +56,7 @@ export async function resumeGateExecution(
     pending?.stage === stage &&
     pending.round === round &&
     pending.purpose === purpose &&
-    ["baseline", "initial", "rebase"].includes(purpose) &&
+    (["baseline", "initial", "rebase"].includes(purpose) || purpose.startsWith("covering-test:")) &&
     (pending.handle.kind !== "inplace" || executor?.canResume?.(pending.handle, env, ctx.deps.cfg.port)) &&
     pending.sha === sha
       ? pending.handle

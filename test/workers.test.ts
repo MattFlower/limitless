@@ -7709,3 +7709,47 @@ test.each(workerStartupCases)(
   },
   30_000,
 );
+
+test("a worker preserves covering-test requests, fresh JUnit evidence and the executed command", async () => {
+  await listen();
+  const req = await request();
+  writeFileSync(
+    join(req.cwd, "x.test.ts"),
+    'import { describe, test } from "bun:test"; describe("outer", () => test("passes", () => {}));',
+  );
+  await sh(["git", "add", "."], { cwd: req.cwd });
+  await sh(["git", "commit", "-qm", "covering worker fixture"], { cwd: req.cwd });
+  req.headSha = (await sh(["git", "rev-parse", "HEAD"], { cwd: req.cwd })).stdout.trim();
+  await sh(["git", "clone", "--bare", req.cwd, join(cfg.paths.repos, "test__repo.git")], { cwd: home });
+  req.gates = {
+    ...req.gates,
+    setup: [],
+    checks: [
+      {
+        name: "test",
+        run: `${process.execPath} test -t '^outer passes$' ./x.test.ts`,
+        coveringTest: { file: "x.test.ts", name: "outer passes" },
+      },
+    ],
+  };
+  const worker = await loop();
+  try {
+    const run = await executeGate(
+      req,
+      AbortSignal.timeout(30_000),
+      {},
+      gateExecutorFor("lan", workers, [req.repo]),
+    );
+    expect(validRun(req, run)).toBe(true);
+    expect(run.sha).toBe(req.headSha);
+    expect(run.trackedClean).toBe(true);
+    expect(run.checks[0]?.coveringTest).toEqual({ file: "x.test.ts", name: "outer passes" });
+    expect(run.checks[0]?.executedCommand).toContain("--reporter=junit");
+    expect(run.checks[0]?.command).toBe(req.gates.checks[0]?.run);
+    expect(workers.jobs("1=1")).toMatchObject([
+      { state: "done", attempt: 1, worker: "loop-runner", failure_reason: null },
+    ]);
+  } finally {
+    await worker.stop();
+  }
+}, 45_000);
