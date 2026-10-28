@@ -1232,8 +1232,11 @@ export function registerCredential(name: string, value?: string): void {
       credentialValues.add(secret);
       // Log normalization removes CRLF line endings before publication-window redaction.
       const values = [secret, secret.replace(/\r\n/g, "\n")];
-      for (const variant of new Set(values.flatMap((s) => [s, JSON.stringify(s).slice(1, -1)])))
-        registerCredentialVariant(variant, secret.length >= 8);
+      const variants = values.flatMap((s) => {
+        const json = JSON.stringify(s).slice(1, -1);
+        return s.includes("/") ? [s, json, json.replaceAll("/", "\\/")] : [s, json];
+      });
+      for (const variant of new Set(variants)) registerCredentialVariant(variant, secret.length >= 8);
     }
 }
 export function redactCredentials(text: string): string;
