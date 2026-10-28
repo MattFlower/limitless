@@ -52,6 +52,7 @@ import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
+import type { SizeReport } from "./size.ts";
 
 export interface EngineDeps {
   gateExecutor?: GateExecutor;
@@ -76,6 +77,7 @@ export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "delive
 
 /** Everything a run needs to resume after a restart. Persisted as runs.state_json. */
 export interface RunState {
+  sizeReport?: SizeReport;
   parked?: boolean;
   flow?: "build" | "verify-change";
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
