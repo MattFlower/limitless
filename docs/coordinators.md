@@ -100,9 +100,14 @@ Private shared store candidates and failure modes:
 | Owner-controlled private object storage | Immutable blobs, versioned conditional writes, access controls and independent availability | Requires credentials, key backup and a proven consistency contract; outage blocks checkpoints; deletion/key loss prevents adoption. Eventually consistent listings cannot decide ownership. |
 | Peer replication among coordinators | No separate hosted data service | Two sleeping peers can lose the only copies; partitions require quorum/conflict rules; acknowledged local writes are not durable if that peer leaves. |
 
-Recommend owner-controlled private object storage, without choosing or provisioning a service.
-Require strongly consistent key reads and conditional create/update, retained immutable versions,
-encryption, least-privilege access and restore checks; reject a backend lacking these semantics.
+**Owner decision (2026-10-28): a private companion GitHub repository holding encrypted blobs.**
+It adds no new service: an outage there also blocks claims, which already depend on GitHub.
+Blobs are Git objects (immutable, content-addressed), and manifests are refs in that repository,
+written with the same GraphQL `updateRefs` and `beforeOid` compare-and-swap as the claims, so a
+lost race re-reads the tip. Payloads are encrypted with keys provisioned per machine and never
+stored on GitHub, so an accidental visibility change discloses nothing readable. Use a token scoped
+to that repository only, and verify a restore before enabling shared mode. The candidates table
+above stays as the rationale; any future backend must keep these same semantics.
 Use random object keys and authenticated encrypted payloads; keep decryption keys off GitHub.
 The public claim contains only opaque run/generation IDs, lease data and an encrypted checkpoint
 object key/digest. It contains no private-policy digest, machine endpoint, request or report text.
@@ -322,6 +327,13 @@ through transition, then remove coordinator-dependent dispatch only after equiva
 execution, capability reporting, upgrade and revocation paths are verified. No Linux changes here.
 
 ## 8. Slices
+
+**Owner decision (2026-10-28): the minimum path first.** Build first the smallest
+dependency-closed set of slices that makes "close any one machine, and its in-flight work continues
+on another" true end to end, with C02 implemented on the private companion repository. Approvals
+and landing may keep waiting for the orchestrator in that first path. Shared approvals and land
+adoption, failover discovery, the shared feed, quota reservations and conversation admission
+(C16, C17, C19–C22) come after, unless a slice in the minimum path needs one of them to be correct.
 
 These are proposed replacement #902 implementation slices, in dependency order; sizes are
 estimated changed source lines (tests accompany each slice separately), all at most 250.
