@@ -286,7 +286,7 @@ async function list(
     if (
       name.startsWith("hook.") ||
       name.startsWith("filter.") ||
-      (process.platform === "linux" && /^diff\..*\.textconv$/.test(name))
+      (process.platform === "linux" && name.startsWith("diff.") && name.endsWith(".textconv"))
     )
       hooks.add(name);
     const file = origin.startsWith("file:") ? resolve(opts.cwd, origin.slice(5)) : undefined;

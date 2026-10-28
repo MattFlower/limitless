@@ -315,6 +315,33 @@ const loaderFixture = seeded(async (dir) => {
   await sh(["git", "commit", "-qm", "payload"], { cwd: repo });
 });
 
+test.each(["2028", "2029"])(
+  "Linux Git blanks textconv drivers whose names contain Unicode separators (U+%s)",
+  async (separator) => {
+    await sh(["git", "init", "-q"], { cwd: root });
+    const driver = `x${String.fromCodePoint(Number.parseInt(separator, 16))}y`;
+    writeFileSync(join(root, ".git/info/attributes"), `payload diff=${driver}\n`);
+    await sh(["git", "config", `diff.${driver}.textconv`, "touch textconv-ran"], { cwd: root });
+    const blob = await sh(["git", "hash-object", "-w", "--stdin"], { cwd: root, stdin: "payload" });
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!platform) throw new Error("Missing process platform descriptor");
+    try {
+      // Exercise Linux's config discovery on macOS too; the identity backend isolates Git overrides.
+      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+      await gitConfinement.run({ wrap: async (cmd) => cmd }, () =>
+        worktreeGit(["git", "cat-file", "--textconv", "--path=payload", blob.stdout.trim()], {
+          cwd: root,
+          env: agentEnv(),
+          allowFail: true,
+        }),
+      );
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+    expect(existsSync(join(root, "textconv-ran"))).toBe(false);
+  },
+);
+
 for (const confined of [false, true])
   for (const route of ["editor", "show", "cat-file", ...(!confined ? ["cat-file-fallback"] : []), "ssh-key"])
     test.skipIf(process.platform !== "linux" || (confined && bwrapSkip !== null))(
@@ -324,13 +351,26 @@ for (const confined of [false, true])
         const repo = join(root, "repo");
         const loader = elfInterpreter(realpathSync(Bun.which("git") ?? "git"));
         if (!loader) throw new Error("Git has no ELF interpreter");
+        const fallback = route === "cat-file-fallback";
+        const env: Record<string, string> = { ...agentEnv(), GIT_EDITOR: loader };
+        if (fallback) {
+          // Config-file discovery is cached by environment, so earlier routes must not supply it.
+          env.GIT_CONFIG_GLOBAL = join(root, "fallback-config");
+          writeFileSync(env.GIT_CONFIG_GLOBAL, "");
+        }
+        let configFileQueries = 0;
+        let fallbackQueries = 0;
         const backend = bwrapGit("linux", process.execPath, async () =>
           sh(["git", "--exec-path"], { cwd: root }),
         );
         const portable = {
           async wrap(cmd: string[], opts: Parameters<typeof sh>[1]) {
             // Git 2.40 lacks the config-file queries; exercise the uncached key-discovery path too.
-            if (route === "cat-file-fallback" && cmd.includes("var")) cmd = ["git", "var", "UNKNOWN"];
+            if (fallback && cmd.includes("var")) {
+              configFileQueries++;
+              cmd = ["git", "var", "UNKNOWN"];
+            }
+            if (cmd.includes("--get-regexp")) fallbackQueries++;
             const launch = await backend.wrap(cmd, opts);
             // Exercise the production payload argv/environment with real Git, without namespaces.
             return {
@@ -363,10 +403,14 @@ for (const confined of [false, true])
         const result = await gitConfinement.run(confined ? bwrapGit() : portable, () =>
           worktreeGit(["git", ...configs, ...args], {
             cwd: repo,
-            env: { ...agentEnv(), GIT_EDITOR: loader },
+            env,
             allowFail: true,
           }),
         );
+        if (fallback) {
+          expect(configFileQueries).toBe(2);
+          expect(fallbackQueries).toBe(1);
+        }
         expect(existsSync(join(repo, "payload-ran"))).toBe(false);
         if (route === "editor") {
           expect(readFileSync(join(repo, ".git/COMMIT_EDITMSG"))).toEqual(
