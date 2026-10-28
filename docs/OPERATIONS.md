@@ -271,8 +271,14 @@ Gates, land checks and Git on Linux run under bubblewrap and Landlock instead of
 (`src/harness/sandbox-linux.ts`, `src/harness/landlock.ts`, `bwrapGit`). The coordinator itself
 stays on macOS; this is for Linux workers (#832). Host requirements:
 
-- `/usr/bin/bwrap` (the `bubblewrap` package, not setuid). Git's Landlock and seccomp rules are
-  applied by the factory's own launcher, so no `setpriv` or util-linux version is needed.
+- `/usr/bin/bwrap` (the `bubblewrap` package, not setuid) with `--ro-bind-fd`: upstream 0.10 or
+  later, or a distribution build carrying the backport that came with the CVE-2024-42472 fix. Check
+  with `bwrap --help | grep -e --ro-bind-fd`. On Ubuntu 24.04 the stock 0.9.0-1 lacks it; the
+  security update 0.9.0-1ubuntu0.1 (USN-7046-1) should carry it, so run
+  `sudo apt update && sudo apt install --only-upgrade bubblewrap` and repeat the check. This is
+  unverified on Ubuntu itself, so trust the check, not the version number. Without it the preflight
+  refuses with "`/usr/bin/bwrap` has no --ro-bind-fd". Git's Landlock and seccomp rules are applied by
+  the factory's own launcher, so no `setpriv` or util-linux version is needed.
 - Unprivileged user namespaces. On Ubuntu 23.10 and later, `kernel.apparmor_restrict_unprivileged_userns=1`
   needs an AppArmor profile that grants bwrap `userns`. Leave the sysctl on and add the profile
   rather than disabling the restriction. **This path is untested:** the host that built this had no
@@ -289,6 +295,24 @@ A denied path that does not exist yet, such as a missing `~/.netrc`, is shadowed
 ancestor becomes a read-only tmpfs holding that directory's entries at launch, so the file stays hidden
 if the host creates it mid-session. Other entries the host adds to that directory afterwards are not
 visible either.
+The plan is built from many host lookups, so it is checked as a whole before launch (#881): the last
+mount at or above every denied path must be a tmpfs or a mask, and nothing may be mounted inside a
+missing denied path's first missing name. A plan that fails is refused, never retried. The launcher
+then opens every bind source without following a symlink and has bwrap mount the descriptors, so a
+rename or symlink swap after that point cannot change the source. Source pinning does not secure
+mount destinations, so Linux refuses two policies with a `ConfinementError` naming the deny and reason:
+a denied pathname containing a symlink (including an absent deny's existing ancestors), and a hiding
+mount whose destination depends on an intermediate host directory beneath a live bind. Those parents
+can be renamed or replaced with symlinks before bwrap mounts the mask or tmpfs. The destination check
+also traces earlier binds the hiding mount depends on, including a tmpfs destination that is itself a
+parent of the deny. Direct file masks beneath a pinned bind remain supported.
+
+Host check: **no symlink along any denied path, and no credential store relocated into the checkout,
+scratch or a toolchain directory**. Canonical home/config deny paths work with checkout and scratch
+paths under a symlinked TMPDIR; the TMPDIR alias itself must not appear in the deny paths. These
+restrictions apply only to Linux. A host that moves credentials to allowed paths after launch is still
+outside the launch-time guarantee, and so is a host process that renames or replaces a deny's parent
+directories while a sandbox is launching.
 The daemon port is refused on every address (Landlock rules are per port), and other egress is
 allowed as on macOS. Launching costs about 5 ms for bwrap and about 70 ms for the 65,535 Landlock
 port rules a daemon port needs.

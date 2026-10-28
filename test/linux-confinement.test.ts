@@ -7,12 +7,13 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import {
   bwrapGit,
   checkApply,
@@ -21,12 +22,13 @@ import {
   gitConfinement,
   gitSh,
 } from "../src/git/confinement.ts";
-import { landlockCommand, PAYLOAD_ENV, seccompFilter } from "../src/harness/landlock.ts";
+import { bwrapOptions, landlockCommand, PAYLOAD_ENV, seccompFilter } from "../src/harness/landlock.ts";
+import { configureReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
 import { ConfinementError, platformConfinement, runSandboxed, SANDBOX_EXEC } from "../src/harness/sandbox.ts";
 import { BWRAP, bwrapArgs, linuxForPort, shadow, verifyLinux } from "../src/harness/sandbox-linux.ts";
-import type { WriteRoots } from "../src/harness/scratch.ts";
+import { type WriteRoots, writeRoots } from "../src/harness/scratch.ts";
 import { agentEnv, invocationScratch, type ProcResult, runProcess } from "../src/util/proc.ts";
-import { bwrapSkip } from "./confinement.ts";
+import { bwrapProbeSkip, bwrapSkip } from "./confinement.ts";
 
 let root: string;
 beforeEach(() => {
@@ -60,7 +62,7 @@ function layout() {
 test("bwrapArgs masks denies, then binds allowances, write roots and protected paths, then re-masks specific denies", () => {
   const { home, tool, work, scratch, commands, roots } = layout();
   const sources = { dir: join(root, "mask-dir"), file: join(root, "mask-file") };
-  const args = bwrapArgs(roots, sources, []);
+  const args = bwrapArgs(roots, sources);
   const at = (...seq: string[]) => {
     const i = args.findIndex((_, n) => seq.every((s, k) => args[n + k] === s));
     expect(i).toBeGreaterThanOrEqual(0);
@@ -101,12 +103,30 @@ test("bwrapArgs refuses unusual paths and invalid daemon ports", () => {
     expect(() => bwrapArgs({ ...roots, daemonPort }, sources)).toThrow("Invalid daemon port");
 });
 
+test.skipIf(bwrapSkip !== null)(
+  `the bwrap skip probe detects a binary without fd binds (${bwrapSkip})`,
+  async () => {
+    const wrapper = join(root, "old-bwrap");
+    const marker = join(root, "probe-args");
+    writeFileSync(
+      wrapper,
+      `#!/usr/bin/env bash
+printf '%s\\n' "$@" > '${marker.replaceAll("'", "'\\''")}'
+[[ " $* " != *" --ro-bind-fd "* ]]
+`,
+      { mode: 0o755 },
+    );
+    expect(await bwrapProbeSkip(wrapper)).toContain("--ro-bind-fd");
+    expect(readFileSync(marker, "utf8").split("\n")).toContain("--ro-bind-fd");
+  },
+);
+
 test("platformConfinement keeps Seatbelt off Linux and runs bwrap behind the Landlock launcher on Linux", () => {
   const { roots } = layout();
   const cmd = ["/bin/true"];
   expect(platformConfinement(7, "darwin").wrap(cmd, roots)[0]).toBe(SANDBOX_EXEC);
   const linux = platformConfinement(7, "linux").wrap(cmd, roots);
-  const launcherEnd = linux.indexOf("--");
+  const launcherEnd = linux.indexOf("--bwrap");
   expect(linux[launcherEnd - 1]).toBe("7");
   expect(linux[launcherEnd + 1]).toBe(BWRAP);
   expect(linux.slice(-2)).toEqual(["--", "/bin/true"]);
@@ -133,6 +153,12 @@ test.skipIf(process.platform !== "linux")(
       return result("linux-verified");
     };
     await expect(verify(leaky)).rejects.toThrow("bubblewrap did not enforce its policy");
+    // A bwrap without descriptor binds names the requirement.
+    const old = (cmd: string[]) =>
+      cmd[0] === "/bin/sh"
+        ? { ...result("", 1), stderr: "bwrap: Unknown option --ro-bind-fd\n" }
+        : result("");
+    await expect(verify(old)).rejects.toThrow("has no --ro-bind-fd: install bubblewrap 0.10 or later");
     const network = (stdout: string) => (cmd: string[]) => {
       if (cmd[0] !== "/bin/sh") return result(stdout, stdout ? 0 : 1);
       writeFileSync(cmd[5] ?? "", "ok");
@@ -271,7 +297,7 @@ test("bwrapArgs refuses policies a bind mount cannot enforce", () => {
   const home = join(root, "home");
   symlinkSync("tool", join(home, "link"));
   const absent = { ...roots, denyRead: [join(home, "missing")] };
-  const shadowed = bwrapArgs(absent, sources, []);
+  const shadowed = bwrapArgs(absent, sources, ["/run"]);
   const at = (...seq: string[]) => shadowed.findIndex((_, n) => seq.every((v, k) => shadowed[n + k] === v));
   expect(at("--tmpfs", home)).toBeGreaterThan(0);
   expect(shadowed[at("--tmpfs", home) - 2]).toBe("--perms");
@@ -286,7 +312,9 @@ test("bwrapArgs refuses policies a bind mount cannot enforce", () => {
   expect(at("--remount-ro", home)).toBeGreaterThan(0);
   expect(shadowed).not.toContain(join(home, "missing"));
   // An ancestor already behind a private tmpfs or a mask shows nothing the host creates there.
-  expect(bwrapArgs(absent, sources, [root])).not.toContain("--ro-bind-try");
+  const privateRoot = bwrapArgs(absent, sources, [root]);
+  expect(bwrapOptions([...privateRoot, "--"]).options).toContainEqual(["--tmpfs", root]);
+  expect(privateRoot).not.toContain("--ro-bind-try");
   expect(bwrapArgs({ ...absent, denyRead: [home, join(home, "missing")] }, sources, [])).not.toContain(
     "--ro-bind-try",
   );
@@ -713,5 +741,493 @@ test.skipIf(bwrapSkip !== null)(
       "read-only",
     ]);
     expect(existsSync(join(home, "new"))).toBe(false);
+  },
+);
+
+const within = (parent: string, path: string) =>
+  path === parent || path.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
+
+/**
+ * The denied paths a sandbox built from `args` lets a process read, judged from the host as it is when bwrap
+ * runs: the last mount at or above a path decides what is there, a mask or a tmpfs shows nothing, and a bind
+ * shows its source's file at the same offset. As in the launcher, a bind source that is gone or reached
+ * through a symlink is skipped for `-try` and ends the launch otherwise.
+ */
+function readableDenies(args: string[], masks: string[], denied: string[]): string[] {
+  const symlinkFree = (path: string) => {
+    try {
+      return realpathSync(path) === path;
+    } catch {
+      return false;
+    }
+  };
+  const mounts: { at: string; from?: string }[] = [];
+  for (const [option = "", a = "", b = ""] of bwrapOptions([...args, "--"]).options) {
+    if (option === "--tmpfs") mounts.push({ at: a });
+    else if (option === "--symlink") mounts.push({ at: b, from: "" });
+    else if (option.includes("bind") && option !== "--ro-bind-data") {
+      if (masks.includes(a)) mounts.push({ at: b });
+      else if (symlinkFree(a)) mounts.push({ at: b, from: a });
+      else if (!option.endsWith("-try")) return [];
+    }
+  }
+  return denied.filter((path) => {
+    if (!existsSync(path)) return false;
+    const real = realpathSync(path);
+    const last = mounts.findLast((m) => within(m.at, real));
+    if (last?.from === undefined) return false;
+    return last.from === "" || existsSync(join(last.from, relative(last.at, real)));
+  });
+}
+
+/** Builds a plan; a refusal is a pass, and a plan must leave every denied path unreadable after `after`. */
+function expectNothingReadable(build: () => string[], denied: string[], after = () => {}): string[] | null {
+  const masks = [join(root, "mask-dir"), join(root, "mask-file")];
+  let args: string[] | null = null;
+  try {
+    args = build();
+  } catch (error) {
+    if (!(error instanceof ConfinementError)) throw error;
+  }
+  after();
+  if (args) expect(readableDenies(args, masks, denied)).toEqual([]);
+  return args;
+}
+
+test.each([false, true])("review: symlinked deny parent swaps (existing=%s)", (existing) => {
+  const home = join(root, "home");
+  const [old, next, alias] = [join(home, "old"), join(home, "next"), join(home, "config")];
+  for (const dir of [old, next]) mkdirSync(dir, { recursive: true });
+  symlinkSync("old", alias);
+  const denied = join(alias, "secret");
+  if (existing) writeFileSync(denied, "secret");
+  const realpath = fs.realpathSync;
+  let swapped = false;
+  const spy = spyOn(fs, "realpathSync").mockImplementation(((path: string, options: never) => {
+    const result = realpath(path, options);
+    if (path === (existing ? denied : alias) && !swapped) {
+      swapped = true;
+      rmSync(alias);
+      symlinkSync("next", alias);
+    }
+    return result;
+  }) as typeof fs.realpathSync);
+  expectNothingReadable(
+    () => {
+      try {
+        return bwrapArgs(
+          { write: [], protect: [], denyRead: [denied] },
+          { dir: join(root, "mask-dir"), file: join(root, "mask-file") },
+          [],
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    },
+    [denied],
+    () => {
+      expect(swapped).toBe(true);
+      writeFileSync(denied, "secret");
+    },
+  );
+});
+
+test("a denied symlink is refused even if the host removes it after resolution", () => {
+  const target = join(root, "target");
+  const denied = join(root, "alias");
+  writeFileSync(target, "secret");
+  symlinkSync("target", denied);
+  const realpath = fs.realpathSync;
+  const spy = spyOn(fs, "realpathSync").mockImplementation(((path: string, options: never) => {
+    const real = realpath(path, options);
+    if (path === denied && existsSync(denied)) rmSync(denied);
+    return real;
+  }) as typeof fs.realpathSync);
+  try {
+    expect(() => bwrapArgs({ write: [], protect: [], denyRead: [denied] }, undefined, [])).toThrow(
+      `Cannot confine ${denied}: denied pathname resolves through a symlink`,
+    );
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("a dangling denied symlink is refused without rejecting an ordinary absent path", () => {
+  const denied = join(root, "alias");
+  symlinkSync("missing", denied);
+  const roots: WriteRoots = { write: [], protect: [], denyRead: [denied] };
+  expect(() => bwrapArgs(roots, undefined, [])).toThrow(
+    `Cannot confine ${denied}: denied pathname goes through a symlink at ${denied}`,
+  );
+  rmSync(denied);
+  expect(() => bwrapArgs(roots, undefined, [])).not.toThrow();
+});
+
+test("the destination restriction follows an earlier protected bind's own parent", () => {
+  const work = join(root, "work");
+  const protectedDir = join(work, "sub", "protected");
+  const denied = join(protectedDir, "secret");
+  mkdirSync(protectedDir, { recursive: true });
+  writeFileSync(denied, "secret");
+  expect(() =>
+    bwrapArgs({ write: [work], protect: [protectedDir], denyRead: [denied] }, undefined, []),
+  ).toThrow(
+    `Cannot confine ${denied}: destination parent ${join(work, "sub")} beneath live bind ${work} can be replaced by the host`,
+  );
+});
+
+test("a readonly toolchain bind with an intermediate destination parent is refused", () => {
+  const { tool, roots } = layout();
+  const denied = join(tool, "sub", "secret");
+  mkdirSync(dirname(denied));
+  writeFileSync(denied, "secret");
+  expect(() => bwrapArgs({ ...roots, denyRead: [...(roots.denyRead ?? []), denied] }, undefined, [])).toThrow(
+    `Cannot confine ${denied}: destination parent ${dirname(denied)} beneath live bind ${tool} can be replaced by the host`,
+  );
+});
+
+test("a tmpfs hiding a deny beneath a live bind cannot use a replaceable destination", () => {
+  const work = join(root, "work");
+  const commands = join(work, "commands");
+  const denied = join(commands, "secret");
+  mkdirSync(commands, { recursive: true });
+  writeFileSync(denied, "secret");
+  expect(() =>
+    bwrapArgs(
+      { write: [work], protect: [], denyRead: [denied], commands: { root: [commands], own: [] } },
+      undefined,
+      [],
+    ),
+  ).toThrow(
+    `Cannot confine ${denied}: destination parent ${commands} beneath live bind ${work} can be replaced by the host`,
+  );
+});
+
+test("unrelated symlinks and a direct child of a pinned write root stay supported", () => {
+  const work = join(root, "work");
+  mkdirSync(work);
+  const denied = join(work, "secret");
+  writeFileSync(denied, "secret");
+  symlinkSync("secret", join(work, "unrelated"));
+  expect(() => bwrapArgs({ write: [work], protect: [], denyRead: [denied] }, undefined, [])).not.toThrow();
+});
+
+test("review: a host rename while the plan is built cannot bind a missing denied path back under a write root", () => {
+  // Round 5 of #841: the deny's lookup sees config moved away after the write root was resolved.
+  const config = join(root, "home", "config");
+  const [work, secret] = [join(config, "work"), join(config, "work", "secret")];
+  mkdirSync(work, { recursive: true });
+  const realpath = fs.realpathSync;
+  let calls = 0;
+  const spy = spyOn(fs, "realpathSync").mockImplementation(((path: string, options: never) => {
+    if (path === work && ++calls === 2) renameSync(config, `${config}.away`);
+    return realpath(path, options);
+  }) as typeof fs.realpathSync);
+  const sources = { dir: join(root, "mask-dir"), file: join(root, "mask-file") };
+  const args = expectNothingReadable(
+    () => {
+      try {
+        return bwrapArgs({ write: [work], protect: [], denyRead: [secret] }, sources, []);
+      } finally {
+        spy.mockRestore();
+      }
+    },
+    [secret],
+    () => {
+      renameSync(`${config}.away`, config);
+      writeFileSync(secret, "secret");
+    },
+  );
+  expect(calls).toBeGreaterThanOrEqual(2);
+  expect(args).toBeNull();
+});
+
+test("whatever the host changes while the plan is built, a plan leaves every denied path unreadable", () => {
+  const seed = Number(process.env.LIMITLESS_RACE_SEED ?? Math.floor(Math.random() * 2 ** 31));
+  let state = seed;
+  // mulberry32: a small seeded generator, so a failure can be replayed.
+  const random = () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 2 ** 32;
+  };
+  const pick = <T>(items: T[]): T => items[Math.floor(random() * items.length)] as T;
+  const sources = { dir: join(root, "mask-dir"), file: join(root, "mask-file") };
+  const spied = {
+    realpathSync: fs.realpathSync,
+    readdirSync: fs.readdirSync,
+    statSync: fs.statSync,
+    readlinkSync: fs.readlinkSync,
+  } as const;
+  let built = 0;
+  for (let i = 0; i < 1000; i++) {
+    const home = join(root, `run-${i}`, "home");
+    const dirs = ["config/work", "config/gh", "proj", ".ssh", "data"].map((d) => join(home, d));
+    for (const dir of [...dirs, join(root, `scratch-${i}`)]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(home, ".ssh", "id"), "secret");
+    const pool = [
+      ".ssh",
+      ".netrc",
+      "config/gh/hosts.yml",
+      "config/work/secret",
+      "data/cache/token",
+      "proj/.env",
+    ];
+    const denied = pool.filter(() => random() < 0.5).map((p) => join(home, p));
+    const moved = [...dirs, join(home, "config"), join(home, "data", "cache")];
+    const mutate = () => {
+      const dir = pick(moved);
+      const file = pick(denied.length ? denied : [join(home, ".netrc")]);
+      const action = pick(["away", "back", "mkdir", "create", "remove"]);
+      try {
+        if (action === "away") renameSync(dir, `${dir}.away`);
+        else if (action === "back") renameSync(`${dir}.away`, dir);
+        else if (action === "mkdir") mkdirSync(dir, { recursive: true });
+        else if (action === "create") {
+          mkdirSync(dirname(file), { recursive: true });
+          writeFileSync(file, "secret");
+        } else rmSync(file, { force: true });
+      } catch {
+        // The path the step needed is not there right now: the host did something else.
+      }
+    };
+    const spies = Object.entries(spied).map(([name, original]) =>
+      spyOn(fs, name as keyof typeof spied).mockImplementation(((...args: never[]) => {
+        if (random() < 0.25) mutate();
+        return (original as (...values: never[]) => unknown)(...args);
+      }) as never),
+    );
+    const roots: WriteRoots = {
+      write: [pick([join(home, "config", "work"), join(home, "proj")]), join(root, `scratch-${i}`)],
+      protect: [],
+      denyRead: denied,
+    };
+    let args: string[] | null = null;
+    try {
+      args = bwrapArgs(roots, sources, []);
+    } catch (error) {
+      // A step that saw a path vanish mid-lookup fails the launch too.
+      if (!(error instanceof ConfinementError) && !(error as NodeJS.ErrnoException).code) throw error;
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+    if (!args) continue;
+    built++;
+    // Then the host creates every denied path it can.
+    for (const file of denied) {
+      try {
+        mkdirSync(dirname(file), { recursive: true });
+        if (!existsSync(file)) writeFileSync(file, "secret");
+      } catch {
+        // An ancestor is now a file: the host cannot create this one.
+      }
+    }
+    expect(readableDenies(args, [sources.dir, sources.file], denied), `seed ${seed}, run ${i}`).toEqual([]);
+  }
+  // The refusals must leave plans to check.
+  expect(built, `seed ${seed}`).toBeGreaterThan(100);
+});
+
+test("bwrapOptions refuses an option it does not know rather than misreading the plan", () => {
+  expect(bwrapOptions(["--tmpfs", "/x", "--ro-bind", "/a", "/b", "--", "--bind", "z"])).toEqual({
+    options: [
+      ["--tmpfs", "/x"],
+      ["--ro-bind", "/a", "/b"],
+    ],
+    command: ["--", "--bind", "z"],
+  });
+  expect(() => bwrapOptions(["--bind-fd", "3", "/x", "--"])).toThrow("unexpected bwrap argument");
+  expect(() => bwrapOptions(["--tmpfs"])).toThrow("unexpected bwrap argument");
+});
+
+test("ordinary layouts: canonical denies with a symlinked TMPDIR checkout, scratch and trusted sidecar", () => {
+  const real = join(root, "real");
+  mkdirSync(join(real, "home", ".ssh"), { recursive: true });
+  writeFileSync(join(real, "home", ".ssh", "id"), "secret");
+  const link = join(root, "tmp-link");
+  symlinkSync(real, link);
+  const home = join(link, "home");
+  const [repo, work, scratch] = [join(home, "repo"), join(home, "work"), join(link, "scratch")];
+  mkdirSync(scratch);
+  const git = (...args: string[]) =>
+    expect(Bun.spawnSync(["git", "-c", "user.name=n", "-c", "user.email=a@b", ...args]).exitCode).toBe(0);
+  git("init", "-q", repo);
+  git("-C", repo, "commit", "-q", "--allow-empty", "-m", "x");
+  git("-C", repo, "worktree", "add", "-q", work);
+  const gitDir = join(realpathSync(repo), ".git", "worktrees", "work");
+  writeFileSync(`${work}.git-paths`, JSON.stringify([work, gitDir, join(realpathSync(repo), ".git")]));
+  const policy = {
+    ...configureReadPolicy(undefined, join(real, "config")),
+    home: realpathSync(home),
+    environment: {},
+  };
+  const roots = readPolicyScope.run(policy, () => writeRoots(work, scratch, true));
+  const args = expectNothingReadable(
+    () => bwrapArgs(roots, { dir: join(root, "mask-dir"), file: join(root, "mask-file") }, []),
+    [...(roots.denyRead ?? []), join(home, ".ssh", "id")],
+  );
+  expect(args).toContain(realpathSync(work));
+});
+
+test.skipIf(bwrapSkip !== null)(
+  `a denied file created during construction stays hidden in a real launch (${bwrapSkip})`,
+  async () => {
+    const home = join(root, "home");
+    mkdirSync(home);
+    const secret = join(home, "secret");
+    const readdir = fs.readdirSync;
+    let created = false;
+    const spy = spyOn(fs, "readdirSync").mockImplementation(((path: string, options: never) => {
+      const entries = readdir(path, options);
+      if (path === home) {
+        writeFileSync(secret, "secret");
+        created = true;
+      }
+      return entries;
+    }) as typeof fs.readdirSync);
+    let args: string[];
+    try {
+      args = bwrapArgs({ write: [], protect: [], denyRead: [secret] }, undefined, ["/run"]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(created).toBe(true);
+    const run = await runProcess({
+      cmd: [
+        ...landlockCommand(0),
+        "--bwrap",
+        BWRAP,
+        ...args,
+        "--",
+        "/bin/sh",
+        "-c",
+        `if head -c 1 '${secret}' >/dev/null 2>&1; then echo leaked; else echo hidden; fi; echo ran`,
+      ],
+      cwd: "/",
+      env: agentEnv(),
+      timeoutMs: 30_000,
+    });
+    expect(run.exitCode, run.stderr).toBe(0);
+    expect(run.stdout.trim()).toBe("hidden\nran");
+  },
+);
+
+test.skipIf(bwrapSkip !== null).each([false, true])(
+  `review: destination parent swaps cannot redirect a hiding mount (tmpfs=%s, ${bwrapSkip})`,
+  async (tmpfs) => {
+    const work = join(root, "work");
+    const [sub, other] = [join(work, "sub"), join(work, "other")];
+    for (const dir of [sub, other]) {
+      mkdirSync(join(dir, "nested"), { recursive: true });
+      writeFileSync(join(dir, "nested", "secret"), "secret");
+    }
+    const secret = join(sub, "nested", "secret");
+    const direct = join(work, "direct-secret");
+    writeFileSync(direct, "secret");
+    const safe = bwrapArgs({ write: [work], protect: [], denyRead: [direct] }, undefined, ["/run"]);
+    const ordinary = await runProcess({
+      cmd: [
+        ...landlockCommand(0),
+        "--bwrap",
+        BWRAP,
+        ...safe,
+        "--",
+        "/bin/sh",
+        "-c",
+        `if head -c 1 '${direct}' >/dev/null 2>&1; then echo leaked; else echo hidden; fi`,
+      ],
+      cwd: "/",
+      env: agentEnv(),
+      timeoutMs: 30_000,
+    });
+    expect(ordinary.exitCode, ordinary.stderr).toBe(0);
+    expect(ordinary.stdout.trim()).toBe("hidden");
+    let args: string[];
+    try {
+      args = bwrapArgs(
+        {
+          write: [work],
+          protect: [],
+          denyRead: [secret],
+          ...(tmpfs ? { commands: { root: [join(sub, "nested")], own: [] } } : {}),
+        },
+        undefined,
+        ["/run"],
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfinementError);
+      expect((error as Error).message).toContain(secret);
+      expect((error as Error).message).toContain("destination parent");
+      return;
+    }
+    // Restore the host's original directory after real bwrap finishes its mounts, before the
+    // payload runs. The writable bind makes this restore shared. A refused plan above passes;
+    // if the destination guard is removed, this real launch must still never read the secret.
+    const wrapper = join(root, "bwrap-wrapper");
+    writeFileSync(
+      wrapper,
+      `#!/usr/bin/env bash
+args=()
+while [[ "$1" != -- ]]; do args+=("$1"); shift; done
+shift
+exec ${BWRAP} "\${args[@]}" -- /bin/sh -c 'rm "$1"; mv "$2" "$1"; shift 2; exec "$@"' sh "$RESTORE_SUB" "$RESTORE_AWAY" "$@"
+`,
+      { mode: 0o755 },
+    );
+    renameSync(sub, `${sub}.away`);
+    symlinkSync("other", sub);
+    const run = await runProcess({
+      cmd: [
+        ...landlockCommand(0),
+        "--bwrap",
+        wrapper,
+        ...args,
+        "--",
+        "/bin/sh",
+        "-c",
+        `cat '${secret}'; echo leaked`,
+      ],
+      cwd: "/",
+      env: { ...agentEnv(), RESTORE_SUB: sub, RESTORE_AWAY: `${sub}.away` },
+      timeoutMs: 30_000,
+    });
+    expect(fs.lstatSync(sub).isDirectory(), run.stderr).toBe(true);
+    expect(run.stdout).not.toContain("leaked");
+    expect(run.exitCode).toBe(125);
+  },
+);
+
+test.skipIf(bwrapSkip !== null)(
+  `the launcher never follows a bind source the host swaps for a symlink after the plan is built (${bwrapSkip})`,
+  async () => {
+    const home = join(root, "home");
+    const [tool, other, keys] = [join(home, "tool"), join(home, "other"), join(root, "keys")];
+    for (const dir of [tool, other, keys]) mkdirSync(dir, { recursive: true });
+    const secret = `secret-${crypto.randomUUID()}`;
+    writeFileSync(join(keys, "key"), secret);
+    const launch = (bind: string[]) =>
+      runProcess({
+        cmd: [
+          ...landlockCommand(0),
+          ...["--bwrap", BWRAP, "--unshare-user", "--ro-bind", "/", "/", "--tmpfs", home, ...bind],
+          ...["--", "/bin/sh", "-c", `cat '${tool}/key' '${other}/key' 2>/dev/null; echo ran`],
+        ],
+        cwd: "/",
+        env: agentEnv(),
+        timeoutMs: 60_000,
+      });
+    const swap = (path: string) => {
+      renameSync(path, `${path}.old`);
+      symlinkSync(keys, path);
+    };
+    swap(tool);
+    // A shadow's -try entry the host swapped is left out; a required source refuses the launch.
+    const skipped = await launch(["--ro-bind-try", tool, tool, "--ro-bind", other, other]);
+    expect(skipped.stdout.trim(), skipped.stderr).toBe("ran");
+    swap(other);
+    const refused = await launch(["--ro-bind-try", tool, tool, "--ro-bind", other, other]);
+    expect(refused.stdout).not.toContain(secret);
+    expect(refused.exitCode).toBe(125);
   },
 );

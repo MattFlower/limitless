@@ -1,4 +1,5 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
+import { lstatSync } from "node:fs";
 import { connect } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { PACKAGED_BUILD } from "../release.ts";
@@ -11,6 +12,7 @@ const RULE_NET_PORT = 2;
 const ACCESS_FS_EXECUTE = 1n;
 const RULE_PATH_BENEATH = 1;
 const [O_PATH, O_CLOEXEC] = [0o10000000, 0o2000000];
+const [OPENAT2, AT_FDCWD, RESOLVE_NO_SYMLINKS] = [437, -100, 4n];
 /** The payload's environment, JSON-encoded in the launcher's own (never a command line's) environment. */
 export const PAYLOAD_ENV = "LIMITLESS_PAYLOAD_ENV";
 /** bwrap reads it from this descriptor (`--ro-bind-data`); the payload's shell sources it inside the sandbox. */
@@ -41,6 +43,33 @@ export function landlockCommand(port: number): string[] {
         join(import.meta.dir, "landlock.ts"),
         String(port),
       ];
+}
+
+/** How many values each bwrap option in the Linux backend's plans takes. */
+const BWRAP_OPTIONS: Record<string, number> = {
+  ...Object.fromEntries(
+    ["user", "pid", "ipc", "uts", "cgroup-try", "net"].map((ns) => [`--unshare-${ns}`, 0]),
+  ),
+  ...{ "--die-with-parent": 0, "--new-session": 0 },
+  ...Object.fromEntries(
+    ["--dev", "--proc", "--tmpfs", "--perms", "--remount-ro", "--chdir"].map((o) => [o, 1]),
+  ),
+  ...Object.fromEntries(
+    ["--bind", "--bind-try", "--ro-bind", "--ro-bind-try", "--symlink", "--ro-bind-data"].map((o) => [o, 2]),
+  ),
+};
+
+/** bwrap's options before the `--` that starts the command, one array each; an unknown option throws. */
+export function bwrapOptions(args: string[]): { options: string[][]; command: string[] } {
+  const options: string[][] = [];
+  let i = 0;
+  for (; args[i] !== "--"; i += options.at(-1)?.length ?? 0) {
+    const arity = BWRAP_OPTIONS[args[i] ?? ""];
+    if (arity === undefined || i + arity >= args.length)
+      throw new Error(`unexpected bwrap argument ${args[i]}`);
+    options.push(args.slice(i, i + arity + 1));
+  }
+  return { options, command: args.slice(i) };
 }
 
 /** What the launcher itself reads, so a sandbox that hides their directories can bind them back. */
@@ -168,6 +197,39 @@ function restrictExec(sys: ReturnType<typeof libc>, executables: string[]): void
   if (sys.prctl(22, 2, ptr(prog), 0, 0) !== 0) throw new Error("Cannot apply the Unix-socket filter");
 }
 
+const PINNED: Record<string, string> = {
+  "--bind": "--bind-fd",
+  "--bind-try": "--bind-fd",
+  "--ro-bind": "--ro-bind-fd",
+  "--ro-bind-try": "--ro-bind-fd",
+};
+
+/**
+ * Opens every bind source without following a symlink anywhere along its path and has bwrap mount the
+ * descriptor, so a host rename or symlink swap after this point cannot change what is mounted. bwrap
+ * closes the descriptors before the command starts. A `-try` source that is gone, or is now reached
+ * through a symlink, is left out: not binding it only hides more.
+ */
+function pinSources(sys: ReturnType<typeof libc>, args: string[]): string[] {
+  const { options, command } = bwrapOptions(args);
+  const how = new BigUint64Array([BigInt(O_PATH), 0n, RESOLVE_NO_SYMLINKS]);
+  const pinned = options.flatMap((option) => {
+    const [name = "", source = "", dest = ""] = option;
+    const fdOption = PINNED[name];
+    if (!fdOption) return option;
+    const fd = Number(
+      sys.syscall(OPENAT2, AT_FDCWD, ptr(Buffer.from(`${source}\0`)), ptr(how), how.byteLength),
+    );
+    if (fd >= 0) return [fdOption, String(fd), dest];
+    if (name.endsWith("-try")) {
+      const entry = lstatSync(source, { throwIfNoEntry: false });
+      if (!entry || entry.isSymbolicLink()) return [];
+    }
+    throw new Error(`Cannot open bind source ${source} without following a symlink`);
+  });
+  return [...pinned, ...command];
+}
+
 /** The payload's own variables plus the process-cleanup markers `runProcess` gave the launcher. */
 function payloadVars(payload: string): Record<string, string> {
   const vars = { ...(JSON.parse(payload) as Record<string, string>) };
@@ -226,14 +288,14 @@ export async function landlockEntry(args: string[]): Promise<number> {
   if (
     !/^\d+$/.test(portArg) ||
     port > 65535 ||
-    (mode === "--"
+    (mode === "--" || mode === "--bwrap"
       ? !isAbsolute(command[0] ?? "")
       : mode === "--git"
         ? port !== 0 || split < 2 || ![...git, command[0] ?? ""].every(isAbsolute)
         : mode !== "--probe" || rest.length !== 2)
   ) {
     console.error(
-      "landlock: usage: <port> -- /absolute/command [args…] | <port> --probe <abstract> <pid> | 0 --git /cwd /executable… -- /absolute/git [args…]",
+      "landlock: usage: <port> -- /absolute/command [args…] | <port> --bwrap /absolute/bwrap [options…] -- command… | <port> --probe <abstract> <pid> | 0 --git /cwd /executable… -- /absolute/git [args…]",
     );
     return 2;
   }
@@ -253,7 +315,6 @@ export async function landlockEntry(args: string[]): Promise<number> {
     return 125;
   }
   if (mode === "--probe") return probe(port, rest[0] ?? "", Number(rest[1]));
-  const argv = cstrings(command);
   // A launch from `launch()` carries the payload's environment privately: bwrap and its loader get only
   // the process-cleanup markers, and the payload's shell reads the rest from a descriptor inside.
   const payload = process.env[PAYLOAD_ENV];
@@ -272,6 +333,14 @@ export async function landlockEntry(args: string[]): Promise<number> {
       console.error(`landlock: ${error instanceof Error ? error.message : String(error)}`);
       return 125;
     }
+  }
+  let argv: ReturnType<typeof cstrings>;
+  try {
+    // After the payload's descriptor is staged, so no pinned source can take its number.
+    argv = cstrings(mode === "--bwrap" ? [command[0] ?? "", ...pinSources(sys, command.slice(1))] : command);
+  } catch (error) {
+    console.error(`landlock: ${error instanceof Error ? error.message : String(error)}`);
+    return 125;
   }
   const env = cstrings(gitEnv ?? inherited.map(([key, value]) => `${key}=${value ?? ""}`));
   sys.execve(ptr(argv.buffers[0] ?? Buffer.from("\0")), ptr(argv.pointers), ptr(env.pointers));
