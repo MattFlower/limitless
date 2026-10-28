@@ -65,10 +65,17 @@ export async function resumeGateExecution(
     const workers = new WorkerStore(ctx.store, ctx.deps.buildSha);
     const job = pending.handle.kind === "inplace" ? workers.job(pending.handle.id) : null;
     const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
-    await cancelGateExecution(
-      pending.handle,
-      pending.handle.kind === "inplace" ? lanExecutor(workers, [], true) : executor,
-    );
+    try {
+      await cancelGateExecution(
+        pending.handle,
+        pending.handle.kind === "inplace" ? lanExecutor(workers, [], true) : executor,
+      );
+      if (pending.handle.githubActions?.cleanupFailed)
+        throw new Error("GitHub Actions gate cleanup remains pending");
+    } catch (error) {
+      await ctx.save("gate-cleanup-pending");
+      throw error;
+    }
     ctx.state.gateExecution = undefined;
     await ctx.save();
     if (pending.handle.kind === "inplace")
@@ -142,10 +149,17 @@ export async function runGateExecution(
         ["lan", "inplace", "github-actions"].includes(ctx.state.gateExecution?.handle.kind ?? "") &&
         gateShutdown(ctx.signal)
       ) &&
-      !ctx.state.gateExecution?.handle.githubActions?.cleanupFailed
+      !ctx.state.gateExecution?.handle.githubActions?.cleanupFailed &&
+      !ctx.state.gateExecution?.handle.githubActions?.completed
     ) {
       ctx.state.gateExecution = undefined;
       await ctx.save("gate-result");
     }
   }
+}
+
+/** Call only when saving the consumer's result in the same checkpoint. */
+export function consumeGateExecution(ctx: RunContext): void {
+  const progress = ctx.state.gateExecution?.handle.githubActions;
+  if (progress?.completed && !progress.cleanupFailed) ctx.state.gateExecution = undefined;
 }

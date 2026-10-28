@@ -47,6 +47,7 @@ import {
 import { runAgentGate } from "./agent-gate.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
+import { consumeGateExecution } from "./gate-execution.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
@@ -515,6 +516,7 @@ export class RunContext {
   }
 
   async setPhase(phase: Phase): Promise<void> {
+    if (phase !== this.state.phase) consumeGateExecution(this);
     this.state.phase = phase;
     if (phase === "done") this.state.completedChecks = undefined;
     await this.save();
@@ -587,6 +589,7 @@ export class RunContext {
           if (this.state.completedChecks?.round !== round || this.state.completedChecks.sha !== checkSha)
             this.state.completedChecks = { round, sha: checkSha, values: {} };
           this.state.completedChecks.values[name] = output.value;
+          if (name === "gates") consumeGateExecution(this);
           await this.save();
         }
         return output;
