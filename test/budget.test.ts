@@ -43,6 +43,53 @@ test("removes nested details, both fences and unclosed fences before selecting a
   expect(statedBudget("<details>Budget: 999 lines\n## Budget\n80 lines")).toBeNull();
 });
 
+test.each([false, true])("handles unterminated details prefixes with trailing budget: %s", (budget) => {
+  const prefixes = "<details ".repeat(131072);
+  expect(statedBudget(prefixes + (budget ? "\n## Budget\n80 lines" : ""))).toEqual(
+    budget ? { kind: "figure", lines: 80, text: "## Budget 80 lines" } : null,
+  );
+});
+
+test("recognizes details attributes and case while preserving nesting and unclosed blocks", () => {
+  const hidden = '<DeTaIlS open class="old">\nBudget: 999 lines\n<DETAILS>old</details>';
+  expect(statedBudget(`${hidden}\n## Budget\n80 lines`)).toBeNull();
+  expect(statedBudget(`${hidden}</DETAILS>\n## Budget\n80 lines`)).toEqual({
+    kind: "figure",
+    lines: 80,
+    text: "## Budget 80 lines",
+  });
+});
+
+test.each([
+  ["Budget: 80 lines", "## Acceptance\nAdd 900 lines of test fixtures."],
+  ["- Budget: 80 lines", "- Add 900 lines of test fixtures."],
+  ["Budget: 80 lines", "  * Add 900 lines of test fixtures."],
+  ["Budget: 80 lines", "+ Add 900 lines of test fixtures."],
+  ["Budget: 80 lines", "1. Add 900 lines of test fixtures."],
+  ["Budget: 80 lines", "  2) Add 900 lines of test fixtures."],
+  ["Budget: 80 lines", "```text\n900 lines\n```"],
+  ["Budget: 80 lines", "~~~text\n900 lines\n~~~"],
+  ["Budget: 80 lines", "\nAdd 900 lines of test fixtures."],
+])("ends inline paragraph %s before block %s", (initial, block) => {
+  expect(statedBudget(`${initial}\n${block}\nAnother 900 lines.`)).toEqual({
+    kind: "figure",
+    lines: 80,
+    text: initial,
+  });
+});
+
+test("keeps ordinary continuation lines within an inline budget paragraph", () => {
+  expect(statedBudget("Budget: 80 lines\nplus tests.")).toEqual({
+    kind: "figure",
+    lines: 80,
+    text: "Budget: 80 lines plus tests.",
+  });
+  expect(statedBudget("Budget: 80 lines\nAllow another 900 lines.")).toEqual({
+    kind: "ambiguous",
+    text: "Budget: 80 lines Allow another 900 lines.",
+  });
+});
+
 test("selects each GitHub source independently", () => {
   const issueBody = "## Budget\n300 lines";
   const comment = (request: string, body = issueBody) =>
