@@ -122,6 +122,19 @@ test("CRLF registrations share normalized and escaped variants with publication 
   }
 });
 
+test("JSON slash spellings cover raw and CRLF-normalized credentials and retain short-secret rules", () => {
+  for (const secret of ["abc/def-ghijkl-credential", 'synthetic/quoted"/key\r\nend', "a/\r\ncdef"]) {
+    registerCredential("MATCHER_JSON_SLASH", secret);
+    for (const value of [secret, secret.replaceAll("\r\n", "\n")]) {
+      const escaped = JSON.stringify(value).slice(1, -1).replaceAll("/", "\\/");
+      expect(redactCredentials(`{"token":"${escaped}","ok":true}`)).toBe('{"token":"[redacted]","ok":true}');
+    }
+  }
+  registerCredential("MATCHER_SHORT_SLASH", "ab/cd");
+  expect(redactCredentials("ab\\/cd")).toBe("[redacted]");
+  expect(redactCredentials('"ab\\/cd"')).toBe('"ab\\/cd"');
+});
+
 test("shared compilation survives duplicates and reloads and invalidates on variant eligibility promotion", () => {
   const short = '"'.repeat(7);
   const escaped = JSON.stringify(short).slice(1, -1);

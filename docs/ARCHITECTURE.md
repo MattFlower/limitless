@@ -414,6 +414,9 @@ mechanism or confinement-policy change is implemented here.
 
 ## 7. Persistence
 
+The [coordinator design](coordinators.md) inventories portable state and proposes adoption,
+graceful leave and capability-aware claiming for #902; it is not implemented yet.
+
 SQLite (`bun:sqlite`, WAL) at `~/.limitless/limitless.db`; large artifacts (event logs, diffs,
 prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, `stages`,
 `invocations`, `events`, `artifacts`, `questions`, `provider_state`, `inbox` (webhook dedupe +
