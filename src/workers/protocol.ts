@@ -68,6 +68,11 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
     .object({
       name: z.string(),
       command: z.string(),
+      executedCommand: z.string().optional(),
+      coveringTest: z
+        .object({ file: z.string(), name: z.string(), reason: z.string().optional() })
+        .strict()
+        .optional(),
       ok: z.boolean(),
       exitCode: z.number().int().nullable(),
       durationMs: z.number().finite().nonnegative(),
