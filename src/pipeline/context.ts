@@ -38,6 +38,7 @@ import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
+import type { AcceptanceSnapshot } from "./acceptance.ts";
 import {
   type AgentExecutor,
   type AgentPublicationHooks,
@@ -79,7 +80,8 @@ export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "delive
 export interface RunState {
   sizeReport?: SizeReport;
   parked?: boolean;
-  flow?: "build" | "verify-change";
+  flow?: "build" | "verify-change" | "acceptance";
+  acceptance?: { snapshot: AcceptanceSnapshot };
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
   /** A review round's chosen base tip, saved before it is merged into the PR branch. */
   reviewBaseSha?: string;
@@ -344,6 +346,19 @@ export function redactPostMergeComparisons(
   );
 }
 
+export function initialRunState(run: Pick<Run, "sourceRef">): RunState {
+  return {
+    flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
+    phase: "prepare",
+    answers: [],
+    round: 0,
+    roundsOnImplementer: 0,
+    triedImplementers: [],
+    feedback: null,
+    toolCommands: [],
+  };
+}
+
 export class RunContext {
   readonly deps: EngineDeps;
   private readonly stageConfig = new AsyncLocalStorage<Config>();
@@ -393,16 +408,7 @@ export class RunContext {
     this.runDir = join(deps.cfg.paths.runs, run.id);
     mkdirSync(this.runDir, { recursive: true });
     const stored = deps.store.getRunState<RunState>(run.id);
-    this.state = stored ?? {
-      flow: run.sourceRef?.kind === "pull_request" ? "verify-change" : "build",
-      phase: "prepare",
-      answers: [],
-      round: 0,
-      roundsOnImplementer: 0,
-      triedImplementers: [],
-      feedback: null,
-      toolCommands: [],
-    };
+    this.state = stored ?? initialRunState(run);
     const comparisons = <T extends GateComparison>(checks: T[]): T[] =>
       checks.map((check) => ({
         ...check,

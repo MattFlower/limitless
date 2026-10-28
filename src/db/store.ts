@@ -56,7 +56,8 @@ import { redactGateOutput } from "../gates/output.ts";
 import { githubWait } from "../git/github-wait.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { PrSnapshot } from "../integrations/github-poller.ts";
-import type { RunState } from "../pipeline/context.ts";
+import { ACCEPTANCE_BLOCK, type AcceptanceSnapshot } from "../pipeline/acceptance.ts";
+import { initialRunState, type RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
 import { type ProcessCleanup, type ProcessDiscovery, redactCredentials } from "../util/proc.ts";
@@ -1224,6 +1225,23 @@ export class Store {
     admission?: () => string | null,
     comment?: GitHubComment,
   ): Run {
+    return this.createClaimedRun(repo, req, verifiedGitHubWebhook, admission, comment);
+  }
+
+  createAcceptanceRun(repo: Repo, req: CreateRunRequest, snapshot: AcceptanceSnapshot): Run {
+    if (req.sourceRef?.kind !== "issue" || req.sourceRef.number !== snapshot.ticket.number)
+      throw new Error("acceptance run requires its ticket issue sourceRef");
+    return this.createClaimedRun(repo, req, false, undefined, undefined, snapshot);
+  }
+
+  private createClaimedRun(
+    repo: Repo,
+    req: CreateRunRequest,
+    verifiedGitHubWebhook: boolean,
+    admission?: () => string | null,
+    comment?: GitHubComment,
+    acceptance?: AcceptanceSnapshot,
+  ): Run {
     if (req.sourceRef?.kind === "review-round")
       throw new Error("review rounds are created only by a review verdict");
     const result = this.transaction(() => {
@@ -1258,7 +1276,7 @@ export class Store {
           return error;
         }
       }
-      const run = this.insertRun(repo, req, verifiedGitHubWebhook);
+      const run = this.insertRun(repo, req, verifiedGitHubWebhook, undefined, acceptance);
       if (comment) this.recordGitHubComment(comment, run.id, null);
       return run;
     });
@@ -1441,6 +1459,7 @@ export class Store {
     req: CreateRunRequest,
     verifiedGitHubWebhook: boolean,
     round?: { prUrl: string; grant: FactoryBranchGrant },
+    acceptance?: AcceptanceSnapshot,
   ): Run {
     assertExistingBranchDelivery(
       repo,
@@ -1460,8 +1479,8 @@ export class Store {
     const allow = validateAllow([...validateAllow(req.allow), ...(composed ? [] : parseAllow(req.prompt))]);
     this.db
       .query(
-        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url, models_json, title_provenance)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, repo_id, title, prompt, source, source_ref, requested_by, profile, status, priority, base_branch, delivery_branch, github_webhook_verified, created_at, depends_on, error, finished_at, no_baseline_cache, audit_allow, pr_url, models_json, title_provenance, state_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1486,6 +1505,17 @@ export class Store {
         round?.prUrl ?? null,
         json(req.models ?? {}),
         req.title != null ? "explicit" : "defaulted",
+        json(
+          acceptance
+            ? {
+                ...initialRunState({ sourceRef: req.sourceRef ?? null }),
+                flow: "acceptance",
+                acceptance: { snapshot: acceptance },
+                needsHumanReason: ACCEPTANCE_BLOCK,
+                deliveryComplete: true,
+              }
+            : undefined,
+        ),
       );
     const run = this.getRun(id) as Run;
     this.publish({ kind: "run", run });

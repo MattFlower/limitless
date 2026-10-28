@@ -6,6 +6,7 @@ import { redactCredentials } from "../util/proc.ts";
 import { commentRunRequest, type GhRunner, issueRunRequest, runGh } from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
 import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
+import { issueTextRefusal } from "./issue-trust.ts";
 
 const date = z.string().refine((s) => Number.isFinite(Date.parse(s)));
 const actor = z.object({ login: z.string() }).nullable();
@@ -95,10 +96,10 @@ export function issueEligibility(
         ) > failedIndex,
     );
   const failed = issue.labels.nodes.some((l) => l.name === "limitless:failed");
+  const textRefusal = issueTextRefusal(issue, trusted);
   let reason = "";
   if (issue.state !== "OPEN") reason = "issue is closed";
-  else if (!trusts(issue.author?.login)) reason = "untrusted author";
-  else if (issue.lastEditedAt && !trusts(issue.editor?.login)) reason = "untrusted body editor";
+  else if (textRefusal) reason = textRefusal;
   else if (rename && !trusts(rename.actor?.login)) reason = "untrusted title editor";
   else if (!issue.labels.nodes.some((l) => priority(l.name))) reason = "no priority label";
   else if (!approved.length) reason = "priority application is untrusted or missing";

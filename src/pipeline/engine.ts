@@ -117,7 +117,7 @@ import {
   type RunState,
   redactPostMergeComparisons,
 } from "./context.ts";
-import { runCoveringTests } from "./covering-tests.ts";
+import { runCoveringTests, succeededCoveringStages } from "./covering-tests.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import { gateCommandScope, resumeGateExecution, runGateExecution } from "./gate-execution.ts";
@@ -2226,12 +2226,7 @@ async function oneRound(
           ctx.state.baseline,
           {
             runs: ctx.state.coveringTestRuns ?? [],
-            succeededStageIds: (ctx.state.coveringTestRuns ?? [])
-              .filter((r) => {
-                const stage = ctx.store.getStage(r.stageId);
-                return stage?.runId === ctx.run.id && stage.name === "gates" && stage.status === "succeeded";
-              })
-              .map((r) => r.stageId),
+            succeededStageIds: succeededCoveringStages(ctx),
           },
         ),
         ctx.state.spec as Spec,
