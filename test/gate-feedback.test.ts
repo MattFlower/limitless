@@ -33,6 +33,7 @@ import { seeded } from "./seeded.ts";
 
 test.each([
   { kind: "JSON", secret: 'synthetic-gate-json-"quoted"-\\slash', padding: "" },
+  { kind: "JSON slash", secret: "abc/def-ghijkl-credential", padding: "" },
   {
     kind: "multiline with blank and result lines",
     secret: "synthetic-blank-header\n\n(fail) x\nsynthetic-result-footer",
@@ -67,12 +68,11 @@ test.each([
     const fixture = providerFixture([]);
     const factory = new Factory(fixture.load());
     try {
-      const diagnostic =
-        kind === "JSON"
-          ? JSON.stringify({ credential: secret })
-          : kind.startsWith("terminal")
-            ? `\u001b[${secret.slice(0, 9)}\u001b[31m${secret.slice(9)}\u001b[0m`
-            : secret;
+      const diagnostic = kind.startsWith("JSON")
+        ? JSON.stringify({ credential: secret }).replaceAll("/", "\\/")
+        : kind.startsWith("terminal")
+          ? `\u001b[${secret.slice(0, 9)}\u001b[31m${secret.slice(9)}\u001b[0m`
+          : secret;
       const fragments = [secret.slice(1, 13), secret.slice(-12)];
       writeFileSync(join(fixture.work, "output.txt"), `${padding}error: ${diagnostic}\n(fail) assertion\n`);
       const gates = await confinementScope.run(fakeConfinement, () =>
@@ -112,6 +112,11 @@ test.each([
       const run = factory.store.createRun(repo, { repo: repo.slug, prompt: "test" });
       factory.store.putArtifact(run.id, "gates.json", "gates", JSON.stringify(gates));
       factory.store.addEvent({ runId: run.id, type: "gate", message: "gates", data: gates });
+      const stored = JSON.stringify(factory.store.listEvents(run.id));
+      expect(stored).toContain("[redacted]");
+      expect(stored).toContain("assertion");
+      expect(stored).not.toContain(secret);
+      expect(stored).not.toContain(JSON.stringify(diagnostic).slice(1, -1));
       const routes = createHttpRoutes(factory);
       const route = routes["/api/runs/:id/artifacts/:name"] as Route;
       const response = await route(
