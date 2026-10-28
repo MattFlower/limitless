@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { addAbortListener } from "node:events";
 import { z } from "zod";
 import type { RunStatus } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
@@ -53,12 +54,8 @@ const fields = z
   .refine((r) => r.kind === "run" || r.number !== undefined);
 
 export function formatRecord(r: ClaimRecord): string {
-  return [
-    "limitless-claim: 1",
-    ...Object.entries(fields.parse(r))
-      .filter(([, v]) => v !== undefined)
-      .map(([k, v]) => `${k}: ${v}`),
-  ].join("\n");
+  const lines = Object.entries(fields.parse(r)).flatMap(([k, v]) => (v === undefined ? [] : [`${k}: ${v}`]));
+  return ["limitless-claim: 1", ...lines].join("\n");
 }
 
 export function parseRecord(message: string, ref: string): ClaimRecord | "malformed" {
@@ -79,62 +76,87 @@ export function parseRecord(message: string, ref: string): ClaimRecord | "malfor
     return "malformed";
   }
 }
-const sha = z.string().regex(/^[0-9a-f]{40}$/);
-const oid = z.object({ sha });
+const oid = z.object({ sha: z.string().regex(/^[0-9a-f]{40}$/) });
 const commitData = z.object({ message: z.string(), committer: z.object({ date: z.iso.datetime() }) });
 const mutation =
   "mutation($r:ID!,$u:[RefUpdate!]!){updateRefs(input:{repositoryId:$r,refUpdates:$u}){clientMutationId}}";
+const repositoryQuery = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}";
+const treeBody = {
+  tree: [{ path: "claim", mode: "100644", type: "blob", content: "limitless claim\n" }],
+};
 const failure = (e: unknown) => ({ kind: "unconfirmed" as const, error: redactCredentials(String(e)) });
 const status = (output: string) => /^HTTP\/\S+ (\d{3})(?: .*)?(?:\r?\n|$)/.exec(output)?.[1];
 
 export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }): ClaimClient {
-  const trees = new Map<string, Promise<string>>();
-  const repositories = new Map<string, Promise<string>>();
-  const commits = new Map<string, Promise<z.infer<typeof commitData>>>();
-  async function cached<T>(cache: Map<string, Promise<T>>, key: string, load: () => Promise<T>) {
-    let pending = cache.get(key);
-    if (!pending) {
-      pending = load().catch((e) => {
-        cache.delete(key);
-        throw e;
-      });
-      cache.set(key, pending);
-    }
-    return pending;
+  const trees = cache<string>();
+  const repositories = cache<string>();
+  const commits = cache<z.infer<typeof commitData>>();
+  function cache<T>() {
+    const values = new Map<string, Promise<T>>();
+    // Pending requests share a signal; completed values are reusable by every caller.
+    const pendingSignals = new WeakMap<Promise<unknown>, AbortSignal | undefined>();
+    return async (key: string, load: () => Promise<T>, signal?: AbortSignal) => {
+      let pending = values.get(key);
+      if (!pending || (pendingSignals.has(pending) && pendingSignals.get(pending) !== signal)) {
+        const current = load()
+          .then((value) => {
+            pendingSignals.delete(current);
+            values.set(key, current);
+            return value;
+          })
+          .catch((e) => {
+            if (values.get(key) === current) values.delete(key);
+            throw e;
+          });
+        pending = current;
+        pendingSignals.set(pending, signal);
+        values.set(key, pending);
+      }
+      return pending;
+    };
   }
   async function call(repo: string, signal: AbortSignal | undefined, args: string[], body?: unknown) {
     signal?.throwIfAborted();
-    const output = await deps.gh(args, signal, body === undefined ? undefined : JSON.stringify(body), repo);
-    signal?.throwIfAborted();
-    return output ?? "";
+    const aborted = Promise.withResolvers<never>();
+    const listener = signal && addAbortListener(signal, () => aborted.reject(signal.reason));
+    try {
+      const request = deps.gh(args, signal, body === undefined ? undefined : JSON.stringify(body), repo);
+      const output = await Promise.race([request, aborted.promise]);
+      signal?.throwIfAborted();
+      return output ?? "";
+    } finally {
+      listener?.[Symbol.dispose]();
+    }
   }
   async function api(repo: string, signal: AbortSignal | undefined, path: string, body?: unknown) {
     const args = ["api", `repos/${repo}/${path}`];
     if (body !== undefined) args.push("--method", "POST", "--input", "-");
     return JSON.parse(await call(repo, signal, args, body)) as unknown;
   }
+  async function graphql(repo: string, signal: AbortSignal | undefined, query: string, variables: unknown) {
+    const output = await call(repo, signal, ["api", "graphql", "--input", "-"], { query, variables });
+    const result = JSON.parse(output);
+    if (result.errors) throw new Error("GraphQL request failed");
+    return result;
+  }
   const client: ClaimClient = {
     async read(repo, ref, signal) {
       try {
-        let output: string;
-        try {
-          output = await call(repo, signal, [
-            "api",
-            `repos/${repo}/git/ref/${ref.replace(/^refs\//, "")}`,
-            "--include",
-          ]);
-        } catch (e) {
+        const path = `repos/${repo}/git/ref/${ref.replace(/^refs\//, "")}`;
+        const output = await call(repo, signal, ["api", path, "--include"]).catch((e: unknown) => {
           signal?.throwIfAborted();
-          if (e instanceof CommandError && status(e.stdout) === "404") return { kind: "absent" };
+          if (e instanceof CommandError && status(e.stdout) === "404") return e.stdout;
           throw e;
-        }
+        });
         const code = status(output);
         if (code === "404") return { kind: "absent" };
         if (!code?.startsWith("2")) throw new Error("Unconfirmed ref HTTP status");
         const body = output.replace(/^.*?\r?\n\r?\n/s, "");
         const tipSha = z.object({ object: oid }).parse(JSON.parse(body)).object.sha;
-        const raw = await cached(commits, tipSha, async () =>
-          commitData.parse(await api(repo, signal, `git/commits/${tipSha}`)),
+        const raw = await commits(
+          tipSha,
+          async () => commitData.parse(await api(repo, signal, `git/commits/${tipSha}`)),
+          signal,
         );
         signal?.throwIfAborted();
         return {
@@ -155,37 +177,24 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
         const message = formatRecord(requested);
         const record = parseRecord(message, ref);
         if (record === "malformed") return unchanged;
-        const tree = await cached(
-          trees,
+        const tree = await trees(
           repo,
-          async () =>
-            oid.parse(
-              await api(repo, signal, "git/trees", {
-                tree: [{ path: "claim", mode: "100644", type: "blob", content: "limitless claim\n" }],
-              }),
-            ).sha,
+          async () => oid.parse(await api(repo, signal, "git/trees", treeBody)).sha,
+          signal,
         );
-        const id = await cached(repositories, repo, async () => {
-          const [owner, name] = repo.split("/");
-          const result = JSON.parse(
-            await call(repo, signal, ["api", "graphql", "--input", "-"], {
-              query: "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){id}}",
-              variables: { owner, name },
-            }),
-          );
-          if (result.errors) throw new Error("Repository query failed");
-          return z
-            .object({ data: z.object({ repository: z.object({ id: z.string().min(1) }) }) })
-            .parse(result).data.repository.id;
-        });
-        const identity = { name: "limitless", email: "factory@example.invalid" };
-        const body = {
-          message,
-          tree,
-          parents: before ? [before.sha] : [],
-          author: identity,
-          committer: identity,
-        };
+        const id = await repositories(
+          repo,
+          async () => {
+            const [owner, name] = repo.split("/");
+            const result = await graphql(repo, signal, repositoryQuery, { owner, name });
+            return z
+              .object({ data: z.object({ repository: z.object({ id: z.string().min(1) }) }) })
+              .parse(result).data.repository.id;
+          },
+          signal,
+        );
+        const author = { name: "limitless", email: "factory@example.invalid" };
+        const body = { message, tree, parents: before ? [before.sha] : [], author, committer: author };
         const anchor = deps.sample();
         const result = await api(repo, signal, "git/commits", body);
         const tip = {
@@ -200,16 +209,10 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
         if (allowed === false) return unchanged;
         attempted = true;
         try {
-          const response = JSON.parse(
-            await call(repo, signal, ["api", "graphql", "--input", "-"], {
-              query: mutation,
-              variables: {
-                r: id,
-                u: [{ name: ref, beforeOid: before?.sha ?? "0".repeat(40), afterOid: tip.sha, force: false }],
-              },
-            }),
-          );
-          if (response.errors) throw new Error("Claim update failed");
+          const response = await graphql(repo, signal, mutation, {
+            r: id,
+            u: [{ name: ref, beforeOid: before?.sha ?? "0".repeat(40), afterOid: tip.sha, force: false }],
+          });
           z.object({
             data: z.object({ updateRefs: z.object({ clientMutationId: z.string().nullable() }) }),
           }).parse(response);
@@ -222,10 +225,7 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
         if (confirmed.kind === "absent") return before ? failure("Claim disappeared") : unchanged;
         if (confirmed.tip.sha === before?.sha) return unchanged;
         if (confirmed.tip.sha === tip.sha) return { kind: "applied", tip: confirmed.tip, anchor };
-        if (
-          confirmed.tip.record !== "malformed" &&
-          formatRecord(confirmed.tip.record) === formatRecord(record)
-        )
+        if (confirmed.tip.record !== "malformed" && formatRecord(confirmed.tip.record) === message)
           return { kind: "applied", tip: confirmed.tip, anchor: null };
         return { kind: "moved", tip: confirmed.tip };
       } catch (e) {

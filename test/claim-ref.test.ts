@@ -739,6 +739,71 @@ describe("failures", () => {
 });
 
 describe("isolation", () => {
+  test.each(
+    (["tree", "repository", "commitRead"] as const).flatMap((step) =>
+      [0, 1].map((cancelled) => ({ step, cancelled })),
+    ),
+  )("pending $step cache isolates cancellation of caller $cancelled", async ({ step, cancelled }) => {
+    const gh = new GitHub();
+    if (step === "commitRead") gh.seed(held);
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const controllers = [new AbortController(), new AbortController()];
+    const error = new DOMException("Cancelled", "AbortError");
+    const errors: unknown[] = [];
+    const client = createClaimClient({
+      sample: () => sample,
+      gh: async (...args) => {
+        const [argv, signal] = args;
+        const target = step === "tree" ? "git/trees" : step === "repository" ? "graphql" : "git/commits/";
+        if (argv[1]?.includes(target)) {
+          started.resolve();
+          // Keep the runner pending even on abort to check the client's own cancellation boundary.
+          await release.promise;
+          signal?.throwIfAborted();
+        }
+        return (await gh.gh(...args)) ?? "";
+      },
+    });
+    const invoke = (index: number) => {
+      const signal = controllers[index]?.signal;
+      return (
+        step === "commitRead"
+          ? client.read(repo, ref, signal)
+          : client.write(repo, ref, null, held, { signal })
+      ).catch((e: unknown) => {
+        errors[index] = e;
+        return null;
+      });
+    };
+    const first = invoke(0);
+    await started.promise;
+    const second = invoke(1);
+    let results: Awaited<ReturnType<typeof invoke>>[] = [];
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      controllers[cancelled]?.abort(error);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(errors[cancelled]).toBe(error);
+      expect(errors[1 - cancelled]).toBeUndefined();
+    } finally {
+      release.resolve();
+      results = await Promise.all([first, second]);
+    }
+    expect(results[1 - cancelled]).toMatchObject({ kind: step === "commitRead" ? "tip" : "applied" });
+    expect(errors[1 - cancelled]).toBeUndefined();
+    // A completed value can be reused by a caller with a different signal.
+    const requests = gh.requests.length;
+    if (step === "commitRead") await client.read(repo, ref, new AbortController().signal);
+    else
+      await client.write(repo, ref, null, held, {
+        signal: new AbortController().signal,
+        beforeSend: () => false,
+      });
+    expect(gh.requests.slice(requests).map((r) => r.step)).toEqual(
+      step === "commitRead" ? ["ref"] : ["commit"],
+    );
+  });
   test("concurrent operations share pending caches within one instance", async () => {
     const gh = new GitHub();
     const client = gh.client();
