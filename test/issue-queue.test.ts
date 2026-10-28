@@ -3773,6 +3773,7 @@ test("queue-produced epic and existing feed items render in the CLI and preserve
   expect(mixed.items[1]?.id).toBe(cursor);
   await feedCommand([], { consumer: "legacy" }, deps);
   expect(lines.join("\n")).toContain(`#${mixed.items[0]?.id} queue.epic_attention`);
+  expect(lines.join("\n")).toContain("    Epic #1: unfiled");
   expect(lines.join("\n")).toContain(`#${cursor} run.failed`);
   expect(lines.at(-1)).toBe(`next after: ${cursor}`);
   expect(h.store.feedCursor("legacy")).toBe(0);
