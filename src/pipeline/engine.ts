@@ -103,6 +103,7 @@ import {
   prepareReaderCheckout,
 } from "./agent-executor.ts";
 import { reusableAgentGate } from "./agent-gate.ts";
+import { statedBudget } from "./budget.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
   CancelledError,
@@ -116,6 +117,7 @@ import {
   type RunState,
   redactPostMergeComparisons,
 } from "./context.ts";
+import { runCoveringTests } from "./covering-tests.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import {
@@ -178,6 +180,7 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
+import { measureSize } from "./size.ts";
 import { createSnapshotParent } from "./snapshots.ts";
 import { outOfRunCriteria, specCriteriaRange } from "./spec-criteria.ts";
 import { specScopeViolation } from "./spec-scope.ts";
@@ -2226,6 +2229,15 @@ async function oneRound(
           verifiedSha,
           usableGates(),
           ctx.state.baseline,
+          {
+            runs: ctx.state.coveringTestRuns ?? [],
+            succeededStageIds: (ctx.state.coveringTestRuns ?? [])
+              .filter((r) => {
+                const stage = ctx.store.getStage(r.stageId);
+                return stage?.runId === ctx.run.id && stage.name === "gates" && stage.status === "succeeded";
+              })
+              .map((r) => r.stageId),
+          },
         ),
         ctx.state.spec as Spec,
         ctx.state.holdout as Holdout,
@@ -2264,7 +2276,30 @@ async function oneRound(
         ctx.previewUrl = preview.url;
       }
     };
+    const pendingVerify = (attempt: number) => {
+      const pending = ctx.state.pendingVerify;
+      return pending?.round === round && pending.sha === verifiedSha && pending.attempt === attempt
+        ? pending
+        : undefined;
+    };
+    const executeCovering = (value: Verify) =>
+      runCoveringTests(
+        ctx,
+        applyGateEvidence(
+          value,
+          ctx.state.spec as Spec,
+          ctx.state.holdout as Holdout,
+          verifiedSha,
+          usableGates(),
+          ctx.state.baseline,
+        ),
+        verifiedSha,
+        checkVerifiedHead,
+      );
+    const pending = pendingVerify(0) ?? pendingVerify(1);
+    if (pending) await executeCovering(pending.modelOutput);
     const prepareVerification = async () => {
+      if (pendingVerify(0) || pendingVerify(1)) return;
       try {
         if (!previewWillSetup) await prepareLocal();
         await preparePreview();
@@ -2286,45 +2321,60 @@ async function oneRound(
       return ctx.stage(
         "verify",
         async (stage) => {
-          const { result, target } = await ctx.invoke({
-            role: "verify",
-            allowLocalBinding: true,
-            stage,
-            mode: "readonly",
-            complexity: ctx.complexity,
-            constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
-            timeoutMs: readingTimeout(diff.added + diff.removed, 25),
-            prompt: (allowLocalBinding) =>
-              verifyPrompt({
-                allowLocalBinding,
-                prompt: ctx.run.prompt,
-                spec: ctx.state.spec as Spec,
-                holdout: ctx.state.holdout as Holdout,
-                baseSha,
-                checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
-              }),
-            jsonSchema: toStrictJsonSchema(VerifySchema),
-            schema: VerifySchema,
-            requireStructured: true,
-            privateSession: true,
-            redactHoldout: true,
-          });
-          if (!ctx.parallelChecks) await discardChanges(cwd);
+          const obtainOutput = async () => {
+            const { result, target } = await ctx.invoke({
+              role: "verify",
+              allowLocalBinding: true,
+              stage,
+              mode: "readonly",
+              complexity: ctx.complexity,
+              constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
+              timeoutMs: readingTimeout(diff.added + diff.removed, 25),
+              prompt: (allowLocalBinding) =>
+                verifyPrompt({
+                  allowLocalBinding,
+                  prompt: ctx.run.prompt,
+                  spec: ctx.state.spec as Spec,
+                  holdout: ctx.state.holdout as Holdout,
+                  baseSha,
+                  checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
+                }),
+              jsonSchema: toStrictJsonSchema(VerifySchema),
+              schema: VerifySchema,
+              requireStructured: true,
+              privateSession: true,
+              redactHoldout: true,
+            });
+            if (!ctx.parallelChecks) await discardChanges(cwd);
+            await checkVerifiedHead();
+            const pending = {
+              round,
+              attempt,
+              sha: verifiedSha,
+              modelOutput: VerifySchema.parse(result.structured),
+              modelId: target.modelId,
+            };
+            ctx.state.pendingVerify = pending;
+            await ctx.save("covering-test-request");
+            return pending;
+          };
+          const { modelOutput, modelId } = pendingVerify(attempt) ?? (await obtainOutput());
+          await executeCovering(modelOutput);
           await checkVerifiedHead();
-          const modelOutput = VerifySchema.parse(result.structured);
           const v = resolveVerify(modelOutput);
-          ctx.state.lastVerify = { ...v, modelId: target.modelId };
+          ctx.state.lastVerify = { ...v, modelId };
           ctx.state.verifyResults = [
             ...(ctx.state.verifyResults ?? []),
-            { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha, modelOutput },
+            { ...v, modelId, round, attempt, sha: verifiedSha, modelOutput },
           ];
-          await ctx.save();
+          ctx.state.pendingVerify = undefined;
+          await ctx.save("verify-result");
           const publicSources = await ctx.publicHoldoutSources();
           ctx.artifact(
             attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
             "verify",
             preDeliveryVerifyArtifact(
-              { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha },
+              { ...v, modelId, round, attempt, sha: verifiedSha },
               ctx.state.spec as Spec,
               ctx.state.holdout as Holdout,
               publicSources,
@@ -2333,7 +2383,7 @@ async function oneRound(
           const met = v.criteria.filter((c) => c.status === "met").length;
           const blocked = v.criteria.filter((c) => c.status === "blocked").length;
           return {
-            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met${blocked ? `, ${blocked} blocked` : ""} (${target.modelId})`,
+            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met${blocked ? `, ${blocked} blocked` : ""} (${modelId})`,
             value: v,
           };
         },
@@ -2352,7 +2402,7 @@ async function oneRound(
       let results: [PromiseSettledResult<Review>, PromiseSettledResult<Verify>];
       try {
         try {
-          results = await Promise.allSettled([reviewStage(), verifyAttempt(0)]);
+          results = await Promise.allSettled([reviewStage(), verifyAttempt(pending?.attempt ?? 0)]);
         } finally {
           ctx.parallelChecks = false;
           await discardChanges(cwd);
@@ -2406,7 +2456,9 @@ async function oneRound(
       ).replace("### Checks not met", "### Acceptance criteria not yet met (verify)");
       if (!(await rejectReview(results[0].value, feedback))) return false;
     } else {
-      verify = original ? resolveVerify(VerifySchema.parse(original)) : await verifyAttempt(0);
+      verify = original
+        ? resolveVerify(VerifySchema.parse(original))
+        : await verifyAttempt(pending?.attempt ?? 0);
     }
     if (recorded) {
       Object.assign(recorded, verify);
@@ -2453,7 +2505,7 @@ async function oneRound(
         await ctx.save();
         throw new NeedsHumanError(detail);
       };
-      if (previous.some((v) => v.attempt === 1)) await stop();
+      if (previous.some((v) => v.attempt === 1) || pending?.attempt === 1) await stop();
       // A reserved retry that never recorded a result was interrupted; resume it, don't grant another.
       if (ctx.state.environmentRetryRound === round)
         ctx.log("Resuming interrupted verification retry", "warn");
@@ -2737,6 +2789,30 @@ async function reconcilePublication(ctx: RunContext, cwd: string, budget: GitHub
   await ctx.save("delivery-reconciled");
 }
 
+export async function renderDeliveryReport(
+  ...[ctx, success, verifiedFailure]: Parameters<typeof buildReportArtifacts>
+) {
+  const cwd = ctx.state.worktreePath,
+    base = ctx.state.verification?.baseSha ?? ctx.run.baseSha;
+  const mode = ctx.state.flow === "verify-change" ? "merge-base" : "two-dot";
+  let head = "HEAD",
+    redact = redactCredentials;
+  if (!cwd || !base) ctx.state.sizeReport = { unavailable: !cwd ? "No worktree" : "No base SHA" };
+  else
+    try {
+      const entries = privateEntries(ctx, cwd);
+      redact = (text) => redactPrivate(text, entries);
+      head = await headSha(cwd);
+      const measured = await measureSize(cwd, base, head, mode, ctx.state.gatesConfig?.docs);
+      const stated = statedBudget(ctx.run.prompt, redact);
+      ctx.state.sizeReport = redactGateData({ ...measured, stated });
+    } catch (error) {
+      ctx.state.sizeReport = { base, head, mode, error: redact(redactCredentials(String(error))) };
+    }
+  ctx.store.setRunState(ctx.run.id, ctx.state);
+  return buildReportArtifacts(ctx, success, verifiedFailure);
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -2750,7 +2826,7 @@ async function deliverVerifiedDraft(
   const branch = ctx.run.branch;
   const base = ctx.run.baseBranch;
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
-  const rendered = buildReportArtifacts(ctx, false, { sha, stage, reason, base });
+  const rendered = await renderDeliveryReport(ctx, false, { sha, stage, reason, base });
   const body = publicationText(ctx, stripReportManifest(rendered.report));
   saveReport(ctx, rendered);
   ctx.checkCancelled();
@@ -2989,7 +3065,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
           throw new Error("Merged PR lookup did not return a URL");
         ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: pr.url, merged: true });
-        saveReport(ctx, buildReportArtifacts(ctx, true));
+        saveReport(ctx, await renderDeliveryReport(ctx, true));
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `PR ${pr.url} — merged`, value: undefined };
@@ -3005,7 +3081,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (ctx.state.verification) {
       await discardChanges(cwd);
       if (!success) {
-        saveReport(ctx, buildReportArtifacts(ctx, false));
+        saveReport(ctx, await renderDeliveryReport(ctx, false));
         return { summary: "PR verification needs human review; no push", value: undefined };
       }
       if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
@@ -3013,7 +3089,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           headSha: await headSha(cwd),
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef?.number}`,
         });
-        const rendered = buildReportArtifacts(ctx, true);
+        const rendered = await renderDeliveryReport(ctx, true);
         const report = rendered.report;
         if (!ctx.state.verdictCommentPosted) {
           const { marker, includes: hasMarker } = deliveryMarker(
@@ -3078,7 +3154,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               if (reason) {
                 ctx.state.terminalReason = reason;
                 ctx.state.needsHumanReason = undefined;
-                saveReport(ctx, buildReportArtifacts(ctx, false));
+                saveReport(ctx, await renderDeliveryReport(ctx, false));
                 await ctx.save("verification-stale");
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
@@ -3095,7 +3171,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
             ctx.state.needsHumanReason = undefined;
-            saveReport(ctx, buildReportArtifacts(ctx, false));
+            saveReport(ctx, await renderDeliveryReport(ctx, false));
             await ctx.save("verification-stale");
             throw new Error(reason);
           });
@@ -3146,7 +3222,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       if (!ctx.state.rebaseNote && !(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
         note("the branch does not contain the recorded base");
     }
-    const rendered = buildReportArtifacts(ctx, success);
+    const rendered = await renderDeliveryReport(ctx, success);
     const body = publicationText(ctx, stripReportManifest(rendered.report));
     const title = success ? ctx.run.title : draftTitle(ctx);
     // Failed existing-branch rounds only retain a local report; they publish no commits or PR text.
