@@ -109,6 +109,7 @@ import {
   CancelledError,
   type EngineDeps,
   invokeGuard,
+  localCheckpointer,
   NeedsHumanError,
   NoCapacityError,
   ParkedError,
@@ -201,10 +202,11 @@ export async function executeRun(
 ): Promise<RunStatus> {
   const run = deps.store.getRun(runId);
   if (!run) return "failed";
-  if (finalizeRecordedCancellation(deps.store, runId)) return "cancelled";
+  const checkpointer = deps.checkpointer ?? localCheckpointer(deps.store);
+  if (finalizeRecordedCancellation(deps.store, runId, checkpointer)) return "cancelled";
   const repo = deps.store.getRepo(run.repoId);
   if (!repo) {
-    deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
+    checkpointer.writeRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
@@ -240,7 +242,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   if (ctx.state.phase !== "deliver") ctx.state.githubWait = undefined;
   // A recorded rejection is already terminal; resume only finishes its rollback.
   if (!ctx.state.postMergeRejection)
-    ctx.run = deps.store.updateRun(
+    ctx.run = ctx.checkpointer.writeRun(
       runId,
       {
         status: "running",
@@ -315,7 +317,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.checkCancelled();
     await ctx.setPhase("done");
     ctx.checkCancelled();
-    ctx.run = deps.store.updateRun(runId, { status: "succeeded", stage: null, finishedAt: Date.now() });
+    ctx.run = ctx.checkpointer.writeRun(runId, { status: "succeeded", stage: null, finishedAt: Date.now() });
     // Terminal success ends the cancellation window before destructive worktree cleanup.
     if (ctx.repo.kind === "github" && ctx.state.worktreePath) {
       try {
@@ -339,7 +341,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       ctx.state.needsHumanReason = terminationError.message;
       // Shutdown can re-queue this run. Persist the cleanup block even with an aborted
       // signal, so a fresh process scope on resume cannot start another round.
-      deps.store.setRunState(runId, ctx.state);
+      ctx.checkpointer.writeState(runId, ctx.state);
     }
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
     if (ctx.state.postMergeRejection && (signal.aborted || !(e instanceof NeedsHumanError))) {
@@ -348,7 +350,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     }
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
-      deps.store.updateRun(runId, { status: "queued", stage: null });
+      ctx.checkpointer.writeRun(runId, { status: "queued", stage: null });
       return "queued";
     }
     const cancelled = (): RunStatus => {
@@ -371,7 +373,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
       const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
       if (!shutdown) clearGitHubWait(ctx.state);
-      deps.store.updateRun(
+      ctx.checkpointer.writeRun(
         runId,
         {
           status,
@@ -386,7 +388,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (e instanceof CancelledError || signal.aborted) return cancelled();
     if (e instanceof ParkedError) {
       ctx.state.parked = true;
-      ctx.run = deps.store.updateRun(runId, { status: "queued", stage: null }, ctx.state);
+      ctx.run = ctx.checkpointer.writeRun(runId, { status: "queued", stage: null }, ctx.state);
       ctx.log(`Run parked at phase "${ctx.state.phase}" for deploy`);
       return "queued";
     }
@@ -411,7 +413,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       if (deps.store.getRun(runId)?.error?.startsWith("cancelled by")) return cancelled();
       const reason = redactCredentials((e as Error).message).slice(0, 300);
       ctx.state.githubWait = { since, nextAttemptAt: now + githubWait.intervalMs, reason };
-      ctx.run = deps.store.updateRun(runId, { status: "queued", stage: null }, ctx.state);
+      ctx.run = ctx.checkpointer.writeRun(runId, { status: "queued", stage: null }, ctx.state);
       ctx.log(
         `GitHub unavailable; delivery retries at ${new Date(ctx.state.githubWait.nextAttemptAt).toISOString()}, gives up at ${new Date(since + githubWait.maxMs).toISOString()}: ${reason}`,
         "warn",
@@ -424,7 +426,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         : "";
     if (ctx.state.githubWait) {
       ctx.state.githubWait = undefined;
-      deps.store.setRunState(runId, ctx.state);
+      ctx.checkpointer.writeState(runId, ctx.state);
     }
     const verifiedFailure =
       verifiedSha &&
@@ -445,7 +447,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
       );
       ctx.state.needsHumanReason = message;
-      deps.store.setRunState(runId, ctx.state);
+      ctx.checkpointer.writeState(runId, ctx.state);
     }
     const failureStage =
       ctx.state.conflictRound !== undefined
@@ -528,12 +530,12 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ) {
       ctx.state.needsHumanReason = redactCredentials(message);
       ctx.state.terminalReason = ctx.state.needsHumanReason;
-      deps.store.setRunState(runId, ctx.state);
+      ctx.checkpointer.writeState(runId, ctx.state);
     }
     if (ctx.state.postMergeRejection)
       return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
-    deps.store.updateRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
+    ctx.checkpointer.writeRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
     return status;
   }
 }
@@ -623,13 +625,13 @@ async function prepare(ctx: RunContext): Promise<void> {
       (reusingWorktree && ctx.state.flow !== "verify-change"
         ? (ctx.run.baseSha ?? (await headSha(wt.path)))
         : wt.baseSha);
-    ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha, branch: wt.branch });
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { baseBranch: base, baseSha, branch: wt.branch });
     const verification = ctx.state.verification;
     const env = gateEnv();
     const resuming =
       (await resumeGateExecution(ctx, "prepare", "baseline", wt.path, env))?.kind === "inplace";
     if (verification) {
-      ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { baseSha: verification.headSha });
       if (!resuming) await resetTo(wt.path, verification.baseSha);
     }
     if (!resuming) await discardChanges(wt.path);
@@ -792,7 +794,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       }
     }
     if (review?.kind === "conflict") {
-      ctx.run = store.updateRun(ctx.run.id, { resolvedProfile: "quick" });
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { resolvedProfile: "quick" });
       const tip =
         ctx.state.reviewBaseSha ??
         (await fetchBase(cfg.paths, ctx.repo, review.owner.baseBranch ?? ctx.repo.defaultBranch, ctx.signal));
@@ -912,7 +914,7 @@ async function triage(ctx: RunContext): Promise<void> {
     const t = TriageSchema.parse(result.structured);
     ctx.state.triage = t;
     const profile: ResolvedProfile = ctx.run.profile === "auto" ? t.suggested_profile : ctx.run.profile;
-    ctx.run = ctx.store.updateRun(ctx.run.id, {
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, {
       title:
         ctx.run.titleProvenance === "defaulted" ||
         (ctx.run.titleProvenance == null && ctx.run.title === ctx.run.prompt.split("\n")[0]?.slice(0, 80))
@@ -944,7 +946,7 @@ async function triage(ctx: RunContext): Promise<void> {
 async function waitForAnswers(ctx: RunContext): Promise<void> {
   const pending = () => ctx.store.listQuestions(ctx.run.id).filter((q) => q.answer === null);
   if (!pending().length) return;
-  ctx.run = ctx.store.updateRun(ctx.run.id, { status: "waiting_input" });
+  ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { status: "waiting_input" });
   ctx.log(`Waiting for answers to ${pending().length} question(s)`, "warn");
   await new Promise<void>((resolve, reject) => {
     const check = () => {
@@ -972,7 +974,7 @@ async function waitForAnswers(ctx: RunContext): Promise<void> {
     };
     check();
   });
-  ctx.run = ctx.store.updateRun(ctx.run.id, { status: "running" });
+  ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { status: "running" });
 }
 
 async function clarify(ctx: RunContext): Promise<void> {
@@ -1108,7 +1110,7 @@ async function buildLoop(ctx: RunContext): Promise<void> {
     // Clear the legacy block with the findings round and its baseline in one database write.
     // The old engine must implement that round; resolution's cached checks belong to the prior one.
     ctx.state.needsHumanReason = undefined;
-    ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: sha }, ctx.state);
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { baseSha: sha }, ctx.state);
     await ctx.save("review-resolution-complete");
   }
   if (ctx.state.verification && !ctx.state.verification.initialComplete) {
@@ -1344,7 +1346,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
     if ((await headSha(cwd)) !== previousHead) {
       const sha = await validateMerge(cwd, previousHead, baseSha);
       ctx.state.implementedRound = round;
-      ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha }, ctx.state);
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha }, ctx.state);
       return;
     }
     await requireMerge(cwd, previousHead, baseSha);
@@ -1461,7 +1463,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
         merge && previousHead
           ? await completeMerge(cwd, previousHead, baseSha, mergeMessage(ctx, baseSha), commitIdentity(ctx))
           : await commitAll(cwd, commitMessage(ctx, round));
-      ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
       ctx.state.implementedRound = round;
       await ctx.save("implementation-committed");
       return {
@@ -2754,7 +2756,7 @@ export async function renderDeliveryReport(
     } catch (error) {
       ctx.state.sizeReport = { base, head, mode, error: redact(redactCredentials(String(error))) };
     }
-  ctx.store.setRunState(ctx.run.id, ctx.state);
+  ctx.checkpointer.writeState(ctx.run.id, ctx.state);
   return buildReportArtifacts(ctx, success, verifiedFailure);
 }
 
@@ -2780,7 +2782,7 @@ async function deliverVerifiedDraft(
   // keep the draft below from finding it.
   if (!ctx.run.prUrl) {
     const found = await findPullRequest(ctx.repo, branch, cwd, ctx.signal, deliveryIdentity(ctx, sha));
-    if (found) ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: found });
+    if (found) ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: found });
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
@@ -2805,7 +2807,7 @@ async function deliverVerifiedDraft(
   });
   await ctx.save("delivery-pr-created");
   ctx.checkCancelled();
-  ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
+  ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: url });
   ctx.state.deliveryComplete = true;
   await ctx.save("delivery-complete");
   ctx.log(`Verified-work draft PR: ${url}`);
@@ -2980,7 +2982,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           )
         : ctx.run.prUrl;
       if (identity && recordedUrl && !ctx.run.prUrl)
-        ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: recordedUrl });
+        ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: recordedUrl });
       const raw =
         identity && !recordedUrl
           ? "null"
@@ -3009,7 +3011,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       if (pr && typeof pr === "object" && "state" in pr && pr.state === "MERGED") {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
           throw new Error("Merged PR lookup did not return a URL");
-        ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: pr.url, merged: true });
+        ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: pr.url, merged: true });
         saveReport(ctx, await renderDeliveryReport(ctx, true));
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
@@ -3030,7 +3032,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         return { summary: "PR verification needs human review; no push", value: undefined };
       }
       if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
-        ctx.run = ctx.store.updateRun(ctx.run.id, {
+        ctx.run = ctx.checkpointer.writeRun(ctx.run.id, {
           headSha: await headSha(cwd),
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef?.number}`,
         });
@@ -3140,7 +3142,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     let head = sha ?? (await headSha(cwd));
     await checkWorkflowPublication(ctx, head);
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
-    ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review) {
       const baseBranch = ctx.run.baseBranch as string;
       const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch, ctx.signal, budget);
@@ -3215,7 +3217,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             head,
           );
         if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number")
-          ctx.run = ctx.store.updateRun(ctx.run.id, {
+          ctx.run = ctx.checkpointer.writeRun(ctx.run.id, {
             prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
           });
       }
@@ -3257,7 +3259,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       budget,
     });
     await ctx.save("delivery-pr-created");
-    ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: url });
     publish();
     ctx.log(`Pull request: ${url}`);
     if (!success) {
@@ -3278,7 +3280,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         budget,
         privateEntries(ctx, cwd),
       );
-      if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
+      if (outcome === "merged") ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { merged: true });
       summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : `merge failed (left open)${outcome === "unavailable" ? ": GitHub unavailable" : ""}`}`;
       ctx.log(summary, outcome === "failed" || outcome === "unavailable" ? "warn" : "info");
     } else {
@@ -3314,7 +3316,7 @@ function finalizePostMergeRejection(ctx: RunContext, reason: string): RunStatus 
   const current = ctx.store.getRun(ctx.run.id);
   if (current && current.status !== "needs_human" && TERMINAL_STATUSES.includes(current.status))
     return current.status;
-  return ctx.store.updateRun(ctx.run.id, {
+  return ctx.checkpointer.writeRun(ctx.run.id, {
     status: "needs_human",
     error: reason.slice(0, 2000),
     finishedAt: Date.now(),
@@ -3332,7 +3334,7 @@ async function rollbackRejectedMerge(ctx: RunContext): Promise<never> {
   ctx.state.preRebaseGates = undefined;
   ctx.state.preRebaseHead = undefined;
   ctx.state.needsHumanReason = rejected.reason;
-  ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: rejected.head }, ctx.state);
+  ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: rejected.head }, ctx.state);
   throw new NeedsHumanError(rejected.reason);
 }
 
@@ -3373,7 +3375,7 @@ async function mergeForDelivery(
     );
     ctx.state.phase = "loop";
     ctx.state.githubWait = undefined;
-    ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
   }
   if (merging) await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
@@ -3573,7 +3575,7 @@ async function mergeForDelivery(
       round: ctx.state.round,
     };
     ctx.state.needsHumanReason = ctx.state.postMergeRejection.reason;
-    ctx.run = ctx.store.updateRun(
+    ctx.run = ctx.checkpointer.writeRun(
       ctx.run.id,
       { status: "needs_human", error: ctx.state.needsHumanReason.slice(0, 2000), finishedAt: Date.now() },
       ctx.state,
@@ -3594,6 +3596,10 @@ async function mergeForDelivery(
   ctx.state.pendingRebaseSha = undefined;
   ctx.state.preRebaseGates = undefined;
   ctx.state.preRebaseHead = undefined;
-  ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) }, ctx.state);
+  ctx.run = ctx.checkpointer.writeRun(
+    ctx.run.id,
+    { baseSha: fetched, headSha: await headSha(cwd) },
+    ctx.state,
+  );
   return "done";
 }

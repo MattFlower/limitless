@@ -19,7 +19,7 @@ import type {
   Stage,
   StageName,
 } from "../core/types.ts";
-import type { Store } from "../db/store.ts";
+import type { RunPatch, Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
@@ -53,7 +53,25 @@ import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schem
 import { renderSpec } from "./schemas.ts";
 import type { SizeReport } from "./size.ts";
 
+export interface Checkpointer {
+  writeState(runId: string, state: RunState): void;
+  writeRun(runId: string, patch: RunPatch, state?: RunState): Run;
+  /** Local: synchronous, returns void. Shared (#960): may return a promise. */
+  checkpoint(runId: string, label?: string): void | Promise<void>;
+}
+
+export function localCheckpointer(store: Store): Checkpointer {
+  return {
+    writeState: (runId, state) => {
+      store.setRunState(runId, state);
+    },
+    writeRun: (runId, patch, state) => store.updateRun(runId, patch, state),
+    checkpoint: () => {},
+  };
+}
+
 export interface EngineDeps {
+  checkpointer?: Checkpointer;
   gateExecutor?: GateExecutor;
   agentExecutor?: AgentExecutor;
   confinement?: import("../harness/sandbox.ts").ConfinementBackend;
@@ -343,6 +361,7 @@ export function redactPostMergeComparisons(
 
 export class RunContext {
   readonly deps: EngineDeps;
+  readonly checkpointer: Checkpointer;
   private readonly stageConfig = new AsyncLocalStorage<Config>();
   private readonly interruption = new AbortController();
   readonly signal: AbortSignal;
@@ -377,6 +396,7 @@ export class RunContext {
     readonly drainEvents?: EventTarget,
   ) {
     const deps = liveDeps;
+    this.checkpointer = deps.checkpointer ?? localCheckpointer(deps.store);
     const thisContext = this;
     this.deps = new Proxy(deps, {
       get(target, key, receiver) {
@@ -513,7 +533,9 @@ export class RunContext {
       );
       this.checkCancelled();
     }
-    this.store.setRunState(this.run.id, this.state);
+    this.checkpointer.writeState(this.run.id, this.state);
+    const p = this.checkpointer.checkpoint(this.run.id, checkpoint);
+    if (p) await p;
   }
 
   async setPhase(phase: Phase): Promise<void> {
@@ -571,7 +593,7 @@ export class RunContext {
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
     if (!background)
-      this.run = this.store.updateRun(this.run.id, {
+      this.run = this.checkpointer.writeRun(this.run.id, {
         stage: this.parallelChecks && name === "verify" ? "review" : name,
       });
     const stage = this.store.startStage(this.run.id, name, round);
@@ -874,7 +896,7 @@ export class RunContext {
           )
         ) {
           this.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
-          store.setRunState(this.run.id, this.state);
+          this.checkpointer.writeState(this.run.id, this.state);
         }
         dispatched = true;
       };
@@ -1041,7 +1063,7 @@ export class RunContext {
       } finally {
         if (!dispatched && revision.aborted && opts.role === "implement") {
           this.state.implementer = previousImplementer;
-          store.setRunState(this.run.id, this.state);
+          this.checkpointer.writeState(this.run.id, this.state);
         }
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });
