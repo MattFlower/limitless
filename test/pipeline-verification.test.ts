@@ -1335,13 +1335,11 @@ test.each([
                     : "sandbox prevents test execution",
                 publicSummary: "",
                 covering_tests:
-                  mode === "empty" ||
-                  mode === "forged-citation" ||
-                  (mode === "resume-retry" && verifierCalls === 1)
+                  mode === "empty" || (mode === "resume-retry" && verifierCalls === 1)
                     ? []
                     : Array.from({ length: mode === "criterion-limit" ? 4 : 1 }, (_, j) => ({
                         file: "x.test.ts",
-                        name: `${mode === "retry-limit" && verifierCalls === 1 ? "missing" : "passes"} ${i + j}`,
+                        name: `${mode === "forged-citation" || (mode === "retry-limit" && verifierCalls === 1) ? "missing" : "passes"} ${i + j}`,
                       })),
               })),
               ...pass.criteria.filter((c) => c.id.startsWith("H-")),
@@ -1413,7 +1411,7 @@ test.each([
         ? 10
         : mode === "criterion-limit"
           ? 3
-          : mode === "empty" || terminator || mode === "forged-citation"
+          : mode === "empty" || terminator
             ? 0
             : 1,
     );
@@ -1428,11 +1426,12 @@ test.each([
           : terminator
             ? "option terminator (--)"
             : mode === "forged-citation"
-              ? "no factory record"
+              ? "test failed"
               : mode === "skip"
                 ? "named test skipped"
                 : "Factory gate substitution unavailable: required outcome is not solely that tests pass.",
       );
+      if (mode === "forged-citation") expect(state?.coveringTestRuns?.[0]?.result?.ok).toBe(false);
       if (terminator) {
         expect(state?.coveringTestRuns?.[0]).toMatchObject({
           stageId: 0,

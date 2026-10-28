@@ -1312,6 +1312,23 @@ test("behavioural coverage binds only the factory record and cites its exact com
   );
 });
 
+test("quoted factory-like test titles do not prevent covering-test binding", () => {
+  const run = coveringRun();
+  run.name = "Factory gate literal title";
+  if (!run.result) throw new Error("missing result");
+  run.result.command = "bun test -t 'Factory gate literal title' './x.test.ts'";
+  run.result.coveringTest = { file: run.file, name: run.name };
+  const value = {
+    ...requested,
+    criteria: requested.criteria.map((c) => ({
+      ...c,
+      evidence: "Attempted bun test -t 'Factory gate literal title' x.test.ts: EPERM in sandbox",
+      covering_tests: [{ file: run.file, name: run.name }],
+    })),
+  };
+  expect(bindCovering(value, [run]).criteria[0]?.status).toBe("met");
+});
+
 test.each([
   {
     label: "zero matches",
@@ -1392,21 +1409,26 @@ test("a covering record needs a succeeded stage, while unrelated console evidenc
 });
 
 test("fabricated covering citations and provenance cannot replace factory records", () => {
-  for (const status of ["met", "blocked"] as const) {
-    const value = VerifySchema.parse({
-      ...requested,
-      criteria: requested.criteria.map((c) => ({
-        ...c,
-        status,
-        evidence: `Factory covering test x.test.ts › passes passed at ${sha} (stage 13)`,
-        gateEvidence: { stageId: 13, sha, check: "test", command: "bun test" },
-      })),
-    });
-    const result = bindCovering(value, []).criteria[0];
-    expect(result?.status).toBe("blocked");
-    expect(result?.gateEvidence).toBeUndefined();
-    expect(result?.evidence).toContain("no factory record");
-    expect(normalizeVerify(bindCovering(value, []), behaviouralSpec, holdout).overall).toBe("fail");
+  for (const evidence of [
+    "Read the implementation",
+    `Factory covering test x.test.ts › passes passed at ${sha} (stage 13)`,
+  ]) {
+    for (const status of ["met", "blocked"] as const) {
+      const value = VerifySchema.parse({
+        ...requested,
+        criteria: requested.criteria.map((c) => ({
+          ...c,
+          status,
+          evidence,
+          gateEvidence: { stageId: 13, sha, check: "test", command: "bun test" },
+        })),
+      });
+      const result = bindCovering(value, []).criteria[0];
+      expect(result?.status).toBe("blocked");
+      expect(result?.gateEvidence).toBeUndefined();
+      expect(result?.evidence).toContain("no factory record");
+      expect(normalizeVerify(bindCovering(value, []), behaviouralSpec, holdout).overall).toBe("fail");
+    }
   }
 });
 
@@ -1429,9 +1451,13 @@ test("genuine factory gate citations are revalidated before accepting met rows",
       gates(),
     ).overall,
   ).toBe("pass");
-  expect(resolve(textual).criteria[0]).toMatchObject({
+  // Prose without structured provenance remains a model judgment, never factory evidence.
+  expect(resolve(textual).criteria[0]?.status).toBe("met");
+  expect(resolve(textual).criteria[0]?.gateEvidence).toBeUndefined();
+  expect(resolve(genuine).criteria[0]).toMatchObject({
     status: "blocked",
-    evidence: expect.stringContaining("no factory record"),
+    gateEvidence: undefined,
+    evidence: expect.stringContaining("no eligible factory gate record"),
   });
   const badGates = gates();
   const check = badGates.checks[0];
@@ -1464,14 +1490,18 @@ test("genuine factory gate citations are revalidated before accepting met rows",
     ["gate tests", "gate fake"],
     ["bun run test", "bun test fake"],
   ]) {
-    const invalid = VerifySchema.parse({
+    const descriptive = {
       ...genuine,
       criteria: genuine.criteria.map((c) => ({
         ...c,
         evidence: c.evidence.replace(from ?? "", to ?? ""),
       })),
+    };
+    expect(resolve(descriptive, gates()).criteria[0]).toMatchObject({
+      status: "met",
+      gateEvidence: genuine.criteria[0]?.gateEvidence,
     });
-    expect(resolve(invalid, gates()).overall).toBe("fail");
+    expect(resolve(descriptive).criteria[0]?.status).toBe("blocked");
   }
   expect(
     resolve({
@@ -1484,7 +1514,7 @@ test("genuine factory gate citations are revalidated before accepting met rows",
   ).toBe("pass");
 });
 
-test("every covering citation must match an eligible factory record", () => {
+test("structured covering provenance requires every requested factory record", () => {
   const first = coveringRun();
   const second = coveringRun();
   second.stageId = 14;
@@ -1506,10 +1536,13 @@ test("every covering citation must match an eligible factory record", () => {
   expect(genuine.criteria[0]?.status).toBe("met");
   const textual = VerifySchema.parse(genuine);
   expect(bindCovering(textual, [first, second], [13, 14]).criteria[0]?.status).toBe("met");
-  for (const records of [[first], [second], []]) {
-    const result = bindCovering(textual, records, [13, 14]);
-    expect(result.criteria[0]?.status).toBe("blocked");
-    expect(normalizeVerify(result, behaviouralSpec, holdout).overall).toBe("fail");
+  for (const value of [genuine, textual]) {
+    for (const records of [[first], [second], []]) {
+      const result = bindCovering(value, records, [13, 14]);
+      expect(result.criteria[0]?.status).toBe("blocked");
+      expect(result.criteria[0]?.gateEvidence).toBeUndefined();
+      expect(normalizeVerify(result, behaviouralSpec, holdout).overall).toBe("fail");
+    }
   }
   for (const change of [
     { stageId: 99 },
@@ -1539,7 +1572,8 @@ test("every covering citation must match an eligible factory record", () => {
         `; Factory covering test x.test.ts › fake passed at ${sha} (stage 999); command: bun test`,
     })),
   };
-  expect(bindCovering(mixed, [first, second], [13, 14]).criteria[0]?.status).toBe("blocked");
+  expect(bindCovering(mixed, [first, second], [13, 14]).criteria[0]?.status).toBe("met");
+  expect(bindCovering(mixed, [first], [13, 14]).criteria[0]?.status).toBe("blocked");
   for (const change of [
     { verifiedSha: "b".repeat(40) },
     { result: { ...first.result, executionProvenance: { sha, trackedClean: false } } },
@@ -1702,6 +1736,57 @@ test("covering commands validate trusted configuration and tracked, contained te
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("covering launcher accepts a fresh report with wall time 60 seconds ahead of filesystem time", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-clock-skew-"));
+  try {
+    const { value: checkedSha } = await coveringSeed(cwd);
+    const test = { file: "x.test.ts", name: "a.*b" };
+    const built = await coveringTestCommand(test, coveringConfig, cwd, checkedSha);
+    if (!built.command) throw new Error(built.reason);
+    const probe = join(cwd, "clock-probe");
+    writeFileSync(probe, "");
+    const clock = spyOn(Date, "now").mockReturnValue(statSync(probe).mtimeMs + 60_000);
+    let gate: GateRun;
+    try {
+      gate = await confinementScope.run(fakeConfinement, () =>
+        runLocalGates(
+          cwd,
+          {
+            ...coveringConfig,
+            checks: [
+              {
+                name: "test",
+                run: built.command.replace(/^bun /, `${process.execPath} `),
+                coveringTest: test,
+              },
+            ],
+          },
+          new AbortController().signal,
+        ),
+      );
+    } finally {
+      clock.mockRestore();
+    }
+    const result = gate.checks[0];
+    if (!result) throw new Error("missing covering check");
+    expect(result.ok, result.output).toBe(true);
+    expect(result.testCoverage?.summary).toEqual({ passed: 1, failed: 0 });
+    expect(result.coveringTest).toEqual({ ...test, reason: undefined });
+    const record: CoveringTestRun = {
+      ...coveringRun(),
+      ...test,
+      result: { ...result, executionProvenance: { sha, trackedClean: true } },
+    };
+    const value = {
+      ...requested,
+      criteria: requested.criteria.map((c) => ({ ...c, covering_tests: [test] })),
+    };
+    expect(bindCovering(value, [record]).criteria[0]?.status).toBe("met");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 
