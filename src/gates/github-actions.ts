@@ -1,3 +1,9 @@
+/**
+ * Each handle dispatches at most once. Restart discards interrupted work before starting a new handle.
+ * A run visible only after cleanup's bounded window may run unobserved: it has contents: read,
+ * no secrets, and nothing consumes its result. Nothing selects this executor until remote-gate
+ * configuration is available.
+ */
 import { randomUUID } from "node:crypto";
 import { worktreeGit } from "../git/command.ts";
 import type { GhRunner } from "../integrations/github.ts";
@@ -19,9 +25,6 @@ export interface ActionsProgress {
   pushed?: boolean;
   dispatchIntent?: boolean;
   dispatchSent?: boolean;
-  recoveryAttempted?: boolean;
-  /** Recovery cannot prove the first POST was rejected, even when the second returns an ID. */
-  unresolvedOriginalDispatch?: boolean;
   cleanupRunIds?: number[];
   /** Absolute deadlines survive restarts. Discovery uses the same bounded visibility window as cleanup. */
   visibilityDeadline?: number;
@@ -55,7 +58,6 @@ interface Run {
 }
 const workflow = "limitless-gates.yml";
 
-/** Nothing selects this executor until remote-gate configuration is available. */
 export function githubActionsExecutor(deps: Dependencies): GateExecutor {
   const api = async <T>(
     p: ActionsProgress,
@@ -102,20 +104,15 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
       signal?.removeEventListener("abort", abort);
     }
   };
-  const discoverUntil = async (
-    p: ActionsProgress,
-    deadline: number,
-    signal?: AbortSignal,
-    cleanup = false,
-  ) => {
+  const discoverUntil = async (p: ActionsProgress, deadline: number, signal: AbortSignal) => {
     for (;;) {
-      if (signal?.aborted && (!cleanup || gateShutdown(signal))) throw signal.reason;
-      const runs = await discover(p, signal?.aborted ? undefined : signal);
+      signal.throwIfAborted();
+      const runs = await discover(p, signal);
       if (runs.length > 1) throw new Error("Ambiguous gate workflow runs");
       p.runId = runs[0]?.id;
       if (p.runId) return;
       if (deps.now() >= deadline) return;
-      await wait(Math.min(deps.pollMs, deadline - deps.now()), signal, cleanup);
+      await wait(Math.min(deps.pollMs, deadline - deps.now()), signal);
     }
   };
   const discard = async (handle: ExecutionHandle, signal?: AbortSignal) => {
@@ -124,44 +121,34 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     p.cleanupFailed = true;
     if (signal && gateShutdown(signal)) throw signal.reason;
     const cleanupSignal = signal?.aborted ? undefined : signal;
-    const deadline = deps.now() + deps.discardVisibilityMs;
     const ids = new Set([...(p.cleanupRunIds ?? []), ...(p.runId ? [p.runId] : [])]);
-    let originalUnconfirmed = false;
-    // Older recovery handles also retain this obligation unless it was explicitly resolved.
-    if (p.recoveryAttempted && p.unresolvedOriginalDispatch !== false) {
+    if (p.dispatchIntent || p.dispatchSent || p.runId) {
+      p.visibilityDeadline ??= deps.now() + deps.discardVisibilityMs;
       for (;;) {
         for (const run of await discover(p, cleanupSignal)) ids.add(run.id);
         p.cleanupRunIds = [...ids];
-        if (ids.size >= 2) {
-          p.unresolvedOriginalDispatch = false;
-          break;
-        }
-        if (deps.now() >= deadline) {
-          originalUnconfirmed = true;
-          break;
-        }
-        await wait(Math.min(deps.pollMs, deadline - deps.now()), signal, true);
+        if (deps.now() >= p.visibilityDeadline) break;
+        await wait(Math.min(deps.pollMs, p.visibilityDeadline - deps.now()), signal, true);
       }
-    } else if ((p.dispatchIntent || p.dispatchSent) && !p.runId) {
-      await discoverUntil(p, deadline, signal, true);
-      if (!p.runId) throw new Error("Dispatch unconfirmed: cleanup discovery deadline expired");
-      ids.add(p.runId);
     }
+    const deadline = deps.now() + deps.discardVisibilityMs;
+    const pending: number[] = [];
     for (const id of ids) {
-      let run = await api<Run>(p, `actions/runs/${id}`, "GET", undefined, cleanupSignal);
+      const run = await api<Run>(p, `actions/runs/${id}`, "GET", undefined, cleanupSignal);
       if (run.status !== "completed") {
         await api(p, `actions/runs/${id}/cancel`, "POST", undefined, cleanupSignal);
-        for (;;) {
-          run = await api<Run>(p, `actions/runs/${id}`, "GET", undefined, cleanupSignal);
-          if (run.status === "completed") break;
-          if (deps.now() >= deadline)
-            throw new Error("Workflow termination unconfirmed: cleanup deadline expired");
-          await wait(Math.min(deps.pollMs, deadline - deps.now()), signal, true);
-        }
+        pending.push(id);
       }
     }
-    if (originalUnconfirmed)
-      throw new Error("Original dispatch unconfirmed: cleanup discovery deadline expired");
+    for (const id of pending) {
+      for (;;) {
+        const run = await api<Run>(p, `actions/runs/${id}`, "GET", undefined, cleanupSignal);
+        if (run.status === "completed") break;
+        if (deps.now() >= deadline)
+          throw new Error("Workflow termination unconfirmed: cleanup deadline expired");
+        await wait(Math.min(deps.pollMs, deadline - deps.now()), signal, true);
+      }
+    }
     // Only branch deletion is independent, after workflow termination is confirmed.
     const failures: unknown[] = [];
     for (const [branch, sha] of [
@@ -285,8 +272,6 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           }
         };
         controller.signal.throwIfAborted();
-        if (p.cleanupFailed && !p.completed)
-          throw new Error("Previous GitHub Actions execution failed; retrying cleanup");
         if (p.completed) return structuredClone(p.completed);
         alive();
         await checkpoint();
@@ -307,14 +292,13 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           await checkpoint();
         }
         controller.signal.throwIfAborted();
-        const send = async () => {
+        if (!p.dispatchIntent && !p.dispatchSent && !p.runId) {
           alive();
           p.dispatchIntent = true;
           p.visibilityDeadline = Math.min(deadline, deps.now() + deps.discardVisibilityMs);
           await checkpoint();
-          let response: { workflow_run_id?: number } | null;
           try {
-            response = await api<{ workflow_run_id?: number } | null>(
+            const response = await api<{ workflow_run_id?: number } | null>(
               p,
               `actions/workflows/${workflow}/dispatches`,
               "POST",
@@ -338,25 +322,17 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
                 },
               },
             );
+            p.dispatchSent = true;
+            p.runId = response?.workflow_run_id;
           } catch {
-            // A failed response cannot prove the POST was rejected. Discover before recovering.
-            return;
+            // A failed response cannot prove the POST was rejected; discover without resending.
           }
-          p.dispatchSent = true;
-          p.runId = response?.workflow_run_id;
           await checkpoint();
-        };
-        if (!p.dispatchSent && !p.dispatchIntent && !p.runId) await send();
+        }
         if (!p.runId) {
           p.visibilityDeadline ??= Math.min(deadline, deps.now() + deps.discardVisibilityMs);
           await checkpoint();
           await discoverUntil(p, p.visibilityDeadline, controller.signal);
-          if (!p.runId && !p.dispatchSent && !p.recoveryAttempted) {
-            p.recoveryAttempted = true;
-            p.unresolvedOriginalDispatch = true;
-            await send();
-            if (!p.runId) await discoverUntil(p, p.visibilityDeadline, controller.signal);
-          }
           if (!p.runId) throw new Error("Dispatch unconfirmed: discovery deadline expired");
           p.dispatchSent = true;
           await checkpoint();
@@ -411,7 +387,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
         }
       })()
         .finally(async () => {
-          if (gateShutdown(controller.signal)) return;
+          // A completed, cleaned-up handle owes nothing: replaying it must not need GitHub.
+          if (gateShutdown(controller.signal) || (p.completed && !p.cleanupFailed)) return;
           try {
             await discard(handle, controller.signal);
             await checkpoint();

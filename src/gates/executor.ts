@@ -240,7 +240,10 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
   return executor;
 }
 
-/** Start, checkpoint, attach and cancel through the same path for all daemon gates. */
+/**
+ * Start, checkpoint, attach and cancel through the same path for all daemon gates.
+ * Interrupted Actions handles are discarded before replacement; completed results are reused.
+ */
 export async function executeGate(
   req: GateRequest,
   signal: AbortSignal,
@@ -255,6 +258,16 @@ export async function executeGate(
       ? localExecutor(hooks)
       : (injected ?? localExecutor(hooks));
   if (stored && stored.kind !== executor.kind) throw new Error(`Unavailable gate executor: ${stored.kind}`);
+  if (stored?.kind === "github-actions" && !stored.githubActions?.completed) {
+    try {
+      await cancelGateExecution(stored, executor);
+      if (stored.githubActions?.cleanupFailed) throw new Error("GitHub Actions gate cleanup remains pending");
+    } catch (error) {
+      await persist(stored);
+      throw error;
+    }
+    stored = undefined;
+  }
   const handle = stored ?? (await executor.start(req, signal));
   if (!stored) await persist(handle);
   let execution: Execution<GateRun>;

@@ -192,7 +192,7 @@ test("dispatch uses trusted per-handle branches and maps pass, failure and timeo
   expect(dispatched?.body).toMatchObject({ ref: p?.dispatch, return_run_details: true });
   expect(p?.dispatch).not.toBe("main");
   expect(f.saved.find((h) => h.githubActions?.dispatchSha)?.githubActions?.dispatchSha).toBe("d".repeat(40));
-  expect(f.calls).toEqual([
+  expect(f.calls.filter((c) => c !== "discover")).toEqual([
     "push",
     "dispatch",
     expect.stringContaining("/dispatch:"),
@@ -212,40 +212,107 @@ test("setup failure returns the first failed setup and no checks", async () => {
   });
 });
 
-test("restart after branches pushed dispatches exactly once, with intent persisted first", async () => {
+test.each([
+  "before push",
+  "after push",
+  "after intent before POST",
+  "after POST before response",
+  "after run ID",
+  "after completed",
+])("restart boundary: %s cleans up before persisting a fresh handle", async (boundary) => {
   const f = fixture();
-  const h = await f.stored();
+  const controller = new AbortController();
+  const crash = () => {
+    controller.abort(new Error("shutdown"));
+    throw new Error("shutdown");
+  };
+  f.state.runStatus = boundary === "after completed" ? "completed" : "in_progress";
+  f.state.logs.set(1, log(framed(), framed(0, 7)));
+  const push = f.deps.push;
+  f.deps.push = async (p) => {
+    if (boundary === "before push") crash();
+    await push(p);
+    if (boundary === "after push") crash();
+  };
   const gh = f.deps.gh;
   f.deps.gh = async (...args) => {
-    if (args[0][1]?.endsWith("/dispatches")) {
-      expect(f.saved.at(-1)?.githubActions).toMatchObject({ dispatchIntent: true });
-      expect(f.saved.at(-1)?.githubActions?.dispatchSent).toBeUndefined();
-    }
+    const raw = await gh(...args);
+    if (boundary === "after POST before response" && args[0][1]?.endsWith("/dispatches")) crash();
+    return raw ?? "";
+  };
+  const persist = async (h: ExecutionHandle) => {
+    await f.persist(h);
+    const p = h.githubActions;
+    if (
+      (boundary === "after intent before POST" && p?.dispatchIntent) ||
+      (boundary === "after run ID" && p?.runId) ||
+      (boundary === "after completed" && p?.completed)
+    )
+      crash();
+  };
+  await expect(executeGate(req, controller.signal, {}, f.executor(), undefined, persist)).rejects.toThrow(
+    "shutdown",
+  );
+  const old = structuredClone(f.saved.at(-1));
+  if (!old?.githubActions) throw new Error("Missing interrupted handle");
+  const completed = old.githubActions.completed;
+  const oldPosts = f.requests.filter((r) => r.body?.ref === old.githubActions?.dispatch);
+  expect(oldPosts).toHaveLength(
+    ["after POST before response", "after run ID", "after completed"].includes(boundary) ? 1 : 0,
+  );
+  f.calls.length = 0;
+  f.deps.push = push;
+  f.deps.gh = async (...args) => {
+    if (args[0][1]?.endsWith("/dispatches")) f.state.runStatus = "completed";
     return (await gh(...args)) ?? "";
   };
-  await f.run(signal(), structuredClone(h));
-  expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(1);
-  expect(f.calls).not.toContain("push");
-});
-
-test("restart after dispatch reattaches to the persisted run id and never dispatches", async () => {
-  const f = fixture();
-  const h = await f.stored({ dispatchSent: true, runId: 17 });
-  await f.run(signal(), structuredClone(h));
-  expect(f.calls).not.toContain("dispatch");
-  expect(f.calls).not.toContain("discover");
-  expect(f.requests.some((r) => r.args[1] === "repos/test/repo/actions/runs/17")).toBe(true);
+  // An intent persisted before POST has no run to discover, but cleanup still finishes.
+  if (oldPosts.length === 0) f.state.visibleAfter = Infinity;
+  const executor = f.executor();
+  const start = executor.start;
+  let starts = 0;
+  executor.start = async (...args) => {
+    starts++;
+    return start(...args);
+  };
+  const resumed = await executeGate(req, signal(), {}, executor, old, async (h) => {
+    if (h.id !== old.id) {
+      expect(f.remote.has(old.githubActions?.dispatch ?? "")).toBe(false);
+      expect(f.remote.has(old.githubActions?.candidate ?? "")).toBe(false);
+      expect(f.calls).toContain(`delete:${old.githubActions?.dispatch}:${old.githubActions?.dispatchSha}`);
+      expect(f.calls).toContain(`delete:${old.githubActions?.candidate}:${req.headSha}`);
+      if (oldPosts.length) expect(f.calls).toContain("cancel");
+      f.state.logs.set(1, log());
+    }
+    await f.persist(h);
+  });
+  expect(starts).toBe(completed ? 0 : 1);
+  if (completed) {
+    expect(resumed).toEqual(completed);
+    expect(resumed.checks[0]?.exitCode).toBe(7);
+    expect(f.saved.every((h) => h.id === old.id)).toBe(true);
+    expect(f.calls).not.toContain("dispatch");
+  } else {
+    expect(resumed.checks[0]?.ok).toBe(true);
+    expect(f.saved.at(-1)?.id).not.toBe(old.id);
+    expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(1);
+  }
+  const perHandle = new Map<unknown, number>();
+  for (const r of f.requests.filter((r) => r.args[1]?.endsWith("/dispatches")))
+    perHandle.set(r.body?.ref, (perHandle.get(r.body?.ref) ?? 0) + 1);
+  expect([...perHandle.values()].every((n) => n === 1)).toBe(true);
+  expect(f.remote.size).toBe(0);
 });
 
 test("discovery uses head branch when the injected host clock is ahead of GitHub", async () => {
   const f = fixture();
   f.state.returnId = false;
-  const h = await f.stored({ dispatchSent: true });
-  await f.run(signal(), structuredClone(h));
+  await f.run();
+  const h = f.saved[0];
   const discovery = f.requests.find((r) => r.args[1]?.includes("workflow_dispatch"));
-  expect(discovery?.args[1]).toContain(`branch=${encodeURIComponent(h.githubActions?.dispatch ?? "")}`);
+  expect(discovery?.args[1]).toContain(`branch=${encodeURIComponent(h?.githubActions?.dispatch ?? "")}`);
   expect(discovery?.args.join(" ")).not.toMatch(/created|title|since/);
-  expect(f.calls).not.toContain("dispatch");
+  expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(1);
 });
 
 test("discard waits for a dispatched run that is not visible yet, then cancels before deleting", async () => {
@@ -254,14 +321,49 @@ test("discard waits for a dispatched run that is not visible yet, then cancels b
   f.state.runStatus = "in_progress";
   const h = await f.stored({ dispatchSent: true });
   await f.executor().discard?.(h);
-  expect(f.state.sleeps).toBe(2);
-  expect(f.calls.slice(0, 4)).toEqual(["discover", "discover", "discover", "cancel"]);
-  expect(f.calls.slice(4)).toEqual([
+  expect(f.state.sleeps).toBe(4);
+  expect(f.calls.slice(0, 6)).toEqual(["discover", "discover", "discover", "discover", "discover", "cancel"]);
+  expect(f.calls.slice(6)).toEqual([
     `delete:${h.githubActions?.dispatch}:${"d".repeat(40)}`,
     `delete:${h.githubActions?.candidate}:${req.headSha}`,
   ]);
   expect(f.remote.size).toBe(0);
 });
+
+test.each(["completed", "active"])(
+  "discard cancels every discovered run when the first stays %s",
+  async (status) => {
+    const f = fixture();
+    const h = await f.stored({ dispatchIntent: true, runId: 17 });
+    f.state.runStatus = "in_progress";
+    let secondStatus = "in_progress";
+    const gh = f.deps.gh;
+    f.deps.gh = async (...args) => {
+      const path = args[0][1] ?? "";
+      if (status === "active" && path.endsWith("/runs/17/cancel")) {
+        f.calls.push("cancel");
+        return "null";
+      }
+      if (path.endsWith("/runs/18/cancel")) {
+        f.calls.push("cancel:18");
+        secondStatus = "completed";
+        return "null";
+      }
+      if (path.endsWith("/runs/18")) return JSON.stringify({ id: 18, status: secondStatus });
+      const raw = await gh(...args);
+      if (path.includes("workflow_dispatch") && f.state.discoveries > 2)
+        return JSON.stringify({ workflow_runs: [{ id: 18, status: secondStatus }] });
+      return raw ?? "";
+    };
+    if (status === "active")
+      await expect(f.executor().discard?.(h)).rejects.toThrow("termination unconfirmed");
+    else await f.executor().discard?.(h);
+    expect(f.calls.filter((c) => c.startsWith("cancel"))).toEqual(["cancel", "cancel:18"]);
+    expect(h.githubActions?.cleanupRunIds).toEqual([17, 18]);
+    expect(h.githubActions?.cleanupFailed).toBe(status === "active" ? true : undefined);
+    expect(f.remote.size).toBe(status === "active" ? 2 : 0);
+  },
+);
 
 test("undispatched discard deletes branches, respects moved branch leases and bounds invisible discovery", async () => {
   const f = fixture();
@@ -273,11 +375,11 @@ test("undispatched discard deletes branches, respects moved branch leases and bo
   f.calls.length = 0;
   f.state.visibleAfter = Infinity;
   const pending = await f.stored({ dispatchSent: true });
-  await expect(f.executor().discard?.(pending)).rejects.toThrow("discovery deadline");
+  await f.executor().discard?.(pending);
   expect(f.state.sleeps).toBe(4);
-  expect(f.calls.filter((c) => c.startsWith("delete:"))).toEqual([]);
-  expect(f.remote.has(pending.githubActions?.dispatch ?? "")).toBe(true);
-  expect(f.remote.has(pending.githubActions?.candidate ?? "")).toBe(true);
+  expect(f.calls.filter((c) => c.startsWith("delete:"))).toHaveLength(2);
+  expect(f.remote.has(pending.githubActions?.dispatch ?? "")).toBe(false);
+  expect(f.remote.has(pending.githubActions?.candidate ?? "")).toBe(false);
 });
 
 test("abort cancels a live run before deleting its two leased branches", async () => {
@@ -431,7 +533,7 @@ test.each(["sha", "stage", "round", "purpose"])(
         await push(p);
       };
       await runGateExecution(ctx, "gates", "initial", cwd, req.gates);
-      expect(f.calls.slice(0, 3)).toEqual([
+      expect(f.calls.filter((c) => c !== "discover").slice(0, 3)).toEqual([
         "cancel",
         expect.stringContaining("/dispatch:"),
         expect.stringContaining("/candidate:"),
@@ -444,7 +546,7 @@ test.each(["sha", "stage", "round", "purpose"])(
   },
 );
 
-test("daemon shutdown preserves persisted progress, the workflow and both branches for reattach", async () => {
+test("daemon shutdown preserves progress for cleanup and replacement on restart", async () => {
   const f = fixture();
   const controller = new AbortController();
   const { ctx, store } = await context(f, controller);
@@ -470,7 +572,7 @@ test("daemon shutdown preserves persisted progress, the workflow and both branch
       signal(),
     );
     await runGateExecution(restarted, "gates", "initial", cwd, req.gates);
-    expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(1);
+    expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(2);
     expect(f.remote.size).toBe(0);
   } finally {
     store.close();
@@ -750,187 +852,34 @@ test("failed cleanup keeps the durable handle so a restart retries it", async ()
   }
 });
 
-test("review regression: invisible accepted dispatch is not declared cleaned up", async () => {
-  const f = fixture();
-  f.state.visibleAfter = Infinity;
-  f.state.runStatus = "in_progress";
-  const h = await f.stored({ dispatchSent: true });
-  await expect(f.executor().discard?.(h)).rejects.toThrow("discovery deadline");
-  expect(f.calls.filter((call) => call.startsWith("delete:"))).toEqual([]);
-  expect(f.remote.size).toBe(2);
-});
-
-test("review regression: persisted legacy dispatch without a visible run has bounded discovery failure", async () => {
-  const f = fixture();
-  f.state.visibleAfter = Infinity;
-  const h = await f.stored({ dispatchSent: true });
-  await expect(f.run(signal(), h)).rejects.toThrow(/dispatch.*unconfirmed|discovery.*deadline/i);
-  expect(f.calls).not.toContain("dispatch");
-  expect(f.state.delays.reduce((a, b) => a + b, 0)).toBe(80);
-  expect(h.githubActions?.cleanupFailed).toBe(true);
-  expect(f.remote.size).toBe(2);
-});
-
-test.each(["before POST", "after acceptance"])(
-  "intent recovery at crash boundary %s discovers before dispatch",
-  async (boundary) => {
+test.each(["visible", "never visible"])(
+  "lost POST response: %s run uses one POST and bounded discovery",
+  async (visibility) => {
     const f = fixture();
-    const controller = new AbortController();
-    if (boundary === "before POST") f.state.visibleAfter = Infinity;
-    const persist = async (handle: ExecutionHandle) => {
-      const p = handle.githubActions;
-      const crash = boundary === "before POST" ? p?.dispatchIntent && !p.dispatchSent : p?.dispatchSent;
-      // The accepted POST's checkpoint never reaches the Store in the second boundary.
-      if (!(crash && boundary === "after acceptance")) await f.persist(handle);
-      if (crash) {
-        controller.abort(new Error("shutdown"));
-        throw new Error("shutdown");
-      }
-    };
-    await expect(executeGate(req, controller.signal, {}, f.executor(), undefined, persist)).rejects.toThrow(
-      "shutdown",
-    );
-    const durable = structuredClone(f.saved.at(-1));
-    expect(durable?.githubActions).toMatchObject({ dispatchIntent: true, pushed: true });
-    expect(durable?.githubActions?.dispatchSent).toBeUndefined();
-    expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(boundary === "before POST" ? 0 : 1);
+    f.state.visibleAfter = visibility === "visible" ? 2 : Infinity;
     const gh = f.deps.gh;
     f.deps.gh = async (...args) => {
-      if (args[0][1]?.endsWith("/dispatches"))
-        expect(f.saved.at(-1)?.githubActions?.recoveryAttempted).toBe(true);
-      return (await gh(...args)) ?? "";
+      const response = await gh(...args);
+      if (args[0][1]?.endsWith("/dispatches")) throw new Error("response lost");
+      return response ?? "";
     };
-    if (boundary === "before POST") {
-      // With an uncertain first POST, recovery's ID alone cannot authorize branch deletion.
-      await expect(f.run(signal(), durable)).rejects.toThrow("Original dispatch unconfirmed");
-      expect(f.remote.size).toBe(2);
-    } else await f.run(signal(), durable);
-    expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
-    expect(f.state.delays.reduce((a, b) => a + b, 0)).toBe(boundary === "before POST" ? 80 : 0);
-    expect(
-      f.saved.some((saved) => saved.githubActions?.dispatchSent && saved.githubActions.runId === 17),
-    ).toBe(true);
+    const result = await f.run().catch((error: unknown) => error);
+    expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(1);
+    if (visibility === "visible") {
+      expect(result).toMatchObject({ checks: [{ ok: true }] });
+      expect(f.requests.some((r) => r.args.includes("--include") && r.args[1]?.endsWith("/runs/17"))).toBe(
+        true,
+      );
+    } else {
+      expect(result).toBeInstanceOf(Error);
+      expect(String(result)).toContain("Dispatch unconfirmed");
+      expect(f.state.delays.reduce((a, b) => a + b, 0)).toBe(40);
+    }
+    expect(f.calls.filter((c) => c.startsWith("delete:"))).toHaveLength(2);
+    expect(f.remote.size).toBe(0);
+    expect(f.saved.at(-1)?.githubActions?.cleanupFailed).toBeUndefined();
   },
 );
-
-test("a lost POST response discovers the accepted run instead of dispatching twice", async () => {
-  const f = fixture();
-  const gh = f.deps.gh;
-  f.deps.gh = async (...args) => {
-    const response = await gh(...args);
-    if (args[0][1]?.endsWith("/dispatches")) throw new Error("response lost");
-    return response ?? "";
-  };
-  await f.run();
-  expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
-  expect(f.calls).toContain("discover");
-});
-
-test.each(["returned ID", "lost response"])(
-  "recovery with %s retains the uncertain original dispatch through cleanup restarts",
-  async (response) => {
-    const f = fixture();
-    const { ctx, store } = await context(f);
-    try {
-      const h = await f.stored({ dispatchIntent: true });
-      ctx.state.gateExecution = { handle: h, sha: req.headSha, stage: "gates", round: 0, purpose: "initial" };
-      await ctx.save();
-      const gh = f.deps.gh;
-      let dispatched = false;
-      let originalVisible = false;
-      let originalStatus = "in_progress";
-      let cancelFails = true;
-      f.deps.gh = async (...args) => {
-        const path = args[0][1] ?? "";
-        if (path.endsWith("/dispatches")) {
-          expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.githubActions).toMatchObject({
-            recoveryAttempted: true,
-            unresolvedOriginalDispatch: true,
-          });
-          dispatched = true;
-          f.calls.push("dispatch");
-          if (response === "lost response") throw new Error("response lost");
-          return JSON.stringify({ workflow_run_id: 18 });
-        }
-        if (path.includes("workflow_dispatch")) {
-          f.calls.push("discover");
-          return JSON.stringify({
-            workflow_runs: dispatched ? [{ id: 18 }, ...(originalVisible ? [{ id: 17 }] : [])] : [],
-          });
-        }
-        if (path.endsWith("/runs/17/cancel")) {
-          f.calls.push("cancel:17");
-          if (cancelFails) throw new Error("original cancel unavailable");
-          originalStatus = "completed";
-          return "null";
-        }
-        if (path.endsWith("/runs/17") || path.endsWith("/runs/18")) {
-          const id = path.endsWith("/17") ? 17 : 18;
-          const status = id === 17 ? originalStatus : "completed";
-          f.calls.push(`status:${id}:${status}`);
-          return `${args[0].includes("--include") ? "HTTP/2.0 200 OK\r\n\r\n" : ""}${JSON.stringify({ id, status })}`;
-        }
-        return (await gh(...args)) ?? "";
-      };
-      await expect(runGateExecution(ctx, "gates", "initial", cwd, req.gates)).rejects.toThrow(
-        /original.*unconfirmed/i,
-      );
-      const pending = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
-      expect(pending?.handle.githubActions).toMatchObject({
-        runId: 18,
-        recoveryAttempted: true,
-        unresolvedOriginalDispatch: true,
-        cleanupFailed: true,
-      });
-      expect(f.calls.filter((call) => call.startsWith("delete:"))).toEqual([]);
-      expect(f.remote.size).toBe(2);
-      originalVisible = true;
-      const restart = () =>
-        new RunContext({ ...ctx.deps, gateExecutor: f.executor() }, ctx.run, ctx.repo, signal());
-      await expect(runGateExecution(restart(), "gates", "initial", cwd, req.gates)).rejects.toThrow(
-        "original cancel unavailable",
-      );
-      expect(f.calls.filter((call) => call.startsWith("delete:"))).toEqual([]);
-      expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.id).toBe(h.id);
-      // Once identified, the original remains a cleanup obligation even if listing hides it again.
-      originalVisible = false;
-      cancelFails = false;
-      await expect(runGateExecution(restart(), "gates", "initial", cwd, req.gates)).resolves.toMatchObject({
-        setupOk: true,
-      });
-      expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
-      expect(f.calls.indexOf("status:17:completed")).toBeLessThan(
-        f.calls.findIndex((call) => call.startsWith("delete:")),
-      );
-      expect(f.remote.size).toBe(0);
-    } finally {
-      store.close();
-    }
-  },
-);
-
-test("uncertain recovery is persisted before POST and repeated restarts cannot dispatch again", async () => {
-  const f = fixture();
-  f.state.visibleAfter = Infinity;
-  const h = await f.stored({ dispatchIntent: true });
-  const controller = new AbortController();
-  const gh = f.deps.gh;
-  f.deps.gh = async (...args) => {
-    const response = await gh(...args);
-    if (args[0][1]?.endsWith("/dispatches")) {
-      controller.abort(new Error("shutdown"));
-      throw new Error("response lost");
-    }
-    return response ?? "";
-  };
-  await expect(f.run(controller.signal, h)).rejects.toThrow("shutdown");
-  const durable = structuredClone(f.saved.at(-1));
-  expect(durable?.githubActions).toMatchObject({ dispatchIntent: true, recoveryAttempted: true });
-  expect(durable?.githubActions?.dispatchSent).toBeUndefined();
-  await expect(f.run(signal(), durable)).rejects.toThrow(/dispatch.*unconfirmed|discovery.*deadline/i);
-  expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
-  expect(f.remote.size).toBe(2);
-});
 
 test("review regression: completion survives restart before the caller saves gate results", async () => {
   const f = fixture();
@@ -1028,29 +977,30 @@ test.each(["active", "cancel error", "confirmation error"])(
   },
 );
 
-test("invisible accepted dispatch keeps its durable cleanup obligation until discovery succeeds", async () => {
+test("restart cleanup failure retains the old handle without persisting a replacement", async () => {
   const f = fixture();
   const { ctx, store } = await context(f);
   try {
-    const h = await f.stored({ dispatchSent: true });
+    const h = await f.stored({ dispatchIntent: true });
     ctx.state.gateExecution = { handle: h, sha: req.headSha, stage: "gates", round: 0, purpose: "initial" };
     await ctx.save();
-    f.state.visibleAfter = Infinity;
-    await expect(runGateExecution(ctx, "gates", "initial", cwd, req.gates)).rejects.toThrow(
-      "discovery deadline",
-    );
-    expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.id).toBe(h.id);
-    expect(f.remote.size).toBe(2);
-    f.state.visibleAfter = 0;
     f.state.runStatus = "in_progress";
+    const gh = f.deps.gh;
+    f.deps.gh = async (...args) => {
+      if (args[0][1]?.endsWith("/cancel")) throw new Error("cancel unavailable");
+      return (await gh(...args)) ?? "";
+    };
     const restarted = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
     await expect(runGateExecution(restarted, "gates", "initial", cwd, req.gates)).rejects.toThrow(
-      "retrying cleanup",
+      "cancel unavailable",
     );
-    expect(f.calls).toContain("cancel");
+    const durable = store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle;
+    expect(durable?.id).toBe(h.id);
+    expect(durable?.githubActions?.cleanupFailed).toBe(true);
+    expect(f.saved.every((saved) => saved.id === h.id)).toBe(true);
+    expect(f.calls).not.toContain("push");
     expect(f.calls).not.toContain("dispatch");
-    expect(f.remote.size).toBe(0);
-    expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution).toBeUndefined();
+    expect(f.remote.size).toBe(2);
   } finally {
     store.close();
   }
@@ -1146,26 +1096,20 @@ test.each(["run", "jobs"])("structured gh %s errors retain rate-limit timing hea
   ).toBeGreaterThan(1);
 });
 
-test("rate limits exhaust the original execution deadline across shutdown and restart", async () => {
+test("rate-limit waits exhaust the execution deadline without redispatching", async () => {
   const f = fixture();
-  const h = await f.stored({ dispatchSent: true, runId: 17, deadline: f.deps.now() + 3_000 });
+  req.gates.setup = [];
+  req.gates.checks[0] = { name: "test", run: "test", timeoutSec: 3 };
   f.state.runStatus = "in_progress";
-  const controller = new AbortController();
-  f.state.onSleep = () => controller.abort(new Error("shutdown"));
   const gh = f.deps.gh;
   f.deps.gh = async (...args) => {
     if (args[0].includes("--include")) throw new Error("HTTP 429; Retry-After: 2");
     return (await gh(...args)) ?? "";
   };
-  await expect(f.run(controller.signal, h)).rejects.toThrow("shutdown");
-  expect(f.remote.size).toBe(2);
-  expect(f.calls).not.toContain("cancel");
-  const durable = structuredClone(f.saved.at(-1));
-  f.state.onSleep = () => {};
-  await expect(f.run(signal(), durable)).rejects.toThrow("execution deadline");
+  await expect(f.run()).rejects.toThrow("execution deadline");
   expect(f.state.delays).toEqual([2_000, 1_000]);
   expect(f.calls).toContain("cancel");
-  expect(f.calls).not.toContain("dispatch");
+  expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(1);
   expect(f.remote.size).toBe(0);
 });
 
@@ -1188,7 +1132,7 @@ test.each(["no quota headers", "remaining quota", "invalid reset"])(
       return (await gh(...args)) ?? "";
     };
     await expect(f.run()).rejects.toThrow("Resource not accessible");
-    expect(f.state.delays).toEqual([]);
+    expect(f.state.delays).toEqual([10, 10, 10, 10]);
     expect(f.calls).toContain("cancel");
   },
 );
@@ -1197,6 +1141,7 @@ test.each(["shutdown", "cancel"])("%s interrupts a pending rate-limit wait", asy
   const f = fixture();
   f.state.runStatus = "in_progress";
   const sleeping = Promise.withResolvers<void>();
+  const sleep = f.deps.sleep;
   f.deps.sleep = async () => {
     sleeping.resolve();
     await new Promise<void>(() => {});
@@ -1209,6 +1154,7 @@ test.each(["shutdown", "cancel"])("%s interrupts a pending rate-limit wait", asy
   const controller = new AbortController();
   const run = f.run(controller.signal);
   await sleeping.promise;
+  f.deps.sleep = sleep;
   controller.abort(new Error(reason));
   await expect(run).rejects.toThrow(reason);
   expect(f.calls.includes("cancel")).toBe(reason !== "shutdown");
@@ -1383,7 +1329,7 @@ test.each(["run response", "jobs response", "run CommandError", "jobs CommandErr
 );
 
 test.each(["run Retry-After", "jobs reset"])(
-  "shutdown checkpoints %s cooldown and both poll paths honour it on restart",
+  "shutdown checkpoints %s cooldown and replacement honours a fresh rate-limit response",
   async (variant) => {
     const f = fixture();
     const { ctx, store } = await context(f);
@@ -1400,7 +1346,7 @@ test.each(["run Retry-After", "jobs reset"])(
             limited = true;
             return variant.startsWith("jobs")
               ? `HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: ${(start + 60_000) / 1_000}\r\n\r\n{}`
-              : "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n{}";
+              : `HTTP/2.0 429 Too Many Requests\r\nRetry-After: ${(start + 60_000 - f.deps.now()) / 1_000}\r\n\r\n{}`;
           }
         }
         return (await gh(...args)) ?? "";
@@ -1424,6 +1370,7 @@ test.each(["run Retry-After", "jobs reset"])(
       times.length = 0;
       f.deps.sleep = sleep;
       await f.deps.sleep(20_000);
+      limited = false;
       await runGateExecution(
         new RunContext(ctx.deps, ctx.run, ctx.repo, signal()),
         "gates",
@@ -1431,11 +1378,15 @@ test.each(["run Retry-After", "jobs reset"])(
         cwd,
         req.gates,
       );
-      expect(times).toEqual([start + 60_000, start + 60_000]);
+      expect(times).toEqual(
+        variant.startsWith("jobs")
+          ? [start + 20_000, start + 20_000, start + 60_000]
+          : [start + 20_000, start + 60_000, start + 60_000],
+      );
       expect(f.state.delays).toEqual([20_000, 40_000]);
-      expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
+      expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(2);
       expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.githubActions?.deadline).toBe(
-        deadline,
+        (deadline ?? 0) + 20_000,
       );
     } finally {
       store.close();
@@ -1444,28 +1395,44 @@ test.each(["run Retry-After", "jobs reset"])(
 );
 
 test.each(["elapsed", "legacy", "past deadline"])(
-  "resumed %s cooldown obeys the original deadline",
+  "restart replaces %s cooldown with a fresh execution deadline",
   async (kind) => {
     const f = fixture();
     const start = f.deps.now();
     const h = await f.stored({
       dispatchSent: true,
       runId: 17,
-      deadline: start + 1_000,
+      deadline: kind === "past deadline" ? start - 1 : start + 1_000,
       nextPollAt: kind === "legacy" ? undefined : kind === "elapsed" ? start - 1 : start + 60_000,
     });
-    if (kind === "past deadline") {
-      f.state.runStatus = "in_progress";
-      await expect(f.run(signal(), h)).rejects.toThrow("execution deadline");
-      expect(f.requests.filter((r) => r.args.includes("--include"))).toEqual([]);
-      expect(f.state.delays).toEqual([1_000]);
-      expect(f.calls).toContain("cancel");
-    } else {
-      await f.run(signal(), h);
-      expect(f.state.delays).toEqual([]);
-    }
-    expect(h.githubActions?.deadline).toBe(start + 1_000);
-    expect(f.calls).not.toContain("dispatch");
+    f.state.runStatus = "in_progress";
+    const gh = f.deps.gh;
+    f.deps.gh = async (...args) => {
+      if (args[0][1]?.endsWith("/dispatches")) f.state.runStatus = "completed";
+      return (await gh(...args)) ?? "";
+    };
+    expect((await f.run(signal(), h)).checks[0]?.ok).toBe(true);
+    const fresh = f.saved.at(-1);
+    expect(fresh?.id).not.toBe(h.id);
+    expect(fresh?.githubActions?.nextPollAt).toBeUndefined();
+    expect(fresh?.githubActions?.deadline).toBeGreaterThan(start + 1_000);
+    expect(f.calls.filter((c) => c === "dispatch")).toHaveLength(1);
+    expect(f.calls).toContain("cancel");
     expect(f.remote.size).toBe(0);
   },
 );
+
+test("a completed and cleaned result replays while GitHub is unavailable", async () => {
+  const f = fixture();
+  const original = await f.run();
+  const h = structuredClone(f.saved.at(-1));
+  if (!h?.githubActions?.completed) throw new Error("Missing completed handle");
+  expect(h.githubActions.cleanupFailed).toBeUndefined();
+  expect(f.remote.size).toBe(0);
+  f.deps.gh = async () => {
+    throw new Error("GitHub unavailable after successful cleanup");
+  };
+  await expect(f.run(signal(), h)).resolves.toEqual(original);
+  expect(f.saved.at(-1)?.id).toBe(h.id);
+  expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
+});
