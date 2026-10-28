@@ -156,6 +156,9 @@ questions and approvals remain later slices.
 
 Keep one list item per planned slice under an exact `## Slices` heading. Once filed,
 reference its same-repository GitHub child with `#N`; unrelated issues do not count.
+Markdown links name children by their absolute HTTPS GitHub issue URL destination,
+including children in other repositories; link labels do not count as references.
+Relative links and non-issue destinations provide no reference.
 Mark the acceptance child with an item beginning `Acceptance:`:
 
 ```markdown

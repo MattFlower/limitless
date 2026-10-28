@@ -4,6 +4,7 @@ import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
+import { feedCommand } from "../src/cli/feed.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, FeedPage, RunStatus } from "../src/core/types.ts";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
@@ -3680,7 +3681,56 @@ test("bare slice references cannot name a foreign child or acceptance candidate"
   ).toBeNull();
 });
 
-test("queue-produced epic and existing feed items preserve HTTP acknowledgement cursors", async () => {
+test.each([
+  "Acceptance: [#3](https://github.com/other/repo/issues/3)",
+  "Build: [#3](https://github.com/other/repo/issues/3)",
+  "Acceptance: [Slice [#3]](https://github.com/other/repo/issues/3)",
+  "Acceptance: [#3]()",
+  "Acceptance: [#3](../issues/3)",
+  "Acceptance: [#3](#3)",
+  "Acceptance: [#3](https://example.com/#3)",
+  "Acceptance: [#3](https://github.com/owner/repo/pull/3)",
+  "Acceptance: [#3](http://github.com/owner/repo/issues/3)",
+  "Acceptance: [#3](https://github.com/owner/repo/issues/0)",
+  "Acceptance: [#3](https://github.com/owner/repo/issues/30)",
+  "Acceptance: [#3](https://github.com/owner/repo/issues/3/extra)",
+])("slice link labels cannot impersonate a child: %s", (text) => {
+  const { epic, open } = attentionEpic();
+  epic.body = `## Slices\n- ${text}`;
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({ state: "unfiled", items: [`- ${text}`] });
+});
+
+test.each([
+  ["[#99](https://github.com/owner/repo/issues/3)", "ready_for_acceptance"],
+  ['[#2](<https://github.com/OWNER/REPO/issues/3> "Slice #99")', "ready_for_acceptance"],
+  ["[#99](https://github.com/owner/repo/issues/3#issuecomment-1)", "ready_for_acceptance"],
+  ["[#99](https://example.com/#2) and #3", "ready_for_acceptance"],
+  ["#3 and [#2](https://example.com/#2)", "ready_for_acceptance"],
+  ["[#3](https://github.com/owner/repo/issues/2)", null],
+  ["[#99](https://github.com/owner/repo/issues/2) and #3", null],
+] as const)("slice destinations and independent plain text identify children: %s", (reference, state) => {
+  const { epic, open } = attentionEpic();
+  epic.body = `## Slices\n- Acceptance: ${reference}`;
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual(state ? { state, items: ["#3"] } : null);
+});
+
+test("slice destinations identify foreign children with the same number as local children", () => {
+  const { epic, open, closed } = attentionEpic();
+  open.repository.nameWithOwner = "other/repo";
+  open.number = closed.number;
+  const check = () =>
+    epicAttention("owner/repo", epic, ["owner"], new Map([["other/repo#2", open]]), () => false);
+  epic.body = "## Slices\n- Acceptance: [#99](https://github.com/OTHER/REPO/issues/2)";
+  expect(check()).toEqual({ state: "ready_for_acceptance", items: ["#2"] });
+  epic.body = "## Slices\n- Acceptance: [#99](https://github.com/owner/repo/issues/2)";
+  expect(check()).toBeNull();
+});
+
+test("queue-produced epic and existing feed items render in the CLI and preserve acknowledgement cursors", async () => {
   const h = harness();
   const { epic, open } = attentionEpic();
   epic.body += "\n- Later";
@@ -3694,11 +3744,24 @@ test("queue-produced epic and existing feed items preserve HTTP acknowledgement 
   const routes = createHttpRoutes(h.factory);
   const feed = (routes["/api/feed"] as { GET: Route }).GET;
   const ack = (routes["/api/feed/ack"] as { POST: Route }).POST;
-  const read = async () =>
-    (await (
-      await feed(requestWithParams("http://localhost:7400/api/feed?consumer=legacy"), localServer)
-    ).json()) as FeedPage;
-  const mixed = await read();
+  const lines: string[] = [];
+  const deps = {
+    api: async <T>(path: string, init?: RequestInit): Promise<T> => {
+      const handler = init?.method === "POST" ? ack : feed;
+      const response = await handler(
+        requestWithParams(`http://localhost:7400${path}`, {
+          ...init,
+          headers: { "content-type": "application/json" },
+        }),
+        localServer,
+      );
+      expect(response.status).toBe(200);
+      return (await response.json()) as T;
+    },
+    print: (line: string) => lines.push(line),
+  };
+  await feedCommand([], { consumer: "legacy", json: true }, deps);
+  const mixed: FeedPage = JSON.parse(lines.pop() ?? "");
   expect(mixed.items.map((i) => i.kind)).toEqual(["queue.epic_attention", "run.failed"]);
   expect(mixed.items[0]?.data).toEqual({
     repo: "owner/repo",
@@ -3708,17 +3771,17 @@ test("queue-produced epic and existing feed items preserve HTTP acknowledgement 
   });
   const cursor = mixed.nextAfter;
   expect(mixed.items[1]?.id).toBe(cursor);
-  const response = await ack(
-    requestWithParams("http://localhost:7400/api/feed/ack", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ consumer: "legacy", id: cursor }),
-    }),
-    localServer,
-  );
-  expect(response.status).toBe(200);
+  await feedCommand([], { consumer: "legacy" }, deps);
+  expect(lines.join("\n")).toContain(`#${mixed.items[0]?.id} queue.epic_attention`);
+  expect(lines.join("\n")).toContain(`#${cursor} run.failed`);
+  expect(lines.at(-1)).toBe(`next after: ${cursor}`);
+  expect(h.store.feedCursor("legacy")).toBe(0);
+  await feedCommand(["ack", String(cursor)], { consumer: "legacy" }, deps);
+  expect(lines.at(-1)).toBe(`legacy acknowledged through ${cursor}`);
+  expect(h.store.feedCursor("legacy")).toBe(cursor);
   h.store.updateRun(run.id, { status: "cancelled" });
-  const next = await read();
+  await feedCommand([], { consumer: "legacy", json: true }, deps);
+  const next: FeedPage = JSON.parse(lines.at(-1) ?? "");
   expect(next.items.map((i) => i.kind)).toEqual(["run.cancelled"]);
   expect(next.items[0]?.id).toBeGreaterThan(cursor);
 });

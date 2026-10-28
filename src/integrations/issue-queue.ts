@@ -110,10 +110,25 @@ export function epicAttention(
       if (slices && text !== undefined) lines.push({ line, text });
     }
   }
-  const refs = (text: string) =>
-    [...text.matchAll(/(?<![\w/])#([1-9][0-9]*)\b/g)]
-      .map((m) => issueKey(repo, Number(m[1])))
-      .filter((k) => childKeys.has(k));
+  const refs = (text: string) => {
+    const keys: string[] = [];
+    // Consume links before bare references: neither labels nor non-issue targets name children.
+    const plain = text.replace(
+      /\[(?:\\.|[^[\]\\]|\[[^\]]*\])*\]\(((?:\\.|[^()\\]|\([^()]*\))*)\)/g,
+      (_link, target: string) => {
+        const destination = target
+          .trim()
+          .match(/^(?:<([^<>]*)>|(\S+?))(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?$/);
+        const issue = (destination?.[1] ?? destination?.[2] ?? "").match(
+          /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/issues\/([1-9][0-9]*)\/?(?:[?#]\S*)?$/i,
+        );
+        if (issue?.[1] && issue[2]) keys.push(issueKey(issue[1], Number(issue[2])));
+        return " ";
+      },
+    );
+    keys.push(...[...plain.matchAll(/(?<![\w/])#([1-9][0-9]*)\b/g)].map((m) => issueKey(repo, Number(m[1]))));
+    return keys.filter((k) => childKeys.has(k));
+  };
   const unfiled = lines.filter((l) => !refs(l.text).length).map((l) => l.line);
   if (unfiled.length) return { state: "unfiled", items: unfiled };
   const open = children.nodes.filter((c) => c.state === "OPEN");
