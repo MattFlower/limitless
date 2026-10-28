@@ -106,7 +106,16 @@ export interface RunState {
   reviewMode?: "single" | "panel";
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
-  gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
+  gateExecution?: {
+    stage: StageName;
+    round: number;
+    purpose: string;
+    sha: string;
+    handle: ExecutionHandle;
+    gateKey?: string;
+    /** Earlier attempts replay caller progress without executing or counting them again. */
+    previous?: { purpose: string; gateKey: string; result: GateRun }[];
+  };
   /** the worker implement job of this round; cleared in the implementation-ready save */
   agentJob?: { round: number; id: string };
   baseline?: GateRun | null;

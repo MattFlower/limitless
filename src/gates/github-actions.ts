@@ -26,6 +26,7 @@ export interface ActionsProgress {
   /** Absolute deadlines survive restarts. Discovery uses the same bounded visibility window as cleanup. */
   visibilityDeadline?: number;
   deadline?: number;
+  nextPollAt?: number;
   completed?: GateRun;
   runId?: number;
   /** Cleanup is pending or failed; retain the identity until termination and branch deletion succeed. */
@@ -236,6 +237,10 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           const old = etags.get(path);
           for (;;) {
             alive();
+            if (p.nextPollAt && p.nextPollAt > deps.now()) {
+              await pause(p.nextPollAt - deps.now());
+              continue;
+            }
             try {
               const raw = await deps.gh(
                 [
@@ -261,15 +266,21 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
                 error instanceof CommandError
                   ? `${error.stdout}\n${error.stderr}\n${error.message}`
                   : String(error);
-              if (!/(?:HTTP[^\n]*?\b429\b|secondary rate limit)/i.test(message)) throw error;
               const retry = message.match(/retry-after:\s*([^\r\n;]+)/i)?.[1]?.trim();
-              const reset = message.match(/x-ratelimit-reset:\s*(\d+)/i)?.[1];
+              const reset = message.match(/x-ratelimit-reset:\s*(\d+)\s*(?:\r?\n|$)/i)?.[1];
+              const primary =
+                /HTTP[^\n]*?\b403\b/i.test(message) &&
+                /x-ratelimit-remaining:\s*0\s*(?:\r?\n|$)/i.test(message) &&
+                reset !== undefined &&
+                Number.isFinite(Number(reset) * 1_000);
+              if (!primary && !/(?:HTTP[^\n]*?\b429\b|secondary rate limit)/i.test(message)) throw error;
               const until = retry
                 ? /^\d+(?:\.\d+)?$/.test(retry)
                   ? deps.now() + Number(retry) * 1_000
                   : Date.parse(retry)
                 : Number(reset) * 1_000;
-              await pause(Number.isFinite(until) ? Math.max(1, until - deps.now()) : 1_000);
+              p.nextPollAt = Number.isFinite(until) ? Math.max(deps.now() + 1, until) : deps.now() + 1_000;
+              await checkpoint();
             }
           }
         };

@@ -110,13 +110,19 @@ export const gateShutdown = (signal: AbortSignal): boolean =>
 
 const liveExecutions = new WeakMap<GateExecutor, Map<string, Execution<GateRun>>>();
 
-/** Discard only work still owned by this process; never replay an old handle to cancel it. */
+/** Cancel live work or ask its owning executor to discard the durable identity. */
 export async function cancelGateExecution(handle: ExecutionHandle, executor?: GateExecutor): Promise<void> {
+  if (handle.kind !== "local" && executor?.kind !== handle.kind)
+    throw new Error(`Unavailable gate executor: ${handle.kind}; cleanup remains pending`);
   const execution = executor?.kind === handle.kind ? liveExecutions.get(executor)?.get(handle.id) : undefined;
   if (execution) {
     await execution.cancel();
     await execution.result.catch(() => {});
-  } else if (executor?.kind === handle.kind) await executor.discard?.(handle);
+  } else if (executor?.kind === handle.kind) {
+    if (!executor.discard && handle.kind === "github-actions")
+      throw new Error(`Unavailable gate executor cleanup: ${handle.kind}`);
+    await executor.discard?.(handle);
+  }
 }
 
 export function gateExecutorFor(

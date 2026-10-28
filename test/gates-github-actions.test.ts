@@ -12,12 +12,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
-import { type ExecutionHandle, executeGate, type GateRequest } from "../src/gates/executor.ts";
+import { type ExecutionHandle, executeGate, type GateRequest, localExecutor } from "../src/gates/executor.ts";
 import { type ActionsProgress, githubActionsExecutor } from "../src/gates/github-actions.ts";
-import { compareGates } from "../src/gates/run.ts";
+import { compareGates, retryBaselineFailures, retryRegressions, validateRetry } from "../src/gates/run.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { type EngineDeps, RunContext, type RunState } from "../src/pipeline/context.ts";
-import { runGateExecution } from "../src/pipeline/gate-execution.ts";
+import {
+  consumeGateExecution,
+  resumeGateExecution,
+  runGateExecution,
+} from "../src/pipeline/gate-execution.ts";
 import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
 
@@ -1165,18 +1169,29 @@ test("rate limits exhaust the original execution deadline across shutdown and re
   expect(f.remote.size).toBe(0);
 });
 
-test("ordinary authorization errors do not retry polls", async () => {
-  const f = fixture();
-  f.state.runStatus = "in_progress";
-  const gh = f.deps.gh;
-  f.deps.gh = async (...args) => {
-    if (args[0].includes("--include")) throw new Error("HTTP 403: Resource not accessible");
-    return (await gh(...args)) ?? "";
-  };
-  await expect(f.run()).rejects.toThrow("Resource not accessible");
-  expect(f.state.delays).toEqual([]);
-  expect(f.calls).toContain("cancel");
-});
+test.each(["no quota headers", "remaining quota", "invalid reset"])(
+  "ordinary authorization errors with %s do not retry polls",
+  async (kind) => {
+    const f = fixture();
+    f.state.runStatus = "in_progress";
+    const gh = f.deps.gh;
+    f.deps.gh = async (...args) => {
+      if (args[0].includes("--include")) {
+        const headers =
+          kind === "remaining quota"
+            ? `X-RateLimit-Remaining: 1\r\nX-RateLimit-Reset: ${(f.deps.now() + 60_000) / 1_000}`
+            : kind === "invalid reset"
+              ? "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: invalid"
+              : "";
+        return `HTTP/2.0 403 Forbidden\r\n${headers}\r\n\r\nResource not accessible`;
+      }
+      return (await gh(...args)) ?? "";
+    };
+    await expect(f.run()).rejects.toThrow("Resource not accessible");
+    expect(f.state.delays).toEqual([]);
+    expect(f.calls).toContain("cancel");
+  },
+);
 
 test.each(["shutdown", "cancel"])("%s interrupts a pending rate-limit wait", async (reason) => {
   const f = fixture();
@@ -1199,3 +1214,258 @@ test.each(["shutdown", "cancel"])("%s interrupts a pending rate-limit wait", asy
   expect(f.calls.includes("cancel")).toBe(reason !== "shutdown");
   expect(f.remote.size).toBe(reason === "shutdown" ? 2 : 0);
 });
+
+test.each(["absent", "wrong kind"])(
+  "mismatched handle retains cleanup identity with %s owner",
+  async (owner) => {
+    const f = fixture();
+    const { ctx, store } = await context(f);
+    try {
+      const h = await f.stored({ dispatchSent: true, runId: 17 });
+      ctx.state.gateExecution = { handle: h, sha: "old", stage: "gates", round: 0, purpose: "initial" };
+      await ctx.save();
+      const unavailable = new RunContext(
+        { ...ctx.deps, gateExecutor: owner === "absent" ? undefined : localExecutor() },
+        ctx.run,
+        ctx.repo,
+        signal(),
+      );
+      await expect(runGateExecution(unavailable, "gates", "initial", cwd, req.gates)).rejects.toThrow(
+        "Unavailable gate executor: github-actions",
+      );
+      expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution).toEqual(ctx.state.gateExecution);
+      expect([...f.remote.keys()]).toEqual([
+        h.githubActions?.dispatch ?? "",
+        h.githubActions?.candidate ?? "",
+      ]);
+      expect(f.calls).toEqual([]);
+      f.state.runStatus = "in_progress";
+      const gh = f.deps.gh;
+      f.deps.gh = async (...args) => {
+        const raw = await gh(...args);
+        if (args[0][1]?.endsWith("/runs/17") && f.state.runStatus === "completed")
+          f.calls.push("termination-confirmed");
+        return raw ?? "";
+      };
+      await runGateExecution(
+        new RunContext(ctx.deps, ctx.run, ctx.repo, signal()),
+        "gates",
+        "initial",
+        cwd,
+        req.gates,
+      );
+      const deletion = f.calls.findIndex((call) => call.startsWith("delete:"));
+      expect(f.calls.indexOf("cancel")).toBeLessThan(f.calls.indexOf("termination-confirmed"));
+      expect(f.calls.indexOf("termination-confirmed")).toBeLessThan(deletion);
+      expect(deletion).toBeLessThan(f.calls.indexOf("dispatch"));
+      expect(f.remote.size).toBe(0);
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.each([
+  "timeout",
+  "regression-retry",
+  "baseline-retry",
+  "regression-retry-targeted",
+  "baseline-retry-targeted",
+])("%s completion replays caller progress and retains retry evidence across restart", async (purpose) => {
+  const f = fixture();
+  const { ctx, store } = await context(f);
+  const stage = purpose.startsWith("baseline") ? "prepare" : "gates";
+  const initialPurpose = stage === "prepare" ? "baseline" : "initial";
+  try {
+    const targeted = purpose.endsWith("targeted");
+    if (targeted) req.gates.retryFiles = "bun test {files}";
+    if (targeted) {
+      mkdirSync(join(cwd, "test"));
+      writeFileSync(join(cwd, "test/example.test.ts"), "");
+    }
+    f.state.logs.set(1, log(framed(), `original failure\n${framed(0, 1, 123, purpose === "timeout")}`));
+    const first = await runGateExecution(ctx, stage, initialPurpose, cwd, req.gates);
+    // Actions does not collect failedFiles yet; model a checkpoint that can select a targeted retry.
+    if (targeted) {
+      const original = ctx.state.gateExecution?.handle.githubActions?.completed?.checks[0];
+      if (!original) throw new Error("Missing initial result");
+      original.failedFiles = ["test/example.test.ts"];
+      await ctx.save();
+    }
+    const caller = async (active: RunContext) => {
+      await resumeGateExecution(active, stage, initialPurpose, cwd);
+      const original = await runGateExecution(active, stage, initialPurpose, cwd, req.gates);
+      if (purpose === "timeout") {
+        const retried = await runGateExecution(active, stage, purpose, cwd, req.gates);
+        const a = original.checks[0];
+        const b = retried.checks[0];
+        if (!a || !b) throw new Error("Missing retry checks");
+        return compareGates(null, {
+          ...retried,
+          checks: [{ ...validateRetry(b, a, req.headSha, retried), firstAttempt: a }],
+        });
+      }
+      const runner = (gates: typeof req.gates, options?: { targeted: boolean }) =>
+        runGateExecution(
+          active,
+          stage,
+          options?.targeted
+            ? `${purpose.replace(/-targeted$/, "")}-targeted`
+            : purpose.replace(/-targeted$/, ""),
+          cwd,
+          gates,
+        );
+      return stage === "prepare"
+        ? compareGates(
+            null,
+            await retryBaselineFailures(original, cwd, req.gates, signal(), undefined, runner, true),
+          )
+        : retryRegressions(
+            compareGates({ ...original, checks: original.checks.map((r) => ({ ...r, ok: true })) }, original),
+            cwd,
+            req.gates,
+            [],
+            signal(),
+            undefined,
+            runner,
+            true,
+          );
+    };
+    // Fail targeted retries, so there is no full-suite attempt after this checkpoint.
+    f.state.logs.set(1, log(framed(), targeted ? framed(0, 2) : framed()));
+    const result = await caller(ctx);
+    const durable = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
+    expect(durable?.purpose).toBe(purpose);
+    expect(durable?.handle.githubActions?.completed).toBeDefined();
+    expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(2);
+    const restarted = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
+    expect(await caller(restarted)).toEqual(result);
+    expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(2);
+    expect(restarted.state.gateTimeoutReruns ?? 0).toBe(purpose === "timeout" ? 1 : 0);
+    expect(result[0]?.result.firstAttempt).toMatchObject({ output: first.checks[0]?.output });
+    expect(result[0]?.blocking).toBe(true);
+    if (stage === "gates" && purpose !== "timeout")
+      expect(result[0]?.retryOriginal).toEqual({ verdict: "regressed", blocking: true });
+    restarted.state.lastGates = result;
+    consumeGateExecution(restarted);
+    await restarted.save("retry-consumed");
+    expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution).toBeUndefined();
+    expect(store.getRunState<RunState>(ctx.run.id)?.lastGates).toEqual(result);
+  } finally {
+    store.close();
+  }
+});
+
+test.each(["run response", "jobs response", "run CommandError", "jobs CommandError"])(
+  "primary quota exhaustion waits until reset for %s",
+  async (variant) => {
+    const f = fixture();
+    const gh = f.deps.gh;
+    const start = f.deps.now();
+    let limited = false;
+    f.deps.gh = async (...args) => {
+      if (args[0].includes("--include") && (!variant.startsWith("jobs") || args[0][1]?.includes("/jobs?"))) {
+        if (!limited) {
+          limited = true;
+          const raw = `HTTP/2.0 403 Forbidden\r\nx-RaTeLiMiT-ReMaInInG: 0\r\nX-rAtElImIt-ReSeT: ${(start + 60_000) / 1_000}\r\n\r\n`;
+          if (variant.endsWith("CommandError"))
+            throw new CommandError("gh api failed", 1, raw, "API rate limit exceeded", false);
+          return `${raw}{"message":"API rate limit exceeded"}`;
+        }
+        expect(f.deps.now()).toBeGreaterThanOrEqual(start + 60_000);
+      }
+      return (await gh(...args)) ?? "";
+    };
+    await expect(f.run()).resolves.toMatchObject({ setupOk: true });
+    expect(f.state.delays).toEqual([60_000]);
+    expect(f.calls).not.toContain("cancel");
+  },
+);
+
+test.each(["run Retry-After", "jobs reset"])(
+  "shutdown checkpoints %s cooldown and both poll paths honour it on restart",
+  async (variant) => {
+    const f = fixture();
+    const { ctx, store } = await context(f);
+    try {
+      const controller = new AbortController();
+      const start = f.deps.now();
+      const gh = f.deps.gh;
+      let limited = false;
+      const times: number[] = [];
+      f.deps.gh = async (...args) => {
+        if (args[0].includes("--include")) {
+          times.push(f.deps.now());
+          if (!limited && (!variant.startsWith("jobs") || args[0][1]?.includes("/jobs?"))) {
+            limited = true;
+            return variant.startsWith("jobs")
+              ? `HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: ${(start + 60_000) / 1_000}\r\n\r\n{}`
+              : "HTTP/2.0 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n{}";
+          }
+        }
+        return (await gh(...args)) ?? "";
+      };
+      const sleep = f.deps.sleep;
+      const sleeping = Promise.withResolvers<void>();
+      f.deps.sleep = async () => {
+        sleeping.resolve();
+        await new Promise<void>(() => {});
+      };
+      const active = new RunContext(ctx.deps, ctx.run, ctx.repo, controller.signal);
+      const running = runGateExecution(active, "gates", "initial", cwd, req.gates);
+      await sleeping.promise;
+      const durable = store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.githubActions;
+      expect(durable?.nextPollAt).toBe(start + 60_000);
+      const deadline = durable?.deadline;
+      controller.abort(new Error("shutdown"));
+      await expect(running).rejects.toThrow("shutdown");
+      expect(f.remote.size).toBe(2);
+      expect(f.calls).not.toContain("cancel");
+      times.length = 0;
+      f.deps.sleep = sleep;
+      await f.deps.sleep(20_000);
+      await runGateExecution(
+        new RunContext(ctx.deps, ctx.run, ctx.repo, signal()),
+        "gates",
+        "initial",
+        cwd,
+        req.gates,
+      );
+      expect(times).toEqual([start + 60_000, start + 60_000]);
+      expect(f.state.delays).toEqual([20_000, 40_000]);
+      expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
+      expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.githubActions?.deadline).toBe(
+        deadline,
+      );
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.each(["elapsed", "legacy", "past deadline"])(
+  "resumed %s cooldown obeys the original deadline",
+  async (kind) => {
+    const f = fixture();
+    const start = f.deps.now();
+    const h = await f.stored({
+      dispatchSent: true,
+      runId: 17,
+      deadline: start + 1_000,
+      nextPollAt: kind === "legacy" ? undefined : kind === "elapsed" ? start - 1 : start + 60_000,
+    });
+    if (kind === "past deadline") {
+      f.state.runStatus = "in_progress";
+      await expect(f.run(signal(), h)).rejects.toThrow("execution deadline");
+      expect(f.requests.filter((r) => r.args.includes("--include"))).toEqual([]);
+      expect(f.state.delays).toEqual([1_000]);
+      expect(f.calls).toContain("cancel");
+    } else {
+      await f.run(signal(), h);
+      expect(f.state.delays).toEqual([]);
+    }
+    expect(h.githubActions?.deadline).toBe(start + 1_000);
+    expect(f.calls).not.toContain("dispatch");
+    expect(f.remote.size).toBe(0);
+  },
+);
