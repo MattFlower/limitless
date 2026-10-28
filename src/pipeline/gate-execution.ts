@@ -1,7 +1,13 @@
 import type { StageName } from "../core/types.ts";
 import { WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
-import { cancelGateExecution, executeGate, type GateRequest, gateShutdown } from "../gates/executor.ts";
+import {
+  cancelGateExecution,
+  type ExecutionHandle,
+  executeGate,
+  type GateRequest,
+  gateShutdown,
+} from "../gates/executor.ts";
 import { lanExecutor } from "../gates/lan.ts";
 import type { GateHooks, GateRun } from "../gates/run.ts";
 import { gateEnv } from "../gates/run.ts";
@@ -50,7 +56,7 @@ export async function resumeGateExecution(
     pending?.stage === stage &&
     pending.round === round &&
     pending.purpose === purpose &&
-    ["baseline", "initial", "rebase"].includes(purpose) &&
+    (["baseline", "initial", "rebase"].includes(purpose) || purpose.startsWith("covering-test:")) &&
     (pending.handle.kind !== "inplace" || executor?.canResume?.(pending.handle, env, ctx.deps.cfg.port)) &&
     pending.sha === sha
       ? pending.handle
@@ -81,6 +87,7 @@ export async function runGateExecution(
   gates: GateConfig,
   hooks: GateHooks = {},
   env = gateEnv(),
+  onExecuted?: (handle: ExecutionHandle, result: GateRun) => void,
 ): Promise<GateRun> {
   ctx.checkCancelled();
   const sha = await headSha(cwd);
@@ -121,6 +128,8 @@ export async function runGateExecution(
       },
     );
     ctx.checkCancelled();
+    const handle = stored ?? ctx.state.gateExecution?.handle;
+    if (handle) onExecuted?.(handle, result);
     return result;
   } finally {
     // A termination before attach leaves the durable identity available for resume.

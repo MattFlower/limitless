@@ -200,6 +200,14 @@ The deterministic audit (`src/gates/audit.ts`) runs on every factory change.
   `--allow <category>` on the run. Allowances never bypass protected paths or a failed binary
   inspection. If your change really needs one, say so in your report instead of working around the
   rule.
+- CI configuration changes (`.github/workflows/**`, root `.gitlab-ci.yml`, `.circleci/**`) block
+  unless the requester grants `Allow: workflows` on its own line or `--allow workflows` (API: `allow`).
+  An older daemon rejects `--allow workflows` from a newer CLI. Ungranted factory edits are never
+  pushed, including needs-human drafts and follow-up rounds. Verify-change keeps the author's
+  already-pushed edits advisory; factory repairs require the allowance, even in the same file.
+  Manual `scripts/land-pr.sh` checks its pinned push commit against the PR base and requires the
+  operator's explicit `--allow workflows` argument; PR text cannot grant it. For example:
+  `scripts/land-pr.sh 123 "Update CI" ./merge-worktree --allow workflows`.
 - The executable bit and mode changes count too: an executable or mode-changed file needs
   `Allow: binary` unless its content is reviewable text (strict UTF-8, no DEL and no control bytes
   besides tab, newline, form feed and carriage return), and an executable or mode-changed image always

@@ -335,6 +335,9 @@ test("CLI --allow is repeatable, validated, and sent as the allow option", async
   const binary = await cli("--allow", "binary");
   expect(binary.exit).toBe(0);
   expect(binary.request.allow).toEqual(["binary"]);
+  const workflows = await cli("--allow", "workflows");
+  expect(workflows.exit).toBe(0);
+  expect(workflows.request.allow).toEqual(["workflows"]);
   expect((await cli()).request.allow).toBeUndefined();
   const invalid = await cli("--allow", "everything");
   expect(invalid.exit).not.toBe(0);

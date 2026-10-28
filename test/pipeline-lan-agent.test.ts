@@ -250,6 +250,7 @@ test("real worker rounds publish, adopt, relay events and deliver over an advanc
       f.workers.approve(text.split(": ")[1] ?? ""),
     );
     task = runWorker(listener.url.origin, remote, release, controller.signal, {
+      platform: "darwin",
       confinement: fakeConfinement,
       heartbeatMs: 10,
       capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
@@ -967,6 +968,7 @@ test.each(["request", "retry wait"])(
         f.workers.approve(text.split(": ")[1] ?? ""),
       );
       task = runWorker(listener.url.origin, remote, release, controller.signal, {
+        platform: "darwin",
         confinement: fakeConfinement,
         heartbeatMs: 10,
         capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
@@ -1050,6 +1052,7 @@ test.each(["running", "pushed", "fenced", "job-cancelled"])(
         f.workers.approve(text.split(": ")[1] ?? ""),
       );
       task = runWorker(origin, remote, release, controller.signal, {
+        platform: "darwin",
         confinement: fakeConfinement,
         heartbeatMs: 10,
         capabilityRunner: async () => ({ exitCode: 0, stdout: "logged in" }),
@@ -1354,6 +1357,7 @@ async function reviewWorker(f: Factory, handler: (s: AgentSpec) => Promise<FakeR
     f.workers.approve(text.split(": ")[1] ?? ""),
   );
   const task = runWorker(listener.url.origin, remote, release, controller.signal, {
+    platform: "darwin",
     confinement: fakeConfinement,
     heartbeatMs: 10,
     retryMs: 5,
@@ -1816,6 +1820,7 @@ test.each(workerStartupFailures)(
         f.workers.approve(text.split(": ")[1] ?? ""),
       );
       task = runWorker(listener.url.origin, remote, release, controller.signal, {
+        platform: "darwin",
         confinement: fakeConfinement,
         heartbeatMs: 10,
         retryMs: 5,

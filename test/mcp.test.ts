@@ -506,6 +506,8 @@ test("model-written MCP prompts cannot opt in through Allow lines", async () => 
   expect(f.factory.store.getRun(run.id)?.allow).toEqual(["gitattributes"]);
   expect((await create({ prompt: "Allow: binary" })).allow).toEqual([]);
   expect((await create({ prompt: "binary fixture", allow: ["binary"] })).allow).toEqual(["binary"]);
+  expect((await create({ prompt: "Allow: workflows" })).allow).toEqual([]);
+  expect((await create({ prompt: "workflow fixture", allow: ["workflows"] })).allow).toEqual(["workflows"]);
   expect((await call("create_run", { repo: f.repo, prompt, allow: ["anything"] })).isError).toBe(true);
 });
 

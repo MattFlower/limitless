@@ -347,6 +347,12 @@ export const VerifySchema = z.object({
     z.object({
       id: z.string(),
       status: z.enum(["met", "unmet", "unclear", "blocked"]),
+      covering_tests: z
+        .array(z.object({ file: z.string(), name: z.string() }))
+        .default([])
+        .describe(
+          "Only for sandbox-blocked criteria: up to 3 tracked test files and exact titles for the factory to run",
+        ),
       // A default, not optional: OpenAI strict mode requires every property, and an optional one made
       // every Codex verifier request fail with a 400.
       blockedReason: z

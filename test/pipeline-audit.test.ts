@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { describe, expect, spyOn, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { CreateRunRequest } from "../src/core/types.ts";
+import * as repos from "../src/git/repos.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { mapGitHubEvent } from "../src/integrations/github.ts";
 import type { RunState } from "../src/pipeline/context.ts";
@@ -14,7 +15,7 @@ import { findingEvidence } from "./review-support.ts";
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start } = pipelineSetup({
+const { start, githubFixture, registerGithub } = pipelineSetup({
   get home() {
     return home;
   },
@@ -36,6 +37,62 @@ const { start } = pipelineSetup({
 });
 
 describe("audit allowances (fake agents, real git)", () => {
+  test.each([
+    { local: false, allowed: false },
+    { local: false, allowed: true },
+    { local: true, allowed: false },
+  ])("workflow build delivery requires a grant: $allowed (local: $local)", async ({ local, allowed }) => {
+    const bare = local ? repoDir : await githubFixture();
+    const refs = () => sh(["git", "show-ref"], { cwd: bare }).then((r) => r.stdout);
+    const before = await refs();
+    let implementations = 0;
+    const f = start((s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      implementations++;
+      return { files: { ".github/workflows/added.yml": "on: push\njobs: {}\n" } };
+    });
+    if (!local) registerGithub(f, bare);
+    f.cfg.maxRounds = 1;
+    const push = spyOn(repos, "pushBranch");
+    const existing = spyOn(repos, "pushExistingBranch");
+    try {
+      const run = await f.createRun({
+        repo: local ? repoDir : "test/repo",
+        prompt: "Update CI",
+        profile: "quick",
+        ...(allowed ? { allow: ["workflows"] } : {}),
+      });
+      expect(await waitFor(f, run.id, ["succeeded", "needs_human", "failed"])).toBe(
+        allowed ? "succeeded" : "needs_human",
+      );
+      expect(f.store.getRun(run.id)?.allow ?? []).toEqual(allowed ? ["workflows"] : []);
+      if (allowed) {
+        expect(push).toHaveBeenCalledTimes(1);
+        const result = f.store.getRun(run.id);
+        expect(
+          (await sh(["git", "rev-parse", `refs/heads/${result?.branch}`], { cwd: bare })).stdout.trim(),
+        ).toBe(result?.headSha ?? "missing");
+      } else {
+        expect(implementations).toBe(f.cfg.maxRounds + 2);
+        expect(push).not.toHaveBeenCalled();
+        expect(existing).not.toHaveBeenCalled();
+        expect(await refs()).toBe(before);
+        expect(f.store.getRun(run.id)?.prUrl).toBeNull();
+        expect(existsSync(join(home, "gh-calls"))).toBe(false);
+        const audit = f.store
+          .listEvents(run.id)
+          .find((e) => e.type === "audit" && e.level === "error" && e.message.includes("[ci-config]"));
+        expect(audit?.message).toContain(".github/workflows/added.yml");
+        expect(audit?.message).toContain("If this is intended, add `Allow: workflows` to the request.");
+        expect(f.store.getRun(run.id)?.error).toContain("Allow: workflows");
+      }
+    } finally {
+      push.mockRestore();
+      existing.mockRestore();
+    }
+  });
+
   test.each(["approve", "gate", "review", "verify"])(
     "scratch warnings stay advisory and survive %s feedback",
     async (cause) => {

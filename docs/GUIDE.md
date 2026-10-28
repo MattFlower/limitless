@@ -72,11 +72,19 @@ Each stage and what it guarantees:
 | holdout | no | yes | yes | A model, preferably from a different vendor than the spec author, writes concrete acceptance scenarios from the prompt and spec. It can read and search a private, read-only snapshot of the base commit (never the implementer's worktree, home or temporary directories), so its steps use real commands and config. The implementer never sees these scenarios. |
 | implement | yes | yes | yes | An agent edits the worktree and each round is committed. Routing depends on task complexity. |
 | gates | yes | yes | yes | The factory reruns every check. A check that passed on the base branch and now fails, or a new check that fails, blocks. Pre-existing failures do not. A failed setup step always blocks. |
-| audit | yes | yes | yes | Deterministic checks on the diff. These block: an empty diff, edits to existing protected paths, new `skip`/`only` markers, tests moved out of test paths, secrets, changed gate scripts, nested repositories (gitlinks) and attribute changes that hide text diffs (`-diff`, `binary`, `filter`, custom `diff` drivers, `linguist-generated`). To allow the last two, put `Allow: submodules` or `Allow: gitattributes` on a line of its own in the request, or pass `limitless run --allow submodules|gitattributes` (API: `allow`); quoted GitHub content never counts. Deleted tests, config or CI edits, lockfile edits, suppressions, removed assertions and `--no-verify` produce warnings. |
+| audit | yes | yes | yes | Deterministic checks on the diff. These block: an empty diff, edits to existing protected paths, new `skip`/`only` markers, tests moved out of test paths, secrets, changed gate scripts, CI configuration changes, binary content, nested repositories (gitlinks) and attribute changes that hide text diffs (`-diff`, `binary`, `filter`, custom `diff` drivers, `linguist-generated`). Allowances are `submodules`, `gitattributes`, `binary` and `workflows`: put `Allow: <kind>` on a line of its own in the request, or pass `limitless run --allow <kind>` (repeatable; API: `allow: ["workflows"]`). An older daemon rejects `--allow workflows` submitted by a newer CLI. Quoted GitHub content never grants an allowance. Deleted tests, test/lint config edits, lockfile edits, suppressions, removed assertions and `--no-verify` produce warnings. |
 | review | yes | yes | yes (frontier cell) | A reviewer from a different vendor than the implementer applies a rubric. It falls back to the same vendor, with a logged warning, only when nothing else is available. In the first review, blocker and major findings block. In later rounds, only regressions, unaddressed earlier blocking findings, and new blockers or security issues block. Everything else becomes a follow-up. |
 | preview | no | if configured | if configured | For UI changes, builds, seeds and serves the app on loopback before verify (see `[preview]` in the [README](../README.md#configuration)). |
 | verify | no | yes | yes | A separate, private session checks every acceptance criterion and holdout scenario by running things. It prefers a different vendor than the implementer. The result is a pass only when every criterion is `met`. |
 | deliver | yes | yes | yes | Commit, rebase onto the latest base and rerun the checks, push, and open a PR with an evidence report. The PR is then merged or left open according to the merge policy. |
+
+CI configuration covers `.github/workflows/**`, root `.gitlab-ci.yml` and `.circleci/**`, including deletions and rename endpoints. Ungranted factory edits are refused before any delivery push, including needs-human drafts and review or CI-fix updates. In verify-change runs, the PR author's already-pushed CI edits remain warnings; factory repairs are checked against the original PR head and require `workflows`, even when repairing the same file.
+
+For manual landing, `scripts/land-pr.sh <pr-number> "<squash subject>" [worktree-dir] [--allow workflows]`
+checks the exact commit it pushes against the PR base, including local commits newer than the PR head.
+Only the operator's explicit `--allow workflows` argument grants permission; PR text never grants it.
+For example: `scripts/land-pr.sh 123 "Update CI" ./merge-worktree --allow workflows`.
+The option bypasses only the workflow guard; privacy, clean-worktree and landing checks still apply.
 
 A few more details:
 
@@ -84,7 +92,7 @@ A few more details:
   a new implement round. After two failing rounds on one model, the implementer escalates to a
   stronger tier (or to any model not yet tried). The total number of rounds is
   `[limits].max_rounds + 2`, which is 5 by default. When the rounds run out, the run ends as
-  `needs_human` and opens a draft PR titled `[needs human] ...`.
+  `needs_human` and opens a draft PR titled `[needs human] ...` when publication checks permit it.
 - **Profiles today.** `quick` skips spec, holdout and verify. `deep` differs from `standard` in
   routing review to the `large` policy cell, which puts frontier models first, and in panel review
   mode it adds the repository's review lenses (see [Review configuration](#review-configuration-and-lenses)).
@@ -135,7 +143,7 @@ smoke results. It asks before registering MCP with Claude Code or Codex; `--yes`
 Without a terminal, questions use defaults and MCP changes are declined unless `--yes` is set.
 Init also fills a missing `[owners] github` using `gh api user`; interactively, you can override
 the discovered login. Without a usable login or supplied owner, it reports that Dependabot runs,
-issue-label triggers and `/limitless` comment triggers remain disabled. Re-running keeps existing
+issue-label triggers and webhook-only `/limitless` comment triggers remain disabled. Re-running keeps existing
 settings and fills gaps. Existing TOML comments and unrelated settings are preserved, and changes
 create a timestamped backup. Converting to `[[providers]]` requires
 consent because the previous release cannot read it. If service startup, smoke checks, or MCP
@@ -182,7 +190,7 @@ persistently inside confined sessions. Older workers retain that same behavior.
 
 **Before upgrading:** installations relying on the former hardcoded GitHub owner must explicitly
 set `github = "<owner>"` under `[owners]` in `config.toml` before upgrading, or their Dependabot
-runs, issue-label triggers and `/limitless` comment triggers stop. Ordinary config loading never
+runs, issue-label triggers and webhook-only `/limitless` comment triggers stop. Ordinary config loading never
 discovers an owner.
 
 **`config.toml`** keys (all optional; defaults shown):
@@ -207,7 +215,7 @@ discovers an owner.
 | `[reserves] codex_five_hour` | `0.90` | Codex 5-hour window |
 | `[reserves] codex_weekly` | `0.90` | Codex weekly (`seven_day`) window |
 | `[reserves.windows.<provider>] <window>` | `1.0` | Reserve for any other provider or quota window, for example `[reserves.windows.my_provider] daily = 0.80` |
-| `[owners] github` | unset | The **only** GitHub login allowed to trigger runs by webhook. Set this to your own login (e.g. `"<owner>"`); Dependabot runs, issue-label triggers and `/limitless` comment triggers are disabled until set. `limitless doctor` warns when unset. |
+| `[owners] github` | unset | The **only** GitHub login allowed to trigger runs by webhook. Set this to your own login (e.g. `"<owner>"`); Dependabot runs, issue-label triggers and webhook-only `/limitless` comment triggers are disabled until set. `limitless doctor` warns when unset. |
 | `[owners] discord` | unset | The only Discord user ID allowed to use the bot |
 | `[discord] channel_id` | unset | Text channel for run threads and quota alerts |
 | `[discord] notify_all` | `false` | Also announce runs from other sources when they finish |
@@ -276,6 +284,10 @@ after ten minutes. The coordinator creates and reuses a self-signed certificate 
 Changing the coordinator's certificate requires pairing again. Keep both machines on the same
 release SHA and Bun version; mismatches show as `needs update`. Upgrade the coordinator before
 its workers: older coordinators reject the new `failureAttributionComplete` worker result metadata.
+A Linux worker pairs and starts the same way and runs gate jobs only, under bubblewrap and Landlock
+([OPERATIONS](OPERATIONS.md#linux-confinement)). It refuses to start unless that confinement passes
+its preflight, and the coordinator never leases it agent jobs. Coordinators from before Linux
+workers reject its heartbeats, so upgrade the coordinator first.
 Workers send heartbeats every ten seconds and show as offline after thirty seconds without a
 heartbeat. Opted-in gates run from git bundles at the requested commit, without GitHub credentials
 on the worker. Leases renew with
@@ -455,7 +467,7 @@ Git LFS objects are not copied into the factory clone.
 | CLI | `limitless run "<prompt>" --repo <repo> [--profile auto\|quick\|standard\|deep] [--title <t>] [-f]` (prompt can come from stdin) | anyone with loopback access to the daemon |
 | UI | **New run** (`/new`): repo, prompt, optional title, profile. **Chat** (`/chat`): describe the work; the concierge proposes a run and you confirm or edit it. | same |
 | Discord | `/build repo:<repo> prompt:<text> [profile:...]`, `/runs [status]`, `/show id:`, `/cancel id:`; or mention the bot to chat | `[owners].discord` only |
-| GitHub | Label an issue `limitless`; comment `/limitless <request>`; Dependabot PRs | `[owners].github` (and `dependabot[bot]`) |
+| GitHub | Label an issue `limitless`; comment `/limitless <request>`; Dependabot PRs | Webhooks: `[owners].github` (and `dependabot[bot]`); [polled comments](ISSUES.md): `[github.queue].trusted` |
 | MCP | `limitless_create_run` and related tools from Claude Code or Codex | local agents |
 
 Use `limitless run "<prompt>" --repo <owner>/<repo> --after <run-id>` to wait for a
@@ -555,27 +567,59 @@ repository the installation does not cover. Tokens stay in memory and are withhe
 and gates. These settings require a daemon restart when changed. Older releases ignore these
 keys because the `[github]` table isn't checked for unknown keys.
 
-Create a repository webhook pointing at `https://<your-host>/webhooks/github`. Use content type
+For issue-label and Dependabot triggers, PR comment commands in any repository, or issue
+comment commands outside queue repositories, create a repository webhook pointing at
+`https://<your-host>/webhooks/github`. Use content type
 `application/json` and the `GITHUB_WEBHOOK_SECRET`, and select the **Issues**, **Issue comments**
 and **Pull requests** events. See [the webhook tunnel](#webhook-tunnel) for exposing the endpoint.
 Deliveries are HMAC-verified and deduplicated by delivery ID. Through the tunnel, the source IP
 must also be in GitHub's published hook ranges.
 
-Dependabot runs, issue-label triggers and `/limitless` comment triggers are disabled unless
-`[owners] github` is configured.
+Dependabot runs, issue-label triggers and webhook-only `/limitless` comment triggers are disabled
+unless `[owners] github` is configured. [Issue queue](ISSUES.md) repositories also accept trusted
+human authors' unedited issue comment commands by polling, without webhooks; logins ending in
+`[bot]` are excluded case-insensitively. Before its first issue query, the queue saves the valid
+`Date` header from `gh api --include rate_limit` as its fixed boundary and does no further work
+for that repository in that poll. This also initializes empty repositories; missing or invalid
+headers and failed requests retry on a later poll. The poll reads the last 20 comments every
+180 s by default, admits only commands strictly after the boundary, and records each command
+transactionally exactly once. A webhook for a queue issue comment only hints a poll, coalesced
+with any in-flight poll and at least 30 seconds after the previous tick started. Hints honor
+rate-limit reset deadlines and cannot shorten the regular retry delay after API failures.
+PR comments keep their direct owner-authorized webhook behavior in every repository.
 
 - **Issue label:** adding the `limitless` label creates a run. Both the person labelling and the
   issue author must be `[owners].github`, and the repository must belong to that account. The
   issue text is passed to the model as quoted, untrusted data. The resulting PR says
   `Closes #<n>`.
 - **Comment command:** an owner comment starting with `/limitless ` followed by a request runs that
-  request in the context of the issue.
+  request in the context of the issue or PR. Queue issue comments use `[github.queue].trusted`
+  and also accept `@<slug>` or `@<slug>[bot]` commands when served by a GitHub App identity. If identity
+  lookup fails, mention commands wait for a later poll while human slash commands still work.
 - **Dependabot:** `opened`, `reopened` and `synchronize` events on Dependabot PRs from the same
   repository start a `quick` verification run on the Dependabot branch. Fixes are pushed to that
   branch only if its head has not moved. The factory never merges these PRs. If the run does not
   succeed, nothing is pushed. Routing is free-first unless `[routing] dependabot = "policy"`.
 - The factory comments on the issue or PR when a run is created and when it finishes (status, PR,
   cost).
+
+For [issue queue and lifecycle](ISSUES.md) claims, labels and comments, link an issue from a
+CLI, UI or other non-GitHub request with a directive on a line of its own:
+
+```text
+Closes #123
+```
+
+`Closes` is case-insensitive; horizontal whitespace (including Unicode no-break and em spaces)
+may surround the directive and must separate `Closes` from `#`, without crossing a line break.
+The number must be positive, with nothing else on that line. Inline mentions, quotes, blockquotes,
+trailing prose and fenced code blocks do not link issues. Fences use at least three backticks or
+tildes, with optional indentation and an opening info string; a closing fence uses the same
+character, at least the opening length, and only surrounding horizontal whitespace. An unclosed
+fence excludes the rest of the prompt. Issue-created runs link through their
+recorded issue reference; GitHub prompt text cannot add links. Review, CI-fix and conflict rounds
+inherit exactly their original run's issues, including no issues. Factory-added findings,
+CI excerpts and instructions never add links, even when they contain a standalone directive.
 
 If a delivery is ignored, GitHub's delivery log shows the reason in the response body, for example
 `actor or issue author is not owner` or `repository owner is not configured owner`.

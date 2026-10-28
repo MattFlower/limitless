@@ -88,6 +88,7 @@ export interface ReportInput {
     | "rebaseNote"
     | "terminalReason"
     | "reviewedSha"
+    | "sizeReport"
   >;
   invocations: Invocation[];
   totals: { costUsd: number; costEquivUsd: number };
@@ -173,6 +174,25 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
         .join("\n"),
     ),
   ];
+  const size = state.sizeReport;
+  if (size) {
+    let text = `Size unavailable: ${"unavailable" in size ? size.unavailable : "error" in size ? size.error : ""}`;
+    if ("source" in size) {
+      const total = size.source.added + size.source.removed,
+        budget = size.stated;
+      const counts = (n: { added: number; removed: number }) => `+${n.added}/−${n.removed}`;
+      let comparison = "No budget was stated.";
+      if (budget) comparison = `Budget is ambiguous: “${budget.text}”.`;
+      if (budget?.kind === "zero") comparison = `Against a stated budget of 0: “${budget.text}”.`;
+      if (budget?.kind === "figure")
+        comparison = `Against a stated budget of ${budget.lines} (${Math.round((total / budget.lines) * 100)}%): “${budget.text}”.`;
+      text = `Source: ${counts(size.source)} (${total} lines); tests ${counts(size.tests)}; docs ${counts(size.docs)}. ${comparison} Range: \`${size.base.slice(0, 8)}${size.mode === "merge-base" ? "..." : ".."}${size.head.slice(0, 8)}\` (${size.mode}).`;
+      if (size.binary) text += ` Binary entries: ${size.binary} (0 lines).`;
+      for (const { from, to } of size.renamesAcross)
+        text += ` Cross-category rename: ${JSON.stringify(from)} → ${JSON.stringify(to)}.`;
+    }
+    blocks.push("## Size", reportText("prose", text));
+  }
 
   if (Object.keys(input.models ?? {}).length)
     blocks.push(
@@ -474,7 +494,7 @@ export function buildReportArtifacts(
       runUrl: `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`,
       freeFirstRouting: ctx.freeFirstRouting,
       models: ctx.run.models,
-      closesIssues: linkedIssues(ctx.run)
+      closesIssues: linkedIssues(ctx.run, ctx.store)
         .filter((i) => i.repo.toLowerCase() === ctx.repo.slug.toLowerCase())
         .map((i) => i.number),
     },

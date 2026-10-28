@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import * as repos from "../src/git/repos.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
@@ -37,6 +38,112 @@ const { start } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["author", "repair same", "repair new", "granted"])(
+    "verify-change workflow scope: %s",
+    async (scenario) => {
+      const git = async (...args: string[]) => (await sh(["git", ...args], { cwd: repoDir })).stdout.trim();
+      const base = await git("rev-parse", "HEAD");
+      const workflow = ".github/workflows/ci.yml";
+      mkdirSync(join(repoDir, ".github/workflows"), { recursive: true });
+      writeFileSync(join(repoDir, workflow), "on: push\njobs: {}\n");
+      await git("add", ".");
+      await git("commit", "-qm", "author CI update");
+      const head = await git("rev-parse", "HEAD");
+      const bare = join(home, "github.git");
+      await git("clone", "-q", "--bare", repoDir, bare);
+      await git("--git-dir", bare, "update-ref", "refs/heads/dependabot/pkg", head);
+      const remote = async () => await git("--git-dir", bare, "rev-parse", "refs/heads/dependabot/pkg");
+      let repairs = 0;
+      const f = start((s) => {
+        if (roleOf(s) === "triage") return { structured: triage() };
+        if (roleOf(s) === "review")
+          return {
+            structured:
+              scenario !== "author" && !repairs
+                ? {
+                    ...approve,
+                    findings: [
+                      {
+                        ...findingEvidence,
+                        severity: "major",
+                        file: workflow,
+                        line: 1,
+                        title: "Needs repair",
+                        detail: "Repair CI",
+                        suggestion: "Repair CI",
+                        security: false,
+                      },
+                    ],
+                  }
+                : approve,
+          };
+        repairs++;
+        return {
+          files: {
+            [scenario === "repair new" ? ".circleci/config.yml" : workflow]: "on: pull_request\njobs: {}\n",
+          },
+        };
+      });
+      f.cfg.maxRounds = 1;
+      f.deps.gh = async (args) => (args[1] === "view" ? JSON.stringify({ headRefOid: await remote() }) : "");
+      f.store.upsertRepo({
+        slug: "test/repo",
+        kind: "github",
+        url: bare,
+        localPath: null,
+        defaultBranch: "main",
+        mergePolicy: "pr",
+      });
+      const push = spyOn(repos, "pushBranch");
+      const existing = spyOn(repos, "pushExistingBranch");
+      try {
+        const run = await f.createRun(
+          {
+            repo: "test/repo",
+            prompt: "Verify dependency",
+            profile: "quick",
+            source: "github",
+            requestedBy: "dependabot[bot]",
+            baseBranch: "dependabot/pkg",
+            deliveryBranch: "dependabot/pkg",
+            sourceRef: {
+              kind: "pull_request",
+              repo: "test/repo",
+              number: 1,
+              headSha: head,
+              baseSha: base,
+              baseRef: "main",
+            },
+            ...(scenario === "granted" ? { allow: ["workflows"] as const } : {}),
+          },
+          true,
+        );
+        const blocked = scenario.startsWith("repair");
+        expect(await waitFor(f, run.id, ["succeeded", "needs_human", "failed"])).toBe(
+          blocked ? "needs_human" : "succeeded",
+        );
+        const events = f.store
+          .listEvents(run.id)
+          .filter((e) => e.type === "audit" && e.message.includes("[ci-config]"));
+        expect(events.some((e) => e.level === "warn" && e.message.includes(workflow))).toBe(true);
+        expect(events.some((e) => e.level === "error" && e.message.includes("Repair:"))).toBe(blocked);
+        expect(push).not.toHaveBeenCalled();
+        if (scenario === "granted") {
+          expect(existing).toHaveBeenCalledTimes(1);
+          expect(await remote()).toBe(f.store.getRun(run.id)?.headSha ?? "missing");
+          expect(await remote()).not.toBe(head);
+        } else {
+          expect(existing).not.toHaveBeenCalled();
+          expect(await remote()).toBe(head);
+        }
+        expect(repairs).toBe(scenario === "author" ? 0 : blocked ? f.cfg.maxRounds + 2 : 1);
+      } finally {
+        push.mockRestore();
+        existing.mockRestore();
+      }
+    },
+  );
+
   // restart-repair covers the plain review repair; a removed gate script is an auditDiff row.
   test.each([
     "approve",
@@ -309,7 +416,9 @@ protected_paths = ["protected.txt"]
       stopNotifier();
       const state = f.store.getRunState<RunState>(runId);
       const report = f.store.getArtifact(runId, "report.md");
+      expect(report?.match(/^## Size$/gm)).toHaveLength(1);
       if (report !== null) {
+        expect(state?.sizeReport).toMatchObject({ base: baseTip, mode: "merge-base" });
         const sources = f.store.getArtifact(runId, "report-sources.json");
         expect(sources).not.toBeNull();
         expect(JSON.parse(sources ?? "null").digest).toBe(reportStructure(report)?.digest ?? "");
@@ -363,6 +472,11 @@ protected_paths = ["protected.txt"]
       ].includes(scenario);
       expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
       if (unchanged) {
+        expect(state?.sizeReport).toMatchObject({
+          base: baseTip,
+          head,
+          source: { added: 1, removed: 0 },
+        });
         expect(implementations).toBe(0);
         expect(f.store.listStages(runId).some((stage) => stage.name === "implement")).toBe(false);
         expect(f.store.getRun(runId)?.headSha).toBe(head);

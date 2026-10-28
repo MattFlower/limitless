@@ -243,6 +243,9 @@ detection, per-invocation budget, process-group kill on cancel.
 
 ## 6. Isolation & git
 
+The [privacy-boundary design](privacy-boundaries.md) inventories text storage/publication paths
+and proposes complete decoded checks before credential redaction and truncation.
+
 - Bare repo cache `~/.limitless/repos/<owner>__<name>.git`, fetched before each run.
 - One worktree per run at `~/.limitless/work/<run-id>` on branch `limitless/<run-id>-<slug>`; discreet repositories use `<branch_prefix><slug>` (default `change/`), with numeric suffixes for collisions.
 - Local-only (non-GitHub) repos use a factory-owned bare clone with independent objects, created
@@ -410,6 +413,9 @@ integration and restart tests; it is substantially beyond this issue's source bu
 mechanism or confinement-policy change is implemented here.
 
 ## 7. Persistence
+
+The [coordinator design](coordinators.md) inventories portable state and proposes adoption,
+graceful leave and capability-aware claiming for #902; it is not implemented yet.
 
 SQLite (`bun:sqlite`, WAL) at `~/.limitless/limitless.db`; large artifacts (event logs, diffs,
 prompts) as files under `~/.limitless/runs/<run-id>/`. Tables: `repos`, `runs`, `stages`,

@@ -1,4 +1,4 @@
-import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
 import { type AttributedTestCounts, attributedJUnitCounts } from "./attribution.ts";
 import { redactGateOutput } from "./output.ts";
@@ -134,13 +134,23 @@ export function parseJUnit(xml: string, cwd: string): FailedTestFiles | undefine
   }
 }
 
-function readReport(path: string): string | undefined {
+function readReport(path: string, filesystemBaseline?: number): string | undefined {
+  let fd: number | undefined;
   try {
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.size > MAX_REPORT_BYTES) return undefined;
-    return readFileSync(path, "utf8");
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (
+      !stat.isFile() ||
+      stat.size > MAX_REPORT_BYTES ||
+      (filesystemBaseline !== undefined && stat.mtimeMs < filesystemBaseline)
+    )
+      return undefined;
+    const xml = readFileSync(fd, "utf8");
+    return Buffer.byteLength(xml) <= MAX_REPORT_BYTES ? xml : undefined;
   } catch {
     return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -175,6 +185,64 @@ export function canonicalTestFile(file: string, cwd: string): string | undefined
       : undefined;
   } catch {
     return undefined;
+  }
+}
+
+export interface CoveringTestEvidence {
+  file: string;
+  name: string;
+  /** Absence affirms that every exact matching testcase passed in this execution's fresh report. */
+  reason?: string;
+}
+
+export function readCoveringJUnit(
+  path: string,
+  cwd: string,
+  test: { file: string; name: string },
+  filesystemBaseline: number,
+  existed: boolean,
+): CoveringTestEvidence {
+  const evidence: CoveringTestEvidence = { file: test.file.replace(/^\.\//, ""), name: test.name };
+  if (existed) return { ...evidence, reason: "JUnit report existed before execution" };
+  try {
+    const xml = readReport(path, filesystemBaseline);
+    if (xml === undefined) return { ...evidence, reason: "JUnit report missing, stale or unsafe" };
+    if (/<!DOCTYPE/i.test(xml)) throw new Error("Unsafe XML");
+    const root = Bun.XML.parse(xml, { compact: false });
+    if (root.name !== "testsuites" && root.name !== "testsuite") throw new Error("Invalid root");
+    const requestedFile = canonicalTestFile(test.file, cwd);
+    if (!requestedFile) throw new Error("Invalid requested file");
+    let matched = false;
+    let reason: string | undefined;
+    const files = new Set<string>();
+    const collect = (node: Bun.XML.Node) => {
+      if (node.attributes.file) files.add(node.attributes.file);
+      elements(node).forEach(collect);
+    };
+    collect(root);
+    const counts = attributedJUnitCounts(
+      root,
+      files,
+      cwd,
+      (file) => canonicalTestFile(file, cwd),
+      (node, file, describes = []) => {
+        if (!node.attributes.name || describes.some((name) => !name)) throw new Error("Missing name");
+        if (
+          canonicalTestFile(file ?? "", cwd) !== requestedFile ||
+          [...describes, node.attributes.name].join(" ") !== test.name
+        )
+          return;
+        matched = true;
+        const outcomes = elements(node);
+        if (outcomes.some((child) => child.name === "failure" || child.name === "error"))
+          reason = "test failed";
+        else if (outcomes.some((child) => child.name === "skipped")) reason ??= "named test skipped";
+      },
+    );
+    if (!counts) throw new Error("Invalid testcase evidence");
+    return { ...evidence, reason: reason ?? (matched ? undefined : "name matched no tests") };
+  } catch {
+    return { ...evidence, reason: "unparseable JUnit report" };
   }
 }
 
