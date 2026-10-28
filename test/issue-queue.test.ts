@@ -3694,6 +3694,10 @@ test.each([
   "Acceptance: [#3](https://github.com/owner/repo/issues/0)",
   "Acceptance: [#3](https://github.com/owner/repo/issues/30)",
   "Acceptance: [#3](https://github.com/owner/repo/issues/3/extra)",
+  'Acceptance: [#3](https://github.com/other/repo/issues/3 "Work (phase (one))")',
+  "Acceptance: [#3](https://github.com/other/repo/issues/3 'Work (phase) \\' (one)')",
+  "Acceptance: [#3](<https://github.com/other/repo/issues/3> (Work \\(phase\\)))",
+  "Acceptance: [#3](https://example.com/a_(b_(c)))",
 ])("slice link labels cannot impersonate a child: %s", (text) => {
   const { epic, open } = attentionEpic();
   epic.body = `## Slices\n- ${text}`;
@@ -3708,6 +3712,7 @@ test.each([
   ["[#99](https://github.com/owner/repo/issues/3#issuecomment-1)", "ready_for_acceptance"],
   ["[#99](https://example.com/#2) and #3", "ready_for_acceptance"],
   ["#3 and [#2](https://example.com/#2)", "ready_for_acceptance"],
+  ['[#99](https://github.com/owner/repo/issues/3 "Work (phase (one)) #2")', "ready_for_acceptance"],
   ["[#3](https://github.com/owner/repo/issues/2)", null],
   ["[#99](https://github.com/owner/repo/issues/2) and #3", null],
 ] as const)("slice destinations and independent plain text identify children: %s", (reference, state) => {
