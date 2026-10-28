@@ -18,7 +18,7 @@ import { compareGates } from "../src/gates/run.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { type EngineDeps, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { runGateExecution } from "../src/pipeline/gate-execution.ts";
-import { registerCredential, sh } from "../src/util/proc.ts";
+import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
 import { seeded } from "./seeded.ts";
 
 const seed = seeded(async (cwd) => {
@@ -796,9 +796,13 @@ test.each(["before POST", "after acceptance"])(
         expect(f.saved.at(-1)?.githubActions?.recoveryAttempted).toBe(true);
       return (await gh(...args)) ?? "";
     };
-    await f.run(signal(), durable);
+    if (boundary === "before POST") {
+      // With an uncertain first POST, recovery's ID alone cannot authorize branch deletion.
+      await expect(f.run(signal(), durable)).rejects.toThrow("Original dispatch unconfirmed");
+      expect(f.remote.size).toBe(2);
+    } else await f.run(signal(), durable);
     expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
-    expect(f.state.delays.reduce((a, b) => a + b, 0)).toBe(boundary === "before POST" ? 40 : 0);
+    expect(f.state.delays.reduce((a, b) => a + b, 0)).toBe(boundary === "before POST" ? 80 : 0);
     expect(
       f.saved.some((saved) => saved.githubActions?.dispatchSent && saved.githubActions.runId === 17),
     ).toBe(true);
@@ -817,6 +821,89 @@ test("a lost POST response discovers the accepted run instead of dispatching twi
   expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
   expect(f.calls).toContain("discover");
 });
+
+test.each(["returned ID", "lost response"])(
+  "recovery with %s retains the uncertain original dispatch through cleanup restarts",
+  async (response) => {
+    const f = fixture();
+    const { ctx, store } = await context(f);
+    try {
+      const h = await f.stored({ dispatchIntent: true });
+      ctx.state.gateExecution = { handle: h, sha: req.headSha, stage: "gates", round: 0, purpose: "initial" };
+      await ctx.save();
+      const gh = f.deps.gh;
+      let dispatched = false;
+      let originalVisible = false;
+      let originalStatus = "in_progress";
+      let cancelFails = true;
+      f.deps.gh = async (...args) => {
+        const path = args[0][1] ?? "";
+        if (path.endsWith("/dispatches")) {
+          expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.githubActions).toMatchObject({
+            recoveryAttempted: true,
+            unresolvedOriginalDispatch: true,
+          });
+          dispatched = true;
+          f.calls.push("dispatch");
+          if (response === "lost response") throw new Error("response lost");
+          return JSON.stringify({ workflow_run_id: 18 });
+        }
+        if (path.includes("workflow_dispatch")) {
+          f.calls.push("discover");
+          return JSON.stringify({
+            workflow_runs: dispatched ? [{ id: 18 }, ...(originalVisible ? [{ id: 17 }] : [])] : [],
+          });
+        }
+        if (path.endsWith("/runs/17/cancel")) {
+          f.calls.push("cancel:17");
+          if (cancelFails) throw new Error("original cancel unavailable");
+          originalStatus = "completed";
+          return "null";
+        }
+        if (path.endsWith("/runs/17") || path.endsWith("/runs/18")) {
+          const id = path.endsWith("/17") ? 17 : 18;
+          const status = id === 17 ? originalStatus : "completed";
+          f.calls.push(`status:${id}:${status}`);
+          return `${args[0].includes("--include") ? "HTTP/2.0 200 OK\r\n\r\n" : ""}${JSON.stringify({ id, status })}`;
+        }
+        return (await gh(...args)) ?? "";
+      };
+      await expect(runGateExecution(ctx, "gates", "initial", cwd, req.gates)).rejects.toThrow(
+        /original.*unconfirmed/i,
+      );
+      const pending = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
+      expect(pending?.handle.githubActions).toMatchObject({
+        runId: 18,
+        recoveryAttempted: true,
+        unresolvedOriginalDispatch: true,
+        cleanupFailed: true,
+      });
+      expect(f.calls.filter((call) => call.startsWith("delete:"))).toEqual([]);
+      expect(f.remote.size).toBe(2);
+      originalVisible = true;
+      const restart = () =>
+        new RunContext({ ...ctx.deps, gateExecutor: f.executor() }, ctx.run, ctx.repo, signal());
+      await expect(runGateExecution(restart(), "gates", "initial", cwd, req.gates)).rejects.toThrow(
+        "original cancel unavailable",
+      );
+      expect(f.calls.filter((call) => call.startsWith("delete:"))).toEqual([]);
+      expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.id).toBe(h.id);
+      // Once identified, the original remains a cleanup obligation even if listing hides it again.
+      originalVisible = false;
+      cancelFails = false;
+      await expect(runGateExecution(restart(), "gates", "initial", cwd, req.gates)).resolves.toMatchObject({
+        setupOk: true,
+      });
+      expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
+      expect(f.calls.indexOf("status:17:completed")).toBeLessThan(
+        f.calls.findIndex((call) => call.startsWith("delete:")),
+      );
+      expect(f.remote.size).toBe(0);
+    } finally {
+      store.close();
+    }
+  },
+);
 
 test("uncertain recovery is persisted before POST and repeated restarts cannot dispatch again", async () => {
   const f = fixture();
@@ -1020,6 +1107,40 @@ test.each(["reset", "date", "fallback"])(
     ).toBeGreaterThan(1);
   },
 );
+
+test.each(["run", "jobs"])("structured gh %s errors retain rate-limit timing headers", async (kind) => {
+  const f = fixture();
+  f.state.runStatus = "in_progress";
+  const gh = f.deps.gh;
+  let limited = false;
+  f.deps.gh = async (...args) => {
+    if (
+      !limited &&
+      args[0].some((arg) => arg.startsWith("If-None-Match:")) &&
+      (kind === "run" || args[0][1]?.includes("/jobs?"))
+    ) {
+      limited = true;
+      throw new CommandError(
+        "gh api failed",
+        1,
+        `HTTP/2.0 ${kind === "run" ? "429 Too Many Requests\r\nRetry-After: 5" : `403 Forbidden\r\nX-RateLimit-Reset: ${(f.deps.now() + 4_990) / 1_000}`}\r\n\r\n`,
+        kind === "run" ? "gh: request failed" : "gh: secondary rate limit",
+        false,
+      );
+    }
+    return (await gh(...args)) ?? "";
+  };
+  f.state.onSleep = () => {
+    if (limited) f.state.runStatus = "completed";
+  };
+  await expect(f.run()).resolves.toMatchObject({ setupOk: true });
+  expect(f.state.delays).toEqual(kind === "run" ? [10, 5_000] : [10, 4_990, 10]);
+  expect(f.calls).not.toContain("cancel");
+  expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
+  expect(
+    f.requests.filter((r) => r.args.some((arg) => arg.startsWith("If-None-Match:"))).length,
+  ).toBeGreaterThan(1);
+});
 
 test("rate limits exhaust the original execution deadline across shutdown and restart", async () => {
   const f = fixture();

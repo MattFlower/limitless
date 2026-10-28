@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { worktreeGit } from "../git/command.ts";
 import type { GhRunner } from "../integrations/github.ts";
+import { CommandError } from "../util/proc.ts";
 import { CI_CONFIG } from "./audit.ts";
 import type { GateCommand } from "./detect.ts";
 import { type ExecutionHandle, type GateExecutor, gateShutdown } from "./executor.ts";
@@ -19,6 +20,9 @@ export interface ActionsProgress {
   dispatchIntent?: boolean;
   dispatchSent?: boolean;
   recoveryAttempted?: boolean;
+  /** Recovery cannot prove the first POST was rejected, even when the second returns an ID. */
+  unresolvedOriginalDispatch?: boolean;
+  cleanupRunIds?: number[];
   /** Absolute deadlines survive restarts. Discovery uses the same bounded visibility window as cleanup. */
   visibilityDeadline?: number;
   deadline?: number;
@@ -75,8 +79,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
       undefined,
       signal,
     );
-    if (data.workflow_runs.length > 1) throw new Error("Ambiguous gate workflow runs");
-    return data.workflow_runs[0]?.id;
+    return data.workflow_runs;
   };
   const wait = async (ms: number, signal?: AbortSignal, shutdownOnly = false) => {
     const stopped = () => signal?.aborted && (!shutdownOnly || gateShutdown(signal));
@@ -106,7 +109,9 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
   ) => {
     for (;;) {
       if (signal?.aborted && (!cleanup || gateShutdown(signal))) throw signal.reason;
-      p.runId = await discover(p, signal?.aborted ? undefined : signal);
+      const runs = await discover(p, signal?.aborted ? undefined : signal);
+      if (runs.length > 1) throw new Error("Ambiguous gate workflow runs");
+      p.runId = runs[0]?.id;
       if (p.runId) return;
       if (deps.now() >= deadline) return;
       await wait(Math.min(deps.pollMs, deadline - deps.now()), signal, cleanup);
@@ -119,16 +124,34 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     if (signal && gateShutdown(signal)) throw signal.reason;
     const cleanupSignal = signal?.aborted ? undefined : signal;
     const deadline = deps.now() + deps.discardVisibilityMs;
-    if ((p.dispatchIntent || p.dispatchSent) && !p.runId) {
+    const ids = new Set([...(p.cleanupRunIds ?? []), ...(p.runId ? [p.runId] : [])]);
+    let originalUnconfirmed = false;
+    // Older recovery handles also retain this obligation unless it was explicitly resolved.
+    if (p.recoveryAttempted && p.unresolvedOriginalDispatch !== false) {
+      for (;;) {
+        for (const run of await discover(p, cleanupSignal)) ids.add(run.id);
+        p.cleanupRunIds = [...ids];
+        if (ids.size >= 2) {
+          p.unresolvedOriginalDispatch = false;
+          break;
+        }
+        if (deps.now() >= deadline) {
+          originalUnconfirmed = true;
+          break;
+        }
+        await wait(Math.min(deps.pollMs, deadline - deps.now()), signal, true);
+      }
+    } else if ((p.dispatchIntent || p.dispatchSent) && !p.runId) {
       await discoverUntil(p, deadline, signal, true);
       if (!p.runId) throw new Error("Dispatch unconfirmed: cleanup discovery deadline expired");
+      ids.add(p.runId);
     }
-    if (p.runId) {
-      let run = await api<Run>(p, `actions/runs/${p.runId}`, "GET", undefined, cleanupSignal);
+    for (const id of ids) {
+      let run = await api<Run>(p, `actions/runs/${id}`, "GET", undefined, cleanupSignal);
       if (run.status !== "completed") {
-        await api(p, `actions/runs/${p.runId}/cancel`, "POST", undefined, cleanupSignal);
+        await api(p, `actions/runs/${id}/cancel`, "POST", undefined, cleanupSignal);
         for (;;) {
-          run = await api<Run>(p, `actions/runs/${p.runId}`, "GET", undefined, cleanupSignal);
+          run = await api<Run>(p, `actions/runs/${id}`, "GET", undefined, cleanupSignal);
           if (run.status === "completed") break;
           if (deps.now() >= deadline)
             throw new Error("Workflow termination unconfirmed: cleanup deadline expired");
@@ -136,6 +159,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
         }
       }
     }
+    if (originalUnconfirmed)
+      throw new Error("Original dispatch unconfirmed: cleanup discovery deadline expired");
     // Only branch deletion is independent, after workflow termination is confirmed.
     const failures: unknown[] = [];
     for (const [branch, sha] of [
@@ -232,7 +257,10 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
               etags.set(path, { etag: headers?.match(/^etag:\s*(.+)\r?$/im)?.[1]?.trim(), data });
               return data;
             } catch (error) {
-              const message = String(error);
+              const message =
+                error instanceof CommandError
+                  ? `${error.stdout}\n${error.stderr}\n${error.message}`
+                  : String(error);
               if (!/(?:HTTP[^\n]*?\b429\b|secondary rate limit)/i.test(message)) throw error;
               const retry = message.match(/retry-after:\s*([^\r\n;]+)/i)?.[1]?.trim();
               const reset = message.match(/x-ratelimit-reset:\s*(\d+)/i)?.[1];
@@ -314,6 +342,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           await discoverUntil(p, p.visibilityDeadline, controller.signal);
           if (!p.runId && !p.dispatchSent && !p.recoveryAttempted) {
             p.recoveryAttempted = true;
+            p.unresolvedOriginalDispatch = true;
             await send();
             if (!p.runId) await discoverUntil(p, p.visibilityDeadline, controller.signal);
           }
