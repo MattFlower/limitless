@@ -69,8 +69,6 @@ export interface JobRow {
   state: "queued" | "leased" | "done" | "failed" | "cancelled";
   worker: string | null;
   worker_os: string | null;
-  /** The coordinator's load when it completed this job itself; null for remote completions. */
-  load_per_core: number | null;
   attempt: number;
   lease_expires_at: number | null;
   attempt_deadline_at: number | null;
@@ -124,10 +122,7 @@ export interface AgentJobRequest
   uiUrl?: string;
 }
 export interface AgentJobRow
-  extends Omit<
-    JobRow,
-    "setup_fallback" | "setup_order" | "events" | "in_place" | "stopped" | "worker_os" | "load_per_core"
-  > {
+  extends Omit<JobRow, "setup_fallback" | "setup_order" | "events" | "in_place" | "stopped" | "worker_os"> {
   invocation_id: number;
   parent_sha: string;
   result_sha: string | null;
@@ -137,7 +132,6 @@ export interface AgentJobRow
 export class WorkerStore {
   resumedAt?: number | null;
   pairingKey?: string;
-  loadSource = hostLoadPerCore;
   readonly times: WorkerTiming;
   constructor(
     readonly store: Store,
@@ -767,17 +761,10 @@ export class WorkerStore {
       const changed =
         this.store.db
           .query(
-            "UPDATE gate_jobs SET state='done',result=?,load_per_core=?,failure_reason=CASE WHEN ? THEN failure_reason ELSE NULL END,updated_at=? WHERE id=? AND state=?",
+            "UPDATE gate_jobs SET state='done',result=?,failure_reason=CASE WHEN ? THEN failure_reason ELSE NULL END,updated_at=? WHERE id=? AND state=?",
           )
-          .run(
-            JSON.stringify(this.sanitize(run)),
-            // A replayed result keeps the coordinator's load from when it ran here.
-            local || j?.in_place ? this.loadSource() : null,
-            local,
-            this.now(),
-            id,
-            local ? "failed" : "leased",
-          ).changes === 1;
+          .run(JSON.stringify(this.sanitize(run)), local, this.now(), id, local ? "failed" : "leased")
+          .changes === 1;
       if (changed && !j?.in_place && j?.worker && run.setupOk && (!local || j.setup_fallback)) {
         // Retain the order after recovery too: an older pending fallback must not re-flag it.
         this.store.db

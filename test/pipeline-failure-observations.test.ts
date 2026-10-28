@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { WorkerStore } from "../src/db/workers.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest } from "../src/gates/executor.ts";
+import { redactGateOutput } from "../src/gates/output.ts";
 import type { GateResult, GateRun } from "../src/gates/run.ts";
 import { ciSignature } from "../src/integrations/ci-classifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
@@ -44,7 +45,6 @@ function executor(
   make: (req: GateRequest, attempt: number) => GateRun,
 ) {
   const workers = new WorkerStore(f.store, f.deps.buildSha);
-  workers.loadSource = () => load;
   const starts: ExecutionHandle[] = [],
     attaches: string[] = [];
   let attempts = 0;
@@ -180,22 +180,31 @@ test("failed-attempt signature and evidence redact before truncation and survive
     cwd: state.repoDir,
   });
   const { f, execute } = await fixture();
+  const command = `true # ${secret}`;
+  const failedOutput = `${secret}${"x".repeat(6010)}\nerror: ${secret} failed\n${secret}`;
+  const passingOutput = "pass: recovered on retry";
+  const expectedTail = redactGateOutput(failedOutput).slice(-6000);
+  const redactedCommand = redactGateOutput(command);
+  const failedSignature = ciSignature("check", expectedTail, redactedCommand).signature;
+  const passingSignature = ciSignature("check", passingOutput, redactedCommand).signature;
+  expect(failedSignature).not.toBe(passingSignature);
   executor(f, "local", (req, attempt) =>
     result(req, {
       ok: attempt > 1,
       exitCode: attempt > 1 ? 0 : 1,
       command: req.gates.checks[0]?.run ?? "",
-      output: `error: ${secret} failed\n${"x".repeat(5990)}${secret}`,
+      output: attempt > 1 ? passingOutput : failedOutput,
     }),
   );
   await execute();
   const row = f.store.failureObservations({})[0];
   expect(row).toBeDefined();
   expect(JSON.stringify(row)).not.toContain(secret);
+  expect(row?.command).toBe(redactedCommand);
+  expect(row?.output_tail).toBe(expectedTail);
   expect(row?.output_tail.length).toBeLessThanOrEqual(6000);
-  expect(row?.signature).toBe(
-    ciSignature(row?.name ?? "", row?.output_tail ?? "", row?.command ?? "").signature,
-  );
+  expect(row?.signature).toBe(failedSignature);
+  expect(row?.signature).not.toBe(passingSignature);
   expect(row).toMatchObject({ class: "flaky", history: "retry_passed" });
 });
 
@@ -212,7 +221,7 @@ for (const kind of ["local", "lan", "inplace"] as const) {
     const handle = f.store.getRunState<RunState>(run.id)?.gateExecution?.handle;
     expect(handle).toBeDefined();
     expect(f.store.failureObservations({})).toEqual([]);
-    // A replay keeps the load measured at completion; only a fresh local execution samples anew.
+    // Unrecorded coordinator results sample the engine's current load on replay.
     load = 8;
     const resumed = executor(f, kind, (req) =>
       result(req, { ok: false, exitCode: 1, output: "farewell.txt:1: failed" }),
@@ -221,7 +230,7 @@ for (const kind of ["local", "lan", "inplace"] as const) {
     const rows = f.store.failureObservations({});
     expect(rows).toHaveLength(1);
     expect(rows[0]?.handle_kind).toBe(kind);
-    expect(rows[0]?.load_per_core).toBe({ local: 8, lan: null, inplace: 3.25 }[kind]);
+    expect(rows[0]?.load_per_core).toBe({ local: 8, lan: null, inplace: 8 }[kind]);
     if (kind === "local") {
       expect(resumed.starts).toHaveLength(1);
       expect(rows[0]?.handle_id).not.toBe(handle?.id);
@@ -285,12 +294,22 @@ test.each(["cancel", "shutdown"])(
       expect(f.store.getRunState<RunState>(run.id)?.gateExecution?.handle.id).toBe(before[0]?.handle_id);
     // Explicitly requeue a cancelled run as the operator's retry path does.
     f.store.updateRun(run.id, { status: "queued", error: null });
+    load = 12.75;
     const resumed = executor(f, "inplace", (req) => result(req));
     expect(await execute()).toBe("running");
     expect(f.store.failureObservations({})).toHaveLength(1);
     expect(f.store.failureObservations({})[0]).toMatchObject({
       class: "regression",
       interim: 0,
+    });
+    const after = f.store.failureObservations({})[0];
+    if (!after || !before[0]) throw new Error("missing observation");
+    expect(after).toEqual({
+      ...before[0],
+      class: after.class,
+      history: after.history,
+      finalized_at: after.finalized_at,
+      interim: after.interim,
     });
     if (reason === "shutdown") expect(resumed.starts).toHaveLength(0);
   },
@@ -310,9 +329,8 @@ test.each(["remote", "named coordinator", "legacy", "fallback", "unknown"])(
           if (where === "legacy")
             f.store.db.query("UPDATE gate_jobs SET worker_os=NULL WHERE id=?").run(h.id);
           if (where === "fallback") {
-            // The real fallback path: the coordinator re-runs the job and records its own load.
+            // The real fallback path: the coordinator re-runs the job.
             const workers = new WorkerStore(f.store, f.deps.buildSha);
-            workers.loadSource = () => 4.5;
             const job = workers.job(h.id);
             expect(workers.fallbackSetup(h.id, "setup")).toBe(true);
             expect(workers.complete(h.id, JSON.parse(job?.result ?? "null"), true)).toBe(true);
@@ -335,10 +353,57 @@ test.each(["remote", "named coordinator", "legacy", "fallback", "unknown"])(
             ? "coordinator"
             : "worker-a",
       os: where === "fallback" ? process.platform : remote ? "linux" : null,
-      load_per_core: where === "fallback" ? 4.5 : null,
+      load_per_core: where === "fallback" ? 3.25 : null,
     });
   },
 );
+
+test.each(["inplace", "lan"] as const)("AC-5 injected engine load: %s", async (kind) => {
+  const { f, execute } = await fixture({
+    ...auditFault,
+    "gate:executed": {
+      action: "continue",
+      when: (c) => c.stage === "gates" && kind === "lan",
+      onHit: (c) => {
+        const handle = f.store.getRunState<RunState>(c.runId)?.gateExecution?.handle;
+        if (!handle) throw new Error("missing execution handle");
+        const workers = new WorkerStore(f.store, f.deps.buildSha);
+        const job = workers.job(handle.id);
+        expect(workers.fallbackSetup(handle.id, "setup")).toBe(true);
+        expect(workers.complete(handle.id, JSON.parse(job?.result ?? "null"), true)).toBe(true);
+      },
+    },
+  });
+  f.deps.loadSource = () => 12.75;
+  executor(f, kind, (req) => result(req, { ok: false, exitCode: 1, output: "farewell.txt:1: failed" }));
+  expect(await execute()).toBe("running");
+  const rows = f.store.failureObservations({});
+  expect(rows).toHaveLength(1);
+  expect(rows[0]?.load_per_core).toBe(12.75);
+});
+
+test("observation location redacts registered credentials in a worker identity", async () => {
+  const secret = "synthetic-worker-credential";
+  registerCredential("observation-worker", secret);
+  const { f, execute } = await fixture({
+    ...auditFault,
+    "gate:executed": {
+      action: "continue",
+      when: (c) => c.stage === "gates",
+      onHit: (c) => {
+        const handle = f.store.getRunState<RunState>(c.runId)?.gateExecution?.handle;
+        if (!handle) throw new Error("missing execution handle");
+        f.store.db.query("UPDATE gate_jobs SET worker=? WHERE id=?").run(secret, handle.id);
+      },
+    },
+  });
+  executor(f, "lan", (req) => result(req, { ok: false, exitCode: 1, output: "farewell.txt:1: failed" }));
+  expect(await execute()).toBe("running");
+  const rows = f.store.failureObservations({});
+  expect(rows).toHaveLength(1);
+  expect(rows[0]?.location).toBe(redactGateOutput(secret));
+  expect(JSON.stringify(rows)).not.toContain(secret);
+});
 
 test("completion checkpoint rolls classification back when its state write fails", async () => {
   const { f, run, execute } = await fixture();

@@ -49,12 +49,7 @@ function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha:
   const { location, remote, job } = executionSite(ctx, handle);
   const coordinator = !remote && location !== null;
   const os = coordinator ? process.platform : remote ? (job?.worker_os ?? null) : null;
-  // Only a live local execution is never replayed; a durable job keeps its completion-time load.
-  const load = !coordinator
-    ? null
-    : handle.kind === "local"
-      ? (ctx.deps.loadSource ?? hostLoadPerCore)()
-      : (job?.load_per_core ?? null);
+  const load = coordinator ? (ctx.deps.loadSource ?? hostLoadPerCore)() : null;
   ctx.store.transaction(() => {
     for (const phase of ["setup", "check"] as const) {
       for (const r of phase === "setup" ? result.setup : result.checks) {
@@ -74,7 +69,7 @@ function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha:
           phase,
           name,
           command,
-          location,
+          location: location === null ? null : redactGateOutput(location),
           os,
           load_per_core: load,
           observed_at: Date.now(),

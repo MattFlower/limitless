@@ -108,7 +108,6 @@ export class Factory {
     const catalog = cfg.catalog ?? resolveCatalog(cfg.raw.providers);
     this.store = opts.store ?? new Store(cfg.paths.db);
     this.workers = new WorkerStore(this.store, opts.bootSha, {}, Date.now, cfg.workers.agentSlots);
-    if (opts.loadSource) this.workers.loadSource = opts.loadSource;
     this.models = [...(opts.models ?? catalog.models)];
     this.evalSettings = evalSettings(cfg.raw);
     this.providerDefs = (opts.providers ?? catalog.providers).map((provider) => ({

@@ -10,4 +10,3 @@ CREATE TABLE failure_observations (
 );
 CREATE INDEX failure_observations_signature ON failure_observations (repo, signature, observed_at);
 ALTER TABLE gate_jobs ADD COLUMN worker_os TEXT;
-ALTER TABLE gate_jobs ADD COLUMN load_per_core REAL;
