@@ -15,6 +15,7 @@ import type { DeployClient, DeployClock } from "../src/cli/deploy-wait.ts";
 import { DrainUnsupportedError } from "../src/cli/deploy-wait.ts";
 import type { sh } from "../src/util/proc.ts";
 import * as proc from "../src/util/proc.ts";
+import { inspectionResult } from "./service-inspection-support.ts";
 
 const home = process.env.SERVICE_TEST_HOME;
 if (!home) throw new Error("missing isolated test home");
@@ -168,6 +169,8 @@ async function compete() {
   lockHeld = existsSync(lock) && readFileSync(lock, "utf8").trim() === String(process.pid);
 }
 const commands: string[][] = [];
+let inspectionInjected = false;
+let replacementFailed = false;
 const command: typeof sh = async (argv) => {
   commands.push([...argv]);
   const ok = (stdout = "", exitCode = 0, stderr = "") => ({ stdout, exitCode, stderr });
@@ -182,13 +185,26 @@ const command: typeof sh = async (argv) => {
   }
   const label = argv.at(-1)?.split("/").at(-1) ?? "";
   if (argv[1] === "print") {
+    const inspectionCase = process.env.SERVICE_TEST_INSPECTION;
+    if (
+      inspectionCase &&
+      ((scenario === "inspection-collision" && label === neutral && !calls.includes(`bootout ${oldLabel}`)) ||
+        (["inspection-status", "inspection-uninstall"].includes(scenario) && label === oldLabel) ||
+        (scenario === "inspection-old" && label === oldLabel && !inspectionInjected) ||
+        (scenario === "inspection-reconcile" && label === neutral && !existsSync(oldPath)) ||
+        (scenario === "inspection-restore" && label === neutral && replacementFailed && !inspectionInjected))
+    ) {
+      inspectionInjected = true;
+      if (inspectionCase === "absent") loaded.delete(label);
+      return inspectionResult(inspectionCase, label);
+    }
     if (stopping && time > stoppedAt && scenario !== "stuck") {
       loaded.delete(stopping);
       stopping = "";
     }
     return loaded.has(label)
       ? ok()
-      : ok("", 1, `Could not find service "${label}" in domain for user gui: ${os.userInfo().uid}`);
+      : ok("", 113, `Could not find service "${label}" in domain for user gui: ${os.userInfo().uid}`);
   }
   if (argv[1] === "enable" || argv[1] === "disable") {
     calls.push(`${argv[1]} ${label}`);
@@ -249,7 +265,11 @@ const command: typeof sh = async (argv) => {
       writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
       process.exit(0);
     }
-    if (data.Label === neutral && ["bootstrap", "restore", "partial"].includes(scenario)) {
+    if (
+      data.Label === neutral &&
+      ["bootstrap", "restore", "partial", "inspection-restore"].includes(scenario)
+    ) {
+      replacementFailed = true;
       if (scenario === "partial") loaded.add(neutral);
       return ok("", 1, "replacement bootstrap failed");
     }
@@ -493,8 +513,8 @@ try {
       scenario = "migration";
       await service.deploy(0, undefined, false, { command, client, clock, executor: true });
     }
-  } else if (scenario === "status") await service.status(0);
-  else if (scenario === "uninstall") await service.uninstall();
+  } else if (["status", "inspection-status"].includes(scenario)) await service.status(0, { command });
+  else if (["uninstall", "inspection-uninstall"].includes(scenario)) await service.uninstall({ command });
   else {
     await service
       .install(0, {

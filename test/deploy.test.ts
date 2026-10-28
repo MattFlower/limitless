@@ -28,6 +28,7 @@ import { deploy } from "../src/cli/service.ts";
 import type { HealthResponse } from "../src/core/types.ts";
 import { registerCredential, type sh } from "../src/util/proc.ts";
 import { resolveTestWorkers } from "../src/util/test-workers.ts";
+import { inspectionCases, inspectionResult } from "./service-inspection-support.ts";
 
 const dirs: string[] = [];
 const originalWorkers = process.env.LIMITLESS_TEST_WORKERS;
@@ -1539,7 +1540,7 @@ function executorSetup() {
     let exitCode = 0;
     if (args[1] === "print")
       return {
-        exitCode: loaded ? 0 : 1,
+        exitCode: loaded ? 0 : 113,
         stdout: "",
         stderr: loaded ? "" : `Could not find service "${label}" in domain for user gui: ${userInfo().uid}`,
       };
@@ -1563,42 +1564,78 @@ function executorSetup() {
   };
 }
 
-for (const recovery of [false, true]) {
-  test(`executor inspection failure refuses checkout changes (recovery: ${recovery})`, async () => {
-    const f = executorSetup();
-    if (recovery)
-      writeFileSync(
-        f.intent,
-        JSON.stringify({
-          phase: "rollback",
-          label: f.label,
-          path: f.path,
-          previous: "previous",
-          target: "next",
-        }),
-      );
-    const command = f.opts.command;
-    f.opts.command = async (args, opts) => {
-      if (args[0] === "launchctl" && args[1] === "print") {
-        f.calls.push(args.join(" "));
-        return { exitCode: 1, stdout: "", stderr: "Operation not permitted" };
+for (const scenario of inspectionCases.filter((c) => !["loaded", "absent"].includes(c)))
+  for (const stage of ["intent", "journal", "rollback", "after-bootout", "reconcile"]) {
+    test(`unknown executor inspection blocks ${stage}: ${scenario}`, async () => {
+      const f = executorSetup();
+      const recovery = ["intent", "journal"].includes(stage);
+      const intent = {
+        phase: "rollback",
+        label: f.label,
+        path: f.path,
+        previous: "previous",
+        target: "next",
+      };
+      if (stage === "intent") writeFileSync(f.intent, JSON.stringify(intent));
+      const directory = join(f.opts.releaseDir, "service-backup"),
+        journal = join(directory, `${f.label}.json`);
+      if (["journal", "reconcile"].includes(stage)) {
+        mkdirSync(directory);
+        writeFileSync(
+          journal,
+          JSON.stringify({
+            ...intent,
+            phase: "restored",
+            old: { label: f.label, path: f.path, kind: "executor" },
+            backup: readFileSync(f.path).toString("base64"),
+          }),
+        );
       }
-      if (args[0] === "bun" && args[1] === "run") throw new Error("gate failed");
-      return command(args, opts);
-    };
-    const error = String(await deploy(7400, "feature", false, { ...f.opts, executor: true }).catch((e) => e));
-    expect(f.calls).not.toContain("git checkout -q --detach previous");
-    if (recovery) expect(f.calls.some((call) => call.startsWith("git "))).toBe(false);
-    expect(error).toContain("Operation not permitted");
-    expect(error).toContain(`launchctl bootout ${f.service}`);
-    expect(error).toContain(`launchctl disable ${f.service}`);
-    if (!recovery) {
-      expect(error).toContain("next");
-      expect(error).toContain("previous");
-    }
-    expect(existsSync(f.intent)).toBe(true);
-  });
-}
+      let bootedOut = false;
+      const command = f.opts.command;
+      f.opts.command = async (args, opts) => {
+        const failInspection =
+          stage === "after-bootout" ? bootedOut : stage === "reconcile" ? f.calls.includes("restart") : true;
+        if (args[0] === "launchctl" && args[1] === "print" && failInspection) {
+          f.calls.push(args.join(" "));
+          return inspectionResult(scenario, f.label);
+        }
+        if (stage !== "reconcile" && args[0] === "bun" && args[1] === "run") throw new Error("gate failed");
+        const result = await command(args, opts);
+        if (args[0] === "launchctl" && args[1] === "bootout") bootedOut = true;
+        return result;
+      };
+      const error = String(
+        await deploy(7400, "feature", false, { ...f.opts, executor: true }).catch((e) => e),
+      );
+      expect(f.calls).not.toContain("git checkout -q --detach previous");
+      if (recovery) expect(f.calls.some((call) => call.startsWith("git "))).toBe(false);
+      if (stage === "after-bootout") expect(f.calls).toContain(`launchctl bootout ${f.service}`);
+      if (stage === "reconcile") expect(f.calls).toContain(`launchctl enable ${f.service}`);
+      expect(error).toContain("launchctl print");
+      if (scenario === "permission") expect(error).toContain("Operation not permitted");
+      expect(error).toContain(`launchctl bootout ${f.service}`);
+      expect(error).toContain(`launchctl disable ${f.service}`);
+      if (!recovery) {
+        expect(error).toContain("next");
+        expect(error).toContain("previous");
+      }
+      expect(existsSync(f.intent)).toBe(stage !== "journal");
+      if (["journal", "reconcile"].includes(stage)) {
+        expect(existsSync(journal)).toBe(true);
+        expect(JSON.parse(readFileSync(journal, "utf8")).phase).toBe("restored");
+      }
+      expect(existsSync(f.path)).toBe(true);
+      if (recovery) {
+        f.calls.length = 0;
+        await expect(deploy(7400, "feature", false, { ...f.opts, executor: true })).rejects.toThrow(
+          `launchctl disable ${f.service}`,
+        );
+        expect(f.calls.some((call) => call.startsWith("git "))).toBe(false);
+        expect(existsSync(stage === "journal" ? journal : f.intent)).toBe(true);
+      }
+    });
+  }
 
 test("executor inspection failure after bootout refuses checkout changes", async () => {
   const f = executorSetup(),

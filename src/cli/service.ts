@@ -141,12 +141,30 @@ export function mtplxPlist(workingDirectory = appDir): string {
   return plist(MTPLX_LABEL, args, {}, workingDirectory);
 }
 
-async function launchctl(args: string[], allowFail = true) {
-  return sh(["launchctl", ...args], { cwd: home, allowFail });
+export async function inspectService(label: string, command = sh, domain: "gui" | "user" = "gui") {
+  const service = `${domain}/${uid}/${label}`;
+  try {
+    const result = await command(["launchctl", "print", service], { cwd: home, allowFail: true });
+    if (!result.timedOut && result.exitCode === 0) return { state: "loaded" as const };
+    const output = `${result.stderr}\n${result.stdout}`;
+    const missing = `Could not find service "${label}" in domain for ${domain === "gui" ? "user gui" : "uid"}: ${uid}`;
+    if (!result.timedOut && result.exitCode === 113 && output.split("\n").includes(missing))
+      return { state: "absent" as const };
+    return {
+      state: "unknown" as const,
+      reason: `launchctl print ${service} failed (${result.timedOut ? "timed out, " : ""}exit ${result.exitCode}): ${output.trim() || "no output"}`,
+    };
+  } catch (error) {
+    return { state: "unknown" as const, reason: `launchctl print ${service} failed: ${error}` };
+  }
 }
 
-async function loaded(label: string): Promise<boolean> {
-  return (await launchctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
+class ServiceInspectionError extends Error {}
+
+async function serviceLoaded(label: string, command: typeof sh): Promise<boolean> {
+  const inspection = await inspectService(label, command);
+  if (inspection.state === "unknown") throw new ServiceInspectionError(inspection.reason);
+  return inspection.state === "loaded";
 }
 
 function samePath(a: unknown, b: string): boolean {
@@ -319,20 +337,7 @@ function executorControl(opts: ServiceOptions) {
   const intentPath = join(opts.lockPath ?? deployLock, "..", "executor-intent.json");
   const directory = join(opts.lockPath ?? deployLock, "..", "service-backup");
   const ctl = (args: string[]) => command(["launchctl", ...args], { cwd: home, allowFail: true });
-  const isLoaded = async (unit: ExecutorUnit) => {
-    const service = `gui/${uid}/${unit.label}`;
-    const result = await ctl(["print", service]);
-    if (result.exitCode === 0) return true;
-    if (
-      result.stderr
-        .split("\n")
-        .includes(`Could not find service "${unit.label}" in domain for user gui: ${uid}`)
-    )
-      return false;
-    throw new Error(
-      `launchctl print ${service} failed (${result.exitCode}): ${result.stderr || result.stdout}`,
-    );
-  };
+  const isLoaded = (unit: ExecutorUnit) => serviceLoaded(unit.label, command);
   const shutdownExecutor = async (unit: ExecutorUnit) => {
     const service = `gui/${uid}/${unit.label}`;
     try {
@@ -345,7 +350,8 @@ function executorControl(opts: ServiceOptions) {
       const result = await ctl(["disable", service]);
       if (result.exitCode !== 0) throw new Error(result.stderr);
     } catch (error) {
-      throw new Error(
+      const Failure = error instanceof ServiceInspectionError ? ServiceInspectionError : Error;
+      throw new Failure(
         `Executor ${unit.label} shutdown unconfirmed: ${error}. Recover with: launchctl bootout ${service}; launchctl disable ${service}; then rerun the command.`,
         { cause: error },
       );
@@ -418,7 +424,7 @@ export async function install(
   const recoveryExecutor = executorControl({ ...opts, command: raw });
   const ctl = async (args: string[]) =>
     (restoring ? raw : command)(["launchctl", ...args], { cwd: home, allowFail: true });
-  const isLoaded = async (label: string) => (await ctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
+  const isLoaded = (label: string) => serviceLoaded(label, restoring ? raw : command);
   const stop = async (label: string) => {
     if (!(await isLoaded(label))) return;
     const result = await ctl(["bootout", `gui/${uid}/${label}`]);
@@ -449,12 +455,16 @@ export async function install(
     const errors: string[] = [];
     await (async () => save({ ...state, phase: "rollback" }))().catch((e) => errors.push(String(e)));
     if (!executor)
-      for (const l of [state.label, state.old.label]) await stop(l).catch((e) => errors.push(String(e)));
+      for (const l of [state.label, state.old.label])
+        await stop(l).catch((error) => {
+          if (error instanceof ServiceInspectionError) throw error;
+          errors.push(String(error));
+        });
     await (async () => {
+      const startOld = !executor && (state.old.label === state.label || !(await isLoaded(state.old.label)));
       if (existsSync(state.path)) unlinkSync(state.path);
       writeFileSync(state.old.path, Buffer.from(state.backup, "base64"));
-      if (!executor && (state.old.label === state.label || !(await isLoaded(state.old.label))))
-        await start(state.old.path);
+      if (startOld) await start(state.old.path);
     })().catch((error) => errors.push(String(error)));
     if (errors.length) throw new Error(errors.join("; "));
     save({ ...state, phase: "restored" });
@@ -479,6 +489,7 @@ export async function install(
           throw new Error("pending migration");
         if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
       } catch (error) {
+        if (error instanceof ServiceInspectionError) throw error;
         await restore(state)
           .then(() => recovered.push(`${state.old.label}: ${String(error)}`))
           .catch((e) => failures.push(`Restoration failed for ${state.old.label}: ${e}`));
@@ -529,6 +540,7 @@ export async function install(
       if (state) save(Object.assign(state, { phase: "stopping" }));
       if (old) await race(label === EXECUTOR_LABEL ? executor.shutdownExecutor(old) : stop(old.label));
     } catch (error) {
+      if (error instanceof ServiceInspectionError) throw error;
       restoring = true;
       try {
         if (state && !(await isLoaded(state.old.label))) await restore(state);
@@ -547,6 +559,7 @@ export async function install(
       if (label === LABEL) await race(waitForHealthy(client, clock, target));
       if (state && label !== EXECUTOR_LABEL) clear(state);
     } catch (error) {
+      if (error instanceof ServiceInspectionError) throw error;
       try {
         restoring = true;
         if (state) await restore(state);
@@ -572,9 +585,11 @@ export async function install(
   await executor.finish();
 }
 
-export async function uninstall(): Promise<void> {
-  for (const { label, path } of await installedUnits()) {
-    if (await loaded(label)) await launchctl(["bootout", `gui/${uid}/${label}`], false);
+export async function uninstall(opts: ServiceOptions = {}): Promise<void> {
+  const command = opts.command ?? sh;
+  for (const { label, path } of await installedUnits(opts)) {
+    if (await serviceLoaded(label, command))
+      await command(["launchctl", "bootout", `gui/${uid}/${label}`], { cwd: home });
     unlinkSync(path);
     console.log(`removed ${label}`);
   }
@@ -958,11 +973,10 @@ export async function status(port: number, opts: ServiceOptions = {}, includeExe
   const dir = opts.releaseDir ?? appDir;
   for (const { label, kind } of await installedUnits(opts)) {
     if (!includeExecutor && kind === "executor") continue;
-    const result = await command(["launchctl", "print", `gui/${uid}/${label}`], {
-      cwd: home,
-      allowFail: true,
-    });
-    log(`${label}: ${result.exitCode === 0 ? "loaded" : "not loaded"}`);
+    const result = await inspectService(label, command);
+    log(
+      `${label}: ${result.state === "unknown" ? `unknown: ${result.reason}` : result.state === "loaded" ? "loaded" : "not loaded"}`,
+    );
   }
   if (existsSync(join(dir, ".git"))) {
     // This release repository is written only by the user/deployer, never by an agent.

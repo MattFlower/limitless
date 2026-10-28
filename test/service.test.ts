@@ -8,9 +8,42 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { installationUnits, stableExecutable } from "../src/cli/service.ts";
+import { inspectService, installationUnits, stableExecutable } from "../src/cli/service.ts";
+import { inspectionCases, inspectionResult } from "./service-inspection-support.ts";
+
+for (const domain of ["gui", "user"] as const)
+  for (const scenario of inspectionCases) {
+    test(`launchctl inspection: ${domain} ${scenario}`, async () => {
+      const label = "custom.executor";
+      const result = await inspectService(
+        label,
+        async (args) => {
+          expect(args).toEqual(["launchctl", "print", `${domain}/${userInfo().uid}/${label}`]);
+          return inspectionResult(scenario, label, domain);
+        },
+        domain,
+      );
+      expect(result.state).toBe(scenario === "loaded" || scenario === "absent" ? scenario : "unknown");
+      if (result.state === "unknown") {
+        expect(result.reason).toContain(`launchctl print ${domain}/${userInfo().uid}/${label} failed`);
+        expect(result.reason).toContain(
+          scenario.startsWith("timeout-")
+            ? "timed out"
+            : scenario === "signal"
+              ? "exit null"
+              : scenario === "empty"
+                ? "no output"
+                : scenario === "execution-error"
+                  ? "print could not execute"
+                  : scenario === "permission"
+                    ? "Operation not permitted"
+                    : "Could not find service",
+        );
+      }
+    });
+  }
 
 test("installation selects only explicitly requested rollback and tunnel agents", () => {
   for (const mtplx of [undefined, false, true])
@@ -122,12 +155,13 @@ async function migration(
   scenario: string,
   kind = "daemon",
   dir = mkdtempSync(join(tmpdir(), "limitless-service-migration-")),
+  inspectionCase = "",
 ) {
   migrationDirs.push(dir);
   const child = Bun.spawn([process.execPath, "test/service-migration-support.ts", scenario, kind], {
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, SERVICE_TEST_HOME: dir },
+    env: { ...process.env, SERVICE_TEST_HOME: dir, SERVICE_TEST_INSPECTION: inspectionCase },
   });
   const [stdout, stderr, code] = await Promise.all([
     new Response(child.stdout).text(),
@@ -433,6 +467,92 @@ test("status and uninstall recognize arbitrary installed labels", async () => {
   expect(r.calls).toEqual(["bootout arbitrary.installed.daemon"]);
   expect(r.files["daemon-original.plist"]).toBeUndefined();
   expect(r.files["unrelated.plist"]).toBe(r.unrelated);
+});
+
+for (const scenario of inspectionCases) {
+  test(`executor destination collision inspection: ${scenario}`, async () => {
+    const { result: r } = await migration("inspection-collision", "executor", undefined, scenario);
+    if (scenario === "absent") {
+      expect(r.error).toBe("");
+      expect(r.files["executor-original.plist"]).toBeUndefined();
+      expect(r.loaded).toContain("dev.limitless.executor");
+    } else {
+      expect(r.error).toContain(
+        scenario === "loaded" ? "unrecognized agent: dev.limitless.executor" : "launchctl print",
+      );
+      expect(r.files["executor-original.plist"]).toBe(r.old);
+      expect(r.files["dev.limitless.executor.plist"]).toBeUndefined();
+      expect(r.loaded).toContain("arbitrary.installed.executor");
+      expect(r.calls.some((c) => c.includes("executor"))).toBe(false);
+      expect(r.journals).toEqual([]);
+    }
+  });
+
+  if (!["loaded", "absent"].includes(scenario))
+    test(`executor old-label inspection preserves the plist: ${scenario}`, async () => {
+      const { result: r } = await migration("inspection-old", "executor", undefined, scenario);
+      expect(r.error).toContain("launchctl print");
+      expect(r.files["executor-original.plist"]).toBe(r.old);
+      expect(r.files["dev.limitless.executor.plist"]).toBeUndefined();
+      expect(r.calls.some((c) => c.includes("executor"))).toBe(false);
+      expect(r.state).toBe(true);
+      expect(
+        r.commands.filter((c) => c[1] === "print" && c[2]?.endsWith("/arbitrary.installed.executor")),
+      ).toHaveLength(1);
+    });
+
+  test(`executor uninstall inspection: ${scenario}`, async () => {
+    const { result: r } = await migration("inspection-uninstall", "executor", undefined, scenario);
+    if (["loaded", "absent"].includes(scenario)) {
+      expect(r.error).toBe("");
+      expect(r.files["executor-original.plist"]).toBeUndefined();
+      expect(r.calls).toEqual(scenario === "loaded" ? ["bootout arbitrary.installed.executor"] : []);
+    } else {
+      expect(r.error).toContain("launchctl print");
+      expect(r.files["executor-original.plist"]).toBe(r.old);
+      expect(r.loaded).toContain("arbitrary.installed.executor");
+      expect(r.calls).toEqual([]);
+    }
+  });
+
+  test(`executor status inspection: ${scenario}`, async () => {
+    const { result: r, stdout } = await migration("inspection-status", "executor", undefined, scenario);
+    const state = scenario === "loaded" ? "loaded" : scenario === "absent" ? "not loaded" : "unknown:";
+    expect(stdout).toContain(`arbitrary.installed.executor: ${state}`);
+    if (state === "unknown:") expect(stdout).toContain("launchctl print");
+    expect(r.error).toBe("");
+    expect(r.files["executor-original.plist"]).toBe(r.old);
+    expect(r.calls).toEqual([]);
+    expect(r.commands.filter((c) => c[0] === "launchctl")).toEqual([
+      ["launchctl", "print", `gui/${userInfo().uid}/arbitrary.installed.executor`],
+    ]);
+  });
+}
+
+for (const kind of ["daemon", "executor"])
+  test(`${kind} restoration preserves replacement and journal on an unknown inspection`, async () => {
+    const { result: r } = await migration("inspection-restore", kind, undefined, "permission");
+    expect(r.error).toContain("replacement bootstrap failed");
+    expect(r.error).toContain("Operation not permitted");
+    expect(r.state).toBe(true);
+    expect(r.phase).toBe("rollback");
+    expect(r.files[`${kind}-original.plist`]).toBeUndefined();
+    expect(r.files[`dev.limitless.${kind}.plist`]).toContain(`<string>dev.limitless.${kind}</string>`);
+    expect(r.backup).toBe(r.old);
+    expect(r.calls).not.toContain(`bootstrap arbitrary.installed.${kind}`);
+  });
+
+test("install retains its replacement and journal when reconciliation times out with exit zero", async () => {
+  const { result: r } = await migration("inspection-reconcile", "executor", undefined, "timeout-loaded");
+  expect(r.error).toContain("timed out, exit 0");
+  expect(r.state).toBe(true);
+  expect(r.phase).toBe("replacing");
+  expect(r.files["executor-original.plist"]).toBeUndefined();
+  expect(r.files["dev.limitless.executor.plist"]).toContain("<string>dev.limitless.executor</string>");
+  expect(r.backup).toBe(r.old);
+  expect(r.calls).toContain("enable dev.limitless.executor");
+  expect(r.calls).not.toContain("bootout dev.limitless.executor");
+  expect(r.calls).not.toContain("bootstrap dev.limitless.executor");
 });
 
 test("an already marked neutral unit is discovered and reinstalled with a drained restart", async () => {
