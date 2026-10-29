@@ -46,7 +46,6 @@ export async function createLeaseManager(deps: {
   const { client, store, clock, member, timer = { set: setInterval, clear: clearInterval } } = deps;
   const mutexes = new Map<string, Promise<unknown>>();
   const anchors = new Map<string, { tip: string; anchor: Anchor | null }>();
-  const handles = new Map<string, LeaseHandle>();
   const losses = new Map<string, { handle: LeaseHandle; tip: ClaimTip | null; delivered: boolean }>();
   let hooks: Hooks | undefined;
   const key = (repo: string, ref: string) => `${canonicalRepo(repo)}:${ref}`;
@@ -103,10 +102,11 @@ export async function createLeaseManager(deps: {
     const { h, patch = {}, release = false, signal } = options;
     return locked(repo, ref, async () => {
       if (h && !current(h)) return "obsolete";
-      let row = store.leaseRow(repo, ref);
-      if (row && row.runId !== want.run && (row.intent || row.confirmed?.state === "held")) return refused;
+      const authority = anchors.get(key(repo, ref));
       const settled = await reconcile(repo, ref, signal);
       if (settled === "pending") return wait;
+      let row = store.leaseRow(repo, ref);
+      if (row && row.runId !== want.run && row.confirmed?.state === "held") return refused;
       if (h && !current(h)) return settled === "superseded" ? "lost" : "obsolete";
       let moved = 0;
       let mine: number | undefined; // our generation a same-holder `moved` tip already carries
@@ -187,9 +187,10 @@ export async function createLeaseManager(deps: {
         if (result.kind === "applied") {
           const { generation, state } = record;
           store.confirmLease(repo, ref, { generation, tip: result.tip.sha, state });
-          anchors.set(key(repo, ref), { tip: result.tip.sha, anchor: result.anchor });
+          // A release invoked while this write awaited must keep its window closed.
+          if (anchors.get(key(repo, ref)) === authority)
+            anchors.set(key(repo, ref), { tip: result.tip.sha, anchor: result.anchor });
           const held: LeaseHandle = Object.freeze({ repo, ref, run: record.run, member, generation });
-          handles.set(key(repo, ref), held);
           return { kind: "held", handle: held, tip: result.tip };
         }
         store.dropLeaseIntent(repo, ref);
@@ -213,13 +214,14 @@ export async function createLeaseManager(deps: {
     });
   }
   async function mutate(h: LeaseHandle, patch: Patch, release = false) {
+    if (release && current(h)) anchors.set(key(h.repo, h.ref), { tip: "", anchor: null });
     const want: LeaseWant = { kind: "run", run: h.run, status: "running" };
     const result = await operate(canonicalRepo(h.repo), h.ref, want, false, { h, patch, release });
     if (typeof result === "string") return result;
     if (result.kind === "superseded") return "lost";
     return result.kind === "held" ? "applied" : "wait";
   }
-  const manager: LeaseManager = {
+  return {
     async acquire(repo, ref, want, opts, signal) {
       const result = await operate(canonicalRepo(repo), ref, want, opts.takeover, { signal });
       return typeof result === "string" ? refused : result;
@@ -239,10 +241,9 @@ export async function createLeaseManager(deps: {
       const id = timer.set(async () => {
         for (const row of store.leaseRowsWithIntent())
           await locked(row.repo, row.ref, () => reconcile(row.repo, row.ref));
-        for (const h of handles.values()) if (current(h) && next.active(h)) await manager.update(h, {});
+        for (const h of store.heldLeaseRows().map(handle)) if (next.active(h)) await mutate(h, {});
       }, LEASE.renewMs);
       return () => timer.clear(id);
     },
   };
-  return manager;
 }

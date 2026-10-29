@@ -135,16 +135,18 @@ async function race(unconditional: boolean, takeover: boolean) {
   };
   const results = await Promise.all([a.acquire(ma, takeover), b.acquire(mb, takeover)]);
   const winners = results.filter((r) => r.kind === "held");
-  expect(winners).toHaveLength(unconditional ? 2 : 1);
+  expect(winners).toHaveLength(1);
   for (const winner of winners) expect(held(winner).handle.generation).toBe(takeover ? 2 : 1);
-  if (!unconditional)
-    expect(results.find((r) => r.kind !== "held")).toMatchObject({ kind: "refused", reason: "live" });
+  expect(results.find((r) => r.kind !== "held")).toMatchObject({ kind: "refused", reason: "live" });
 }
-test.each(["CAS", "unconditional-ref-write mutant"])("concurrent create: %s", (mode) =>
-  race(mode !== "CAS", false),
+test.each(["create", "takeover"])("concurrent %s: CAS single winner", (mode) =>
+  race(false, mode === "takeover"),
 );
-test.each(["CAS", "unconditional-ref-write mutant"])("concurrent takeover: %s", (mode) =>
-  race(mode !== "CAS", true),
+test.each(["create", "takeover"])(
+  "concurrent %s: unconditional-ref-write mutant fails the same single-winner assertions",
+  async (mode) => {
+    await expect(race(true, mode === "takeover")).rejects.toThrow("toHaveLength");
+  },
 );
 
 test.each([
@@ -166,7 +168,7 @@ test.each([
   } else expect(f.raw()).toEqual(before);
 });
 
-test("fresh lineage refuses an old run still confirmed held or pending, byte-identically", async () => {
+test("fresh lineage protects confirmed ownership and reconciles pending intents first", async () => {
   for (const pending of [false, true]) {
     const f = fixture();
     const before = f.confirmed();
@@ -181,12 +183,11 @@ test("fresh lineage refuses an old run still confirmed held or pending, byte-ide
       });
     const snapshot = f.raw();
     const requests = f.gh.requests.length;
-    expect(await f.acquire(manager, true, { ...want, run: "run-b" })).toEqual({
-      kind: "refused",
-      reason: "live",
-    });
+    expect(await f.acquire(manager, true, { ...want, run: "run-b" })).toMatchObject(
+      pending ? { kind: "wait" } : { kind: "refused", reason: "live" },
+    );
     expect(f.raw()).toEqual(snapshot);
-    expect(f.gh.requests).toHaveLength(requests);
+    expect(f.gh.requests.slice(requests).map((r) => r.step)).toEqual(pending ? ["ref", "commitRead"] : []);
   }
 });
 
@@ -250,10 +251,12 @@ test("obsolete handles reject update, release and window checks before all reque
   });
   const snapshot = f.raw();
   const requests = f.gh.requests.length;
+  expect(manager.windowOpen(h2)).toBe(true);
   for (const stale of [h1, { ...h2, member: other }, { ...h2, run: "another-run" }]) {
     expect(await manager.update(stale, { status: "failed" })).toBe("obsolete");
     expect(await manager.release(stale)).toBe("obsolete");
     expect(manager.windowOpen(stale)).toBe(false);
+    expect(manager.windowOpen(h2)).toBe(true);
   }
   expect(f.raw()).toEqual(snapshot);
   expect(f.gh.requests).toHaveLength(requests);
@@ -640,4 +643,220 @@ test("reconciled release makes the old handle obsolete, without marking it lost"
   expect(await manager.update(h, {})).toBe("obsolete");
   expect(f.row()).toMatchObject({ confirmed: { state: "released" }, intent: null });
   expect(f.lost).not.toHaveBeenCalled();
+});
+
+test.each(["unconfirmed", "unchanged"] as const)(
+  "an ambiguous %s release closes the old holder's window before remote work",
+  async (mode) => {
+    const a = fixture();
+    const b = fixture(a.gh, other);
+    const ma = await a.create();
+    const mb = await b.create();
+    const h = held(await a.acquire(ma)).handle;
+    a.start(ma, false);
+    const entered = Promise.withResolvers<void>();
+    const unblock = Promise.withResolvers<void>();
+    let unreadable = false;
+    let applyLater: (() => void) | undefined;
+    a.gh.fault = async (r) => {
+      if (r.step === "update") {
+        applyLater = () => a.gh.apply(r);
+        entered.resolve();
+        await unblock.promise;
+        if (mode === "unconfirmed") {
+          applyLater();
+          unreadable = true;
+        }
+        throw new Error("Lost release response");
+      }
+      if (r.step === "ref" && unreadable) throw new Error("Unreadable");
+    };
+    const releasing = ma.release(h);
+    expect(ma.windowOpen(h)).toBe(false);
+    await entered.promise;
+    expect(ma.windowOpen(h)).toBe(false);
+    unblock.resolve();
+    expect(await releasing).toBe("wait");
+    expect(a.row()?.intent !== null).toBe(mode === "unconfirmed");
+    const snapshot = a.raw();
+    await a.tick();
+    expect(a.raw()).toEqual(snapshot);
+    expect(ma.windowOpen(h)).toBe(false);
+    a.gh.fault = undefined;
+    applyLater?.();
+    expect(held(await b.acquire(mb)).handle.generation).toBe(2);
+    expect(a.row()?.confirmed?.state).toBe("held");
+    expect(ma.windowOpen(h)).toBe(false);
+    expect(a.lost).not.toHaveBeenCalled();
+  },
+);
+
+test("release closes the window while reconciliation is pending; dropping the intent cannot reopen it", async () => {
+  const f = fixture();
+  const manager = await f.create();
+  const h = held(await f.acquire(manager)).handle;
+  f.start(manager, false);
+  let unreadable = false;
+  f.gh.fault = (r) => {
+    if (r.step === "update") {
+      unreadable = true;
+      throw new Error("Write not applied");
+    }
+    if (r.step === "ref" && unreadable) throw new Error("Unreadable");
+  };
+  expect(await manager.update(h, {})).toBe("wait");
+  expect(manager.windowOpen(h)).toBe(true);
+  const snapshot = f.raw();
+  const releasing = manager.release(h);
+  expect(manager.windowOpen(h)).toBe(false);
+  expect(await releasing).toBe("wait");
+  expect(f.raw()).toEqual(snapshot);
+  f.gh.fault = undefined;
+  await f.tick();
+  expect(f.row()).toMatchObject({ confirmed: { state: "held" }, intent: null });
+  expect(manager.windowOpen(h)).toBe(false);
+  expect(f.lost).not.toHaveBeenCalled();
+  expect(held(await f.acquire(manager)).handle).toEqual(h);
+  expect(f.times).toHaveLength(1);
+  expect(manager.windowOpen(h)).toBe(true);
+});
+
+test("an earlier in-flight renewal cannot reopen a window closed by release", async () => {
+  const f = fixture();
+  const manager = await f.create();
+  const h = held(await f.acquire(manager)).handle;
+  const entered = Promise.withResolvers<void>();
+  const unblock = Promise.withResolvers<void>();
+  const releaseEntered = Promise.withResolvers<void>();
+  const releaseUnblock = Promise.withResolvers<void>();
+  f.gh.fault = async (r) => {
+    if (r.step !== "commit") return;
+    if (f.gh.calls("commit").length === 2) {
+      entered.resolve();
+      await unblock.promise;
+    } else {
+      releaseEntered.resolve();
+      await releaseUnblock.promise;
+      throw new Error("Release commit failed");
+    }
+  };
+  const renewal = manager.update(h, {});
+  await entered.promise;
+  const releasing = manager.release(h);
+  expect(manager.windowOpen(h)).toBe(false);
+  unblock.resolve();
+  expect(await renewal).toBe("applied");
+  await releaseEntered.promise;
+  expect(manager.windowOpen(h)).toBe(false);
+  releaseUnblock.resolve();
+  expect(await releasing).toBe("wait");
+  expect(manager.windowOpen(h)).toBe(false);
+});
+
+test.each(["confirmed", "recovered acquisition", "loop-reconciled acquisition"] as const)(
+  "renewal discovers %s without reacquisition or a manufactured anchor",
+  async (mode) => {
+    const f = fixture();
+    const tip = f.gh.seed(record);
+    f.store.beginLeaseIntent("Owner/Project", ref, want.run, {
+      op: "acquire",
+      before: "0".repeat(40),
+      record,
+      commit: tip.sha,
+    });
+    if (mode === "confirmed") f.store.confirmLease(repo, ref, { generation: 1, tip: tip.sha, state: "held" });
+    if (mode === "loop-reconciled acquisition")
+      f.gh.fault = (r) => {
+        if (r.step === "ref") throw new Error("Unreadable");
+      };
+    const manager = await f.create();
+    const h = { repo, ref, run: want.run, member, generation: 1 };
+    expect(manager.windowOpen(h)).toBe(false);
+    f.start(manager);
+    f.advance(LEASE.renewMs);
+    f.gh.fault = undefined;
+    // Reconciliation and candidate registration must not supply a time anchor.
+    f.usable(false);
+    await f.tick();
+    expect(f.row()).toMatchObject({ confirmed: { generation: 1, state: "held" }, intent: null });
+    expect(f.gh.calls("update")).toHaveLength(0);
+    expect(manager.windowOpen(h)).toBe(false);
+    f.usable(true);
+    f.gh.fault = (r) => {
+      if (r.step === "commit" && f.gh.calls("commit").length === 1) f.advance(5_000, true);
+      if (r.step === "update") expect(f.times).toHaveLength(3);
+    };
+    await f.tick();
+    expect(f.gh.calls("commit")).toHaveLength(2);
+    expect(f.gh.calls("update")).toHaveLength(1);
+    expect(f.row()).toMatchObject({ confirmed: { generation: 1, state: "held" }, intent: null });
+    expect(manager.windowOpen(h)).toBe(true);
+  },
+);
+
+test.each([false, true])(
+  "the first tick renews a recovered acquisition (pending at start: %s)",
+  async (pending) => {
+    const f = fixture();
+    const tip = f.gh.seed(record);
+    f.store.beginLeaseIntent(repo, ref, want.run, {
+      op: "acquire",
+      before: "0".repeat(40),
+      record,
+      commit: tip.sha,
+    });
+    if (pending)
+      f.gh.fault = (r) => {
+        if (r.step === "ref") throw new Error("Unreadable");
+      };
+    const manager = await f.create();
+    f.start(manager);
+    f.advance(LEASE.renewMs);
+    f.gh.fault = undefined;
+    await f.tick();
+    expect(f.row()).toMatchObject({ confirmed: { generation: 1, state: "held" }, intent: null });
+    expect(f.gh.calls("update")).toHaveLength(1);
+  },
+);
+
+test("the first renewal tick renews recovered ownership only when active", async () => {
+  const f = fixture();
+  f.confirmed();
+  const manager = await f.create();
+  const seen = mock((h: LeaseHandle) => h.ref === ref);
+  const stop = manager.start({ active: seen, onLost: f.lost });
+  cleanup.push(stop);
+  f.advance(LEASE.renewMs);
+  await f.tick();
+  expect(seen).toHaveBeenCalledWith({ repo, ref, run: want.run, member, generation: 1 });
+  expect(f.gh.calls("update")).toHaveLength(1);
+  expect(f.tip().generation).toBe(1);
+  stop();
+  f.start(await f.create(), false);
+  f.advance(LEASE.renewMs);
+  await f.tick();
+  expect(f.gh.calls("update")).toHaveLength(1);
+});
+
+test("run B reconciles run A's unapplied pending acquisition before acquiring", async () => {
+  const f = fixture();
+  const manager = await f.create();
+  let unreadable = false;
+  f.gh.fault = (r) => {
+    if (r.step === "update") {
+      unreadable = true;
+      throw new Error("Write not applied");
+    }
+    if (r.step === "ref" && unreadable) throw new Error("Unreadable");
+  };
+  expect((await f.acquire(manager)).kind).toBe("wait");
+  expect(f.row()).toMatchObject({ confirmed: null, intent: { op: "acquire" } });
+  const snapshot = f.raw();
+  const next = { ...want, run: "run-b" };
+  expect((await f.acquire(manager, false, next)).kind).toBe("wait");
+  expect(f.raw()).toEqual(snapshot);
+  expect(f.lost).not.toHaveBeenCalled();
+  f.gh.fault = undefined;
+  expect(held(await f.acquire(manager, false, next)).handle.generation).toBe(1);
+  expect(f.row()).toMatchObject({ runId: "run-b", confirmed: { state: "held" }, intent: null });
 });

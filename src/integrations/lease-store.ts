@@ -88,6 +88,8 @@ export function leaseMethods(store: Store) {
     }),
     leaseRowsWithIntent: () =>
       store.db.transaction(() => rows("WHERE intent_op IS NOT NULL ORDER BY repo,ref")).immediate(),
+    heldLeaseRows: () =>
+      store.db.transaction(() => rows("WHERE confirmed_state='held' ORDER BY repo,ref")).immediate(),
   };
 }
 type Deps = { client: ClaimClient; store: Store; signal?: AbortSignal };
