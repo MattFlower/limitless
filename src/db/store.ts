@@ -62,6 +62,7 @@ import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
 import { type ProcessCleanup, type ProcessDiscovery, redactCredentials } from "../util/proc.ts";
 import { activity } from "../util/stall.ts";
+import { FailureObservations, type ObservationFilter } from "./failure-observations.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
 
@@ -517,6 +518,10 @@ function buildUpdate(patch: object, columns: Record<string, string>): { sets: st
 }
 
 export class Store {
+  readonly observations = new FailureObservations(this);
+  failureObservations(filter: ObservationFilter = {}) {
+    return this.observations.read(filter);
+  }
   readonly db: Database;
   private listeners = new Set<Listener>();
   private pendingPublications: StreamMessage[] | null = null;
@@ -855,13 +860,13 @@ export class Store {
   }
 
   /** Buffer publications until the outermost store transaction commits; discard them on rollback. */
-  transaction<T>(fn: () => T): T {
+  transaction<T>(fn: () => T, immediate = false): T {
     if (this.pendingPublications) return fn();
     const messages: StreamMessage[] = [];
     this.pendingPublications = messages;
     let result: T;
     try {
-      result = this.db.transaction(fn)();
+      result = this.db.transaction(fn)[immediate ? "immediate" : "deferred"]();
     } finally {
       this.pendingPublications = null;
     }
@@ -2262,8 +2267,16 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     state?: unknown,
     excludeFromSupersession: readonly string[] = [],
   ): Run {
-    if (patch.merged && !this.pendingPublications)
-      return this.transaction(() => this.updateRun(id, patch, state, excludeFromSupersession));
+    const terminal = patch.status && TERMINAL_STATUSES.includes(patch.status);
+    if ((patch.merged || terminal) && !this.pendingPublications)
+      return this.transaction(() => this.applyRunUpdate(id, patch, state, excludeFromSupersession), true);
+    return this.applyRunUpdate(id, patch, state, excludeFromSupersession);
+  }
+
+  private applyRunUpdate(
+    ...[id, patch, state, excludeFromSupersession = []]: Parameters<Store["updateRun"]>
+  ): Run {
+    if (patch.status && TERMINAL_STATUSES.includes(patch.status)) this.observations.finalize(id);
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);
     if (state !== undefined) {
       sets.push("state_json = ?");

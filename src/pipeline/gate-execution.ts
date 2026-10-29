@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { StageName } from "../core/types.ts";
-import { WorkerStore } from "../db/workers.ts";
+import { hostLoadPerCore, WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import {
   cancelGateExecution,
@@ -10,13 +10,83 @@ import {
   gateShutdown,
 } from "../gates/executor.ts";
 import { lanExecutor } from "../gates/lan.ts";
-import type { GateHooks, GateRun } from "../gates/run.ts";
-import { gateEnv } from "../gates/run.ts";
+import { redactGateOutput } from "../gates/output.ts";
+import type { GateHooks, GateResult, GateRun } from "../gates/run.ts";
+import { confinementFailed, gateEnv } from "../gates/run.ts";
 import { checkoutCommitted, headSha } from "../git/repos.ts";
 import { withCommandScratch } from "../harness/sandbox.ts";
 import { removeScratch, withScratch } from "../harness/scratch.ts";
+import { ciSignature } from "../integrations/ci-classifier.ts";
 import { invocationScratch } from "../util/proc.ts";
 import type { RunContext } from "./context.ts";
+
+/**
+ * A LAN identity alone does not prove remote execution: it can finish locally.
+ * Locality is structural, never inferred from the name: a worker may be called "coordinator".
+ */
+export function executionSite(ctx: RunContext, handle: ExecutionHandle) {
+  const job = handle.kind === "local" ? null : new WorkerStore(ctx.store, ctx.deps.buildSha).job(handle.id);
+  const coordinator = { location: "coordinator", remote: false, job } as const;
+  if (handle.kind === "local" || handle.kind === "inplace") return coordinator;
+  const unknown = { location: null, remote: false, job } as const;
+  if (handle.kind !== "lan" || !job || job.run_id !== ctx.run.id) return unknown;
+  if (job.failure_reason || job.setup_fallback) return coordinator;
+  return job.state === "done" && !job.in_place && job.worker
+    ? ({ location: job.worker, remote: true, job } as const)
+    : unknown;
+}
+
+export function executionLocation(ctx: RunContext, handle: ExecutionHandle): string | null {
+  return executionSite(ctx, handle).location;
+}
+
+function observe(ctx: RunContext, handle: ExecutionHandle, result: GateRun, sha: string): void {
+  const failed = (r: GateResult) =>
+    !r.reused && r.docsOnly?.mode !== "skipped" && (!r.ok || r.timedOut || confinementFailed(r));
+  if (![...result.setup, ...result.checks].some(failed)) return;
+  // Only a run's gates stage is observed; a direct call outside one has no stage to attribute.
+  const stageId = ctx.stageId;
+  if (stageId === undefined) return;
+  const { location, remote, job } = executionSite(ctx, handle);
+  const coordinator = !remote && location !== null;
+  const os = coordinator ? process.platform : remote ? (job?.worker_os ?? null) : null;
+  const load = coordinator ? (ctx.deps.loadSource ?? hostLoadPerCore)() : null;
+  ctx.store.transaction(() => {
+    for (const phase of ["setup", "check"] as const) {
+      for (const r of phase === "setup" ? result.setup : result.checks) {
+        const confinement = confinementFailed(r);
+        if (!failed(r)) continue;
+        const name = redactGateOutput(r.name),
+          command = redactGateOutput(r.command);
+        const output = redactGateOutput(r.output).slice(-6000);
+        ctx.store.observations.insert({
+          run_id: ctx.run.id,
+          repo: ctx.repo.slug,
+          stage_id: stageId,
+          round: ctx.state.round,
+          sha,
+          handle_kind: handle.kind,
+          handle_id: handle.id,
+          phase,
+          name,
+          command,
+          location: location === null ? null : redactGateOutput(location),
+          os,
+          load_per_core: load,
+          observed_at: Date.now(),
+          exit_code: r.exitCode,
+          timed_out: Number(!!r.timedOut),
+          confinement: Number(confinement),
+          duration_ms: r.durationMs,
+          failed_files: JSON.stringify((r.failedFiles ?? []).map(redactGateOutput)),
+          output_tail: output,
+          signature: ciSignature(name, output, command).signature,
+          setup_eligible: Number((phase === "setup" || r.exitCode === 127) && !confinement),
+        });
+      }
+    }
+  }, true);
+}
 
 /** The daemon owns scratch across detachment, reattachment and the stage's retries. */
 export function gateCommandScope<T>(
@@ -33,7 +103,9 @@ export function gateCommandScope<T>(
     const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
     return withScratch(cwd, (dir) => withCommandScratch(cwd, fn, dir), {
       existing: scratch,
-      keep: () => gateShutdown(ctx.signal) && ctx.state.gateExecution?.handle.kind === "inplace",
+      // An interrupted save can leave a replayable handle ahead of the in-memory state.
+      keep: () =>
+        ctx.store.getRunState<RunContext["state"]>(ctx.run.id)?.gateExecution?.handle.kind === "inplace",
     });
   };
 }
@@ -56,6 +128,7 @@ export async function resumeGateExecution(
   sha ??= await headSha(cwd);
   const stored =
     pending?.stage === stage &&
+    pending.handle.kind !== "local" &&
     pending.round === round &&
     (pending.purpose === purpose ||
       (preserveSequence && pending.previous?.some((attempt) => attempt.purpose === purpose))) &&
@@ -167,8 +240,13 @@ export async function runGateExecution(
         settled = true;
       },
     );
-    ctx.checkCancelled();
+    // Preserve the handle if the result has not reached its evidence checkpoint.
+    settled = false;
+    await ctx.faults.hit("gate:executed", { runId: ctx.run.id, stage, round }, ctx.signal);
     const handle = stored ?? ctx.state.gateExecution?.handle;
+    if (handle && stage === "gates" && purpose === "initial") observe(ctx, handle, result, sha);
+    settled = true;
+    ctx.checkCancelled();
     if (handle) onExecuted?.(handle, result);
     return result;
   } finally {
