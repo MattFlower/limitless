@@ -67,6 +67,20 @@ test("complete decoded checks precede overlapping credential replacement and ter
   expect(
     await protectText({ text: "\x1b[31mclean\x1b[0m", policy: p, provenance, terminal: true }),
   ).toMatchObject({ text: "clean", withheld: false, truncated: false, checkedComplete: true });
+  // Refused terminal text measures clipping on the visible rendering the cut would see.
+  for (const [limit, truncated] of [
+    [12, false],
+    [11, true],
+  ] as const) {
+    for (const text of ["host.example", "\x1b[31mhost.example\x1b[0m"]) {
+      const cut = { unit: "U", from: "start", limit } as const;
+      expect(await protectText({ text, policy, provenance, terminal: true, cut })).toMatchObject({
+        text: WITHHELD,
+        reason: "private-match",
+        truncated,
+      });
+    }
+  }
 });
 
 test("actual clipping, provenance, immutable issuance and digest checks", async () => {
@@ -297,6 +311,13 @@ test("batched recursive and JSON adapters protect keys, values, numbers and sibl
   expect(await protectData(JSON.parse('{"__proto__":{"a":"clean"}}'), provenance, p)).toEqual(
     JSON.parse('{"__proto__":{"a":"clean"}}'),
   );
+  // Inherited graphs are refused before enumeration rather than walked and discarded.
+  expect(await protectData({ ok: Object.create({ inherited: "host.example" }) }, provenance, p)).toBe(
+    WITHHELD,
+  );
+  expect(await protectData(Object.assign(Object.create(null), { a: "clean" }), provenance, p)).toEqual({
+    a: "clean",
+  });
 });
 
 test("adapter field refusals and transformed-key collisions stay local", async () => {

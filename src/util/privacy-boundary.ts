@@ -49,6 +49,14 @@ async function* jsonPieces(value: unknown): AsyncGenerator<string> {
     } else if (v === null || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) {
       yield String(v);
     } else if (typeof v === "object" && v && !ancestors.has(v) && ancestors.size < 128) {
+      // Only plain objects and arrays: no inherited enumerable graph to walk before refusing.
+      const prototype = Object.getPrototypeOf(v);
+      if (
+        Array.isArray(v)
+          ? prototype !== Array.prototype
+          : prototype !== Object.prototype && prototype !== null
+      )
+        throw new Error("resource-refusal");
       ancestors.add(v);
       yield Array.isArray(v) ? "[" : "{";
       let first = true;
@@ -60,7 +68,11 @@ async function* jsonPieces(value: unknown): AsyncGenerator<string> {
         }
       } else {
         for (const name in v) {
-          if (!Object.hasOwn(v, name)) continue;
+          if (!Object.hasOwn(v, name)) {
+            // Discarded (polluted) names still pass the yield and elapsed-time checks below.
+            yield "";
+            continue;
+          }
           if (!first) yield ",";
           first = false;
           yield* tokens(name);
@@ -77,7 +89,7 @@ async function* jsonPieces(value: unknown): AsyncGenerator<string> {
   for (const token of tokens(value)) {
     batch += token;
     if (batch.length >= CHUNK || performance.now() - start >= 4) {
-      yield batch;
+      if (batch) yield batch;
       batch = "";
       await turn();
       start = performance.now();

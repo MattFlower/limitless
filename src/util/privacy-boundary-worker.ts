@@ -134,28 +134,35 @@ async function run(request: Request) {
         withheld: false,
       };
       const deny = (reason: Refusal) => ({ text: WITHHELD, metadata: { ...state, withheld: true, reason } });
+      const render = () =>
+        request.terminal ? terminal(raw, policy.credentials) : policy.credentials.redact(raw);
+      let measured = false;
+      // Actual clipping is measured on the rendering the cut would see, even when a check refuses
+      // first; that rendering is only measured, never returned.
+      const refuse = (reason: Refusal) => {
+        if (!measured && request.cut && sourceLength(render(), request.cut.unit) > request.cut.limit)
+          state.truncated = true;
+        return deny(reason);
+      };
       try {
         if (!raw.isWellFormed()) return deny("invalid-input-encoding");
         if (request.mode === "cut") {
+          measured = true;
           const cut = cutText(raw, request.cut);
           if (cut.clipped) state.truncated = true;
           const reason = check(cut.text, state.truncated === true);
           return reason ? deny(reason) : { text: cut.text, metadata: state };
         }
-        // Determine actual clipping even if a prior check refuses the value.
-        if (request.cut && sourceLength(raw, request.cut.unit) > request.cut.limit) state.truncated = true;
         let reason = check(raw, request.truncated === true);
-        if (reason) return deny(reason);
+        if (reason) return refuse(reason);
         state.checkedComplete ||= request.truncated === false;
         const visible = request.terminal ? terminal(raw, EMPTY) : raw;
         if (visible !== raw) {
           reason = check(visible, request.truncated === true);
-          if (reason) return deny(reason);
+          if (reason) return refuse(reason);
         }
-        const redacted = request.terminal
-          ? terminal(raw, policy.credentials)
-          : policy.credentials.redact(raw);
-        const cut = cutText(redacted, request.cut);
+        measured = true;
+        const cut = cutText(render(), request.cut);
         state.truncated = request.truncated === true || cut.clipped ? true : request.truncated;
         if (cut.text !== raw || request.truncated === true) {
           reason = check(cut.text, state.truncated === true);
@@ -163,7 +170,9 @@ async function run(request: Request) {
         }
         return { text: cut.text, metadata: state };
       } catch (error) {
-        return deny(error instanceof PrivateResourceError ? "resource-refusal" : "checker-unavailable");
+        return error instanceof PrivateResourceError
+          ? refuse("resource-refusal")
+          : deny("checker-unavailable");
       }
     };
     if (request.mode === "text" || request.mode === "cut") {
