@@ -1,13 +1,7 @@
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import type { Run } from "../core/types.ts";
-import {
-  CommentProcessed,
-  ISSUE_CLAIM_STATUSES,
-  type IssueRunObservation,
-  type IssueRunSummary,
-  linkedIssues,
-} from "../db/store.ts";
+import { CommentProcessed, ISSUE_CLAIM_STATUSES, type IssueRunSummary, linkedIssues } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
 import { commentRunRequest, type GhRunner, issueRunRequest, runGh } from "./github.ts";
@@ -241,24 +235,31 @@ export function startIssueQueue(
       [];
     const snapshots = new Map<string, Map<number, IssueRunSummary>>();
     try {
-      const decision = (run: IssueRunObservation) => {
-        const issues = linkedIssues(run, factory.store)
-          .map((i) => issueKey(i.repo, i.number))
-          .sort();
-        return { issues, state: JSON.stringify([run.status, run.finishedAt, issues]) };
-      };
-      const observed = new Map(factory.store.issueRunObservations().map((run) => [run.id, decision(run)]));
       unsubscribe = factory.store.subscribe((msg) => {
         if (msg.kind !== "run") return;
-        const previous = observed.get(msg.run.id);
-        const current = decision(msg.run);
-        observed.set(msg.run.id, current);
-        if (previous?.state !== current.state)
-          for (const key of [...(previous?.issues ?? []), ...current.issues]) invalidated.add(key);
+        const run = msg.run;
+        const issues = linkedIssues(run, factory.store);
+        const links = new Set(issues.map((i) => issueKey(i.repo, i.number)));
+        for (const [repo, latest] of snapshots) {
+          for (const [number, summary] of latest) {
+            const key = issueKey(repo, number);
+            const state =
+              summary.id === run.id ? summary : summary.ownerId === run.id ? summary.ownerState : undefined;
+            if (
+              (state && (state.status !== run.status || state.finishedAt !== run.finishedAt)) ||
+              ((summary.id === run.id || summary.ownerId === run.id) && !links.has(key))
+            )
+              invalidated.add(key);
+          }
+        }
+        // Missing snapshots retain conservative invalidation; existing ones compare only linked candidates.
+        for (const { repo, number } of issues) {
+          const summary = snapshots.get(repo.toLowerCase())?.get(number);
+          if (summary?.id !== run.id && summary?.ownerId !== run.id) invalidated.add(issueKey(repo, number));
+        }
       });
       await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log, opts.lifecycle);
-      for (const configuredRepo of q.repos) {
-        const repo = configuredRepo.toLowerCase();
+      for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
         const end = beginActivity("issue-queue.repository");
         try {
@@ -278,7 +279,7 @@ export function startIssueQueue(
           // Validate every page before consuming commands.
           do {
             const data = await query(
-              configuredRepo,
+              repo,
               `issues(first:100, states:OPEN, orderBy:{field:CREATED_AT,direction:ASC}${after ? `, after:${JSON.stringify(after)}` : ""}) { pageInfo { hasNextPage endCursor } nodes { ${ISSUE_FIELDS} } }`,
             );
             const page = z
@@ -319,7 +320,7 @@ export function startIssueQueue(
             repo,
             issues.nodes.map((i) => i.number),
           );
-          snapshots.set(repo, latest);
+          snapshots.set(repo.toLowerCase(), latest);
           for (const issue of issues.nodes) {
             for (const c of boundary && issue.state === "OPEN" ? issue.comments.nodes : []) {
               const author = c.author?.login;
@@ -396,7 +397,7 @@ export function startIssueQueue(
         const current = issueEligibility(issue, q.trusted, {
           blockers: states,
           claim: factory.store.issueClaim(repo, issue.number),
-          ...latestContext(repo, issue.number, snapshots.get(repo)?.get(issue.number)),
+          ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
         });
         const reason = changedDuringPoll(repo, issue.number) ?? (!current.eligible ? current.reason : null);
         if (reason) {
@@ -410,7 +411,7 @@ export function startIssueQueue(
           if (deferred) return deferred;
           const eligibility = issueEligibility(issue, q.trusted, {
             blockers: states,
-            ...latestContext(repo, issue.number, snapshots.get(repo)?.get(issue.number)),
+            ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
           });
           if (!eligibility.eligible) return eligibility.reason;
           const active = factory.store.listRuns({
