@@ -3451,8 +3451,14 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     }
     sets.push("updated_at = ?");
     values.push(Date.now());
-    this.db.query(`UPDATE land_entries SET ${sets.join(", ")} WHERE id = ?`).run(...(values as never[]), id);
-    return this.getLandEntry(id) as LandEntry;
+    return this.transaction(() => {
+      this.db
+        .query(`UPDATE land_entries SET ${sets.join(", ")} WHERE id = ?`)
+        .run(...(values as never[]), id);
+      if (patch.state && ["landed", "blocked", "cancelled"].includes(patch.state))
+        this.observations.finalize(`land:${id}`);
+      return this.getLandEntry(id) as LandEntry;
+    });
   }
 
   /** Orders observation requests and approval waits across processes and restarts. */

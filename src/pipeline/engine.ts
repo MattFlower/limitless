@@ -3504,6 +3504,16 @@ async function mergeForDelivery(
               run.checks.some((r) => r.timedOut) &&
               run.checks.every((r) => r.ok || r.timedOut || r.docsOnly?.mode === "skipped");
             let after = await execute("rebase", docs.gates);
+            const observedHandles = ctx.store
+              .failureObservations({ finalized: false })
+              .filter(
+                (r) =>
+                  r.run_id === ctx.run.id &&
+                  r.purpose === "rebase" &&
+                  r.sha === sha &&
+                  r.stage_id === ctx.stageId,
+              )
+              .map((r) => r.handle_id);
             ctx.checkCancelled();
             if (timeoutOnly(after)) {
               const first = after;
@@ -3557,7 +3567,17 @@ async function mergeForDelivery(
                   fallbackSetup: docs.gates.setup,
                 }),
               ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
-              (c) => isSlowRegression(c, initial, reference?.checks ?? []),
+              (c) => {
+                const slow = isSlowRegression(c, initial, reference?.checks ?? []);
+                if (slow)
+                  for (const handle of observedHandles)
+                    ctx.store.db
+                      .query(
+                        "UPDATE failure_observations SET slow_regression=1 WHERE run_id=? AND handle_id=? AND purpose='rebase' AND phase='check' AND name=?",
+                      )
+                      .run(ctx.run.id, handle, redactGateOutput(c.name));
+                return slow;
+              },
             );
             ctx.checkCancelled();
             for (const c of comparison) {
@@ -3586,6 +3606,15 @@ async function mergeForDelivery(
         const { setupOk, timedOut, comparison } = checked;
         await confirmPostMerge(ctx, cwd, docs.gates, comparison, attempt.deadline, sha, () =>
           ctx.save("post-merge-confirmed"),
+        );
+        await ctx.save("post-merge-confirmed", () =>
+          ctx.store.observations.finalize(ctx.run.id, {
+            round: ctx.state.round,
+            sha,
+            stageId: ctx.stageId ?? 0,
+            purpose: "rebase",
+            comparisons: comparison,
+          }),
         );
         ctx.checkCancelled();
         for (const c of comparison) {

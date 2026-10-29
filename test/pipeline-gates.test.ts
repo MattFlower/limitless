@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { GateComparison } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
+import { ciSignature } from "../src/integrations/ci-classifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import * as proc from "../src/util/proc.ts";
@@ -131,6 +132,29 @@ describe("pipeline (fake agents, real git + gates)", () => {
         f.store.getArtifact(run.id, "gates-rebase-0.json") ?? "[]",
       );
       const check = saved?.result?.comparison[0] ?? evidence[0];
+      const observations = f.store.failureObservations().filter((r) => r.purpose === "rebase");
+      expect(observations).toHaveLength(1);
+      expect(observations[0]?.finalized_at).toBeNumber();
+      if (scenario === "pass")
+        expect(observations[0]).toMatchObject({
+          class: "unclassified",
+          history: "confirmed_passed",
+          reason: "worker OS unknown",
+          slow_regression: 1,
+        });
+      if (scenario === "fail")
+        expect(observations[0]).toMatchObject({
+          class: "regression",
+          history: "confirmed_failed",
+          slow_regression: 1,
+        });
+      if (scenario === "slot deadline")
+        expect(observations[0]).toMatchObject({
+          class: "unclassified",
+          history: "confirmation_unavailable",
+          reason: expect.stringContaining("deadline expired"),
+        });
+      expect(observations[0]?.output_tail).not.toContain("coordinator assertion detail");
       expect(check?.blocking).toBe(scenario !== "pass");
       expect(check?.verdict).toBe(scenario === "pass" ? "flaky" : "regressed");
       expect(check?.result.ok).toBe(scenario === "pass");
@@ -676,6 +700,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (postMerge && (command === "fake-test" || command.startsWith("fake-targeted"))) {
         if (command === "fake-test") testAttempts++;
         if (slow && (testAttempts > 1 || command.startsWith("fake-targeted"))) {
+          expect(f.store.failureObservations().filter((r) => r.purpose === "rebase")).toMatchObject([
+            { slow_regression: 1, finalized_at: null },
+          ]);
           expect(readFileSync(join(cwd, "slow-build-output"), "utf8")).toBe("built\n");
           retryPurposes.push(f.store.getRunState<RunState>(runId)?.gateExecution?.purpose ?? "missing");
           if (scenario === "slow pass") {
@@ -768,7 +795,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
           command === "fake-test" &&
           (!postMerge || slow || (scenario === "retry failure" && testAttempts === 2))
             ? postMerge
-              ? 400_000
+              ? scenario === "slow pass" && testAttempts > 1
+                ? 1
+                : 400_000
               : 100_000
             : timeout
               ? (opts.timeoutMs ?? 900_000)
@@ -840,6 +869,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
           expect(evidence[0]?.firstAttempt).toMatchObject({ timedOut: true, exitCode: null });
       }
       if (slow) {
+        if (scenario === "slow pass")
+          expect(f.store.failureObservations().filter((r) => r.purpose === "rebase")).toMatchObject([
+            { class: "load", history: "retry_passed", slow_regression: 1 },
+          ]);
         const recovered = !["slow twice", "slow confinement", "slow dirty"].includes(scenario);
         expect(evidence[0]).toMatchObject({
           verdict: recovered ? "flaky" : scenario === "slow confinement" ? "confinement_error" : "regressed",
@@ -1048,3 +1081,71 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(readFileSync(count, "utf8").trim().split("\n").length).toBe(3);
   });
 });
+
+test.each([process.platform, process.platform === "linux" ? "darwin" : "linux", null])(
+  "post-merge observations retain worker evidence across confirmation and restart (OS %s)",
+  async (workerOs) => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]\n',
+    );
+    await sh(["git", "commit", "-qam", "observation fixture"], { cwd: repoDir });
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") {
+        await advanceBase(bare, "base.txt", "base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    const fixture = postMergeWorkerFixture(f);
+    const attach = f.deps.gateExecutor?.attach;
+    if (!attach || !f.deps.gateExecutor) throw new Error("missing executor");
+    f.deps.gateExecutor = {
+      ...f.deps.gateExecutor,
+      attach(...args) {
+        const execution = attach(...args);
+        return {
+          ...execution,
+          result: execution.result.then((result) => {
+            f.store.db.query("UPDATE gate_jobs SET worker_os=? WHERE id=?").run(workerOs, args[0].id);
+            return result;
+          }),
+        };
+      },
+    };
+    f.deps.faults = {
+      "store:save": { action: "throw", when: (c) => c.checkpoint === "post-merge-confirmed" },
+    };
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("queued");
+      const before = f.store.failureObservations().filter((r) => r.purpose === "rebase");
+      expect(before).toHaveLength(1);
+      expect(before[0]).toMatchObject({ os: workerOs, slow_regression: 1, finalized_at: null });
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
+      const after = f.store.failureObservations().filter((r) => r.purpose === "rebase");
+      expect(after).toHaveLength(1);
+      expect(after[0]).toMatchObject({
+        id: before[0]?.id,
+        class: workerOs === null ? "unclassified" : workerOs === process.platform ? "flaky" : "platform",
+        reason: workerOs === null ? "worker OS unknown" : null,
+        history: "confirmed_passed",
+        slow_regression: 1,
+        signature: before[0]?.signature,
+        output_tail: before[0]?.output_tail,
+      });
+      expect(after[0]?.finalized_at).toBeNumber();
+      expect(after[0]?.output_tail).toBe("[withheld: private text]");
+      expect(after[0]?.signature).toBe(ciSignature("test", "[withheld: private text]", "bun test").signature);
+      expect(after[0]?.output_tail).not.toContain("1 pass");
+      await executeRun(f.deps, run.id, new AbortController().signal);
+      expect(f.store.failureObservations().filter((r) => r.purpose === "rebase")).toEqual(after);
+    } finally {
+      fixture.processSpy.mockRestore();
+    }
+  },
+);

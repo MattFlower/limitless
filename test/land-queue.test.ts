@@ -654,6 +654,16 @@ test("a passing LAN land retry that rewrites tracked files remains blocked", asy
   const completed = store.getLandEntry(entry.id);
   expect(completed).toMatchObject({ state: "blocked", pushedSha: null });
   expect(completed?.reason).not.toContain("flaky");
+  expect(store.failureObservations()).toMatchObject([
+    {
+      purpose: "land",
+      class: "regression",
+      history: "retry_rejected",
+      handle_id: `${entry.id}:1`,
+      interim: 0,
+    },
+  ]);
+  expect(store.failureObservations()[0]?.finalized_at).toBeNumber();
   const log = readFileSync(completed?.logPath ?? "", "utf8");
   expect(log).toContain("Retry rejected:");
   expect(log).toContain('tracked files changed: ["README.md"]');
@@ -684,6 +694,12 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
   const summary = `flaky: test (${retryFile}); other (README.md)`;
   expect(store.getLandEntry(entry.id)?.reason).toBe(summary);
+  expect(store.failureObservations()).toHaveLength(2);
+  expect(
+    store
+      .failureObservations()
+      .every((r) => r.class === "flaky" && r.history === "retry_passed" && r.finalized_at !== null),
+  ).toBe(true);
   expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
     [testCommand, otherTestCommand, "lint"],
     [retryCommand],
@@ -963,6 +979,20 @@ test.each(ineligibleRetries)("an ineligible land failure blocks without retry: $
     reason: `${row.label === "setup" ? "setup" : "test"} failed (${blocked?.logPath})`,
   });
   expect(fake.requests).toHaveLength(1);
+  if (row.label === "setup") {
+    expect(store.failureObservations()).toMatchObject([
+      {
+        run_id: `land:${entry.id}`,
+        purpose: "land",
+        handle_id: `${entry.id}:1`,
+        phase: "setup",
+        class: "setup",
+        history: "no_retry",
+        interim: 0,
+      },
+    ]);
+    expect(store.failureObservations()[0]?.finalized_at).toBeNumber();
+  }
   const expected =
     row.label === "setup"
       ? "setup failures are not retried"
@@ -5510,4 +5540,49 @@ test("App approvals use the cached bot login, count the owner and reject the fac
   expect(github.calls.filter((c) => c.path === "user")).toEqual([]);
   expect(requests.filter((url) => url.endsWith("/app"))).toHaveLength(1);
   expect(requests.filter((url) => url.endsWith("/access_tokens"))).toHaveLength(1);
+});
+
+test("lost land attempt stays open until the replacement blocks", async () => {
+  const { pr } = await retryLandFixture();
+  const fake = fakeLandGates((req) => ({
+    ...retryRun(req),
+    setupOk: false,
+    checks: [],
+    setup: [gateResult("setup", "prepare", { ok: false, exitCode: 1, output: "setup failed" })],
+  }));
+  const q = queue({ gateExecutor: fake.executor });
+  const insert = store.observations.insert.bind(store.observations);
+  let reclaimed = false;
+  const spy = spyOn(store.observations, "insert").mockImplementation((row) => {
+    insert(row);
+    if (!reclaimed) {
+      reclaimed = true;
+      expect(store.claimLandEntry(SLUG, 30_000, "replacement", clock.now() + 31_000)?.id).toBe(
+        Number(row.run_id.slice(5)),
+      );
+    }
+  });
+  try {
+    const entry = await q.request({ target: pr.run.id });
+    await waitWithoutClock(() => reclaimed, 15_000);
+    await Promise.all((q as unknown as { workers: Map<string, Promise<void>> }).workers.values());
+    expect(store.getLandEntry(entry.id)?.state).toBe("checking");
+    expect(store.failureObservations()).toMatchObject([
+      { handle_id: `${entry.id}:1`, finalized_at: null, history: null },
+    ]);
+    const replacement = queue({ start: false, gateExecutor: fake.executor });
+    const worker = replacement as unknown as { owner: string; process: (entry: LandEntry) => Promise<void> };
+    const claimed = store.claimLandEntry(SLUG, 30_000, worker.owner, clock.now() + 62_000);
+    if (!claimed) throw new Error("missing replacement claim");
+    await worker.process(claimed);
+    expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
+    expect(store.failureObservations()).toMatchObject([
+      { handle_id: `${entry.id}:1`, class: "setup", history: "interrupted" },
+      { handle_id: `${entry.id}:3`, class: "setup", history: "no_retry" },
+    ]);
+    expect(store.failureObservations().every((r) => r.finalized_at !== null)).toBe(true);
+  } finally {
+    spy.mockRestore();
+    await q.stop();
+  }
 });

@@ -17,7 +17,7 @@ import { executionSite } from "./gate-execution.ts";
 /** A LAN handle alone does not prove remote execution: failed jobs can finish locally. */
 export function postMergeWorker(ctx: RunContext, handle: ExecutionHandle): string | null | undefined {
   if (handle.kind !== "lan") return undefined;
-  const { location, remote } = executionSite(ctx, handle);
+  const { location, remote } = executionSite(ctx.store, ctx.deps.buildSha, ctx.run.id, handle);
   return remote || location === null ? location : undefined;
 }
 
