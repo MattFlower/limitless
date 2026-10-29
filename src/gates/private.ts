@@ -169,9 +169,18 @@ export function decodeBackslashes(text: string, slashes = true): string {
 }
 const decodePercent = (text: string) =>
   text.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString());
+export class PrivateResourceError extends Error {
+  constructor() {
+    super("Private checker resource refusal");
+  }
+}
 /** Reusable policy compilation; decoder caches remain local to each checked text. */
-export function preparePrivateStrings(entries: PrivateStrings) {
-  const normalized = entries.map(({ value }) => normalize(value));
+export function preparePrivateStrings(entries: PrivateStrings, formLimit = Infinity) {
+  const bounded = (text: string) => {
+    if (text.length > formLimit) throw new PrivateResourceError();
+    return text;
+  };
+  const normalized = entries.map(({ value }) => bounded(normalize(bounded(value))));
   const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
   const literals = normalized.length
     ? new RegExp(normalized.map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"))
@@ -179,7 +188,7 @@ export function preparePrivateStrings(entries: PrivateStrings) {
   const candidates = entries.length
     ? new RegExp(`(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{${Math.max(1, minimum)},}=*`, "g")
     : undefined;
-  return { entries, normalized, minimum, literals, candidates };
+  return { entries, normalized, minimum, literals, candidates, bounded };
 }
 export type PreparedPrivateStrings = ReturnType<typeof preparePrivateStrings>;
 /** The decoded text of a base64 run that holds a protected value; undefined for unrelated runs. */
@@ -192,8 +201,8 @@ function preparedBase64Match(run: string, policy: PreparedPrivateStrings): strin
   // One of four alignments decodes any encoding inside the run (a directory prefix or "/" included),
   // and later characters never change bytes already decoded, so this stays linear in the run.
   for (let offset = 0; offset < 4; offset++) {
-    const plain = Buffer.from(run.slice(offset), "base64").toString();
-    const found = normalize(plain);
+    const plain = policy.bounded(Buffer.from(run.slice(offset), "base64").toString());
+    const found = policy.bounded(normalize(plain));
     if (policy.literals?.test(found)) return plain;
   }
   return undefined;
@@ -218,16 +227,16 @@ function preparedNormalizedLayers(text: string, policy: PreparedPrivateStrings):
         })
       : layer;
   const rounds = (current: string, slashes: boolean): string[] | null => {
-    const layers = [current];
+    const layers = [policy.bounded(current)];
     for (let round = 0; round < 5; round++) {
       // Unrelated runs must not change decoding convergence or cause a refusal.
       // Keep the text before backslash and HTML decoding too, since a protected value can contain either.
-      const percentDecoded = decodePercent(current);
-      const unescaped = decodeBackslashes(percentDecoded, slashes);
-      const expanded = decodeHTML(unescaped);
+      const percentDecoded = policy.bounded(decodePercent(current));
+      const unescaped = policy.bounded(decodeBackslashes(percentDecoded, slashes));
+      const expanded = policy.bounded(decodeHTML(unescaped));
       // Keep line breaks too: report quotations and multiline credentials depend on them.
-      layers.push(percentDecoded, unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
-      const next = decodeBase64(expanded);
+      layers.push(percentDecoded, unescaped, policy.bounded(decodeBase64(expanded.replace(/\s+/g, " "))));
+      const next = policy.bounded(decodeBase64(expanded));
       if (next === current) return [...layers, next];
       layers.push(next);
       current = next;
@@ -240,7 +249,7 @@ function preparedNormalizedLayers(text: string, policy: PreparedPrivateStrings):
   const slashed = kept?.some((layer) => layer.includes("\\/")) ? rounds(text, true) : kept;
   if (!kept || !slashed) return null;
   const all = kept === slashed ? kept : [...kept, ...slashed];
-  const normalized = new Map([...new Set(all)].map((layer) => [layer, normalize(layer)]));
+  const normalized = new Map([...new Set(all)].map((layer) => [layer, policy.bounded(normalize(layer))]));
   return all.map((layer) => normalized.get(layer) ?? "");
 }
 function stripPartialEscapes(text: string): string {
@@ -271,6 +280,7 @@ export function preparedPrivateMatches(
   truncated = false,
 ): PrivateStrings {
   const normalized = preparedNormalizedLayers(text, policy);
+  if (normalized && !truncated && !normalized.some((layer) => policy.literals?.test(layer))) return [];
   if (normalized)
     return policy.entries.filter((_entry, index) => {
       const protectedText = policy.normalized[index] ?? "";
