@@ -8,7 +8,7 @@ import { processBirthSync, processCleanupStore, redactCredentials } from "../uti
 import { executeGate, type GateRequest } from "./executor.ts";
 import { attachSlotPools } from "./slots.ts";
 
-/** A foreground owner whose jobs and capacity survive coordinator shutdown. */
+/** An independent owner whose jobs and capacity survive coordinator shutdown. */
 export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal: AbortSignal) {
   const store = new Store(cfg.paths.db);
   const workers = new WorkerStore(store, releaseSha);
@@ -37,20 +37,26 @@ export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal
   try {
     await processCleanupStore.run(store, () =>
       readPolicyScope.run(cfg.readPolicy, async () => {
+        let serving = false;
         while (!signal.aborted) {
           // A concurrent Git inspection can outlive a finished job's first stop check.
           confirmStops();
+          const matches = store.getSetting("executor.daemonRelease", "") === releaseSha;
+          if (serving && !matches) return;
+          serving ||= matches;
           const job = workers.leaseInplace(owner);
           if (!job) {
             await Bun.sleep(workers.times.tick);
             continue;
           }
+          let releaseChanged = false;
           const controller = new AbortController();
           const req: GateRequest = JSON.parse(job.request);
           const checkLease = () => {
             confirmStops();
             const current = workers.job(job.id);
             const changed = store.getSetting("executor.daemonRelease", "") !== releaseSha;
+            releaseChanged ||= changed;
             if (
               signal.aborted ||
               changed ||
@@ -106,6 +112,7 @@ export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal
             pendingStops.set(job.id, canonicalGateCwd(req.cwd));
             confirmStops();
           }
+          if (releaseChanged) return;
         }
       }),
     );

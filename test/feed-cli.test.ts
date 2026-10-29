@@ -318,3 +318,28 @@ test("land list binary shows waiting_approval and its reason", async () => {
     server.stop();
   }
 });
+
+test("generic CLI renders and acknowledges a mixed epic page and continues from its cursor", async () => {
+  const epic: FeedItem = {
+    ...feedItem(1),
+    kind: "queue.epic_attention",
+    runId: null,
+    title: "Epic attention",
+    summary: "unfiled",
+    data: { repo: "o/r", epic: 12, state: "unfiled", items: ["- Later"] },
+  };
+  const daemon = fakeDaemon([
+    { items: [epic, feedItem(2)], nextAfter: 2, pruned: false },
+    { items: [feedItem(3)], nextAfter: 3, pruned: false },
+  ]);
+  const lines: string[] = [];
+  const deps = { ...daemon, print: (line: string) => lines.push(line) };
+  await feedCommand([], { consumer: "legacy" }, deps);
+  expect(lines.join("\n")).toContain("#1 queue.epic_attention  Epic attention");
+  expect(lines.join("\n")).toContain("#2 run.failed");
+  await feedCommand(["ack", "2"], { consumer: "legacy" }, deps);
+  await feedCommand([], { consumer: "legacy", after: "2", json: true }, deps);
+  expect(JSON.parse(lines.at(-1) ?? "")).toEqual({ items: [feedItem(3)], nextAfter: 3, pruned: false });
+  expect(daemon.params().at(-1)?.after).toBe("2");
+  expect(daemon.requests[1]?.init?.body).toBe(JSON.stringify({ consumer: "legacy", id: 2 }));
+});
