@@ -73,6 +73,7 @@ export function localCheckpointer(store: Store): Checkpointer {
 }
 
 export interface EngineDeps {
+  loadSource?: () => number;
   checkpointer?: Checkpointer;
   gateExecutor?: GateExecutor;
   agentExecutor?: AgentExecutor;
@@ -380,7 +381,7 @@ export class RunContext {
   readonly signal: AbortSignal;
   termination?: SimulatedTermination;
   private readonly stageContext = new AsyncLocalStorage<Stage>();
-  private readonly faults: FaultInjector;
+  readonly faults: FaultInjector;
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   private foregroundStageDepth = 0;
   /** Defer shared-worktree cleanup until the review/verify pair has settled. */
@@ -535,7 +536,11 @@ export class RunContext {
     return [this.run.prompt, this.state.spec ? renderSpec(this.state.spec) : "", ...identifiers].join("\n");
   }
 
-  async save(checkpoint?: string): Promise<void> {
+  get stageId(): number | undefined {
+    return this.stageContext.getStore()?.id;
+  }
+
+  async save(checkpoint?: string, onComplete?: () => void): Promise<void> {
     if (this.state.phase !== "deliver" || this.state.deliveryComplete) this.state.githubWait = undefined;
     if (this.deps.faults) {
       const stage = this.stageContext.getStore();
@@ -546,7 +551,12 @@ export class RunContext {
       );
       this.checkCancelled();
     }
-    this.checkpointer.writeState(this.run.id, this.state);
+    if (onComplete)
+      this.store.transaction(() => {
+        onComplete();
+        this.checkpointer.writeState(this.run.id, this.state);
+      }, true);
+    else this.checkpointer.writeState(this.run.id, this.state);
     const p = this.checkpointer.checkpoint(this.run.id, checkpoint);
     if (p) await p;
   }
@@ -582,9 +592,10 @@ export class RunContext {
     round = 0,
     background = false,
     parkOnDrain = true,
+    onComplete?: (value: T, stage: Stage, sha?: string) => void,
   ): Promise<T> {
     return this.stageConfig.run(this.liveDeps.cfg, () =>
-      this.runStage(name, fn, round, background, parkOnDrain),
+      this.runStage(name, fn, round, background, parkOnDrain, onComplete),
     );
   }
 
@@ -594,6 +605,7 @@ export class RunContext {
     round: number,
     background: boolean,
     parkOnDrain: boolean,
+    onComplete?: (value: T, stage: Stage, sha?: string) => void,
   ): Promise<T> {
     this.checkCancelled();
     const cacheable =
@@ -626,7 +638,10 @@ export class RunContext {
             this.state.completedChecks = { round, sha: checkSha, values: {} };
           this.state.completedChecks.values[name] = output.value;
           if (name === "gates") consumeGateExecution(this);
-          await this.save();
+          await this.save(
+            undefined,
+            onComplete ? () => onComplete(output.value, stage, checkSha) : undefined,
+          );
         }
         return output;
       });

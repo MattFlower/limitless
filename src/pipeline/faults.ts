@@ -4,6 +4,7 @@ export type FaultPoint =
   | `stage:${StageName}:${"before" | "after"}`
   | "harness:invoke"
   | "harness:stream"
+  | "gate:executed"
   | "store:save";
 export interface FaultContext {
   runId: string;
