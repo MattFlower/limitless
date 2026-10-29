@@ -387,3 +387,26 @@ test("committed items are published on the global SSE stream", async () => {
   controller.abort();
   expect(message).toEqual({ kind: "feed", item: store.readFeed({ after: id - 1 }).items[0] as never });
 });
+
+test("mixed epic and existing feed kinds preserve envelopes and acknowledgement cursors", async () => {
+  store.reconcileEpicAttention("owner/repo", new Map([[12, { state: "unfiled", items: ["- Later"] }]]));
+  const existing = await item("existing");
+  const mixed = await page("?consumer=legacy&limit=2");
+  expect(mixed.items.map((i) => i.kind)).toEqual(["queue.epic_attention", "run.failed"]);
+  expect(mixed.items[0]).toMatchObject({
+    runId: null,
+    evalId: null,
+    repo: "owner/repo",
+    data: { repo: "owner/repo", epic: 12, state: "unfiled", items: ["- Later"] },
+  });
+  expect(mixed.nextAfter).toBe(existing);
+  expect(await (await acknowledge({ consumer: "legacy", id: mixed.nextAfter })).json()).toEqual({
+    consumer: "legacy",
+    id: existing,
+  });
+  const next = await item("next");
+  expect(await page("?consumer=legacy")).toMatchObject({
+    items: [{ id: next, kind: "run.failed" }],
+    nextAfter: next,
+  });
+});

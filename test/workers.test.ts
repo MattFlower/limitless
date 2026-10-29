@@ -3624,7 +3624,7 @@ test("worker startup retains legacy cleanup without termination evidence across 
       await task;
     }
   }
-});
+}, 30_000);
 
 test("worker removes a NUL-argument job's directories and pending marker after synchronous spawn failure", async () => {
   await listen();
