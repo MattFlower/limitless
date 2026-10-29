@@ -379,7 +379,10 @@ export function linkedIssues(
 }
 
 type IssueLinkRun = Pick<Run, "sourceRef" | "source" | "prompt" | "repoSlug">;
-export type IssueRunSummary = Pick<Run, "id" | "status" | "createdAt" | "finishedAt"> & { ownerId?: string };
+export type IssueRunSummary = Pick<Run, "id" | "status" | "createdAt" | "finishedAt"> & {
+  ownerId?: string;
+  ownerState?: Pick<Run, "status" | "finishedAt">;
+};
 
 function issueLinks(run: IssueLinkRun): { repo: string; number: number }[] {
   const ref = run.sourceRef;
@@ -423,8 +426,9 @@ export const LATEST_ISSUE_RUNS_SQL = `WITH RECURSIVE linked(id, owner, source, s
   SELECT rr.run_id, linked.owner, linked.source, linked.source_ref, linked.prompt, linked.repo_slug
   FROM linked JOIN review_rounds rr ON rr.source_run_id = linked.id
 ) SELECT runs.id, runs.status, runs.created_at AS createdAt, runs.finished_at AS finishedAt,
-  linked.owner, linked.source, linked.source_ref, linked.prompt, linked.repo_slug
-FROM linked CROSS JOIN runs ON runs.id = linked.id
+  linked.owner, owner.status AS ownerStatus, owner.finished_at AS ownerFinishedAt,
+  linked.source, linked.source_ref, linked.prompt, linked.repo_slug
+FROM linked CROSS JOIN runs ON runs.id = linked.id JOIN runs owner ON owner.id = linked.owner
 ORDER BY runs.created_at DESC, runs.rowid DESC`;
 
 export interface RunPatch {
@@ -1505,6 +1509,8 @@ export class Store {
   latestIssueRuns(repo: string, numbers: readonly number[]): Map<number, IssueRunSummary> {
     const rows = this.db.query(LATEST_ISSUE_RUNS_SQL).all(repo) as (IssueRunSummary & {
       owner: string;
+      ownerStatus: Run["status"];
+      ownerFinishedAt: number | null;
       source: Run["source"];
       source_ref: string | null;
       prompt: string;
@@ -1526,6 +1532,7 @@ export class Store {
           latest.set(issue.number, {
             id: row.id,
             ownerId: row.owner,
+            ownerState: { status: row.ownerStatus, finishedAt: row.ownerFinishedAt },
             status: row.status,
             createdAt: row.createdAt,
             finishedAt: row.finishedAt,
