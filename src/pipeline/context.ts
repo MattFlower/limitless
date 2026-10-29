@@ -48,6 +48,7 @@ import { runAgentGate } from "./agent-gate.ts";
 import type { CoveringTestRun } from "./covering-tests.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
+import { consumeGateExecution } from "./gate-execution.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
@@ -108,7 +109,16 @@ export interface RunState {
   reviewMode?: "single" | "panel";
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
-  gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
+  gateExecution?: {
+    stage: StageName;
+    round: number;
+    purpose: string;
+    sha: string;
+    handle: ExecutionHandle;
+    gateKey?: string;
+    /** Earlier attempts replay caller progress without executing or counting them again. */
+    previous?: { purpose: string; gateKey: string; result: GateRun }[];
+  };
   /** the worker implement job of this round; cleared in the implementation-ready save */
   agentJob?: { round: number; id: string };
   baseline?: GateRun | null;
@@ -520,6 +530,7 @@ export class RunContext {
   }
 
   async setPhase(phase: Phase): Promise<void> {
+    if (phase !== this.state.phase) consumeGateExecution(this);
     this.state.phase = phase;
     if (phase === "done") this.state.completedChecks = undefined;
     await this.save();
@@ -592,6 +603,7 @@ export class RunContext {
           if (this.state.completedChecks?.round !== round || this.state.completedChecks.sha !== checkSha)
             this.state.completedChecks = { round, sha: checkSha, values: {} };
           this.state.completedChecks.values[name] = output.value;
+          if (name === "gates") consumeGateExecution(this);
           await this.save();
         }
         return output;
