@@ -101,7 +101,11 @@ export class FailureObservations {
           redactGateOutput((c.firstAttempt ?? c.result.firstAttempt ?? c.result).command) === row.command,
       );
       const history = completion
-        ? observationHistory(c, row.purpose === "initial" && row.stage_id !== completion.stageId)
+        ? observationHistory(
+            c,
+            row.stage_id !== completion.stageId &&
+              (row.purpose === "initial" || (row.purpose === "rebase" && !c?.coordinatorConfirmation)),
+          )
         : "interrupted";
       const cls = classifyObservation({ ...row, history }, c);
       this.store.db

@@ -927,7 +927,7 @@ export class LandQueue {
               name: r.name,
               result: retries.get(r) ?? r,
               firstAttempt: r,
-              verdict: "regressed",
+              verdict: confinementFailed(retries.get(r) ?? r) ? "confinement_error" : "regressed",
               blocking: true,
               ...(retries.has(r) ? { retryOriginal: { verdict: "regressed" as const, blocking: true } } : {}),
             })),

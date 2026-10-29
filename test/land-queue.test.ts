@@ -931,6 +931,24 @@ test.each([
   },
 );
 
+test("land observation classifies a confined targeted retry as confinement", async () => {
+  const { pr } = await retryLandFixture();
+  const fake = fakeLandGates((req, attempt) =>
+    retryRun(req, {
+      test: attempt === 1 ? testFailure : { ok: false, exitCode: 1, confinementError: true },
+    }),
+  );
+  const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+  await settle();
+  expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
+  expect(store.failureObservations()).toHaveLength(1);
+  expect(store.failureObservations()[0]).toMatchObject({
+    class: "confinement",
+    history: "retry_failed",
+    finalized_at: expect.any(Number),
+  });
+});
+
 const ineligibleRetries: { label: string; result?: Partial<GateResult>; template?: string | null }[] = [
   { label: "setup" },
   { label: "legacy evidence", result: { failureAttributionComplete: undefined } },

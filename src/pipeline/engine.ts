@@ -25,7 +25,7 @@ import {
   readRetryFiles,
 } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
-import { gateProvenance } from "../gates/executor.ts";
+import { type ExecutionHandle, gateProvenance } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
@@ -3486,8 +3486,10 @@ async function mergeForDelivery(
           attempt.result ??
           (await (async () => {
             const workers = new Map<string, string | null | undefined>();
+            let primaryHandle: ExecutionHandle | undefined;
             const execute = (purpose: string, gates: GateConfig, hooks: GateHooks = gateEvents(ctx)) =>
               runGateExecution(ctx, "gates", purpose, cwd, gates, hooks, env, (handle, run) => {
+                if (purpose === "rebase") primaryHandle = handle;
                 const worker = postMergeWorker(ctx, handle);
                 for (const check of [...gates.checks, ...run.setup]) workers.set(check.name, worker);
               });
@@ -3511,9 +3513,11 @@ async function mergeForDelivery(
                   r.run_id === ctx.run.id &&
                   r.purpose === "rebase" &&
                   r.sha === sha &&
-                  r.stage_id === ctx.stageId,
+                  r.round === ctx.state.round &&
+                  (!primaryHandle ||
+                    (r.handle_kind === primaryHandle.kind && r.handle_id === primaryHandle.id)),
               )
-              .map((r) => r.handle_id);
+              .map((r) => ({ kind: r.handle_kind, id: r.handle_id }));
             ctx.checkCancelled();
             if (timeoutOnly(after)) {
               const first = after;
@@ -3573,9 +3577,16 @@ async function mergeForDelivery(
                   for (const handle of observedHandles)
                     ctx.store.db
                       .query(
-                        "UPDATE failure_observations SET slow_regression=1 WHERE run_id=? AND handle_id=? AND purpose='rebase' AND phase='check' AND name=?",
+                        "UPDATE failure_observations SET slow_regression=1 WHERE run_id=? AND round=? AND sha=? AND handle_kind=? AND handle_id=? AND purpose='rebase' AND phase='check' AND name=? AND finalized_at IS NULL",
                       )
-                      .run(ctx.run.id, handle, redactGateOutput(c.name));
+                      .run(
+                        ctx.run.id,
+                        ctx.state.round,
+                        sha,
+                        handle.kind,
+                        handle.id,
+                        redactGateOutput(c.name),
+                      );
                 return slow;
               },
             );

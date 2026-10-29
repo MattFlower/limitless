@@ -1082,6 +1082,83 @@ describe("pipeline (fake agents, real git + gates)", () => {
   });
 });
 
+test.each(["local", "lan"])(
+  "post-merge observation survives restart immediately after evidence (%s)",
+  async (kind) => {
+    writeFileSync(
+      join(repoDir, ".limitless.toml"),
+      '[gates]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]\n',
+    );
+    await sh(["git", "commit", "-qam", "early restart fixture"], { cwd: repoDir });
+    const bare = await githubFixture();
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") {
+        await advanceBase(bare, "base.txt", "base\n");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    const fixture = postMergeWorkerFixture(f, kind === "local" ? "local" : "pass");
+    const executor = f.deps.gateExecutor;
+    if (!executor) throw new Error("missing executor");
+    let failures = 0;
+    f.deps.gateExecutor = {
+      ...executor,
+      attach(...args) {
+        const execution = executor.attach(...args);
+        return {
+          ...execution,
+          result: execution.result.then((result) => {
+            if (kind !== "local" || result.checks.every((r) => r.ok) || ++failures === 1) return result;
+            return {
+              ...result,
+              checks: result.checks.map((r) => ({ ...r, ok: true, exitCode: 0, output: "pass" })),
+            };
+          }),
+        };
+      },
+    };
+    f.deps.faults = {
+      "store:save": {
+        action: "throw",
+        when: (c) =>
+          c.checkpoint === "gate-result" && f.store.failureObservations().some((r) => r.purpose === "rebase"),
+      },
+    };
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("queued");
+      const before = f.store.failureObservations().filter((r) => r.purpose === "rebase");
+      expect(before).toHaveLength(1);
+      expect(before[0]?.finalized_at).toBeNull();
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
+      const after = f.store.failureObservations().filter((r) => r.purpose === "rebase");
+      expect(after).toHaveLength(1);
+      expect(after[0]).toMatchObject({
+        id: before[0]?.id,
+        signature: before[0]?.signature,
+        output_tail: before[0]?.output_tail,
+        duration_ms: before[0]?.duration_ms,
+        failed_files: before[0]?.failed_files,
+        handle_kind: before[0]?.handle_kind,
+        handle_id: before[0]?.handle_id,
+        observed_at: before[0]?.observed_at,
+        exit_code: 1,
+      });
+      expect(after[0]?.finalized_at).toBeNumber();
+      if (kind === "local") expect(after[0]).toMatchObject({ class: "flaky", history: "retry_passed" });
+      else expect(after[0]).toMatchObject({ slow_regression: 1, history: "confirmed_passed" });
+      await executeRun(f.deps, run.id, new AbortController().signal);
+      expect(f.store.failureObservations().filter((r) => r.purpose === "rebase")).toEqual(after);
+    } finally {
+      fixture.processSpy.mockRestore();
+    }
+  },
+);
+
 test.each([process.platform, process.platform === "linux" ? "darwin" : "linux", null])(
   "post-merge observations retain worker evidence across confirmation and restart (OS %s)",
   async (workerOs) => {
