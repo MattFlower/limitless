@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { sep } from "node:path";
-import { credentialMatcher, registerCredentialVariant } from "./credential-matcher.ts";
+import { credentialMatcher, credentialVariants, registerCredentialVariant } from "./credential-matcher.ts";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 import { activity } from "./stall.ts";
 import { terminalRedactor } from "./terminal-redaction.ts";
@@ -1230,13 +1230,8 @@ export function registerCredential(name: string, value?: string): void {
   for (const secret of [value, process.env[name]])
     if (typeof secret === "string" && secret && !credentialValues.has(secret)) {
       credentialValues.add(secret);
-      // Log normalization removes CRLF line endings before publication-window redaction.
-      const values = [secret, secret.replace(/\r\n/g, "\n")];
-      const variants = values.flatMap((s) => {
-        const json = JSON.stringify(s).slice(1, -1);
-        return s.includes("/") ? [s, json, json.replaceAll("/", "\\/")] : [s, json];
-      });
-      for (const variant of new Set(variants)) registerCredentialVariant(variant, secret.length >= 8);
+      for (const [variant, substring] of credentialVariants([secret]))
+        registerCredentialVariant(variant, substring);
     }
 }
 export function redactCredentials(text: string): string;

@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { CredentialMatcher, credentialMatcher, type MatchingWork } from "../src/util/credential-matcher.ts";
+import {
+  CredentialMatcher,
+  credentialMatcher,
+  credentialVariants,
+  type MatchingWork,
+} from "../src/util/credential-matcher.ts";
 import {
   agentEnv,
   credentialRedactionPadding,
@@ -442,4 +447,29 @@ test("an unterminated strict string bounds carry and releases visible text while
   expect(output.length).toBeGreaterThan(5_000);
   output += redactor.push(`${SECRET} end`, true);
   expect(output).toBe(`x [redacted]]0;${`${"line ".repeat(39)}\n`.repeat(50)}[redacted] end`);
+});
+
+test("explicit credential preparation shares variants without relying on global registrations", () => {
+  const secret = 'synthetic/quoted"/key\r\nend';
+  const matcher = new CredentialMatcher(credentialVariants([secret, "ab\r\ncdef", "ab/cd"]));
+  for (const value of [secret, secret.replaceAll("\r\n", "\n"), "ab\r\ncdef", "ab\ncdef"])
+    for (const variant of [
+      value,
+      JSON.stringify(value).slice(1, -1),
+      JSON.stringify(value).slice(1, -1).replaceAll("/", "\\/"),
+    ]) {
+      expect(matcher.redact(`x${variant}y`)).toBe("x[redacted]y");
+      const terminal = terminalRedactor(() => matcher);
+      expect(terminal.push(`x${variant}`, false) + terminal.push("y", true)).toBe("x[redacted]y");
+    }
+  expect(matcher.redact("ab\\/cd")).toBe("[redacted]");
+  expect(matcher.redact("xab\\/cdy")).toBe("xab\\/cdy");
+  const short = '"'.repeat(7);
+  const escaped = JSON.stringify(short).slice(1, -1);
+  for (const values of [
+    [short, escaped, short],
+    [escaped, short],
+  ])
+    expect(new CredentialMatcher(credentialVariants(values)).redact(`x${escaped}y`)).toBe("x[redacted]y");
+  expect([...credentialVariants(["", "ab/cd", "ab/cd"])].length).toBe(2);
 });

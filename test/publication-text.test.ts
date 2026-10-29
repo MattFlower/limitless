@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { preparedPrivateMatches, preparePrivateStrings, privateMatches } from "../src/gates/private.ts";
 import { checkPublicationText, sanitizePublication } from "../src/gates/publication.ts";
 import { registerCredential, registeredCredentials } from "../src/util/proc.ts";
 
@@ -199,3 +200,54 @@ test("malformed labels and destinations remain bounded and still sanitize bare l
     expect(sanitizePublication(expected, work, "/factory/data")).toBe(expected);
   }
 }, 5_000);
+
+test("prepared private policy preserves decoded, cut and refusal results across repeated requests", () => {
+  const entries = ["host.example", "private phrase", "host/path.example", "[value]+(test)?"].map(
+    (value, i) => ({ value, entry: i + 1 }),
+  );
+  const policy = preparePrivateStrings(entries);
+  const percent = (text: string) => Array.from(Buffer.from(text), (byte) => `%${byte.toString(16)}`).join("");
+  const host = entries[0]?.value ?? "";
+  let nested = percent("a");
+  for (let round = 0; round < 7; round++) nested = nested.replaceAll("%", "%25");
+  const cases: [string, boolean, number[]][] = [
+    [host, false, [1]],
+    [percent(host), false, [1]],
+    [percent(percent(host)), false, [1]],
+    [String.raw`host.exam\u0070le`, false, [1]],
+    ["host.exam%70le", false, [1]],
+    ["host.exam&#112;le", false, [1]],
+    ["ｈｏｓｔ．ｅｘａｍｐｌｅ", false, [1]],
+    ["private\n\t phrase", false, [2]],
+    [String.raw`host\/path.example`, false, [3]],
+    ["[value]+(test)?", false, [4]],
+    ["valueeeetest", false, []],
+    [Buffer.from("[value]+(test)?").toString("base64"), false, [4]],
+    [Buffer.from("valueeeetest").toString("base64"), false, []],
+    ["host.%2", true, [1]],
+    ["host.%2", false, []],
+    [`${host}\u0301`, false, []],
+    [`${host}\u0301`.slice(0, 12), true, [1]],
+    [Buffer.from(percent(host)).toString("base64"), false, []],
+    ["ordinary text YWJjZA==", false, []],
+    [nested, false, [0]],
+  ];
+  const encoded = Buffer.from(host).toString("base64");
+  for (let offset = 0; offset < 4; offset++)
+    for (const run of [encoded, encoded.replace(/=+$/, "")])
+      cases.push([`${"A".repeat(offset)}${run}`, false, [1]]);
+  for (const length of [32, 64, 128]) {
+    const run = "\\".repeat(length * 1024);
+    cases.push([`${run}\\u00`, false, []], [`${run} ${host}`, false, [1]]);
+  }
+  // Reuse exercises the compiled candidate regex as well as request-local decoder caches.
+  for (let repeat = 0; repeat < 2; repeat++)
+    for (const [text, truncated, expected] of cases) {
+      expect(preparedPrivateMatches(text, policy, truncated).map(({ entry }) => entry)).toEqual(expected);
+      expect(privateMatches(text, entries, truncated).map(({ entry }) => entry)).toEqual(expected);
+    }
+  expect(preparedPrivateMatches(nested, preparePrivateStrings([]))).toEqual([{ value: "", entry: 0 }]);
+  const wide = preparePrivateStrings([{ value: "Ａ".repeat(4), entry: 7 }]);
+  expect(preparedPrivateMatches(Buffer.from("AAAA").toString("base64"), wide)).toEqual([]);
+  expect(preparedPrivateMatches(Buffer.from("Ａ".repeat(4)).toString("base64"), wide)).toEqual(wide.entries);
+});

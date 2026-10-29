@@ -274,6 +274,20 @@ function render(text: string, spans: RedactionWindow[], window?: RedactionWindow
   return bounds ? result.slice(bounds.start, bounds.end) : result;
 }
 
+/** The original length controls substring eligibility, including shortened CRLF variants. */
+export function credentialVariants(credentials: readonly string[]): Map<string, boolean> {
+  const result = new Map<string, boolean>();
+  for (const secret of credentials.filter(Boolean)) {
+    const values = [secret, secret.replace(/\r\n/g, "\n")];
+    for (const value of values) {
+      const json = JSON.stringify(value).slice(1, -1);
+      for (const variant of value.includes("/") ? [value, json, json.replaceAll("/", "\\/")] : [value, json])
+        result.set(variant, result.get(variant) === true || secret.length >= 8);
+    }
+  }
+  return result;
+}
+
 const variants = new Map<string, boolean>();
 let compiled: CredentialMatcher | undefined;
 export function registerCredentialVariant(text: string, substring: boolean): void {
