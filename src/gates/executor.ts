@@ -5,6 +5,7 @@ import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { GateConfig } from "./detect.ts";
+import type { ActionsProgress } from "./github-actions.ts";
 import { lanExecutor } from "./lan.ts";
 import { redactGateData, redactGateOutput } from "./output.ts";
 import {
@@ -19,7 +20,13 @@ import { bindGateSlotScope, type GatePriority } from "./slots.ts";
 export interface Executor<Req, Res> {
   readonly kind: "local" | "github-actions" | "lan" | "inplace" | "claude-cloud";
   start(req: Req, signal: AbortSignal): Promise<ExecutionHandle>;
-  attach(handle: ExecutionHandle, signal: AbortSignal, req?: Req, hooks?: GateHooks): Execution<Res>;
+  attach(
+    handle: ExecutionHandle,
+    signal: AbortSignal,
+    req?: Req,
+    hooks?: GateHooks,
+    persist?: (handle: ExecutionHandle) => Promise<void>,
+  ): Execution<Res>;
   discard?(handle: ExecutionHandle): void | Promise<void>;
 }
 export interface ExecutionHandle {
@@ -27,6 +34,7 @@ export interface ExecutionHandle {
   id: string;
   startedAt: number;
   url?: string;
+  githubActions?: ActionsProgress;
 }
 export interface Execution<Res> {
   events: AsyncIterable<ExecutionEvent>;
@@ -102,13 +110,19 @@ export const gateShutdown = (signal: AbortSignal): boolean =>
 
 const liveExecutions = new WeakMap<GateExecutor, Map<string, Execution<GateRun>>>();
 
-/** Discard only work still owned by this process; never replay an old handle to cancel it. */
+/** Cancel live work or ask its owning executor to discard the durable identity. */
 export async function cancelGateExecution(handle: ExecutionHandle, executor?: GateExecutor): Promise<void> {
+  if (handle.kind !== "local" && executor?.kind !== handle.kind)
+    throw new Error(`Unavailable gate executor: ${handle.kind}; cleanup remains pending`);
   const execution = executor?.kind === handle.kind ? liveExecutions.get(executor)?.get(handle.id) : undefined;
   if (execution) {
     await execution.cancel();
     await execution.result.catch(() => {});
-  } else if (executor?.kind === handle.kind) await executor.discard?.(handle);
+  } else if (executor?.kind === handle.kind) {
+    if (!executor.discard && handle.kind === "github-actions")
+      throw new Error(`Unavailable gate executor cleanup: ${handle.kind}`);
+    await executor.discard?.(handle);
+  }
 }
 
 export function gateExecutorFor(
@@ -226,7 +240,10 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
   return executor;
 }
 
-/** Start, checkpoint, attach and cancel through the same path for all daemon gates. */
+/**
+ * Start, checkpoint, attach and cancel through the same path for all daemon gates.
+ * Interrupted Actions handles are discarded before replacement; completed results are reused.
+ */
 export async function executeGate(
   req: GateRequest,
   signal: AbortSignal,
@@ -241,11 +258,21 @@ export async function executeGate(
       ? localExecutor(hooks)
       : (injected ?? localExecutor(hooks));
   if (stored && stored.kind !== executor.kind) throw new Error(`Unavailable gate executor: ${stored.kind}`);
+  if (stored?.kind === "github-actions" && !stored.githubActions?.completed) {
+    try {
+      await cancelGateExecution(stored, executor);
+      if (stored.githubActions?.cleanupFailed) throw new Error("GitHub Actions gate cleanup remains pending");
+    } catch (error) {
+      await persist(stored);
+      throw error;
+    }
+    stored = undefined;
+  }
   const handle = stored ?? (await executor.start(req, signal));
   if (!stored) await persist(handle);
   let execution: Execution<GateRun>;
   try {
-    execution = executor.attach(handle, signal, req, hooks);
+    execution = executor.attach(handle, signal, req, hooks, persist);
   } catch (error) {
     onSettled();
     throw error;

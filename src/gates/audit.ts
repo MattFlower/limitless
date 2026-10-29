@@ -21,8 +21,7 @@ const LINT_CONFIG =
 const LOCKFILE =
   /(^|\/)(bun\.lockb?|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|uv\.lock|poetry\.lock)$/;
 
-// Anchored to the start of a statement so test *data* that mentions these (e.g. an auditor's own
-// fixtures inside string literals) doesn't trip them.
+// Anchored to the start of an added line, including lines inside string/template-literal fixtures.
 const SKIP_MARKERS: [RegExp, string][] = [
   [/^\s*(it|test|describe)\.(skip|only|todo)\s*\(/, "test skipped/focused with .skip/.only"],
   [/^\s*x(it|describe|test)\s*\(/, "test disabled with xit/xdescribe"],
@@ -381,7 +380,12 @@ export function auditDiff(
     for (const line of fp.added) {
       for (const [re, label] of SKIP_MARKERS) {
         if (isTest && re.test(line))
-          findings.push({ rule: "test-skipped", severity: "block", file: fp.path, detail: label });
+          findings.push({
+            rule: "test-skipped",
+            severity: "block",
+            file: fp.path,
+            detail: `${label}: "${line}". Fixture text requiring a skip marker should construct it without the literal marker at the start of a source line, for example through concatenation.`,
+          });
       }
       for (const [re, label] of SUPPRESSIONS) {
         if (re.test(line))

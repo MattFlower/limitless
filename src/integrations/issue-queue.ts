@@ -1,8 +1,9 @@
 import { z } from "zod";
 import type { Factory } from "../app.ts";
-import type { Run } from "../core/types.ts";
-import { CommentProcessed, ISSUE_CLAIM_STATUSES } from "../db/store.ts";
+import type { EpicAttention, Run } from "../core/types.ts";
+import { CommentProcessed, ISSUE_CLAIM_STATUSES, type IssueRunSummary, linkedIssues } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
+import { beginActivity } from "../util/stall.ts";
 import { commentRunRequest, type GhRunner, issueRunRequest, runGh } from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
 import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
@@ -14,6 +15,11 @@ const connection = <T extends z.ZodType>(node: T) =>
     nodes: z.array(node),
     totalCount: z.number().int().nonnegative(),
   });
+const issueReference = z.object({
+  number: z.number().int().positive(),
+  state: z.enum(["OPEN", "CLOSED"]),
+  repository: z.object({ nameWithOwner: z.string() }),
+});
 const issueSchema = z.object({
   number: z.number().int().positive(),
   title: z.string(),
@@ -35,7 +41,12 @@ const issueSchema = z.object({
   lastEditedAt: date.nullable(),
   labels: connection(z.object({ name: z.string() })),
   subIssuesSummary: z.object({ total: z.number().int().nonnegative() }),
-  blockedBy: connection(z.object({ state: z.enum(["OPEN", "CLOSED"]) })),
+  subIssues: connection(
+    issueReference.extend({
+      labels: z.object({ nodes: z.array(z.object({ name: z.string() })) }),
+    }),
+  ),
+  blockedBy: connection(issueReference),
   closedByPullRequestsReferences: connection(z.object({ state: z.enum(["OPEN", "CLOSED", "MERGED"]) })),
   timelineItems: connection(
     z.discriminatedUnion("__typename", [
@@ -50,12 +61,99 @@ const issueSchema = z.object({
   ),
 });
 export type QueueIssue = z.infer<typeof issueSchema>;
+const issueKey = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
 const priority = (s: string) => /^priority:(10|[0-9])$/.test(s);
 const blockers = (body: string) =>
   body
     .split(/\r?\n/)
     .filter((line) => /^[\t ]*(?:(?:[-*+]|\d+[.)])[\t ]+)?blocked by\b:?/i.test(line))
     .flatMap((line) => [...line.matchAll(/#([1-9][0-9]*)\b/g)].map((m) => Number(m[1])));
+
+/** Undefined means incomplete evidence: preserve the saved observation. */
+export function epicAttention(
+  repo: string,
+  epic: QueueIssue,
+  trusted: string[],
+  issues: ReadonlyMap<string, QueueIssue>,
+  claimed: (repo: string, number: number) => boolean,
+): EpicAttention | null | undefined {
+  if (epic.state !== "OPEN") return null;
+  const children = epic.subIssues;
+  const key = (c: z.infer<typeof issueReference>) => issueKey(c.repository.nameWithOwner, c.number);
+  const childKeys = new Set(children.nodes.map(key));
+  if (
+    children.totalCount > 50 ||
+    children.totalCount !== children.nodes.length ||
+    children.totalCount !== epic.subIssuesSummary.total ||
+    childKeys.size !== children.totalCount
+  )
+    return undefined;
+  if (!children.totalCount) return null;
+  const trusts = (login: string | undefined) =>
+    !!login && trusted.some((t) => t.toLowerCase() === login.toLowerCase());
+  const lines: { line: string; text: string }[] = [];
+  let slices = false;
+  let fence: string | undefined;
+  if (trusts(epic.author?.login) && (!epic.lastEditedAt || trusts(epic.editor?.login))) {
+    for (const line of epic.body.split(/\r?\n/)) {
+      const marker = line.match(/^ {0,3}(`{3,}|~{3,})/)?.[1];
+      if (fence) {
+        if (marker && marker[0] === fence[0] && marker.length >= fence.length && line.trim() === marker)
+          fence = undefined;
+        continue;
+      }
+      if (marker) {
+        fence = marker;
+        continue;
+      }
+      if (/^ {0,3}#{1,2}(?:\s|$)/.test(line)) slices = /^ {0,3}## Slices\s*$/.test(line);
+      const text = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.*)$/)?.[1];
+      if (slices && text !== undefined) lines.push({ line, text });
+    }
+  }
+  const reference = (text: string) => {
+    const match = text.match(/^(?:Acceptance:\s+)?(?:([\w.-]+\/[\w.-]+))?#([1-9][0-9]*)(?=$|[\s\p{P}])/u);
+    return match?.[2] ? issueKey(match[1] ?? repo, Number(match[2])) : undefined;
+  };
+  const unfiled = lines.filter((l) => !childKeys.has(reference(l.text) ?? "")).map((l) => l.line);
+  if (unfiled.length) return { state: "unfiled", items: unfiled };
+  const open = children.nodes.filter((c) => c.state === "OPEN");
+  if (!open.length) return null;
+  const records = open.map((c) => issues.get(key(c)));
+  if (
+    open.some((c, n) => {
+      const i = records[n];
+      // Local records must be complete; unobserved foreign children lack priority evidence.
+      if (!i) return c.repository.nameWithOwner.toLowerCase() === repo.toLowerCase();
+      return i.state !== "OPEN" || i.labels.totalCount !== i.labels.nodes.length;
+    })
+  )
+    return undefined;
+  if (
+    !open.some(
+      (c, n) =>
+        records[n]?.labels.nodes.some((l) => priority(l.name)) ||
+        claimed(c.repository.nameWithOwner, c.number),
+    )
+  )
+    return { state: "needs_approval", items: open.map((c) => `#${c.number}`) };
+  if (open.length !== 1) return null;
+  const candidate = open[0];
+  const record = records[0];
+  if (!candidate || !record) return undefined;
+  const acceptance = lines.filter((l) => /^Acceptance:/.test(l.text));
+  if (acceptance.length) {
+    const references = new Set(acceptance.map((l) => reference(l.text)));
+    return acceptance.length === 1 && references.size === 1 && references.has(key(candidate))
+      ? { state: "ready_for_acceptance", items: [`#${candidate.number}`] }
+      : null;
+  }
+  if (record.blockedBy.totalCount !== record.blockedBy.nodes.length) return undefined;
+  const covered = new Set([key(candidate), ...record.blockedBy.nodes.map(key)]);
+  return children.nodes.every((c) => covered.has(key(c)))
+    ? { state: "ready_for_acceptance", items: [`#${candidate.number}`] }
+    : null;
+}
 
 /** Policy only: callers supply observed dependency and local run state. Missing evidence never approves. */
 export function issueEligibility(
@@ -64,7 +162,7 @@ export function issueEligibility(
   context: {
     blockers?: ReadonlyMap<number, string>;
     claim?: Run | null;
-    latest?: Run | null;
+    latest?: IssueRunSummary | null;
     failureBoundary?: number | null;
   } = {},
 ): { eligible: true; priority: number } | { eligible: false; reason: string } {
@@ -139,7 +237,8 @@ export function issueEligibility(
 const ISSUE_FIELDS = `number title body createdAt updatedAt state author { login } editor { login } lastEditedAt
   comments(last: 20) { totalCount nodes { databaseId body createdAt lastEditedAt author { login } } }
   labels(first:100) { totalCount nodes { name } } subIssuesSummary { total }
-  blockedBy(first:100) { totalCount nodes { state } }
+  subIssues(first:50) { totalCount nodes { number state repository { nameWithOwner } labels(first:20) { nodes { name } } } }
+  blockedBy(first:100) { totalCount nodes { number state repository { nameWithOwner } } }
   closedByPullRequestsReferences(first:100) { totalCount nodes { state } }
   timelineItems(last:100, itemTypes:[LABELED_EVENT, RENAMED_TITLE_EVENT]) { totalCount nodes { __typename
     ... on LabeledEvent { label { name } actor { login } createdAt }
@@ -208,8 +307,7 @@ export function startIssueQueue(
     if (response.errors?.length) throw new Error("GraphQL issue query returned errors");
     return z.record(z.string(), z.unknown()).parse(response.data.repository);
   };
-  const latestContext = (repo: string, number: number) => {
-    const latest = factory.store.latestIssueRun(repo, number);
+  const latestContext = (repo: string, number: number, latest: IssueRunSummary | undefined) => {
     const failure =
       latest?.status === "failed"
         ? factory.store.issueLifecycleEffects(latest.id, repo, number).find((e) => e.effect === "failure")
@@ -224,12 +322,43 @@ export function startIssueQueue(
     pending = false;
     limited = false;
     let failed = false;
+    let unsubscribe = () => {};
+    const invalidated = new Set<string>();
+    const changedDuringPoll = (repo: string, number: number) =>
+      invalidated.has(issueKey(repo, number))
+        ? "linked run changed during the poll; retrying next poll"
+        : null;
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
+    const snapshots = new Map<string, Map<number, IssueRunSummary>>();
     try {
+      unsubscribe = factory.store.subscribe((msg) => {
+        if (msg.kind !== "run") return;
+        const run = msg.run;
+        const issues = linkedIssues(run, factory.store);
+        const links = new Set(issues.map((i) => issueKey(i.repo, i.number)));
+        for (const [repo, latest] of snapshots) {
+          for (const [number, summary] of latest) {
+            const key = issueKey(repo, number);
+            const state =
+              summary.id === run.id ? summary : summary.ownerId === run.id ? summary.ownerState : undefined;
+            if (
+              (state && (state.status !== run.status || state.finishedAt !== run.finishedAt)) ||
+              ((summary.id === run.id || summary.ownerId === run.id) && !links.has(key))
+            )
+              invalidated.add(key);
+          }
+        }
+        // Missing snapshots retain conservative invalidation; existing ones compare only linked candidates.
+        for (const { repo, number } of issues) {
+          const summary = snapshots.get(repo.toLowerCase())?.get(number);
+          if (summary?.id !== run.id && summary?.ownerId !== run.id) invalidated.add(issueKey(repo, number));
+        }
+      });
       await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log, opts.lifecycle);
       for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
+        const end = beginActivity("issue-queue.repository");
         try {
           const boundary = factory.store.githubCommentBoundary(repo);
           if (!boundary) {
@@ -283,7 +412,23 @@ export function startIssueQueue(
           }
           if (stopped) break;
           const identity = await (opts.lifecycle?.identity ?? githubIdentity)(repo).catch(() => null);
+          if (stopped) break;
+          const observed = new Map(issues.nodes.map((i) => [issueKey(repo, i.number), i]));
+          factory.store.reconcileEpicAttention(
+            repo,
+            new Map(
+              issues.nodes.map((i) => [
+                i.number,
+                epicAttention(repo, i, q.trusted, observed, (r, n) => !!factory.store.issueClaim(r, n)),
+              ]),
+            ),
+          );
           const bot = identity?.kind === "app" ? identity.botLogin.toLowerCase() : null;
+          const latest = factory.store.latestIssueRuns(
+            repo,
+            issues.nodes.map((i) => i.number),
+          );
+          snapshots.set(repo.toLowerCase(), latest);
           for (const issue of issues.nodes) {
             for (const c of boundary && issue.state === "OPEN" ? issue.comments.nodes : []) {
               const author = c.author?.login;
@@ -336,7 +481,7 @@ export function startIssueQueue(
             const result = issueEligibility(issue, q.trusted, {
               blockers: states,
               claim: factory.store.issueClaim(repo, issue.number),
-              ...latestContext(repo, issue.number),
+              ...latestContext(repo, issue.number, latest.get(issue.number)),
             });
             if (result.eligible) candidates.push({ repo, issue, priority: result.priority, states });
             else if (result.reason.startsWith("claimed"))
@@ -345,6 +490,8 @@ export function startIssueQueue(
         } catch (e) {
           failed = true;
           if (!stopped) log(redactCredentials(`Issue queue ${repo}: ${String(e)}`));
+        } finally {
+          end();
         }
       }
       candidates.sort(
@@ -358,18 +505,21 @@ export function startIssueQueue(
         const current = issueEligibility(issue, q.trusted, {
           blockers: states,
           claim: factory.store.issueClaim(repo, issue.number),
-          ...latestContext(repo, issue.number),
+          ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
         });
-        if (!current.eligible) {
-          log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${current.reason}`));
+        const reason = changedDuringPoll(repo, issue.number) ?? (!current.eligible ? current.reason : null);
+        if (reason) {
+          log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${reason}`));
           continue;
         }
         const admission = () => {
           if (stopped) return "queue stopped";
           if (factory.scheduler.draining) return "scheduler draining";
+          const deferred = changedDuringPoll(repo, issue.number);
+          if (deferred) return deferred;
           const eligibility = issueEligibility(issue, q.trusted, {
             blockers: states,
-            ...latestContext(repo, issue.number),
+            ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
           });
           if (!eligibility.eligible) return eligibility.reason;
           const active = factory.store.listRuns({
@@ -410,6 +560,7 @@ export function startIssueQueue(
       failed = true;
       if (!stopped) log(redactCredentials(`Issue queue: ${String(e)}`));
     } finally {
+      unsubscribe();
       inFlight = false;
       const regular = now() + q.pollSeconds * 1000;
       retryNotBefore = failed ? regular : 0;

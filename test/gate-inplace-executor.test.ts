@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { restart } from "../src/cli/service.ts";
 import { loadConfig } from "../src/config.ts";
 import { reloadedConfig } from "../src/config-reload.ts";
 import { WorkerStore } from "../src/db/workers.ts";
@@ -107,7 +108,11 @@ async function setup(enabled = true) {
 
 async function withExecutor(
   f: Factory,
-  fn: (workers: WorkerStore, crash: () => Promise<void>) => Promise<void>,
+  fn: (
+    workers: WorkerStore,
+    crash: () => Promise<void>,
+    child: ReturnType<typeof Bun.spawn>,
+  ) => Promise<void>,
   sha = release,
   realConfinement = false,
   beforeRun = "",
@@ -147,10 +152,14 @@ async function withExecutor(
   try {
     await wait(() => f.workers.executor(undefined, false)?.pid === child.pid, { timeoutMs: 10_000 });
     await confinementScope.run(fakeConfinement, () =>
-      fn(f.workers, async () => {
-        child.kill("SIGKILL");
-        await child.exited;
-      }),
+      fn(
+        f.workers,
+        async () => {
+          child.kill("SIGKILL");
+          await child.exited;
+        },
+        child,
+      ),
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill(beforeRun ? "SIGKILL" : "SIGTERM");
@@ -636,6 +645,65 @@ test("shutdown detaches and a new context reattaches to the same job and executo
         expect(slots()).toEqual(expected);
         await recoverProcessCleanups(f.store);
         expect(slots()).toEqual(expected);
+        const agentsDir = join(fixture.home, "restart-agents");
+        mkdirSync(agentsDir);
+        mkdirSync(join(fixture.home, "src/cli"), { recursive: true });
+        const entry = join(fixture.home, "src/cli/main.ts");
+        writeFileSync(entry, "");
+        for (const [label, command] of [
+          ["custom.daemon", "serve"],
+          ["custom.executor", "executor"],
+        ])
+          writeFileSync(
+            join(agentsDir, `${label}.plist`),
+            JSON.stringify({ Label: label, ProgramArguments: ["bun", entry, command] }),
+          );
+        const intent = join(fixture.home, "executor-intent.json");
+        writeFileSync(intent, "untouched");
+        const calls: string[][] = [];
+        let boot = 1,
+          draining = false;
+        await restart(f.cfg.port, {
+          agentsDir,
+          releaseDir: fixture.home,
+          lockPath: join(fixture.home, "deploy.lock"),
+          now: true,
+          log: () => {},
+          command: async (args) => {
+            calls.push([...args]);
+            if (args[1] === "kickstart") {
+              boot++;
+              draining = false;
+            }
+            return {
+              exitCode: 0,
+              stderr: "",
+              stdout: args[0] === "plutil" ? readFileSync(args.at(-1) ?? "", "utf8") : "",
+            };
+          },
+          client: {
+            health: async () => ({
+              ok: true,
+              sha: release,
+              uptimeMs: 1,
+              startedAt: boot,
+              draining,
+              active: [],
+            }),
+            admin: async (action) => {
+              draining = action === "drain";
+              return { draining, active: [] };
+            },
+            run: async () => ({ stage: "gates" }),
+          },
+        });
+        expect(
+          calls
+            .filter((args) => args[0] === "launchctl")
+            .some((args) => args.join(" ").includes("custom.executor")),
+        ).toBe(false);
+        expect(readFileSync(intent, "utf8")).toBe("untouched");
+        expect(workers.job(handle?.id ?? "")?.state).toBe("leased");
         const second = context();
         const resumed = gateCommandScope(second, "gates", "initial", req.cwd, async () => {
           const result = await runGateExecution(second, "gates", "initial", req.cwd, req.gates);
@@ -793,41 +861,212 @@ test("cancelling shared scratch waits for the stopped first attempt and its runn
   }
 });
 
+test("SHA mismatch resumes after a cancelled parallel Git inspection finishes cleanup", async () => {
+  const { f, context, req } = await setup();
+  const scratch = createScratch(req.cwd);
+  const old = f.workers.enqueue({ ...req, scratch }, randomUUID(), true);
+  const ctx = context();
+  ctx.state.gateExecution = {
+    stage: "gates",
+    round: 0,
+    purpose: "initial",
+    sha: "older",
+    handle: { kind: "inplace", id: old, startedAt: Date.now() },
+  };
+  await ctx.save();
+  writeFileSync(join(req.cwd, "greeting.txt"), "old gate output\n");
+  writeFileSync(join(req.cwd, "old-build"), "old gate output\n");
+  const inspectionReady = join(fixture.home, "inspection-ready");
+  const releaseInspection = join(fixture.home, "release-inspection");
+  const finished = join(fixture.home, "executor-idle");
+  const stopRequested = join(fixture.home, "stop-requested");
+  const observed = join(fixture.home, "executor-observed-clear-records");
+  const stopping = Promise.withResolvers<void>();
+  const releaseStop = Promise.withResolvers<void>();
+  void releaseStop.promise.catch(() => {});
+  const originalWait = WorkerStore.prototype.waitStopped;
+  const stopped = spyOn(WorkerStore.prototype, "waitStopped").mockImplementation(async function (
+    this: WorkerStore,
+    id,
+    signal,
+  ) {
+    if (id === old) {
+      stopping.resolve();
+      await releaseStop.promise;
+    }
+    return originalWait.call(this, id, signal);
+  });
+  const executor = f.deps.gateExecutor;
+  if (!executor) throw new Error("missing gate executor");
+  const attach = executor.attach.bind(executor);
+  const attached = spyOn(executor, "attach").mockImplementation((handle, ...args) => {
+    if (handle.id === old) throw new Error("attached to stale gate result");
+    return attach(handle, ...args);
+  });
+  let resumed: ReturnType<typeof runGateExecution> | undefined;
+  try {
+    await withExecutor(
+      f,
+      async (workers) => {
+        await wait(() => existsSync(inspectionReady), { timeoutMs: 10_000 });
+        resumed = runGateExecution(context(), "gates", "initial", req.cwd, gates);
+        void resumed.catch(() => {});
+        await Promise.race([
+          stopping.promise,
+          resumed.then(() => {
+            throw new Error("resume finished before discarding stale work");
+          }),
+        ]);
+        await wait(() => existsSync(finished), { timeoutMs: 10_000 });
+        expect(workers.job(old)).toMatchObject({ state: "cancelled", stopped: 0 });
+        expect(f.store.listProcessDiscoveries(undefined, realpathSync(req.cwd))).toHaveLength(1);
+        expect(attached).not.toHaveBeenCalled();
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("old gate output\n");
+        expect(existsSync(join(req.cwd, "old-build"))).toBe(true);
+        expect(existsSync(scratch)).toBe(true);
+        writeFileSync(releaseInspection, "");
+        writeFileSync(stopRequested, "");
+        await wait(() => existsSync(observed), { timeoutMs: 10_000 });
+        // Two idle polls with cleared records establish a confirmation check between them.
+        // Without reconfirmation, discard's waitStopped polls until its lease-based failure.
+        expect(workers.job(old)?.stopped).toBe(1);
+        releaseStop.resolve();
+        expect(await resumed).toMatchObject({ setupOk: true, sha: req.headSha });
+        expect(attached.mock.calls).toHaveLength(1);
+        expect(workers.jobs("in_place=1 AND state='done'")).toHaveLength(1);
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+        expect(existsSync(join(req.cwd, "old-build"))).toBe(false);
+        expect(existsSync(scratch)).toBe(false);
+      },
+      release,
+      false,
+      `
+      import * as proc from ${JSON.stringify(new URL("../src/util/proc.ts", import.meta.url).pathname)};
+      import { spyOn } from 'bun:test';
+      const { WorkerStore } = await import(${JSON.stringify(new URL("../src/db/workers.ts", import.meta.url).pathname)});
+      const { existsSync, writeFileSync } = await import('node:fs');
+      const sh = proc.sh;
+      let holdRev = true, holdConfig = true;
+      spyOn(proc, 'sh').mockImplementation(async (cmd, opts) => {
+        // harden.list runs these siblings concurrently. Reject rev-parse on cancellation
+        // while the real config command's process cleanup is still pending.
+        if (holdRev && cmd.includes('--show-object-format')) {
+          holdRev = false;
+          opts.signal.throwIfAborted();
+          await new Promise((_, reject) => opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true }));
+        }
+        if (holdConfig && cmd.includes('--show-origin')) {
+          holdConfig = false;
+          return proc.processInspection.run(async (_, marker) => {
+            writeFileSync(${JSON.stringify(inspectionReady)}, '');
+            while (!existsSync(${JSON.stringify(releaseInspection)})) await Bun.sleep(10);
+            return process.pid + ' ' + process.getuid() + ' S scanner LIMITLESS_PROCESS_SCAN=' + marker;
+          }, () => sh(cmd, opts));
+        }
+        return sh(cmd, opts);
+      });
+      const lease = WorkerStore.prototype.leaseInplace;
+      let sawClear = false;
+      WorkerStore.prototype.leaseInplace = function(owner) {
+        if (this.job(${JSON.stringify(old)})?.state === 'cancelled') {
+          writeFileSync(${JSON.stringify(finished)}, '');
+          const clear = existsSync(${JSON.stringify(stopRequested)}) &&
+            !this.store.listProcessDiscoveries(undefined, ${JSON.stringify(realpathSync(req.cwd))}).length;
+          if (clear && sawClear) writeFileSync(${JSON.stringify(observed)}, '');
+          sawClear = clear;
+        }
+        return lease.call(this, owner);
+      };
+    `,
+    );
+  } finally {
+    writeFileSync(releaseInspection, "");
+    releaseStop.reject(new Error("fixture released stop observation"));
+    await resumed?.catch(() => {});
+    stopped.mockRestore();
+    attached.mockRestore();
+    removeScratch(scratch);
+  }
+});
+
 test.each(["sha", "missing", "release", "environment"])(
   "resume rejects a %s mismatch instead of waiting on the old handle",
   async (kind) => {
     const { f, context, req } = await setup();
-    await withExecutor(f, async (workers) => {
-      const ctx = context();
-      const scratch = kind === "missing" ? undefined : createScratch(req.cwd);
-      const old = workers.enqueue(
-        {
-          ...req,
-          scratch,
-          releaseSha: kind === "release" ? "older" : release,
-          env: kind === "environment" ? { ...req.env, EXTRA_MARKER: "old-daemon" } : req.env,
+    const ctx = context();
+    const scratch = kind === "missing" ? undefined : createScratch(req.cwd);
+    const pidFile = join(fixture.home, "stale-pid");
+    const proceed = join(fixture.home, "stale-proceed");
+    // Cover cancellation of active work; the parallel-inspection regression above covers late cleanup.
+    const old = f.workers.enqueue(
+      {
+        ...req,
+        scratch,
+        gates: {
+          ...gates,
+          setup: [],
+          checks: [
+            {
+              name: "stale",
+              run: `echo $$ > '${pidFile}'; while [ ! -f '${proceed}' ]; do sleep 0.05; done`,
+            },
+          ],
         },
-        randomUUID(),
-        true,
-      );
-      ctx.state.gateExecution = {
-        stage: "gates",
-        round: 0,
-        purpose: "initial",
-        sha: kind === "sha" ? "older" : req.headSha,
-        handle: { kind: "inplace", id: old, startedAt: Date.now() },
-      };
-      if (kind === "missing") f.store.db.query("DELETE FROM gate_jobs WHERE id=?").run(old);
-      writeFileSync(join(req.cwd, "greeting.txt"), "old gate output\n");
-      writeFileSync(join(req.cwd, "old-build"), "old gate output\n");
-      await ctx.save();
-      expect((await runGateExecution(context(), "gates", "initial", req.cwd, gates)).setupOk).toBe(true);
-      expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
-      expect(existsSync(join(req.cwd, "old-build"))).toBe(false);
-      if (kind !== "missing") expect(workers.job(old)?.state).toBe("cancelled");
-      if (scratch) expect(existsSync(scratch)).toBe(false);
-      expect(workers.jobs("in_place=1 AND state='done'")).toHaveLength(1);
-    });
+        releaseSha: kind === "release" ? "older" : release,
+        env: kind === "environment" ? { ...req.env, EXTRA_MARKER: "old-daemon" } : req.env,
+      },
+      randomUUID(),
+      true,
+    );
+    ctx.state.gateExecution = {
+      stage: "gates",
+      round: 0,
+      purpose: "initial",
+      sha: kind === "sha" ? "older" : req.headSha,
+      handle: { kind: "inplace", id: old, startedAt: Date.now() },
+    };
+    if (kind === "missing") f.store.db.query("DELETE FROM gate_jobs WHERE id=?").run(old);
+    writeFileSync(join(req.cwd, "greeting.txt"), "old gate output\n");
+    writeFileSync(join(req.cwd, "old-build"), "old gate output\n");
+    await ctx.save();
+    try {
+      await withExecutor(f, async (workers) => {
+        if (kind === "sha" || kind === "environment") {
+          await wait(() => existsSync(pidFile) || workers.job(old)?.state === "done", {
+            timeoutMs: 10_000,
+          });
+          expect(workers.job(old)?.state).toBe("leased");
+          await waitForPid(pidFile);
+        }
+        const executor = f.deps.gateExecutor;
+        if (!executor) throw new Error("missing gate executor");
+        const attach = executor.attach.bind(executor);
+        const attached = spyOn(executor, "attach").mockImplementation((handle, ...args) => {
+          if (handle.id === old) throw new Error("attached to stale gate result");
+          return attach(handle, ...args);
+        });
+        try {
+          expect(await runGateExecution(context(), "gates", "initial", req.cwd, gates)).toMatchObject({
+            setupOk: true,
+            sha: req.headSha,
+          });
+          expect(attached.mock.calls).toHaveLength(1);
+          expect(attached.mock.calls[0]?.[0]).toMatchObject({ kind: "inplace" });
+          expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+          expect(existsSync(join(req.cwd, "old-build"))).toBe(false);
+          if (kind !== "missing") expect(workers.job(old)?.state).toBe("cancelled");
+          if (scratch) expect(existsSync(scratch)).toBe(false);
+          expect(workers.jobs("in_place=1 AND state='done'")).toHaveLength(1);
+        } finally {
+          attached.mockRestore();
+        }
+      });
+    } finally {
+      writeFileSync(proceed, "");
+      f.workers.cancel(old);
+      await f.workers.waitStopped(old);
+      if (scratch) removeScratch(scratch);
+    }
   },
 );
 
@@ -962,12 +1201,23 @@ test.each(["SHA", "daemon port"])(
           { name: "long", run: "echo $$ > previous-pid; while [ ! -f stop-old ]; do sleep 0.05; done" },
         ],
       };
-      const pending = runGateExecution(current, "gates", "initial", req.cwd, long).catch((e) => e);
+      const pending = gateCommandScope(current, "gates", "initial", req.cwd, () =>
+        runGateExecution(current, "gates", "initial", req.cwd, long),
+      )().catch((e) => e);
+      const confirmed = Promise.withResolvers<void>();
+      const releaseWait = Promise.withResolvers<void>();
+      let stopped: ReturnType<typeof spyOn> | undefined;
+      let checkout: ReturnType<typeof spyOn> | undefined;
+      let replacement: ReturnType<typeof runGateExecution> | undefined;
       try {
         const pid = await waitForPid(join(req.cwd, "previous-pid"));
         const old = current.state.gateExecution?.handle.id ?? "";
+        const scratch = (JSON.parse(workers.job(old)?.request ?? "{}") as GateRequest).scratch;
+        if (!scratch) throw new Error("missing gate scratch");
         controller.abort(new Error("shutdown"));
         await pending;
+        writeFileSync(join(req.cwd, "greeting.txt"), "old gate output\n");
+        writeFileSync(join(req.cwd, "old-build"), "old gate output\n");
         if (kind === "SHA") {
           writeFileSync(join(req.cwd, "new-file"), "head moved");
           await sh(["git", "add", "new-file"], { cwd: req.cwd });
@@ -978,18 +1228,54 @@ test.each(["SHA", "daemon port"])(
             ? context()
             : new RunContext({ ...f.deps, cfg: { ...f.deps.cfg, port } }, first.run, first.repo, signal);
         let stoppedBeforeResult = false;
-        const result = await runGateExecution(resumed, "gates", "initial", req.cwd, gates, {
+        const originalWait = WorkerStore.prototype.waitStopped;
+        stopped = spyOn(WorkerStore.prototype, "waitStopped").mockImplementation(async function (
+          this: WorkerStore,
+          id,
+          signal,
+        ) {
+          await originalWait.call(this, id, signal);
+          if (id === old) {
+            confirmed.resolve();
+            await releaseWait.promise;
+          }
+        });
+        checkout = spyOn(repos, "checkoutCommitted");
+        replacement = runGateExecution(resumed, "gates", "initial", req.cwd, gates, {
           onResult: () => {
             stoppedBeforeResult = recoveryProcessStopped(pid);
           },
         });
-        expect(result.setupOk).toBe(true);
+        void replacement.catch(() => {});
+        await Promise.race([
+          confirmed.promise,
+          replacement.then(() => {
+            throw new Error("replacement finished before stop confirmation");
+          }),
+        ]);
+        expect(workers.job(old)).toMatchObject({ state: "cancelled", stopped: 1 });
+        expect(recoveryProcessStopped(pid)).toBe(true);
+        expect(checkout).not.toHaveBeenCalled();
+        expect(workers.jobs("in_place=1")).toHaveLength(1);
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("old gate output\n");
+        expect(existsSync(join(req.cwd, "old-build"))).toBe(true);
+        expect(existsSync(scratch)).toBe(true);
+        releaseWait.resolve();
+        expect((await replacement).setupOk).toBe(true);
+        expect(checkout).toHaveBeenCalledTimes(1);
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+        expect(existsSync(join(req.cwd, "old-build"))).toBe(false);
+        expect(existsSync(scratch)).toBe(false);
         expect(workers.job(old)).toMatchObject({ state: "cancelled", stopped: 1 });
         expect(stoppedBeforeResult).toBe(true);
         expect(workers.jobs("in_place=1")).toHaveLength(2);
         const ports = readFileSync(join(fixture.home, "executor-ports"), "utf8").trim().split("\n");
         expect(ports.at(-1)).toBe(String(kind === "SHA" ? f.cfg.port : port));
       } finally {
+        releaseWait.resolve();
+        await replacement?.catch(() => {});
+        stopped?.mockRestore();
+        checkout?.mockRestore();
         writeFileSync(join(req.cwd, "stop-old"), "");
         controller.abort(new Error("shutdown"));
         await pending;
@@ -1001,7 +1287,7 @@ test.each(["SHA", "daemon port"])(
 test("a daemon release change stops a running job before in-process fallback", async () => {
   const { f, context, req } = await setup();
   const attempted = join(fixture.home, "attempted");
-  await withExecutor(f, async (workers) => {
+  await withExecutor(f, async (workers, _crash, child) => {
     const long = {
       ...gates,
       setup: [],
@@ -1021,6 +1307,8 @@ test("a daemon release change stops a running job before in-process fallback", a
       expect(recoveryProcessStopped(pid)).toBe(true);
       const job = workers.jobs("in_place=1")[0];
       expect(job?.stopped).toBe(1);
+      await wait(() => child.exitCode !== null, { timeoutMs: 2 * workers.times.tick + 2000 });
+      expect(await child.exited).toBe(0);
       expect(job?.failure_reason).toContain("release changed");
     } finally {
       writeFileSync(join(req.cwd, "proceed"), "");
@@ -1197,4 +1485,57 @@ test.each([
     await fixture.factory?.stop();
     if (fixture.factory !== f) f.store.close();
   }
+});
+
+test("an idle serving executor exits on a release change without leasing a job", async () => {
+  const { f } = await setup();
+  await withExecutor(f, async (workers, _crash, child) => {
+    // Hold SQLite's write lock: idle serving observation must still run without a transaction.
+    f.store.db.exec("BEGIN IMMEDIATE");
+    try {
+      await Bun.sleep(2 * workers.times.tick);
+    } finally {
+      f.store.db.exec("ROLLBACK");
+    }
+    f.store.setSetting("executor.daemonRelease", "next-release");
+    await wait(() => child.exitCode !== null, { timeoutMs: 2 * workers.times.tick + 2000 });
+    expect(await child.exited).toBe(0);
+    expect(workers.jobs("1=1")).toHaveLength(0);
+  });
+});
+
+test("an executor awaiting its first matching release stays alive and read-only, then leases", async () => {
+  const { f, req } = await setup();
+  f.store.setSetting("executor.daemonRelease", "previous-release");
+  await withExecutor(f, async (workers, _crash, child) => {
+    const id = workers.enqueue(req, randomUUID(), true);
+    const version = () => f.store.db.query("PRAGMA data_version").get();
+    const before = version();
+    await Bun.sleep(3 * workers.times.tick);
+    expect(version()).toEqual(before);
+    expect(child.exitCode).toBeNull();
+    expect(workers.job(id)?.state).toBe("queued");
+    f.store.setSetting("executor.daemonRelease", release);
+    await wait(() => workers.job(id)?.state === "done", { timeoutMs: 10_000 });
+    expect(workers.job(id)?.state).toBe("done");
+  });
+});
+
+test("a serving executor fails and stops its leased job before exiting on a release change", async () => {
+  const { f, req } = await setup();
+  const started = join(req.cwd, "release-job-started");
+  req.gates = {
+    ...gates,
+    setup: [],
+    checks: [{ name: "long", run: "touch release-job-started; while :; do sleep 0.05; done" }],
+  };
+  await withExecutor(f, async (workers, _crash, child) => {
+    const id = workers.enqueue(req, randomUUID(), true);
+    await wait(() => existsSync(started), { timeoutMs: 10_000 });
+    expect(workers.job(id)?.state).toBe("leased");
+    f.store.setSetting("executor.daemonRelease", "next-release");
+    await wait(() => child.exitCode !== null, { timeoutMs: 10_000 });
+    expect(await child.exited).toBe(0);
+    expect(workers.job(id)).toMatchObject({ state: "failed", stopped: 1 });
+  });
 });

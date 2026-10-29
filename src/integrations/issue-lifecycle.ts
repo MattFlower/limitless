@@ -13,6 +13,8 @@ export const lifecycleManaged = (cfg: Partial<Pick<Config, "githubQueue">>, repo
   cfg.githubQueue.repos.some((r) => r.toLowerCase() === repo.toLowerCase());
 const labels = ["limitless:in-progress", "limitless:needs-you", "limitless:failed"] as const;
 const eventOrder = ["started", "pr", "needs_human", "failed", "cancelled"] as const;
+export const lifecycleMarker = (runId: string, event: string) =>
+  `<!-- limitless-lifecycle:${runId}:${event} -->`;
 export const ISSUE_LIFECYCLE_CALL_CAP = 50;
 export type IssueLifecycleOptions = { identity?: typeof githubIdentity; maxCalls?: number };
 const cursors = new WeakMap<Store, { key: string; deferred: boolean }>();
@@ -94,10 +96,7 @@ export async function reconcileIssueLifecycle(
         continue;
       }
       try {
-        const body = checkBody(
-          run,
-          `<!-- limitless-lifecycle:${run.id}:${event} -->\nLimitless run ${run.id} ${text}`,
-        );
+        const body = checkBody(run, `${lifecycleMarker(run.id, event)}\nLimitless run ${run.id} ${text}`);
         save(effect, "pending", { body });
       } catch (error) {
         save(effect, "done");

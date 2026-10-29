@@ -4,8 +4,9 @@ import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
+import { feedCommand } from "../src/cli/feed.ts";
 import { loadConfig } from "../src/config.ts";
-import type { CreateRunRequest, RunStatus } from "../src/core/types.ts";
+import type { CreateRunRequest, FeedPage, RunStatus } from "../src/core/types.ts";
 import { MIGRATION_DIR } from "../src/db/migration-runner.ts";
 import { ISSUE_CLAIM_STATUSES, IssueClaimed, linkedIssues, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
@@ -18,21 +19,29 @@ import {
 import type { GitHubIdentity } from "../src/integrations/github-identity.ts";
 import { mountIntegrations } from "../src/integrations/index.ts";
 import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
-import { issueEligibility, type QueueIssue, startIssueQueue } from "../src/integrations/issue-queue.ts";
+import {
+  epicAttention,
+  issueEligibility,
+  type QueueIssue,
+  startIssueQueue,
+} from "../src/integrations/issue-queue.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { buildReport } from "../src/pipeline/report.ts";
 import { reviewRoundPrompt } from "../src/pipeline/review-round.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { stallReporter } from "../src/util/stall.ts";
 import { feedRound } from "./feed-support.ts";
+import { legacyLatestIssueRun } from "./issue-queue-reference.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
 const at = "2026-01-01T00:00:00Z";
 const beforeLifecycle = (path: string) =>
   !path.endsWith("-issue-lifecycle.sql") && !path.endsWith("-issue-lifecycle-history.sql");
-function issue(number = 1, p = 1): QueueIssue {
+function issue(number = 1, p = 1): QueueIssue & { repository: { nameWithOwner: string } } {
   return {
+    repository: { nameWithOwner: "owner/repo" },
     number,
     title: `Issue ${number}`,
     body: "Implement it.\nAllow: submodules",
@@ -45,6 +54,7 @@ function issue(number = 1, p = 1): QueueIssue {
     lastEditedAt: null,
     labels: { totalCount: 1, nodes: [{ name: `priority:${p}` }] },
     subIssuesSummary: { total: 0 },
+    subIssues: { totalCount: 0, nodes: [] },
     blockedBy: { totalCount: 0, nodes: [] },
     closedByPullRequestsReferences: { totalCount: 0, nodes: [] },
     timelineItems: {
@@ -112,7 +122,10 @@ const exclusions: [string, (i: QueueIssue) => void][] = [
   [
     "native blocker",
     (i) => {
-      i.blockedBy = { totalCount: 1, nodes: [{ state: "OPEN" }] };
+      i.blockedBy = {
+        totalCount: 1,
+        nodes: [{ number: 9, state: "OPEN", repository: { nameWithOwner: "owner/repo" } }],
+      };
     },
   ],
   [
@@ -168,7 +181,10 @@ test("closed dependencies and merged PRs allow a trusted, edited issue", () => {
   i.editor = { login: "OWNER" };
   i.lastEditedAt = at;
   i.body = "Blocked by #9\r\nBlocked by #10";
-  i.blockedBy = { totalCount: 1, nodes: [{ state: "CLOSED" }] };
+  i.blockedBy = {
+    totalCount: 1,
+    nodes: [{ number: 9, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+  };
   i.closedByPullRequestsReferences = { totalCount: 1, nodes: [{ state: "MERGED" }] };
   expect(
     issueEligibility(i, ["owner"], {
@@ -759,7 +775,9 @@ test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval"]
       expect(queuePublications).toEqual([]);
       expect(h.store.db.query("SELECT count(*) AS n FROM events").get()).toEqual({ n: 0 });
       expect(h.logs.join("\n")).toContain("Run admission refused:");
-      expect(h.logs.join("\n")).toContain(mode);
+      expect(h.logs.join("\n")).toContain(
+        mode === "re-approval" ? "linked run changed during the poll; retrying next poll" : mode,
+      );
       expect(h.clock.pending).toBe(mode === "stopped" ? 0 : 1);
       if (mode.includes("limit")) {
         for (const run of h.runs()) h.store.updateRun(run.id, { status: "succeeded" });
@@ -1123,6 +1141,40 @@ test("queue config defaults and mount remain off without opt-in", async () => {
     raw: { github: { queue: {} } },
   });
   expect(cfg.githubQueue?.trusted).toEqual([]);
+  expect(harness({}, ["owner/repo", "OWNER/REPO", "owner/other"]).cfg.githubQueue?.repos).toEqual([
+    "owner/repo",
+    "owner/other",
+  ]);
+});
+
+test("queue preserves the first configured repository spelling and existing repository ID", async () => {
+  const h = harness({ repos: ["Owner/Repo", "owner/repo"], max_issue_runs: 2 }, ["Owner/Repo"]);
+  expect(h.cfg.githubQueue?.repos).toEqual(["Owner/Repo"]);
+  const repo = h.store.getRepoBySlug("Owner/Repo");
+  if (!repo) throw new Error("missing repository");
+  // An unexpected spelling must fail locally rather than discovering a repository over the network.
+  const get = h.store.getRepoBySlug.bind(h.store);
+  const lookup = spyOn(h.store, "getRepoBySlug").mockImplementation((slug) => {
+    const found = get(slug);
+    if (!found) throw new Error(`unexpected repository lookup: ${slug}`);
+    return found;
+  });
+  try {
+    h.data.set(repo.slug, [
+      { ...issue(), body: "Blocked by #9" },
+      { ...commentIssue(2), comments: { nodes: [commandComment()], totalCount: 1 } },
+    ]);
+    h.states.set(9, "CLOSED");
+    h.start();
+    await h.advance();
+    expect(h.requests).toHaveLength(2);
+    expect(h.requests.map((request) => request.repo)).toEqual([repo.slug, repo.slug]);
+    expect(h.runs().map((run) => run.repoId)).toEqual([repo.id, repo.id]);
+    expect(h.store.listRepos()).toEqual([repo]);
+    expect(h.scopes.every((scope) => scope === repo.slug)).toBe(true);
+  } finally {
+    lookup.mockRestore();
+  }
 });
 
 test.each([
@@ -1183,6 +1235,203 @@ test("a run failing during another repository lookup is rechecked before startin
   pending.resolve();
   await h.advance();
   expect(h.runs()).toHaveLength(1);
+});
+
+test("case-variant repository snapshots cannot clear another candidate's invalidation", async () => {
+  const h = harness();
+  // Bypass configuration deduplication to exercise a second read of the same repository.
+  h.cfg.githubQueue?.repos.push("OWNER/REPO");
+  const repo = h.store.getRepoBySlug("owner/repo");
+  if (!repo) throw new Error("missing repo");
+  h.data.set("owner/repo", [issue()]);
+  h.data.set("OWNER/REPO", [issue()]);
+  let competingId = "";
+  h.intercept = (args) => {
+    if (!args[3]?.includes('name:"REPO"') || competingId) return;
+    const run = h.store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "Competing start",
+      source: "github",
+      sourceRef: { kind: "issue", repo: "OWNER/REPO", number: 1 },
+    });
+    competingId = run.id;
+    h.store.updateRun(run.id, { status: "cancelled", finishedAt: Date.parse(at) - 1000 });
+  };
+  h.start();
+  await h.advance();
+  expect(competingId).not.toBe("");
+  expect(h.runs().map((run) => run.id)).toEqual([competingId]);
+  expect(h.logs.join("\n")).toContain("linked run changed during the poll; retrying next poll");
+  h.intercept = undefined;
+  await h.advance(180_000);
+  expect(h.runs().filter((run) => run.sourceRef?.via === "queue")).toHaveLength(1);
+});
+
+test.each(["accounting only", "reference metadata", "linkage ordering"])(
+  "metadata publications do not starve an approved issue across polls: %s",
+  async (publication) => {
+    const h = harness({}, ["owner/a", "owner/b"]);
+    const repo = h.store.getRepoBySlug("owner/a");
+    if (!repo) throw new Error("missing repo");
+    const previous = h.store.createRun(repo, {
+      repo: repo.slug,
+      prompt: publication === "linkage ordering" ? "Closes #1\nCloses #2" : "Closes #1",
+    });
+    h.store.updateRun(previous.id, { status: "cancelled", finishedAt: Date.parse(at) - 1000 });
+    h.data.set(repo.slug, [issue()]);
+    let publications = 0;
+    h.intercept = (args) => {
+      if (!args[3]?.includes('name:"b"')) return;
+      h.store.refreshRunTotals(previous.id);
+      if (publication === "reference metadata")
+        h.store.setRunSourceRef(previous.id, {
+          kind: "issue",
+          repo: publications % 2 ? "owner/a" : "OWNER/A",
+          number: 1,
+          note: `publication ${publications}`,
+        });
+      if (publication === "linkage ordering") {
+        h.store.db.query("UPDATE runs SET prompt = ? WHERE id = ?").run("Closes #2\nCloses #1", previous.id);
+        h.store.refreshRunTotals(previous.id);
+      }
+      publications++;
+    };
+    h.start();
+    await h.advance();
+    expect(h.runs().filter((run) => run.sourceRef?.via === "queue")).toHaveLength(1);
+    await h.advance(180_000);
+    expect(publications).toBe(2);
+    expect(h.runs().filter((run) => run.sourceRef?.via === "queue")).toHaveLength(1);
+    expect(h.logs.join("\n")).not.toContain("linked run changed during the poll");
+  },
+);
+
+test.each(["status", "finishedAt", "linkage", "removed link", "new run"] as const)(
+  "%s changes defer affected issues for one poll without blocking unrelated issues",
+  async (field) => {
+    const h = harness({ max_issue_runs: 4 }, ["owner/a", "owner/b"]);
+    const repo = h.store.getRepoBySlug("owner/a");
+    if (!repo) throw new Error("missing repo");
+    const previous = h.store.createRun(repo, { repo: repo.slug, prompt: "Closes #1" });
+    h.store.updateRun(previous.id, { status: "cancelled", finishedAt: Date.parse(at) - 2000 });
+    h.data.set(repo.slug, [issue(1), issue(2), issue(3)]);
+    h.data.set("owner/b", [issue(1)]);
+    let changes = 0;
+    h.intercept = (args) => {
+      if (!args[3]?.includes('name:"b"')) return;
+      if (changes++ === 0) {
+        if (field === "status") h.store.updateRun(previous.id, { status: "resolved" });
+        else if (field === "finishedAt")
+          h.store.updateRun(previous.id, { finishedAt: Date.parse(at) - 1000 });
+        else if (field === "linkage")
+          h.store.setRunSourceRef(previous.id, { kind: "issue", repo: "OWNER/A", number: 2 });
+        else if (field === "removed link") h.store.setRunSourceRef(previous.id, { kind: "review-round" });
+        else {
+          const competing = h.store.createRun(repo, { repo: repo.slug, prompt: "Closes #1" });
+          h.store.updateRun(competing.id, { status: "cancelled", finishedAt: Date.parse(at) - 1000 });
+        }
+      }
+      if (field !== "new run") h.store.refreshRunTotals(previous.id);
+    };
+    const queued = () =>
+      h
+        .runs()
+        .filter((run) => run.sourceRef?.via === "queue")
+        .map((run) => `${run.sourceRef?.repo}#${run.sourceRef?.number}`)
+        .sort();
+    h.start();
+    await h.advance();
+    expect(changes).toBe(1);
+    expect(queued()).toEqual(
+      field === "linkage" ? ["owner/a#3", "owner/b#1"] : ["owner/a#2", "owner/a#3", "owner/b#1"],
+    );
+    const deferred = field === "linkage" ? [1, 2] : [1];
+    for (const number of deferred)
+      expect(h.logs).toContain(
+        `Issue queue owner/a#${number}: linked run changed during the poll; retrying next poll`,
+      );
+    await h.advance(180_000);
+    expect(changes).toBe(2);
+    expect(queued()).toEqual(["owner/a#1", "owner/a#2", "owner/a#3", "owner/b#1"]);
+  },
+);
+
+test.each(["accounting", "latest status", "owner status", "owner finish", "owner linkage", "removed link"])(
+  "nested review-round snapshots compare authoritative ownership: %s",
+  async (change) => {
+    const h = harness({ max_issue_runs: 4 }, ["owner/a", "owner/b"]);
+    const repo = h.store.getRepoBySlug("owner/a");
+    const other = h.store.getRepoBySlug("owner/b");
+    if (!repo || !other) throw new Error("missing repositories");
+    const owner = h.store.createRun(repo, { repo: repo.slug, prompt: "Closes #1" });
+    h.store.updateRun(owner.id, { status: "resolved", finishedAt: Date.parse(at) - 3000 });
+    const round = feedRound(h.store, other, owner, "review");
+    h.store.updateRun(round.id, { status: "cancelled", finishedAt: Date.parse(at) - 2000 });
+    const nested = feedRound(h.store, other, round, "ci");
+    h.store.updateRun(nested.id, { status: "cancelled", finishedAt: Date.parse(at) - 1000 });
+    h.data.set(repo.slug, [issue(1), issue(2), issue(3)]);
+    let changed = false;
+    h.intercept = (args) => {
+      if (!args[3]?.includes('name:"b"') || changed) return;
+      changed = true;
+      if (change === "latest status") h.store.updateRun(nested.id, { status: "resolved" });
+      else if (change === "owner status") h.store.updateRun(owner.id, { status: "cancelled" });
+      else if (change === "owner finish") h.store.updateRun(owner.id, { finishedAt: Date.parse(at) - 2500 });
+      else if (change === "owner linkage")
+        h.store.setRunSourceRef(owner.id, { kind: "issue", repo: "OWNER/A", number: 2 });
+      else if (change === "removed link") h.store.setRunSourceRef(owner.id, { kind: "review-round" });
+      else {
+        h.store.refreshRunTotals(owner.id);
+        // A round's reference cannot override the root recorded in review_rounds.
+        h.store.setRunSourceRef(nested.id, { kind: "issue", repo: repo.slug, number: 3 });
+        h.store.refreshRunTotals(nested.id);
+      }
+    };
+    h.start();
+    await h.advance();
+    expect(changed).toBe(true);
+    expect(
+      h
+        .runs()
+        .filter((run) => run.sourceRef?.via === "queue")
+        .map((run) => run.sourceRef?.number)
+        .sort(),
+    ).toEqual(change === "accounting" ? [1, 2, 3] : change === "owner linkage" ? [3] : [2, 3]);
+    if (change === "accounting")
+      expect(h.logs.join("\n")).not.toContain("linked run changed during the poll");
+    else expect(h.logs.join("\n")).toContain("linked run changed during the poll; retrying next poll");
+  },
+);
+
+test("publications before a repository snapshot defer only the linked issue until the next poll", async () => {
+  const h = harness({ max_issue_runs: 3 });
+  const repo = h.store.getRepoBySlug("owner/repo");
+  if (!repo) throw new Error("missing repo");
+  h.data.set(repo.slug, [issue(1), issue(2)]);
+  let competingId = "";
+  h.intercept = (args) => {
+    if (!args[3]?.includes("issues(first:") || competingId) return;
+    const run = h.store.createRun(repo, { repo: repo.slug, prompt: "Closes #1" });
+    competingId = run.id;
+    h.store.updateRun(run.id, { status: "cancelled", finishedAt: Date.parse(at) - 1000 });
+  };
+  h.start();
+  await h.advance();
+  expect(
+    h
+      .runs()
+      .filter((run) => run.sourceRef?.via === "queue")
+      .map((run) => run.sourceRef?.number),
+  ).toEqual([2]);
+  expect(h.logs.join("\n")).toContain("linked run changed during the poll; retrying next poll");
+  await h.advance(180_000);
+  expect(
+    h
+      .runs()
+      .filter((run) => run.sourceRef?.via === "queue")
+      .map((run) => run.sourceRef?.number)
+      .sort(),
+  ).toEqual([1, 2]);
 });
 
 test("MCP, comments and retries share the claim refusal; repository scope stays independent", async () => {
@@ -2785,6 +3034,174 @@ function commandComment(databaseId = 1): QueueIssue["comments"]["nodes"][number]
 function commentIssue(number = 1): QueueIssue {
   return { ...issue(number), labels: { totalCount: 0, nodes: [] } };
 }
+test("batched latest runs match the pre-change reference without hydrating candidate or owner states", () => {
+  const h = harness({}, ["Owner/Repo", "owner/other"]);
+  const repo = h.store.getRepoBySlug("Owner/Repo");
+  const other = h.store.getRepoBySlug("owner/other");
+  if (!repo || !other) throw new Error("missing repositories");
+  const state = JSON.stringify({ issueQueueStateProbe: "x".repeat(128 * 1024) });
+  const make = (request: Partial<CreateRunRequest>, target = repo, createdAt = 10) => {
+    const run = h.store.createRun(target, { repo: target.slug, prompt: "Work", ...request });
+    h.store.db
+      .query(
+        "UPDATE runs SET status = 'cancelled', created_at = ?, finished_at = 20, state_json = ? WHERE id = ?",
+      )
+      .run(createdAt, state, run.id);
+    return run;
+  };
+  const explicit = make({
+    source: "github",
+    sourceRef: { kind: "issue", repo: "OWNER/REPO", number: 1 },
+    prompt: "Closes #8",
+  });
+  const directives = make({ prompt: "Closes #2\nCloses #3" });
+  const tied = make({ prompt: "Closes #3" });
+  const crossRepo = make({ sourceRef: { kind: "issue", repo: "owner/repo", number: 4 } }, other);
+  make({ source: "github", prompt: "Closes #5" });
+  const standalone = make({
+    prompt:
+      "> Closes #6\n```text\nCloses #6\n```\n`Closes #6`\nExample: Closes #6\n~~~\nCloses #6\n~~~\nCloses #7",
+  });
+  const invalid = make({ prompt: "Closes #9" });
+  h.store.db
+    .query("UPDATE runs SET source_ref = ? WHERE id = ?")
+    .run(JSON.stringify({ kind: "issue", repo: repo.slug, number: 0 }), invalid.id);
+  const orphan = make({ prompt: "Closes #9" });
+  h.store.db
+    .query("UPDATE runs SET source_ref = ? WHERE id = ?")
+    .run(JSON.stringify({ kind: "review-round", sourceRunId: explicit.id }), orphan.id);
+  const round = feedRound(h.store, other, explicit, "review");
+  const nested = feedRound(h.store, other, round, "ci");
+  const unlinked = make({ prompt: "No directives" });
+  const misleading = feedRound(h.store, repo, unlinked, "conflict");
+  for (const run of [round, nested, misleading])
+    h.store.db
+      .query(
+        "UPDATE runs SET source_ref = NULL, prompt = 'Closes #6', state_json = ?, created_at = 30 WHERE id = ?",
+      )
+      .run(state, run.id);
+  const otherRun = make({ prompt: "Closes #1" }, other);
+  const numbers = Array.from({ length: 10 }, (_, i) => i + 1);
+  const expected = new Map([
+    [1, nested.id],
+    [2, directives.id],
+    [3, tied.id],
+    [4, crossRepo.id],
+    [7, standalone.id],
+  ]);
+  const reference = numbers.map((n) => legacyLatestIssueRun(h.store, "owner/repo", n)?.id ?? null);
+  expect(reference).toEqual(numbers.map((n) => expected.get(n) ?? null));
+  expect(numbers.map((n) => legacyLatestIssueRun(h.store, "OWNER/OTHER", n)?.id ?? null)).toEqual(
+    numbers.map((n) => (n === 1 ? otherRun.id : null)),
+  );
+
+  const parse = JSON.parse;
+  let stateParses = 0;
+  const parseSpy = spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+    if (text.includes('"issueQueueStateProbe"')) stateParses++;
+    return parse(text, reviver);
+  });
+  const get = spyOn(h.store, "getRun");
+  const query = spyOn(h.store.db, "query");
+  try {
+    for (const slug of ["owner/repo", "OWNER/OTHER"]) {
+      const latest = h.store.latestIssueRuns(slug, numbers);
+      expect(numbers.map((n) => latest.get(n)?.id ?? null)).toEqual(
+        slug === "owner/repo" ? reference : numbers.map((n) => (n === 1 ? otherRun.id : null)),
+      );
+    }
+    expect(get).not.toHaveBeenCalled();
+    expect(stateParses).toBe(0);
+    expect(query).toHaveBeenCalledTimes(2);
+    for (const [sql] of query.mock.calls) {
+      expect(sql).not.toContain("state_json");
+      expect(sql).not.toContain("runs.*");
+    }
+    expect(h.store.latestIssueRun("OWNER/REPO", 1)?.id).toBe(nested.id);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(stateParses).toBe(1);
+  } finally {
+    query.mockRestore();
+    get.mockRestore();
+    parseSpy.mockRestore();
+  }
+});
+
+test("poll shares one batch per repository through admission and refreshes it next poll", async () => {
+  const repos = ["owner/repo", "owner/other"];
+  const h = harness({ max_issue_runs: 10 }, repos);
+  h.cfg.maxConcurrentRuns = 10;
+  const blocked = repos.map((slug) => {
+    const repo = h.store.getRepoBySlug(slug);
+    if (!repo) throw new Error("missing repo");
+    const run = h.store.createRun(repo, { repo: slug, prompt: "Closes #1" });
+    h.store.updateRun(run.id, { status: "cancelled", finishedAt: Date.parse(at) + 1 });
+    h.data.set(slug, [issue(1), issue(2), issue(3)]);
+    return run.id;
+  });
+  const batch = spyOn(h.store, "latestIssueRuns");
+  const legacy = spyOn(h.store, "latestIssueRun").mockImplementation(() => {
+    throw new Error("queue must use the poll batch");
+  });
+  try {
+    h.start();
+    await h.advance();
+    expect(batch.mock.calls).toEqual(repos.map((repo) => [repo, [1, 2, 3]]));
+    expect(h.requests.map((r) => [r.repo, r.sourceRef?.number])).toEqual([
+      [repos[0], 2],
+      [repos[1], 2],
+      [repos[0], 3],
+      [repos[1], 3],
+    ]);
+    for (const id of blocked) h.store.updateRun(id, { finishedAt: Date.parse(at) - 1 });
+    await h.advance(180_000);
+    expect(batch.mock.calls).toEqual([...repos, ...repos].map((repo) => [repo, [1, 2, 3]]));
+    expect(h.requests.slice(4).map((r) => [r.repo, r.sourceRef?.number])).toEqual(
+      repos.map((repo) => [repo, 1]),
+    );
+    expect(legacy).not.toHaveBeenCalled();
+  } finally {
+    batch.mockRestore();
+    legacy.mockRestore();
+  }
+});
+
+test.each(["success", "failure", "initialization"])("repository activity closes after %s", async (mode) => {
+  const h = harness({}, ["owner/repo"], mode === "initialization");
+  let active = 0;
+  let starts = 0;
+  let ends = 0;
+  const begin = stallReporter.beginActivity.bind(stallReporter);
+  const activity = spyOn(stallReporter, "beginActivity").mockImplementation((name) => {
+    if (name !== "issue-queue.repository") return begin(name);
+    starts++;
+    active++;
+    return () => {
+      active--;
+      ends++;
+    };
+  });
+  const batchRead = h.store.latestIssueRuns.bind(h.store);
+  const batch = spyOn(h.store, "latestIssueRuns").mockImplementation((...args) => {
+    expect(active).toBe(1);
+    if (mode === "failure") throw new Error("synthetic batch failure");
+    return batchRead(...args);
+  });
+  try {
+    h.data.set("owner/repo", [issue()]);
+    h.start();
+    await h.advance();
+    expect(starts).toBe(1);
+    expect(ends).toBe(1);
+    expect(active).toBe(0);
+    expect(batch).toHaveBeenCalledTimes(mode === "initialization" ? 0 : 1);
+    if (mode === "failure") expect(h.logs.join("\n")).toContain("synthetic batch failure");
+  } finally {
+    batch.mockRestore();
+    activity.mockRestore();
+  }
+});
+
 const records = (h: ReturnType<typeof harness>) =>
   h.store.db.query("SELECT * FROM github_processed_comments").all();
 async function pollComments(h: ReturnType<typeof harness>) {
@@ -3570,4 +3987,608 @@ test("mounted webhook requests a queue poll only for verified trusted created de
   } finally {
     await integrations.stop();
   }
+});
+
+function attentionEpic() {
+  const closed = { ...issue(2), state: "CLOSED" as const };
+  const open = issue(3);
+  // Keep priority visible to attention while preventing automatic admission in poll tests.
+  open.author = { login: "stranger" };
+  const epic = { ...issue(1), body: "## Slices\n- #2 Build\n- Acceptance: #3" };
+  epic.subIssuesSummary.total = 2;
+  epic.subIssues = { totalCount: 2, nodes: [closed, open] };
+  return { epic, open, closed };
+}
+
+test.each(["approval", "local claim", "missing record", "native acceptance", "foreign claim"] as const)(
+  "epic attention does not substitute a local issue for a foreign child during %s",
+  async (kind) => {
+    const h = harness();
+    const { epic, open, closed } = attentionEpic();
+    epic.body = "";
+    const foreign = {
+      ...(kind === "native acceptance" ? closed : open),
+      repository: { nameWithOwner: "other/repo" },
+      labels: kind === "missing record" ? open.labels : { totalCount: 0, nodes: [] },
+    };
+    epic.subIssues.nodes = kind === "native acceptance" ? [foreign, open] : [closed, foreign];
+    if (kind === "native acceptance") {
+      open.blockedBy = {
+        totalCount: 1,
+        nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+      };
+    }
+    if (kind === "local claim" || kind === "foreign claim") {
+      open.labels = { totalCount: 0, nodes: [] };
+      const repo = h.store.getRepoBySlug("owner/repo");
+      if (!repo) throw new Error("missing repo");
+      h.store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "Local issue",
+        sourceRef: {
+          kind: "issue",
+          repo: kind === "foreign claim" ? "OTHER/REPO" : "OWNER/REPO",
+          number: 3,
+        },
+      });
+      h.maxCalls = 0;
+    }
+    h.data.set("owner/repo", kind === "missing record" ? [epic] : [epic, open]);
+    h.start();
+    await h.advance();
+    expect(
+      h.store
+        .readFeed()
+        .items.filter((item) => item.kind === "queue.epic_attention")
+        .map((item) => item.data.state),
+    ).toEqual(kind === "native acceptance" || kind === "foreign claim" ? [] : ["needs_approval"]);
+  },
+);
+
+test("native acceptance covers an exact foreign sibling even when its number equals the candidate's", () => {
+  const { epic, open, closed } = attentionEpic();
+  epic.body = "";
+  closed.repository.nameWithOwner = "OTHER/REPO";
+  open.repository.nameWithOwner = "OWNER/REPO";
+  open.number = closed.number;
+  const check = () =>
+    epicAttention("Owner/Repo", epic, ["owner"], new Map([["owner/repo#2", open]]), () => false);
+  expect(check()).toBeNull();
+  open.blockedBy = {
+    totalCount: 1,
+    nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "other/repo" } }],
+  };
+  expect(check()).toEqual({ state: "ready_for_acceptance", items: ["#2"] });
+  // The same repository and number in different casing really is a duplicate.
+  closed.repository.nameWithOwner = "owner/repo";
+  expect(check()).toBeUndefined();
+});
+
+test("bare slice references cannot name a foreign child or acceptance candidate", () => {
+  const { epic, open, closed } = attentionEpic();
+  open.repository.nameWithOwner = "OWNER/REPO";
+  expect(
+    epicAttention("Owner/Repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({ state: "ready_for_acceptance", items: ["#3"] });
+  closed.repository.nameWithOwner = "other/repo";
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({ state: "unfiled", items: ["- #2 Build"] });
+
+  closed.repository.nameWithOwner = "owner/repo";
+  open.repository.nameWithOwner = "other/repo";
+  open.number = closed.number;
+  epic.body = "## Slices\n- Acceptance: #2";
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["other/repo#2", open]]), () => false),
+  ).toBeNull();
+});
+
+test.each([
+  "#3",
+  "#3 Build",
+  "#3\tBuild",
+  "#3: Build",
+  "#3, Build",
+  "#3) Build",
+  "#3—Build",
+  "owner/repo#3",
+  "OWNER/REPO#3 Build",
+  "Acceptance: #3",
+  "Acceptance: \tOWNER/Repo#3 Build",
+  "Acceptance: #3 #2",
+  "Acceptance: #3 other/repo#3",
+])("leading slice reference identifies a child: %s", (text) => {
+  const { epic, open } = attentionEpic();
+  epic.body = `## Slices\n- ${text}`;
+  open.blockedBy = {
+    totalCount: 1,
+    nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+  };
+  expect(
+    epicAttention("Owner/Repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({ state: "ready_for_acceptance", items: ["#3"] });
+});
+
+test.each([
+  "[#3](https://github.com/owner/repo/issues/3)",
+  '[#3][target]\n\n[target]: https://github.com/other/repo/issues/3 "Slice"',
+  "[#3][]\n\n[#3]: https://github.com/owner/repo/issues/3",
+  "[#3]\n\n[#3]: https://github.com/owner/repo/issues/3",
+  "<https://github.com/owner/repo/issues/3>",
+  "<https://example.com/?ref=#3>",
+  "https://github.com/owner/repo/issues/3",
+  "`#3`",
+  "\\#3",
+  "Q2 claims (#3)",
+  "#3abc",
+  "#30 #3",
+  "other/repo#3 #3",
+  "Acceptance:#3",
+])("non-leading or unrelated slice references remain unfiled: %s", (text) => {
+  const { epic, open } = attentionEpic();
+  // Even complete native blockers cannot override an unfiled Acceptance item.
+  open.blockedBy = {
+    totalCount: 1,
+    nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+  };
+  for (const prefix of ["", "Acceptance: "]) {
+    const line = `  - ${prefix}${text.split("\n")[0]}`;
+    epic.body = `## Slices\n  - ${prefix}${text}`;
+    expect(
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+    ).toEqual({ state: "unfiled", items: [line] });
+  }
+});
+
+test("leading references distinguish same-number children across repositories", () => {
+  const { epic, open, closed } = attentionEpic();
+  open.repository.nameWithOwner = "other/repo";
+  open.number = closed.number;
+  const check = () =>
+    epicAttention("owner/repo", epic, ["owner"], new Map([["other/repo#2", open]]), () => false);
+  epic.body = "## Slices\n- Acceptance: OTHER/REPO#2";
+  expect(check()).toEqual({ state: "ready_for_acceptance", items: ["#2"] });
+  for (const reference of ["#2", "owner/repo#2", "#2 other/repo#2"]) {
+    epic.body = `## Slices\n- Acceptance: ${reference}`;
+    expect(check()).toBeNull();
+  }
+});
+
+test("queue-produced epic and existing feed items render in the CLI and preserve acknowledgement cursors", async () => {
+  const h = harness();
+  const { epic, open } = attentionEpic();
+  epic.body += "\n- Later";
+  h.data.set("owner/repo", [epic, open]);
+  h.start();
+  await h.advance();
+  const repo = h.store.getRepoBySlug("owner/repo");
+  if (!repo) throw new Error("missing repo");
+  const run = h.store.createRun(repo, { repo: repo.slug, prompt: "Existing work" });
+  h.store.updateRun(run.id, { status: "failed" });
+  const routes = createHttpRoutes(h.factory);
+  const feed = (routes["/api/feed"] as { GET: Route }).GET;
+  const ack = (routes["/api/feed/ack"] as { POST: Route }).POST;
+  const lines: string[] = [];
+  const deps = {
+    api: async <T>(path: string, init?: RequestInit): Promise<T> => {
+      const handler = init?.method === "POST" ? ack : feed;
+      const response = await handler(
+        requestWithParams(`http://localhost:7400${path}`, {
+          ...init,
+          headers: { "content-type": "application/json" },
+        }),
+        localServer,
+      );
+      expect(response.status).toBe(200);
+      return (await response.json()) as T;
+    },
+    print: (line: string) => lines.push(line),
+  };
+  await feedCommand([], { consumer: "legacy", json: true }, deps);
+  const mixed: FeedPage = JSON.parse(lines.pop() ?? "");
+  expect(mixed.items.map((i) => i.kind)).toEqual(["queue.epic_attention", "run.failed"]);
+  expect(mixed.items[0]?.data).toEqual({
+    repo: "owner/repo",
+    epic: 1,
+    state: "unfiled",
+    items: ["- Later"],
+  });
+  const cursor = mixed.nextAfter;
+  expect(mixed.items[1]?.id).toBe(cursor);
+  await feedCommand([], { consumer: "legacy" }, deps);
+  expect(lines.join("\n")).toContain(`#${mixed.items[0]?.id} queue.epic_attention`);
+  expect(lines.join("\n")).toContain("    Epic #1: unfiled");
+  expect(lines.join("\n")).toContain(`#${cursor} run.failed`);
+  expect(lines.at(-1)).toBe(`next after: ${cursor}`);
+  expect(h.store.feedCursor("legacy")).toBe(0);
+  await feedCommand(["ack", String(cursor)], { consumer: "legacy" }, deps);
+  expect(lines.at(-1)).toBe(`legacy acknowledged through ${cursor}`);
+  expect(h.store.feedCursor("legacy")).toBe(cursor);
+  h.store.updateRun(run.id, { status: "cancelled" });
+  await feedCommand([], { consumer: "legacy", json: true }, deps);
+  const next: FeedPage = JSON.parse(lines.at(-1) ?? "");
+  expect(next.items.map((i) => i.kind)).toEqual(["run.cancelled"]);
+  expect(next.items[0]?.id).toBeGreaterThan(cursor);
+});
+
+test.each([
+  [
+    "unrelated reference",
+    (e: QueueIssue) => {
+      e.body += "\n- Later #99";
+    },
+    "unfiled",
+    ["- Later #99"],
+  ],
+  [
+    "unfiled precedence",
+    (e: QueueIssue, o: QueueIssue) => {
+      e.body += "\n- Later";
+      o.labels = { totalCount: 0, nodes: [] };
+    },
+    "unfiled",
+    ["- Later"],
+  ],
+  [
+    "approval precedence",
+    (_e: QueueIssue, o: QueueIssue) => {
+      o.labels = { totalCount: 0, nodes: [] };
+    },
+    "needs_approval",
+    ["#3"],
+  ],
+  ["trusted acceptance", () => {}, "ready_for_acceptance", ["#3"]],
+  [
+    "native acceptance with closed sibling",
+    (e: QueueIssue, o: QueueIssue) => {
+      e.body = "";
+      o.blockedBy = {
+        totalCount: 1,
+        nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+      };
+    },
+    "ready_for_acceptance",
+    ["#3"],
+  ],
+] as const)("epic attention: %s", (_name, change, state, items) => {
+  const { epic, open } = attentionEpic();
+  change(epic, open);
+  expect(
+    epicAttention("owner/repo", epic, ["OWNER"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({
+    state,
+    items: [...items],
+  });
+});
+
+test("Slices parsing excludes fences and other sections, counts closed children, and supports list markers", () => {
+  const { epic, open } = attentionEpic();
+  epic.body =
+    "- Outside\n## Slices\n```md\n- Ignored\n```\n1. #2 Build\n2) Acceptance: #3\n  continuation\n### Notes\n+ Future\n## Tests\n- Outside";
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({
+    state: "unfiled",
+    items: ["+ Future"],
+  });
+});
+
+test.each(["author", "editor", "missing editor"])(
+  "untrusted %s cannot identify unfiled or acceptance slices",
+  (kind) => {
+    const { epic, open } = attentionEpic();
+    epic.body += "\n- Unfiled";
+    if (kind === "author") epic.author = { login: "stranger" };
+    else {
+      epic.lastEditedAt = at;
+      epic.editor = kind === "editor" ? { login: "stranger" } : null;
+    }
+    const check = () =>
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false);
+    expect(check()).toBeNull();
+    open.labels = { totalCount: 0, nodes: [] };
+    expect(check()).toEqual({ state: "needs_approval", items: ["#3"] });
+    open.blockedBy = {
+      totalCount: 1,
+      nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+    };
+    expect(
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => true),
+    ).toEqual({
+      state: "ready_for_acceptance",
+      items: ["#3"],
+    });
+  },
+);
+
+test.each(["children", "51 children", "labels", "missing open record", "blockers"])(
+  "incomplete %s preserves attention",
+  (kind) => {
+    const { epic, open } = attentionEpic();
+    const records = new Map([["owner/repo#3", open]]);
+    if (kind === "children") epic.subIssues.nodes.pop();
+    if (kind === "51 children") epic.subIssues.totalCount = epic.subIssuesSummary.total = 51;
+    if (kind === "labels") open.labels.totalCount++;
+    if (kind === "missing open record") records.clear();
+    if (kind === "blockers") {
+      epic.body = "";
+      open.blockedBy.totalCount++;
+    }
+    expect(epicAttention("owner/repo", epic, ["owner"], records, () => false)).toBeUndefined();
+  },
+);
+
+test("fifty complete children report; closed, childless, approved and claimed slices do not need approval", () => {
+  const { epic, open, closed } = attentionEpic();
+  epic.body = "";
+  epic.subIssues.nodes = [...Array.from({ length: 49 }, (_, n) => ({ ...closed, number: n + 4 })), open];
+  epic.subIssues.totalCount = epic.subIssuesSummary.total = 50;
+  const check = (claim = false) =>
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => claim);
+  expect(check()).toBeNull();
+  open.labels = { totalCount: 0, nodes: [] };
+  expect(check()?.state).toBe("needs_approval");
+  expect(check(true)).toBeNull();
+  epic.state = "CLOSED";
+  expect(check()).toBeNull();
+  epic.state = "OPEN";
+  epic.subIssues = { totalCount: 0, nodes: [] };
+  epic.subIssuesSummary.total = 0;
+  expect(check()).toBeNull();
+  epic.subIssues = { totalCount: 1, nodes: [closed] };
+  epic.subIssuesSummary.total = 1;
+  expect(check()).toBeNull();
+});
+
+test("ambiguous acceptance or blockers missing a closed sibling do not establish acceptance", () => {
+  const { epic, open } = attentionEpic();
+  for (const body of [
+    "",
+    "## Slices\n- Acceptance: #2 #3",
+    "## Slices\n- Acceptance: #2\n- Acceptance: #3",
+  ]) {
+    epic.body = body;
+    expect(
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+    ).toBeNull();
+  }
+});
+
+test("poll redacts attention before storage and publication without creating runs or mutations", async () => {
+  const h = harness();
+  const { epic, open } = attentionEpic();
+  const secret = `credential-${crypto.randomUUID()}`;
+  registerCredential("EPIC_TEST_CREDENTIAL", secret);
+  epic.body += `\n- File ${secret}`;
+  const published: unknown[] = [];
+  h.store.subscribe((msg) => {
+    if (msg.kind === "feed") published.push(msg.item);
+  });
+  h.data.set("owner/repo", [epic, open]);
+  h.data.set("outside/repo", [epic]);
+  h.start();
+  await h.advance();
+  const items = h.store.readFeed({ after: 0 }).items;
+  expect(items).toMatchObject([
+    {
+      kind: "queue.epic_attention",
+      runId: null,
+      evalId: null,
+      repo: "owner/repo",
+      data: { repo: "owner/repo", epic: 1, state: "unfiled", items: ["- File [redacted]"] },
+    },
+  ]);
+  expect(published).toEqual(items);
+  expect(JSON.stringify(items)).not.toContain(secret);
+  expect(h.runs()).toEqual([]);
+  expect(h.calls).toHaveLength(1);
+  expect(h.calls[0]?.[1]).toBe("graphql");
+  expect(h.calls[0]?.[3]).toContain("subIssues(first:50)");
+  expect(h.calls[0]?.[3]).toContain(
+    "subIssues(first:50) { totalCount nodes { number state repository { nameWithOwner }",
+  );
+  expect(h.calls[0]?.[3]).toContain(
+    "blockedBy(first:100) { totalCount nodes { number state repository { nameWithOwner }",
+  );
+});
+
+test("epic episodes survive reopen, change A to B to A, clear silently and re-enter A", async () => {
+  const h = harness();
+  const path = join(h.cfg.paths.home, "epics.db");
+  let store = new Store(path);
+  store.githubCommentBoundary("owner/repo", at);
+  const { epic, open } = attentionEpic();
+  epic.body += "\n- Unfiled";
+  h.data.set("owner/repo", [epic, open]);
+  const start = () =>
+    startIssueQueue(
+      { ...h.factory, cfg: h.cfg, store, scheduler: h.factory.scheduler, createRun: h.factory.createRun },
+      {
+        gh: h.gh,
+        lifecycle: { identity: h.identity },
+        clock: {
+          now: h.clock.now,
+          set: h.clock.timer.set as unknown as typeof setTimeout,
+          clear: h.clock.timer.clear,
+        },
+        log: (s) => h.logs.push(s),
+      },
+    );
+  let stop = start();
+  const poll = () => h.advance(180_000);
+  const states = () => store.readFeed({ after: 0 }).items.map((i) => i.data.state);
+  const saved = () => store.db.query("SELECT * FROM queue_epic_attention").all();
+  try {
+    await h.advance();
+    await poll();
+    expect(states()).toEqual(["unfiled"]);
+    epic.body += "\n- Also unfiled";
+    await poll();
+    expect(states()).toEqual(["unfiled"]);
+    stop();
+    store.close();
+    store = new Store(path);
+    stop = start();
+    await h.advance();
+    expect(states()).toEqual(["unfiled"]);
+    epic.body = "";
+    open.labels = { totalCount: 0, nodes: [] };
+    await poll();
+    expect(states()).toEqual(["unfiled", "needs_approval"]);
+    epic.body = "## Slices\n- Unfiled";
+    await poll();
+    expect(states()).toEqual(["unfiled", "needs_approval", "unfiled"]);
+    expect(saved()).toEqual([{ repo: "owner/repo", epic: 1, state: "unfiled" }]);
+    // A failed second page, then incomplete child evidence, cannot clear saved attention.
+    h.data.set(
+      "owner/repo",
+      Array.from({ length: 101 }, (_, n) => commentIssue(n + 10)),
+    );
+    h.intercept = (args) => {
+      if (args[3]?.includes('after:"issues:100"')) throw new Error("unavailable");
+    };
+    await poll();
+    expect(saved()).toHaveLength(1);
+    h.intercept = undefined;
+    h.data.set("owner/repo", [epic, open]);
+    epic.subIssues.totalCount++;
+    await poll();
+    expect(saved()).toHaveLength(1);
+    epic.subIssues.totalCount--;
+    epic.body = "";
+    open.labels = { totalCount: 1, nodes: [{ name: "priority:1" }] };
+    await poll();
+    expect(saved()).toEqual([]);
+    expect(states()).toHaveLength(3);
+    epic.body = "## Slices\n- Unfiled";
+    await poll();
+    expect(states()).toEqual(["unfiled", "needs_approval", "unfiled", "unfiled"]);
+    for (const leave of [
+      () => {
+        epic.state = "CLOSED";
+      },
+      () => {
+        h.data.set("owner/repo", [open]);
+      },
+      () => {
+        epic.subIssues = { totalCount: 0, nodes: [] };
+        epic.subIssuesSummary.total = 0;
+      },
+    ]) {
+      leave();
+      await poll();
+      expect(saved()).toEqual([]);
+      epic.state = "OPEN";
+      epic.subIssues = { totalCount: 2, nodes: [{ ...issue(2), state: "CLOSED" }, open] };
+      epic.subIssuesSummary.total = 2;
+      h.data.set("owner/repo", [epic, open]);
+      await poll();
+      expect(saved()).toHaveLength(1);
+    }
+  } finally {
+    stop();
+    store.close();
+  }
+});
+
+test.each(["needs_approval", "ready_for_acceptance", "native", "claim"] as const)(
+  "poll detects %s using current children and claims",
+  async (kind) => {
+    const h = harness();
+    const { epic, open } = attentionEpic();
+    if (kind === "needs_approval" || kind === "claim") open.labels = { totalCount: 0, nodes: [] };
+    if (kind === "native") {
+      epic.body = "";
+      open.blockedBy = {
+        totalCount: 1,
+        nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+      };
+    }
+    if (kind === "claim") {
+      const repo = h.store.getRepoBySlug("owner/repo");
+      if (!repo) throw new Error("missing repo");
+      h.store.createRun(repo, {
+        repo: repo.slug,
+        prompt: "Acceptance",
+        sourceRef: { kind: "issue", repo: "OWNER/REPO", number: 3 },
+      });
+      h.maxCalls = 0;
+    }
+    h.data.set("owner/repo", [epic, open]);
+    h.start();
+    await h.advance();
+    expect(
+      h.store
+        .readFeed({ after: 0 })
+        .items.filter((i) => i.kind === "queue.epic_attention")
+        .map((i) => i.data),
+    ).toEqual([
+      {
+        repo: "owner/repo",
+        epic: 1,
+        state: kind === "needs_approval" ? kind : "ready_for_acceptance",
+        items: ["#3"],
+      },
+    ]);
+  },
+);
+
+test("epic state rolls back with its feed item and publishes only committed observations", () => {
+  const h = harness();
+  const observation = new Map([[1, { state: "unfiled" as const, items: ["- Later"] }]]);
+  h.store.db.exec(
+    "CREATE TRIGGER reject_epic BEFORE INSERT ON feed BEGIN SELECT RAISE(ABORT, 'feed unavailable'); END",
+  );
+  expect(() => h.store.reconcileEpicAttention("OWNER/REPO", observation)).toThrow("feed unavailable");
+  expect(h.store.db.query("SELECT * FROM queue_epic_attention").all()).toEqual([]);
+  expect(h.store.readFeed().items).toEqual([]);
+  h.store.db.exec("DROP TRIGGER reject_epic");
+  const saved: unknown[] = [];
+  h.store.subscribe((m) => {
+    if (m.kind === "feed") saved.push(h.store.db.query("SELECT * FROM queue_epic_attention").all());
+  });
+  h.store.reconcileEpicAttention("OWNER/REPO", observation);
+  expect(saved).toEqual([[{ repo: "owner/repo", epic: 1, state: "unfiled" }]]);
+  h.store.reconcileEpicAttention("owner/repo", observation);
+  expect(saved).toHaveLength(1);
+});
+
+test.each(["children", "51 children", "labels", "blockers", "missing child"])(
+  "poll retains saved attention on incomplete %s evidence",
+  async (kind) => {
+    const h = harness();
+    const { epic, open } = attentionEpic();
+    epic.body = "";
+    h.store.reconcileEpicAttention("owner/repo", new Map([[1, { state: "unfiled", items: ["- Previous"] }]]));
+    if (kind === "children") epic.subIssues.nodes.pop();
+    if (kind === "51 children") epic.subIssues.totalCount = epic.subIssuesSummary.total = 51;
+    if (kind === "labels") open.labels.totalCount++;
+    if (kind === "blockers") open.blockedBy.totalCount++;
+    h.data.set("owner/repo", kind === "missing child" ? [epic] : [epic, open]);
+    h.start();
+    await h.advance();
+    expect(h.store.readFeed().items.map((i) => i.data.state)).toEqual(["unfiled"]);
+    expect(h.store.db.query("SELECT * FROM queue_epic_attention").all()).toEqual([
+      { repo: "owner/repo", epic: 1, state: "unfiled" },
+    ]);
+  },
+);
+
+test("attention uses full open-issue labels when the child preview omits priority", () => {
+  const { epic, open } = attentionEpic();
+  epic.subIssues.nodes = epic.subIssues.nodes.map((c) => ({ ...c, labels: { nodes: [] } }));
+  open.labels.nodes = [
+    ...Array.from({ length: 20 }, (_, n) => ({ name: `label:${n}` })),
+    { name: "priority:10" },
+  ];
+  open.labels.totalCount = 21;
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false)?.state,
+  ).toBe("ready_for_acceptance");
+  open.labels = { totalCount: 0, nodes: [] };
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), (_repo, n) => n === 2)
+      ?.state,
+  ).toBe("needs_approval");
 });

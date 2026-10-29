@@ -601,6 +601,12 @@ describe("runGates / compareGates", () => {
     ]);
   });
 
+  test("incomplete execution stays blocking against a failing baseline", () => {
+    const baseline: GateRun = { setupOk: true, setup: [], checks: [r("test", false)] };
+    const after = { ...baseline, checks: [{ ...r("test", false), incomplete: "runner cancelled" }] };
+    expect(compareGates(baseline, after)[0]).toMatchObject({ verdict: "not_run", blocking: true });
+  });
+
   test.each([true, false])("targeted results are independent of full baseline (ok=%s)", (baseOk) => {
     const baseline: GateRun = { setupOk: true, setup: [], checks: [r("test", baseOk)] };
     const docsOnly = {
@@ -1798,11 +1804,12 @@ describe("auditDiff", () => {
     ]);
   });
 
-  test("blocks newly skipped tests and flags suppressions", () => {
+  test.each(["skip", "only"])("blocks tests with .%s and flags suppressions", (mode) => {
+    const line = `  it.${mode}('does the thing', () => {`;
     const patch = [
       "diff --git a/src/a.test.ts b/src/a.test.ts",
       "+++ b/src/a.test.ts",
-      "+  it.skip('does the thing', () => {",
+      `+${line}`,
       "diff --git a/src/a.ts b/src/a.ts",
       "+++ b/src/a.ts",
       "+  // @ts-ignore",
@@ -1814,8 +1821,79 @@ describe("auditDiff", () => {
       ]),
       { taskClass: "bugfix", protectedPaths: [] },
     );
-    expect(f.find((x) => x.rule === "test-skipped")?.severity).toBe("block");
+    const skipped = f.find((x) => x.rule === "test-skipped");
+    expect(skipped).toMatchObject({ severity: "block", file: "src/a.test.ts" });
+    expect(skipped?.detail).toContain("test skipped/focused with .skip/.only");
+    expect(skipped?.detail).toContain(`"${line}"`);
+    expect(skipped?.detail).toContain("without the literal marker at the start of a source line");
+    expect(skipped?.detail).toContain("concatenation");
     expect(f.find((x) => x.rule === "suppression")?.severity).toBe("warn");
+
+    const fixturePatch = [
+      "diff --git a/src/a.test.ts b/src/a.test.ts",
+      "+++ b/src/a.test.ts",
+      `+writeFileSync(path, "it" + ".${mode}('fixture', () => {});");`,
+    ].join("\n");
+    expect(
+      auditDiff(diff(fixturePatch, [{ status: "M", path: "src/a.test.ts" }]), {
+        taskClass: "bugfix",
+        protectedPaths: [],
+      }).some((finding) => finding.rule === "test-skipped"),
+    ).toBe(false);
+  });
+
+  test("skip markers inside template-literal fixtures still block with actionable detail", () => {
+    const line = ["test", '.skip("skipped", () => {});'].join("");
+    const patch = [
+      "diff --git a/src/a.test.ts b/src/a.test.ts",
+      "+++ b/src/a.test.ts",
+      '+writeFileSync(path, `import { test } from "bun:test";',
+      `+${line}`,
+      "+`);",
+    ].join("\n");
+    const findings = auditDiff(diff(patch, [{ status: "M", path: "src/a.test.ts" }]), {
+      taskClass: "bugfix",
+      protectedPaths: [],
+    });
+    expect(findings).toEqual([
+      {
+        rule: "test-skipped",
+        severity: "block",
+        file: "src/a.test.ts",
+        detail: `test skipped/focused with .skip/.only: "${line}". Fixture text requiring a skip marker should construct it without the literal marker at the start of a source line, for example through concatenation.`,
+      },
+    ]);
+  });
+
+  test("skip diagnostics redact private strings and registered credentials after terminal stripping", () => {
+    const privateValue = ["synthetic", "skip", "private"].join("-");
+    const credential = ["synthetic", "skip", "credential"].join("-");
+    proc.registerCredential("audit-skip-test", credential);
+    const configDir = tempDir({ "private-strings.txt": privateValue });
+    try {
+      for (const value of [privateValue, credential]) {
+        const colored = `${value.slice(0, 10)}\u001b[31m${value.slice(10)}\u001b[0m`;
+        const patch = [
+          "diff --git a/src/a.test.ts b/src/a.test.ts",
+          "+++ b/src/a.test.ts",
+          `+test.skip("${colored}", () => {});`,
+        ].join("\n");
+        const findings = auditDiff(diff(patch, [{ status: "M", path: "src/a.test.ts" }]), {
+          configDir,
+          taskClass: "bugfix",
+          protectedPaths: [],
+        });
+        expect(findings.find((finding) => finding.rule === "test-skipped")).toEqual({
+          rule: "test-skipped",
+          severity: "block",
+          file: "src/a.test.ts",
+          detail: "[redacted diagnostic]",
+        });
+        expect(JSON.stringify(findings)).not.toContain(value);
+      }
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
   });
 
   test("blocks secrets, protected paths and CI, warns on lockfiles", () => {
