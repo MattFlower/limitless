@@ -17,12 +17,21 @@ export function singleBunTest(command: string, requiredArgument?: string): boole
   if (!/^[\t ]*bun[\t ]+test(?:[\t ]|$)/.test(command)) return false;
   let foundArgument = requiredArgument === undefined;
   let wordStart = true;
+  let literalFilter = false;
   const stack = [{ quote: "" }];
   for (let i = 0; i < command.length; i++) {
     const frame = stack.at(-1);
     const c = command[i];
-    if (!frame || c === "`" || (stack.length === 1 && /[\r\n]/.test(c ?? ""))) return false;
+    if (
+      !frame ||
+      (c === "`" && !(frame.quote === "'" && literalFilter)) ||
+      (stack.length === 1 && /[\r\n]/.test(c ?? ""))
+    )
+      return false;
     if (stack.length === 1 && !frame.quote) {
+      // Keep filename recognition conservative; only a quoted -t filter permits literal backticks.
+      if (wordStart && !/[\t ]/.test(c ?? ""))
+        literalFilter = c === "'" && /(?:^|[\t ])-t[\t ]+$/.test(command.slice(0, i));
       if (
         wordStart &&
         requiredArgument &&

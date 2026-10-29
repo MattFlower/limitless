@@ -1486,6 +1486,7 @@ for (const mode of [...processModes, ...interruptModes, ...timeoutModes]) {
       join(dir, "claude"),
       `#!/bin/sh
 ${mode === "stubborn" || timed || ownTimeout || escaped ? "trap '' TERM" : ""}
+${mode === "cli-timeout" ? `while [ ! -f '${dir}/deadline' ]; do sleep 0.01; done` : ""}
 ${escaped ? `python3 -c "import os,time; os.setsid(); open('${dir}/escaped', 'w').write(str(os.getpid())); time.sleep(60)" &` : ""}
 printf '%s\n' "$PWD" "$TMPDIR" "$CLAUDE_CODE_TMPDIR" >> '${dir}/dirs'
 sleep 60 &
@@ -1511,6 +1512,17 @@ import { CodexReaderProbe } from ${JSON.stringify(join(process.cwd(), "src/harne
 import { readPolicyScope } from ${JSON.stringify(join(process.cwd(), "src/harness/read-policy.ts"))};
 const kill = process.kill.bind(process);
 process.kill = (pid, signal) => { appendFileSync('${dir}/signals', pid + ' ' + signal + ' ' + Date.now() + '\\n'); return kill(pid, signal); };
+// Deliver the real CLI deadline only after its fixture has recorded the tree we assert on.
+// Otherwise a loaded host can time out the shell before it even writes its PIDs.
+if (${mode === "cli-timeout"}) {
+  const schedule = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...args) => schedule(ms === 250 ? async () => {
+    appendFileSync('${dir}/deadline', '');
+    const until = Date.now() + 3000;
+    while (readFileSync('${dir}/pids', 'utf8').trim().split(/\\s+/).filter(Boolean).length < 2 && Date.now() < until) await Bun.sleep(10);
+    fn(...args);
+  } : fn, ms, ...args);
+}
 const run = async (signal) => {
   if (${mode === "probe"}) { await readPolicyScope.run({home: '${dir}', environment: {}}, () => new CodexReaderProbe().verify({cwd: '${dir}/work', scratchDir: '${dir}/scratch', mode: 'readonly', signal}, runProcess)); return {status: 'pass'}; }
   const previous = ${timed} ? readFileSync('${dir}/pids', 'utf8').trim().split(/\\s+/).map(Number).filter(Boolean) : [];
