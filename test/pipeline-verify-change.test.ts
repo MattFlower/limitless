@@ -416,7 +416,9 @@ protected_paths = ["protected.txt"]
       stopNotifier();
       const state = f.store.getRunState<RunState>(runId);
       const report = f.store.getArtifact(runId, "report.md");
+      expect(report?.match(/^## Size$/gm)).toHaveLength(1);
       if (report !== null) {
+        expect(state?.sizeReport).toMatchObject({ base: baseTip, mode: "merge-base" });
         const sources = f.store.getArtifact(runId, "report-sources.json");
         expect(sources).not.toBeNull();
         expect(JSON.parse(sources ?? "null").digest).toBe(reportStructure(report)?.digest ?? "");
@@ -470,6 +472,11 @@ protected_paths = ["protected.txt"]
       ].includes(scenario);
       expect(remote).toBe(unchanged || blocked ? head : (f.store.getRun(runId)?.headSha ?? "missing"));
       if (unchanged) {
+        expect(state?.sizeReport).toMatchObject({
+          base: baseTip,
+          head,
+          source: { added: 1, removed: 0 },
+        });
         expect(implementations).toBe(0);
         expect(f.store.listStages(runId).some((stage) => stage.name === "implement")).toBe(false);
         expect(f.store.getRun(runId)?.headSha).toBe(head);

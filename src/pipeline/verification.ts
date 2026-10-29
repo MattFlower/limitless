@@ -38,6 +38,10 @@ export function preDeliveryVerifyArtifact(
         rowKind(criterion.id, spec, holdout) === "public"
           ? {
               ...criterion,
+              covering_tests: criterion.covering_tests?.map((t) => ({
+                file: redact(t.file, criterion.id),
+                name: redact(t.name, criterion.id),
+              })),
               evidence: evidence(criterion, true),
               publicSummary: redactHoldoutText(criterion.publicSummary, holdout, publicSources, false),
               ...gateCitation(criterion),
