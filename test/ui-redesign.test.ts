@@ -289,7 +289,6 @@ test("pipeline stations render active counts, asking runs and the combined queue
     " runs at review",
     " runs at preview",
     " runs at verify",
-    " runs at accept",
     " runs at deliver",
   ]);
   expect(stations.map((s) => byClass(s, "pipeline-count").map(text).join(""))).toEqual([
@@ -300,7 +299,6 @@ test("pipeline stations render active counts, asking runs and the combined queue
     "1",
     "0",
     "2",
-    "0",
     "0",
     "0",
     "0",
