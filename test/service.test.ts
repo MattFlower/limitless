@@ -130,6 +130,7 @@ type MigrationResult = {
   >;
   error: string;
   errorKind: string;
+  errorCause: string;
   filesBefore: Record<string, string>;
   loadedBefore: string[];
   disabledBefore: string[];
@@ -439,6 +440,47 @@ for (const resumeFails of [false, true])
     expect(
       r.commands.filter((c) => c[1] === "print" && c[2]?.endsWith("/arbitrary.installed.daemon")),
     ).toHaveLength(2);
+  });
+
+for (const failure of ["drain-timeout", "stop"])
+  test(`an unknown recovery inspection after ${failure} still resumes once`, async () => {
+    const { result: r } = await migration(
+      `failed-recovery-inspection-${failure}`,
+      "daemon",
+      undefined,
+      "permission",
+    );
+    const original = failure === "drain-timeout" ? "daemon request timed out" : "stop failed";
+    expect(r.error).toContain(original);
+    expect(r.calls.filter((c) => c === "resume")).toHaveLength(1);
+    expect(r.error).toContain("Restoration failed:");
+    expect(r.error).toContain("launchctl print");
+    expect(r.error).toContain("Operation not permitted");
+    expect(r.errorCause).toContain(original);
+    expect(r.errorKind).toBe("Error");
+    expect(r.calls.at(-1)).toBe("resume");
+    expect(r.draining).toBe(false);
+    expect(r.loaded.sort()).toEqual(["arbitrary.installed.daemon", "other.program"]);
+    expect(r.files["daemon-original.plist"]).toBe(r.old);
+    expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
+    expect(r.calls.some((c) => c.startsWith("bootstrap"))).toBe(false);
+  });
+
+for (const resumeFails of [false, true])
+  test(`a failed restoration after stop failure still resumes once (resume fails: ${resumeFails})`, async () => {
+    const { result: r } = await migration(`failed-recovery-restore${resumeFails ? "-resume-failure" : ""}`);
+    expect(r.error).toContain("stop failed");
+    expect(r.calls.filter((c) => c === "resume")).toHaveLength(1);
+    expect(r.error).toContain("Restoration failed:");
+    expect(r.error).toContain("old bootstrap failed");
+    expect(r.errorCause).toContain("stop failed");
+    if (resumeFails) expect(r.error).toContain("Resume scheduler failed: Error: resume failed");
+    else expect(r.error).not.toContain("Resume scheduler failed:");
+    expect(r.calls.slice(-2)).toEqual(["bootstrap arbitrary.installed.daemon", "resume"]);
+    expect(r.draining).toBe(resumeFails);
+    expect(r.loaded.sort()).toEqual(["arbitrary.installed.daemon", "other.program"]);
+    expect(r.files["daemon-original.plist"]).toBe(r.old);
+    expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
   });
 
 test("rollback reports both the replacement and restoration failures", async () => {
