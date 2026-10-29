@@ -65,6 +65,8 @@ and extend the closest case when it already exercises that behavior.
 - **No timing margins.** An ordering that holds by a few milliseconds (for example a grace period
   of 0 that needs one event recorded before another completes) passes today and fails when either
   path gets faster or slower. Arrange the order with deferred promises or readiness signals.
+  The same goes for subprocess startup: wait for an explicit readiness marker with a deadline of
+  several seconds, not a 1 s timeout that a loaded CI runner misses (#987).
 - **CI is Linux.** It pins the Bun version in `.github/workflows/ci.yml`, runs a newer git than
   macOS, and has git-lfs filters (`filter.lfs.*`) configured outside the global file `setup.ts`
   replaces. Avoid assertions on incidental, environment-dependent argv or config entries; keep
@@ -85,6 +87,12 @@ and extend the closest case when it already exercises that behavior.
   temporary path before comparing it with one a subprocess reports: on macOS `os.tmpdir()` is under
   `/var`, a symlink to `/private/var`. Confined gates use a scratch `TMPDIR` that isn't a symlink, so
   the mismatch shows only unconfined (the deploy gate, `scripts/land-pr.sh`, a local `bun run check`).
+- **Machine paths are injected.** Code that reads the home (`~/Library/LaunchAgents`, the release
+  directory, the deploy lock) takes each path as an option; a test passes every one (`agentsDir`,
+  `releaseDir`, `lockPath`) into its own temporary directory. A test that leaves one out passes on
+  Linux CI (no LaunchAgents) and in confined gates (the home is read-denied), then fails only in the
+  unconfined deploy gate, which reads the real files: #942's deploy test did this and blocked a
+  deploy until #989.
 - **External clients are injected.** `gh`, GitHub and model clients come in through parameters or
   factory dependencies, and some default to the real one (for example the `client` parameter of
   `startGitHubNotifier`). Pass a fake every time.
