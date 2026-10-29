@@ -322,21 +322,39 @@ export function startIssueQueue(
     pending = false;
     limited = false;
     let failed = false;
+    let unsubscribe = () => {};
+    const invalidated = new Set<string>();
+    const changedDuringPoll = (repo: string, number: number) =>
+      invalidated.has(issueKey(repo, number))
+        ? "linked run changed during the poll; retrying next poll"
+        : null;
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
     const snapshots = new Map<string, Map<number, IssueRunSummary>>();
-    const changed = new Set<string>();
-    const key = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
-    // A snapshot cannot approve work after a linked run changes across an await. Defer to the next poll.
-    const unsubscribe = factory.store.subscribe((msg) => {
-      if (msg.kind === "run" && snapshots.size) {
-        for (const [repo, latest] of snapshots)
-          for (const [number, run] of latest)
-            if (run.id === msg.run.id || run.ownerId === msg.run.id) changed.add(key(repo, number));
-        for (const link of linkedIssues(msg.run, factory.store)) changed.add(key(link.repo, link.number));
-      }
-    });
     try {
+      unsubscribe = factory.store.subscribe((msg) => {
+        if (msg.kind !== "run") return;
+        const run = msg.run;
+        const issues = linkedIssues(run, factory.store);
+        const links = new Set(issues.map((i) => issueKey(i.repo, i.number)));
+        for (const [repo, latest] of snapshots) {
+          for (const [number, summary] of latest) {
+            const key = issueKey(repo, number);
+            const state =
+              summary.id === run.id ? summary : summary.ownerId === run.id ? summary.ownerState : undefined;
+            if (
+              (state && (state.status !== run.status || state.finishedAt !== run.finishedAt)) ||
+              ((summary.id === run.id || summary.ownerId === run.id) && !links.has(key))
+            )
+              invalidated.add(key);
+          }
+        }
+        // Missing snapshots retain conservative invalidation; existing ones compare only linked candidates.
+        for (const { repo, number } of issues) {
+          const summary = snapshots.get(repo.toLowerCase())?.get(number);
+          if (summary?.id !== run.id && summary?.ownerId !== run.id) invalidated.add(issueKey(repo, number));
+        }
+      });
       await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log, opts.lifecycle);
       for (const repo of q.repos) {
         if (stopped || limited || now() < notBefore) break;
@@ -410,8 +428,7 @@ export function startIssueQueue(
             repo,
             issues.nodes.map((i) => i.number),
           );
-          snapshots.set(repo, latest);
-          for (const issue of issues.nodes) changed.delete(key(repo, issue.number));
+          snapshots.set(repo.toLowerCase(), latest);
           for (const issue of issues.nodes) {
             for (const c of boundary && issue.state === "OPEN" ? issue.comments.nodes : []) {
               const author = c.author?.login;
@@ -488,20 +505,21 @@ export function startIssueQueue(
         const current = issueEligibility(issue, q.trusted, {
           blockers: states,
           claim: factory.store.issueClaim(repo, issue.number),
-          ...latestContext(repo, issue.number, snapshots.get(repo)?.get(issue.number)),
+          ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
         });
-        if (!current.eligible) {
-          log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${current.reason}`));
+        const reason = changedDuringPoll(repo, issue.number) ?? (!current.eligible ? current.reason : null);
+        if (reason) {
+          log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${reason}`));
           continue;
         }
         const admission = () => {
           if (stopped) return "queue stopped";
           if (factory.scheduler.draining) return "scheduler draining";
-          if (changed.has(key(repo, issue.number)))
-            return "priority re-approval required: issue run changed during poll";
+          const deferred = changedDuringPoll(repo, issue.number);
+          if (deferred) return deferred;
           const eligibility = issueEligibility(issue, q.trusted, {
             blockers: states,
-            ...latestContext(repo, issue.number, snapshots.get(repo)?.get(issue.number)),
+            ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
           });
           if (!eligibility.eligible) return eligibility.reason;
           const active = factory.store.listRuns({
