@@ -169,6 +169,20 @@ test("save is visible synchronously and settles before a second microtask", asyn
   expect(done).toBe(true);
 });
 
+test("foreground stage refreshes ctx.run with the writeRun result", async () => {
+  const { f, run, ctx } = await setup();
+  expect(ctx.run).toMatchObject({ status: "queued", stage: null, title: "Add farewell" });
+  const updated = f.store.updateRun(run.id, {
+    status: "running",
+    title: "Refreshed title",
+    startedAt: 123,
+  });
+  await ctx.stage("triage", async () => {
+    expect(ctx.run).toEqual({ ...updated, stage: "triage" });
+    return { summary: "observed refreshed run", value: undefined };
+  });
+});
+
 test("save awaits a shared boundary after the write and passes its label", async () => {
   const { f, run, repo } = await setup();
   const boundary = Promise.withResolvers<void>();
@@ -238,17 +252,32 @@ test("full fake run records prepare and stages with identical events and final r
   const committerDate = process.env.GIT_COMMITTER_DATE;
   process.env.GIT_AUTHOR_DATE = "2026-01-01T00:00:00Z";
   process.env.GIT_COMMITTER_DATE = "2026-01-01T00:00:00Z";
-  const statuses: string[] = [];
+  const events: Run[] = [];
   const unsubscribe = f.store.subscribe((msg) => {
-    if (msg.kind === "run") statuses.push(msg.run.status);
+    if (msg.kind === "run")
+      events.push({
+        ...msg.run,
+        id: "comparison",
+        branch: msg.run.branch?.replace(msg.run.id, "comparison") ?? null,
+        createdAt: 0,
+        startedAt: msg.run.startedAt === null ? null : 0,
+        finishedAt: msg.run.finishedAt === null ? null : 0,
+      });
   });
   let recorder: ReturnType<typeof recordingCheckpointer> | undefined;
   try {
-    await executeRun(f.deps, run.id, new AbortController().signal);
+    // Reproduce the pre-adapter Store writes independently of localCheckpointer.
+    const direct: Checkpointer = {
+      writeState: (id, state) => f.store.setRunState(id, state),
+      writeRun: (id, patch, state) => f.store.updateRun(id, patch, state),
+      checkpoint: () => {},
+    };
+    await executeRun({ ...f.deps, checkpointer: direct }, run.id, new AbortController().signal);
     expect(f.store.getRun(run.id)).toMatchObject({ status: "succeeded", error: null });
-    const baseline = statuses.splice(0);
+    const baseline = events.splice(0);
     const other = f.store.createRun(repo, { repo: repo.slug, prompt: run.prompt, profile: "quick" });
-    statuses.length = 0;
+    // Exclude run creation from both event sequences.
+    events.length = 0;
     recorder = recordingCheckpointer(f.store);
     expect(
       await executeRun(
@@ -260,7 +289,7 @@ test("full fake run records prepare and stages with identical events and final r
     expect(recorder.outside).toEqual([]);
     expect(recorder.log.some((entry) => entry.patch?.stage === "prepare")).toBe(true);
     expect(recorder.log.some((entry) => entry.patch?.stage === "implement")).toBe(true);
-    expect(statuses).toEqual(baseline);
+    expect(events).toEqual(baseline);
     expect(finalFields(f.store.getRun(other.id))).toEqual(finalFields(f.store.getRun(run.id)));
   } finally {
     recorder?.restore();
