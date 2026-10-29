@@ -30,7 +30,9 @@ import { buildReport } from "../src/pipeline/report.ts";
 import { reviewRoundPrompt } from "../src/pipeline/review-round.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { stallReporter } from "../src/util/stall.ts";
 import { feedRound } from "./feed-support.ts";
+import { legacyLatestIssueRun } from "./issue-queue-reference.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -2799,6 +2801,174 @@ function commandComment(databaseId = 1): QueueIssue["comments"]["nodes"][number]
 function commentIssue(number = 1): QueueIssue {
   return { ...issue(number), labels: { totalCount: 0, nodes: [] } };
 }
+test("batched latest runs match the pre-change reference without hydrating candidate or owner states", () => {
+  const h = harness({}, ["Owner/Repo", "owner/other"]);
+  const repo = h.store.getRepoBySlug("Owner/Repo");
+  const other = h.store.getRepoBySlug("owner/other");
+  if (!repo || !other) throw new Error("missing repositories");
+  const state = JSON.stringify({ issueQueueStateProbe: "x".repeat(128 * 1024) });
+  const make = (request: Partial<CreateRunRequest>, target = repo, createdAt = 10) => {
+    const run = h.store.createRun(target, { repo: target.slug, prompt: "Work", ...request });
+    h.store.db
+      .query(
+        "UPDATE runs SET status = 'cancelled', created_at = ?, finished_at = 20, state_json = ? WHERE id = ?",
+      )
+      .run(createdAt, state, run.id);
+    return run;
+  };
+  const explicit = make({
+    source: "github",
+    sourceRef: { kind: "issue", repo: "OWNER/REPO", number: 1 },
+    prompt: "Closes #8",
+  });
+  const directives = make({ prompt: "Closes #2\nCloses #3" });
+  const tied = make({ prompt: "Closes #3" });
+  const crossRepo = make({ sourceRef: { kind: "issue", repo: "owner/repo", number: 4 } }, other);
+  make({ source: "github", prompt: "Closes #5" });
+  const standalone = make({
+    prompt:
+      "> Closes #6\n```text\nCloses #6\n```\n`Closes #6`\nExample: Closes #6\n~~~\nCloses #6\n~~~\nCloses #7",
+  });
+  const invalid = make({ prompt: "Closes #9" });
+  h.store.db
+    .query("UPDATE runs SET source_ref = ? WHERE id = ?")
+    .run(JSON.stringify({ kind: "issue", repo: repo.slug, number: 0 }), invalid.id);
+  const orphan = make({ prompt: "Closes #9" });
+  h.store.db
+    .query("UPDATE runs SET source_ref = ? WHERE id = ?")
+    .run(JSON.stringify({ kind: "review-round", sourceRunId: explicit.id }), orphan.id);
+  const round = feedRound(h.store, other, explicit, "review");
+  const nested = feedRound(h.store, other, round, "ci");
+  const unlinked = make({ prompt: "No directives" });
+  const misleading = feedRound(h.store, repo, unlinked, "conflict");
+  for (const run of [round, nested, misleading])
+    h.store.db
+      .query(
+        "UPDATE runs SET source_ref = NULL, prompt = 'Closes #6', state_json = ?, created_at = 30 WHERE id = ?",
+      )
+      .run(state, run.id);
+  const otherRun = make({ prompt: "Closes #1" }, other);
+  const numbers = Array.from({ length: 10 }, (_, i) => i + 1);
+  const expected = new Map([
+    [1, nested.id],
+    [2, directives.id],
+    [3, tied.id],
+    [4, crossRepo.id],
+    [7, standalone.id],
+  ]);
+  const reference = numbers.map((n) => legacyLatestIssueRun(h.store, "owner/repo", n)?.id ?? null);
+  expect(reference).toEqual(numbers.map((n) => expected.get(n) ?? null));
+  expect(numbers.map((n) => legacyLatestIssueRun(h.store, "OWNER/OTHER", n)?.id ?? null)).toEqual(
+    numbers.map((n) => (n === 1 ? otherRun.id : null)),
+  );
+
+  const parse = JSON.parse;
+  let stateParses = 0;
+  const parseSpy = spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+    if (text.includes('"issueQueueStateProbe"')) stateParses++;
+    return parse(text, reviver);
+  });
+  const get = spyOn(h.store, "getRun");
+  const query = spyOn(h.store.db, "query");
+  try {
+    for (const slug of ["owner/repo", "OWNER/OTHER"]) {
+      const latest = h.store.latestIssueRuns(slug, numbers);
+      expect(numbers.map((n) => latest.get(n)?.id ?? null)).toEqual(
+        slug === "owner/repo" ? reference : numbers.map((n) => (n === 1 ? otherRun.id : null)),
+      );
+    }
+    expect(get).not.toHaveBeenCalled();
+    expect(stateParses).toBe(0);
+    expect(query).toHaveBeenCalledTimes(2);
+    for (const [sql] of query.mock.calls) {
+      expect(sql).not.toContain("state_json");
+      expect(sql).not.toContain("runs.*");
+    }
+    expect(h.store.latestIssueRun("OWNER/REPO", 1)?.id).toBe(nested.id);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(stateParses).toBe(1);
+  } finally {
+    query.mockRestore();
+    get.mockRestore();
+    parseSpy.mockRestore();
+  }
+});
+
+test("poll shares one batch per repository through admission and refreshes it next poll", async () => {
+  const repos = ["owner/repo", "owner/other"];
+  const h = harness({ max_issue_runs: 10 }, repos);
+  h.cfg.maxConcurrentRuns = 10;
+  const blocked = repos.map((slug) => {
+    const repo = h.store.getRepoBySlug(slug);
+    if (!repo) throw new Error("missing repo");
+    const run = h.store.createRun(repo, { repo: slug, prompt: "Closes #1" });
+    h.store.updateRun(run.id, { status: "cancelled", finishedAt: Date.parse(at) + 1 });
+    h.data.set(slug, [issue(1), issue(2), issue(3)]);
+    return run.id;
+  });
+  const batch = spyOn(h.store, "latestIssueRuns");
+  const legacy = spyOn(h.store, "latestIssueRun").mockImplementation(() => {
+    throw new Error("queue must use the poll batch");
+  });
+  try {
+    h.start();
+    await h.advance();
+    expect(batch.mock.calls).toEqual(repos.map((repo) => [repo, [1, 2, 3]]));
+    expect(h.requests.map((r) => [r.repo, r.sourceRef?.number])).toEqual([
+      [repos[0], 2],
+      [repos[1], 2],
+      [repos[0], 3],
+      [repos[1], 3],
+    ]);
+    for (const id of blocked) h.store.updateRun(id, { finishedAt: Date.parse(at) - 1 });
+    await h.advance(180_000);
+    expect(batch.mock.calls).toEqual([...repos, ...repos].map((repo) => [repo, [1, 2, 3]]));
+    expect(h.requests.slice(4).map((r) => [r.repo, r.sourceRef?.number])).toEqual(
+      repos.map((repo) => [repo, 1]),
+    );
+    expect(legacy).not.toHaveBeenCalled();
+  } finally {
+    batch.mockRestore();
+    legacy.mockRestore();
+  }
+});
+
+test.each(["success", "failure", "initialization"])("repository activity closes after %s", async (mode) => {
+  const h = harness({}, ["owner/repo"], mode === "initialization");
+  let active = 0;
+  let starts = 0;
+  let ends = 0;
+  const begin = stallReporter.beginActivity.bind(stallReporter);
+  const activity = spyOn(stallReporter, "beginActivity").mockImplementation((name) => {
+    if (name !== "issue-queue.repository") return begin(name);
+    starts++;
+    active++;
+    return () => {
+      active--;
+      ends++;
+    };
+  });
+  const batchRead = h.store.latestIssueRuns.bind(h.store);
+  const batch = spyOn(h.store, "latestIssueRuns").mockImplementation((...args) => {
+    expect(active).toBe(1);
+    if (mode === "failure") throw new Error("synthetic batch failure");
+    return batchRead(...args);
+  });
+  try {
+    h.data.set("owner/repo", [issue()]);
+    h.start();
+    await h.advance();
+    expect(starts).toBe(1);
+    expect(ends).toBe(1);
+    expect(active).toBe(0);
+    expect(batch).toHaveBeenCalledTimes(mode === "initialization" ? 0 : 1);
+    if (mode === "failure") expect(h.logs.join("\n")).toContain("synthetic batch failure");
+  } finally {
+    batch.mockRestore();
+    activity.mockRestore();
+  }
+});
+
 const records = (h: ReturnType<typeof harness>) =>
   h.store.db.query("SELECT * FROM github_processed_comments").all();
 async function pollComments(h: ReturnType<typeof harness>) {
