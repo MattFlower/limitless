@@ -601,6 +601,12 @@ describe("runGates / compareGates", () => {
     ]);
   });
 
+  test("incomplete execution stays blocking against a failing baseline", () => {
+    const baseline: GateRun = { setupOk: true, setup: [], checks: [r("test", false)] };
+    const after = { ...baseline, checks: [{ ...r("test", false), incomplete: "runner cancelled" }] };
+    expect(compareGates(baseline, after)[0]).toMatchObject({ verdict: "not_run", blocking: true });
+  });
+
   test.each([true, false])("targeted results are independent of full baseline (ok=%s)", (baseOk) => {
     const baseline: GateRun = { setupOk: true, setup: [], checks: [r("test", baseOk)] };
     const docsOnly = {
