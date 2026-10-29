@@ -350,6 +350,33 @@ test("same-holder moved retries without reporting loss; repeated contention wait
   }
 });
 
+test.each(["absent", "released"] as const)(
+  "same-holder moved acquisition from a %s tip retries without loss",
+  async (start) => {
+    const f = fixture();
+    if (start === "released") f.confirmed({ ...record, state: "released", status: "succeeded" });
+    const manager = await f.create();
+    f.start(manager, false);
+    let moved = false;
+    f.gh.fault = (r) => {
+      if (r.step !== "update" || moved) return;
+      moved = true;
+      const sent = parseRecord(f.gh.commits.get(f.gh.update(r).afterOid)?.message ?? "", ref);
+      if (sent === "malformed") throw new Error("Malformed attempt");
+      f.gh.seed({ ...sent, status: "waiting_input" });
+    };
+    const generation = start === "absent" ? 1 : 2;
+    expect(held(await f.acquire(manager)).handle.generation).toBe(generation);
+    expect(f.gh.calls("update")).toHaveLength(2);
+    expect(f.tip()).toMatchObject({ generation, holder: member, run: want.run, status: "waiting_input" });
+    expect(f.row()).toMatchObject({
+      confirmed: { generation, state: "held", tip: f.gh.refs.get(f.gh.key(repo, ref)) },
+      intent: null,
+    });
+    expect(f.lost).not.toHaveBeenCalled();
+  },
+);
+
 test("canonical repository shares a row and mutex while the first acquisition waits", async () => {
   const f = fixture();
   const manager = await f.create();

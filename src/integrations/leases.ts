@@ -109,6 +109,7 @@ export async function createLeaseManager(deps: {
       if (settled === "pending") return wait;
       if (h && !current(h)) return settled === "superseded" ? "lost" : "obsolete";
       let moved = 0;
+      let mine: number | undefined; // our generation a same-holder `moved` tip already carries
       for (let attempt = 0; attempt < 4; attempt++) {
         row = store.leaseRow(repo, ref);
         const read = await client.read(repo, ref, signal);
@@ -116,7 +117,8 @@ export async function createLeaseManager(deps: {
         const tip = read.kind === "tip" ? read.tip : null;
         if (tip?.record === "malformed") return { kind: "refused", reason: "malformed", tip };
         const r = tip?.record;
-        const confirmed = row?.runId === want.run ? row.confirmed : null;
+        let confirmed = row?.runId === want.run ? row.confirmed : null;
+        if (mine) confirmed = { generation: mine, tip: "", state: "held" };
         const owns = (v: ClaimRecord) => v.holder === member && v.run === want.run;
         const own = r && owns(r) && r.generation === confirmed?.generation;
         const supersedes =
@@ -125,7 +127,7 @@ export async function createLeaseManager(deps: {
           (r.generation > confirmed.generation || (r.generation === confirmed.generation && !own));
         if (h && !tip) return wait;
         if (supersedes || (h && (!r || !own || r.state !== "held"))) {
-          lose(row, tip);
+          if (confirmed?.generation === row?.confirmed?.generation) lose(row, tip);
           return tip ? { kind: "superseded", tip } : wait;
         }
         if (r && r.run !== want.run && (r.state === "held" || ISSUE_CLAIM_STATUSES.includes(r.status)))
@@ -146,7 +148,7 @@ export async function createLeaseManager(deps: {
             const now = clock.sample();
             if (!sample || !sampleUsable(sample, now)) return wait;
             if (same && !allowed("same-generation", now)) {
-              lose(row, tip);
+              if (confirmed?.generation === row?.confirmed?.generation) lose(row, tip);
               if (!takeover) return { kind: "superseded", tip };
               same = false;
             }
@@ -197,13 +199,9 @@ export async function createLeaseManager(deps: {
           return wait;
         }
         const next = result.tip.record;
-        if (
-          next !== "malformed" &&
-          owns(next) &&
-          next.generation === record.generation &&
-          next.state === "held"
-        )
-          continue;
+        const ours = next !== "malformed" && owns(next) && next.state === "held";
+        mine = ours && next.generation === record.generation ? record.generation : undefined;
+        if (mine) continue;
         if (++moved < 2) continue;
         if (row?.confirmed && row.runId === want.run) {
           lose(row, result.tip);
