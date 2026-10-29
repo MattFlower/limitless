@@ -151,3 +151,39 @@ record the same comment id.
 Managed issue runs use polling lifecycle comments instead of legacy notifier comments.
 Marked queue runs outside managed repositories keep suppressing legacy comments. GitHub
 questions and approvals remain later slices.
+
+## Epic attention
+
+Keep one list item per planned slice under an exact `## Slices` heading. Once filed,
+start its text with `#N` for a child in the epic's repository, or `owner/repo#N` for a
+child in a named repository (compared case-insensitively). The positive issue number
+must be followed by whitespace, punctuation, or the end of the line; `#3abc` does not
+count. Only that leading reference identifies the slice; later references are ignored,
+so `#99 Build #123` cannot name child #123. Unrelated issues do not count.
+Mark the acceptance child with an `Acceptance:` prefix followed by whitespace and
+the leading reference. Links, autolinks, bare URLs, code spans, escaped references,
+and references after descriptive text name no slice.
+
+```markdown
+## Slices
+- #123 Build
+- owner/repo#124 Documentation
+- Acceptance: #125
+```
+
+For open epics in configured queue repositories, polls emit `queue.epic_attention`
+once per change of attention state, including across restarts. The first matching state wins:
+
+1. `unfiled`: a Slices list item names no child, including closed children.
+2. `needs_approval`: open children exist but none has a current `priority:0` through
+   `priority:10` label or an active run claim.
+3. `ready_for_acceptance`: only the acceptance child remains open. Without an explicit
+   acceptance item, the sole open child must have native blockers covering every sibling,
+   including closed siblings.
+
+Body-derived attention requires a trusted author and either no edit or a trusted last
+editor. Unordered and numbered lists work; fenced code and text outside Slices are ignored.
+Structural states still apply to untrusted bodies. Incomplete evidence preserves the saved
+state, and epics with more than 50 children produce no attention. Returning to a previously
+reported state emits again after a change or clear; changing only the listed items does not.
+These notifications are observations: they do not file issues, approve slices, or start work.

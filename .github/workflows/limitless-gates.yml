@@ -1,0 +1,138 @@
+name: limitless-gates
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        required: true
+        type: string
+      candidate:
+        required: true
+        type: string
+      setup:
+        required: true
+        type: string
+      checks:
+        required: true
+        type: string
+      setup_minutes:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  gate:
+    if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+    name: gate-${{ matrix.check.index }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ${{ fromJSON(inputs.checks) }}
+    steps:
+      # Everything before Setup is trusted. Candidate commands later run as limitless-gate, which cannot
+      # read this directory, the runner's logs or file commands, or alter anything the runner user runs.
+      - name: Token
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        env:
+          TRUSTED: ${{ runner.temp }}/limitless
+        run: |
+          umask 077
+          mkdir "$TRUSTED"
+          openssl rand -hex 16 > "$TRUSTED/frame"
+          echo "LIMITLESS_TOKEN $(cat "$TRUSTED/frame")"
+          cat > "$TRUSTED/supervise.mjs" <<'JS'
+          import { spawn, spawnSync } from "node:child_process";
+          import { readFileSync, writeSync } from "node:fs";
+          import { constants } from "node:os";
+          const { TRUSTED, COMMANDS, GATE, SWEEP, GATE_HOME, GATE_CWD, LIMITLESS_GATE_REPORT } = process.env;
+          const token = readFileSync(`${TRUSTED}/frame`, "utf8").trim();
+          // Candidates get a fixed environment: no token, no file-command paths, no runner PATH.
+          const env = [`HOME=${GATE_HOME}`, "PATH=/usr/local/bin:/usr/bin:/bin", "CI=true", "LANG=C.UTF-8"];
+          if (LIMITLESS_GATE_REPORT) env.push(`LIMITLESS_GATE_REPORT=${LIMITLESS_GATE_REPORT}`);
+          const sweep = (pid) => {
+            try {
+              process.kill(-pid, "SIGKILL");
+            } catch {}
+            const [command, ...args] = JSON.parse(SWEEP || "[]");
+            if (command) spawnSync(command, args, { stdio: "ignore" });
+          };
+          for (const [index, command] of JSON.parse(COMMANDS).entries()) {
+            const started = performance.now();
+            const [file, ...args] = [...JSON.parse(GATE), "/usr/bin/env", "-i", ...env, "/bin/sh", "-c", command.run];
+            const child = spawn(file, args, { cwd: GATE_CWD, detached: true, stdio: ["ignore", "inherit", "inherit"] });
+            let timedOut = false;
+            const timer = setTimeout(() => {
+              timedOut = true;
+              sweep(child.pid);
+            }, (command.timeoutSec ?? 900) * 1000);
+            const [code, signal] = await new Promise((resolve) => {
+              child.on("exit", (code, signal) => resolve([code, signal]));
+              child.on("error", () => resolve([127, null]));
+            });
+            clearTimeout(timer);
+            sweep(child.pid);
+            const exit = code ?? 128 + (constants.signals[signal] ?? 0);
+            const duration = Math.round(performance.now() - started);
+            writeSync(1, `\nLIMITLESS:${token}:${index}:${exit}:${duration}:${timedOut}\n`);
+            if (exit || timedOut) process.exit(1);
+          }
+          JS
+      - name: Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.3
+          no-cache: true
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - name: Verify commit
+        env:
+          EXPECTED_SHA: ${{ inputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Isolate
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        working-directory: ${{ runner.temp }}/limitless
+        env:
+          TRUSTED: ${{ runner.temp }}/limitless
+        run: |
+          install -m 700 "$(command -v bun)" "$TRUSTED/bun"
+          sudo install -m 755 "$TRUSTED/bun" /usr/local/bin/bun
+          sudo ln -sf bun /usr/local/bin/bunx
+          sudo useradd --create-home --user-group --shell /bin/bash limitless-gate
+          sudo cp -a "$GITHUB_WORKSPACE" /home/limitless-gate/work
+          sudo chown -R limitless-gate:limitless-gate /home/limitless-gate/work
+          sudo chmod 711 /home/limitless-gate
+          # Others may only traverse to the report directory; every other runner-owned entry becomes private.
+          find "$HOME" "$HOME/work" "$RUNNER_TEMP" -mindepth 1 -maxdepth 1 -user "$(id -u)" \
+            ! -path "$HOME/work" ! -path "$RUNNER_TEMP" -exec chmod go-rwx {} +
+          chmod 711 "$HOME" "$HOME/work" "$RUNNER_TEMP"
+          diag="$(dirname "$(dirname "$(readlink -f "/proc/$PPID/exe")")")/_diag"
+          if [ -d "$diag" ]; then sudo chmod -R go-rwx "$diag"; fi
+          sudo install -d -o limitless-gate -g limitless-gate -m 700 "$RUNNER_TEMP/limitless-report"
+      - name: Setup
+        timeout-minutes: ${{ fromJSON(inputs.setup_minutes) }}
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        working-directory: ${{ runner.temp }}/limitless
+        env:
+          TRUSTED: ${{ runner.temp }}/limitless
+          COMMANDS: ${{ inputs.setup }}
+          GATE: '["/usr/bin/sudo", "-n", "-u", "limitless-gate", "--"]'
+          SWEEP: '["/usr/bin/sudo", "-n", "/usr/bin/pkill", "-KILL", "-u", "limitless-gate"]'
+          GATE_HOME: /home/limitless-gate
+          GATE_CWD: /home/limitless-gate/work
+        run: '"$TRUSTED/bun" "$TRUSTED/supervise.mjs"'
+      - name: Check
+        timeout-minutes: ${{ matrix.check.minutes }}
+        shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+        working-directory: ${{ runner.temp }}/limitless
+        env:
+          TRUSTED: ${{ runner.temp }}/limitless
+          COMMANDS: ${{ format('[{0}]', toJSON(matrix.check)) }}
+          GATE: '["/usr/bin/sudo", "-n", "-u", "limitless-gate", "--"]'
+          SWEEP: '["/usr/bin/sudo", "-n", "/usr/bin/pkill", "-KILL", "-u", "limitless-gate"]'
+          GATE_HOME: /home/limitless-gate
+          GATE_CWD: /home/limitless-gate/work
+          LIMITLESS_GATE_REPORT: ${{ runner.temp }}/limitless-report/report.xml
+        run: '"$TRUSTED/bun" "$TRUSTED/supervise.mjs"'
