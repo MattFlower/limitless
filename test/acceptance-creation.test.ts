@@ -2,7 +2,7 @@ import { expect, mock, test } from "bun:test";
 import type { CreateRunRequest, Run } from "../src/core/types.ts";
 import { IssueClaimed, Store } from "../src/db/store.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
-import { ACCEPTANCE_BLOCK, acceptanceRunRequest } from "../src/pipeline/acceptance.ts";
+import { ACCEPTANCE_BLOCK, acceptanceEngine, acceptanceRunRequest } from "../src/pipeline/acceptance.ts";
 import { initialRunState, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -146,6 +146,7 @@ test("HTTP run input cannot set persisted acceptance state or its flow", async (
 test("persisted acceptance guards block an engine without acceptance handling at all checkpoints", async () => {
   const f = await fixture();
   try {
+    acceptanceEngine.enabled = false;
     const store = f.factory.store;
     const repo = store.upsertRepo(repoInput);
     const gh = mock(async () => {
@@ -171,7 +172,7 @@ test("persisted acceptance guards block an engine without acceptance handling at
             ...(checkpoint === "output" ? { output: { items: [] } } : {}),
           },
         });
-      // This engine still has the previous release's block, with no acceptance allowance.
+      // The seam gives the previous release's block, with no acceptance allowance.
       expect(await executeRun(deps, run.id, new AbortController().signal)).toBe("needs_human");
       expect(store.getRun(run.id)).toMatchObject({
         status: "needs_human",
@@ -187,6 +188,7 @@ test("persisted acceptance guards block an engine without acceptance handling at
     expect(gh).not.toHaveBeenCalled();
     expect(reader).not.toHaveBeenCalled();
   } finally {
+    acceptanceEngine.enabled = true;
     await f.close();
   }
 });
