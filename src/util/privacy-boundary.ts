@@ -6,7 +6,6 @@ import {
   type Cut,
   type FromChecker,
   type Metadata,
-  type PolicyData,
   type Refusal,
   type Request,
   WITHHELD,
@@ -23,15 +22,16 @@ export type BoundaryText = Readonly<Metadata & { text: string; policyDigest: str
   readonly [brand]: true;
 };
 declare const brand: unique symbol;
-const policies = new WeakMap<BoundaryPolicy, PolicyData>();
+const policies = new WeakMap<BoundaryPolicy, Map<string, unknown>>();
 const policySizes = new WeakMap<BoundaryPolicy, number>();
 const issued = new WeakMap<BoundaryText, BoundaryPolicy | null>();
 const key = randomBytes(32);
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 const CHUNK = 16 * 1024;
 
-/** JSON-compatible data only: no getters, proxies, cycles or non-finite numbers. Small tokens keep
- * escaping, encoding and hashing off a single large synchronous serialization path. */
+/** JSON-compatible data whose objects are Maps with string keys: a Map's size and entry iterator are
+ * incremental, while discovering a plain object's own keys is one unbounded synchronous step, so plain
+ * objects are refused. Small tokens keep escaping, encoding and hashing off one large synchronous path. */
 async function* jsonPieces(value: unknown): AsyncGenerator<string> {
   const ancestors = new Set<object>();
   function* tokens(v: unknown): Generator<string> {
@@ -48,35 +48,30 @@ async function* jsonPieces(value: unknown): AsyncGenerator<string> {
       yield '"';
     } else if (v === null || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) {
       yield String(v);
-    } else if (typeof v === "object" && v && !ancestors.has(v) && ancestors.size < 128) {
-      // Only plain objects and arrays: no inherited enumerable graph to walk before refusing.
-      const prototype = Object.getPrototypeOf(v);
-      if (
-        Array.isArray(v)
-          ? prototype !== Array.prototype
-          : prototype !== Object.prototype && prototype !== null
-      )
-        throw new Error("resource-refusal");
+    } else if (Array.isArray(v) && Object.getPrototypeOf(v) === Array.prototype && !ancestors.has(v)) {
+      if (ancestors.size >= 128) throw new Error("resource-refusal");
       ancestors.add(v);
-      yield Array.isArray(v) ? "[" : "{";
-      let first = true;
-      if (Array.isArray(v)) {
-        for (let i = 0; i < v.length; i++) {
-          if (!first) yield ",";
-          first = false;
-          yield* tokens(v[i]);
-        }
-      } else {
-        // Own names only: for-in would first collect every inherited enumerable name in one slice.
-        for (const name of Object.keys(v)) {
-          if (!first) yield ",";
-          first = false;
-          yield* tokens(name);
-          yield ":";
-          yield* tokens((v as Record<string, unknown>)[name]);
-        }
+      yield "[";
+      for (let i = 0; i < v.length; i++) {
+        if (i) yield ",";
+        yield* tokens(v[i]);
       }
-      yield Array.isArray(v) ? "]" : "}";
+      yield "]";
+      ancestors.delete(v);
+    } else if (v instanceof Map && Object.getPrototypeOf(v) === Map.prototype && !ancestors.has(v)) {
+      if (ancestors.size >= 128) throw new Error("resource-refusal");
+      ancestors.add(v);
+      yield "{";
+      let first = true;
+      for (const [name, item] of Map.prototype.entries.call(v) as MapIterator<[unknown, unknown]>) {
+        if (typeof name !== "string") throw new Error("resource-refusal");
+        if (!first) yield ",";
+        first = false;
+        yield* tokens(name);
+        yield ":";
+        yield* tokens(item);
+      }
+      yield "}";
       ancestors.delete(v);
     } else throw new Error("resource-refusal");
   }
@@ -99,34 +94,45 @@ export async function preparePrivacyPolicy(input: {
   entries: PrivateStrings;
   credentials: readonly string[];
 }): Promise<BoundaryPolicy> {
-  const snapshot: PolicyData = { entries: [], credentials: [] };
+  // Serialized as the worker's PolicyData object; Maps keep that serialization incremental.
+  const entries: Map<string, unknown>[] = [];
+  const credentials: string[] = [];
   let size = 0;
   for (const entry of input.entries) {
     size += entry.value.length;
-    if (size > 32 * 1024 * 1024 || snapshot.entries.length + snapshot.credentials.length >= 16_384)
+    if (size > 32 * 1024 * 1024 || entries.length + credentials.length >= 16_384)
       throw new Error("resource-refusal");
-    snapshot.entries.push({ value: entry.value, entry: entry.entry });
-    if (snapshot.entries.length % 256 === 0) await turn();
+    entries.push(
+      new Map<string, unknown>([
+        ["value", entry.value],
+        ["entry", entry.entry],
+      ]),
+    );
+    if (entries.length % 256 === 0) await turn();
   }
   const seen = new Set<string>();
   for (const value of input.credentials) {
     size += value.length;
-    if (size > 32 * 1024 * 1024 || snapshot.entries.length + snapshot.credentials.length >= 16_384)
+    if (size > 32 * 1024 * 1024 || entries.length + credentials.length >= 16_384)
       throw new Error("resource-refusal");
     if (value && !seen.has(value)) {
       seen.add(value);
-      snapshot.credentials.push(value);
+      credentials.push(value);
     }
     if (seen.size % 256 === 0) await turn();
   }
+  const wire = new Map<string, unknown>([
+    ["entries", entries],
+    ["credentials", credentials],
+  ]);
   const hash = createHmac("sha256", key);
   let bytes = 0;
-  for await (const piece of jsonPieces(snapshot)) {
+  for await (const piece of jsonPieces(wire)) {
     hash.update(piece);
     bytes += Buffer.byteLength(piece);
   }
   const policy = Object.freeze({ policyDigest: hash.digest("hex") });
-  policies.set(policy, snapshot);
+  policies.set(policy, wire);
   policySizes.set(policy, bytes);
   return policy;
 }

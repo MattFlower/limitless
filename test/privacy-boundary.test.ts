@@ -277,21 +277,31 @@ test("prepared worker matches decoded matcher corpus including credential entrie
   }
 });
 
+/** The in-memory adapter takes objects as Maps, whose keys are discovered incrementally. */
+const data = (value: unknown): unknown =>
+  Array.isArray(value)
+    ? value.map(data)
+    : value && typeof value === "object"
+      ? new Map(Object.entries(value).map(([name, item]) => [name, data(item)]))
+      : value;
+
 test("batched recursive and JSON adapters protect keys, values, numbers and sibling objects", async () => {
   const p = await preparePrivacyPolicy({ entries, credentials: ["123456789"] });
   expect(
     await protectData(
-      {
+      data({
         ok: { a: "clean" },
         bad: { note: "x host.example" },
         keyed: { "host.example": 1, other: 2 },
         n: 123456789,
-      },
+      }),
       provenance,
       p,
     ),
   ).toEqual({ ok: { a: "clean" }, bad: { note: WITHHELD }, keyed: WITHHELD, n: WITHHELD });
-  expect(await protectData({ nested: { "host.example": 1, "x host.example": 2 } }, provenance, p)).toEqual({
+  expect(
+    await protectData(data({ nested: { "host.example": 1, "x host.example": 2 } }), provenance, p),
+  ).toEqual({
     nested: WITHHELD,
   });
   expect(
@@ -303,21 +313,34 @@ test("batched recursive and JSON adapters protect keys, values, numbers and sibl
   });
   expect(await protectJsonText('{"a":"host.example"', provenance, p)).toBe(WITHHELD);
   for (const prov of [{ kind: "legacy-unknown" }, { kind: "cut", truncated: true }] as const) {
-    expect(await protectData({ a: "clean" }, prov, p)).toBe(WITHHELD);
+    expect(await protectData(data({ a: "clean" }), prov, p)).toBe(WITHHELD);
     expect(await protectJsonText('{"a":"clean"}', prov, p)).toBe(WITHHELD);
   }
-  expect(await protectData({ a: "clean" }, provenance, null)).toBe(WITHHELD);
+  expect(await protectData(data({ a: "clean" }), provenance, null)).toBe(WITHHELD);
   expect(await protectJsonText('"clean"', provenance, null)).toBe(WITHHELD);
-  expect(await protectData(JSON.parse('{"__proto__":{"a":"clean"}}'), provenance, p)).toEqual(
+  expect(await protectData(data(JSON.parse('{"__proto__":{"a":"clean"}}')), provenance, p)).toEqual(
     JSON.parse('{"__proto__":{"a":"clean"}}'),
   );
-  // Inherited graphs are refused before enumeration rather than walked and discarded.
-  expect(await protectData({ ok: Object.create({ inherited: "host.example" }) }, provenance, p)).toBe(
-    WITHHELD,
+  expect(await protectJsonText('{"__proto__":{"a":"clean"}}', provenance, p)).toEqual(
+    JSON.parse('{"__proto__":{"a":"clean"}}'),
   );
-  expect(await protectData(Object.assign(Object.create(null), { a: "clean" }), provenance, p)).toEqual({
-    a: "clean",
-  });
+  // Plain objects need an unbounded synchronous key discovery, so they are refused before enumeration;
+  // so are Map subclasses, non-string Map keys and cycles.
+  class Sub extends Map {}
+  const cyclic = new Map<string, unknown>();
+  cyclic.set("self", cyclic);
+  for (const value of [
+    { a: "clean" },
+    new Map([["ok", { a: "clean" }]]),
+    Object.create(null),
+    new Sub([["a", "clean"]]),
+    new Map([[1, "clean"]]),
+    cyclic,
+  ])
+    expect(await protectData(value, provenance, p)).toBe(WITHHELD);
+  const many = new Map<string, number>();
+  for (let i = 0; i < 1000; i++) many.set(String(i), 0);
+  expect(await protectData([many], provenance, p)).toEqual([Object.fromEntries(many)]);
 });
 
 test("adapter field refusals and transformed-key collisions stay local", async () => {
@@ -325,13 +348,15 @@ test("adapter field refusals and transformed-key collisions stay local", async (
   for (let i = 0; i < 7; i++) nested = nested.replaceAll("%", "%25");
   const empty = await preparePrivacyPolicy({ entries: [], credentials: [] });
   const value = { ok: "clean", refusal: nested };
-  expect(await protectData(value, provenance, empty)).toEqual({ ok: "clean", refusal: WITHHELD });
+  expect(await protectData(data(value), provenance, empty)).toEqual({ ok: "clean", refusal: WITHHELD });
   expect(await protectJsonText(JSON.stringify(value), provenance, empty)).toEqual({
     ok: "clean",
     refusal: WITHHELD,
   });
   const p = await preparePrivacyPolicy({ entries: [], credentials: ["a\r\nb"] });
-  expect(await protectData({ nested: { "a\nb": 1, "[redacted]": 2 }, ok: "clean" }, provenance, p)).toEqual({
+  expect(
+    await protectData(data({ nested: { "a\nb": 1, "[redacted]": 2 }, ok: "clean" }), provenance, p),
+  ).toEqual({
     nested: WITHHELD,
     ok: "clean",
   });
