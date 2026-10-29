@@ -132,6 +132,7 @@ export async function confirmPostMerge(
       originalVerdict: c.verdict,
       reason,
       result,
+      ...(result ? { os: process.platform } : {}),
     });
     if (result) {
       c.retryOriginal ??= { verdict: c.verdict, blocking: c.blocking };
