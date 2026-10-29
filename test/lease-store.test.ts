@@ -220,6 +220,19 @@ test.each([false, true])(
   },
 );
 
+test("restart drops an identical-record renewal that was never sent", async () => {
+  const f = fixture(true);
+  const before = f.confirmed();
+  f.journal("renew", before, held);
+  f.reopen();
+  expect(await f.reconcile()).toBe("dropped");
+  expect(f.store.leaseRow(repo, ref)).toMatchObject({
+    confirmed: { generation: 1, tip: before.sha, state: "held" },
+    intent: null,
+  });
+  expect(f.gh.calls("update")).toHaveLength(0);
+});
+
 test("failed acquisition commit POST leaves no ownership history and can be explicitly forgotten", async () => {
   const f = fixture(true);
   f.journal("acquire", null);
@@ -412,28 +425,62 @@ test.each(["commit", "update", "unreadable"])(
   },
 );
 
-async function replayRace(unconditional: boolean) {
+test.each(["same owner", "malformed"])(
+  "a replay moved to %s retains the final release and confirmed history",
+  async (mode) => {
+    const f = fixture();
+    const before = f.confirmed();
+    f.journal("release", before);
+    const interveningRecord: ClaimRecord | string =
+      mode === "malformed" ? "invalid record" : { ...held, status: "waiting_input" };
+    let intervening: ClaimTip | undefined;
+    f.gh.fault = (r) => {
+      if (r.step === "update") intervening = f.gh.seed(interveningRecord);
+    };
+    expect(await f.reconcile()).toBe("pending");
+    const update = f.gh.calls("update")[0];
+    if (!update || !intervening) throw new Error("Replay race was not exercised");
+    expect(f.gh.update(update).beforeOid).toBe(before.sha);
+    expect(f.store.leaseRow(repo, ref)).toMatchObject({
+      confirmed: { generation: 1, tip: before.sha, state: "held" },
+      intent: {
+        op: "release",
+        before: before.sha,
+        record: release,
+        commit: f.gh.update(update).afterOid,
+      },
+    });
+    expect(f.gh.refs.get(f.gh.key(repo, ref))).toBe(intervening.sha);
+    expect(tipRecord(f.gh)).toEqual(typeof interveningRecord === "string" ? "malformed" : interveningRecord);
+  },
+);
+
+async function replayRace(unconditional: boolean, record = successor) {
   const f = fixture(false, unconditional);
   const before = f.confirmed();
   f.journal("release", before);
   const successors: ClaimTip[] = [];
   f.gh.fault = (r) => {
-    if (r.step === "update") successors.push(f.gh.seed(successor));
+    if (r.step === "update") successors.push(f.gh.seed(record));
   };
   const result = await f.reconcile();
   const update = f.gh.calls("update")[0];
   const successorTip = successors[0];
   if (!update || !successorTip) throw new Error("Replay race was not exercised");
   expect(f.gh.update(update).beforeOid).toBe(before.sha);
-  return { f, result, successorTip };
+  return { f, result, successorTip, before };
 }
-test("replayed release loses the CAS race and cannot overwrite a successor", async () => {
-  const { f, result, successorTip } = await replayRace(false);
+test.each([
+  ["successor", successor],
+  ["same-generation holder", { ...held, holder: successor.holder }],
+  ["same-generation run", { ...held, run: successor.run }],
+] as const)("replayed release loses the CAS race and cannot overwrite a %s", async (_mode, record) => {
+  const { f, result, successorTip, before } = await replayRace(false, record);
   expect(f.gh.refs.get(f.gh.key(repo, ref))).toBe(successorTip.sha);
-  expect(tipRecord(f.gh)).toEqual(successor);
+  expect(tipRecord(f.gh)).toEqual(record);
   expect(result).toBe("superseded");
   expect(f.store.leaseRow(repo, ref)).toMatchObject({
-    confirmed: { generation: 1, state: "lost" },
+    confirmed: { generation: 1, tip: before.sha, state: "lost" },
     intent: null,
   });
 });

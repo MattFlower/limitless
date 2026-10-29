@@ -108,33 +108,30 @@ export async function reconcileLeaseIntent(
   signal?.throwIfAborted();
   if (read.kind === "unconfirmed") return "pending";
   if (read.kind === "absent" && intent.before !== "0".repeat(40)) return "pending";
-  const tip = read.kind === "tip" ? read.tip : null;
+  let tip = read.kind === "tip" ? read.tip : null;
+  if (tip?.record === "malformed") return "pending";
+  if (read.kind === "absent" || read.tip.sha === intent.before) {
+    if (intent.op !== "release" || read.kind !== "tip" || intent.before !== confirmed?.tip) {
+      store.dropLeaseIntent(repo, ref);
+      return "dropped";
+    }
+    const result = await client.write(repo, ref, read.tip, intent.record, {
+      signal,
+      onCommit: (sha) => store.setLeaseIntentCommit(repo, ref, sha),
+    });
+    signal?.throwIfAborted();
+    if (result.kind === "applied") {
+      confirm(result.tip.sha);
+      return "replayed";
+    }
+    if (result.kind !== "moved") return "pending";
+    tip = result.tip;
+  }
   const record = tip?.record;
-  if (record === "malformed") return "pending";
-  if (
-    tip &&
-    (tip.sha === intent.commit || (record && formatRecord(record) === formatRecord(intent.record)))
-  ) {
+  if (!tip || tip.sha === intent.before || record === "malformed") return "pending";
+  if (tip.sha === intent.commit || (record && formatRecord(record) === formatRecord(intent.record))) {
     confirm(tip.sha);
     return "applied";
-  }
-  if (read.kind === "absent" || read.tip.sha === intent.before) {
-    if (intent.op === "release" && read.kind === "tip" && intent.before === confirmed?.tip) {
-      const result = await client.write(repo, ref, read.tip, intent.record, {
-        signal,
-        onCommit: (sha) => store.setLeaseIntentCommit(repo, ref, sha),
-      });
-      signal?.throwIfAborted();
-      if (result.kind === "applied") {
-        confirm(result.tip.sha);
-        return "replayed";
-      }
-      if (result.kind !== "moved") return "pending";
-      store.markLeaseLost(repo, ref);
-      return "superseded";
-    }
-    store.dropLeaseIntent(repo, ref);
-    return "dropped";
   }
   const previous = confirmed?.generation ?? generation;
   if (
