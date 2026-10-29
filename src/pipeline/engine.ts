@@ -117,6 +117,7 @@ import {
   type RunState,
   redactPostMergeComparisons,
 } from "./context.ts";
+import { runCoveringTests } from "./covering-tests.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import { gateCommandScope, resumeGateExecution, runGateExecution } from "./gate-execution.ts";
@@ -2223,6 +2224,15 @@ async function oneRound(
           verifiedSha,
           usableGates(),
           ctx.state.baseline,
+          {
+            runs: ctx.state.coveringTestRuns ?? [],
+            succeededStageIds: (ctx.state.coveringTestRuns ?? [])
+              .filter((r) => {
+                const stage = ctx.store.getStage(r.stageId);
+                return stage?.runId === ctx.run.id && stage.name === "gates" && stage.status === "succeeded";
+              })
+              .map((r) => r.stageId),
+          },
         ),
         ctx.state.spec as Spec,
         ctx.state.holdout as Holdout,
@@ -2261,7 +2271,30 @@ async function oneRound(
         ctx.previewUrl = preview.url;
       }
     };
+    const pendingVerify = (attempt: number) => {
+      const pending = ctx.state.pendingVerify;
+      return pending?.round === round && pending.sha === verifiedSha && pending.attempt === attempt
+        ? pending
+        : undefined;
+    };
+    const executeCovering = (value: Verify) =>
+      runCoveringTests(
+        ctx,
+        applyGateEvidence(
+          value,
+          ctx.state.spec as Spec,
+          ctx.state.holdout as Holdout,
+          verifiedSha,
+          usableGates(),
+          ctx.state.baseline,
+        ),
+        verifiedSha,
+        checkVerifiedHead,
+      );
+    const pending = pendingVerify(0) ?? pendingVerify(1);
+    if (pending) await executeCovering(pending.modelOutput);
     const prepareVerification = async () => {
+      if (pendingVerify(0) || pendingVerify(1)) return;
       try {
         if (!previewWillSetup) await prepareLocal();
         await preparePreview();
@@ -2283,45 +2316,60 @@ async function oneRound(
       return ctx.stage(
         "verify",
         async (stage) => {
-          const { result, target } = await ctx.invoke({
-            role: "verify",
-            allowLocalBinding: true,
-            stage,
-            mode: "readonly",
-            complexity: ctx.complexity,
-            constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
-            timeoutMs: readingTimeout(diff.added + diff.removed, 25),
-            prompt: (allowLocalBinding) =>
-              verifyPrompt({
-                allowLocalBinding,
-                prompt: ctx.run.prompt,
-                spec: ctx.state.spec as Spec,
-                holdout: ctx.state.holdout as Holdout,
-                baseSha,
-                checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
-              }),
-            jsonSchema: toStrictJsonSchema(VerifySchema),
-            schema: VerifySchema,
-            requireStructured: true,
-            privateSession: true,
-            redactHoldout: true,
-          });
-          if (!ctx.parallelChecks) await discardChanges(cwd);
+          const obtainOutput = async () => {
+            const { result, target } = await ctx.invoke({
+              role: "verify",
+              allowLocalBinding: true,
+              stage,
+              mode: "readonly",
+              complexity: ctx.complexity,
+              constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
+              timeoutMs: readingTimeout(diff.added + diff.removed, 25),
+              prompt: (allowLocalBinding) =>
+                verifyPrompt({
+                  allowLocalBinding,
+                  prompt: ctx.run.prompt,
+                  spec: ctx.state.spec as Spec,
+                  holdout: ctx.state.holdout as Holdout,
+                  baseSha,
+                  checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
+                }),
+              jsonSchema: toStrictJsonSchema(VerifySchema),
+              schema: VerifySchema,
+              requireStructured: true,
+              privateSession: true,
+              redactHoldout: true,
+            });
+            if (!ctx.parallelChecks) await discardChanges(cwd);
+            await checkVerifiedHead();
+            const pending = {
+              round,
+              attempt,
+              sha: verifiedSha,
+              modelOutput: VerifySchema.parse(result.structured),
+              modelId: target.modelId,
+            };
+            ctx.state.pendingVerify = pending;
+            await ctx.save("covering-test-request");
+            return pending;
+          };
+          const { modelOutput, modelId } = pendingVerify(attempt) ?? (await obtainOutput());
+          await executeCovering(modelOutput);
           await checkVerifiedHead();
-          const modelOutput = VerifySchema.parse(result.structured);
           const v = resolveVerify(modelOutput);
-          ctx.state.lastVerify = { ...v, modelId: target.modelId };
+          ctx.state.lastVerify = { ...v, modelId };
           ctx.state.verifyResults = [
             ...(ctx.state.verifyResults ?? []),
-            { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha, modelOutput },
+            { ...v, modelId, round, attempt, sha: verifiedSha, modelOutput },
           ];
-          await ctx.save();
+          ctx.state.pendingVerify = undefined;
+          await ctx.save("verify-result");
           const publicSources = await ctx.publicHoldoutSources();
           ctx.artifact(
             attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
             "verify",
             preDeliveryVerifyArtifact(
-              { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha },
+              { ...v, modelId, round, attempt, sha: verifiedSha },
               ctx.state.spec as Spec,
               ctx.state.holdout as Holdout,
               publicSources,
@@ -2330,7 +2378,7 @@ async function oneRound(
           const met = v.criteria.filter((c) => c.status === "met").length;
           const blocked = v.criteria.filter((c) => c.status === "blocked").length;
           return {
-            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met${blocked ? `, ${blocked} blocked` : ""} (${target.modelId})`,
+            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met${blocked ? `, ${blocked} blocked` : ""} (${modelId})`,
             value: v,
           };
         },
@@ -2349,7 +2397,7 @@ async function oneRound(
       let results: [PromiseSettledResult<Review>, PromiseSettledResult<Verify>];
       try {
         try {
-          results = await Promise.allSettled([reviewStage(), verifyAttempt(0)]);
+          results = await Promise.allSettled([reviewStage(), verifyAttempt(pending?.attempt ?? 0)]);
         } finally {
           ctx.parallelChecks = false;
           await discardChanges(cwd);
@@ -2403,7 +2451,9 @@ async function oneRound(
       ).replace("### Checks not met", "### Acceptance criteria not yet met (verify)");
       if (!(await rejectReview(results[0].value, feedback))) return false;
     } else {
-      verify = original ? resolveVerify(VerifySchema.parse(original)) : await verifyAttempt(0);
+      verify = original
+        ? resolveVerify(VerifySchema.parse(original))
+        : await verifyAttempt(pending?.attempt ?? 0);
     }
     if (recorded) {
       Object.assign(recorded, verify);
@@ -2450,7 +2500,7 @@ async function oneRound(
         await ctx.save();
         throw new NeedsHumanError(detail);
       };
-      if (previous.some((v) => v.attempt === 1)) await stop();
+      if (previous.some((v) => v.attempt === 1) || pending?.attempt === 1) await stop();
       // A reserved retry that never recorded a result was interrupted; resume it, don't grant another.
       if (ctx.state.environmentRetryRound === round)
         ctx.log("Resuming interrupted verification retry", "warn");
