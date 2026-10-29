@@ -264,6 +264,25 @@ async function request(bundle = false): Promise<GateRequest> {
 }
 const fields = (run: GateRun) => run.checks.map(({ name, ok, exitCode }) => ({ name, ok, exitCode }));
 
+test("gate lease captures OS independently of later worker heartbeats", async () => {
+  await listen();
+  const token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const id = workers.enqueue(await request());
+  expect((await call("/worker/lease", {}, token)).json()).toMatchObject({ job: { id } });
+  expect(workers.job(id)?.worker_os).toBe("darwin");
+  await call("/worker/heartbeat", { ...caps([id]), os: "linux" }, token);
+  expect(workers.job(id)?.worker_os).toBe("darwin");
+  const setup = [
+    { name: "setup:0", command: "missing", ok: false, exitCode: 127, durationMs: 1, output: "" },
+  ];
+  expect(workers.complete(id, { setupOk: false, setup, checks: [] })).toBe(true);
+  expect(workers.job(id)?.worker_os).toBe("darwin");
+  expect(workers.fallbackSetup(id, "missing")).toBe(true);
+  expect(workers.complete(id, { setupOk: true, setup: [], checks: [] }, true)).toBe(true);
+  expect(workers.job(id)?.worker_os).toBe("darwin");
+});
+
 async function failedWorkerSetup(req: GateRequest, afterLease = () => {}, previousFailure = false) {
   await listen();
   const token = await paired();
