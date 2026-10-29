@@ -61,18 +61,14 @@ async function* jsonPieces(value: unknown): AsyncGenerator<string> {
       yield Array.isArray(v) ? "[" : "{";
       let first = true;
       if (Array.isArray(v)) {
-        for (const field of v) {
+        for (let i = 0; i < v.length; i++) {
           if (!first) yield ",";
           first = false;
-          yield* tokens(field);
+          yield* tokens(v[i]);
         }
       } else {
-        for (const name in v) {
-          if (!Object.hasOwn(v, name)) {
-            // Discarded (polluted) names still pass the yield and elapsed-time checks below.
-            yield "";
-            continue;
-          }
+        // Own names only: for-in would first collect every inherited enumerable name in one slice.
+        for (const name of Object.keys(v)) {
           if (!first) yield ",";
           first = false;
           yield* tokens(name);
