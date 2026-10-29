@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
+import { restart } from "../src/cli/service.ts";
 import { loadConfig } from "../src/config.ts";
 import { reloadedConfig } from "../src/config-reload.ts";
 import { WorkerStore } from "../src/db/workers.ts";
@@ -107,7 +108,11 @@ async function setup(enabled = true) {
 
 async function withExecutor(
   f: Factory,
-  fn: (workers: WorkerStore, crash: () => Promise<void>) => Promise<void>,
+  fn: (
+    workers: WorkerStore,
+    crash: () => Promise<void>,
+    child: ReturnType<typeof Bun.spawn>,
+  ) => Promise<void>,
   sha = release,
   realConfinement = false,
   beforeRun = "",
@@ -147,10 +152,14 @@ async function withExecutor(
   try {
     await wait(() => f.workers.executor(undefined, false)?.pid === child.pid, { timeoutMs: 10_000 });
     await confinementScope.run(fakeConfinement, () =>
-      fn(f.workers, async () => {
-        child.kill("SIGKILL");
-        await child.exited;
-      }),
+      fn(
+        f.workers,
+        async () => {
+          child.kill("SIGKILL");
+          await child.exited;
+        },
+        child,
+      ),
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill(beforeRun ? "SIGKILL" : "SIGTERM");
@@ -636,6 +645,65 @@ test("shutdown detaches and a new context reattaches to the same job and executo
         expect(slots()).toEqual(expected);
         await recoverProcessCleanups(f.store);
         expect(slots()).toEqual(expected);
+        const agentsDir = join(fixture.home, "restart-agents");
+        mkdirSync(agentsDir);
+        mkdirSync(join(fixture.home, "src/cli"), { recursive: true });
+        const entry = join(fixture.home, "src/cli/main.ts");
+        writeFileSync(entry, "");
+        for (const [label, command] of [
+          ["custom.daemon", "serve"],
+          ["custom.executor", "executor"],
+        ])
+          writeFileSync(
+            join(agentsDir, `${label}.plist`),
+            JSON.stringify({ Label: label, ProgramArguments: ["bun", entry, command] }),
+          );
+        const intent = join(fixture.home, "executor-intent.json");
+        writeFileSync(intent, "untouched");
+        const calls: string[][] = [];
+        let boot = 1,
+          draining = false;
+        await restart(f.cfg.port, {
+          agentsDir,
+          releaseDir: fixture.home,
+          lockPath: join(fixture.home, "deploy.lock"),
+          now: true,
+          log: () => {},
+          command: async (args) => {
+            calls.push([...args]);
+            if (args[1] === "kickstart") {
+              boot++;
+              draining = false;
+            }
+            return {
+              exitCode: 0,
+              stderr: "",
+              stdout: args[0] === "plutil" ? readFileSync(args.at(-1) ?? "", "utf8") : "",
+            };
+          },
+          client: {
+            health: async () => ({
+              ok: true,
+              sha: release,
+              uptimeMs: 1,
+              startedAt: boot,
+              draining,
+              active: [],
+            }),
+            admin: async (action) => {
+              draining = action === "drain";
+              return { draining, active: [] };
+            },
+            run: async () => ({ stage: "gates" }),
+          },
+        });
+        expect(
+          calls
+            .filter((args) => args[0] === "launchctl")
+            .some((args) => args.join(" ").includes("custom.executor")),
+        ).toBe(false);
+        expect(readFileSync(intent, "utf8")).toBe("untouched");
+        expect(workers.job(handle?.id ?? "")?.state).toBe("leased");
         const second = context();
         const resumed = gateCommandScope(second, "gates", "initial", req.cwd, async () => {
           const result = await runGateExecution(second, "gates", "initial", req.cwd, req.gates);
@@ -1001,7 +1069,7 @@ test.each(["SHA", "daemon port"])(
 test("a daemon release change stops a running job before in-process fallback", async () => {
   const { f, context, req } = await setup();
   const attempted = join(fixture.home, "attempted");
-  await withExecutor(f, async (workers) => {
+  await withExecutor(f, async (workers, _crash, child) => {
     const long = {
       ...gates,
       setup: [],
@@ -1021,6 +1089,8 @@ test("a daemon release change stops a running job before in-process fallback", a
       expect(recoveryProcessStopped(pid)).toBe(true);
       const job = workers.jobs("in_place=1")[0];
       expect(job?.stopped).toBe(1);
+      await wait(() => child.exitCode !== null, { timeoutMs: 2 * workers.times.tick + 2000 });
+      expect(await child.exited).toBe(0);
       expect(job?.failure_reason).toContain("release changed");
     } finally {
       writeFileSync(join(req.cwd, "proceed"), "");
@@ -1197,4 +1267,57 @@ test.each([
     await fixture.factory?.stop();
     if (fixture.factory !== f) f.store.close();
   }
+});
+
+test("an idle serving executor exits on a release change without leasing a job", async () => {
+  const { f } = await setup();
+  await withExecutor(f, async (workers, _crash, child) => {
+    // Hold SQLite's write lock: idle serving observation must still run without a transaction.
+    f.store.db.exec("BEGIN IMMEDIATE");
+    try {
+      await Bun.sleep(2 * workers.times.tick);
+    } finally {
+      f.store.db.exec("ROLLBACK");
+    }
+    f.store.setSetting("executor.daemonRelease", "next-release");
+    await wait(() => child.exitCode !== null, { timeoutMs: 2 * workers.times.tick + 2000 });
+    expect(await child.exited).toBe(0);
+    expect(workers.jobs("1=1")).toHaveLength(0);
+  });
+});
+
+test("an executor awaiting its first matching release stays alive and read-only, then leases", async () => {
+  const { f, req } = await setup();
+  f.store.setSetting("executor.daemonRelease", "previous-release");
+  await withExecutor(f, async (workers, _crash, child) => {
+    const id = workers.enqueue(req, randomUUID(), true);
+    const version = () => f.store.db.query("PRAGMA data_version").get();
+    const before = version();
+    await Bun.sleep(3 * workers.times.tick);
+    expect(version()).toEqual(before);
+    expect(child.exitCode).toBeNull();
+    expect(workers.job(id)?.state).toBe("queued");
+    f.store.setSetting("executor.daemonRelease", release);
+    await wait(() => workers.job(id)?.state === "done", { timeoutMs: 10_000 });
+    expect(workers.job(id)?.state).toBe("done");
+  });
+});
+
+test("a serving executor fails and stops its leased job before exiting on a release change", async () => {
+  const { f, req } = await setup();
+  const started = join(req.cwd, "release-job-started");
+  req.gates = {
+    ...gates,
+    setup: [],
+    checks: [{ name: "long", run: "touch release-job-started; while :; do sleep 0.05; done" }],
+  };
+  await withExecutor(f, async (workers, _crash, child) => {
+    const id = workers.enqueue(req, randomUUID(), true);
+    await wait(() => existsSync(started), { timeoutMs: 10_000 });
+    expect(workers.job(id)?.state).toBe("leased");
+    f.store.setSetting("executor.daemonRelease", "next-release");
+    await wait(() => child.exitCode !== null, { timeoutMs: 10_000 });
+    expect(await child.exited).toBe(0);
+    expect(workers.job(id)).toMatchObject({ state: "failed", stopped: 1 });
+  });
 });

@@ -34,6 +34,7 @@ import { type LeaseClient, type LeaseOptions, localLeaseClient, withGateLease } 
 
 const LABEL = "dev.limitless.daemon";
 const TUNNEL_LABEL = "dev.limitless.tunnel";
+const EXECUTOR_LABEL = "dev.limitless.executor";
 const MTPLX_LABEL = "dev.limitless.mtplx";
 const MTPLX_MODEL = process.env.LIMITLESS_MTPLX_MODEL ?? "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality";
 const REPO_URL = "git@github.com:MattFlower/limitless.git";
@@ -140,12 +141,30 @@ export function mtplxPlist(workingDirectory = appDir): string {
   return plist(MTPLX_LABEL, args, {}, workingDirectory);
 }
 
-async function launchctl(args: string[], allowFail = true) {
-  return sh(["launchctl", ...args], { cwd: home, allowFail });
+export async function inspectService(label: string, command = sh, domain: "gui" | "user" = "gui") {
+  const service = `${domain}/${uid}/${label}`;
+  try {
+    const result = await command(["launchctl", "print", service], { cwd: home, allowFail: true });
+    if (!result.timedOut && result.exitCode === 0) return { state: "loaded" as const };
+    const output = `${result.stderr}\n${result.stdout}`;
+    const missing = `Could not find service "${label}" in domain for ${domain === "gui" ? "user gui" : "uid"}: ${uid}`;
+    if (!result.timedOut && result.exitCode === 113 && output.split("\n").includes(missing))
+      return { state: "absent" as const };
+    return {
+      state: "unknown" as const,
+      reason: `launchctl print ${service} failed (${result.timedOut ? "timed out, " : ""}exit ${result.exitCode}): ${output.trim() || "no output"}`,
+    };
+  } catch (error) {
+    return { state: "unknown" as const, reason: `launchctl print ${service} failed: ${error}` };
+  }
 }
 
-async function loaded(label: string): Promise<boolean> {
-  return (await launchctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
+class ServiceInspectionError extends Error {}
+
+async function serviceLoaded(label: string, command: typeof sh): Promise<boolean> {
+  const inspection = await inspectService(label, command);
+  if (inspection.state === "unknown") throw new ServiceInspectionError(inspection.reason);
+  return inspection.state === "loaded";
 }
 
 function samePath(a: unknown, b: string): boolean {
@@ -156,7 +175,7 @@ function samePath(a: unknown, b: string): boolean {
   }
 }
 type Migration = Record<"label" | "path" | "target" | "phase" | "backup", string> & {
-  old: { label: string; path: string };
+  old: { label: string; path: string; kind?: string };
 };
 type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]> & {
   release?: Release;
@@ -203,6 +222,12 @@ export async function installedUnits(opts: ServiceOptions = {}) {
         : executable === "bun" && is(1, entry, "serve")
     )
       kind = "daemon";
+    else if (
+      packaged
+        ? args.length === 2 && args[0] === executablePath && args[1] === "executor"
+        : executable === "bun" && is(1, entry, "executor")
+    )
+      kind = "executor";
     else if (samePath(data.WorkingDirectory, workingDirectory)) {
       if (is(0, join(home, ".mtplx", "bin", "mtplx"), "serve")) kind = "mtplx";
       if (executable === "cloudflared" && is(1, "tunnel", "--config", config, "run")) kind = "tunnel";
@@ -269,7 +294,7 @@ async function health(port: number, timeoutMs = 30_000): Promise<boolean> {
 }
 
 export function installationUnits(
-  opts: { mtplx?: boolean; release?: Release; execPath?: string } = {},
+  opts: { mtplx?: boolean; executor?: boolean; release?: Release; execPath?: string } = {},
   tunnel: string | null = null,
 ): [string, string][] {
   const packaged = (opts.release ?? release).kind === "packaged";
@@ -292,7 +317,89 @@ export function installationUnits(
       ),
     ]);
   }
+  if (opts.executor)
+    units.push([
+      EXECUTOR_LABEL,
+      plist(EXECUTOR_LABEL, [...args.slice(0, -1), "executor"], {}, workingDirectory),
+    ]);
   return units;
+}
+
+type ExecutorUnit = { label: string; path: string };
+type ExecutorIntent = ExecutorUnit & { phase: "deploying" | "rollback"; previous: string; target: string };
+function atomicSave(path: string, value: unknown) {
+  writeFileSync(`${path}.tmp`, JSON.stringify(value), { mode: 0o600, flush: true });
+  renameSync(`${path}.tmp`, path);
+}
+function executorControl(opts: ServiceOptions) {
+  const command = opts.command ?? sh,
+    clock = opts.clock ?? deployClock;
+  const intentPath = join(opts.lockPath ?? deployLock, "..", "executor-intent.json");
+  const directory = join(opts.lockPath ?? deployLock, "..", "service-backup");
+  const ctl = (args: string[]) => command(["launchctl", ...args], { cwd: home, allowFail: true });
+  const isLoaded = (unit: ExecutorUnit) => serviceLoaded(unit.label, command);
+  const shutdownExecutor = async (unit: ExecutorUnit) => {
+    const service = `gui/${uid}/${unit.label}`;
+    try {
+      if (await isLoaded(unit)) {
+        const result = await ctl(["bootout", service]);
+        if (result.exitCode !== 0) throw new Error(result.stderr);
+        for (let i = 0; i < 30 && (await isLoaded(unit)); i++) await clock.sleep(500);
+        if (await isLoaded(unit)) throw new Error("agent still loaded");
+      }
+      const result = await ctl(["disable", service]);
+      if (result.exitCode !== 0) throw new Error(result.stderr);
+    } catch (error) {
+      const Failure = error instanceof ServiceInspectionError ? ServiceInspectionError : Error;
+      throw new Failure(
+        `Executor ${unit.label} shutdown unconfirmed: ${error}. Recover with: launchctl bootout ${service}; launchctl disable ${service}; then rerun the command.`,
+        { cause: error },
+      );
+    }
+  };
+  const unit = async () => {
+    const found = (await installedUnits(opts)).find((u) => u.kind === "executor");
+    return found && { label: found.label, path: found.path };
+  };
+  const isExecutor = async (state: Migration) =>
+    state.old.kind === "executor" ||
+    state.label === EXECUTOR_LABEL ||
+    state.old.label === EXECUTOR_LABEL ||
+    (await installedUnits(opts)).some(
+      (u) => u.kind === "executor" && [state.label, state.old.label].includes(u.label),
+    );
+  const reconcileExecutor = async (enabled = false) => {
+    const installed = await unit();
+    if (!installed) return;
+    if (!enabled) return shutdownExecutor(installed);
+    const result = await ctl(["enable", `gui/${uid}/${installed.label}`]);
+    if (result.exitCode !== 0) throw new Error(`enable ${installed.label}: ${result.stderr}`);
+    if (!(await isLoaded(installed))) {
+      const result = await ctl(["bootstrap", `gui/${uid}`, installed.path]);
+      if (result.exitCode !== 0) throw new Error(`bootstrap ${installed.label}: ${result.stderr}`);
+    }
+  };
+  const finish = async () => {
+    await reconcileExecutor(opts.executor);
+    if (existsSync(intentPath)) unlinkSync(intentPath);
+    for (const file of existsSync(directory)
+      ? readdirSync(directory).filter((f) => f.endsWith(".json"))
+      : []) {
+      const path = join(directory, file);
+      if (await isExecutor(JSON.parse(readFileSync(path, "utf8")))) unlinkSync(path);
+    }
+  };
+  return {
+    shutdownExecutor,
+    reconcileExecutor,
+    unit,
+    isExecutor,
+    finish,
+    save: (intent: ExecutorIntent) => atomicSave(intentPath, intent),
+    recover: async () => {
+      if (existsSync(intentPath)) await shutdownExecutor(JSON.parse(readFileSync(intentPath, "utf8")));
+    },
+  };
 }
 
 export async function install(
@@ -313,9 +420,11 @@ export async function install(
   const raw = opts.command ?? sh,
     clock = opts.clock ?? deployClock;
   const client = opts.client ?? localDeployClient(port);
+  const executor = executorControl({ ...opts, command });
+  const recoveryExecutor = executorControl({ ...opts, command: raw });
   const ctl = async (args: string[]) =>
     (restoring ? raw : command)(["launchctl", ...args], { cwd: home, allowFail: true });
-  const isLoaded = async (label: string) => (await ctl(["print", `gui/${uid}/${label}`])).exitCode === 0;
+  const isLoaded = (label: string) => serviceLoaded(label, restoring ? raw : command);
   const stop = async (label: string) => {
     if (!(await isLoaded(label))) return;
     const result = await ctl(["bootout", `gui/${uid}/${label}`]);
@@ -330,32 +439,49 @@ export async function install(
   const directory = join(opts.lockPath ?? deployLock, "..", "service-backup");
   const journal = (state: Migration) => join(directory, `${state.label}.json`);
   const save = (state: Migration) => {
-    writeFileSync(`${journal(state)}.tmp`, JSON.stringify(state), { mode: 0o600, flush: true });
-    renameSync(`${journal(state)}.tmp`, journal(state));
+    atomicSave(journal(state), state);
   };
   const clear = (state: Migration) => {
     if (existsSync(journal(state))) unlinkSync(journal(state));
   };
   const restore = async (state: Migration) => {
     restoring = true;
+    const executor = await recoveryExecutor.isExecutor(state);
+    if (executor) {
+      save({ ...state, phase: "rollback" });
+      await recoveryExecutor.shutdownExecutor(state);
+      if (state.old.label !== state.label) await recoveryExecutor.shutdownExecutor(state.old);
+    }
     const errors: string[] = [];
     await (async () => save({ ...state, phase: "rollback" }))().catch((e) => errors.push(String(e)));
-    for (const l of [state.label, state.old.label]) await stop(l).catch((e) => errors.push(String(e)));
+    if (!executor)
+      for (const l of [state.label, state.old.label])
+        await stop(l).catch((error) => {
+          if (error instanceof ServiceInspectionError) throw error;
+          errors.push(String(error));
+        });
     await (async () => {
+      const startOld = !executor && (state.old.label === state.label || !(await isLoaded(state.old.label)));
       if (existsSync(state.path)) unlinkSync(state.path);
       writeFileSync(state.old.path, Buffer.from(state.backup, "base64"));
-      if (state.old.label === state.label || !(await isLoaded(state.old.label))) await start(state.old.path);
+      if (startOld) await start(state.old.path);
     })().catch((error) => errors.push(String(error)));
     if (errors.length) throw new Error(errors.join("; "));
     save({ ...state, phase: "restored" });
   };
   if (control.recover) {
+    await executor.recover();
     const recovered: string[] = [];
     const failures: string[] = [];
     for (const file of existsSync(directory)
       ? readdirSync(directory).filter((f) => f.endsWith(".json"))
       : []) {
       const state: Migration = JSON.parse(readFileSync(join(directory, file), "utf8"));
+      if (await executor.isExecutor(state)) {
+        if (state.phase !== "restored") await restore(state);
+        await executor.shutdownExecutor(state.old);
+        continue;
+      }
       // Rollback data outlives a running old agent: only a healthy replacement retires it.
       if (["prepared", "restored"].includes(state.phase) && (await isLoaded(state.old.label))) continue;
       try {
@@ -363,6 +489,7 @@ export async function install(
           throw new Error("pending migration");
         if (state.label === LABEL) await race(waitForHealthy(client, clock, state.target));
       } catch (error) {
+        if (error instanceof ServiceInspectionError) throw error;
         await restore(state)
           .then(() => recovered.push(`${state.old.label}: ${String(error)}`))
           .catch((e) => failures.push(`Restoration failed for ${state.old.label}: ${e}`));
@@ -391,11 +518,15 @@ export async function install(
   const tunnel = opts.tunnel ? tunnelConfig(port, opts.publicUrl ?? null) : null;
   if (opts.tunnel && !tunnel) console.warn("skipping tunnel: no cloudflared credentials or no public_url");
   const units = installationUnits(opts, tunnel);
-  for (const [label, content] of units) {
+  for (const [label] of units) {
     const path = join(agents, `${label}.plist`);
     const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
     if (existsSync(path) && !samePath(old?.path, path)) throw new Error(`unrelated agent: ${path}`);
     if (old?.label !== label && (await isLoaded(label))) throw new Error(`unrecognized agent: ${label}`);
+  }
+  for (const [label, content] of units) {
+    const path = join(agents, `${label}.plist`);
+    const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
     const state = old
       ? { old, label, path, target, phase: "prepared", backup: readFileSync(old.path).toString("base64") }
       : null;
@@ -411,14 +542,17 @@ export async function install(
         await race(waitForDrain(client, clock, DEFAULT_MAX_WAIT_MS, false, console.log));
       }
       if (state) save(Object.assign(state, { phase: "stopping" }));
-      if (old) await race(stop(old.label));
+      if (old) await race(label === EXECUTOR_LABEL ? executor.shutdownExecutor(old) : stop(old.label));
     } catch (error) {
+      const inspectionFailed = error instanceof ServiceInspectionError;
       restoring = true;
       try {
-        if (state && !(await isLoaded(state.old.label))) await restore(state);
-        if (drainAttempted && old && (await isLoaded(old.label))) await requestAdmin(client, clock, "resume");
+        if (!inspectionFailed && state && !(await isLoaded(state.old.label))) await restore(state);
+        if (drainAttempted && old && (inspectionFailed || (await isLoaded(old.label))))
+          await requestAdmin(client, clock, "resume");
       } catch (resume) {
-        throw new Error(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });
+        const Failure = inspectionFailed ? ServiceInspectionError : Error;
+        throw new Failure(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });
       }
       throw error;
     }
@@ -426,15 +560,18 @@ export async function install(
       if (state) save({ ...state, phase: "replacing" });
       if (old) unlinkSync(old.path);
       writeFileSync(path, content);
-      await race(start(path));
+      if (label === EXECUTOR_LABEL) await race(executor.reconcileExecutor(true));
+      else await race(start(path));
       if (label === LABEL) await race(waitForHealthy(client, clock, target));
-      if (state) clear(state);
+      if (state && label !== EXECUTOR_LABEL) clear(state);
     } catch (error) {
+      if (error instanceof ServiceInspectionError) throw error;
       try {
         restoring = true;
         if (state) await restore(state);
         else {
-          await stop(label);
+          if (label === EXECUTOR_LABEL) await recoveryExecutor.reconcileExecutor(false);
+          else await stop(label);
           if (existsSync(path)) unlinkSync(path);
         }
       } catch (restore) {
@@ -444,11 +581,21 @@ export async function install(
     }
     console.log(`installed ${label}`);
   }
+  if (!opts.executor) {
+    const unit = await executor.unit();
+    if (unit) {
+      await executor.shutdownExecutor(unit);
+      unlinkSync(unit.path);
+    }
+  }
+  await executor.finish();
 }
 
-export async function uninstall(): Promise<void> {
-  for (const { label, path } of await installedUnits()) {
-    if (await loaded(label)) await launchctl(["bootout", `gui/${uid}/${label}`], false);
+export async function uninstall(opts: ServiceOptions = {}): Promise<void> {
+  const command = opts.command ?? sh;
+  for (const { label, path } of await installedUnits(opts)) {
+    if (await serviceLoaded(label, command))
+      await command(["launchctl", "bootout", `gui/${uid}/${label}`], { cwd: home });
     unlinkSync(path);
     console.log(`removed ${label}`);
   }
@@ -614,7 +761,7 @@ export async function restart(port: number, opts: ServiceOptions = {}): Promise<
           }
         }
       }
-      if (restartAttempted && !interruption()) await status(port, opts);
+      if (restartAttempted && !interruption()) await status(port, opts, false);
       throw error;
     }
   } finally {
@@ -676,6 +823,7 @@ export async function deploy(
   ref = "origin/main",
   smoke = false,
   opts: {
+    executor?: boolean;
     leaseClient?: LeaseClient;
     lifecycle?: (run: typeof sh, race: <T>(work: Promise<T>) => Promise<T>) => Promise<void>;
     agentsDir?: string;
@@ -701,7 +849,10 @@ export async function deploy(
   const log = opts.log ?? console.log;
   const { run, race, interruption, signal, release } = serviceControl(opts, "deploy");
   const lease = { client: opts.leaseClient ?? localLeaseClient(port), signal };
+  const executor = executorControl({ ...opts, command: run });
+  let intent: ExecutorIntent | undefined;
   let previous = "";
+  let target = "";
   let drainAttempted = false;
   let restartAttempted = false;
   let gatesPassed = false;
@@ -714,8 +865,9 @@ export async function deploy(
     log(`daemon before: ${running.sha}`);
     previous = running.sha === "unknown" ? "" : running.sha;
     const checkout = (await run(["git", "rev-parse", "HEAD"], { cwd: dir })).stdout.trim();
+    target = checkout;
     await run(["git", "fetch", "origin", "--prune"], { cwd: dir, timeoutMs: 300_000 });
-    const target = (await run(["git", "rev-parse", `${ref}^{commit}`], { cwd: dir })).stdout.trim();
+    target = (await run(["git", "rev-parse", `${ref}^{commit}`], { cwd: dir })).stdout.trim();
     if (running.sha === "unknown" && checkout === target) {
       const label = (await installedUnits(opts)).find((unit) => unit.kind === "daemon")?.label ?? LABEL;
       throw new Error(
@@ -724,6 +876,11 @@ export async function deploy(
     }
     // Legacy upgrades can use the checkout for rollback, but never as proof of completion.
     previous ||= checkout;
+    const unit = await executor.unit();
+    if (unit) {
+      intent = { ...unit, phase: "deploying", previous, target };
+      executor.save(intent);
+    }
     if (target === previous) {
       if (checkout !== target) {
         await run(["git", "checkout", "-q", "--detach", target], { cwd: dir });
@@ -736,6 +893,7 @@ export async function deploy(
       }
       if (smoke) await gates(run, dir, smoke, lease);
       log(`daemon after: ${running.sha}`);
+      await executor.finish();
       log(`already deployed ${target}`);
       return;
     }
@@ -765,10 +923,26 @@ export async function deploy(
     await race(restart());
     const replacement = await race(waitForHealthy(client, clock, target, log));
     log(`daemon after: ${replacement.sha}`);
+    await executor.finish();
     log(`deployed ${previous.slice(0, 8)} → ${target.slice(0, 8)}`);
   } catch (error) {
     if (interruption() && restartAttempted) throw interruption();
     if (!previous) throw error;
+    if (!intent) {
+      const unit = await executorControl(opts).unit();
+      if (unit) intent = { ...unit, phase: "rollback", previous, target };
+    }
+    if (intent) {
+      executor.save({ ...intent, phase: "rollback" });
+      try {
+        await executorControl(opts).shutdownExecutor(intent);
+      } catch (shutdown) {
+        throw new Error(
+          `Rollback of ${intent.label} from ${intent.target} to ${intent.previous} stopped: ${shutdown}`,
+          { cause: error },
+        );
+      }
+    }
     const cleanupErrors: string[] = [];
     const cleanup = async (name: string, action: () => Promise<unknown>) => {
       try {
@@ -799,16 +973,16 @@ export async function deploy(
   }
 }
 
-export async function status(port: number, opts: ServiceOptions = {}): Promise<void> {
+export async function status(port: number, opts: ServiceOptions = {}, includeExecutor = true): Promise<void> {
   const command = opts.command ?? sh,
     log = opts.log ?? console.log;
   const dir = opts.releaseDir ?? appDir;
-  for (const { label } of await installedUnits(opts)) {
-    const result = await command(["launchctl", "print", `gui/${uid}/${label}`], {
-      cwd: home,
-      allowFail: true,
-    });
-    log(`${label}: ${result.exitCode === 0 ? "loaded" : "not loaded"}`);
+  for (const { label, kind } of await installedUnits(opts)) {
+    if (!includeExecutor && kind === "executor") continue;
+    const result = await inspectService(label, command);
+    log(
+      `${label}: ${result.state === "unknown" ? `unknown: ${result.reason}` : result.state === "loaded" ? "loaded" : "not loaded"}`,
+    );
   }
   if (existsSync(join(dir, ".git"))) {
     // This release repository is written only by the user/deployer, never by an agent.

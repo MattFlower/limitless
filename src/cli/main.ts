@@ -660,8 +660,14 @@ async function main(): Promise<void> {
       const port = resolveClientPort();
       if (rest[0] === "install") {
         const tunnel = values.tunnel === true;
-        const publicUrl = tunnel ? (await import("../config.ts")).loadConfig().publicUrl : null;
-        return svc.install(port, { tunnel, mtplx: values.mtplx === true, publicUrl });
+        const cfg = (await import("../config.ts")).loadConfig();
+        const publicUrl = tunnel ? cfg.publicUrl : null;
+        return svc.install(port, {
+          tunnel,
+          mtplx: values.mtplx === true,
+          publicUrl,
+          executor: cfg.executorEnabled,
+        });
       }
       if (rest[0] === "uninstall") return svc.uninstall();
       return svc.status(port);
@@ -680,6 +686,7 @@ async function main(): Promise<void> {
         throw new Error("usage: limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]");
       return svc.deploy(resolveClientPort(), rest[0], values.smoke === true, {
         maxWaitMs,
+        executor: (await import("../config.ts")).loadConfig().executorEnabled,
         now: values.now === true,
       });
     }
