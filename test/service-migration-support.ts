@@ -27,6 +27,7 @@ const executorRecovery = requestedScenario.startsWith("executor-recovery");
 let scenario = sequential || executorRecovery ? "bootstrap" : requestedScenario;
 const kind = process.argv[3] ?? "daemon";
 const packaged = requestedScenario.startsWith("packaged-");
+const destinationPreflight = requestedScenario.endsWith("-inspection-collision");
 const programCase = requestedScenario.split("-program-")[1];
 const agents = packaged ? join(home, "isolated-agents") : join(home, "Library", "LaunchAgents");
 const realApp = join(home, "app & release");
@@ -171,6 +172,7 @@ async function compete() {
 const commands: string[][] = [];
 let inspectionInjected = false;
 let replacementFailed = false;
+let drainCompleted = false;
 const command: typeof sh = async (argv) => {
   commands.push([...argv]);
   const ok = (stdout = "", exitCode = 0, stderr = "") => ({ stdout, exitCode, stderr });
@@ -188,7 +190,10 @@ const command: typeof sh = async (argv) => {
     const inspectionCase = process.env.SERVICE_TEST_INSPECTION;
     if (
       inspectionCase &&
-      ((scenario === "inspection-collision" && label === neutral && !calls.includes(`bootout ${oldLabel}`)) ||
+      (((scenario === "inspection-collision" || destinationPreflight) &&
+        label === neutral &&
+        !calls.includes(`bootout ${oldLabel}`)) ||
+        (scenario.startsWith("inspection-post-drain") && label === oldLabel && drainCompleted) ||
         (["inspection-status", "inspection-uninstall"].includes(scenario) && label === oldLabel) ||
         (scenario === "inspection-old" && label === oldLabel && !inspectionInjected) ||
         (scenario === "inspection-reconcile" && label === neutral && !existsSync(oldPath)) ||
@@ -304,7 +309,8 @@ let failHealth = false;
 const client: DeployClient = {
   async admin(action) {
     calls.push(action);
-    if (action === "resume" && scenario === "resume-failure") throw new Error("resume failed");
+    if (action === "resume" && ["resume-failure", "inspection-post-drain-resume-failure"].includes(scenario))
+      throw new Error("resume failed");
     if (action === "drain" && (scenario.endsWith("signal-drain") || scenario === "signal-journal")) {
       writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
       const interrupted = new Promise<void>((resolve) => {
@@ -328,6 +334,7 @@ const client: DeployClient = {
     return { draining, active: [] };
   },
   async health() {
+    if (draining && time >= 5000) drainCompleted = true;
     if (packaged) {
       const sha = !draining && (failHealth || packagedHealthReads++ === 0) ? "b".repeat(40) : "a".repeat(40);
       calls.push(`health ${draining ? "draining" : sha}`);
@@ -375,6 +382,12 @@ let discoveredUnits: { label: string; path: string; kind: string }[] = [];
 let original = "";
 let stable = "";
 let executable = "";
+let errorKind = "";
+let filesBefore: Record<string, string> = {};
+let loadedBefore: string[] = [];
+let disabledBefore: string[] = [];
+const agentFiles = () =>
+  Object.fromEntries(readdirSync(agents).map((name) => [name, readFileSync(join(agents, name), "utf8")]));
 try {
   if (programCase) {
     executable = join(home, "bin", kind === "tunnel" ? "cloudflared" : packaged ? "limitless" : "bun");
@@ -425,6 +438,33 @@ try {
     discoveredUnits = await service.installedUnits(options);
     discovered = discoveredUnits.map((unit) => unit.kind);
     if (programCase === "collision") await service.install(0, options);
+  } else if (destinationPreflight) {
+    executable = join(home, "bin", "limitless");
+    const options = {
+      command,
+      client,
+      clock,
+      agentsDir: agents,
+      executor: true,
+      execPath: executable,
+      release: packaged
+        ? { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version }
+        : { kind: "source" as const, root: app, version: "1.0", bun: Bun.version },
+    };
+    for (const [label, content] of service.installationUnits(options)) {
+      const unitKind = label.split(".").at(-1);
+      const oldLabel = `arbitrary.installed.${unitKind}`;
+      writeFileSync(join(agents, `${unitKind}-original.plist`), content.replaceAll(label, oldLabel));
+      loaded.add(oldLabel);
+    }
+    disabled.add(oldLabel);
+    const inspectionCase = process.env.SERVICE_TEST_INSPECTION;
+    if (inspectionCase === "path") writeFileSync(join(agents, `${neutral}.plist`), unrelated);
+    if (inspectionCase === "loaded") loaded.add(neutral);
+    filesBefore = agentFiles();
+    loadedBefore = [...loaded];
+    disabledBefore = [...disabled];
+    await service.install(0, options);
   } else if (packaged) {
     const prefix = join(home, "brew");
     const version = join(prefix, "Cellar", "limitless", "1.0");
@@ -548,12 +588,17 @@ try {
   }
 } catch (caught) {
   error = String(caught);
+  errorKind = caught instanceof Error ? caught.constructor.name : "";
 }
 clearTimeout(signalTimer);
 writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
 console.log(
   JSON.stringify({
     error,
+    errorKind,
+    filesBefore,
+    loadedBefore,
+    disabledBefore,
     firstCalls,
     recoveries,
     discovered,
@@ -587,9 +632,7 @@ console.log(
     draining,
     old,
     time,
-    files: Object.fromEntries(
-      readdirSync(agents).map((name) => [name, readFileSync(join(agents, name), "utf8")]),
-    ),
+    files: agentFiles(),
     unrelated,
   }),
 );

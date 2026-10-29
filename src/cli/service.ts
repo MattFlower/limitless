@@ -518,11 +518,15 @@ export async function install(
   const tunnel = opts.tunnel ? tunnelConfig(port, opts.publicUrl ?? null) : null;
   if (opts.tunnel && !tunnel) console.warn("skipping tunnel: no cloudflared credentials or no public_url");
   const units = installationUnits(opts, tunnel);
-  for (const [label, content] of units) {
+  for (const [label] of units) {
     const path = join(agents, `${label}.plist`);
     const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
     if (existsSync(path) && !samePath(old?.path, path)) throw new Error(`unrelated agent: ${path}`);
     if (old?.label !== label && (await isLoaded(label))) throw new Error(`unrecognized agent: ${label}`);
+  }
+  for (const [label, content] of units) {
+    const path = join(agents, `${label}.plist`);
+    const old = previous.find((unit) => `dev.limitless.${unit.kind}` === label);
     const state = old
       ? { old, label, path, target, phase: "prepared", backup: readFileSync(old.path).toString("base64") }
       : null;
@@ -540,13 +544,15 @@ export async function install(
       if (state) save(Object.assign(state, { phase: "stopping" }));
       if (old) await race(label === EXECUTOR_LABEL ? executor.shutdownExecutor(old) : stop(old.label));
     } catch (error) {
-      if (error instanceof ServiceInspectionError) throw error;
+      const inspectionFailed = error instanceof ServiceInspectionError;
       restoring = true;
       try {
-        if (state && !(await isLoaded(state.old.label))) await restore(state);
-        if (drainAttempted && old && (await isLoaded(old.label))) await requestAdmin(client, clock, "resume");
+        if (!inspectionFailed && state && !(await isLoaded(state.old.label))) await restore(state);
+        if (drainAttempted && old && (inspectionFailed || (await isLoaded(old.label))))
+          await requestAdmin(client, clock, "resume");
       } catch (resume) {
-        throw new Error(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });
+        const Failure = inspectionFailed ? ServiceInspectionError : Error;
+        throw new Failure(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });
       }
       throw error;
     }

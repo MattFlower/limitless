@@ -129,6 +129,10 @@ type MigrationResult = {
     }
   >;
   error: string;
+  errorKind: string;
+  filesBefore: Record<string, string>;
+  loadedBefore: string[];
+  disabledBefore: string[];
   backupBeforeStop: boolean;
   contenderError: string;
   contenderCalls: string[];
@@ -411,6 +415,32 @@ test("a failed resume reports both the original failure and the cleanup failure"
   expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
 });
 
+for (const resumeFails of [false, true])
+  test(`an unknown stop inspection after drain resumes once (resume fails: ${resumeFails})`, async () => {
+    const { result: r } = await migration(
+      `inspection-post-drain${resumeFails ? "-resume-failure" : ""}`,
+      "daemon",
+      undefined,
+      "permission",
+    );
+    expect(r.error).toContain("launchctl print");
+    expect(r.error).toContain("Operation not permitted");
+    expect(r.errorKind).toBe("ServiceInspectionError");
+    if (resumeFails) expect(r.error).toContain("Resume scheduler failed: Error: resume failed");
+    expect(r.calls.filter((c) => c === "resume")).toHaveLength(1);
+    expect(r.calls[0]).toBe("drain");
+    expect(r.calls).toContain("health draining");
+    expect(r.calls.at(-1)).toBe("resume");
+    expect(r.draining).toBe(resumeFails);
+    expect(r.files["daemon-original.plist"]).toBe(r.old);
+    expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
+    expect(r.loaded).toEqual(["arbitrary.installed.daemon", "other.program"]);
+    expect(r.commands.filter((c) => c[0] === "launchctl" && c[1] !== "print")).toEqual([]);
+    expect(
+      r.commands.filter((c) => c[1] === "print" && c[2]?.endsWith("/arbitrary.installed.daemon")),
+    ).toHaveLength(2);
+  });
+
 test("rollback reports both the replacement and restoration failures", async () => {
   const { result: r } = await migration("restore");
   expect(r.error).toContain("replacement bootstrap failed");
@@ -469,25 +499,35 @@ test("status and uninstall recognize arbitrary installed labels", async () => {
   expect(r.files["unrelated.plist"]).toBe(r.unrelated);
 });
 
-for (const scenario of inspectionCases) {
-  test(`executor destination collision inspection: ${scenario}`, async () => {
-    const { result: r } = await migration("inspection-collision", "executor", undefined, scenario);
-    if (scenario === "absent") {
-      expect(r.error).toBe("");
-      expect(r.files["executor-original.plist"]).toBeUndefined();
-      expect(r.loaded).toContain("dev.limitless.executor");
-    } else {
-      expect(r.error).toContain(
-        scenario === "loaded" ? "unrecognized agent: dev.limitless.executor" : "launchctl print",
-      );
-      expect(r.files["executor-original.plist"]).toBe(r.old);
-      expect(r.files["dev.limitless.executor.plist"]).toBeUndefined();
-      expect(r.loaded).toContain("arbitrary.installed.executor");
-      expect(r.calls.some((c) => c.includes("executor"))).toBe(false);
-      expect(r.journals).toEqual([]);
-    }
-  });
+for (const mode of ["source", "packaged"])
+  for (const scenario of [...inspectionCases, "path"]) {
+    test(`${mode} executor destination collision preflights every unit: ${scenario}`, async () => {
+      const { result: r } = await migration(`${mode}-inspection-collision`, "executor", undefined, scenario);
+      if (scenario === "absent") {
+        expect(r.error).toBe("");
+        expect(r.files["executor-original.plist"]).toBeUndefined();
+        expect(r.loaded).toContain("dev.limitless.executor");
+        expect(r.loaded).toContain("dev.limitless.daemon");
+      } else {
+        expect(r.error).toContain(
+          scenario === "path"
+            ? "unrelated agent:"
+            : scenario === "loaded"
+              ? "unrecognized agent: dev.limitless.executor"
+              : "launchctl print",
+        );
+        expect(r.files).toEqual(r.filesBefore);
+        expect(r.loaded).toEqual(r.loadedBefore);
+        expect(r.disabled).toEqual(r.disabledBefore);
+        expect(r.calls).toEqual([]);
+        expect(r.commands.filter((c) => c[0] === "launchctl" && c[1] !== "print")).toEqual([]);
+        expect(r.draining).toBe(false);
+        expect(r.journals).toEqual([]);
+      }
+    });
+  }
 
+for (const scenario of inspectionCases) {
   if (!["loaded", "absent"].includes(scenario))
     test(`executor old-label inspection preserves the plist: ${scenario}`, async () => {
       const { result: r } = await migration("inspection-old", "executor", undefined, scenario);
