@@ -36,6 +36,7 @@ try {
     comments: { nodes: [], totalCount: 0 },
     labels: { nodes: [{ name: "priority:1" }], totalCount: 1 },
     subIssuesSummary: { total: 0 },
+    subIssues: { totalCount: 0, nodes: [] },
     blockedBy: { nodes: [], totalCount: 0 },
     closedByPullRequestsReferences: { nodes: [], totalCount: 0 },
     timelineItems: {

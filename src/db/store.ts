@@ -13,6 +13,7 @@ import type {
   ChatProposalFields,
   CiFailure,
   CreateRunRequest,
+  EpicAttention,
   EvalRun,
   EvalTrial,
   EventType,
@@ -1317,6 +1318,48 @@ export class Store {
           .get(repo.toLowerCase()) as { github_at: string } | null
       )?.github_at ?? null
     );
+  }
+
+  /** Reconcile only a fully fetched repository snapshot; undefined observations preserve prior state. */
+  reconcileEpicAttention(
+    repo: string,
+    observations: ReadonlyMap<number, EpicAttention | null | undefined>,
+  ): void {
+    repo = repo.toLowerCase();
+    this.transaction(() => {
+      const saved = this.db
+        .query<{ epic: number; state: string }, [string]>(
+          "SELECT epic, state FROM queue_epic_attention WHERE repo = ?",
+        )
+        .all(repo);
+      const previous = new Map(saved.map((r) => [r.epic, r.state]));
+      for (const row of saved) {
+        if (!observations.has(row.epic) || observations.get(row.epic) === null)
+          this.db.query("DELETE FROM queue_epic_attention WHERE repo = ? AND epic = ?").run(repo, row.epic);
+      }
+      for (const [epic, attention] of observations) {
+        if (!attention || previous.get(epic) === attention.state) continue;
+        this.db
+          .query("INSERT OR REPLACE INTO queue_epic_attention VALUES (?, ?, ?)")
+          .run(repo, epic, attention.state);
+        const data = {
+          repo: redactCredentials(repo),
+          epic,
+          state: attention.state,
+          items: attention.items.map(redactCredentials),
+        };
+        this.addFeedItems([
+          {
+            kind: "queue.epic_attention",
+            runId: null,
+            repo: data.repo,
+            summary: `Epic #${epic}: ${attention.state}`,
+            data,
+            key: crypto.randomUUID(),
+          },
+        ]);
+      }
+    });
   }
 
   issueClaim(repo: string, number: number): Run | null {
