@@ -87,6 +87,15 @@ function tipRecord(gh: GitHub) {
 test("store canonicalizes keys and preserves ownership until explicitly forgotten", () => {
   const f = fixture();
   const before = f.confirmed();
+  expect(f.store.heldLeaseRows()).toEqual([
+    {
+      repo,
+      ref,
+      runId: held.run,
+      confirmed: { generation: 1, tip: before.sha, state: "held" },
+      intent: null,
+    },
+  ]);
   expect(f.store.leaseRow("Owner/Project", ref)).toEqual(f.store.leaseRow(repo, ref));
   expect(f.store.db.query("SELECT repo FROM claim_leases").get()).toEqual({ repo });
   expect(() => f.store.forgetLease(repo, ref)).toThrow();
@@ -97,6 +106,7 @@ test("store canonicalizes keys and preserves ownership until explicitly forgotte
   expect(() => f.store.beginLeaseIntent(repo, ref, "run-b", intent)).toThrow();
   expect(() => f.store.forgetLease(repo, ref)).toThrow();
   f.store.confirmLease("Owner/Project", ref, { generation: 1, tip: before.sha, state: "released" }, false);
+  expect(f.store.heldLeaseRows()).toEqual([]);
   expect(f.store.leaseRow(repo, ref)?.intent).not.toBeNull();
   expect(() => f.store.forgetLease(repo, ref)).toThrow();
   f.store.dropLeaseIntent("Owner/Project", ref);
@@ -108,6 +118,7 @@ test("store canonicalizes keys and preserves ownership until explicitly forgotte
   expect(() => f.store.beginLeaseIntent(repo, ref, "run-b", intent)).toThrow();
   f.store.forgetLease("Owner/Project", ref);
   f.store.beginLeaseIntent(repo, ref, "run-b", intent);
+  expect(f.store.heldLeaseRows()).toEqual([]);
   expect(f.store.leaseRow(repo, ref)).toMatchObject({ runId: "run-b", confirmed: null, intent });
   expect(() => f.store.forgetLease(repo, ref)).toThrow();
   f.store.dropLeaseIntent(repo, ref);

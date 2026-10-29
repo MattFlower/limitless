@@ -528,6 +528,7 @@ export class Store {
   readonly markLeaseLost = this.leases.markLeaseLost;
   readonly forgetLease = this.leases.forgetLease;
   readonly leaseRowsWithIntent = this.leases.leaseRowsWithIntent;
+  readonly heldLeaseRows = this.leases.heldLeaseRows;
   readonly observations = new FailureObservations(this);
   failureObservations(filter: ObservationFilter = {}) {
     return this.observations.read(filter);
