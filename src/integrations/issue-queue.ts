@@ -68,53 +68,6 @@ const blockers = (body: string) =>
     .filter((line) => /^[\t ]*(?:(?:[-*+]|\d+[.)])[\t ]+)?blocked by\b:?/i.test(line))
     .flatMap((line) => [...line.matchAll(/#([1-9][0-9]*)\b/g)].map((m) => Number(m[1])));
 
-/** Parses a CommonMark inline link `[label](destination "title")` starting at `start`. */
-function inlineLink(text: string, start: number): { destination: string; end: number } | undefined {
-  let i = start + 1;
-  for (let depth = 1; depth; i++) {
-    if (i >= text.length) return undefined;
-    if (text[i] === "\\") i++;
-    else if (text[i] === "[") depth++;
-    else if (text[i] === "]") depth--;
-  }
-  if (text[i++] !== "(") return undefined;
-  const space = () => {
-    const from = i;
-    while (text[i] === " " || text[i] === "\t") i++;
-    return i > from;
-  };
-  space();
-  let raw = "";
-  if (text[i] === "<") {
-    for (i++; text[i] !== ">"; i++) {
-      if (i >= text.length || text[i] === "<") return undefined;
-      if (text[i] === "\\") raw += text[i++];
-      raw += text.charAt(i);
-    }
-    i++;
-  } else {
-    for (let depth = 0; text.charCodeAt(i) > 32; i++) {
-      if (text[i] === "(") depth++;
-      else if (text[i] === ")" && !depth--) break;
-      if (text[i] === "\\") raw += text[i++];
-      raw += text.charAt(i);
-    }
-  }
-  const separated = space();
-  const close = { '"': '"', "'": "'", "(": ")" }[text[i] ?? ""];
-  if (close) {
-    if (!separated) return undefined;
-    for (i++; text[i] !== close; i++) {
-      if (i >= text.length || (close === ")" && text[i] === "(")) return undefined;
-      if (text[i] === "\\") i++;
-    }
-    i++;
-    space();
-  }
-  if (text[i] !== ")") return undefined;
-  return { destination: raw.replace(/\\([!-/:-@[-`{-~])/g, "$1"), end: i + 1 };
-}
-
 /** Undefined means incomplete evidence: preserve the saved observation. */
 export function epicAttention(
   repo: string,
@@ -157,29 +110,11 @@ export function epicAttention(
       if (slices && text !== undefined) lines.push({ line, text });
     }
   }
-  const refs = (text: string) => {
-    const keys: string[] = [];
-    // Consume links before bare references: neither labels nor non-issue targets name children.
-    let plain = "";
-    for (let i = 0; i < text.length; ) {
-      const link = text[i] === "[" ? inlineLink(text, i) : undefined;
-      if (!link) {
-        const step = text[i] === "\\" ? 2 : 1;
-        plain += text.slice(i, i + step);
-        i += step;
-        continue;
-      }
-      const issue = link.destination.match(
-        /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/issues\/([1-9][0-9]*)\/?(?:[?#]\S*)?$/i,
-      );
-      if (issue?.[1] && issue[2]) keys.push(issueKey(issue[1], Number(issue[2])));
-      plain += " ";
-      i = link.end;
-    }
-    keys.push(...[...plain.matchAll(/(?<![\w/])#([1-9][0-9]*)\b/g)].map((m) => issueKey(repo, Number(m[1]))));
-    return keys.filter((k) => childKeys.has(k));
+  const reference = (text: string) => {
+    const match = text.match(/^(?:Acceptance:\s+)?(?:([\w.-]+\/[\w.-]+))?#([1-9][0-9]*)(?=$|[\s\p{P}])/u);
+    return match?.[2] ? issueKey(match[1] ?? repo, Number(match[2])) : undefined;
   };
-  const unfiled = lines.filter((l) => !refs(l.text).length).map((l) => l.line);
+  const unfiled = lines.filter((l) => !childKeys.has(reference(l.text) ?? "")).map((l) => l.line);
   if (unfiled.length) return { state: "unfiled", items: unfiled };
   const open = children.nodes.filter((c) => c.state === "OPEN");
   if (!open.length) return null;
@@ -207,7 +142,7 @@ export function epicAttention(
   if (!candidate || !record) return undefined;
   const acceptance = lines.filter((l) => /^Acceptance:/.test(l.text));
   if (acceptance.length) {
-    const references = new Set(acceptance.flatMap((l) => refs(l.text)));
+    const references = new Set(acceptance.map((l) => reference(l.text)));
     return acceptance.length === 1 && references.size === 1 && references.has(key(candidate))
       ? { state: "ready_for_acceptance", items: [`#${candidate.number}`] }
       : null;

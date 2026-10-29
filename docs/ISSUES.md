@@ -155,16 +155,19 @@ questions and approvals remain later slices.
 ## Epic attention
 
 Keep one list item per planned slice under an exact `## Slices` heading. Once filed,
-reference its same-repository GitHub child with `#N`; unrelated issues do not count.
-Markdown links name children by their absolute HTTPS GitHub issue URL destination,
-including children in other repositories; link labels do not count as references.
-Relative links and non-issue destinations provide no reference.
-Mark the acceptance child with an item beginning `Acceptance:`:
+start its text with `#N` for a child in the epic's repository, or `owner/repo#N` for a
+child in a named repository (compared case-insensitively). The positive issue number
+must be followed by whitespace, punctuation, or the end of the line; `#3abc` does not
+count. Only that leading reference identifies the slice; later references are ignored,
+so `#99 Build #123` cannot name child #123. Unrelated issues do not count.
+Mark the acceptance child with an `Acceptance:` prefix followed by whitespace and
+the leading reference. Links, autolinks, bare URLs, code spans, escaped references,
+and references after descriptive text name no slice.
 
 ```markdown
 ## Slices
-- Build: #123
-- Documentation: #124
+- #123 Build
+- owner/repo#124 Documentation
 - Acceptance: #125
 ```
 

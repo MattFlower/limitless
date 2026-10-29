@@ -3591,7 +3591,7 @@ function attentionEpic() {
   const open = issue(3);
   // Keep priority visible to attention while preventing automatic admission in poll tests.
   open.author = { login: "stranger" };
-  const epic = { ...issue(1), body: "## Slices\n- Build: #2\n- Acceptance: #3" };
+  const epic = { ...issue(1), body: "## Slices\n- #2 Build\n- Acceptance: #3" };
   epic.subIssuesSummary.total = 2;
   epic.subIssues = { totalCount: 2, nodes: [closed, open] };
   return { epic, open, closed };
@@ -3670,7 +3670,7 @@ test("bare slice references cannot name a foreign child or acceptance candidate"
   closed.repository.nameWithOwner = "other/repo";
   expect(
     epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
-  ).toEqual({ state: "unfiled", items: ["- Build: #2"] });
+  ).toEqual({ state: "unfiled", items: ["- #2 Build"] });
 
   closed.repository.nameWithOwner = "owner/repo";
   open.repository.nameWithOwner = "other/repo";
@@ -3682,57 +3682,74 @@ test("bare slice references cannot name a foreign child or acceptance candidate"
 });
 
 test.each([
-  "Acceptance: [#3](https://github.com/other/repo/issues/3)",
-  "Build: [#3](https://github.com/other/repo/issues/3)",
-  "Acceptance: [Slice [#3]](https://github.com/other/repo/issues/3)",
-  "Acceptance: [#3]()",
-  "Acceptance: [#3](../issues/3)",
-  "Acceptance: [#3](#3)",
-  "Acceptance: [#3](https://example.com/#3)",
-  "Acceptance: [#3](https://github.com/owner/repo/pull/3)",
-  "Acceptance: [#3](http://github.com/owner/repo/issues/3)",
-  "Acceptance: [#3](https://github.com/owner/repo/issues/0)",
-  "Acceptance: [#3](https://github.com/owner/repo/issues/30)",
-  "Acceptance: [#3](https://github.com/owner/repo/issues/3/extra)",
-  'Acceptance: [#3](https://github.com/other/repo/issues/3 "Work (phase (one))")',
-  "Acceptance: [#3](https://github.com/other/repo/issues/3 'Work (phase) \\' (one)')",
-  "Acceptance: [#3](<https://github.com/other/repo/issues/3> (Work \\(phase\\)))",
-  "Acceptance: [#3](https://example.com/a_(b_(c)))",
-])("slice link labels cannot impersonate a child: %s", (text) => {
+  "#3",
+  "#3 Build",
+  "#3\tBuild",
+  "#3: Build",
+  "#3, Build",
+  "#3) Build",
+  "#3—Build",
+  "owner/repo#3",
+  "OWNER/REPO#3 Build",
+  "Acceptance: #3",
+  "Acceptance: \tOWNER/Repo#3 Build",
+  "Acceptance: #3 #2",
+  "Acceptance: #3 other/repo#3",
+])("leading slice reference identifies a child: %s", (text) => {
   const { epic, open } = attentionEpic();
   epic.body = `## Slices\n- ${text}`;
+  open.blockedBy = {
+    totalCount: 1,
+    nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+  };
   expect(
-    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
-  ).toEqual({ state: "unfiled", items: [`- ${text}`] });
+    epicAttention("Owner/Repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toEqual({ state: "ready_for_acceptance", items: ["#3"] });
 });
 
 test.each([
-  ["[#99](https://github.com/owner/repo/issues/3)", "ready_for_acceptance"],
-  ['[#2](<https://github.com/OWNER/REPO/issues/3> "Slice #99")', "ready_for_acceptance"],
-  ["[#99](https://github.com/owner/repo/issues/3#issuecomment-1)", "ready_for_acceptance"],
-  ["[#99](https://example.com/#2) and #3", "ready_for_acceptance"],
-  ["#3 and [#2](https://example.com/#2)", "ready_for_acceptance"],
-  ['[#99](https://github.com/owner/repo/issues/3 "Work (phase (one)) #2")', "ready_for_acceptance"],
-  ["[#3](https://github.com/owner/repo/issues/2)", null],
-  ["[#99](https://github.com/owner/repo/issues/2) and #3", null],
-] as const)("slice destinations and independent plain text identify children: %s", (reference, state) => {
+  "[#3](https://github.com/owner/repo/issues/3)",
+  '[#3][target]\n\n[target]: https://github.com/other/repo/issues/3 "Slice"',
+  "[#3][]\n\n[#3]: https://github.com/owner/repo/issues/3",
+  "[#3]\n\n[#3]: https://github.com/owner/repo/issues/3",
+  "<https://github.com/owner/repo/issues/3>",
+  "<https://example.com/?ref=#3>",
+  "https://github.com/owner/repo/issues/3",
+  "`#3`",
+  "\\#3",
+  "Q2 claims (#3)",
+  "#3abc",
+  "#30 #3",
+  "other/repo#3 #3",
+  "Acceptance:#3",
+])("non-leading or unrelated slice references remain unfiled: %s", (text) => {
   const { epic, open } = attentionEpic();
-  epic.body = `## Slices\n- Acceptance: ${reference}`;
-  expect(
-    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
-  ).toEqual(state ? { state, items: ["#3"] } : null);
+  // Even complete native blockers cannot override an unfiled Acceptance item.
+  open.blockedBy = {
+    totalCount: 1,
+    nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
+  };
+  for (const prefix of ["", "Acceptance: "]) {
+    const line = `  - ${prefix}${text.split("\n")[0]}`;
+    epic.body = `## Slices\n  - ${prefix}${text}`;
+    expect(
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+    ).toEqual({ state: "unfiled", items: [line] });
+  }
 });
 
-test("slice destinations identify foreign children with the same number as local children", () => {
+test("leading references distinguish same-number children across repositories", () => {
   const { epic, open, closed } = attentionEpic();
   open.repository.nameWithOwner = "other/repo";
   open.number = closed.number;
   const check = () =>
     epicAttention("owner/repo", epic, ["owner"], new Map([["other/repo#2", open]]), () => false);
-  epic.body = "## Slices\n- Acceptance: [#99](https://github.com/OTHER/REPO/issues/2)";
+  epic.body = "## Slices\n- Acceptance: OTHER/REPO#2";
   expect(check()).toEqual({ state: "ready_for_acceptance", items: ["#2"] });
-  epic.body = "## Slices\n- Acceptance: [#99](https://github.com/owner/repo/issues/2)";
-  expect(check()).toBeNull();
+  for (const reference of ["#2", "owner/repo#2", "#2 other/repo#2"]) {
+    epic.body = `## Slices\n- Acceptance: ${reference}`;
+    expect(check()).toBeNull();
+  }
 });
 
 test("queue-produced epic and existing feed items render in the CLI and preserve acknowledgement cursors", async () => {
@@ -3845,7 +3862,7 @@ test.each([
 test("Slices parsing excludes fences and other sections, counts closed children, and supports list markers", () => {
   const { epic, open } = attentionEpic();
   epic.body =
-    "- Outside\n## Slices\n```md\n- Ignored\n```\n1. Build #2\n2) Acceptance: #3\n  continuation\n### Notes\n+ Future\n## Tests\n- Outside";
+    "- Outside\n## Slices\n```md\n- Ignored\n```\n1. #2 Build\n2) Acceptance: #3\n  continuation\n### Notes\n+ Future\n## Tests\n- Outside";
   expect(
     epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
   ).toEqual({
