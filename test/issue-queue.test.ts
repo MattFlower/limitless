@@ -759,7 +759,9 @@ test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval"]
       expect(queuePublications).toEqual([]);
       expect(h.store.db.query("SELECT count(*) AS n FROM events").get()).toEqual({ n: 0 });
       expect(h.logs.join("\n")).toContain("Run admission refused:");
-      expect(h.logs.join("\n")).toContain(mode);
+      expect(h.logs.join("\n")).toContain(
+        mode === "re-approval" ? "linked run changed during the poll; retrying next poll" : mode,
+      );
       expect(h.clock.pending).toBe(mode === "stopped" ? 0 : 1);
       if (mode.includes("limit")) {
         for (const run of h.runs()) h.store.updateRun(run.id, { status: "succeeded" });
@@ -1123,6 +1125,10 @@ test("queue config defaults and mount remain off without opt-in", async () => {
     raw: { github: { queue: {} } },
   });
   expect(cfg.githubQueue?.trusted).toEqual([]);
+  expect(harness({}, ["owner/repo", "OWNER/REPO", "owner/other"]).cfg.githubQueue?.repos).toEqual([
+    "owner/repo",
+    "owner/other",
+  ]);
 });
 
 test.each([
@@ -1184,6 +1190,109 @@ test("a run failing during another repository lookup is rechecked before startin
   await h.advance();
   expect(h.runs()).toHaveLength(1);
 });
+
+test("case-variant repository snapshots cannot clear another candidate's invalidation", async () => {
+  const h = harness();
+  // Bypass configuration deduplication to exercise a second read of the same repository.
+  h.cfg.githubQueue?.repos.push("OWNER/REPO");
+  const repo = h.store.getRepoBySlug("owner/repo");
+  if (!repo) throw new Error("missing repo");
+  h.data.set("owner/repo", [issue()]);
+  h.data.set("OWNER/REPO", [issue()]);
+  let competingId = "";
+  h.intercept = (args) => {
+    if (!args[3]?.includes('name:"REPO"') || competingId) return;
+    const run = h.store.createRun(repo, {
+      repo: repo.slug,
+      prompt: "Competing start",
+      source: "github",
+      sourceRef: { kind: "issue", repo: "OWNER/REPO", number: 1 },
+    });
+    competingId = run.id;
+    h.store.updateRun(run.id, { status: "cancelled", finishedAt: Date.parse(at) - 1000 });
+  };
+  h.start();
+  await h.advance();
+  expect(competingId).not.toBe("");
+  expect(h.runs().map((run) => run.id)).toEqual([competingId]);
+  expect(h.logs.join("\n")).toContain("linked run changed during the poll; retrying next poll");
+  h.intercept = undefined;
+  await h.advance(180_000);
+  expect(h.runs().filter((run) => run.sourceRef?.via === "queue")).toHaveLength(1);
+});
+
+test("metadata publications do not starve an approved issue across polls", async () => {
+  const h = harness({}, ["owner/a", "owner/b"]);
+  const repo = h.store.getRepoBySlug("owner/a");
+  if (!repo) throw new Error("missing repo");
+  const previous = h.store.createRun(repo, { repo: repo.slug, prompt: "Closes #1" });
+  h.store.updateRun(previous.id, { status: "cancelled", finishedAt: Date.parse(at) - 1000 });
+  h.data.set(repo.slug, [issue()]);
+  let publications = 0;
+  h.intercept = (args) => {
+    if (!args[3]?.includes('name:"b"')) return;
+    h.store.refreshRunTotals(previous.id);
+    // Changing reference metadata or casing preserves the effective prompt linkage.
+    h.store.setRunSourceRef(previous.id, {
+      kind: "issue",
+      repo: publications % 2 ? "owner/a" : "OWNER/A",
+      number: 1,
+      note: `publication ${publications}`,
+    });
+    publications++;
+  };
+  h.start();
+  await h.advance();
+  expect(h.runs().filter((run) => run.sourceRef?.via === "queue")).toHaveLength(1);
+  await h.advance(180_000);
+  expect(publications).toBe(2);
+  expect(h.runs().filter((run) => run.sourceRef?.via === "queue")).toHaveLength(1);
+  expect(h.logs.join("\n")).not.toContain("linked run changed during the poll");
+});
+
+test.each(["status", "finishedAt", "linkage"] as const)(
+  "%s changes defer affected issues for one poll without blocking unrelated issues",
+  async (field) => {
+    const h = harness({ max_issue_runs: 4 }, ["owner/a", "owner/b"]);
+    const repo = h.store.getRepoBySlug("owner/a");
+    if (!repo) throw new Error("missing repo");
+    const previous = h.store.createRun(repo, { repo: repo.slug, prompt: "Closes #1" });
+    h.store.updateRun(previous.id, { status: "cancelled", finishedAt: Date.parse(at) - 2000 });
+    h.data.set(repo.slug, [issue(1), issue(2), issue(3)]);
+    h.data.set("owner/b", [issue(1)]);
+    let changes = 0;
+    h.intercept = (args) => {
+      if (!args[3]?.includes('name:"b"')) return;
+      if (changes++ === 0) {
+        if (field === "status") h.store.updateRun(previous.id, { status: "resolved" });
+        else if (field === "finishedAt")
+          h.store.updateRun(previous.id, { finishedAt: Date.parse(at) - 1000 });
+        else h.store.setRunSourceRef(previous.id, { kind: "issue", repo: "OWNER/A", number: 2 });
+      }
+      h.store.refreshRunTotals(previous.id);
+    };
+    const queued = () =>
+      h
+        .runs()
+        .filter((run) => run.sourceRef?.via === "queue")
+        .map((run) => `${run.sourceRef?.repo}#${run.sourceRef?.number}`)
+        .sort();
+    h.start();
+    await h.advance();
+    expect(changes).toBe(1);
+    expect(queued()).toEqual(
+      field === "linkage" ? ["owner/a#3", "owner/b#1"] : ["owner/a#2", "owner/a#3", "owner/b#1"],
+    );
+    const deferred = field === "linkage" ? [1, 2] : [1];
+    for (const number of deferred)
+      expect(h.logs).toContain(
+        `Issue queue owner/a#${number}: linked run changed during the poll; retrying next poll`,
+      );
+    await h.advance(180_000);
+    expect(changes).toBe(2);
+    expect(queued()).toEqual(["owner/a#1", "owner/a#2", "owner/a#3", "owner/b#1"]);
+  },
+);
 
 test("MCP, comments and retries share the claim refusal; repository scope stays independent", async () => {
   const h = harness({}, ["owner/repo", "owner/other"]);

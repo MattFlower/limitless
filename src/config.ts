@@ -436,7 +436,12 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
       throw new Error("github.queue.max_issue_runs must be a positive integer");
     if (typeof pollSeconds !== "number" || !Number.isFinite(pollSeconds) || pollSeconds <= 0)
       throw new Error("github.queue.poll_seconds must be positive seconds");
-    githubQueue = { repos, trusted, maxIssueRuns, pollSeconds: Math.max(15, pollSeconds) };
+    githubQueue = {
+      repos: [...new Set(repos.map((repo) => repo.toLowerCase()))],
+      trusted,
+      maxIssueRuns,
+      pollSeconds: Math.max(15, pollSeconds),
+    };
   }
   const repos = github.repos;
   const valid = Array.isArray(repos) && repos.every((r) => typeof r === "string" && repoName.test(r));

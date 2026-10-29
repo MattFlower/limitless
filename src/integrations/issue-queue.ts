@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import type { Run } from "../core/types.ts";
-import { CommentProcessed, ISSUE_CLAIM_STATUSES } from "../db/store.ts";
+import { CommentProcessed, ISSUE_CLAIM_STATUSES, linkedIssues } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { commentRunRequest, type GhRunner, issueRunRequest, runGh } from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
@@ -150,6 +150,7 @@ export type IssueQueueClock = {
   clear: typeof clearTimeout;
 };
 type QueueFactory = Pick<Factory, "cfg" | "store" | "scheduler" | "createRun">;
+const issueKey = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
 
 export function startIssueQueue(
   factory: QueueFactory,
@@ -224,11 +225,35 @@ export function startIssueQueue(
     pending = false;
     limited = false;
     let failed = false;
+    let unsubscribe = () => {};
+    const invalidated = new Set<string>();
+    const changedDuringPoll = (repo: string, number: number) =>
+      invalidated.has(issueKey(repo, number))
+        ? "linked run changed during the poll; retrying next poll"
+        : null;
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
     try {
+      const decision = (run: Run) => {
+        const issues = linkedIssues(run, factory.store)
+          .map((i) => issueKey(i.repo, i.number))
+          .sort();
+        return { issues, state: JSON.stringify([run.status, run.finishedAt, issues]) };
+      };
+      const observed = new Map(
+        factory.store.listRuns({ limit: Number.MAX_SAFE_INTEGER }).map((run) => [run.id, decision(run)]),
+      );
+      unsubscribe = factory.store.subscribe((msg) => {
+        if (msg.kind !== "run") return;
+        const previous = observed.get(msg.run.id);
+        const current = decision(msg.run);
+        observed.set(msg.run.id, current);
+        if (previous?.state !== current.state)
+          for (const key of [...(previous?.issues ?? []), ...current.issues]) invalidated.add(key);
+      });
       await reconcileIssueLifecycle(factory.store, factory.cfg, gh, abort.signal, log, opts.lifecycle);
-      for (const repo of q.repos) {
+      for (const configuredRepo of q.repos) {
+        const repo = configuredRepo.toLowerCase();
         if (stopped || limited || now() < notBefore) break;
         try {
           const boundary = factory.store.githubCommentBoundary(repo);
@@ -247,7 +272,7 @@ export function startIssueQueue(
           // Validate every page before consuming commands.
           do {
             const data = await query(
-              repo,
+              configuredRepo,
               `issues(first:100, states:OPEN, orderBy:{field:CREATED_AT,direction:ASC}${after ? `, after:${JSON.stringify(after)}` : ""}) { pageInfo { hasNextPage endCursor } nodes { ${ISSUE_FIELDS} } }`,
             );
             const page = z
@@ -360,13 +385,16 @@ export function startIssueQueue(
           claim: factory.store.issueClaim(repo, issue.number),
           ...latestContext(repo, issue.number),
         });
-        if (!current.eligible) {
-          log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${current.reason}`));
+        const reason = changedDuringPoll(repo, issue.number) ?? (!current.eligible ? current.reason : null);
+        if (reason) {
+          log(redactCredentials(`Issue queue ${repo}#${issue.number}: ${reason}`));
           continue;
         }
         const admission = () => {
           if (stopped) return "queue stopped";
           if (factory.scheduler.draining) return "scheduler draining";
+          const deferred = changedDuringPoll(repo, issue.number);
+          if (deferred) return deferred;
           const eligibility = issueEligibility(issue, q.trusted, {
             blockers: states,
             ...latestContext(repo, issue.number),
@@ -410,6 +438,7 @@ export function startIssueQueue(
       failed = true;
       if (!stopped) log(redactCredentials(`Issue queue: ${String(e)}`));
     } finally {
+      unsubscribe();
       inFlight = false;
       const regular = now() + q.pollSeconds * 1000;
       retryNotBefore = failed ? regular : 0;
