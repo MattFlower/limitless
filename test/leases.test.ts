@@ -333,6 +333,7 @@ test("loop renewal and update serialize and preserve waiting_input", async () =>
   await tick;
   expect(await update).toBe("applied");
   expect(f.tip().status).toBe("waiting_input");
+  expect(manager.windowOpen(h)).toBe(true);
 });
 
 test("same-holder moved retries without reporting loss; repeated contention waits", async () => {
@@ -752,6 +753,57 @@ test("an earlier in-flight renewal cannot reopen a window closed by release", as
   expect(await releasing).toBe("wait");
   expect(manager.windowOpen(h)).toBe(false);
 });
+
+test.each(["unchanged", "unconfirmed"] as const)(
+  "renewals executing and queued before an ambiguous %s release cannot reopen its window",
+  async (mode) => {
+    const a = fixture();
+    const b = fixture(a.gh, other);
+    const ma = await a.create();
+    const mb = await b.create();
+    const h = held(await a.acquire(ma)).handle;
+    a.start(ma, false);
+    const entered = Promise.withResolvers<void>();
+    const unblock = Promise.withResolvers<void>();
+    let unreadable = false;
+    let applyLater: (() => void) | undefined;
+    a.gh.fault = async (r) => {
+      if (r.step === "commit" && a.gh.calls("commit").length === 2) {
+        entered.resolve();
+        await unblock.promise;
+      }
+      if (r.step === "update") {
+        const sent = parseRecord(a.gh.commits.get(a.gh.update(r).afterOid)?.message ?? "", ref);
+        if (sent === "malformed" || sent.state !== "released") return;
+        applyLater = () => a.gh.apply(r);
+        if (mode === "unconfirmed") {
+          applyLater();
+          unreadable = true;
+        }
+        throw new Error("Lost release response");
+      }
+      if (r.step === "ref" && unreadable) throw new Error("Unreadable");
+    };
+    const executing = ma.update(h, {});
+    await entered.promise;
+    const queued = ma.update(h, { status: "waiting_input" });
+    const releasing = ma.release(h);
+    expect(ma.windowOpen(h)).toBe(false);
+    unblock.resolve();
+    expect(await executing).toBe("applied");
+    expect(await queued).toBe("applied");
+    expect(await releasing).toBe("wait");
+    expect(a.row()?.intent !== null).toBe(mode === "unconfirmed");
+    expect(ma.windowOpen(h)).toBe(false);
+    a.gh.fault = undefined;
+    expect(applyLater).toBeDefined();
+    applyLater?.();
+    expect(held(await b.acquire(mb)).handle.generation).toBe(2);
+    expect(a.row()?.confirmed?.state).toBe("held");
+    expect(ma.windowOpen(h)).toBe(false);
+    expect(a.lost).not.toHaveBeenCalled();
+  },
+);
 
 test.each(["confirmed", "recovered acquisition", "loop-reconciled acquisition"] as const)(
   "renewal discovers %s without reacquisition or a manufactured anchor",

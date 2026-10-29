@@ -45,7 +45,7 @@ export async function createLeaseManager(deps: {
 }): Promise<LeaseManager> {
   const { client, store, clock, member, timer = { set: setInterval, clear: clearInterval } } = deps;
   const mutexes = new Map<string, Promise<unknown>>();
-  const anchors = new Map<string, { tip: string; anchor: Anchor | null }>();
+  const anchors = new Map<string, { tip: string; anchor: Anchor | null; revocation?: symbol }>();
   const losses = new Map<string, { handle: LeaseHandle; tip: ClaimTip | null; delivered: boolean }>();
   let hooks: Hooks | undefined;
   const key = (repo: string, ref: string) => `${canonicalRepo(repo)}:${ref}`;
@@ -100,9 +100,9 @@ export async function createLeaseManager(deps: {
     options: { h?: LeaseHandle; patch?: Patch; release?: boolean; signal?: AbortSignal } = {},
   ): Promise<AcquireResult | "obsolete" | "lost"> {
     const { h, patch = {}, release = false, signal } = options;
+    const revocation = anchors.get(key(repo, ref))?.revocation;
     return locked(repo, ref, async () => {
       if (h && !current(h)) return "obsolete";
-      const authority = anchors.get(key(repo, ref));
       const settled = await reconcile(repo, ref, signal);
       if (settled === "pending") return wait;
       let row = store.leaseRow(repo, ref);
@@ -187,9 +187,9 @@ export async function createLeaseManager(deps: {
         if (result.kind === "applied") {
           const { generation, state } = record;
           store.confirmLease(repo, ref, { generation, tip: result.tip.sha, state });
-          // A release invoked while this write awaited must keep its window closed.
-          if (anchors.get(key(repo, ref)) === authority)
-            anchors.set(key(repo, ref), { tip: result.tip.sha, anchor: result.anchor });
+          // A release invoked while this write was queued or awaiting must keep its window closed.
+          if (anchors.get(key(repo, ref))?.revocation === revocation)
+            anchors.set(key(repo, ref), { tip: result.tip.sha, anchor: result.anchor, revocation });
           const held: LeaseHandle = Object.freeze({ repo, ref, run: record.run, member, generation });
           return { kind: "held", handle: held, tip: result.tip };
         }
@@ -214,7 +214,8 @@ export async function createLeaseManager(deps: {
     });
   }
   async function mutate(h: LeaseHandle, patch: Patch, release = false) {
-    if (release && current(h)) anchors.set(key(h.repo, h.ref), { tip: "", anchor: null });
+    if (release && current(h))
+      anchors.set(key(h.repo, h.ref), { tip: "", anchor: null, revocation: Symbol() });
     const want: LeaseWant = { kind: "run", run: h.run, status: "running" };
     const result = await operate(canonicalRepo(h.repo), h.ref, want, false, { h, patch, release });
     if (typeof result === "string") return result;
