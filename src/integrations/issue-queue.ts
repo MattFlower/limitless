@@ -1,8 +1,15 @@
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import type { Run } from "../core/types.ts";
-import { CommentProcessed, ISSUE_CLAIM_STATUSES, linkedIssues } from "../db/store.ts";
+import {
+  CommentProcessed,
+  ISSUE_CLAIM_STATUSES,
+  type IssueRunObservation,
+  type IssueRunSummary,
+  linkedIssues,
+} from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
+import { beginActivity } from "../util/stall.ts";
 import { commentRunRequest, type GhRunner, issueRunRequest, runGh } from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
 import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
@@ -64,7 +71,7 @@ export function issueEligibility(
   context: {
     blockers?: ReadonlyMap<number, string>;
     claim?: Run | null;
-    latest?: Run | null;
+    latest?: IssueRunSummary | null;
     failureBoundary?: number | null;
   } = {},
 ): { eligible: true; priority: number } | { eligible: false; reason: string } {
@@ -209,8 +216,7 @@ export function startIssueQueue(
     if (response.errors?.length) throw new Error("GraphQL issue query returned errors");
     return z.record(z.string(), z.unknown()).parse(response.data.repository);
   };
-  const latestContext = (repo: string, number: number) => {
-    const latest = factory.store.latestIssueRun(repo, number);
+  const latestContext = (repo: string, number: number, latest: IssueRunSummary | undefined) => {
     const failure =
       latest?.status === "failed"
         ? factory.store.issueLifecycleEffects(latest.id, repo, number).find((e) => e.effect === "failure")
@@ -233,16 +239,15 @@ export function startIssueQueue(
         : null;
     const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
       [];
+    const snapshots = new Map<string, Map<number, IssueRunSummary>>();
     try {
-      const decision = (run: Run) => {
+      const decision = (run: IssueRunObservation) => {
         const issues = linkedIssues(run, factory.store)
           .map((i) => issueKey(i.repo, i.number))
           .sort();
         return { issues, state: JSON.stringify([run.status, run.finishedAt, issues]) };
       };
-      const observed = new Map(
-        factory.store.listRuns({ limit: Number.MAX_SAFE_INTEGER }).map((run) => [run.id, decision(run)]),
-      );
+      const observed = new Map(factory.store.issueRunObservations().map((run) => [run.id, decision(run)]));
       unsubscribe = factory.store.subscribe((msg) => {
         if (msg.kind !== "run") return;
         const previous = observed.get(msg.run.id);
@@ -255,6 +260,7 @@ export function startIssueQueue(
       for (const configuredRepo of q.repos) {
         const repo = configuredRepo.toLowerCase();
         if (stopped || limited || now() < notBefore) break;
+        const end = beginActivity("issue-queue.repository");
         try {
           const boundary = factory.store.githubCommentBoundary(repo);
           if (!boundary) {
@@ -309,6 +315,11 @@ export function startIssueQueue(
           if (stopped) break;
           const identity = await (opts.lifecycle?.identity ?? githubIdentity)(repo).catch(() => null);
           const bot = identity?.kind === "app" ? identity.botLogin.toLowerCase() : null;
+          const latest = factory.store.latestIssueRuns(
+            repo,
+            issues.nodes.map((i) => i.number),
+          );
+          snapshots.set(repo, latest);
           for (const issue of issues.nodes) {
             for (const c of boundary && issue.state === "OPEN" ? issue.comments.nodes : []) {
               const author = c.author?.login;
@@ -361,7 +372,7 @@ export function startIssueQueue(
             const result = issueEligibility(issue, q.trusted, {
               blockers: states,
               claim: factory.store.issueClaim(repo, issue.number),
-              ...latestContext(repo, issue.number),
+              ...latestContext(repo, issue.number, latest.get(issue.number)),
             });
             if (result.eligible) candidates.push({ repo, issue, priority: result.priority, states });
             else if (result.reason.startsWith("claimed"))
@@ -370,6 +381,8 @@ export function startIssueQueue(
         } catch (e) {
           failed = true;
           if (!stopped) log(redactCredentials(`Issue queue ${repo}: ${String(e)}`));
+        } finally {
+          end();
         }
       }
       candidates.sort(
@@ -383,7 +396,7 @@ export function startIssueQueue(
         const current = issueEligibility(issue, q.trusted, {
           blockers: states,
           claim: factory.store.issueClaim(repo, issue.number),
-          ...latestContext(repo, issue.number),
+          ...latestContext(repo, issue.number, snapshots.get(repo)?.get(issue.number)),
         });
         const reason = changedDuringPoll(repo, issue.number) ?? (!current.eligible ? current.reason : null);
         if (reason) {
@@ -397,7 +410,7 @@ export function startIssueQueue(
           if (deferred) return deferred;
           const eligibility = issueEligibility(issue, q.trusted, {
             blockers: states,
-            ...latestContext(repo, issue.number),
+            ...latestContext(repo, issue.number, snapshots.get(repo)?.get(issue.number)),
           });
           if (!eligibility.eligible) return eligibility.reason;
           const active = factory.store.listRuns({
