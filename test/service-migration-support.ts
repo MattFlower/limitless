@@ -12,7 +12,7 @@ import {
 import * as os from "node:os";
 import { join } from "node:path";
 import type { DeployClient, DeployClock } from "../src/cli/deploy-wait.ts";
-import { DrainUnsupportedError } from "../src/cli/deploy-wait.ts";
+import { DaemonTimeoutError, DrainUnsupportedError } from "../src/cli/deploy-wait.ts";
 import type { sh } from "../src/util/proc.ts";
 import * as proc from "../src/util/proc.ts";
 import { inspectionResult } from "./service-inspection-support.ts";
@@ -173,6 +173,9 @@ const commands: string[][] = [];
 let inspectionInjected = false;
 let replacementFailed = false;
 let drainCompleted = false;
+let recoveryFailure = false;
+const recoveryInspection = scenario.startsWith("failed-recovery-inspection-");
+const recoveryRestore = scenario.startsWith("failed-recovery-restore");
 const command: typeof sh = async (argv) => {
   commands.push([...argv]);
   const ok = (stdout = "", exitCode = 0, stderr = "") => ({ stdout, exitCode, stderr });
@@ -196,6 +199,7 @@ const command: typeof sh = async (argv) => {
         (scenario.startsWith("inspection-post-drain") && label === oldLabel && drainCompleted) ||
         (["inspection-status", "inspection-uninstall"].includes(scenario) && label === oldLabel) ||
         (scenario === "inspection-old" && label === oldLabel && !inspectionInjected) ||
+        (recoveryInspection && recoveryFailure && label === oldLabel && !inspectionInjected) ||
         (scenario === "inspection-reconcile" && label === neutral && !existsSync(oldPath)) ||
         (scenario === "inspection-restore" && label === neutral && replacementFailed && !inspectionInjected))
     ) {
@@ -220,6 +224,11 @@ const command: typeof sh = async (argv) => {
   if (argv[1] === "bootout") {
     calls.push(`bootout ${label}`);
     if (label === oldLabel) backupBeforeStop = record()?.backup === Buffer.from(old).toString("base64");
+    if (label === oldLabel && (scenario === "failed-recovery-inspection-stop" || recoveryRestore)) {
+      recoveryFailure = true;
+      if (recoveryRestore) loaded.delete(label);
+      return ok("", 1, "stop failed");
+    }
     if (label === oldLabel && scenario === "signal-stopping") {
       console.log("READY");
       await new Promise(() => {});
@@ -243,6 +252,11 @@ const command: typeof sh = async (argv) => {
     const unitOld = unitKind === kind ? oldLabel : `arbitrary.installed.${unitKind}`;
     const unitOldPath = join(agents, `${unitKind}-original.plist`);
     calls.push(`bootstrap ${data.Label}`);
+    if (data.Label === oldLabel && recoveryRestore) {
+      // The old daemon restarts, but launchctl still reports a restoration failure.
+      loaded.add(oldLabel);
+      return ok("", 1, "old bootstrap failed");
+    }
     if (disabled.has(data.Label ?? "")) return ok("", 1, "label disabled");
     if (packaged && data.Label === neutral) {
       packagedHealthReads = 0;
@@ -309,7 +323,14 @@ let failHealth = false;
 const client: DeployClient = {
   async admin(action) {
     calls.push(action);
-    if (action === "resume" && ["resume-failure", "inspection-post-drain-resume-failure"].includes(scenario))
+    if (
+      action === "resume" &&
+      [
+        "resume-failure",
+        "inspection-post-drain-resume-failure",
+        "failed-recovery-restore-resume-failure",
+      ].includes(scenario)
+    )
       throw new Error("resume failed");
     if (action === "drain" && (scenario.endsWith("signal-drain") || scenario === "signal-journal")) {
       writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
@@ -341,6 +362,10 @@ const client: DeployClient = {
       return { ok: true, uptimeMs: 1, sha, draining, active: [] };
     }
     calls.push(`health ${draining ? "draining" : "fresh"}`);
+    if (draining && scenario === "failed-recovery-inspection-drain-timeout") {
+      recoveryFailure = true;
+      throw new DaemonTimeoutError();
+    }
     if (scenario === "deploy-install") await compete();
     if (draining && scenario === "drain-health") throw new Error("drain health failed");
     if (scenario === "recover-unhealthy-deploy") throw new Error("daemon health failed");
@@ -383,6 +408,7 @@ let original = "";
 let stable = "";
 let executable = "";
 let errorKind = "";
+let errorCause = "";
 let filesBefore: Record<string, string> = {};
 let loadedBefore: string[] = [];
 let disabledBefore: string[] = [];
@@ -589,6 +615,7 @@ try {
 } catch (caught) {
   error = String(caught);
   errorKind = caught instanceof Error ? caught.constructor.name : "";
+  errorCause = caught instanceof Error && caught.cause ? String(caught.cause) : "";
 }
 clearTimeout(signalTimer);
 writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
@@ -596,6 +623,7 @@ console.log(
   JSON.stringify({
     error,
     errorKind,
+    errorCause,
     filesBefore,
     loadedBefore,
     disabledBefore,

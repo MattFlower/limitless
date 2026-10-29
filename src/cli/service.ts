@@ -546,13 +546,19 @@ export async function install(
     } catch (error) {
       const inspectionFailed = error instanceof ServiceInspectionError;
       restoring = true;
+      const failures: string[] = [];
       try {
         if (!inspectionFailed && state && !(await isLoaded(state.old.label))) await restore(state);
-        if (drainAttempted && old && (inspectionFailed || (await isLoaded(old.label))))
-          await requestAdmin(client, clock, "resume");
-      } catch (resume) {
+      } catch (restore) {
+        failures.push(`Restoration failed: ${String(restore)}`);
+      }
+      if (drainAttempted)
+        await requestAdmin(client, clock, "resume").catch((resume) =>
+          failures.push(`Resume scheduler failed: ${String(resume)}`),
+        );
+      if (failures.length) {
         const Failure = inspectionFailed ? ServiceInspectionError : Error;
-        throw new Failure(`${String(error)}\nResume scheduler failed: ${String(resume)}`, { cause: error });
+        throw new Failure(`${String(error)}\n${failures.join("\n")}`, { cause: error });
       }
       throw error;
     }

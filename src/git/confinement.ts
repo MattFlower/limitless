@@ -207,7 +207,16 @@ export function bwrapGit(platform = process.platform, bwrap = BWRAP, run = sh): 
       if (platform !== "linux" || !existsSync(bwrap))
         throw new ConfinementError("Git confinement requires Linux bubblewrap");
       const { env, git, scratch } = resolveGit(cmd, opts);
-      const launch = trustedLaunch(env);
+      // The ELF loader can map an editor's template or a transport's payload without another exec.
+      // These environment overrides beat both caller and repository settings; /dev/null cannot run.
+      const launch = trustedLaunch({
+        ...env,
+        GIT_ALLOW_PROTOCOL: "file",
+        GIT_EDITOR: "/dev/null",
+        GIT_SEQUENCE_EDITOR: "/dev/null",
+        GIT_ASKPASS: "/dev/null",
+        SSH_ASKPASS: "/dev/null",
+      });
       let installation = installations.get(git);
       if (!installation) {
         installation = (async () => {

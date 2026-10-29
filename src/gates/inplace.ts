@@ -22,11 +22,25 @@ export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal
   store.db
     .query("INSERT INTO executors (id,pid,birth,release_sha) VALUES (?,?,?,?)")
     .run(owner, process.pid, birth, releaseSha);
+  const pendingStops = new Map<string, string>();
+  const confirmStops = () => {
+    for (const [id, cwd] of pendingStops) {
+      if (
+        store.listProcessDiscoveries(undefined, cwd).length ||
+        store.listProcessCleanups(undefined, cwd).length
+      )
+        continue;
+      store.db.query("UPDATE gate_jobs SET stopped=1 WHERE id=? AND worker=?").run(id, owner);
+      pendingStops.delete(id);
+    }
+  };
   try {
     await processCleanupStore.run(store, () =>
       readPolicyScope.run(cfg.readPolicy, async () => {
         let serving = false;
         while (!signal.aborted) {
+          // A concurrent Git inspection can outlive a finished job's first stop check.
+          confirmStops();
           const matches = store.getSetting("executor.daemonRelease", "") === releaseSha;
           if (serving && !matches) return;
           serving ||= matches;
@@ -39,6 +53,7 @@ export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal
           const controller = new AbortController();
           const req: GateRequest = JSON.parse(job.request);
           const checkLease = () => {
+            confirmStops();
             const current = workers.job(job.id);
             const changed = store.getSetting("executor.daemonRelease", "") !== releaseSha;
             releaseChanged ||= changed;
@@ -94,12 +109,8 @@ export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal
             clearInterval(renewal);
             signal.removeEventListener("abort", abort);
             // A failed process cleanup must never authorize another gate in this worktree.
-            const cwd = canonicalGateCwd(req.cwd);
-            if (
-              !store.listProcessDiscoveries(undefined, cwd).length &&
-              !store.listProcessCleanups(undefined, cwd).length
-            )
-              store.db.query("UPDATE gate_jobs SET stopped=1 WHERE id=? AND worker=?").run(job.id, owner);
+            pendingStops.set(job.id, canonicalGateCwd(req.cwd));
+            confirmStops();
           }
           if (releaseChanged) return;
         }

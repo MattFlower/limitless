@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { worktreeGit } from "../src/git/command.ts";
 import {
   bwrapGit,
   checkApply,
@@ -27,8 +28,9 @@ import { configureReadPolicy, readPolicyScope } from "../src/harness/read-policy
 import { ConfinementError, platformConfinement, runSandboxed, SANDBOX_EXEC } from "../src/harness/sandbox.ts";
 import { BWRAP, bwrapArgs, linuxForPort, shadow, verifyLinux } from "../src/harness/sandbox-linux.ts";
 import { type WriteRoots, writeRoots } from "../src/harness/scratch.ts";
-import { agentEnv, invocationScratch, type ProcResult, runProcess } from "../src/util/proc.ts";
+import { agentEnv, invocationScratch, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
 import { bwrapProbeSkip, bwrapSkip } from "./confinement.ts";
+import { seeded } from "./seeded.ts";
 
 let root: string;
 beforeEach(() => {
@@ -274,6 +276,17 @@ test.skipIf(bwrapSkip !== null)(
     expect(connections).toBe(0);
     expect((await git(["init", "-q", join(repo, "..", "outside")])).exitCode).toBe(0);
     expect(existsSync(join(root, "outside"))).toBe(false);
+    // The ELF loader runs whatever an exec transport names, from the command line or repository config.
+    const loader = elfInterpreter(realpathSync(Bun.which("git") ?? "git")) ?? "";
+    const touch = (name: string) => `ext::${loader} ${Bun.which("touch")} ${join(repo, name)}`;
+    await git(["-c", "protocol.ext.allow=always", "ls-remote", touch("ext-cmdline")]);
+    await git(["config", "protocol.ext.allow", "always"]);
+    await git(["config", "remote.x.url", touch("ext-config")]);
+    expect((await git(["fetch", "x"])).stderr).toContain("transport 'ext' not allowed");
+    for (const marker of ["ext-cmdline", "ext-config"]) expect(existsSync(join(repo, marker))).toBe(false);
+    // Bundles, which workers fetch, still work.
+    expect((await git(["bundle", "create", join(repo, "b.bundle"), "HEAD"])).exitCode).toBe(0);
+    expect((await git(["fetch", "-q", join(repo, "b.bundle"), "HEAD"])).exitCode).toBe(0);
   },
 );
 
@@ -285,6 +298,130 @@ test.skipIf(process.platform !== "linux")(
     expect(() => elfInterpreter(script)).toThrow(ConfinementError);
   },
 );
+
+const loaderFixture = seeded(async (dir) => {
+  const repo = join(dir, "repo");
+  await sh(["git", "init", "-qb", "main", repo], { cwd: dir });
+  // No arguments needed: both the editor's message file and textconv's temporary blob are ELF.
+  const source = join(dir, "payload.c");
+  writeFileSync(
+    source,
+    '#include <stdio.h>\nint main(void) { FILE *f = fopen("payload-ran", "w"); if (f) fclose(f); return 0; }\n',
+  );
+  await sh(["cc", "-o", "payload", source], { cwd: repo });
+  writeFileSync(join(repo, ".gitattributes"), "payload diff=x\n");
+  writeFileSync(join(repo, ".git/info/attributes"), "payload diff=x\n");
+  await sh(["git", "add", "."], { cwd: repo });
+  await sh(["git", "commit", "-qm", "payload"], { cwd: repo });
+});
+
+test.each(["2028", "2029"])(
+  "Linux Git blanks textconv drivers whose names contain Unicode separators (U+%s)",
+  async (separator) => {
+    await sh(["git", "init", "-q"], { cwd: root });
+    const driver = `x${String.fromCodePoint(Number.parseInt(separator, 16))}y`;
+    writeFileSync(join(root, ".git/info/attributes"), `payload diff=${driver}\n`);
+    await sh(["git", "config", `diff.${driver}.textconv`, "touch textconv-ran"], { cwd: root });
+    const blob = await sh(["git", "hash-object", "-w", "--stdin"], { cwd: root, stdin: "payload" });
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!platform) throw new Error("Missing process platform descriptor");
+    try {
+      // Exercise Linux's config discovery on macOS too; the identity backend isolates Git overrides.
+      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+      await gitConfinement.run({ wrap: async (cmd) => cmd }, () =>
+        worktreeGit(["git", "cat-file", "--textconv", "--path=payload", blob.stdout.trim()], {
+          cwd: root,
+          env: agentEnv(),
+          allowFail: true,
+        }),
+      );
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+    expect(existsSync(join(root, "textconv-ran"))).toBe(false);
+  },
+);
+
+for (const confined of [false, true])
+  for (const route of ["editor", "show", "cat-file", ...(!confined ? ["cat-file-fallback"] : []), "ssh-key"])
+    test.skipIf(process.platform !== "linux" || (confined && bwrapSkip !== null))(
+      `Linux Git blocks the loader ${route} route (${confined ? `real bwrap: ${bwrapSkip}` : "portable launch"})`,
+      async () => {
+        await loaderFixture(root);
+        const repo = join(root, "repo");
+        const loader = elfInterpreter(realpathSync(Bun.which("git") ?? "git"));
+        if (!loader) throw new Error("Git has no ELF interpreter");
+        const fallback = route === "cat-file-fallback";
+        const env: Record<string, string> = { ...agentEnv(), GIT_EDITOR: loader };
+        if (fallback) {
+          // Config-file discovery is cached by environment, so earlier routes must not supply it.
+          env.GIT_CONFIG_GLOBAL = join(root, "fallback-config");
+          writeFileSync(env.GIT_CONFIG_GLOBAL, "");
+        }
+        let configFileQueries = 0;
+        let fallbackQueries = 0;
+        const backend = bwrapGit("linux", process.execPath, async () =>
+          sh(["git", "--exec-path"], { cwd: root }),
+        );
+        const portable = {
+          async wrap(cmd: string[], opts: Parameters<typeof sh>[1]) {
+            // Git 2.40 lacks the config-file queries; exercise the uncached key-discovery path too.
+            if (fallback && cmd.includes("var")) {
+              configFileQueries++;
+              cmd = ["git", "var", "UNKNOWN"];
+            }
+            if (cmd.includes("--get-regexp")) fallbackQueries++;
+            const launch = await backend.wrap(cmd, opts);
+            // Exercise the production payload argv/environment with real Git, without namespaces.
+            return {
+              cmd: launch.cmd.slice(launch.cmd.indexOf("--") + 1),
+              env: JSON.parse(launch.env[PAYLOAD_ENV] ?? "{}") as Record<string, string>,
+              cwd: opts.cwd,
+            };
+          },
+        };
+        const configs = [
+          // bwrap hides setup.ts's temporary global config. Without an explicit identity, commit
+          // aborts before reaching the editor or signing, and a missing marker proves nothing.
+          "user.name=Test",
+          "user.email=test@example.invalid",
+          `core.editor=${loader}`,
+          `commit.template=${join(repo, "payload")}`,
+          "commit.status=false",
+          `diff.x.textconv=${loader}`,
+          "gpg.format=ssh",
+          `gpg.ssh.defaultKeyCommand=${loader} ${join(repo, "payload")}`,
+        ].flatMap((value) => ["-c", value]);
+        const args =
+          route === "editor"
+            ? ["commit", "--allow-empty"]
+            : route === "ssh-key"
+              ? ["commit", "--allow-empty", "-S", "-m", "signed"]
+              : route === "show"
+                ? ["show", "HEAD"]
+                : ["cat-file", "--textconv", "HEAD:payload"];
+        const result = await gitConfinement.run(confined ? bwrapGit() : portable, () =>
+          worktreeGit(["git", ...configs, ...args], {
+            cwd: repo,
+            env,
+            allowFail: true,
+          }),
+        );
+        if (fallback) {
+          expect(configFileQueries).toBe(2);
+          expect(fallbackQueries).toBe(1);
+        }
+        expect(existsSync(join(repo, "payload-ran"))).toBe(false);
+        if (route === "editor") {
+          expect(readFileSync(join(repo, ".git/COMMIT_EDITMSG"))).toEqual(
+            readFileSync(join(repo, "payload")),
+          );
+          expect(result.stderr).toContain("editor '/dev/null'");
+        }
+        if (route === "show") expect(result.exitCode).toBe(0);
+        else expect(result.exitCode).not.toBe(0);
+      },
+    );
 
 test("bwrapArgs refuses policies a bind mount cannot enforce", () => {
   const { work, scratch, roots } = layout();
@@ -521,7 +658,16 @@ test.skipIf(process.platform !== "linux")(
     const bwrap = join(root, "bwrap");
     writeFileSync(bwrap, "");
     const secret = `secret-${crypto.randomUUID()}`;
-    const env = { ...agentEnv(), LD_PRELOAD: "/x.so", GIT_AUTHOR_NAME: secret };
+    const env = {
+      ...agentEnv(),
+      LD_PRELOAD: "/x.so",
+      GIT_AUTHOR_NAME: secret,
+      GIT_ALLOW_PROTOCOL: "ext:file",
+      GIT_EDITOR: "/editor",
+      GIT_SEQUENCE_EDITOR: "/sequence-editor",
+      GIT_ASKPASS: "/askpass",
+      SSH_ASKPASS: "/ssh-askpass",
+    };
     const probes: { env?: Record<string, string>; cwd: string }[] = [];
     const run = (async (cmd: string[], opts: { env?: Record<string, string>; cwd: string }) => {
       probes.push(opts);
@@ -537,7 +683,15 @@ test.skipIf(process.platform !== "linux")(
     // The cached installation probe gets a fixed environment; the command gets the caller's.
     expect(probes).toHaveLength(1);
     expect(JSON.parse(probes[0]?.env?.[PAYLOAD_ENV] ?? "")).toEqual({ PATH: "/usr/bin:/bin" });
-    expect(JSON.parse(launch.env[PAYLOAD_ENV] ?? "")).toEqual(env);
+    // Only local transports: an exec transport could start the loader with any program (#867).
+    expect(JSON.parse(launch.env[PAYLOAD_ENV] ?? "")).toEqual({
+      ...env,
+      GIT_ALLOW_PROTOCOL: "file",
+      GIT_EDITOR: "/dev/null",
+      GIT_SEQUENCE_EDITOR: "/dev/null",
+      GIT_ASKPASS: "/dev/null",
+      SSH_ASKPASS: "/dev/null",
+    });
     expect(launch.cmd.join("\0")).not.toContain(secret);
     expect(launch.cmd.slice(launch.cmd.indexOf("--git") + 1)[0]).toBe(repo);
     expect(launch.cmd.slice(-2)).toEqual([expect.stringMatching(/^--exec-path=/), "status"]);
