@@ -1413,7 +1413,9 @@ test.each([
           ? 3
           : mode === "empty" || terminator
             ? 0
-            : 1,
+            : mode === "inflight"
+              ? 2 // The interrupted local covering-test execution restarts under a new handle.
+              : 1,
     );
     const last = state?.lastVerify?.criteria.find(
       (c) => c.id === (mode === "round-limit" ? "AC-11" : "AC-1"),

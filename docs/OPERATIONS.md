@@ -186,6 +186,28 @@ daemon has no boot SHA while the checkout already matches the target, restart it
 `launchctl kickstart -k gui/$UID/dev.limitless.daemon` (or `limitless service install`),
 then retry. A second interrupt exits immediately; recovery may then require those manual steps.
 
+Deploy records executor intent in `~/.limitless/executor-intent.json`, beside the deploy lock
+and `service-backup/`. Its `deploying` or `rollback` phase, actual unit label/path, and previous
+and target SHAs identify unfinished work. Every deploy or `service install` recovers this intent
+by confirming the executor unloaded and disabled before changing the checkout. A rollback leaves
+it disabled until a healthy deploy or install reconciles the configured state. `limitless restart`
+leaves the executor and its running jobs alone.
+
+If recovery cannot confirm shutdown, use the label recorded in the intent or executor journal:
+
+```sh
+launchctl bootout gui/<uid>/<label>
+launchctl disable gui/<uid>/<label>
+limitless service status
+```
+
+Then rerun the deploy or install. `limitless service status` includes the installed executor’s
+actual label and whether it is loaded. Do not change the release checkout until shutdown is
+confirmed. The intent is removed only after successful reconciliation. An executor install
+journal restored after a failed replacement remains until that reconciliation; its old plist
+is restored unloaded and disabled. An older CLI recovering this journal tries to re-bootstrap
+the disabled unit, fails, and reports the failure. Use the newer CLI to finish recovery.
+
 ## Live CLI smoke checks
 
 Run `bun scripts/packaged-smoke.ts [--binary <path>]` locally to check a real packaged binary:

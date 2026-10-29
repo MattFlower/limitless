@@ -495,7 +495,7 @@ export function buildReportArtifacts(
   const worktree = publicationWorktree(ctx.state);
   if (worktree.length && worktree.join("\0") !== ctx.state.worktreeAliases?.join("\0")) {
     ctx.state.worktreeAliases = worktree;
-    ctx.store.setRunState(ctx.run.id, ctx.state);
+    ctx.checkpointer.writeState(ctx.run.id, ctx.state);
   }
   return renderReportArtifacts(
     {

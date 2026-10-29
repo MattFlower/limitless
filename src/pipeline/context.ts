@@ -19,7 +19,7 @@ import type {
   Stage,
   StageName,
 } from "../core/types.ts";
-import type { Store } from "../db/store.ts";
+import type { RunPatch, Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
@@ -49,13 +49,33 @@ import { runAgentGate } from "./agent-gate.ts";
 import type { CoveringTestRun } from "./covering-tests.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
+import { consumeGateExecution } from "./gate-execution.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 import type { SizeReport } from "./size.ts";
 
+export interface Checkpointer {
+  writeState(runId: string, state: RunState): void;
+  writeRun(runId: string, patch: RunPatch, state?: RunState): Run;
+  /** Local: synchronous, returns void. Shared (#960): may return a promise. */
+  checkpoint(runId: string, label?: string): void | Promise<void>;
+}
+
+export function localCheckpointer(store: Store): Checkpointer {
+  return {
+    writeState: (runId, state) => {
+      store.setRunState(runId, state);
+    },
+    writeRun: (runId, patch, state) => store.updateRun(runId, patch, state),
+    checkpoint: () => {},
+  };
+}
+
 export interface EngineDeps {
+  loadSource?: () => number;
+  checkpointer?: Checkpointer;
   gateExecutor?: GateExecutor;
   agentExecutor?: AgentExecutor;
   confinement?: import("../harness/sandbox.ts").ConfinementBackend;
@@ -110,7 +130,16 @@ export interface RunState {
   reviewMode?: "single" | "panel";
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
-  gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
+  gateExecution?: {
+    stage: StageName;
+    round: number;
+    purpose: string;
+    sha: string;
+    handle: ExecutionHandle;
+    gateKey?: string;
+    /** Earlier attempts replay caller progress without executing or counting them again. */
+    previous?: { purpose: string; gateKey: string; result: GateRun }[];
+  };
   /** the worker implement job of this round; cleared in the implementation-ready save */
   agentJob?: { round: number; id: string };
   baseline?: GateRun | null;
@@ -361,12 +390,13 @@ export function initialRunState(run: Pick<Run, "sourceRef">): RunState {
 
 export class RunContext {
   readonly deps: EngineDeps;
+  readonly checkpointer: Checkpointer;
   private readonly stageConfig = new AsyncLocalStorage<Config>();
   private readonly interruption = new AbortController();
   readonly signal: AbortSignal;
   termination?: SimulatedTermination;
   private readonly stageContext = new AsyncLocalStorage<Stage>();
-  private readonly faults: FaultInjector;
+  readonly faults: FaultInjector;
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   private foregroundStageDepth = 0;
   /** Defer shared-worktree cleanup until the review/verify pair has settled. */
@@ -395,6 +425,7 @@ export class RunContext {
     readonly drainEvents?: EventTarget,
   ) {
     const deps = liveDeps;
+    this.checkpointer = deps.checkpointer ?? localCheckpointer(deps.store);
     const thisContext = this;
     this.deps = new Proxy(deps, {
       get(target, key, receiver) {
@@ -511,7 +542,11 @@ export class RunContext {
     return [this.run.prompt, this.state.spec ? renderSpec(this.state.spec) : "", ...identifiers].join("\n");
   }
 
-  async save(checkpoint?: string): Promise<void> {
+  get stageId(): number | undefined {
+    return this.stageContext.getStore()?.id;
+  }
+
+  async save(checkpoint?: string, onComplete?: () => void): Promise<void> {
     if (this.state.phase !== "deliver" || this.state.deliveryComplete) this.state.githubWait = undefined;
     if (this.deps.faults) {
       const stage = this.stageContext.getStore();
@@ -522,10 +557,18 @@ export class RunContext {
       );
       this.checkCancelled();
     }
-    this.store.setRunState(this.run.id, this.state);
+    if (onComplete)
+      this.store.transaction(() => {
+        onComplete();
+        this.checkpointer.writeState(this.run.id, this.state);
+      }, true);
+    else this.checkpointer.writeState(this.run.id, this.state);
+    const p = this.checkpointer.checkpoint(this.run.id, checkpoint);
+    if (p) await p;
   }
 
   async setPhase(phase: Phase): Promise<void> {
+    if (phase !== this.state.phase) consumeGateExecution(this);
     this.state.phase = phase;
     if (phase === "done") this.state.completedChecks = undefined;
     await this.save();
@@ -555,9 +598,10 @@ export class RunContext {
     round = 0,
     background = false,
     parkOnDrain = true,
+    onComplete?: (value: T, stage: Stage, sha?: string) => void,
   ): Promise<T> {
     return this.stageConfig.run(this.liveDeps.cfg, () =>
-      this.runStage(name, fn, round, background, parkOnDrain),
+      this.runStage(name, fn, round, background, parkOnDrain, onComplete),
     );
   }
 
@@ -567,6 +611,7 @@ export class RunContext {
     round: number,
     background: boolean,
     parkOnDrain: boolean,
+    onComplete?: (value: T, stage: Stage, sha?: string) => void,
   ): Promise<T> {
     this.checkCancelled();
     const cacheable =
@@ -580,7 +625,7 @@ export class RunContext {
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
     if (!background)
-      this.run = this.store.updateRun(this.run.id, {
+      this.run = this.checkpointer.writeRun(this.run.id, {
         stage: this.parallelChecks && name === "verify" ? "review" : name,
       });
     const stage = this.store.startStage(this.run.id, name, round);
@@ -598,7 +643,11 @@ export class RunContext {
           if (this.state.completedChecks?.round !== round || this.state.completedChecks.sha !== checkSha)
             this.state.completedChecks = { round, sha: checkSha, values: {} };
           this.state.completedChecks.values[name] = output.value;
-          await this.save();
+          if (name === "gates") consumeGateExecution(this);
+          await this.save(
+            undefined,
+            onComplete ? () => onComplete(output.value, stage, checkSha) : undefined,
+          );
         }
         return output;
       });
@@ -883,7 +932,7 @@ export class RunContext {
           )
         ) {
           this.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
-          store.setRunState(this.run.id, this.state);
+          this.checkpointer.writeState(this.run.id, this.state);
         }
         dispatched = true;
       };
@@ -1050,7 +1099,7 @@ export class RunContext {
       } finally {
         if (!dispatched && revision.aborted && opts.role === "implement") {
           this.state.implementer = previousImplementer;
-          store.setRunState(this.run.id, this.state);
+          this.checkpointer.writeState(this.run.id, this.state);
         }
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });

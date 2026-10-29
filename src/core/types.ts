@@ -450,7 +450,13 @@ export interface RoutingChange {
   by: string;
 }
 
+export type EpicAttention = {
+  state: "unfiled" | "needs_approval" | "ready_for_acceptance";
+  items: string[];
+};
+
 export type FeedKind =
+  | "queue.epic_attention"
   | `ci.${"round_started" | "round_delivered" | "fix_cap_reached"}`
   | `conflict.${"round_started" | "round_delivered"}`
   | "run.warning"
