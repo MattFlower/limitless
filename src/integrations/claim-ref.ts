@@ -92,41 +92,40 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
   const repositories = cache<string>();
   const commits = cache<z.infer<typeof commitData>>();
   function cache<T>() {
+    // Shared requests have no caller signal; only each caller's wait is cancellable.
     const values = new Map<string, Promise<T>>();
-    // Pending requests share a signal; completed values are reusable by every caller.
-    const pendingSignals = new WeakMap<Promise<unknown>, AbortSignal | undefined>();
     return async (key: string, load: () => Promise<T>, signal?: AbortSignal) => {
+      signal?.throwIfAborted();
       let pending = values.get(key);
-      if (!pending || (pendingSignals.has(pending) && pendingSignals.get(pending) !== signal)) {
-        const current = load()
-          .then((value) => {
-            pendingSignals.delete(current);
-            values.set(key, current);
-            return value;
-          })
-          .catch((e) => {
-            if (values.get(key) === current) values.delete(key);
-            throw e;
-          });
-        pending = current;
-        pendingSignals.set(pending, signal);
+      if (!pending) {
+        pending = load().catch((e) => {
+          values.delete(key);
+          throw e;
+        });
         values.set(key, pending);
       }
-      return pending;
+      return wait(pending, signal);
     };
   }
-  async function call(repo: string, signal: AbortSignal | undefined, args: string[], body?: unknown) {
-    signal?.throwIfAborted();
+  async function wait<T>(request: Promise<T>, signal?: AbortSignal): Promise<T> {
+    // Observe the request even if it synchronously aborted the signal.
     const aborted = Promise.withResolvers<never>();
     const listener = signal && addAbortListener(signal, () => aborted.reject(signal.reason));
     try {
-      const request = deps.gh(args, signal, body === undefined ? undefined : JSON.stringify(body), repo);
       const output = await Promise.race([request, aborted.promise]);
       signal?.throwIfAborted();
-      return output ?? "";
+      return output;
     } finally {
       listener?.[Symbol.dispose]();
     }
+  }
+  async function call(repo: string, signal: AbortSignal | undefined, args: string[], body?: unknown) {
+    signal?.throwIfAborted();
+    const request = deps.gh(args, signal, body === undefined ? undefined : JSON.stringify(body), repo);
+    return wait(
+      request.then((output) => output ?? ""),
+      signal,
+    );
   }
   async function api(repo: string, signal: AbortSignal | undefined, path: string, body?: unknown) {
     const args = ["api", `repos/${repo}/${path}`];
@@ -155,7 +154,7 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
         const tipSha = z.object({ object: oid }).parse(JSON.parse(body)).object.sha;
         const raw = await commits(
           tipSha,
-          async () => commitData.parse(await api(repo, signal, `git/commits/${tipSha}`)),
+          async () => commitData.parse(await api(repo, undefined, `git/commits/${tipSha}`)),
           signal,
         );
         signal?.throwIfAborted();
@@ -179,14 +178,14 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
         if (record === "malformed") return unchanged;
         const tree = await trees(
           repo,
-          async () => oid.parse(await api(repo, signal, "git/trees", treeBody)).sha,
+          async () => oid.parse(await api(repo, undefined, "git/trees", treeBody)).sha,
           signal,
         );
         const id = await repositories(
           repo,
           async () => {
             const [owner, name] = repo.split("/");
-            const result = await graphql(repo, signal, repositoryQuery, { owner, name });
+            const result = await graphql(repo, undefined, repositoryQuery, { owner, name });
             return z
               .object({ data: z.object({ repository: z.object({ id: z.string().min(1) }) }) })
               .parse(result).data.repository.id;
@@ -239,7 +238,8 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
 export function memberId(store: Store): string {
   const existing = store.getSetting<string | null>("member.id", null);
   if (existing !== null) return existing;
-  const id = `m-${randomBytes(8).toString("hex")}`;
-  store.setSetting("member.id", id);
-  return id;
+  store.db
+    .query("INSERT OR IGNORE INTO settings (key, value) VALUES ('member.id', ?)")
+    .run(JSON.stringify(`m-${randomBytes(8).toString("hex")}`));
+  return z.string().parse(store.getSetting("member.id", null));
 }

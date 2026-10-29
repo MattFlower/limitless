@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,7 +50,7 @@ class GitHub {
   commits = new Map<string, RawCommit>();
   clock = Date.parse("2026-10-27T12:00:00Z");
   serial = 0;
-  fault?: (request: Request) => string | undefined;
+  fault?: (request: Request) => string | undefined | Promise<string | undefined>;
   constructor(readonly unconditional = false) {}
   key(repository: string, name: string) {
     return `${repository}:${name}`;
@@ -303,7 +303,12 @@ describe("protocol", () => {
         before = outcome.tip;
       }
       expect(gh.calls("update")).toHaveLength(3);
-      expect(gh.requests.every((r) => r.repo === repo && r.signal === controller.signal)).toBe(true);
+      expect(gh.requests.every((r) => r.repo === repo)).toBe(true);
+      for (const request of gh.requests) {
+        if (["tree", "repository", "commitRead"].includes(request.step))
+          expect(request.signal).not.toBe(controller.signal);
+        else expect(request.signal).toBe(controller.signal);
+      }
       expect(gh.calls("tree")).toHaveLength(1);
     },
   );
@@ -496,31 +501,76 @@ describe("outcomes", () => {
     };
     expect((await gh.client().write(repo, ref, before, held)).kind).toBe("unconfirmed");
   });
-  test.each(["success", "own", "equivalent", "unchanged", "moved"])(
-    "GitHub clock skew does not affect %s classification",
-    async (mode) => {
-      for (const offset of [-3_600_000, 3_600_000]) {
-        const gh = new GitHub();
-        gh.clock += offset;
-        const anchor = { inclusive: -offset * 97, exclusive: offset * 73 };
-        gh.fault = (r) => {
-          if (r.step !== "update" || mode === "success") return;
-          if (mode === "own") gh.apply(r);
-          if (mode === "equivalent") gh.seed(held);
-          if (mode === "moved") gh.seed({ ...held, generation: 2 });
-          throw new Error("Something went wrong");
-        };
-        const outcome = await gh.client(anchor).write(repo, ref, null, held);
-        expect(String(outcome.kind)).toBe(["success", "own", "equivalent"].includes(mode) ? "applied" : mode);
-        if (outcome.kind === "applied") {
-          expect(outcome.anchor).toEqual(mode === "equivalent" ? null : anchor);
-          expect(Date.parse(outcome.tip.committedAt)).toBeGreaterThanOrEqual(
-            Date.parse("2026-10-27T12:00:00Z") + offset,
+  for (const operation of ["create", "renew", "release"] as const) {
+    test.each(["success", "own", "equivalent", "unchanged", "moved", "unconfirmed", "commit failure"])(
+      `GitHub clock skew: ${operation} %s`,
+      async (mode) => {
+        for (const offset of [-3_600_000, 3_600_000]) {
+          const gh = new GitHub();
+          // Simulated host samples straddle zero so negative local anchors are exercised too.
+          const host = -offset;
+          gh.clock = host + offset;
+          const anchor = { inclusive: host, exclusive: host + 1 };
+          const record: ClaimRecord = {
+            ...held,
+            state: operation === "release" ? "released" : "held",
+          };
+          // Renewals retain an identical prior record to exercise unchanged-tip precedence.
+          const before = operation === "create" ? null : gh.seed(held);
+          const committedAt = new Date(gh.clock).toISOString();
+          let other: ClaimTip | undefined;
+          gh.fault = (r) => {
+            if (r.step === "commit" && mode === "commit failure") throw new Error("Commit failed");
+            if (r.step === "ref" && mode === "unconfirmed") throw new Error("Read failed");
+            if (r.step !== "update" || mode === "success") return;
+            if (mode === "own") gh.apply(r);
+            if (mode === "equivalent") other = gh.seed(record);
+            if (mode === "moved") other = gh.seed({ ...record, generation: 2 });
+            throw new Error("Something went wrong");
+          };
+          const outcome = await gh.client(anchor).write(repo, ref, before, record);
+          const expectedKind = ["success", "own", "equivalent"].includes(mode)
+            ? "applied"
+            : ["unchanged", "commit failure"].includes(mode)
+              ? "unchanged"
+              : mode;
+          expect(String(outcome.kind)).toBe(expectedKind);
+          if (outcome.kind === "applied") {
+            const ownSha = gh.calls("update")[0]?.body.variables?.u?.[0]?.afterOid;
+            const tip =
+              mode === "equivalent" ? other : ownSha ? { sha: ownSha, committedAt, record } : undefined;
+            if (!tip) throw new Error("Missing expected applied tip");
+            expect(outcome).toEqual({
+              kind: "applied",
+              tip,
+              anchor: mode === "equivalent" ? null : anchor,
+            });
+            if (mode === "equivalent") {
+              expect(other?.record).toEqual(record);
+              expect(other?.committedAt).toBe(new Date(Date.parse(committedAt) + 1).toISOString());
+              expect(other?.sha).not.toBe(ownSha);
+            }
+          }
+          if (outcome.kind === "unchanged") expect(outcome).toEqual({ kind: "unchanged", tip: before });
+          if (outcome.kind === "moved") {
+            if (!other) throw new Error("Missing expected competing tip");
+            expect(outcome).toEqual({ kind: "moved", tip: other });
+            expect(other?.record).toEqual({ ...record, generation: 2 });
+            expect(other?.committedAt).toBe(new Date(Date.parse(committedAt) + 1).toISOString());
+          }
+          if (outcome.kind === "unconfirmed")
+            expect(outcome).toEqual({ kind: "unconfirmed", error: "Error: Read failed" });
+          expect(gh.calls("update")).toHaveLength(mode === "commit failure" ? 0 : 1);
+          expect(gh.calls("ref")).toHaveLength(["success", "commit failure"].includes(mode) ? 0 : 1);
+          expect(gh.refs.get(gh.key(repo, ref))).toBe(
+            outcome.kind === "applied" || outcome.kind === "moved" ? outcome.tip.sha : before?.sha,
           );
+          if (mode !== "commit failure")
+            expect(gh.calls("update")[0]?.body.variables?.u?.[0]?.beforeOid).toBe(before?.sha ?? zeros);
         }
-      }
-    },
-  );
+      },
+    );
+  }
 });
 
 describe("failures", () => {
@@ -667,7 +717,9 @@ describe("failures", () => {
       const controller = new AbortController();
       const error = new DOMException("Cancelled", "AbortError");
       gh.fault = (r) => {
-        expect(r.signal).toBe(controller.signal);
+        if (["tree", "repository", "commitRead"].includes(r.step))
+          expect(r.signal).not.toBe(controller.signal);
+        else expect(r.signal).toBe(controller.signal);
         if (r.step === "update" && step !== "update") {
           gh.apply(r);
           throw new Error("Lost response");
@@ -741,7 +793,7 @@ describe("failures", () => {
 describe("isolation", () => {
   test.each(
     (["tree", "repository", "commitRead"] as const).flatMap((step) =>
-      [0, 1].map((cancelled) => ({ step, cancelled })),
+      [null, 0, 1].map((cancelled) => ({ step, cancelled })),
     ),
   )("pending $step cache isolates cancellation of caller $cancelled", async ({ step, cancelled }) => {
     const gh = new GitHub();
@@ -751,26 +803,25 @@ describe("isolation", () => {
     const controllers = [new AbortController(), new AbortController()];
     const error = new DOMException("Cancelled", "AbortError");
     const errors: unknown[] = [];
-    const client = createClaimClient({
-      sample: () => sample,
-      gh: async (...args) => {
-        const [argv, signal] = args;
-        const target = step === "tree" ? "git/trees" : step === "repository" ? "graphql" : "git/commits/";
-        if (argv[1]?.includes(target)) {
-          started.resolve();
-          // Keep the runner pending even on abort to check the client's own cancellation boundary.
-          await release.promise;
-          signal?.throwIfAborted();
-        }
-        return (await gh.gh(...args)) ?? "";
-      },
-    });
+    gh.fault = async (r) => {
+      if (r.step !== step) return;
+      started.resolve();
+      // Leave the runner pending even on abort to exercise each caller's own cancellation wait.
+      await release.promise;
+    };
+    const client = gh.client();
     const invoke = (index: number) => {
       const signal = controllers[index]?.signal;
       return (
         step === "commitRead"
           ? client.read(repo, ref, signal)
-          : client.write(repo, ref, null, held, { signal })
+          : client.write(
+              repo,
+              `refs/limitless/claims/${12 + index}`,
+              null,
+              { ...held, number: 12 + index },
+              { signal },
+            )
       ).catch((e: unknown) => {
         errors[index] = e;
         return null;
@@ -782,16 +833,31 @@ describe("isolation", () => {
     let results: Awaited<ReturnType<typeof invoke>>[] = [];
     try {
       await new Promise<void>((resolve) => setImmediate(resolve));
-      controllers[cancelled]?.abort(error);
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(errors[cancelled]).toBe(error);
-      expect(errors[1 - cancelled]).toBeUndefined();
+      if (cancelled !== null) {
+        controllers[cancelled]?.abort(error);
+        // The cancelled caller must settle while the shared request is still blocked.
+        expect(await [first, second][cancelled]).toBeNull();
+        expect(errors[cancelled]).toBe(error);
+        expect(errors[1 - cancelled]).toBeUndefined();
+      }
     } finally {
       release.resolve();
       results = await Promise.all([first, second]);
     }
-    expect(results[1 - cancelled]).toMatchObject({ kind: step === "commitRead" ? "tip" : "applied" });
-    expect(errors[1 - cancelled]).toBeUndefined();
+    expect(gh.calls(step)).toHaveLength(1);
+    for (const index of [0, 1]) {
+      if (index === cancelled) continue;
+      expect(results[index]).toMatchObject({ kind: step === "commitRead" ? "tip" : "applied" });
+      expect(errors[index]).toBeUndefined();
+    }
+    if (cancelled !== null && step !== "commitRead") {
+      expect(gh.calls("commit").map((r) => r.body.message)).not.toContain(
+        formatRecord({ ...held, number: 12 + cancelled }),
+      );
+      expect(gh.calls("update").map((r) => r.body.variables?.u?.[0]?.name)).not.toContain(
+        `refs/limitless/claims/${12 + cancelled}`,
+      );
+    }
     // A completed value can be reused by a caller with a different signal.
     const requests = gh.requests.length;
     if (step === "commitRead") await client.read(repo, ref, new AbortController().signal);
@@ -816,6 +882,45 @@ describe("isolation", () => {
     expect(gh.calls("repository")).toHaveLength(1);
     await Promise.all([client.read(repo, ref), client.read(repo, ref)]);
     expect(gh.calls("commitRead")).toHaveLength(1);
+  });
+  test.each(["tree", "repository"] as const)("failed shared %s load is evicted for a retry", async (step) => {
+    const gh = new GitHub();
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    gh.fault = async (r) => {
+      if (r.step !== step) return;
+      started.resolve();
+      await release.promise;
+      throw new Error("Shared load failed");
+    };
+    const client = gh.client();
+    const write = (number: number) =>
+      client.write(
+        repo,
+        `refs/limitless/claims/${number}`,
+        null,
+        { ...held, number },
+        { signal: new AbortController().signal },
+      );
+    const first = write(12);
+    await started.promise;
+    const second = write(13);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(gh.calls(step)).toHaveLength(1);
+    } finally {
+      release.resolve();
+    }
+    expect(await Promise.all([first, second])).toEqual([
+      { kind: "unchanged", tip: null },
+      { kind: "unchanged", tip: null },
+    ]);
+    expect(gh.calls("commit")).toHaveLength(0);
+    expect(gh.calls("update")).toHaveLength(0);
+    gh.fault = undefined;
+    expect((await write(14)).kind).toBe("applied");
+    expect(gh.calls(step)).toHaveLength(2);
+    expect(gh.calls("tree")).toHaveLength(step === "tree" ? 2 : 1);
   });
   test("101 historical refs need one exact read and never a listing", async () => {
     const gh = new GitHub();
@@ -852,6 +957,48 @@ describe("isolation", () => {
     expect(gh.calls("tree")).toHaveLength(3);
     expect(gh.calls("repository")).toHaveLength(3);
     expect(gh.calls("commitRead")).toHaveLength(5);
+  });
+  test("racing Store connections return the persisted member identity winner", () => {
+    const directory = mkdtempSync(join(tmpdir(), "claim-member-race-"));
+    const path = join(directory, "store.db");
+    const first = new Store(path);
+    const second = new Store(path);
+    let winner = "";
+    const read = first.getSetting.bind(first);
+    // Both connections see no identity before the second wins the insert.
+    const interleave = spyOn(first, "getSetting").mockImplementationOnce((key, fallback) => {
+      const snapshot = read(key, fallback);
+      expect(snapshot).toBeNull();
+      winner = memberId(second);
+      return snapshot;
+    });
+    try {
+      try {
+        expect(memberId(first)).toBe(winner);
+        expect(winner).toMatch(/^m-[0-9a-f]{16}$/);
+        expect(memberId(second)).toBe(winner);
+        expect(first.getSetting("member.id", "missing")).toBe(winner);
+        expect(first.db.query("SELECT value FROM settings WHERE key = 'member.id'").get()).toEqual({
+          value: JSON.stringify(winner),
+        });
+      } finally {
+        interleave.mockRestore();
+        first.close();
+        second.close();
+      }
+      const reopened = new Store(path);
+      try {
+        expect(memberId(reopened)).toBe(winner);
+        // Ordinary settings writes must still overwrite.
+        reopened.setSetting("member.id", held.holder);
+        expect(memberId(reopened)).toBe(held.holder);
+        expect(reopened.getSetting("member.id", "missing")).toBe(held.holder);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
   test("member id is opaque, stable and survives Store reopen", () => {
     const directory = mkdtempSync(join(tmpdir(), "claim-member-"));
