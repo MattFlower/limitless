@@ -797,37 +797,80 @@ test.each(["sha", "missing", "release", "environment"])(
   "resume rejects a %s mismatch instead of waiting on the old handle",
   async (kind) => {
     const { f, context, req } = await setup();
-    await withExecutor(f, async (workers) => {
-      const ctx = context();
-      const scratch = kind === "missing" ? undefined : createScratch(req.cwd);
-      const old = workers.enqueue(
-        {
-          ...req,
-          scratch,
-          releaseSha: kind === "release" ? "older" : release,
-          env: kind === "environment" ? { ...req.env, EXTRA_MARKER: "old-daemon" } : req.env,
+    const ctx = context();
+    const scratch = kind === "missing" ? undefined : createScratch(req.cwd);
+    const pidFile = join(fixture.home, "stale-pid");
+    const proceed = join(fixture.home, "stale-proceed");
+    // A short stale job can finish before resume. Persist first, then wait for cancellable work.
+    const old = f.workers.enqueue(
+      {
+        ...req,
+        scratch,
+        gates: {
+          ...gates,
+          setup: [],
+          checks: [
+            {
+              name: "stale",
+              run: `echo $$ > '${pidFile}'; while [ ! -f '${proceed}' ]; do sleep 0.05; done`,
+            },
+          ],
         },
-        randomUUID(),
-        true,
-      );
-      ctx.state.gateExecution = {
-        stage: "gates",
-        round: 0,
-        purpose: "initial",
-        sha: kind === "sha" ? "older" : req.headSha,
-        handle: { kind: "inplace", id: old, startedAt: Date.now() },
-      };
-      if (kind === "missing") f.store.db.query("DELETE FROM gate_jobs WHERE id=?").run(old);
-      writeFileSync(join(req.cwd, "greeting.txt"), "old gate output\n");
-      writeFileSync(join(req.cwd, "old-build"), "old gate output\n");
-      await ctx.save();
-      expect((await runGateExecution(context(), "gates", "initial", req.cwd, gates)).setupOk).toBe(true);
-      expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
-      expect(existsSync(join(req.cwd, "old-build"))).toBe(false);
-      if (kind !== "missing") expect(workers.job(old)?.state).toBe("cancelled");
-      if (scratch) expect(existsSync(scratch)).toBe(false);
-      expect(workers.jobs("in_place=1 AND state='done'")).toHaveLength(1);
-    });
+        releaseSha: kind === "release" ? "older" : release,
+        env: kind === "environment" ? { ...req.env, EXTRA_MARKER: "old-daemon" } : req.env,
+      },
+      randomUUID(),
+      true,
+    );
+    ctx.state.gateExecution = {
+      stage: "gates",
+      round: 0,
+      purpose: "initial",
+      sha: kind === "sha" ? "older" : req.headSha,
+      handle: { kind: "inplace", id: old, startedAt: Date.now() },
+    };
+    if (kind === "missing") f.store.db.query("DELETE FROM gate_jobs WHERE id=?").run(old);
+    writeFileSync(join(req.cwd, "greeting.txt"), "old gate output\n");
+    writeFileSync(join(req.cwd, "old-build"), "old gate output\n");
+    await ctx.save();
+    try {
+      await withExecutor(f, async (workers) => {
+        if (kind === "sha" || kind === "environment") {
+          await wait(() => existsSync(pidFile) || workers.job(old)?.state === "done", {
+            timeoutMs: 10_000,
+          });
+          expect(workers.job(old)?.state).toBe("leased");
+          await waitForPid(pidFile);
+        }
+        const executor = f.deps.gateExecutor;
+        if (!executor) throw new Error("missing gate executor");
+        const attach = executor.attach.bind(executor);
+        const attached = spyOn(executor, "attach").mockImplementation((handle, ...args) => {
+          if (handle.id === old) throw new Error("attached to stale gate result");
+          return attach(handle, ...args);
+        });
+        try {
+          expect(await runGateExecution(context(), "gates", "initial", req.cwd, gates)).toMatchObject({
+            setupOk: true,
+            sha: req.headSha,
+          });
+          expect(attached.mock.calls).toHaveLength(1);
+          expect(attached.mock.calls[0]?.[0]).toMatchObject({ kind: "inplace" });
+          expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+          expect(existsSync(join(req.cwd, "old-build"))).toBe(false);
+          if (kind !== "missing") expect(workers.job(old)?.state).toBe("cancelled");
+          if (scratch) expect(existsSync(scratch)).toBe(false);
+          expect(workers.jobs("in_place=1 AND state='done'")).toHaveLength(1);
+        } finally {
+          attached.mockRestore();
+        }
+      });
+    } finally {
+      writeFileSync(proceed, "");
+      f.workers.cancel(old);
+      await f.workers.waitStopped(old);
+      if (scratch) removeScratch(scratch);
+    }
   },
 );
 
@@ -962,12 +1005,23 @@ test.each(["SHA", "daemon port"])(
           { name: "long", run: "echo $$ > previous-pid; while [ ! -f stop-old ]; do sleep 0.05; done" },
         ],
       };
-      const pending = runGateExecution(current, "gates", "initial", req.cwd, long).catch((e) => e);
+      const pending = gateCommandScope(current, "gates", "initial", req.cwd, () =>
+        runGateExecution(current, "gates", "initial", req.cwd, long),
+      )().catch((e) => e);
+      const confirmed = Promise.withResolvers<void>();
+      const releaseWait = Promise.withResolvers<void>();
+      let stopped: ReturnType<typeof spyOn> | undefined;
+      let checkout: ReturnType<typeof spyOn> | undefined;
+      let replacement: ReturnType<typeof runGateExecution> | undefined;
       try {
         const pid = await waitForPid(join(req.cwd, "previous-pid"));
         const old = current.state.gateExecution?.handle.id ?? "";
+        const scratch = (JSON.parse(workers.job(old)?.request ?? "{}") as GateRequest).scratch;
+        if (!scratch) throw new Error("missing gate scratch");
         controller.abort(new Error("shutdown"));
         await pending;
+        writeFileSync(join(req.cwd, "greeting.txt"), "old gate output\n");
+        writeFileSync(join(req.cwd, "old-build"), "old gate output\n");
         if (kind === "SHA") {
           writeFileSync(join(req.cwd, "new-file"), "head moved");
           await sh(["git", "add", "new-file"], { cwd: req.cwd });
@@ -978,18 +1032,54 @@ test.each(["SHA", "daemon port"])(
             ? context()
             : new RunContext({ ...f.deps, cfg: { ...f.deps.cfg, port } }, first.run, first.repo, signal);
         let stoppedBeforeResult = false;
-        const result = await runGateExecution(resumed, "gates", "initial", req.cwd, gates, {
+        const originalWait = WorkerStore.prototype.waitStopped;
+        stopped = spyOn(WorkerStore.prototype, "waitStopped").mockImplementation(async function (
+          this: WorkerStore,
+          id,
+          signal,
+        ) {
+          await originalWait.call(this, id, signal);
+          if (id === old) {
+            confirmed.resolve();
+            await releaseWait.promise;
+          }
+        });
+        checkout = spyOn(repos, "checkoutCommitted");
+        replacement = runGateExecution(resumed, "gates", "initial", req.cwd, gates, {
           onResult: () => {
             stoppedBeforeResult = recoveryProcessStopped(pid);
           },
         });
-        expect(result.setupOk).toBe(true);
+        void replacement.catch(() => {});
+        await Promise.race([
+          confirmed.promise,
+          replacement.then(() => {
+            throw new Error("replacement finished before stop confirmation");
+          }),
+        ]);
+        expect(workers.job(old)).toMatchObject({ state: "cancelled", stopped: 1 });
+        expect(recoveryProcessStopped(pid)).toBe(true);
+        expect(checkout).not.toHaveBeenCalled();
+        expect(workers.jobs("in_place=1")).toHaveLength(1);
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("old gate output\n");
+        expect(existsSync(join(req.cwd, "old-build"))).toBe(true);
+        expect(existsSync(scratch)).toBe(true);
+        releaseWait.resolve();
+        expect((await replacement).setupOk).toBe(true);
+        expect(checkout).toHaveBeenCalledTimes(1);
+        expect(readFileSync(join(req.cwd, "greeting.txt"), "utf8")).toBe("hello\n");
+        expect(existsSync(join(req.cwd, "old-build"))).toBe(false);
+        expect(existsSync(scratch)).toBe(false);
         expect(workers.job(old)).toMatchObject({ state: "cancelled", stopped: 1 });
         expect(stoppedBeforeResult).toBe(true);
         expect(workers.jobs("in_place=1")).toHaveLength(2);
         const ports = readFileSync(join(fixture.home, "executor-ports"), "utf8").trim().split("\n");
         expect(ports.at(-1)).toBe(String(kind === "SHA" ? f.cfg.port : port));
       } finally {
+        releaseWait.resolve();
+        await replacement?.catch(() => {});
+        stopped?.mockRestore();
+        checkout?.mockRestore();
         writeFileSync(join(req.cwd, "stop-old"), "");
         controller.abort(new Error("shutdown"));
         await pending;
