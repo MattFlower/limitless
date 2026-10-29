@@ -73,6 +73,12 @@ test("#819-shaped quotes from the parent and docs/PLAN.md, and decision bullets,
   ).rejects.toThrow("unresolvable source: docs/MISSING.md");
 });
 
+test("a quote absent from an existing PLAN is not a whole source unit", async () => {
+  await expect(
+    resolve("From docs/PLAN.md:\n\n> The queue accepts untrusted issues.", "- Parent requirement."),
+  ).rejects.toThrow("quote is not a whole source unit");
+});
+
 test("quotes must equal one whole source unit", async () => {
   const parent = "- The service retries failed deliveries three times.\n- Other item.";
   await expect(resolve("> The service", parent)).rejects.toThrow("quote is not a whole source unit");
@@ -131,4 +137,69 @@ test("a ticket with neither form resolves to no units", async () => {
   await expect(
     resolveIntent({ ticket: issue(9, "No intent section."), parent: issue(1, "- a") }, read),
   ).rejects.toThrow("resolves to no units");
+});
+
+test("section boundaries ignore headings inside excluded details blocks", async () => {
+  const units = await resolve(
+    `#1's "Goal" section`,
+    `## Goal
+- Required before details.
+
+<details>
+<summary>Context</summary>
+
+## Hidden heading
+- Hidden context.
+</details>
+
+- Required after details.
+
+## Next
+- Outside the section.`,
+  );
+  expect(units.map((u) => u.text)).toEqual(["Required before details.", "Required after details."]);
+});
+
+test("a hidden duplicate heading does not make a visible section ambiguous", async () => {
+  const units = await resolve(
+    `#1's "Goal" section`,
+    `<details>
+## Goal
+- Hidden context.
+</details>
+
+## Goal
+- Visible requirement.
+
+## Next
+- Outside the section.`,
+  );
+  expect(units.map((u) => u.text)).toEqual(["Visible requirement."]);
+});
+
+test("plain context mentioning a section reference creates no additional units", async () => {
+  const units = await resolve(
+    `> Required behaviour.\n\nThis check does not use #1's "Risks" section.`,
+    "## Goal\n- Required behaviour.\n\n## Risks\n- Context only.",
+  );
+  expect(units.map((u) => u.text)).toEqual(["Required behaviour."]);
+});
+
+test("paragraph normalization cannot turn a wrapped mention into a reference line", async () => {
+  const units = await resolve(
+    `> Required behaviour.\n\n#1's "Risks"\nsection`,
+    "## Goal\n- Required behaviour.\n\n## Risks\n- Context only.",
+  );
+  expect(units.map((u) => u.text)).toEqual(["Required behaviour."]);
+});
+
+test("adjacent references preserve order, sources, docs classification and deduplication", async () => {
+  const units = await resolve(
+    `  #1's "Docs" section (docs)  \n#1's "Goal" section\n#1's "Docs" section (docs)`,
+    "## Goal\n- Behaviour.\n\n## Docs\n- Documentation.",
+  );
+  expect(brief(units)).toEqual([
+    ["U1", "Documentation.", "docs", '#1 "Docs"'],
+    ["U2", "Behaviour.", "behaviour", '#1 "Goal"'],
+  ]);
 });

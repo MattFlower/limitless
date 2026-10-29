@@ -14,13 +14,13 @@ const STATIONS = [
   { stage: "review" },
   { stage: "preview", optional: true },
   { stage: "verify" },
-  { stage: "accept", optional: true },
   { stage: "deliver" },
 ] as const satisfies readonly { stage: StageName; optional?: true }[];
 
-// A new StageName must get a station before this assignment can typecheck.
+// A new StageName other than engine-only acceptance must get a station before this can typecheck.
 export const PIPELINE: readonly { stage: StageName; optional?: true }[] &
-  (Exclude<StageName, (typeof STATIONS)[number]["stage"]> extends never ? unknown : never) = STATIONS;
+  (Exclude<StageName, "accept" | (typeof STATIONS)[number]["stage"]> extends never ? unknown : never) =
+  STATIONS;
 
 export interface PipelineCounts {
   queued: number;

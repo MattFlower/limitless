@@ -81,10 +81,11 @@ export function acceptanceRunRequest({
 }
 
 const norm = (text: string) => text.replace(/\s+/g, " ").trim();
-type Block = { text: string; kind: "quote" | "item" | "para" | "cell" };
+const sectionReference = /^#(\d+)'s "([^"]+)" section( \(docs\))?$/;
+type Block = { text: string; kind: "quote" | "item" | "para" | "cell" | "reference" };
 
 /** Whole units: list items, paragraphs, blockquote paragraphs and table cells; no fences or <details>. */
-export function markdownUnits(md: string): Block[] {
+export function markdownUnits(md: string, references = false): Block[] {
   const out: Block[] = [];
   let current: Block | undefined;
   let fence = "";
@@ -114,6 +115,11 @@ export function markdownUnits(md: string): Block[] {
       flush();
       return;
     }
+    if (!quoted && references && sectionReference.test(body)) {
+      flush();
+      out.push({ text: body, kind: "reference" });
+      return;
+    }
     if (body.startsWith("|")) {
       flush();
       if (separator(body) || separator(lines[i + 1]?.body)) return;
@@ -141,8 +147,13 @@ export function markdownUnits(md: string): Block[] {
 function section(md: string, heading: string): string | undefined {
   const lines = md.split("\n");
   let fence = false;
+  let details = 0;
   const heads: { i: number; level: number; text: string }[] = [];
   lines.forEach((line, i) => {
+    if (!fence && (details || /^\s*<details\b/i.test(line))) {
+      details += (line.match(/<details\b/gi)?.length ?? 0) - (line.match(/<\/details>/gi)?.length ?? 0);
+      return;
+    }
     if (/^\s*(`{3,}|~{3,})/.test(line)) fence = !fence;
     const h = !fence && /^(#{1,6})\s+(.*?)[\s#]*$/.exec(line);
     if (h) heads.push({ i, level: h[1]?.length ?? 0, text: norm(h[2] ?? "") });
@@ -180,8 +191,8 @@ export async function resolveIntent(
       );
     return sources.get(source) as Promise<Block[]>;
   };
-  for (const block of markdownUnits(section(ticket.body, "The original intent") ?? "")) {
-    const ref = /#(\d+)'s "([^"]+)" section( \(docs\))?/.exec(block.text);
+  for (const block of markdownUnits(section(ticket.body, "The original intent") ?? "", true)) {
+    const ref = block.kind === "reference" && sectionReference.exec(block.text);
     const from = /^From (#\d+|[\w-]+(?:[./][\w-]+)+)\b.*:$/.exec(block.text);
     if (ref) {
       if (Number(ref[1]) !== parent.number)

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
@@ -8,9 +8,9 @@ import { localExecutor } from "../src/gates/executor.ts";
 import { resolveRepo } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { type AcceptanceState, acceptanceEngine, acceptanceRunRequest } from "../src/pipeline/acceptance.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { localCheckpointer, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
-import type { Fault } from "../src/pipeline/faults.ts";
+import { type Fault, SimulatedTermination } from "../src/pipeline/faults.ts";
 import { AcceptanceSchema } from "../src/pipeline/schemas.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
@@ -63,7 +63,9 @@ const output = (items: Item[]) => ({
   })),
 });
 
-async function setup(options: { setup?: string; parent?: string; ticket?: string } = {}) {
+async function setup(
+  options: { setup?: string; parent?: string; ticket?: string; junit?: "stale" | "missing" } = {},
+) {
   writeFileSync(join(repoDir, ".gitignore"), "local.env\n");
   writeFileSync(
     join(repoDir, ".limitless.toml"),
@@ -75,9 +77,20 @@ async function setup(options: { setup?: string; parent?: string; ticket?: string
 test("passes", () => expect(1).toBe(1));
 test("also passes", () => expect(1).toBe(1));
 test("fails", () => expect(1).toBe(2));
-test.skip("skipped", () => {});
+test${".skip"}("skipped", () => {});
 `,
   );
+  mkdirSync(join(repoDir, "docs"), { recursive: true });
+  writeFileSync(join(repoDir, "docs/PLAN.md"), "- The queue skips untrusted issues.\n");
+  if (options.junit)
+    writeFileSync(
+      join(repoDir, "junit-evidence.sh"),
+      `bun test -t '(?:^| )passes$' ./x.test.ts "$@"
+status=$?
+${options.junit === "stale" ? 'touch -t 200001010000 "$LIMITLESS_GATE_REPORT"' : 'rm -f "$LIMITLESS_GATE_REPORT"'}
+exit "$status"
+`,
+    );
   writeFileSync(join(repoDir, "notes.txt"), "a\nb\n");
   await sh(["git", "add", "."], { cwd: repoDir });
   await sh(["git", "commit", "-qm", "acceptance fixture"], { cwd: repoDir });
@@ -90,7 +103,11 @@ test.skip("skipped", () => {});
   const executor = localExecutor();
   const start = executor.start.bind(executor);
   executor.start = (request, signal) => {
-    for (const check of request.gates.checks) if (check.run.includes(" -t ")) targeted.push(check.run);
+    for (const check of request.gates.checks)
+      if (check.run.includes(" -t ")) {
+        targeted.push(check.run);
+        if (options.junit) check.run = "bash ./junit-evidence.sh";
+      }
     return start(request, signal);
   };
   const cfg = loadConfig({ home: join(home, "data"), configDir: join(home, "cfg") });
@@ -184,6 +201,64 @@ test("all units verified met succeed without publishing, at the pinned SHA", asy
   await t.published();
 });
 
+test("adjacent section references retain an unassessed requirement and prevent success", async () => {
+  const t = await setup({
+    parent: "## Goal\n- Required goal.\n\n## Demo\n- Required demo.",
+    ticket: `## The original intent\n#1's "Goal" section\n#1's "Demo" section`,
+  });
+  t.reply(() => ({
+    structured: output([{ unit: "U1", verdict: "met", tests: ["passes"] }]),
+  }));
+  expect(await t.execute()).toBe("needs_human");
+  expect(t.outcome().units.map((u) => [u.unit, u.verdict])).toEqual([
+    ["U1", "met"],
+    ["U2", "not_assessed"],
+  ]);
+  await t.published();
+});
+
+test.each(["stale", "missing"] as const)(
+  "%s JUnit evidence cannot satisfy acceptance despite successful execution",
+  async (junit) => {
+    const t = await setup({
+      junit,
+      parent: "- Required behaviour.",
+      ticket: "## The original intent\n> Required behaviour.",
+    });
+    t.reply(() => ({ structured: output([{ unit: "U1", verdict: "met", tests: ["passes"] }]) }));
+    expect(await t.execute()).toBe("needs_human");
+    expect(t.state()?.coveringTestRuns?.[0]?.result).toMatchObject({
+      ok: true,
+      exitCode: 0,
+      coveringTest: { file: "x.test.ts", name: "passes", reason: "JUnit report missing, stale or unsafe" },
+    });
+    expect(t.outcome().units).toEqual([
+      {
+        unit: "U1",
+        verdict: "unmet",
+        citations: [],
+        refusals: ["x.test.ts › passes: JUnit report missing, stale or unsafe"],
+        note: "",
+      },
+    ]);
+    expect(t.targeted).toHaveLength(1);
+    await t.published();
+  },
+);
+
+test("a quote absent from the tracked PLAN at the checked SHA fails before the model", async () => {
+  const t = await setup({
+    ticket: "## The original intent\nFrom docs/PLAN.md:\n\n> The queue accepts untrusted issues.",
+  });
+  expect(await t.execute()).toBe("failed");
+  expect(t.f.store.getRun(t.run.id)?.error).toContain("quote is not a whole source unit");
+  expect(t.state()?.acceptance?.sha).toBe(t.sha);
+  expect(t.calls()).toBe(0);
+  expect(t.targeted).toHaveLength(0);
+  expect(t.state()?.acceptance?.outcome).toBeUndefined();
+  await t.published();
+});
+
 const adversarialParent = `## Goal
 ${Array.from({ length: 8 }, (_, i) => `- Behaviour ${i + 1}.`).join("\n")}
 
@@ -235,7 +310,8 @@ test("claimed met verdicts are downgraded unless the engine verifies them", asyn
     ["U15", "manual"],
   ]);
   expect(verdict("U1")?.refusals).toEqual(["x.test.ts › fails: test failed"]);
-  expect(verdict("U2")?.refusals[0]).toContain("x.test.ts › skipped: ");
+  expect(verdict("U2")?.refusals).toEqual(["x.test.ts › skipped: named test skipped"]);
+  expect(verdict("U2")?.citations).toEqual([]);
   expect(verdict("U3")?.refusals[0]).toContain("x.test.ts › no such test: ");
   expect(verdict("U4")?.refusals).toEqual(["local.env: file not tracked at verified SHA"]);
   expect(verdict("U5")?.refusals).toEqual(["../outside.txt: file outside repository or invalid retry file"]);
@@ -304,13 +380,13 @@ const metAll = output([
 ]);
 const parsedMetAll = AcceptanceSchema.parse(metAll);
 
-test.each(["manifest", "covering-test", "outcome"] as const)(
+test.each(["manifest", "output", "covering-test", "outcome"] as const)(
   "a restart after the %s checkpoint resumes without repeating it",
   async (boundary) => {
     const t = await setup();
     const shutdown = new AbortController();
     t.reply(() => ({ structured: metAll }));
-    const faults: Record<typeof boundary, [string, Fault]> = {
+    const faults: Record<Exclude<typeof boundary, "output">, [string, Fault]> = {
       manifest: ["harness:invoke", { action: "hang", onHit: () => shutdown.abort(new Error("shutdown")) }],
       "covering-test": [
         "store:save",
@@ -318,18 +394,34 @@ test.each(["manifest", "covering-test", "outcome"] as const)(
       ],
       outcome: ["store:save", { action: "kill", when: () => !!t.state()?.acceptance?.outcome }],
     };
-    const [point, fault] = faults[boundary];
-    t.f.deps.faults = { [point]: fault };
+    if (boundary === "output") {
+      t.f.deps.checkpointer = {
+        ...localCheckpointer(t.f.store),
+        checkpoint(_runId, label) {
+          if (label === "acceptance-output") throw new SimulatedTermination("saved acceptance output");
+        },
+      };
+    } else {
+      const [point, fault] = faults[boundary];
+      t.f.deps.faults = { [point]: fault };
+    }
     expect(["queued", "running"]).toContain(await t.execute(shutdown.signal));
     const before = t.state();
     expect(before?.acceptance?.manifest).toHaveLength(3);
     if (boundary !== "manifest") expect(before?.acceptance?.output).toEqual(parsedMetAll);
+    if (boundary === "output") {
+      expect(t.calls()).toBe(1);
+      expect(t.targeted).toHaveLength(0);
+      expect(before?.coveringTestRuns).toBeUndefined();
+    }
     if (boundary === "covering-test") expect(before?.coveringTestRuns?.[0]?.result).toBeDefined();
     const ran = t.targeted.length;
     t.f.deps.faults = undefined;
+    t.f.deps.checkpointer = undefined;
     expect(await t.execute()).toBe("succeeded");
     const after = t.state();
     expect(t.calls()).toBe(1);
+    expect(after?.coveringTestRuns?.map((r) => r.name)).toEqual(["passes", "also passes"]);
     expect(after?.acceptance?.manifest).toEqual(before?.acceptance?.manifest);
     if (boundary === "outcome") {
       expect(after?.acceptance?.outcome).toEqual(before?.acceptance?.outcome);
