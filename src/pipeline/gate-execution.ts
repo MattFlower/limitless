@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { StageName } from "../core/types.ts";
 import { hostLoadPerCore, WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
@@ -117,6 +118,7 @@ export async function resumeGateExecution(
   cwd: string,
   env = gateEnv(),
   sha?: string,
+  preserveSequence = true,
 ) {
   ctx.checkCancelled();
   const pending = ctx.state.gateExecution;
@@ -128,8 +130,8 @@ export async function resumeGateExecution(
     pending?.stage === stage &&
     pending.handle.kind !== "local" &&
     pending.round === round &&
-    pending.purpose === purpose &&
-    (["baseline", "initial", "rebase"].includes(purpose) || purpose.startsWith("covering-test:")) &&
+    (pending.purpose === purpose ||
+      (preserveSequence && pending.previous?.some((attempt) => attempt.purpose === purpose))) &&
     (pending.handle.kind !== "inplace" || executor?.canResume?.(pending.handle, env, ctx.deps.cfg.port)) &&
     pending.sha === sha
       ? pending.handle
@@ -138,10 +140,17 @@ export async function resumeGateExecution(
     const workers = new WorkerStore(ctx.store, ctx.deps.buildSha);
     const job = pending.handle.kind === "inplace" ? workers.job(pending.handle.id) : null;
     const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
-    await cancelGateExecution(
-      pending.handle,
-      pending.handle.kind === "inplace" ? lanExecutor(workers, [], true) : executor,
-    );
+    try {
+      await cancelGateExecution(
+        pending.handle,
+        pending.handle.kind === "inplace" ? lanExecutor(workers, [], true) : executor,
+      );
+      if (pending.handle.githubActions?.cleanupFailed)
+        throw new Error("GitHub Actions gate cleanup remains pending");
+    } catch (error) {
+      await ctx.save("gate-cleanup-pending");
+      throw error;
+    }
     ctx.state.gateExecution = undefined;
     await ctx.save();
     if (pending.handle.kind === "inplace")
@@ -151,7 +160,7 @@ export async function resumeGateExecution(
   return stored;
 }
 
-/** Resume only a stage's first execution; later attempts depend on its setup. */
+/** Keep earlier results with the active attempt until the consumer durably saves its result. */
 export async function runGateExecution(
   ctx: RunContext,
   stage: StageName,
@@ -164,9 +173,38 @@ export async function runGateExecution(
 ): Promise<GateRun> {
   ctx.checkCancelled();
   const sha = await headSha(cwd);
-  const stored = await resumeGateExecution(ctx, stage, purpose, cwd, env, sha);
   const executor = ctx.deps.gateExecutor;
   const round = ctx.state.round;
+  const pending = ctx.state.gateExecution;
+  const sameIdentity = pending?.stage === stage && pending.round === round && pending.sha === sha;
+  const gateKey = createHash("sha256").update(JSON.stringify(gates)).digest("hex");
+  const previous = sameIdentity ? [...(pending.previous ?? [])] : [];
+  const replay = previous.find((attempt) => attempt.purpose === purpose && attempt.gateKey === gateKey);
+  if (replay) {
+    await resumeGateExecution(ctx, stage, pending?.purpose ?? purpose, cwd, env, sha);
+    if (pending && executor?.kind !== pending.handle.kind)
+      throw new Error(`Unavailable gate executor: ${pending.handle.kind}`);
+    return structuredClone(replay.result);
+  }
+  const completed = pending?.handle.githubActions?.completed;
+  let stored: ExecutionHandle | undefined;
+  if (
+    sameIdentity &&
+    pending.gateKey &&
+    completed &&
+    (pending.purpose !== purpose || pending.gateKey !== gateKey)
+  ) {
+    // Leave the previous identity durable until the next handle and its history replace it together.
+    try {
+      await cancelGateExecution(pending.handle, executor);
+      if (pending.handle.githubActions?.cleanupFailed)
+        throw new Error("GitHub Actions gate cleanup remains pending");
+    } catch (error) {
+      await ctx.save("gate-cleanup-pending");
+      throw error;
+    }
+    previous.push({ purpose: pending.purpose, gateKey: pending.gateKey, result: completed });
+  } else stored = await resumeGateExecution(ctx, stage, purpose, cwd, env, sha, false);
   let settled = false;
   try {
     const result = await executeGate(
@@ -191,9 +229,11 @@ export async function runGateExecution(
       hooks,
       executor,
       stored,
-      async ({ kind, id, startedAt, url }) => {
-        ctx.state.gateExecution = { stage, round, purpose, sha, handle: { kind, id, startedAt, url } };
-        if (purpose === "timeout") ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
+      async (handle) => {
+        const first = ctx.state.gateExecution?.handle.id !== handle.id;
+        ctx.state.gateExecution = { stage, round, purpose, sha, handle, gateKey, previous };
+        if (first && purpose === "timeout")
+          ctx.state.gateTimeoutReruns = (ctx.state.gateTimeoutReruns ?? 0) + 1;
         await ctx.save("gate-started");
       },
       () => {
@@ -210,13 +250,25 @@ export async function runGateExecution(
     if (handle) onExecuted?.(handle, result);
     return result;
   } finally {
-    // A termination before attach leaves the durable identity available for resume.
+    // A termination before attach leaves the durable identity available for resume; so does
+    // failed remote cleanup, so a later resume or discard retries it.
     if (
       settled &&
-      !(["lan", "inplace"].includes(ctx.state.gateExecution?.handle.kind ?? "") && gateShutdown(ctx.signal))
+      !(
+        ["lan", "inplace", "github-actions"].includes(ctx.state.gateExecution?.handle.kind ?? "") &&
+        gateShutdown(ctx.signal)
+      ) &&
+      !ctx.state.gateExecution?.handle.githubActions?.cleanupFailed &&
+      !ctx.state.gateExecution?.handle.githubActions?.completed
     ) {
       ctx.state.gateExecution = undefined;
       await ctx.save("gate-result");
     }
   }
+}
+
+/** Call only when saving the consumer's result in the same checkpoint. */
+export function consumeGateExecution(ctx: RunContext): void {
+  const progress = ctx.state.gateExecution?.handle.githubActions;
+  if (progress?.completed && !progress.cleanupFailed) ctx.state.gateExecution = undefined;
 }

@@ -120,7 +120,12 @@ import {
 import { runCoveringTests } from "./covering-tests.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
-import { gateCommandScope, resumeGateExecution, runGateExecution } from "./gate-execution.ts";
+import {
+  consumeGateExecution,
+  gateCommandScope,
+  resumeGateExecution,
+  runGateExecution,
+} from "./gate-execution.ts";
 import {
   checkDiscreetCommits,
   DiscreetError,
@@ -3571,6 +3576,7 @@ async function mergeForDelivery(
               timedOut: timeoutOnly(after),
               comparison: redactPostMergeComparisons(comparison, Object.fromEntries(workers)),
             });
+            consumeGateExecution(ctx);
             await ctx.save("post-merge-confirmation-pending");
             return attempt.result;
           })());
