@@ -846,6 +846,8 @@ test("deploy restores the previous checkout when injected smoke fails before res
         leaseClient: async () => ({ id: "lease", acquired: true }),
         releaseDir: dir,
         lockPath: join(dir, "deploy.lock"),
+        // Never read the machine's real LaunchAgents: the fake command can't answer plutil.
+        agentsDir: join(dir, "LaunchAgents"),
         command,
         client: {
           admin: async () => {
