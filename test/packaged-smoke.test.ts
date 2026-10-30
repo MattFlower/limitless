@@ -348,7 +348,10 @@ test("packaged workflows pin toolchains, run Linux in parallel and reserve macOS
     manual = read("packaged-smoke.yml");
   expect(Object.keys(manual.on)).toEqual(["workflow_dispatch"]);
   expect(manual.permissions).toEqual({ contents: "read" });
-  const actions = ci.jobs.check?.steps.flatMap((step) => (step.uses ? [step.uses] : []));
+  const checkActions = ci.jobs.check?.steps.flatMap((step) => (step.uses ? [step.uses] : [])) ?? [];
+  for (const action of checkActions) expect(action).toMatch(/@[0-9a-f]{40}$/);
+  // Only the check job uploads the JUnit report; the toolchain actions must match.
+  const actions = checkActions.filter((action) => !action.startsWith("actions/upload-artifact@"));
   for (const [workflow, platform] of [
     [ci, "ubuntu-latest"],
     [manual, "macos-15"],

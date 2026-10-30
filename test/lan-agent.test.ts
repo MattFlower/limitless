@@ -7,6 +7,7 @@ import { Store } from "../src/db/store.ts";
 import { WorkerStore } from "../src/db/workers.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import type { AgentEvent } from "../src/harness/types.ts";
+import { ClaimLostError } from "../src/integrations/claim-errors.ts";
 import type { AgentCall, AgentPublication } from "../src/pipeline/agent-executor.ts";
 import { NeedsHumanError } from "../src/pipeline/context.ts";
 import { SimulatedTermination } from "../src/pipeline/faults.ts";
@@ -821,4 +822,40 @@ test("older worker reports mentioning authentication retain ordinary task errors
   f.complete(f.job(), { ...(await f.report()), status: "error", error: "Test user cannot authenticate" });
   expect(await running).toMatchObject({ status: "error", error: "Test user cannot authenticate" });
   expect(f.counts()).toMatchObject({ locals: 0, adopted: 1 });
+});
+
+test.each(["abort", "done", "open"])("claim interruption precedes resume race: %s", async (race) => {
+  const f = fixture();
+  const { id, controller } = await detach(f);
+  const hooks = f.call.publication;
+  if (!hooks) throw new Error("Missing publication");
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<boolean>();
+  const sentinel = new ClaimLostError();
+  hooks.resume = () => {
+    entered.resolve();
+    return release.promise;
+  };
+  const adopt = spyOn(hooks, "adopt");
+  const cancel = spyOn(f.workers, "cancelAgentJob");
+  const running = f.run().catch((error: unknown) => error);
+  await entered.promise;
+  if (race === "abort") controller.abort();
+  if (race === "done") f.complete(id, await f.report());
+  release.reject(sentinel);
+  expect(await running).toBe(sentinel);
+  expect(adopt).not.toHaveBeenCalled();
+  expect(cancel).not.toHaveBeenCalled();
+  expect(f.counts()).toMatchObject({ locals: 0, adopted: 0, jobs: 1 });
+});
+
+test("claim interruption during preparation is never wrapped", async () => {
+  const f = fixture();
+  if (!f.call.publication) throw new Error("Missing publication");
+  const sentinel = new ClaimLostError();
+  f.call.publication.prepare = async () => {
+    throw sentinel;
+  };
+  await expect(f.run()).rejects.toBe(sentinel);
+  expect(f.counts()).toMatchObject({ locals: 0, jobs: 0, adopted: 0 });
 });
