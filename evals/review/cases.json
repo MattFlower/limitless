@@ -7259,7 +7259,7 @@
           "on": "2026-10-30",
           "rule": "evals/review/LABELS.md (held-out clean-case audit, 2026-10-30)",
           "by": "blind adjudication 2026-10-29 (codex/sol-6.1 high and claude/opus), reproduction re-run by the orchestrator 2026-10-30",
-          "evidence": "Head src/pipeline/gate-evidence.ts:74 rejects a check with any skippedFiles and :104 requires every check to pass that guard. Re-run: applyGateEvidence with test/server.test.ts passed and an unrelated test/sandbox.test.ts skipped returns \"blocked ... without retries or skipped tests\"; without the skipped file it returns \"met\". Fixed later on main by #647. Head src/gates/test-coverage.ts:37 accepts any `<x>.test.ts:` line as a header and :47 any `(pass)` line; run.ts feeds stdout and stderr into it. Re-run: a real `bun test` of one test that prints `test/missing.test.ts:` and `(pass) fabricated` gives passedFiles [\"test/missing.test.ts\"]. Base has neither the substitution nor the parser. Rejected as gold: a crash between checkpoint and finishStage (needs a hard kill between two synchronous writes; minor)."
+          "evidence": "Head src/pipeline/gate-evidence.ts:74 rejects a check with any skippedFiles and :104 requires every check to pass that guard. Re-run: applyGateEvidence with test/server.test.ts passed and an unrelated test/sandbox.test.ts skipped returns \"blocked ... without retries or skipped tests\"; without the skipped file it returns \"met\". Fixed later on main by #647. Head src/gates/test-coverage.ts:37 accepts any `<x>.test.ts:` line as a header and :47 any `(pass)` line; run.ts feeds stdout and stderr into it. Re-run: a real `bun test` of one test that prints `test/missing.test.ts:` and `(pass) fabricated` gives passedFiles [\"test/missing.test.ts\"]. Base has neither the substitution nor the parser. Kept as an optional minor, not gold: a crash between checkpoint and finishStage (needs a hard kill between two synchronous writes; minor)."
         }
       ]
     },
@@ -8002,7 +8002,7 @@
         },
         {
           "file": "src/harness/types.ts",
-          "lines": [226, 232],
+          "lines": [230, 230],
           "severity": "minor",
           "category": "logic",
           "summary": "A threshold call whose result never arrives defers the loop stop until the next tool call or the end of the invocation.",
@@ -8018,7 +8018,7 @@
           "on": "2026-10-30",
           "rule": "evals/review/LABELS.md (held-out clean-case audit, 2026-10-30)",
           "by": "blind adjudication 2026-10-29 (codex/sol-6.1 high and claude/opus), reproduction re-run by the orchestrator 2026-10-30",
-          "evidence": "Head src/harness/types.ts:217 only sets `same = 0` on a changed result and never removes earlier same-key entries from `recent`; the request requires dropping them. Re-run: LoopDetector(1000) on [poll a with changing output, poll b with changing output, Bash failing with identical output] x12 returns no stop after 12 identical failing calls (36 calls) and finish() returns null. Rejected as gold: window eviction forgetting the previous identical result (stops a genuine repeat loop at most one call early; minor), pending identical calls finalized by an unrelated call (also at base), never-returning poll deferring a stop (minor)."
+          "evidence": "Head src/harness/types.ts:217 only sets `same = 0` on a changed result and never removes earlier same-key entries from `recent`; the request requires dropping them. Re-run: LoopDetector(1000) on [poll a with changing output, poll b with changing output, Bash failing with identical output] x12 returns no stop after 12 identical failing calls (36 calls) and finish() returns null. Not gold: window eviction forgetting the previous identical result (stops a genuine repeat loop at most one call early; minor), pending identical calls finalized by an unrelated call (also at base), never-returning poll deferring a stop (minor)."
         }
       ]
     },
@@ -8597,7 +8597,7 @@
           "on": "2026-10-30",
           "rule": "evals/review/LABELS.md (held-out clean-case audit, 2026-10-30)",
           "by": "blind adjudication 2026-10-29 (codex/sol-6.1 high and claude/opus), reproduction re-run by the orchestrator 2026-10-30",
-          "evidence": "Head .limitless.toml:10 runs `bun test --parallel=$(bun scripts/test-workers.ts)` (base: `bun test`); src/pipeline/gate-evidence.ts:13-16, unchanged, accepts only /^bun test(?: [\\w./-]+)*$/. Re-run in the head checkout: gateTestCommand(head command, package.json scripts) returns null; gateTestCommand(\"bun test\") returns \"bun test\". Both adjudicators showed applyGateEvidence then refuses with \"do not cover every required verification step\". Rejected as gold: worker count missing from the baseline cache key (flake classification only; minor), measurements missing from the PR description (process)."
+          "evidence": "Head .limitless.toml:10 runs `bun test --parallel=$(bun scripts/test-workers.ts)` (base: `bun test`); src/pipeline/gate-evidence.ts:13-16, unchanged, accepts only /^bun test(?: [\\w./-]+)*$/. Re-run in the head checkout: gateTestCommand(head command, package.json scripts) returns null; gateTestCommand(\"bun test\") returns \"bun test\". Both adjudicators showed applyGateEvidence then refuses with \"do not cover every required verification step\". Not gold: worker count missing from the baseline cache key (flake classification only; minor), measurements missing from the PR description (process)."
         }
       ]
     },

@@ -427,8 +427,9 @@ of the existing `dev`/`heldout` assignment and seed.
 Every M5.2 held-out system blocked review-068, review-092 and review-108, so held-out clean blocks were
 saturated. Each blocking claim from the stored held-out evals was adjudicated blind (system identity
 withheld) by codex/sol-6.1 at high effort and by claude/opus, under the 2026-10-08 rule. The orchestrator
-then re-ran the evidence in a checkout of each case's head. Claims the two adjudicators rated differently
-were settled by consequence: medium needs a realistic input in normal operation.
+then re-ran the reproduction of every gold claim in a checkout of each case's head. Claims the two
+adjudicators rated differently were settled by consequence from their evidence: medium needs a realistic
+input in normal operation.
 
 | Case | PR | Split | Gold | Optional | Downgraded | Rejected | Outcome |
 |---|---|---|---|---|---|---|---|
@@ -466,5 +467,5 @@ Downgraded claims stay as optional (minor) defects, as in the M5.2 procedure.
 After the audit, the held-out clean set is the ten clean cases from the 2026-10-16 fresh set.
 review-114 is the only held-out case blocked by both production and D, and both of its claims were
 rejected. review-133's Unicode claim was already confirmed minor (sandbox PR #14 above). Decisions
-measured before this audit keep their recorded verdicts. #551 (D) recorded 10/26 clean blocks against
-7/26. On true clean cases it is 4/20 against 2/20.
+measured before this audit keep their recorded verdicts. #551 recorded 10/26 held-out clean blocks for D
+against 7/26 for production's standard reviewer. On the true clean cases it is 4/20 against 2/20.
