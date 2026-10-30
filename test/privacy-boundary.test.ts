@@ -59,6 +59,11 @@ test("prepared readings retain intermediates, alignments, normalization and slas
   );
   expect(checkPrepared(prepared, `prefix ${word.slice(0, 6)}%a`, { truncated: true })).toEqual(match());
   expect(checkPrepared(prepared, `prefix ${word.slice(0, 6)}%a`)).toEqual({ clean: true });
+  // A short credential's base64 run inside other text stays encoded for private entries.
+  const mixed = preparePrivacyPolicy(snapshot([`${b64("abcd")} tail`], ["abcd"]));
+  for (const text of [`${b64("abcd")}\n tail`, `${b64("abcd")} t%2561il`])
+    expect(checkPrepared(mixed, text)).toEqual(match());
+  expect(checkPrepared(mixed, b64("abcd"))).toEqual(match(true, []));
   const wide = "Ａ".repeat(4);
   expect(checkPrepared(preparePrivacyPolicy(snapshot([wide])), b64("A".repeat(4)))).toEqual({ clean: true });
 });
@@ -149,7 +154,7 @@ test.each([
 test("forms refuse at cap plus one, reject ill-formed inputs and never return partial matches", () => {
   for (const [key, cap, code] of [
     ["formLength", 3, "form-length"],
-    ["formsTotal", 18, "forms-total"],
+    ["formsTotal", 21, "forms-total"],
   ] as const) {
     expect(checkPrepared(preparePrivacyPolicy(snapshot(["abc"]), { limits: { [key]: cap } }), "abc")).toEqual(
       match(),

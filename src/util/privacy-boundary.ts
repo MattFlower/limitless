@@ -32,9 +32,12 @@ export function createPrivacyRegistry(secrets = createCredentialRegistry(), chec
   let entries: PrivateStrings = [];
   let policy = 0;
   const identity = Symbol();
+  const copy = () => entries.map((entry) => ({ ...entry }));
+  const generation = () =>
+    Object.freeze({ identity, policy, credentials: secrets.generation, checker: checker() });
   return {
     get entries() {
-      return entries.map((entry) => ({ ...entry }));
+      return copy();
     },
     replacePolicy(value: PrivateStrings) {
       entries = value.map((entry) => ({ ...entry }));
@@ -42,13 +45,9 @@ export function createPrivacyRegistry(secrets = createCredentialRegistry(), chec
     },
     addCredential: secrets.add,
     get generation() {
-      return Object.freeze({ identity, policy, credentials: secrets.generation, checker: checker() });
+      return generation();
     },
-    snapshot: () => ({
-      entries: entries.map((entry) => ({ ...entry })),
-      credentials: secrets.values(),
-      generation: Object.freeze({ identity, policy, credentials: secrets.generation, checker: checker() }),
-    }),
+    snapshot: () => ({ entries: copy(), credentials: secrets.values(), generation: generation() }),
   };
 }
 export const privacyRegistry = createPrivacyRegistry(credentialRegistry);
@@ -76,8 +75,8 @@ export function preparePrivacyPolicy(
   const originals = [...snapshot.entries.map(({ value }) => value), ...snapshot.credentials];
   if (originals.some((value) => !value.isWellFormed())) return refuse("ill-formed");
   if (originals.some((value) => value.length > limits.originalLength)) return refuse("original-length");
-  if (originals.reduce((sum, value) => sum + value.length, 0) > limits.originalsTotal)
-    return refuse("originals-total");
+  const sum = (values: string[]) => values.reduce((total, value) => total + value.length, 0);
+  if (sum(originals) > limits.originalsTotal) return refuse("originals-total");
   if (options.counters) options.counters.preparations++;
   const entries = snapshot.entries.map(({ value, entry }) => {
     if (options.counters) options.counters.normalizations++;
@@ -88,8 +87,7 @@ export function preparePrivacyPolicy(
     for (const variant of credentialVariants(secret))
       variants.set(variant, variants.get(variant) || secret.length >= 8);
   const units = [...entries.map(({ value }) => value), ...variants.keys()];
-  if (units.reduce((sum, value) => sum + value.length, 0) > limits.variantsTotal)
-    return refuse("variants-total");
+  if (sum(units) > limits.variantsTotal) return refuse("variants-total");
   const bytes = [...originals, ...variants.keys()].map((value) => Buffer.byteLength(value));
   const minimum = Math.ceil((Math.min(...bytes) * 4) / 3);
   const candidates = originals.length
@@ -120,27 +118,30 @@ export function checkPrepared(
     total += form.length;
     if (total > limits.formsTotal) throw "forms-total";
   };
-  const credential = (form: string) =>
-    matcher.has(form) || matcher.scan(form).hits.some(({ node }) => node.output);
+  const substring = (form: string) => matcher.scan(form).hits.some(({ node }) => node.output);
+  const credential = (form: string) => matcher.has(form) || substring(form);
   const cache = new Map<string, string>();
   let memoUnits = 0;
   const decode = (layer: string) =>
     candidates
       ? layer.replace(candidates, (run) => {
-          const cached = cache.get(run);
+          // A short credential matches only a whole form; decoding a run inside other text would hide entries.
+          const whole = run.length === layer.length;
+          const cached = whole ? undefined : cache.get(run);
           if (cached !== undefined) return cached;
+          const secret = whole ? credential : substring;
           let decoded = run;
           if (run.replace(/=+$/, "").length >= minimum)
             for (let offset = 0; offset < 4; offset++) {
               const plain = Buffer.from(run.slice(offset), "base64").toString();
               const found = normalize(plain);
-              if (entries.some(({ value }) => found.includes(value)) || credential(plain)) {
+              if (entries.some(({ value }) => found.includes(value)) || secret(plain)) {
                 decoded = plain;
                 break;
               }
             }
           const units = run.length + decoded.length;
-          if (cache.size < limits.memoEntries && memoUnits + units <= limits.memoUnits) {
+          if (!whole && cache.size < limits.memoEntries && memoUnits + units <= limits.memoUnits) {
             cache.set(run, decoded);
             memoUnits += units;
           }
@@ -148,7 +149,6 @@ export function checkPrepared(
         })
       : layer;
   try {
-    if (!text.isWellFormed()) return { refused: "ill-formed" };
     const forms = decodedLayers(text, decode, retain);
     if (!forms) return { refused: "nonconvergent" };
     const normalized = [...new Set(forms)].map(normalize);

@@ -214,22 +214,23 @@ export function decodedLayers(
   retain?: (form: string) => void,
 ): string[] | null {
   const rounds = (current: string, slashes: boolean): string[] | null => {
-    const layers: string[] = [];
+    const layers = [current];
+    retain?.(current);
     const keep = (...forms: string[]) => {
       for (const form of forms) retain?.(form);
       layers.push(...forms);
     };
-    keep(current);
     for (let round = 0; round < 5; round++) {
       // Unrelated runs must not change decoding convergence or cause a refusal.
       // Keep the text before backslash and HTML decoding too, since a protected value can contain either.
       const percentDecoded = decodePercent(current);
       const unescaped = decodeBackslashes(percentDecoded, slashes);
       const expanded = decodeHTML(unescaped);
-      // Prepared checks inspect HTML before selective base64 replacement.
-      if (retain) keep(expanded);
+      const collapsed = expanded.replace(/\s+/g, " ");
+      // Prepared checks inspect both readings before selective base64 replacement.
+      if (retain) keep(expanded, collapsed);
       // Keep line breaks too: report quotations and multiline credentials depend on them.
-      keep(percentDecoded, unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
+      keep(percentDecoded, unescaped, decodeBase64(collapsed));
       const next = decodeBase64(expanded);
       keep(next);
       if (next === current) return layers;
