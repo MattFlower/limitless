@@ -31,10 +31,16 @@ export const privacyLimits = {
 export function createPrivacyRegistry(secrets = createCredentialRegistry(), checker = () => "privacy/1") {
   let entries: PrivateStrings = [];
   let policy = 0;
+  let label = checker();
+  let semantics = 0;
   const identity = Symbol();
   const copy = () => entries.map((entry) => ({ ...entry }));
-  const generation = () =>
-    Object.freeze({ identity, policy, credentials: secrets.generation, checker: checker() });
+  const generation = () => {
+    const next = checker();
+    if (next !== label) semantics++;
+    label = next;
+    return Object.freeze({ identity, policy, credentials: secrets.generation, checker: semantics });
+  };
   return {
     get entries() {
       return copy();
@@ -60,12 +66,14 @@ export function isCurrentPrivacyGeneration(prepared: Prepared, registry = privac
     (key) => prepared.generation[key] === current[key],
   );
 }
-const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
 export function preparePrivacyPolicy(
   snapshot: ReturnType<typeof capturePrivacySnapshot>,
   options: {
     limits?: Partial<typeof privacyLimits>;
-    counters?: { preparations: number; normalizations: number };
+    counters?: Record<
+      "registrations" | "inputs" | "memoAdmissions" | "memoPeakEntries" | "memoPeakUnits",
+      number
+    >;
   } = {},
 ) {
   const limits = { ...privacyLimits, ...options.limits };
@@ -77,27 +85,34 @@ export function preparePrivacyPolicy(
   if (originals.some((value) => value.length > limits.originalLength)) return refuse("original-length");
   const sum = (values: string[]) => values.reduce((total, value) => total + value.length, 0);
   if (sum(originals) > limits.originalsTotal) return refuse("originals-total");
-  if (options.counters) options.counters.preparations++;
-  const entries = snapshot.entries.map(({ value, entry }) => {
-    if (options.counters) options.counters.normalizations++;
-    return { value: normalize(value), entry };
-  });
+  const { counters } = options;
+  const normalize = (text: string, registration = false) => {
+    if (counters) counters[registration ? "registrations" : "inputs"]++;
+    return text.normalize("NFKC").toLowerCase();
+  };
+  const entries = snapshot.entries.map(({ value, entry }) => ({ value: normalize(value, true), entry }));
   const variants = new Map<string, boolean>();
   for (const secret of snapshot.credentials)
     for (const variant of credentialVariants(secret))
       variants.set(variant, variants.get(variant) || secret.length >= 8);
   const units = [...entries.map(({ value }) => value), ...variants.keys()];
   if (sum(units) > limits.variantsTotal) return refuse("variants-total");
-  const bytes = [...originals, ...variants.keys()].map((value) => Buffer.byteLength(value));
-  const minimum = Math.ceil((Math.min(...bytes) * 4) / 3);
-  const candidates = originals.length
-    ? new RegExp(`(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{${Math.max(1, minimum)},}=*`, "g")
-    : undefined;
+  const search = (values: string[]) => {
+    const minimum = Math.ceil((Math.min(...values.map((value) => Buffer.byteLength(value))) * 4) / 3);
+    return {
+      minimum,
+      candidates: values.length
+        ? new RegExp(`(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{${Math.max(1, minimum)},}=*`, "g")
+        : undefined,
+    };
+  };
   return Object.freeze({
     generation: Object.freeze({ ...snapshot.generation }),
     entries,
-    minimum,
-    candidates,
+    privateSearch: search(snapshot.entries.map(({ value }) => value)),
+    credentialSearch: search([...variants.keys()]),
+    normalize,
+    counters,
     matcher: new CredentialMatcher(variants),
     limits,
   });
@@ -110,7 +125,7 @@ export function checkPrepared(
   { truncated = false } = {},
 ): Refusal | { clean: true } | { match: { entries: number[]; credential: boolean } } {
   if ("refused" in prepared) return prepared;
-  const { entries, matcher, limits, candidates, minimum } = prepared;
+  const { entries, matcher, limits, normalize, counters } = prepared;
   let total = 0;
   const retain = (form: string) => {
     if (!form.isWellFormed()) throw "ill-formed";
@@ -122,36 +137,48 @@ export function checkPrepared(
   const credential = (form: string) => matcher.has(form) || substring(form);
   const cache = new Map<string, string>();
   let memoUnits = 0;
-  const decode = (layer: string) =>
-    candidates
+  const decode = (layer: string, secrets = false) => {
+    const { candidates, minimum } = secrets ? prepared.credentialSearch : prepared.privateSearch;
+    return candidates
       ? layer.replace(candidates, (run) => {
-          // A short credential matches only a whole form; decoding a run inside other text would hide entries.
-          const whole = run.length === layer.length;
-          const cached = whole ? undefined : cache.get(run);
+          const cached = secrets ? undefined : cache.get(run);
           if (cached !== undefined) return cached;
-          const secret = whole ? credential : substring;
+          const secret = run.length === layer.length ? credential : substring;
           let decoded = run;
           if (run.replace(/=+$/, "").length >= minimum)
             for (let offset = 0; offset < 4; offset++) {
               const plain = Buffer.from(run.slice(offset), "base64").toString();
-              const found = normalize(plain);
-              if (entries.some(({ value }) => found.includes(value)) || secret(plain)) {
+              const found = secrets ? "" : normalize(plain);
+              if (secrets ? secret(plain) : entries.some(({ value }) => found.includes(value))) {
                 decoded = plain;
                 break;
               }
             }
           const units = run.length + decoded.length;
-          if (!whole && cache.size < limits.memoEntries && memoUnits + units <= limits.memoUnits) {
+          if (!secrets && cache.size < limits.memoEntries && memoUnits + units <= limits.memoUnits) {
             cache.set(run, decoded);
             memoUnits += units;
+            if (counters) {
+              counters.memoAdmissions++;
+              counters.memoPeakEntries = Math.max(counters.memoPeakEntries, cache.size);
+              counters.memoPeakUnits = Math.max(counters.memoPeakUnits, memoUnits);
+            }
           }
           return decoded;
         })
       : layer;
+  };
   try {
-    const forms = decodedLayers(text, decode, retain);
+    let hit = false;
+    // Credential readings never steer the private decoder's replacements or convergence.
+    const inspect = (form: string) => {
+      retain(form);
+      hit ||= credential(form) || decode(form, true) !== form;
+    };
+    const forms = decodedLayers(text, (layer) => decode(layer), inspect);
     if (!forms) return { refused: "nonconvergent" };
-    const normalized = [...new Set(forms)].map(normalize);
+    const normalized = [...new Set(forms)].map((form) => normalize(form));
+    for (const form of normalized) retain(form);
     const hits = entries
       .filter(({ value }) =>
         normalized.some((layer) => {
@@ -164,7 +191,6 @@ export function checkPrepared(
         }),
       )
       .map(({ entry }) => entry);
-    const hit = forms.some(credential);
     return hits.length || hit ? { match: { entries: hits, credential: hit } } : { clean: true };
   } catch (code) {
     return { refused: privacyRefusals.find((fixed) => fixed === code) ?? "nonconvergent" };

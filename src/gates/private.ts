@@ -228,7 +228,7 @@ export function decodedLayers(
       const expanded = decodeHTML(unescaped);
       const collapsed = expanded.replace(/\s+/g, " ");
       // Prepared checks inspect both readings before selective base64 replacement.
-      if (retain) keep(expanded, collapsed);
+      if (retain) for (const form of [expanded, collapsed]) retain(form);
       // Keep line breaks too: report quotations and multiline credentials depend on them.
       keep(percentDecoded, unescaped, decodeBase64(collapsed));
       const next = decodeBase64(expanded);

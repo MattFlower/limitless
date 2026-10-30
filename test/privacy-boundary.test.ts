@@ -27,6 +27,7 @@ const unicode = (s: string) =>
   [...s].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`).join("");
 const html = (s: string) => [...s].map((c) => `&#${c.charCodeAt(0)};`).join("");
 const match = (credential = false, entries = [1]) => ({ match: { entries, credential } });
+const work = () => ({ registrations: 0, inputs: 0, memoAdmissions: 0, memoPeakEntries: 0, memoPeakUnits: 0 });
 
 test("prepared readings retain intermediates, alignments, normalization and slash alternatives", () => {
   for (const text of [
@@ -97,16 +98,48 @@ test("decoded credentials work without a private policy and keep original-length
   });
 });
 
+test("credential base64 readings preserve private decoding and its original thresholds", () => {
+  const spelling = b64("eight888");
+  const entries = policy([`${spelling} tail`]);
+  const text = `${spelling} t%2561il`;
+  expect(privateMatches(text, entries).map(({ entry }) => entry)).toEqual([1]);
+  expect(checkPrepared(preparePrivacyPolicy(snapshot([`${spelling} tail`], ["eight888"])), text)).toEqual(
+    match(true),
+  );
+  // A credential must not lower the original private threshold after NFKC shrinks an entry.
+  const wide = "Ａ".repeat(4);
+  expect(privateMatches(b64("AAAA"), policy([wide]))).toEqual([]);
+  expect(checkPrepared(preparePrivacyPolicy(snapshot([wide], ["x"])), b64("AAAA"))).toEqual({ clean: true });
+  // Extra forms observed for credentials must not become additional private readings.
+  const values = [word, b64(word).slice(0, 7)];
+  const encoded = html(b64(word));
+  expect(privateMatches(encoded, policy(values)).map(({ entry }) => entry)).toEqual([1]);
+  expect(checkPrepared(preparePrivacyPolicy(snapshot(values)), encoded)).toEqual(match());
+});
+
+test("normalization work observes registrations once and inputs for each base64 alignment", () => {
+  for (const count of [1, 2]) {
+    const counters = work();
+    const prepared = preparePrivacyPolicy(snapshot([word, `${word}-other`].slice(0, count)), { counters });
+    expect(counters.registrations).toBe(count);
+    expect(counters.inputs).toBe(0);
+    for (const candidates of [1, 30]) {
+      const text = Array.from({ length: candidates }, (_, n) => b64(`ordinary clean field ${n}`)).join(":");
+      const previous = counters.inputs;
+      for (let i = 0; i < 3; i++) expect(checkPrepared(prepared, text)).toEqual({ clean: true });
+      // Four alignments per candidate, plus one unique retained input form per check.
+      expect(counters.inputs - previous).toBe(3 * (4 * candidates + 1));
+      expect(counters.registrations).toBe(count);
+    }
+  }
+});
+
 test("preparation is reused and generations remain bound to captured snapshots", () => {
   let version = "v1";
   const registry = createPrivacyRegistry(createCredentialRegistry(), () => version);
   registry.replacePolicy(policy([word]));
-  const counters = { preparations: 0, normalizations: 0 };
   const old = capturePrivacySnapshot(registry);
-  const prepared = preparePrivacyPolicy(old, { counters });
-  for (let i = 0; i < 10; i++)
-    checkPrepared(prepared, Array.from({ length: 30 }, (_, n) => b64(`ordinary clean field ${n}`)).join(":"));
-  expect(counters).toEqual({ preparations: 1, normalizations: 1 });
+  const prepared = preparePrivacyPolicy(old);
   expect(isCurrentPrivacyGeneration(prepared, registry)).toBe(true);
   registry.addCredential(word);
   expect(currentPrivacyGeneration(registry)).toEqual({ ...old.generation, credentials: 1 });
@@ -129,8 +162,19 @@ test("preparation is reused and generations remain bound to captured snapshots",
   registry.replacePolicy([]);
   expect(currentPrivacyGeneration(registry)).toEqual({ ...replaced, policy: replaced.policy + 1 });
   const latest = preparePrivacyPolicy(capturePrivacySnapshot(registry));
+  const v1 = capturePrivacySnapshot(registry);
   version = "v2";
   expect(isCurrentPrivacyGeneration(latest, registry)).toBe(false);
+  const v2 = capturePrivacySnapshot(registry);
+  version = "v1";
+  for (const obsolete of [v1, v2]) {
+    expect(isCurrentPrivacyGeneration(preparePrivacyPolicy(obsolete), registry)).toBe(false);
+    expect(currentPrivacyGeneration(registry).checker).toBeGreaterThan(obsolete.generation.checker);
+  }
+  expect(isCurrentPrivacyGeneration(latest, registry)).toBe(false);
+  expect(isCurrentPrivacyGeneration(preparePrivacyPolicy(capturePrivacySnapshot(registry)), registry)).toBe(
+    true,
+  );
   expect(isCurrentPrivacyGeneration(preparePrivacyPolicy(old), createPrivacyRegistry())).toBe(false);
 });
 
@@ -154,7 +198,7 @@ test.each([
 test("forms refuse at cap plus one, reject ill-formed inputs and never return partial matches", () => {
   for (const [key, cap, code] of [
     ["formLength", 3, "form-length"],
-    ["formsTotal", 21, "forms-total"],
+    ["formsTotal", 24, "forms-total"],
   ] as const) {
     expect(checkPrepared(preparePrivacyPolicy(snapshot(["abc"]), { limits: { [key]: cap } }), "abc")).toEqual(
       match(),
@@ -177,14 +221,48 @@ test("forms refuse at cap plus one, reject ill-formed inputs and never return pa
     });
 });
 
-test.each([{ memoEntries: 1 }, { memoUnits: 1 }])("memo exhaustion never skips checking: %j", (limits) => {
-  const prepared = preparePrivacyPolicy(snapshot([word]), { limits });
-  const runs = Array.from({ length: 6 }, (_, n) => b64(`ordinary field number ${n}`));
-  expect(checkPrepared(prepared, runs.join(":"))).toEqual({ clean: true });
-  expect(checkPrepared(prepared, [...runs, b64(word)].join(":"))).toEqual(match());
+test("normalized expansions charge per-form and aggregate storage before approval", () => {
+  // Seven one-unit decoder forms, plus the unique four-unit NFKC/lowercase form.
+  for (const limits of [{ formLength: 4 }, { formsTotal: 11 }])
+    expect(checkPrepared(preparePrivacyPolicy(snapshot(), { limits }), "㍿")).toEqual({ clean: true });
+  for (const [limits, refused] of [
+    [{ formLength: 1 }, "form-length"],
+    [{ formLength: 3 }, "form-length"],
+    [{ formsTotal: 7 }, "forms-total"],
+    [{ formsTotal: 10 }, "forms-total"],
+  ] as const)
+    expect(checkPrepared(preparePrivacyPolicy(snapshot(), { limits }), "㍿")).toEqual({ refused });
   expect(
-    checkPrepared(preparePrivacyPolicy(snapshot([], [word]), { limits }), [...runs, b64(word)].join(":")),
-  ).toEqual(match(true, []));
+    checkPrepared(preparePrivacyPolicy(snapshot(["株式会社"]), { limits: { formsTotal: 10 } }), "㍿"),
+  ).toEqual({ refused: "forms-total" });
+});
+
+test.each(["memoEntries", "memoUnits"] as const)("%s admissions observe equality and exhaustion", (bound) => {
+  const runs = Array.from({ length: 6 }, (_, n) => b64(`ordinary field number ${n}`));
+  const units = 2 * (runs[0]?.length ?? 0); // Clean candidates cache their unchanged key and result.
+  for (const cap of [0, 1, 2]) {
+    const limits = { [bound]: cap * (bound === "memoUnits" ? units : 1) };
+    const counters = work();
+    const prepared = preparePrivacyPolicy(snapshot([word]), { limits, counters });
+    for (const [text, expected] of [
+      [runs.join(":"), { clean: true }],
+      [[...runs, b64(word)].join(":"), match()],
+    ] as const) {
+      counters.memoAdmissions = 0;
+      expect(checkPrepared(prepared, text)).toEqual(expected);
+      expect(counters.memoAdmissions).toBe(cap);
+      expect(counters.memoPeakEntries).toBe(cap);
+      expect(counters.memoPeakUnits).toBe(cap * units);
+    }
+    expect(
+      checkPrepared(preparePrivacyPolicy(snapshot([], [word]), { limits }), [...runs, b64(word)].join(":")),
+    ).toEqual(match(true, []));
+  }
+  const counters = work();
+  const prepared = preparePrivacyPolicy(snapshot([word]), { limits: { memoUnits: units - 1 }, counters });
+  expect(checkPrepared(prepared, runs.join(":"))).toEqual({ clean: true });
+  expect(counters.memoAdmissions).toBe(0);
+  expect(counters.memoPeakUnits).toBe(0);
 });
 
 test("legacy registrations exceed prepared caps and default generation observes proc registrations", () => {
