@@ -75,6 +75,80 @@ Nested paragraph.
   ]);
 });
 
+// Representative static section: the request quotes these parent labels, but omits #822's full text.
+const epic822 = `## Epic Q: issues are the work queue
+- Issues are the work queue.
+- **Order:**
+  - Process issues in order.
+  - Respect dependencies.
+- **Claim (exactly once), on every path.**
+  - Claim an issue before starting work.
+  - Avoid duplicate runs.
+- Keep the queue visible.
+## Next
+- Outside.`;
+
+test("a #822-shaped section keeps parent units and contextual children in order", () => {
+  const units = resolveIntent({
+    ticket: issue(828, `## The original intent\n#822's "Epic Q: issues are the work queue" section`),
+    parent: issue(822, epic822),
+  });
+  expect(brief(units)).toEqual([
+    ["U1", "Issues are the work queue.", "behaviour", '#822 "Epic Q: issues are the work queue"'],
+    ["U2", "**Order:**", "behaviour", '#822 "Epic Q: issues are the work queue"'],
+    ["U3", "**Order:** — Process issues in order.", "behaviour", '#822 "Epic Q: issues are the work queue"'],
+    ["U4", "**Order:** — Respect dependencies.", "behaviour", '#822 "Epic Q: issues are the work queue"'],
+    [
+      "U5",
+      "**Claim (exactly once), on every path.**",
+      "behaviour",
+      '#822 "Epic Q: issues are the work queue"',
+    ],
+    [
+      "U6",
+      "**Claim (exactly once), on every path.** — Claim an issue before starting work.",
+      "behaviour",
+      '#822 "Epic Q: issues are the work queue"',
+    ],
+    [
+      "U7",
+      "**Claim (exactly once), on every path.** — Avoid duplicate runs.",
+      "behaviour",
+      '#822 "Epic Q: issues are the work queue"',
+    ],
+    ["U8", "Keep the queue visible.", "behaviour", '#822 "Epic Q: issues are the work queue"'],
+  ]);
+});
+
+test.each(["-", "*", "+", "1.", "2)", "123456789.", "999999999)"])(
+  "marker %s works for parents and children",
+  (marker) => {
+    expect(
+      texts(goal, inGoal(`${marker} Parent.\n  ${marker} First.\n  - Second.\n+ Next.\n  * Third.`)),
+    ).toEqual(["Parent.", "Parent. — First.", "Parent. — Second.", "Next.", "Next. — Third."]);
+  },
+);
+
+test("children preserve normalization, written-text deduplication, sources and behaviour precedence", () => {
+  const parent = `## Goal
+- Parent  text.
+  - Use \`a  b\`.
+  - Use \`a b\`.
+## Docs
+- Parent  text.
+  - Use \`a  b\`.`;
+  expect(brief(resolve(`#1's "Docs" section (docs)\n${goal}\n${goal}`, parent))).toEqual([
+    ["U1", "Parent text.", "behaviour", '#1 "Docs",#1 "Goal"'],
+    ["U2", "Parent text. — Use `a b`.", "behaviour", '#1 "Docs",#1 "Goal"'],
+    ["U3", "Parent text. — Use `a b`.", "behaviour", '#1 "Goal"'],
+  ]);
+  expect(brief(resolve(`${goal} (docs)`, parent))).toEqual([
+    ["U1", "Parent text.", "docs", '#1 "Goal"'],
+    ["U2", "Parent text. — Use `a b`.", "docs", '#1 "Goal"'],
+    ["U3", "Parent text. — Use `a b`.", "docs", '#1 "Goal"'],
+  ]);
+});
+
 test.each(["## Next", "# Top", "## Next ##", "##"])(
   "a same or higher heading ends the section: %s",
   (heading) => {
@@ -165,7 +239,23 @@ const thematic = "thematic break, setext underline or table delimiter";
 const sectionCases: [string, string, number, string][] = [
   ["lazy list item", "- Retry.\nNever omit.", 3, "list item continuation"],
   ["tab after a list marker", "-\tRetry.\n\n    Never omit.", 2, "malformed list item"],
-  ["nested list item", "- Retry.\n  - Never omit.", 3, "indented line"],
+  ["orphan child", "  - Never omit.", 2, "orphan sub-item"],
+  ["three-space item", "- Parent.\n  - Child.\n   - Too deep.", 4, "indented line"],
+  ["nested child", "- Parent.\n  - Child.\n    - Too deep.", 4, "indented line"],
+  ["tab-indented item", "- Parent.\n  - Child.\n\t- Too deep.", 4, "indented line"],
+  ["mixed tab indentation", "- Parent.\n  - Child.\n  \t- Too deep.", 4, "indented line"],
+  ["child after paragraph", "- Parent.\n  - Child.\n\nParagraph.\n  - Orphan.", 6, "orphan sub-item"],
+  ["child after blank", "- Parent.\n  - Child.\n\n  - Orphan.", 5, "orphan sub-item"],
+  ["child after heading", "- Parent.\n  - Child.\n### Detail\n  - Orphan.", 5, "orphan sub-item"],
+  ["unindented child continuation", "- Parent.\n  - Child.\nNever omit.", 4, "list item continuation"],
+  ["indented child continuation", "- Parent.\n  - Child.\n  Never omit.", 4, "indented line"],
+  ["child marker tab separator", "- Parent.\n  - Child.\n  -\tInvalid.", 4, "indented line"],
+  ["empty child marker", "- Parent.\n  - Child.\n  +", 4, "indented line"],
+  ["empty ordered child marker", "- Parent.\n  - Child.\n  1. ", 4, "indented line"],
+  ["ten-digit child marker", "- Parent.\n  - Child.\n  1234567890. Invalid.", 4, "indented line"],
+  ["two-space dash thematic break", "- Parent.\n  - Child.\n  - - -", 4, thematic],
+  ["two-space star thematic break", "- Parent.\n  - Child.\n  * * *", 4, thematic],
+  ["two-space bare thematic break", "- Parent.\n  - Child.\n  ---", 4, "indented line"],
   ["fenced item", "- Retry.\n\n  ```\n  example\n  ```\n\n  Never omit.", 4, "indented line"],
   ["details item", "- Retry.\n\n  <details>example</details>\n\n  Never omit.", 4, "indented line"],
   ["setext underline in an item", "- Retry.\n  ===\n\n  Never omit.", 3, "indented line"],
@@ -203,6 +293,7 @@ const ticketCases: [string, string, number, string][] = [
   ],
   ["quoted unit", `${goal}\n\n> Before.`, 6, "blockquote"],
   ["indented reference", `  ${goal}`, 4, "indented line"],
+  ["child in ticket", `${goal}\n  - A requirement of its own.`, 5, "indented line"],
   ["fence in the intent", `\`\`\`\n${goal}\n\`\`\``, 4, "fence"],
   // A requirement written as a list item next to a reference would otherwise be dropped silently.
   [
