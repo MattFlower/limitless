@@ -51,6 +51,7 @@ export interface ActionsProgress {
   gateKey?: string;
   inputs?: Record<string, string>;
   interrupted?: string;
+  diagnostic?: string;
 }
 interface Dependencies {
   gh: GhRunner;
@@ -251,7 +252,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     attach(handle, signal, req, _hooks, persist = async () => {}) {
       const p = handle.githubActions;
       if (!p || !req) throw new Error("Missing GitHub Actions gate request");
-      const owned = bound(p, req.runId, req.headSha, gateDigest(req.gates));
+      const owned = bound(p, req.runId, req.headSha, gateDigest(req.gates), req.repo);
       if (!owned || !same(deps.destination(req.runId), p.repo) || !same(req.repo, p.repo))
         throw refuse("GitHub Actions handle is bound to another repository");
       const controller = new AbortController();
@@ -450,6 +451,18 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           await pause(deps.pollMs);
         }
       })()
+        .catch(async (error: unknown) => {
+          if (gateShutdown(controller.signal)) throw error;
+          const aborted = controller.signal.aborted;
+          const kind = error instanceof PrivateError ? "refused" : aborted ? "cancelled" : "operational";
+          const blocked =
+            error instanceof GateBlockedError ? error : new GateBlockedError(kind, String(error), p.cwd);
+          p.cleanupFailed = true; // The rejection checkpoint must also retain its cleanup debt.
+          const { classification, message } = blocked;
+          if (!p.completed) Object.assign(p, { interrupted: classification, diagnostic: message });
+          await checkpoint();
+          throw blocked;
+        })
         .finally(async () => {
           // A completed, cleaned-up handle owes nothing: replaying it must not need GitHub.
           if (gateShutdown(controller.signal) || (p.completed && !p.cleanupFailed)) return;
@@ -459,19 +472,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           } catch (error) {
             p.cleanupFailed = true;
             await checkpoint();
-            throw error;
+            if (!p.interrupted) throw new GateBlockedError("cleanup", String(error), p.cwd);
           }
-        })
-        .catch(async (error: unknown) => {
-          if (gateShutdown(controller.signal)) throw error;
-          const aborted = controller.signal.aborted;
-          const kind = error instanceof PrivateError ? "refused" : aborted ? "cancelled" : "operational";
-          const blocked =
-            error instanceof GateBlockedError ? error : new GateBlockedError(kind, String(error), p.cwd);
-          // A completed result may replay once cleanup succeeds; anything else stays blocked.
-          if (!p.completed) p.interrupted = blocked.classification;
-          await checkpoint();
-          throw blocked;
         })
         .finally(() => signal.removeEventListener("abort", abort));
       return {
@@ -513,6 +515,9 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
     for (const record of records) {
       const m = record.match(/^LIMITLESS:[a-f\d]{32}:(\d+):(\d+):(\d+):(true|false)$/);
       const index = Number(m?.[1]);
+      const prior = values.get(index);
+      if (prior && (prior.exit !== Number(m?.[2]) || prior.timeout !== (m?.[4] === "true")))
+        throw new GateBlockedError("contradictory-records", "Contradictory gate records");
       if (!m || !commands[index] || values.has(index)) throw new Error("Malformed gate record");
       values.set(index, { exit: Number(m[2]), ms: Number(m[3]), timeout: m[4] === "true" });
     }
@@ -541,10 +546,13 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
   };
   const setupResults = parse("Setup", setup);
   const failure = setupResults.findIndex((r) => !r.ok);
+  const result = parse("Check", [check])[0];
+  if (failure >= 0 && result?.ok)
+    throw new GateBlockedError("contradictory-records", "Check passed after setup failed");
   return {
     setup: failure < 0 ? setupResults : setupResults.slice(0, failure + 1),
     check:
-      parse("Check", [check])[0] ??
+      result ??
       (() => {
         throw new Error("Missing check");
       })(),

@@ -907,6 +907,73 @@ test("failed cleanup keeps the durable handle so a restart retries it", async ()
   }
 });
 
+test.each(["malformed evidence", "protected diagnostic"])(
+  "original rejection survives cleanup failure and restart: %s",
+  async (failure) => {
+    const f = fixture();
+    const { ctx, store } = await context(f);
+    registerCredential("ACTIONS_REJECTION_TEST", credential);
+    f.state.logs.set(1, log(framed(), `near ${secret} ${credential}\nLIMITLESS:${token}:bad`));
+    const gh = f.deps.gh;
+    if (failure === "protected diagnostic")
+      f.deps.gh = async (...args) => {
+        if (args[0][0] === "run") throw new Error(`Malformed gate record near ${secret} ${credential}`);
+        return (await gh(...args)) ?? "";
+      };
+    const remove = f.deps.delete;
+    let failing = true;
+    f.deps.delete = async (p, branch, sha, url) => {
+      if (failing && branch === p.dispatch) throw new Error(`lease rejected ${secret} ${credential}`);
+      await remove(p, branch, sha, url);
+    };
+    try {
+      await withPrivateString(async () => {
+        const first = await runGateExecution(ctx, "gates", "initial", cwd, req.gates).catch(
+          (e: unknown) => e,
+        );
+        expect(first).toBeInstanceOf(GateBlockedError);
+        if (!(first instanceof GateBlockedError)) throw new Error("Expected blocked execution");
+        expect(first.classification).toBe("operational");
+        expect(first.message).toContain("Malformed gate record");
+        expect(first.message).not.toContain("lease rejected");
+        const pending = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
+        expect(pending?.handle.githubActions).toMatchObject({
+          cleanupFailed: true,
+          interrupted: "operational",
+          diagnostic: first.message,
+        });
+        // Reopen while cleanup still fails, then revoke admission and finish cleanup only.
+        for (const cleanupFails of [true, false, false]) {
+          failing = cleanupFails;
+          f.settings.githubActions = false;
+          const restarted = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
+          const error = await runGateExecution(restarted, "gates", "initial", cwd, req.gates).catch(
+            (e: unknown) => e,
+          );
+          expect(error).toBeInstanceOf(GateBlockedError);
+          if (!(error instanceof GateBlockedError)) throw new Error("Expected blocked restart");
+          expect(error.classification).toBe("operational");
+          expect(error.message).toContain(first.message);
+          const durable = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
+          expect(durable?.handle.id).toBe(pending?.handle.id);
+          expect(durable?.handle.githubActions?.diagnostic).toBe(first.message);
+          expect(!!durable?.handle.githubActions?.cleanupFailed).toBe(cleanupFails);
+          expect(durable?.handle.githubActions?.completed).toBeUndefined();
+          expect(durable?.previous ?? []).toEqual([]);
+          expect(JSON.stringify([durable, String(error), store.listEvents(ctx.run.id)])).not.toContain(
+            secret,
+          );
+          expect(JSON.stringify([durable, String(error)])).not.toContain(credential);
+        }
+        expect(published(f)).toEqual({ pushes: 1, dispatches: 1 });
+        expect(f.remote.size).toBe(0);
+      });
+    } finally {
+      store.close();
+    }
+  },
+);
+
 test.each(["visible", "never visible"])(
   "lost POST response: %s run uses one POST and bounded discovery",
   async (visibility) => {
@@ -1836,8 +1903,23 @@ test.each<[string, string, (f: Fixture) => void]>([
   ],
   [
     "contradictory records",
-    "operational",
+    "contradictory-records",
     (f) => f.state.logs.set(1, log(framed(), `${framed(0, 0)}\n${framed(0, 1)}`)),
+  ],
+  [
+    "setup failed but check passed",
+    "contradictory-records",
+    (f) => f.state.logs.set(1, log(framed(0, 7), framed())),
+  ],
+  [
+    "contradictory setup records",
+    "contradictory-records",
+    (f) => f.state.logs.set(1, log(`${framed(0, 0)}\n${framed(0, 7)}`, "not run")),
+  ],
+  [
+    "contradictory timeout records",
+    "contradictory-records",
+    (f) => f.state.logs.set(1, log(framed(), `${framed()}\n${framed(0, 0, 123, true)}`)),
   ],
   ["incomplete check", "incomplete", (f) => f.state.logs.set(1, log(framed(), "no record"))],
   [
@@ -1850,7 +1932,7 @@ test.each<[string, string, (f: Fixture) => void]>([
   ],
   [
     "unconfirmed termination",
-    "cleanup",
+    "operational",
     (f) => {
       f.state.runStatus = "in_progress";
       f.state.logs.set(1, log(framed(), `LIMITLESS:${token}:bad`));
@@ -1878,6 +1960,7 @@ test.each<[string, string, (f: Fixture) => void]>([
     expect(durable?.gateExecution?.handle.kind).toBe("github-actions");
     expect(durable?.gateExecution?.handle.githubActions?.interrupted).toBe(kind);
     expect(durable?.lastGates).toBeUndefined();
+    expect(durable?.gateExecution?.handle.githubActions?.completed).toBeUndefined();
     expect(f.dispatches()).toHaveLength(1);
     expect(existsSync(join(cwd, "ran-locally"))).toBe(false);
   } finally {
@@ -1946,6 +2029,142 @@ test("a legacy completed handle advanced to another purpose never replays throug
     expect(durable?.handle.githubActions?.interrupted).toBe("interrupted");
     expect(f.dispatches()).toHaveLength(1);
     expect(f.calls.filter((c) => c === "push")).toHaveLength(1);
+  } finally {
+    store.close();
+  }
+});
+
+test.each([
+  "repository",
+  "missing repository",
+  "missing progress",
+  "owner",
+  "legacy owner",
+  "SHA",
+  "digest",
+  "legacy digest",
+  "envelope SHA",
+  "envelope digest",
+  "requested initial configuration",
+  "requested retry configuration",
+])("completed retry binding blocks current and retained replay after restart: %s", async (change) => {
+  const f = fixture();
+  const { ctx, store } = await context(f);
+  const retryGates = { ...req.gates, checks: [{ name: "test", run: "targeted test" }] };
+  try {
+    const initial = await runGateExecution(ctx, "gates", "initial", cwd, req.gates);
+    const retry = await runGateExecution(ctx, "gates", "regression-retry", cwd, retryGates);
+    const pending = ctx.state.gateExecution;
+    const p = pending?.handle.githubActions;
+    if (!pending || !p) throw new Error("Missing retry identity");
+    expect(pending.previous?.[0]?.gateKey).not.toBe(pending.gateKey);
+    // Both purposes replay with distinct digests before the durable binding is changed.
+    const valid = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
+    await resumeGateExecution(valid, "gates", "initial", cwd);
+    expect(await runGateExecution(valid, "gates", "initial", cwd, req.gates)).toEqual(initial);
+    expect(await runGateExecution(valid, "gates", "regression-retry", cwd, retryGates)).toEqual(retry);
+    if (change === "repository") p.repo = "other/repo";
+    if (change === "missing repository") Reflect.deleteProperty(p, "repo");
+    if (change === "missing progress") pending.handle.githubActions = undefined;
+    if (change === "owner") p.owner = "another-run";
+    if (change === "legacy owner") p.owner = undefined;
+    if (change === "SHA") p.headSha = req.baseSha;
+    if (change === "digest") p.gateKey = "different";
+    if (change === "legacy digest") p.gateKey = undefined;
+    if (change === "envelope SHA") pending.sha = req.baseSha;
+    if (change === "envelope digest") pending.gateKey = "different";
+    await ctx.save();
+    const configChange = change.startsWith("requested");
+    for (const purpose of configChange
+      ? [change.includes("initial") ? "initial" : "regression-retry"]
+      : ["initial", "regression-retry"]) {
+      const gates = configChange
+        ? { ...req.gates, setup: ["changed setup"] }
+        : purpose === "initial"
+          ? req.gates
+          : retryGates;
+      for (let reopen = 0; reopen < 2; reopen++) {
+        if (!configChange) {
+          const resumed = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
+          await expect(resumeGateExecution(resumed, "gates", purpose, cwd)).rejects.toBeInstanceOf(
+            GateBlockedError,
+          );
+        }
+        const restarted = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
+        await expect(runGateExecution(restarted, "gates", purpose, cwd, gates)).rejects.toBeInstanceOf(
+          GateBlockedError,
+        );
+        const durable = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
+        expect(durable?.handle.id).toBe(pending.handle.id);
+        expect(durable?.previous).toEqual(pending.previous);
+      }
+    }
+    expect(published(f)).toEqual({ pushes: 2, dispatches: 2 });
+    if (["repository", "missing repository"].includes(change)) {
+      expect(f.requests.every((r) => r.repo === "test/repo")).toBe(true);
+      expect(
+        store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.githubActions?.cleanupFailed,
+      ).toBe(true);
+    }
+  } finally {
+    store.close();
+  }
+});
+
+test("a rejection checkpoint before cleanup retains cleanup debt across shutdown", async () => {
+  const f = fixture();
+  f.state.logs.set(1, log(framed(), `LIMITLESS:${token}:bad`));
+  const controller = new AbortController();
+  await expect(
+    executeGate(req, controller.signal, {}, f.executor(), undefined, async (handle) => {
+      await f.persist(handle);
+      if (handle.githubActions?.interrupted) controller.abort(new Error("shutdown"));
+    }),
+  ).rejects.toThrow("Malformed gate record");
+  const durable = f.saved.at(-1);
+  expect(durable?.githubActions).toMatchObject({ cleanupFailed: true, interrupted: "operational" });
+  expect(f.remote.size).toBe(2);
+  f.settings.githubActions = false;
+  await expect(f.run(signal(), durable)).rejects.toThrow("Malformed gate record");
+  expect(f.saved.at(-1)?.id).toBe(durable?.id);
+  expect(f.saved.at(-1)?.githubActions?.cleanupFailed).toBeUndefined();
+  expect(published(f)).toEqual({ pushes: 1, dispatches: 1 });
+  expect(f.remote.size).toBe(0);
+});
+
+test("retained attempt replay waits for the active retry's cleanup", async () => {
+  const f = fixture();
+  const { ctx, store } = await context(f);
+  const retryGates = { ...req.gates, setup: ["retry install"] };
+  try {
+    const initial = await runGateExecution(ctx, "gates", "initial", cwd, req.gates);
+    const initialKey = ctx.state.gateExecution?.gateKey;
+    const remove = f.deps.delete;
+    let failing = true;
+    f.deps.delete = async (p, branch, sha, url) => {
+      if (failing && p.gateKey !== initialKey) throw new Error("lease rejected");
+      await remove(p, branch, sha, url);
+    };
+    await expect(runGateExecution(ctx, "gates", "regression-retry", cwd, retryGates)).rejects.toThrow(
+      "lease rejected",
+    );
+    const pending = ctx.state.gateExecution;
+    const restarted = () => new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
+    await expect(runGateExecution(restarted(), "gates", "initial", cwd, req.gates)).rejects.toThrow(
+      "lease rejected",
+    );
+    expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.id).toBe(pending?.handle.id);
+    expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.githubActions?.cleanupFailed).toBe(
+      true,
+    );
+    failing = false;
+    f.settings.githubActions = false;
+    expect(await runGateExecution(restarted(), "gates", "initial", cwd, req.gates)).toEqual(initial);
+    expect(await runGateExecution(restarted(), "gates", "regression-retry", cwd, retryGates)).toMatchObject({
+      setupOk: true,
+    });
+    expect(published(f)).toEqual({ pushes: 2, dispatches: 2 });
+    expect(f.remote.size).toBe(0);
   } finally {
     store.close();
   }

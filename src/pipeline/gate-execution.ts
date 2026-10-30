@@ -146,8 +146,19 @@ export async function resumeGateExecution(
   const pending = ctx.state.gateExecution;
   if (!pending) return undefined;
   const executor = ctx.deps.gateExecutor;
+  const repo = ctx.repo.slug;
   const round = ctx.state.round;
   sha ??= await headSha(cwd);
+  const actions = pending.handle.githubActions;
+  if (pending.handle.kind === "github-actions") {
+    try {
+      if (pending.sha !== sha || !replayable(actions, ctx.run.id, sha, pending.gateKey, repo))
+        await blockInterrupted(pending.handle, executor);
+      if (actions?.cleanupFailed) await cancelGateExecution(pending.handle, executor);
+    } finally {
+      await ctx.save("gate-cleanup-pending");
+    }
+  }
   const stored =
     pending?.stage === stage &&
     pending.handle.kind !== "local" &&
@@ -163,9 +174,6 @@ export async function resumeGateExecution(
     const job = pending.handle.kind === "inplace" ? workers.job(pending.handle.id) : null;
     const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
     try {
-      const actions = pending.handle.githubActions;
-      if (actions && (pending.sha !== sha || !replayable(actions, ctx.run.id, sha, pending.gateKey)))
-        await blockInterrupted(pending.handle, executor);
       await cancelGateExecution(
         pending.handle,
         pending.handle.kind === "inplace" ? lanExecutor(workers, [], true) : executor,
@@ -199,19 +207,22 @@ export async function runGateExecution(
   ctx.checkCancelled();
   const sha = await headSha(cwd);
   const executor = ctx.deps.gateExecutor;
+  const repo = ctx.repo.slug;
   const round = ctx.state.round;
   const pending = ctx.state.gateExecution;
   const sameIdentity = pending?.stage === stage && pending.round === round && pending.sha === sha;
   const gateKey = gateDigest(gates);
   const previous = sameIdentity ? [...(pending.previous ?? [])] : [];
   const replay = previous.find((attempt) => attempt.purpose === purpose && attempt.gateKey === gateKey);
+  if (pending && !replay && previous.some((a) => a.purpose === purpose))
+    await blockInterrupted(pending.handle, executor, () => ctx.save());
   if (replay) {
     await resumeGateExecution(ctx, stage, pending?.purpose ?? purpose, cwd, env, sha);
     if (pending && executor?.kind !== pending.handle.kind)
       throw new Error(`Unavailable gate executor: ${pending.handle.kind}`);
     return structuredClone(replay.result);
   }
-  const completed = replayable(pending?.handle.githubActions, ctx.run.id, sha, pending?.gateKey);
+  const completed = replayable(pending?.handle.githubActions, ctx.run.id, sha, pending?.gateKey, repo);
   let stored: ExecutionHandle | undefined;
   if (
     sameIdentity &&
@@ -221,7 +232,6 @@ export async function runGateExecution(
   ) {
     // Leave the previous identity durable until the next handle and its history replace it together.
     try {
-      // A changed configuration for the same attempt never replaces Actions work.
       if (pending.purpose === purpose) await blockInterrupted(pending.handle, executor);
       await cancelGateExecution(pending.handle, executor);
       if (pending.handle.githubActions?.cleanupFailed)

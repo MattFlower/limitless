@@ -106,18 +106,19 @@ export async function gateProvenance(cwd: string, signal: AbortSignal, checkedSh
   return { trackedClean: false, provenanceError: "execution provenance could not be confirmed" };
 }
 
-export const gateDigest = (gates: GateConfig) =>
-  createHash("sha256").update(JSON.stringify(gates)).digest("hex");
+export const gateDigest = (cfg: GateConfig) => createHash("sha256").update(JSON.stringify(cfg)).digest("hex");
 export const protectedEntries = (cwd?: string): PrivateStrings => [
   ...loadPrivateStrings(undefined, [cwd]),
   ...registeredCredentials().map((value) => ({ value, entry: 1 })),
 ];
 
-/** Actions work attaches only under its full binding and replays only completed, uninterrupted work. */
-export const bound = (p: ActionsProgress | undefined, run?: string, sha?: string, key?: string) =>
-  !!p?.owner && p.owner === run && p.headSha === sha && !!key && p.gateKey === key;
-export const replayable = (p: ActionsProgress | undefined, run?: string, sha?: string, key?: string) =>
-  p && !p.interrupted && bound(p, run, sha, key) ? p.completed : undefined;
+type Binding = ActionsProgress | undefined;
+export const bound = (p: Binding, run?: string, sha?: string, key?: string, repo?: string) => {
+  if (!p?.owner || !key || p.repo?.toLowerCase() !== repo?.toLowerCase()) return false;
+  return p.owner === run && p.headSha === sha && p.gateKey === key;
+};
+export const replayable = (p: Binding, run?: string, sha?: string, key?: string, repo?: string) =>
+  p && !p.interrupted && bound(p, run, sha, key, repo) ? p.completed : undefined;
 
 /** Operational failure, never a gate result or feedback; unredactable detail keeps only its class. */
 export class GateBlockedError extends Error {
@@ -135,16 +136,19 @@ export class GateBlockedError extends Error {
 export async function blockInterrupted(handle: ExecutionHandle, ex?: GateExecutor, save = async () => {}) {
   const p = handle.githubActions;
   try {
-    // Recorded only once cleanup succeeds, so a failed or unavailable cleanup is retried.
     if (!p?.interrupted || p.cleanupFailed) await cancelGateExecution(handle, ex);
     if (p?.cleanupFailed) throw new Error("cleanup remains pending");
     if (p) p.interrupted ??= "interrupted";
   } catch (error) {
-    throw error instanceof GateBlockedError ? error : new GateBlockedError("cleanup", String(error), p?.cwd);
+    if (!p?.interrupted)
+      throw error instanceof GateBlockedError
+        ? error
+        : new GateBlockedError("cleanup", String(error), p?.cwd);
   } finally {
     await save();
   }
-  throw new GateBlockedError(p?.interrupted ?? "interrupted", "interrupted execution is not replaced");
+  const message = p?.diagnostic ?? "interrupted execution is not replaced";
+  throw new GateBlockedError(p?.interrupted ?? "interrupted", message, p?.cwd);
 }
 
 /** Shutdown detaches durable jobs; owner cancellation discards them. */
@@ -302,8 +306,8 @@ export async function executeGate(
       : (injected ?? localExecutor(hooks));
   if (stored && stored.kind !== executor.kind) throw new Error(`Unavailable gate executor: ${stored.kind}`);
   if (
-    stored?.githubActions &&
-    !replayable(stored.githubActions, req.runId, req.headSha, gateDigest(req.gates))
+    stored?.kind === "github-actions" &&
+    !replayable(stored.githubActions, req.runId, req.headSha, gateDigest(req.gates), req.repo)
   )
     await blockInterrupted(stored, executor, () => persist(stored));
   const handle = stored ?? (await executor.start(req, signal));
