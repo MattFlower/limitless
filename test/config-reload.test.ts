@@ -18,6 +18,10 @@ test("mixed reloads apply only live keys, compare against active overrides, and 
   const f = reloadFixture(
     '[server]\nport = 7400\n[limits]\n[workers]\n[review]\nimplementer_report = "include"\n',
   );
+  // Fix the feed's SQLite timestamps locally; Date.now mocks don't affect SQL triggers.
+  f.factory.store.db.run(
+    "CREATE TEMP TRIGGER test_feed_clock AFTER INSERT ON feed BEGIN UPDATE feed SET ts = 1793326357500 WHERE id = NEW.id; END",
+  );
   const initialSecrets = f.factory.cfg.secrets;
   const sentinel = crypto.randomUUID();
   writeFileSync(join(f.configDir, "secrets.env"), `OPENROUTER_API_KEY=${sentinel}\n`);
@@ -55,8 +59,13 @@ test("mixed reloads apply only live keys, compare against active overrides, and 
     data: { applied: result.applied, restartRequired: result.restartRequired },
   });
   expect(Object.keys(items[0]?.data ?? {}).sort()).toEqual(["applied", "restartRequired"]);
-  expect(JSON.stringify({ result, items })).not.toContain(sentinel);
-  expect(JSON.stringify({ result, items })).not.toContain("7500");
+  expect(items.map(({ ts }) => ts)).toEqual([1_793_326_357_500, 1_793_326_357_500]);
+  const recordedConfig = JSON.stringify({
+    result,
+    items: items.map(({ title, summary, data }) => ({ title, summary, data })),
+  });
+  expect(recordedConfig).not.toContain(sentinel);
+  expect(recordedConfig).not.toContain("7500");
   f.write("[server]\nport = 7400\n[limits]\n[workers]\n[review]\n");
   expect(f.factory.reloadConfig()).toEqual({
     applied: result.applied,
