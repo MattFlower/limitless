@@ -14,6 +14,8 @@ export const lifecycleManaged = (cfg: Partial<Pick<Config, "githubQueue">>, repo
   cfg.githubQueue.repos.some((r) => r.toLowerCase() === repo.toLowerCase());
 const labels = ["limitless:in-progress", "limitless:needs-you", "limitless:failed"] as const;
 const eventOrder = ["started", "pr", "needs_human", "failed", "cancelled"] as const;
+const commentAllowed = (run: Run, event: string) =>
+  run.flow !== "acceptance" || ["started", "needs_human"].includes(event);
 export const lifecycleMarker = (runId: string, event: string) =>
   `<!-- limitless-lifecycle:${runId}:${event} -->`;
 export const ISSUE_LIFECYCLE_CALL_CAP = 50;
@@ -138,6 +140,7 @@ export async function reconcileIssueLifecycle(
     if (run.status === "failed") events.set("failed", `failed: see ${link}.`);
     if (run.status === "cancelled") events.set("cancelled", `was cancelled: see ${link}.`);
     for (const [event, text] of events) {
+      if (!commentAllowed(run, event)) continue;
       const effect = `comment:${event}`;
       if (effects.has(effect)) continue;
       if (repoSettings(cfg, repo).discreet) {
@@ -205,6 +208,7 @@ export async function reconcileIssueLifecycle(
       const current = store.getRun(snapshot.id);
       return (
         !!current &&
+        (task === "labels" || commentAllowed(current, task)) &&
         lifecycleManaged(cfg, repo) &&
         !repoSettings(cfg, repo).discreet &&
         linkedIssues(current, store).some(

@@ -70,17 +70,24 @@ eligibility rules and routes eligible tickets to acceptance runs only when the m
 application of `acceptance` was by an account in `[github.queue] trusted` (case-insensitive).
 A missing or untrusted application refuses the ticket; an earlier trusted application does
 not approve a later untrusted one. The ticket needs a parent, and both bodies must pass the
-trusted-author and last-editor checks. Acceptance runs retain the lifecycle labels and fixed
-started, needs-you, failed and cancelled comments above; they make no other GitHub writes.
+trusted-author and last-editor checks. Acceptance runs retain the lifecycle labels and only
+the fixed started and needs-you comments, carrying the run id and UI link; they make no other
+GitHub writes, including failed or cancelled comments.
 
-Operators can run `limitless accept <owner/name>#<n>` without queue eligibility or the label.
+Operators can run `limitless accept <owner/name>#<n>` without queue scheduling eligibility or the label.
+The repository must be listed in `[github.queue] repos` (case-insensitive), with a nonempty
+`trusted` list, so lifecycle effects are managed. Creation and `--check` otherwise refuse with
+`acceptance requires a configured queue repository and trusted accounts`.
 It uses the same configured trusted accounts and ticket/parent checks, and refuses a ticket
 already claimed by a run. Use `limitless accept <owner/name>#<n> --check` to resolve the units
 against the current default-branch head SHA, or print the refusal reason, without creating a
-run, a worktree or invoking a model. An empty trusted list refuses acceptance.
+run, a worktree or invoking a model. Restart acceptance from the ticket with `limitless accept`;
+retry refuses with `acceptance runs are restarted from the ticket, not retried`.
 
 Acceptance runs resolve a stable manifest from trusted ticket and parent snapshots before any
-model call. The ticket's `## The original intent` section names sections of the parent with
+model call. Both queue and operator starts validate intent before creating a run or claiming
+the issue; malformed or unresolvable intent refuses with the resolver's reason.
+The ticket's `## The original intent` section names sections of the parent with
 lines of the form `#123's "Goal" section`, optionally followed by ` (docs)`; #123 must be the
 parent. Every list item and paragraph of a referenced section is a requirement unit. A `(docs)`
 suffix marks that section's units as documentation requirements; other units require test

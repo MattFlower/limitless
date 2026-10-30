@@ -320,6 +320,20 @@ export function githubWebhook(
           p?.action === "created" &&
           !!author &&
           queue.trusted.some((t) => t.toLowerCase() === author.toLowerCase());
+        const body = string(object(p?.comment)?.body);
+        const labels = object(p?.issue)?.labels;
+        if (
+          hint &&
+          body?.startsWith("/limitless ") &&
+          body.slice(11).trim() &&
+          !reservedAnswer(body.slice(11)) &&
+          Array.isArray(labels) &&
+          labels.some((l) => object(l)?.name === "acceptance")
+        ) {
+          const note = "acceptance ticket: build runs refused";
+          factory.store.finishInbox(id, "ignored", note);
+          return new Response(note, { status: 200 });
+        }
         if (hint) pollNow?.();
         const note = hint ? "Issue queue poll requested" : "Issue queue comment ignored";
         factory.store.finishInbox(id, "ignored", note);
