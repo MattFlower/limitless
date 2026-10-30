@@ -125,13 +125,52 @@ function linkedRuntime(cache: string, runtime: string, alias: string) {
   );
 }
 
-test("dyld's symlink lookups to the runtime are readable only as metadata", async () => {
+test("dyld's symlink lookups to the runtime are readable only as metadata, and must stay recorded", async () => {
   const { root, cache, spec } = await fixture();
+  const events: AgentEvent[] = [];
+  spec.onEvent = (event) => events.push(event);
   linkedRuntime(cache, join(root, "runtime"), join(root, "opt-link"));
   const profile = policy(browserMcp(spec, "codex", [], "darwin"));
   expect(profile).toContain(`(allow file-read-metadata (literal "${join(root, "opt-link")}"))`);
   expect(profile).not.toContain(`(subpath "${join(root, "opt-link")}")`);
   expect(profile).toContain('(allow file-read-data (literal "/"))');
+  // A Homebrew upgrade keeps the old keg and moves the link to a new, unrecorded one.
+  mkdirSync(join(root, "runtime-new"));
+  writeFileSync(join(root, "runtime-new/libb.dylib"), machO());
+  rmSync(join(root, "opt-link"));
+  symlinkSync(join(root, "runtime-new"), join(root, "opt-link"));
+  expect(browserMcp(spec, "codex", [], "darwin")).toBeUndefined();
+  expect(events).toEqual([
+    expect.objectContaining({
+      text: `Browser disabled: browser runtime changed: ${join(root, "opt-link/libb.dylib")} resolves to an unrecorded path; reprovision the browser cache`,
+    }),
+  ]);
+});
+
+test("a runtime library or dyld link in the agent's write roots refuses setup", async () => {
+  const { root, cwd, cache, spec } = await fixture();
+  const events: AgentEvent[] = [];
+  spec.onEvent = (event) => events.push(event);
+  const manifest = join(cache, "ready.json");
+  const record = (libraries: string[]) =>
+    writeFileSync(manifest, JSON.stringify({ ...JSON.parse(readFileSync(manifest, "utf8")), libraries }));
+  for (const directory of [cwd, root]) {
+    writeFileSync(join(directory, "runtime-library"), machO());
+    record([join(directory, "runtime-library")]);
+    // Only the copy outside the checkout is accepted.
+    expect(!!browserMcp(spec, "codex", [], "darwin")).toBe(directory === root);
+  }
+  for (const [runtime, alias] of [
+    [join(root, "runtime"), join(cwd, "link")],
+    [join(root, "runtime-outside"), join(root, "link")],
+  ] as const) {
+    linkedRuntime(cache, runtime, alias);
+    expect(!!browserMcp(spec, "codex", [], "darwin")).toBe(!alias.startsWith(cwd));
+  }
+  const agentWritable = expect.objectContaining({
+    text: "Browser disabled: browser runtime is agent-writable",
+  });
+  expect(events).toEqual([agentWritable, agentWritable]);
 });
 
 test("provisioning requires no-sandbox even when sandbox is advertised", async () => {
@@ -349,9 +388,7 @@ test.each([
   "unavailable read policy",
   "rejected profile path",
   "private cache",
-  "runtime in checkout",
   "runtime metadata missing",
-  "runtime link in checkout",
   "Claude editor",
 ])("browser fails closed: %s", async (failure) => {
   const { root, spec, cache, scratch, cwd } = await fixture();
@@ -392,17 +429,12 @@ test.each([
     spec.scratchDir = path;
   }
   if (failure === "private cache") spec.denyRead = [cache];
-  if (failure === "runtime in checkout" || failure === "runtime metadata missing") {
+  if (failure === "runtime metadata missing") {
     const path = join(cache, "ready.json");
     const record = JSON.parse(readFileSync(path, "utf8"));
-    if (failure === "runtime metadata missing") delete record.libraries;
-    else {
-      writeFileSync(join(cwd, "runtime-library"), "library");
-      record.libraries = [join(cwd, "runtime-library")];
-    }
+    delete record.libraries;
     writeFileSync(path, JSON.stringify(record));
   }
-  if (failure === "runtime link in checkout") linkedRuntime(cache, join(root, "runtime"), join(cwd, "link"));
   if (failure === "Claude editor") spec.mode = "edit";
   const secret = "browser-secret-" + "fixture";
   registerCredential("browser-test", secret);
