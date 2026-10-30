@@ -56,22 +56,25 @@ filenames on output tools such as `browser_take_screenshot` bypass `--output-dir
 spawn MCP servers outside the agent's command sandbox, so the factory confines the server itself.
 
 On macOS the launch configuration wraps Node and its Chromium child together in the factory's
-`seatbeltProfile`. Outbound connections are allowed only to the preview's loopback address family
-and port, writes only to the invocation's browser directory in scratch, and reads only to that
-directory, the pinned cache, the recorded Node runtime and system resources, with every credential
-and private-path denial kept. Explicit provisioning records Node's loaded libraries; older valid
-caches acquire that metadata without reinstalling packages. Chromium uses `--no-sandbox` only inside
-this factory profile because its own sandbox cannot nest under Seatbelt. The
-[pinned-browser probes](browser-mcp-probes.md) exercise these boundaries on unconfined macOS.
+`seatbeltProfile`, started through `/usr/bin/env -C` in the invocation's browser directory.
+Outbound connections are allowed only to the preview's loopback address family and port, writes
+only to that browser directory, and reads only to that directory, the pinned cache, the recorded
+Node runtime (with the symlinks dyld traverses to reach it, as metadata) and the system resources
+the pinned build needs, with every credential and private-path denial kept. Mach lookups, Apple
+Events and POSIX and SysV IPC are denied except LaunchServices check-in, the Metal shader compiler
+and Chromium's own child rendezvous. Explicit provisioning records Node's loaded libraries; older
+valid caches acquire that metadata without reinstalling packages. Chromium uses `--no-sandbox` only
+inside this factory profile because its own sandbox cannot nest under Seatbelt. The
+[pinned-browser probe](browser-mcp-probes.md) passed on unconfined macOS against the pinned build,
+and lists each allowance with its reason; `CONFINEMENT_GAPS` is now empty.
 
-Claude readers and Codex readers and editors apply this profile, but **the browser stays disabled**
-until the pinned-browser probes pass unconfined and the matching `CONFINEMENT_GAPS` entries are
-removed; until then each eligible invocation records a no-browser warning naming the open gaps.
-Claude editors get none: they already
+Claude readers and Codex readers and editors apply this profile and get the browser. Claude editors
+get none: they already
 run inside the factory's outer profile, and Seatbelt cannot nest. LAN workers get none because the
 preview runs on the coordinator; Linux and other platforms get none. Each excluded or failed
-invocation records a no-browser warning naming its reason. Missing or incompatible tooling, a
-non-loopback preview URL or a scratch or profile failure records its own warning. The call continues
+invocation records a no-browser warning naming its reason, as does a browser request on a
+tool-less invocation. Missing or incompatible tooling, a non-loopback preview URL or a scratch or
+profile failure records its own warning. The call continues
 without a browser; no unrestricted server or download is used as a fallback.
 
 The server is launched over stdio: headless, with `--allowed-origins` set to exactly the preview

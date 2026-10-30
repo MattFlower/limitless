@@ -170,9 +170,9 @@ test.each([
     text: expect.stringContaining("tool-less"),
   });
   events.length = 0;
-  // Until the unconfined probes clear the production gap list, no path gets a browser.
-  expect(browserMcp(spec, harness, undefined, platform)).toBeUndefined();
-  expect(events).toHaveLength(1);
+  // The unconfined probe cleared the production gap list: the same paths get a browser by default.
+  expect(!!browserMcp(spec, harness, undefined, platform)).toBe(enabled);
+  expect(events).toHaveLength(enabled ? 0 : 1);
 });
 
 test("browser read allowlist and private denials enclose only its own writable directory", async () => {
