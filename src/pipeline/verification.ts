@@ -12,6 +12,8 @@ export const browserToolNames = new Set(
 );
 
 export function browserSucceeded(events: RunEvent[]): boolean {
+  // An explicit infrastructure limitation takes precedence over any successful tool result.
+  if (events.some((e) => (e.data as { code?: string } | null)?.code === "browser_unavailable")) return false;
   const calls = new Set<string>();
   for (const event of events) {
     const data = event.data as { id?: unknown; toolUseId?: unknown; browserTool?: string } | null;

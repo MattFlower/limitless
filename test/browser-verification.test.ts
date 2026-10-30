@@ -68,6 +68,17 @@ test.each(BROWSER_TOOLS)("successful granted browser tool %s is recognized for b
     expect(browserSucceeded([browserCall(`${prefix}${tool}`), browserResult()])).toBe(true);
 });
 
+test.each(["before", "after"])("browser unavailability overrides successful tools: %s", (order) => {
+  const warning: RunEvent = {
+    ...browserCall("Browser disabled: remote invocation"),
+    type: "status",
+    level: "warn",
+    data: { code: "browser_unavailable", id: "browser-unavailable" },
+  };
+  const success = [browserCall("playwright.browser_snapshot"), browserResult()];
+  expect(browserSucceeded(order === "before" ? [warning, ...success] : [...success, warning])).toBe(false);
+});
+
 test("browser success requires a matching granted call and a recorded successful result", () => {
   const call = browserCall("playwright.browser_snapshot");
   for (const events of [

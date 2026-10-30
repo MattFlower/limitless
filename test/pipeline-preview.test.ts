@@ -80,6 +80,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
   test.each([
     "available",
     "unavailable",
+    "unavailable before success",
+    "unavailable after success",
     "unmarked",
     "no preview",
     "handshake failure",
@@ -110,14 +112,20 @@ describe("pipeline (fake agents, real git + gates)", () => {
           if (mode === "no preview") successfulBrowser(agent);
         } else {
           expect(agent.prompt).toContain(agent.browser?.previewUrl ?? "missing preview");
-          if (mode === "unavailable")
+          if (
+            mode === "unavailable" ||
+            mode === "unavailable before success" ||
+            mode === "unavailable after success"
+          ) {
+            if (mode === "unavailable after success") successfulBrowser(agent);
             agent.onEvent({
               type: "warning",
               id: "browser-unavailable",
               code: "browser_unavailable",
               text: "Browser disabled: remote invocation",
             });
-          else {
+            if (mode === "unavailable before success") successfulBrowser(agent);
+          } else {
             expect(browserMcp(agent, "codex", [], "darwin")).toBeDefined();
             if (mode === "handshake failure")
               agent.onEvent({ type: "stderr", text: "MCP startup failed during handshake" });
