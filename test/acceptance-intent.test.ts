@@ -293,10 +293,35 @@ test.each(["## Goal#", "  ## End", "   ## End ###", "##"])(
   "a valid ATX boundary ends the selected section: %s",
   async (heading) => {
     expect(
-      brief(await resolve(`#1's "Goal" section`, `  ## Goal ###\n- Before.\n\n${heading}\n- Outside.`)),
+      brief(await resolve(`#1's "Goal" section`, `  ## Goal ###\nBefore.\n\n${heading}\n- Outside.`)),
     ).toEqual([["U1", "Before.", "behaviour", '#1 "Goal"']]);
   },
 );
+
+test.each(["  ## In list", "   ## In list ###", "1.  Before.\n\n    ## In list"])(
+  "a heading inside a list item cannot truncate a section or a quoted item: %s",
+  async (heading) => {
+    const body = `${heading.startsWith("1.") ? heading : `- Before.\n\n${heading}`}\n  Never omit.\n\n- After.`;
+    const reason = unsupported("heading inside a list item");
+    await expect(resolve(`#1's "Goal" section`, `## Goal\n${body}\n\n## End`)).rejects.toThrow(reason);
+    await expect(resolve(`> Before.\n\n${body}`, "- Before.\n- After.")).rejects.toThrow(reason);
+    await expect(resolve("> Before.", body)).rejects.toThrow(reason);
+    expect((await resolve("> After.", body)).map((u) => u.text)).toEqual(["After."]);
+  },
+);
+
+test("a heading ends a table, so the following paragraph stays one whole unit", async () => {
+  const body =
+    "| Kind | Value |\n| --- | --- |\n| Old | Done. |\n## Goal | details\nThe service accepts red | blue tokens.";
+  await expect(resolve("> blue tokens.", body)).rejects.toThrow("quote is not a whole source unit");
+  expect((await resolve("> The service accepts red | blue tokens.", body)).map((u) => u.text)).toEqual([
+    "The service accepts red | blue tokens.",
+  ]);
+  expect((await resolve(`#1's "Goal | details" section`, body)).map((u) => u.text)).toEqual([
+    "The service accepts red | blue tokens.",
+  ]);
+  expect((await resolve("> Done.", body)).map((u) => u.text)).toEqual(["Done."]);
+});
 
 test("attached trailing hashes and invalid ATX markers remain distinct", async () => {
   const units = await resolve(

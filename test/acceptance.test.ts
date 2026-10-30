@@ -394,6 +394,12 @@ test.each([
     "fence",
   ],
   [
+    "list-contained heading",
+    "## Goal\n- Before.\n\n  ## In list\n  Never omit.\n\n- After.",
+    `#1's "Goal" section`,
+    "heading inside a list item",
+  ],
+  [
     "escaped pipe source",
     "| The service accepts red \\| blue tokens. |",
     "> blue tokens.",

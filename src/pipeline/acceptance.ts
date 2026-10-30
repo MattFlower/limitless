@@ -110,7 +110,8 @@ function tableRows(lines: (string | null | undefined)[]): Set<number> {
   let inTable = false;
   lines.forEach((line, i) => {
     const body = quoteLine(line ?? "");
-    const candidate = body.includes("|") && !listItem(body);
+    // A heading is a block boundary: it ends a table even when it contains a pipe.
+    const candidate = body.includes("|") && !listItem(body) && !atx(body);
     if (!candidate) inTable = false;
     else if (tableSeparator(body)) {
       if (previous) rows.add(i - 1);
@@ -192,17 +193,21 @@ function sectionEnd(lines: string[], start: number, level: number): number {
     const item = listItem(body);
     const content = item?.text ?? body;
     const h = atx(raw);
-    const reason = /^ *(`{3,}|~{3,})/.test(content)
-      ? "fence"
-      : /^ *</.test(content) || content.includes("<!--")
-        ? "HTML block or comment"
-        : paragraph && setext(body)
-          ? "setext heading"
-          : indent >= 4 && !continuations.length
-            ? "indented code or heading"
-            : rows.has(i) && body.includes("\\|")
-              ? "escaped pipe in a table row"
-              : undefined;
+    // A heading inside a list item is not a section boundary; refuse it rather than truncate.
+    const reason =
+      continuations.length && atx(body.slice(continuations.at(-1)))
+        ? "heading inside a list item"
+        : /^ *(`{3,}|~{3,})/.test(content)
+          ? "fence"
+          : /^ *</.test(content) || content.includes("<!--")
+            ? "HTML block or comment"
+            : paragraph && setext(body)
+              ? "setext heading"
+              : indent >= 4 && !continuations.length
+                ? "indented code or heading"
+                : rows.has(i) && body.includes("\\|")
+                  ? "escaped pipe in a table row"
+                  : undefined;
     if (reason) throw new Error(unsupported(reason));
     if (i > start && h && h.level <= level) return i;
     if (item) continuations.push(item.continuation);
@@ -244,17 +249,16 @@ export function markdownUnits(md: string, references = false): Block[] {
       out.push({ text: body.trim(), kind: leadIn.test(body.trim()) ? "lead" : "reference" });
       return;
     }
-    if (atx(quoteLine(line)) || setext(body)) {
+    const continues =
+      current && continuation !== undefined && quoted === currentQuoted && indent >= continuation && !item;
+    if (current && continues && atx(body.slice(continuation))) {
+      // A heading inside a list item leaves no quotable whole unit, so the item refuses.
+      current.refusal = unsupported("heading inside a list item");
+    } else if (atx(quoteLine(line)) || setext(body)) {
       flush();
       return;
     }
-    if (
-      current &&
-      continuation !== undefined &&
-      quoted === currentQuoted &&
-      indent >= continuation &&
-      !item
-    ) {
+    if (current && continues) {
       current.text += ` ${body}`;
       return;
     }
@@ -294,7 +298,8 @@ function section(md: string, heading: string): string | undefined {
     return h ? [{ ...h, i }] : [];
   });
   const hits = heads.filter((h) => h.text === norm(heading));
-  const hit = hits[0];
+  // A duplicate ATX heading is ambiguous before its range is scanned.
+  const hit = hits.length === 1 ? hits[0] : undefined;
   const raw = md.split(/\r?\n/);
   const end = hit ? sectionEnd(raw, hit.i, hit.level) : raw.length;
   if (scanned.unclosed) throw new Error("unresolvable source: unclosed fence, comment or details");
@@ -307,7 +312,7 @@ function section(md: string, heading: string): string | undefined {
       norm(previous) === norm(heading)
     );
   });
-  if (hits.length !== 1 || !hit || setextMatch) return undefined;
+  if (!hit || setextMatch) return undefined;
   return raw.slice(hit.i + 1, end).join("\n");
 }
 
@@ -346,7 +351,10 @@ export async function resolveIntent(
       const body = section(parent.body, ref[2] ?? "");
       if (body === undefined)
         throw new Error(`section "${ref[2]}" does not name exactly one heading of #${ref[1]}`);
-      for (const unit of markdownUnits(body)) add(unit.text, !!ref[3], `#${ref[1]} "${ref[2]}"`);
+      for (const unit of markdownUnits(body)) {
+        if (unit.refusal) throw new Error(unit.refusal);
+        add(unit.text, !!ref[3], `#${ref[1]} "${ref[2]}"`);
+      }
     } else if (from) lead = { source: from[1] ?? "", docs: block.text.endsWith("(docs):") };
     else if (block.kind === "quote" || block.kind === "item") {
       const sourceUnits = await unitsOf(lead.source);

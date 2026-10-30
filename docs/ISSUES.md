@@ -59,12 +59,13 @@ with indented continuation lines and paragraphs, paragraphs, blockquotes, table 
 lines. A list item is one whole unit, including its continuation paragraphs. Quoting only its
 first paragraph is refused. Table rows without escaped pipes supply whole cell units. Rows
 have explicit outer pipes or belong to a delimiter-backed table; a literal pipe in a list
-item or ordinary paragraph does not split that unit into cells.
+item, heading or ordinary paragraph does not split that unit into cells, and a heading ends a
+table.
 
 Selected sections are scanned sequentially: a fence (three or more backticks or tildes), HTML
 block/comment or details tag starting with `<` (including inline HTML comments), setext
-underline directly beneath paragraph text, or four-space indentation outside list
-continuations fails the run before the model.
+underline directly beneath paragraph text, heading inside a list item, or four-space
+indentation outside list continuations fails the run before the model.
 The reason is `unsupported Markdown in the intent: <construct>; normalize the ticket`.
 An escaped pipe in a selected table row, or a source row used for a quotation, fails with
 `unsupported Markdown in the intent: escaped pipe in a table row; normalize the ticket`.
@@ -79,7 +80,8 @@ heading can truncate the range.
 
 Quote sources are distinct from selected sections: unrelated fences, HTML and details may
 remain in the parent or checked-SHA file. Fenced and commented text cannot supply source units
-or headings. Inline source comments preserve all surrounding visible text as part of the
+or headings. A source list item containing a heading cannot be quoted.
+Inline source comments preserve all surrounding visible text as part of the
 whole unit, including list continuation paragraphs. A closing fence must use the opening
 character, be at least as long, and have only spaces after it. Unclosed fences/comments make
 the source unresolvable. File sources still undergo containment and tracked-membership
