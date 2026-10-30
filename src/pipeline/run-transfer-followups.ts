@@ -48,7 +48,8 @@ function decodeFollowUp(value: unknown, run: r.PortableRun, repo: Repo): Transfe
     owner.deliveryBranch !== null ||
     run.baseBranch !== owner.branch ||
     run.deliveryBranch !== owner.branch ||
-    f.prUrl.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/)?.[1] !== repo.slug ||
+    f.prUrl.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/[1-9][0-9]*$/)?.[1]?.toLowerCase() !==
+      repo.slug.toLowerCase() ||
     ref?.kind !== "review-round" ||
     ref.runId !== owner.id ||
     ref.round !== f.round ||
@@ -71,8 +72,7 @@ export function decodeRunTransfer(value: unknown, repo: Repo) {
 export function encodeRunTransfer(input: r.TransferRowInput, repo: Repo, dependency?: FollowUpInput) {
   const rows = r.encodeRunTransferRows(input, repo);
   if (!dependency) return decodeRunTransfer(rows, repo);
-  if (!dependency.owner || !dependency.round || dependency.owner.repoId !== repo.id)
-    throw new RunTransferError("incomplete");
+  if (!dependency.owner || !dependency.round) throw new RunTransferError("incomplete");
   const owner = r.encodeTransferRun(dependency.owner, repo, "incomplete");
   return decodeRunTransfer({ ...rows, followUp: { ...dependency.round, owner } }, repo);
 }

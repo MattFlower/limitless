@@ -62,6 +62,23 @@ test.each(["review", "conflict", "ci"] as const)(
   },
 );
 
+test.each(["encoding", "decoding"] as const)("accepts mixed-case GitHub PR paths during %s", (boundary) => {
+  const { input, dependency } = followUpFixture();
+  const wire = encodeRunTransfer(input, repo, dependency);
+  if (!dependency.owner || !dependency.round || !("followUp" in wire)) throw new Error("Expected history");
+  const url = "https://github.com/Example/Project/pull/42";
+  const run = boundary === "encoding" ? input.run : wire.run;
+  const owner = boundary === "encoding" ? dependency.owner : wire.followUp.owner;
+  const round = boundary === "encoding" ? dependency.round : wire.followUp;
+  for (const record of [run, run.sourceRef, owner, round]) Object.assign(record ?? {}, { prUrl: url });
+  const result =
+    boundary === "encoding" ? encodeRunTransfer(input, repo, dependency) : decodeRunTransfer(wire, repo);
+  expect(result).toHaveProperty("run.prUrl", url);
+  expect(result).toHaveProperty("run.sourceRef.prUrl", url);
+  expect(result).toHaveProperty("followUp.prUrl", url);
+  expect(result).toHaveProperty("followUp.owner.prUrl", url);
+});
+
 test("unsupported repositories, flows and round kinds fail on both boundaries", () => {
   const input = fixture(),
     wire = encodeRunTransfer(input, repo);
