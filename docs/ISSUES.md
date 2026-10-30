@@ -38,9 +38,10 @@ Recovery accepts only an exact factory-generated first-line marker from the chec
 identity. Question markers identify the run, linked repository/issue and sorted question IDs;
 markers embedded in question or reason text never acknowledge delivery. Transformations that
 alter the marker suppress publication. Unsent stale question sets are superseded; uncertain POSTs
-are recovered before closing the checkpoint and are never reposted when stale. Accepted comments
-remain visible. Completed historical comments are preserved, and pending legacy comments retain
-their stored text.
+are recovered before rechecking the saved body's privacy or closing the checkpoint, even if
+inspection is unavailable. New POSTs still require current inspection and eligibility; stale sets
+are never reposted. Accepted comments remain visible. Completed historical comments are preserved,
+and pending legacy comments retain their stored text.
 
 Observed events are recorded before delivery and have durable checkpoints, including comment
 ids and posting identities; restarts do not duplicate comments. Pre-existing runs receive only

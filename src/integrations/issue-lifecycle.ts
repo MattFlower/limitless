@@ -59,9 +59,11 @@ export async function reconcileIssueLifecycle(
     before?.();
     return gh(["api", ...args], signal, undefined, repo);
   };
-  const logFailure = (run: Run, repo: string, number: number, error: unknown) => {
-    if (!signal.aborted && error !== exhausted)
-      log(redactCredentials(`Issue lifecycle ${repo}#${number} run ${run.id}: ${String(error)}`));
+  const logFailure = (
+    code: "field-withheld" | "body-suppressed" | "labels-failed" | "publication-failed",
+    error?: unknown,
+  ) => {
+    if (!signal.aborted && error !== exhausted) log(`Issue lifecycle: ${code}`);
   };
   const openQuestions = (run: Run) => store.listQuestions(run.id).filter((q) => q.answer === null);
   const questionSet = (run: Run) =>
@@ -102,7 +104,7 @@ export async function reconcileIssueLifecycle(
         checkPublicationText(text, "", inspect().entries);
         return text;
       } catch {
-        logFailure(run, repo, number, "field-withheld");
+        logFailure("field-withheld");
         return "[withheld; see the UI]";
       }
     };
@@ -146,7 +148,7 @@ export async function reconcileIssueLifecycle(
         save(effect, "pending", { body });
       } catch {
         save(effect, "done");
-        logFailure(run, repo, number, "body-suppressed");
+        logFailure("body-suppressed");
       }
     }
     if (!effects.has("labels")) save("labels", "pending");
@@ -344,7 +346,7 @@ export async function reconcileIssueLifecycle(
           return;
         }
         freshLabels.delete(key);
-        logFailure(snapshot, repo, number, error);
+        logFailure("labels-failed", error);
       }
       continue;
     }
@@ -359,17 +361,9 @@ export async function reconcileIssueLifecycle(
     }
     if (stale) save(effect, "recovering", { page: pending.page });
     try {
-      let body: string;
-      try {
-        if (!pending.body) throw new Error("missing lifecycle comment body");
-        body = checkBody(run, pending.body, markerFor(run.id, task, repo, number));
-      } catch {
-        save(effect, "done");
-        logFailure(run, repo, number, "body-suppressed");
-        continue;
-      }
+      // Recovery depends only on the checkpoint, even if its body is no longer publishable.
+      const marker = markerFor(run.id, task, repo, number);
       if (pending.page) {
-        const marker = body.split("\n")[0] ?? "";
         let page = pending.page;
         while (page) {
           const comments = z
@@ -408,11 +402,13 @@ export async function reconcileIssueLifecycle(
         continue;
       }
       if (!login) throw new Error("cannot identify lifecycle comment author");
+      let body: string;
       try {
-        body = checkBody(run, body, markerFor(run.id, task, repo, number));
+        if (!pending.body) throw new Error("missing lifecycle comment body");
+        body = checkBody(run, pending.body, marker);
       } catch {
         save(effect, "done");
-        logFailure(run, repo, number, "body-suppressed");
+        logFailure("body-suppressed");
         continue;
       }
       if (!eligible()) {
@@ -439,7 +435,7 @@ export async function reconcileIssueLifecycle(
         const checkpoint = store.issueLifecycleEffects(run.id, repo, number).find((e) => e.effect === effect);
         save(effect, checkpoint?.page ? "recovering" : "done", { page: checkpoint?.page ?? 0 });
       }
-      logFailure(run, repo, number, error);
+      logFailure("publication-failed", error);
     }
   }
 }
