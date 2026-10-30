@@ -58,6 +58,26 @@ export const SpecSchema = z.object({
   blocking_questions: z.array(z.string()),
 });
 export type Spec = z.infer<typeof SpecSchema>;
+export const AcceptanceSchema = z.strictObject({
+  items: z.array(
+    z.strictObject({
+      unit: z.string().regex(/^U[1-9]\d*$/),
+      verdict: z.enum(["met", "partly_met", "unmet", "regressed", "manual"]),
+      files: z.array(
+        z.strictObject({
+          path: z.string(),
+          lines: z
+            .strictObject({ start: z.number().int().positive(), end: z.number().int().positive() })
+            .nullable()
+            .default(null),
+        }),
+      ),
+      tests: z.array(z.strictObject({ file: z.string(), name: z.string() })),
+      note: z.string(),
+    }),
+  ),
+});
+export type Acceptance = z.infer<typeof AcceptanceSchema>;
 
 export const HoldoutSchema = z
   .object({

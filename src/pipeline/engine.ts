@@ -97,6 +97,7 @@ import {
   redactCredentials,
 } from "../util/proc.ts";
 import { publicationFields } from "../workers/publication.ts";
+import { ACCEPTANCE_BLOCK, acceptanceEngine, prepareAcceptance, runAcceptance } from "./acceptance.ts";
 import {
   type AgentPublication,
   type AgentPublicationHooks,
@@ -118,7 +119,7 @@ import {
   type RunState,
   redactPostMergeComparisons,
 } from "./context.ts";
-import { runCoveringTests } from "./covering-tests.ts";
+import { runCoveringTests, succeededCoveringStages } from "./covering-tests.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import {
@@ -270,6 +271,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         ctx.state.needsHumanReason === REVIEW_RESOLUTION_BLOCK &&
         ctx.state.reviewResolution &&
         !ctx.state.reviewResolution.sha
+      ) &&
+      !(
+        ctx.state.needsHumanReason === ACCEPTANCE_BLOCK &&
+        ctx.state.flow === "acceptance" &&
+        acceptanceEngine.enabled
       )
     )
       throw new NeedsHumanError(
@@ -309,7 +315,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       ctx.state.agentFullSuite ??= readAgentFullSuite(contents, (message) => ctx.log(message, "warn"));
       await ctx.save();
     }
-    if (ctx.state.phase === "prepare") await prepare(ctx);
+    if (ctx.state.phase === "prepare")
+      await (ctx.state.flow === "acceptance" ? prepareAcceptance(ctx) : prepare(ctx));
+    if (ctx.state.phase === "accept") await runAcceptance(ctx);
     if (ctx.state.phase === "triage") await triage(ctx);
     if (ctx.state.phase === "clarify") await clarify(ctx);
     if (ctx.state.phase === "spec") await spec(ctx);
@@ -500,6 +508,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
       }
     } else if (
+      ctx.state.flow !== "acceptance" &&
       e instanceof NeedsHumanError &&
       !(e instanceof ReaderSetupError) &&
       !(e instanceof DeliveryHeadError) &&
@@ -1102,8 +1111,11 @@ async function buildLoop(ctx: RunContext): Promise<void> {
     await ctx.save("review-resolution-start");
     if (ctx.state.conflictRound === undefined)
       await mergeForDelivery(ctx, ctx.state.worktreePath as string, tip, review.reviewedSha);
-    if (!(await oneRound(ctx, ctx.state.round, null)))
-      throw new NeedsHumanError(`Conflict resolution rejected:\n${ctx.state.feedback ?? ""}`);
+    if (!(await oneRound(ctx, ctx.state.round, null))) {
+      if (ctx.state.lastAudit?.some((finding) => finding.severity === "block"))
+        throw new NeedsHumanError(`Conflict resolution rejected:\n${ctx.state.feedback ?? ""}`);
+      ctx.state.reviewResolution.feedback = ctx.state.feedback ?? "";
+    }
     await ctx.save("review-resolution-checked");
     const sha = await headSha(ctx.state.worktreePath as string);
     ctx.state.reviewResolution.sha = sha;
@@ -1111,7 +1123,9 @@ async function buildLoop(ctx: RunContext): Promise<void> {
     ctx.state.pendingRebaseSha = undefined;
     ctx.state.preRebaseHead = undefined;
     ctx.state.preRebaseGates = undefined;
-    ctx.state.feedback = null;
+    ctx.state.feedback = ctx.state.reviewResolution.feedback
+      ? `### Resolution findings\n${ctx.state.reviewResolution.feedback}`
+      : null;
     ctx.state.round++;
     // Clear the legacy block with the findings round and its baseline in one database write.
     // The old engine must implement that round; resolution's cached checks belong to the prior one.
@@ -1951,7 +1965,13 @@ async function oneRound(
         await ctx.save();
       }
       const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
-      const reviewDiff = fixSha ? await diffSince(cwd, fixSha) : diff;
+      const reviewBaseSha =
+        !resolution && ctx.state.reviewResolution?.sha ? (ctx.state.reviewBaseSha ?? baseSha) : baseSha;
+      const reviewDiff = fixSha
+        ? await diffSince(cwd, fixSha)
+        : reviewBaseSha !== baseSha
+          ? await diffSince(cwd, reviewBaseSha)
+          : diff;
       const scope: ReviewScope | undefined =
         system.mode !== "panel"
           ? undefined
@@ -1959,7 +1979,7 @@ async function oneRound(
             ? { kind: "fix", range: `${fixSha}..${reviewedSha}` }
             : {
                 kind: resolution ? "resolution" : "full",
-                range: `${baseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
+                range: `${reviewBaseSha}${ctx.state.flow === "verify-change" ? "..." : ".."}${reviewedSha}`,
               };
       const sameVendorAllowed =
         system.mode === "single" &&
@@ -1988,7 +2008,7 @@ async function oneRound(
               ? (reviewRound(ctx)?.owner.prompt ?? ctx.run.prompt)
               : ctx.run.prompt,
           spec: resolution && ctx.state.reviewResolution ? null : (ctx.state.spec ?? null),
-          baseSha,
+          baseSha: reviewBaseSha,
           stat: reviewDiff.stat,
           ...(ctx.state.flow === "verify-change" ? { patch: reviewDiff.patch } : {}),
           gates: comparison,
@@ -2239,12 +2259,7 @@ async function oneRound(
           ctx.state.baseline,
           {
             runs: ctx.state.coveringTestRuns ?? [],
-            succeededStageIds: (ctx.state.coveringTestRuns ?? [])
-              .filter((r) => {
-                const stage = ctx.store.getStage(r.stageId);
-                return stage?.runId === ctx.run.id && stage.name === "gates" && stage.status === "succeeded";
-              })
-              .map((r) => r.stageId),
+            succeededStageIds: succeededCoveringStages(ctx),
           },
         ),
         ctx.state.spec as Spec,
