@@ -127,7 +127,7 @@ export function epicAttention(
         continue;
       }
       if (/^ {0,3}#{1,2}(?:\s|$)/.test(line)) slices = /^ {0,3}## Slices\s*$/.test(line);
-      const text = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.*)$/)?.[1];
+      const text = line.match(/^ {0,1}(?:[-*+]|\d+[.)])\s+(.*)$/)?.[1];
       if (slices && text !== undefined) lines.push({ line, text });
     }
   }

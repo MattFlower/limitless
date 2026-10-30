@@ -5223,8 +5223,8 @@ test.each([
     nodes: [{ number: 2, state: "CLOSED", repository: { nameWithOwner: "owner/repo" } }],
   };
   for (const prefix of ["", "Acceptance: "]) {
-    const line = `  - ${prefix}${text.split("\n")[0]}`;
-    epic.body = `## Slices\n  - ${prefix}${text}`;
+    const line = ` - ${prefix}${text.split("\n")[0]}`;
+    epic.body = `## Slices\n - ${prefix}${text}`;
     expect(
       epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
     ).toEqual({ state: "unfiled", items: [line] });
@@ -5364,6 +5364,26 @@ test("Slices parsing excludes fences and other sections, counts closed children,
   });
 });
 
+test.each(["-", " *", "+", "1.", " 2)"])(
+  "Slices parsing counts only the top-level line with marker %s",
+  (marker) => {
+    const { epic, open } = attentionEpic();
+    const line = `${marker} Unfiled slice  `;
+    epic.body = `## Slices\n${line}\n  - #2 Build\n  - Nested\n   * Nested\n    + Nested\n\t1. Nested\n \t2) Nested\n  Continuation #3\nAcceptance: #3`;
+    expect(
+      epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+    ).toEqual({ state: "unfiled", items: [line] });
+  },
+);
+
+test("nested Acceptance references do not establish readiness without native blocker evidence", () => {
+  const { epic, open } = attentionEpic();
+  epic.body = "## Slices\n- #2 Build\n - #3 Verify\n  - Acceptance: #3";
+  expect(
+    epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), () => false),
+  ).toBeNull();
+});
+
 test.each(["author", "editor", "missing editor"])(
   "untrusted %s cannot identify unfiled or acceptance slices",
   (kind) => {
@@ -5446,7 +5466,7 @@ test("ambiguous acceptance or blockers missing a closed sibling do not establish
 });
 
 test("poll redacts attention before storage and publication without creating runs or mutations", async () => {
-  const h = harness();
+  const h = harness({}, ["Owner/Repo"]);
   const { epic, open } = attentionEpic();
   const secret = `credential-${crypto.randomUUID()}`;
   registerCredential("EPIC_TEST_CREDENTIAL", secret);
@@ -5455,7 +5475,7 @@ test("poll redacts attention before storage and publication without creating run
   h.store.subscribe((msg) => {
     if (msg.kind === "feed") published.push(msg.item);
   });
-  h.data.set("owner/repo", [epic, open]);
+  h.data.set("Owner/Repo", [epic, open]);
   h.data.set("outside/repo", [epic]);
   h.start();
   await h.advance();
@@ -5465,8 +5485,8 @@ test("poll redacts attention before storage and publication without creating run
       kind: "queue.epic_attention",
       runId: null,
       evalId: null,
-      repo: "owner/repo",
-      data: { repo: "owner/repo", epic: 1, state: "unfiled", items: ["- File [redacted]"] },
+      repo: "Owner/Repo",
+      data: { repo: "Owner/Repo", epic: 1, state: "unfiled", items: ["- File [redacted]"] },
     },
   ]);
   expect(published).toEqual(items);
@@ -5649,6 +5669,10 @@ test("epic state rolls back with its feed item and publishes only committed obse
   expect(saved).toEqual([[{ repo: "owner/repo", epic: 1, state: "unfiled" }]]);
   h.store.reconcileEpicAttention("owner/repo", observation);
   expect(saved).toHaveLength(1);
+  expect(h.store.db.query("SELECT * FROM queue_epic_attention").all()).toEqual([
+    { repo: "owner/repo", epic: 1, state: "unfiled" },
+  ]);
+  expect(h.store.readFeed().items).toHaveLength(1);
 });
 
 test.each(["children", "51 children", "labels", "blockers", "missing child"])(

@@ -607,6 +607,44 @@ describe("runGates / compareGates", () => {
     expect(compareGates(baseline, after)[0]).toMatchObject({ verdict: "not_run", blocking: true });
   });
 
+  const actionsIdentity: GateResult["executor"] = {
+    kind: "github-actions",
+    workflowSha: "a".repeat(40),
+    runsOn: "ubuntu-24.04",
+  };
+  test.each([
+    ["Actions baseline, local candidate", actionsIdentity, undefined],
+    ["local baseline, Actions candidate", undefined, actionsIdentity],
+    ["matching Actions identity", actionsIdentity, actionsIdentity],
+    ["different workflow", actionsIdentity, { ...actionsIdentity, workflowSha: "b".repeat(40) }],
+    ["different runner label", actionsIdentity, { ...actionsIdentity, runsOn: "ubuntu-22.04" }],
+  ])("failed baseline is insufficient evidence: %s", (_name, baselineIdentity, candidateIdentity) => {
+    const baseline: GateRun = {
+      setupOk: true,
+      setup: [],
+      checks: [{ ...r("test", false), executor: baselineIdentity }],
+    };
+    const candidate = { ...baseline, checks: [{ ...r("test", false), executor: candidateIdentity }] };
+    expect(compareGates(baseline, candidate)[0]).toMatchObject({ verdict: "new_failure", blocking: true });
+    const legacy = { ...baseline, checks: [r("test", false)] };
+    expect(compareGates(legacy, legacy)[0]).toMatchObject({ verdict: "still_failing", blocking: false });
+  });
+
+  for (const side of ["baseline", "candidate"])
+    test.each(["firstAttempt", "retryAttempt", "targetedRetry"] as const)(
+      `${side} retained %s Actions evidence stays blocking`,
+      (field) => {
+        const legacy: GateRun = { setupOk: true, setup: [], checks: [r("test", false)] };
+        const retained: GateRun = {
+          ...legacy,
+          checks: [{ ...r("test", false), [field]: { ...r("test", false), executor: actionsIdentity } }],
+        };
+        const comparison =
+          side === "baseline" ? compareGates(retained, legacy) : compareGates(legacy, retained);
+        expect(comparison[0]).toMatchObject({ verdict: "new_failure", blocking: true });
+      },
+    );
+
   test.each([true, false])("targeted results are independent of full baseline (ok=%s)", (baseOk) => {
     const baseline: GateRun = { setupOk: true, setup: [], checks: [r("test", baseOk)] };
     const docsOnly = {

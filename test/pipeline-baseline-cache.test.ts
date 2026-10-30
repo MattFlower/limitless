@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { BaselineCacheKey } from "../src/db/store.ts";
 import * as baselineCache from "../src/gates/cache.ts";
-import { localExecutor } from "../src/gates/executor.ts";
+import { type GateExecutor, localExecutor } from "../src/gates/executor.ts";
 import * as gateRunner from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
@@ -387,6 +387,71 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(JSON.parse(f.store.getArtifact(second.run.id, "baseline-gates.json") ?? "{}")).toEqual(
         second.state?.baseline,
       );
+    });
+
+    test.each([true, false])("Actions prepare bypasses cache and shared flights (passing=%s)", async (ok) => {
+      const count = join(home, "gate-runs");
+      await commitGates(`[gates]\nchecks = [{ name = "check", run = "echo x >> '${count}'" }]\n`);
+      const f = start(quick);
+      const first = await prepared(f);
+      const rows = cacheRows(f);
+      expect(rows).toHaveLength(1);
+      const local = f.deps.gateExecutor;
+      const executions: string[] = [];
+      const actions: GateExecutor = {
+        kind: "github-actions",
+        async start(req) {
+          executions.push(req.headSha);
+          return { kind: "github-actions", id: `fake-actions-${executions.length}`, startedAt: 0 };
+        },
+        attach(_handle, _signal, req) {
+          if (!req) throw new Error("Missing fake Actions request");
+          return {
+            result: Promise.resolve({
+              setupOk: true,
+              setup: [],
+              checks: req.gates.checks.map((c) => ({
+                name: c.name,
+                command: c.run,
+                ok,
+                exitCode: ok ? 0 : 1,
+                durationMs: 1,
+                output: "",
+                executor: {
+                  kind: "github-actions" as const,
+                  workflowSha: "a".repeat(40),
+                  runsOn: "ubuntu-24.04",
+                },
+              })),
+            }),
+            cancel: async () => {},
+            events: { async *[Symbol.asyncIterator]() {} },
+          };
+        },
+      };
+      const spies = [
+        spyOn(f.store, "getBaselineCache"),
+        spyOn(f.store, "putBaselineCache"),
+        spyOn(f.store, "deleteBaselineCache"),
+        spyOn(baselineCache, "singleFlight"),
+      ];
+      try {
+        f.deps.gateExecutor = actions;
+        const fresh = await prepared(f);
+        expect(fresh.state?.baselineCached).toBe(false);
+        expect(fresh.state?.baseline?.checks[0]?.ok).toBe(ok);
+        expect(executions.length).toBeGreaterThan(0);
+        for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+        expect(cacheRows(f)).toEqual(rows);
+      } finally {
+        for (const spy of spies) spy.mockRestore();
+        f.deps.gateExecutor = local;
+      }
+      const reused = await prepared(f);
+      expect(reused.state?.baselineCached).toBe(true);
+      expect(reused.state?.baseline).toEqual(first.state?.baseline);
+      expect(lines(count)).toBe(1);
+      expect(cacheRows(f)).toEqual(rows);
     });
 
     // #556 (2026-10-17): alone 8.59 s, worst of 10 paired runs 6.56 s; multiple real-Git pipelines.
