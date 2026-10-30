@@ -106,6 +106,8 @@ export interface Config {
 }
 
 export interface RepoSettings {
+  githubActions?: boolean;
+  githubActionsPaidMinutes?: boolean;
   discreet: boolean;
   branchPrefix: string;
   landRequiresApproval: boolean;
@@ -114,6 +116,8 @@ export interface RepoSettings {
 export function repoSettings(cfg: Pick<Config, "repos">, slug: string): RepoSettings {
   return (
     cfg.repos?.[slug.toLowerCase()] ?? {
+      githubActions: false,
+      githubActionsPaidMinutes: false,
       discreet: false,
       branchPrefix: "change/",
       landRequiresApproval: false,
@@ -135,15 +139,29 @@ function parseRepos(value: unknown): Record<string, RepoSettings> {
     spellings.set(normalized, slug);
     if (!table(entry)) throw new Error("repos entries must be tables");
     for (const key of Object.keys(entry))
-      if (key !== "discreet" && key !== "branch_prefix" && key !== "land_requires_approval")
+      if (
+        ![
+          "discreet",
+          "branch_prefix",
+          "land_requires_approval",
+          "github_actions",
+          "github_actions_paid_minutes",
+        ].includes(key)
+      )
         console.warn(`Ignoring unknown repository setting for ${slug}: ${key}`);
     const { discreet = false, branch_prefix = "change/", land_requires_approval = false } = entry;
+    const { github_actions = false, github_actions_paid_minutes = false } = entry;
+    if (typeof github_actions !== "boolean") throw new Error("repos.github_actions must be a boolean");
+    if (typeof github_actions_paid_minutes !== "boolean")
+      throw new Error("repos.github_actions_paid_minutes must be a boolean");
     if (typeof discreet !== "boolean") throw new Error("repos.discreet must be a boolean");
     if (typeof land_requires_approval !== "boolean")
       throw new Error("repos.land_requires_approval must be a boolean");
     if (typeof branch_prefix !== "string" || !branch_prefix || !isBranchName(`${branch_prefix}x`))
       throw new Error("repos.branch_prefix must be a nonempty valid branch prefix");
     out[normalized] = {
+      githubActions: github_actions,
+      githubActionsPaidMinutes: github_actions_paid_minutes,
       discreet,
       branchPrefix: branch_prefix,
       landRequiresApproval: land_requires_approval,

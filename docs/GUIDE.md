@@ -236,6 +236,8 @@ discovers an owner.
 | `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
 | `[repos."<owner>/<name>"] discreet` | `false` | Omit factory marks from published branches, commits, PR reports and round comments; skip issue-trigger status comments. Slugs match case-insensitively. Older releases ignore this table and publish their usual marks. Existing branches retain their names. |
 | `[repos."<owner>/<name>"] branch_prefix` | `"change/"` | In discreet mode, branches use `<branch_prefix><title-slug>` with `-2` through `-5`, then one random suffix for collisions (six probes maximum). Must form a valid branch when followed by `x`. Ignored unless `discreet = true`. |
+| `[repos."<owner>/<name>"] github_actions` | `false` | Reserve operator authorization for Actions gates. This release does not activate Actions selection; production keeps its existing routing. |
+| `[repos."<owner>/<name>"] github_actions_paid_minutes` | `false` | Additional permission required for private-repository Actions minutes; grants nothing without `github_actions`. |
 | `[workers] agent_slots` | `2` | Positive integer cap on leased agent sessions per worker, independent of gate slots. Older releases ignore this key. |
 | `[workers] agents` | `[]` | Role names opted into worker sessions. `implement` and `review` dispatch in this release; other known roles warn and stay local. Requires `listen`, independently of `[gates] executor`. Older releases ignore this key. |
 | `[workers] repos` | `[]` | Repositories allowed to send gate code and agent sessions to paired workers, for example `["owner/name"]`. Gates also require `[gates] executor = "lan"`. |
@@ -254,6 +256,11 @@ discovers an owner.
 | `[local] remote_model_path`, `remote_host`, `remote_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
 
 Unknown repository settings are ignored with a warning naming the repository and key, so later keys do not prevent rollback.
+On rollback, older releases ignore `github_actions` and `github_actions_paid_minutes` with an
+`Ignoring unknown repository setting` warning and continue their existing routing. Neither key
+adds an accepted value to `[gates] executor`, which remains `"local"` or `"lan"`.
+Actions baselines bypass cache reads, writes and shared flights. A runner's `runs-on` label
+(currently `ubuntu-24.04`) is not an installed image version and does not establish cache equivalence.
 
 Gates deny home reads except their checkout, scratch, recorded Git directories and approved
 toolchains; system paths remain readable. Exact ancestor manifest names and `node_modules`

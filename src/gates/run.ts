@@ -30,6 +30,8 @@ import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
+  /** Factory-authored execution identity; absent on legacy and local results. */
+  executor?: { kind: "github-actions"; workflowSha: string; runsOn: string };
   /** Infrastructure stopped this command before a complete execution could be observed. */
   incomplete?: string;
   coveringTest?: CoveringTestEvidence;
@@ -561,7 +563,7 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     else if (before.ok && r.ok) verdict = "pass";
     else if (before.ok && !r.ok) verdict = "regressed";
     else if (!before.ok && r.ok) verdict = "fixed";
-    else verdict = "still_failing";
+    else verdict = actionsEvidence(r) || actionsEvidence(before) ? "new_failure" : "still_failing";
     out.push({
       name: r.name,
       verdict,
@@ -576,6 +578,18 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     });
   }
   return out;
+}
+
+function actionsEvidence(result?: GateResult): boolean {
+  return (
+    !!result &&
+    !!(
+      result.executor ||
+      actionsEvidence(result.firstAttempt) ||
+      actionsEvidence(result.retryAttempt) ||
+      actionsEvidence(result.targetedRetry)
+    )
+  );
 }
 
 /** Whether the output names a location (`file:12`, `file(12,`) in one of the changed files. */

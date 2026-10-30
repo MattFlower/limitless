@@ -723,7 +723,8 @@ async function prepare(ctx: RunContext): Promise<void> {
       const buildSha = ctx.deps.buildSha;
       if (!hasGates) ctx.state.baseline = null;
       // Without a known build the gate environment can't be keyed: never read or write the cache.
-      else if (!buildSha) ctx.state.baseline = await runBaseline();
+      else if (!buildSha || ctx.deps.gateExecutor?.kind === "github-actions")
+        ctx.state.baseline = await runBaseline();
       else {
         const executor =
           cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local";
