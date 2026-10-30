@@ -18,7 +18,16 @@ jobs:
       - run: git config --global user.email ci@example.com && git config --global user.name ci
       - run: |
           export LIMITLESS_CI_TEST_LOG="/proc/$$/fd/2"
+          export LIMITLESS_CI_JUNIT="$RUNNER_TEMP/bun-test-junit.xml"
           bash scripts/ci-check.sh 20m bun run check
+      # The factory reads this report from PR and main runs to tell unrelated test failures apart (#994).
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: junit
+          path: ${{ runner.temp }}/bun-test-junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
   packaged-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 15
