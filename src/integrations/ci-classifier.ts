@@ -343,7 +343,15 @@ async function inspectCiInner(
       .object({ head_sha: z.string(), run_attempt: z.number().int().positive() })
       .parse(await read(`actions/runs/${origin.runId}`));
     if (run.head_sha !== f.sha) throw new Error("Outdated CI rerun SHA");
-    if (run.run_attempt <= origin.attempt) continue;
+    if (!current()) return true;
+    if (run.run_attempt <= origin.attempt) {
+      if (
+        f.outcome === "rerun_requested" &&
+        (f.rerunClaimedAt == null || Date.now() - f.rerunClaimedAt > 10 * 60_000)
+      )
+        reject(f);
+      continue;
+    }
     const matches = (await jobs(origin.runId, run.run_attempt)).filter((j) => j.name === origin.name);
     if (matches.length !== 1) throw new Error("Ambiguous CI rerun job");
     const job = matches[0];
