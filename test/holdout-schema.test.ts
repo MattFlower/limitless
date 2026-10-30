@@ -27,7 +27,9 @@ test("holdout schema accepts 1–8 sequential scenarios without an edge-case quo
 test("holdout schema still accepts the previously persisted three-scenario format", () => {
   // Shape written by the old 3–8 scenario, two-edge-case schema.
   const persisted = JSON.parse(JSON.stringify({ scenarios }));
-  expect(HoldoutSchema.parse(persisted)).toEqual({ scenarios });
+  expect(HoldoutSchema.parse(persisted)).toEqual({
+    scenarios: scenarios.map((s) => ({ ...s, browser: false })),
+  });
 });
 
 test("holdout schema rejects length, IDs and missing fields", () => {
