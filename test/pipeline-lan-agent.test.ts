@@ -9,9 +9,11 @@ import { type GateExecutor, gateProvenance } from "../src/gates/executor.ts";
 import { loadPrivateStrings, privateStringsDigest } from "../src/gates/private.ts";
 import { runLocalGates } from "../src/gates/run.ts";
 import { worktreeGit } from "../src/git/command.ts";
+import * as repos from "../src/git/repos.ts";
 import { headSha } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import { ClaimLostError } from "../src/integrations/claim-errors.ts";
 import type { AgentCall, AgentExecutor } from "../src/pipeline/agent-executor.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import type { FaultPlan } from "../src/pipeline/faults.ts";
@@ -1863,4 +1865,62 @@ test.each(workerStartupFailures)(
     }
   },
   60_000,
+);
+
+test.each(["remoteSha", "resume", "adopt"])(
+  "worker publication preserves claim interruption: %s",
+  async (boundary) => {
+    const bare = await githubFixture();
+    const sentinel = new ClaimLostError();
+    let observed: unknown;
+    let reached = false;
+    let interruptedState: RunState | undefined;
+    let publishedBefore: string | undefined;
+    const saves = spyOn(RunContext.prototype, "save");
+    const executor: AgentExecutor = {
+      kind: "test",
+      async run(call, local) {
+        const hooks = call.publication;
+        if (!hooks) return local();
+        const req = await hooks.prepare();
+        if (!req) throw new Error("Missing publication");
+        publishedBefore = f.store.getRunState<RunState>(call.runId)?.publishedSha;
+        const injected =
+          boundary === "remoteSha"
+            ? spyOn(repos, "remoteBranchSha").mockRejectedValue(sentinel)
+            : boundary === "resume"
+              ? spyOn(repos, "headSha").mockRejectedValue(sentinel)
+              : spyOn(repos, "adoptWorkerCommit").mockRejectedValue(sentinel);
+        try {
+          reached = true;
+          try {
+            if (boundary === "remoteSha") await hooks.prepare();
+            else if (boundary === "resume") await hooks.resume(req);
+            else await hooks.adopt("e".repeat(40), req);
+          } catch (error) {
+            observed = error;
+            interruptedState = structuredClone(f.store.getRunState<RunState>(call.runId) ?? undefined);
+          }
+        } finally {
+          injected.mockRestore();
+        }
+        throw sentinel;
+      },
+    };
+    const { f, locals } = boot({ executor });
+    registerGithub(f, bare);
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      await waitFor(f, run.id, ["failed", "needs_human", "succeeded"]);
+      expect(reached).toBe(true);
+      expect(observed).toBe(sentinel);
+      expect(locals()).toBe(0);
+      expect(jobs(f)).toHaveLength(0);
+      expect(interruptedState?.workerCommitRound).toBeUndefined();
+      expect(interruptedState?.publishedSha).toBe(publishedBefore);
+      expect(saves.mock.calls.map(([reason]) => reason)).not.toContain("worker-commit-adopted");
+    } finally {
+      saves.mockRestore();
+    }
+  },
 );
