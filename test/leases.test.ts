@@ -1,7 +1,16 @@
 import { afterEach, expect, mock, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { setImmediate } from "node:timers/promises";
 import { Store } from "../src/db/store.ts";
-import { type ClaimRecord, createClaimClient, parseRecord } from "../src/integrations/claim-ref.ts";
+import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
+import { bindClaim, claimGuard, claimScope, type ScopedClaim } from "../src/integrations/claim-guard.ts";
+import {
+  type ClaimClient,
+  type ClaimRecord,
+  type ClaimTip,
+  createClaimClient,
+  parseRecord,
+} from "../src/integrations/claim-ref.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import {
   type AcquireResult,
@@ -28,7 +37,7 @@ function held(result: AcquireResult) {
   if (result.kind !== "held") throw new Error(`Expected held, got ${result.kind}`);
   return result;
 }
-function fixture(gh = new GitHub(), identity = member) {
+function fixture(gh = new GitHub(), identity = member, probe = () => {}) {
   const store = new Store(":memory:");
   cleanup.push(() => store.close());
   let inclusive = 1_000;
@@ -42,6 +51,9 @@ function fixture(gh = new GitHub(), identity = member) {
   const clock = { sample: () => ({ inclusive, exclusive }), wall };
   const times: number[] = [];
   const timeGh = mock<GhRunner>(async (args, _signal, _stdin, target) => {
+    probe();
+    await Promise.resolve();
+    probe();
     expect(args).toEqual(["api", "--include", "rate_limit"]);
     expect(target).toBe(repo);
     times.push(server);
@@ -49,6 +61,7 @@ function fixture(gh = new GitHub(), identity = member) {
   });
   const timer = {
     set: ((fn: () => void, ms: number) => {
+      probe();
       expect(ms).toBe(LEASE.renewMs);
       callback = fn;
       return 1 as unknown as ReturnType<typeof setInterval>;
@@ -57,8 +70,25 @@ function fixture(gh = new GitHub(), identity = member) {
       callback = undefined;
     }) as typeof clearInterval,
   };
-  const client = createClaimClient({ gh: gh.gh, sample: clock.sample });
-  const lost = mock((_h: LeaseHandle, _tip: unknown) => {});
+  const underlying = createClaimClient({ gh: gh.gh, sample: clock.sample });
+  const read = mock<ClaimClient["read"]>(async (...args) => {
+    probe();
+    await Promise.resolve();
+    probe();
+    return underlying.read(...args);
+  });
+  const write = mock<ClaimClient["write"]>(async (...args) => {
+    probe();
+    await Promise.resolve();
+    probe();
+    return underlying.write(...args);
+  });
+  const client: ClaimClient = { read, write };
+  const bindings: ScopedClaim[] = [];
+  const lost = mock((h: LeaseHandle, tip: ClaimTip | null) => {
+    probe();
+    for (const claim of bindings) claim.onLost(h, tip);
+  });
   return {
     gh,
     store,
@@ -66,6 +96,24 @@ function fixture(gh = new GitHub(), identity = member) {
     times,
     timeGh,
     lost,
+    read,
+    write,
+    bind(manager: Awaited<ReturnType<typeof createLeaseManager>>, h: LeaseHandle) {
+      const claim = bindClaim(manager, h, () => false);
+      bindings.push(claim);
+      return claim;
+    },
+    capture(): LeaseHandle {
+      const row = store.leaseRow(repo, ref);
+      if (!row) throw new Error("Missing recovery identity");
+      return {
+        repo: row.repo,
+        ref: row.ref,
+        run: row.runId,
+        member: identity,
+        generation: row.confirmed?.generation ?? row.intent?.record.generation ?? 0,
+      };
+    },
     create: () => createLeaseManager({ client, store, clock, gh: timeGh, member: identity, timer }),
     advance(ms: number, suspend = false) {
       inclusive += ms;
@@ -113,6 +161,13 @@ function fixture(gh = new GitHub(), identity = member) {
       return tip;
     },
   };
+}
+
+function expectGuard(claim: ScopedClaim, reason?: "lease" | "lost") {
+  const check = () => claimScope.run([claim], claimGuard);
+  if (!reason) expect(check).not.toThrow();
+  else if (reason === "lost") expect(check).toThrow(ClaimLostError);
+  else expect(check).toThrow(expect.objectContaining({ name: "ClaimWaitError", reason }));
 }
 
 async function race(unconditional: boolean, takeover: boolean) {
@@ -210,14 +265,19 @@ test("expired own generation is lost, never renewed, and takeover creates genera
   const f = fixture();
   const manager = await f.create();
   const h = held(await f.acquire(manager)).handle;
+  const claim = f.bind(manager, h);
   f.start(manager);
   f.advance(LEASE.expireMs);
   f.gh.requests = [];
-  expect(await manager.update(h, {})).toBe("lost");
+  expect(await claimScope.run([claim], () => manager.update(h, {}))).toBe("lost");
+  expectGuard(claim, "lost");
   expect(f.row()?.confirmed?.state).toBe("lost");
   expect(f.gh.calls("update")).toHaveLength(0);
   expect((await f.acquire(manager)).kind).toBe("superseded");
-  expect(held(await f.acquire(manager, true)).handle.generation).toBe(2);
+  const successor = held(await f.acquire(manager, true)).handle;
+  expect(successor.generation).toBe(2);
+  expectGuard(f.bind(manager, successor));
+  expectGuard(claim, "lost");
   expect(f.lost).toHaveBeenCalledTimes(1);
 });
 
@@ -238,10 +298,15 @@ test("obsolete handles reject update, release and window checks before all reque
   const f = fixture();
   const manager = await f.create();
   const h1 = held(await f.acquire(manager)).handle;
+  const claim = f.bind(manager, h1);
+  const delayed = () => claimScope.run([claim], claimGuard);
   expect(Object.isFrozen(h1)).toBe(true);
   expect(await manager.release(h1, { checkpoint })).toBe("released");
   const h2 = held(await f.acquire(manager)).handle;
   expect(h2.generation).toBe(2);
+  await Promise.resolve();
+  expect(delayed).toThrow(ClaimWaitError);
+  expectGuard(f.bind(manager, h2));
   // Even an intent must remain untouched by the obsolete callback.
   f.store.beginLeaseIntent(repo, ref, want.run, {
     op: "update",
@@ -286,6 +351,7 @@ test.each(["unchanged", "unconfirmed"] as const)(
     const f = fixture();
     const manager = await f.create();
     const h = held(await f.acquire(manager)).handle;
+    const claim = f.bind(manager, h);
     f.start(manager, false);
     f.advance(LEASE.windowMs - 1_000);
     let unreadable = false;
@@ -303,8 +369,10 @@ test.each(["unchanged", "unconfirmed"] as const)(
     expect(f.row()?.confirmed).toEqual(before);
     expect(f.row()?.intent !== null).toBe(mode === "unconfirmed");
     expect(manager.windowOpen(h)).toBe(true);
+    expectGuard(claim);
     f.advance(1_000);
     expect(manager.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     expect(f.lost).not.toHaveBeenCalled();
   },
 );
@@ -341,6 +409,7 @@ test("same-holder moved retries without reporting loss; repeated contention wait
     const f = fixture();
     const manager = await f.create();
     const h = held(await f.acquire(manager)).handle;
+    const claim = f.bind(manager, h);
     f.start(manager, false);
     let moved = 0;
     f.gh.fault = (r) => {
@@ -350,6 +419,12 @@ test("same-holder moved retries without reporting loss; repeated contention wait
     expect(await manager.update(h, { checkpoint })).toBe(repeat ? "wait" : "applied");
     expect(f.row()?.confirmed?.state).toBe("held");
     expect(f.lost).not.toHaveBeenCalled();
+    expect(claim.lost).toBe(false);
+    expectGuard(claim);
+    if (repeat) {
+      f.advance(LEASE.windowMs);
+      expectGuard(claim, "lease");
+    }
     if (!repeat) expect(f.tip()).toMatchObject({ status: "waiting_input", checkpoint });
   }
 });
@@ -424,10 +499,14 @@ test("recovery finishes before start and reports superseded confirmed ownership 
   const before = f.confirmed();
   f.store.beginLeaseIntent(repo, ref, want.run, { op: "renew", before: before.sha, record, commit: null });
   f.gh.seed({ ...record, holder: other, generation: 2 });
+  const expected = f.capture();
   const manager = await f.create();
+  const claim = f.bind(manager, expected);
+  expectGuard(claim, "lease");
   expect(f.row()).toMatchObject({ confirmed: { generation: 1, state: "lost" }, intent: null });
   expect(f.lost).not.toHaveBeenCalled();
   const stop = f.start(manager);
+  expectGuard(claim, "lost");
   expect(f.lost).toHaveBeenCalledTimes(1);
   expect(f.lost).toHaveBeenCalledWith({ repo, ref, run: want.run, member, generation: 1 }, null);
   stop();
@@ -491,6 +570,7 @@ test("unconfirmed update reconciles on the loop without restart or an anchor ref
   const f = fixture();
   const manager = await f.create();
   const h = held(await f.acquire(manager)).handle;
+  const claim = f.bind(manager, h);
   f.start(manager, false);
   f.advance(100_000);
   let unreadable = false;
@@ -512,6 +592,7 @@ test("unconfirmed update reconciles on the loop without restart or an anchor ref
   expect(f.raw()).toEqual(snapshot);
   f.advance(320_000);
   expect(manager.windowOpen(h)).toBe(false);
+  expectGuard(claim, "lease");
   f.gh.fault = undefined;
   await f.tick();
   expect(f.row()).toMatchObject({
@@ -519,6 +600,7 @@ test("unconfirmed update reconciles on the loop without restart or an anchor ref
     intent: null,
   });
   expect(manager.windowOpen(h)).toBe(false);
+  expectGuard(claim, "lease");
   expect(f.lost).not.toHaveBeenCalled();
   expect(await manager.update(h, {})).toBe("applied");
   expect(f.tip().status).toBe("waiting_input");
@@ -599,6 +681,7 @@ test("a moved successor loses only confirmed ownership, and each generation is r
   const f = fixture();
   const manager = await f.create();
   const h = held(await f.acquire(manager)).handle;
+  const claim = f.bind(manager, h);
   f.start(manager, false);
   f.gh.fault = (r) => {
     if (r.step === "update") f.gh.seed({ ...record, holder: other, generation: 2 });
@@ -607,6 +690,7 @@ test("a moved successor loses only confirmed ownership, and each generation is r
   expect(f.row()).toMatchObject({ confirmed: { generation: 1, state: "lost" }, intent: null });
   expect((await f.acquire(manager)).kind).toBe("superseded");
   expect(f.lost).toHaveBeenCalledTimes(1);
+  expectGuard(claim, "lost");
   expect(await manager.release(h)).toBe("obsolete");
 });
 
@@ -614,7 +698,9 @@ test("record-equivalent applied writes never manufacture an anchor", async () =>
   const f = fixture();
   const manager = await f.create();
   const h = held(await f.acquire(manager)).handle;
+  const claim = f.bind(manager, h);
   expect(manager.windowOpen(h)).toBe(true);
+  expectGuard(claim);
   f.gh.fault = (r) => {
     if (r.step === "update") {
       f.gh.seed(f.tip());
@@ -623,12 +709,14 @@ test("record-equivalent applied writes never manufacture an anchor", async () =>
   };
   expect(await manager.update(h, {})).toBe("applied");
   expect(manager.windowOpen(h)).toBe(false);
+  expectGuard(claim, "lease");
 });
 
 test("reconciled release makes the old handle obsolete, without marking it lost", async () => {
   const f = fixture();
   const manager = await f.create();
   const h = held(await f.acquire(manager)).handle;
+  const claim = f.bind(manager, h);
   f.start(manager, false);
   let unreadable = false;
   f.gh.fault = (r) => {
@@ -644,6 +732,7 @@ test("reconciled release makes the old handle obsolete, without marking it lost"
   expect(await manager.update(h, {})).toBe("obsolete");
   expect(f.row()).toMatchObject({ confirmed: { state: "released" }, intent: null });
   expect(f.lost).not.toHaveBeenCalled();
+  expectGuard(claim, "lease");
 });
 
 test.each(["unconfirmed", "unchanged"] as const)(
@@ -654,6 +743,7 @@ test.each(["unconfirmed", "unchanged"] as const)(
     const ma = await a.create();
     const mb = await b.create();
     const h = held(await a.acquire(ma)).handle;
+    const claim = a.bind(ma, h);
     a.start(ma, false);
     const entered = Promise.withResolvers<void>();
     const unblock = Promise.withResolvers<void>();
@@ -674,8 +764,10 @@ test.each(["unconfirmed", "unchanged"] as const)(
     };
     const releasing = ma.release(h);
     expect(ma.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     await entered.promise;
     expect(ma.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     unblock.resolve();
     expect(await releasing).toBe("wait");
     expect(a.row()?.intent !== null).toBe(mode === "unconfirmed");
@@ -683,11 +775,13 @@ test.each(["unconfirmed", "unchanged"] as const)(
     await a.tick();
     expect(a.raw()).toEqual(snapshot);
     expect(ma.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     a.gh.fault = undefined;
     applyLater?.();
     expect(held(await b.acquire(mb)).handle.generation).toBe(2);
     expect(a.row()?.confirmed?.state).toBe("held");
     expect(ma.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     expect(a.lost).not.toHaveBeenCalled();
   },
 );
@@ -696,6 +790,7 @@ test("release closes the window while reconciliation is pending; dropping the in
   const f = fixture();
   const manager = await f.create();
   const h = held(await f.acquire(manager)).handle;
+  const claim = f.bind(manager, h);
   f.start(manager, false);
   let unreadable = false;
   f.gh.fault = (r) => {
@@ -707,25 +802,30 @@ test("release closes the window while reconciliation is pending; dropping the in
   };
   expect(await manager.update(h, {})).toBe("wait");
   expect(manager.windowOpen(h)).toBe(true);
+  expectGuard(claim);
   const snapshot = f.raw();
   const releasing = manager.release(h);
   expect(manager.windowOpen(h)).toBe(false);
+  expectGuard(claim, "lease");
   expect(await releasing).toBe("wait");
   expect(f.raw()).toEqual(snapshot);
   f.gh.fault = undefined;
   await f.tick();
   expect(f.row()).toMatchObject({ confirmed: { state: "held" }, intent: null });
   expect(manager.windowOpen(h)).toBe(false);
+  expectGuard(claim, "lease");
   expect(f.lost).not.toHaveBeenCalled();
   expect(held(await f.acquire(manager)).handle).toEqual(h);
   expect(f.times).toHaveLength(1);
   expect(manager.windowOpen(h)).toBe(true);
+  expectGuard(claim);
 });
 
 test("an earlier in-flight renewal cannot reopen a window closed by release", async () => {
   const f = fixture();
   const manager = await f.create();
   const h = held(await f.acquire(manager)).handle;
+  const claim = f.bind(manager, h);
   const entered = Promise.withResolvers<void>();
   const unblock = Promise.withResolvers<void>();
   const releaseEntered = Promise.withResolvers<void>();
@@ -745,13 +845,16 @@ test("an earlier in-flight renewal cannot reopen a window closed by release", as
   await entered.promise;
   const releasing = manager.release(h);
   expect(manager.windowOpen(h)).toBe(false);
+  expectGuard(claim, "lease");
   unblock.resolve();
   expect(await renewal).toBe("applied");
   await releaseEntered.promise;
   expect(manager.windowOpen(h)).toBe(false);
+  expectGuard(claim, "lease");
   releaseUnblock.resolve();
   expect(await releasing).toBe("wait");
   expect(manager.windowOpen(h)).toBe(false);
+  expectGuard(claim, "lease");
 });
 
 test.each(["unchanged", "unconfirmed"] as const)(
@@ -762,6 +865,7 @@ test.each(["unchanged", "unconfirmed"] as const)(
     const ma = await a.create();
     const mb = await b.create();
     const h = held(await a.acquire(ma)).handle;
+    const claim = a.bind(ma, h);
     a.start(ma, false);
     const entered = Promise.withResolvers<void>();
     const unblock = Promise.withResolvers<void>();
@@ -789,18 +893,21 @@ test.each(["unchanged", "unconfirmed"] as const)(
     const queued = ma.update(h, { status: "waiting_input" });
     const releasing = ma.release(h);
     expect(ma.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     unblock.resolve();
     expect(await executing).toBe("applied");
     expect(await queued).toBe("applied");
     expect(await releasing).toBe("wait");
     expect(a.row()?.intent !== null).toBe(mode === "unconfirmed");
     expect(ma.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     a.gh.fault = undefined;
     expect(applyLater).toBeDefined();
     applyLater?.();
     expect(held(await b.acquire(mb)).handle.generation).toBe(2);
     expect(a.row()?.confirmed?.state).toBe("held");
     expect(ma.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     expect(a.lost).not.toHaveBeenCalled();
   },
 );
@@ -821,9 +928,13 @@ test.each(["confirmed", "recovered acquisition", "loop-reconciled acquisition"] 
       f.gh.fault = (r) => {
         if (r.step === "ref") throw new Error("Unreadable");
       };
+    const expected = f.capture();
     const manager = await f.create();
+    const claim = f.bind(manager, expected);
+    expectGuard(claim, "lease");
     const h = { repo, ref, run: want.run, member, generation: 1 };
     expect(manager.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     f.start(manager);
     f.advance(LEASE.renewMs);
     f.gh.fault = undefined;
@@ -833,6 +944,7 @@ test.each(["confirmed", "recovered acquisition", "loop-reconciled acquisition"] 
     expect(f.row()).toMatchObject({ confirmed: { generation: 1, state: "held" }, intent: null });
     expect(f.gh.calls("update")).toHaveLength(0);
     expect(manager.windowOpen(h)).toBe(false);
+    expectGuard(claim, "lease");
     f.usable(true);
     f.gh.fault = (r) => {
       if (r.step === "commit" && f.gh.calls("commit").length === 1) f.advance(5_000, true);
@@ -843,8 +955,64 @@ test.each(["confirmed", "recovered acquisition", "loop-reconciled acquisition"] 
     expect(f.gh.calls("update")).toHaveLength(1);
     expect(f.row()).toMatchObject({ confirmed: { generation: 1, state: "held" }, intent: null });
     expect(manager.windowOpen(h)).toBe(true);
+    expectGuard(claim);
+    expectGuard(f.bind(manager, { ...expected, generation: expected.generation + 1 }), "lease");
   },
 );
+
+test("recovery advancing generations cannot authorize a reconstructed stale callback", async () => {
+  const f = fixture();
+  const before = f.confirmed();
+  f.store.markLeaseLost(repo, ref);
+  const next = { ...record, generation: 2 };
+  const applied = f.gh.seed(next);
+  f.store.beginLeaseIntent(repo, ref, want.run, {
+    op: "acquire",
+    before: before.sha,
+    record: next,
+    commit: applied.sha,
+  });
+  expect(f.row()).toMatchObject({
+    confirmed: { generation: 1, state: "lost" },
+    intent: { op: "acquire", record: next, commit: applied.sha },
+  });
+  const expected = f.capture();
+  expect(expected).toEqual({ repo, ref, run: want.run, member, generation: 1 });
+  const manager = await f.create();
+  expect(f.row()).toMatchObject({
+    confirmed: { generation: 2, tip: applied.sha, state: "held" },
+    intent: null,
+  });
+  // Reconstruct the old callback with its identity from before recovery changed the row.
+  const stale = f.bind(manager, expected);
+  const current = f.bind(manager, f.capture());
+  expectGuard(stale, "lease");
+  expectGuard(current, "lease");
+  f.start(manager);
+  f.advance(LEASE.renewMs);
+  await f.tick();
+  expect(f.gh.calls("update")).toHaveLength(1);
+  expect(f.times).toHaveLength(1);
+  expect(f.row()).toMatchObject({ confirmed: { generation: 2, state: "held" }, intent: null });
+  expect(manager.windowOpen(current.handle)).toBe(true);
+  const currentPublication = mock(() => {});
+  claimScope.run([current], () => {
+    claimGuard();
+    currentPublication();
+  });
+  expect(currentPublication).toHaveBeenCalledTimes(1);
+  const stalePublication = mock(() => {});
+  const staleCallback = () =>
+    claimScope.run([stale], () => {
+      claimGuard();
+      stalePublication();
+    });
+  expect(staleCallback).toThrow(ClaimWaitError);
+  expect(staleCallback).toThrow(expect.objectContaining({ reason: "lease" }));
+  expect(stalePublication).not.toHaveBeenCalled();
+  expect(stale.lost).toBe(false);
+  expect(f.lost).not.toHaveBeenCalled();
+});
 
 test.each([false, true])(
   "the first tick renews a recovered acquisition (pending at start: %s)",
@@ -861,13 +1029,17 @@ test.each([false, true])(
       f.gh.fault = (r) => {
         if (r.step === "ref") throw new Error("Unreadable");
       };
+    const expected = f.capture();
     const manager = await f.create();
+    const claim = f.bind(manager, expected);
+    expectGuard(claim, "lease");
     f.start(manager);
     f.advance(LEASE.renewMs);
     f.gh.fault = undefined;
     await f.tick();
     expect(f.row()).toMatchObject({ confirmed: { generation: 1, state: "held" }, intent: null });
     expect(f.gh.calls("update")).toHaveLength(1);
+    expectGuard(claim);
   },
 );
 
@@ -912,3 +1084,135 @@ test("run B reconciles run A's unapplied pending acquisition before acquiring", 
   expect(held(await f.acquire(manager, false, next)).handle.generation).toBe(1);
   expect(f.row()).toMatchObject({ runId: "run-b", confirmed: { state: "held" }, intent: null });
 });
+
+test("manager operations and captured ticks independently exit blocked scopes", async () => {
+  const sentinel = new AsyncLocalStorage<string>();
+  const probe = mock(() => {
+    claimGuard();
+    expect(sentinel.getStore()).toBe("sentinel");
+  });
+  const blocked = bindClaim(
+    { windowOpen: () => false },
+    { repo, ref, run: want.run, member, generation: 0 },
+    () => false,
+  );
+  await sentinel.run("sentinel", () =>
+    claimScope.run([blocked], async () => {
+      const f = fixture(new GitHub(), member, probe);
+      const manager = await f.create();
+      const h = held(await f.acquire(manager)).handle;
+      expect(f.read).toHaveBeenCalledTimes(1);
+      expect(f.write).toHaveBeenCalledTimes(1);
+      expectGuard(blocked, "lease");
+      expect(await manager.update(h, {})).toBe("applied");
+      expect(f.read).toHaveBeenCalledTimes(2);
+      expect(f.write).toHaveBeenCalledTimes(2);
+      f.start(manager);
+      await f.tick(); // Invoked here, rather than in the timer registration's context.
+      expect(f.read).toHaveBeenCalledTimes(3);
+      expect(f.write).toHaveBeenCalledTimes(3);
+      expect(await manager.release(h)).toBe("released");
+      expect(f.read).toHaveBeenCalledTimes(4);
+      expect(f.write).toHaveBeenCalledTimes(4);
+      expect(f.gh.requests.map((r) => r.step)).toEqual([
+        "ref",
+        "tree",
+        "repository",
+        "commit",
+        "update",
+        "ref",
+        "commitRead",
+        "commit",
+        "update",
+        "ref",
+        "commitRead",
+        "commit",
+        "update",
+        "ref",
+        "commitRead",
+        "commit",
+        "update",
+      ]);
+      expect(f.times).toHaveLength(1);
+      expect(probe).toHaveBeenCalledTimes(19);
+      expect(sentinel.getStore()).toBe("sentinel");
+      expectGuard(blocked, "lease");
+    }),
+  );
+});
+
+test.each(["release", "superseded", "pending"] as const)(
+  "construction recovery exits scope and preserves captured %s identity",
+  async (mode) => {
+    const sentinel = new AsyncLocalStorage<string>();
+    const probe = () => {
+      claimGuard();
+      expect(sentinel.getStore()).toBe("sentinel");
+    };
+    const f = fixture(new GitHub(), member, probe);
+    const before = f.confirmed();
+    const released = { ...record, state: "released" as const };
+    f.store.beginLeaseIntent(repo, ref, want.run, {
+      op: mode === "release" ? "release" : "update",
+      before: before.sha,
+      record: mode === "release" ? released : record,
+      commit: null,
+    });
+    if (mode === "superseded") f.gh.seed({ ...record, generation: 2, holder: other });
+    if (mode === "pending")
+      f.gh.fault = () => {
+        throw new Error("Unreadable");
+      };
+    const expected = f.capture(); // Construction may replace or remove the local records.
+    const blocked = bindClaim({ windowOpen: () => false }, expected, () => false);
+    await sentinel.run("sentinel", () =>
+      claimScope.run([blocked], async () => {
+        const manager = await f.create();
+        const claim = f.bind(manager, expected);
+        expectGuard(claim, "lease");
+        expect(f.read).toHaveBeenCalledTimes(1);
+        expect(f.write).toHaveBeenCalledTimes(mode === "release" ? 1 : 0);
+        expect(f.times).toHaveLength(0);
+        expect(f.gh.requests.map((r) => r.step)).toEqual(
+          mode === "release"
+            ? ["ref", "commitRead", "tree", "repository", "commit", "update"]
+            : mode === "superseded"
+              ? ["ref", "commitRead"]
+              : ["ref"],
+        );
+        f.start(manager, false);
+        expectGuard(claim, mode === "superseded" ? "lost" : "lease");
+        expect(f.row()).toMatchObject(
+          mode === "pending"
+            ? { confirmed: { state: "held" }, intent: { op: "update" } }
+            : { confirmed: { state: mode === "release" ? "released" : "lost" }, intent: null },
+        );
+        expectGuard(blocked, "lease");
+        expect(sentinel.getStore()).toBe("sentinel");
+      }),
+    );
+  },
+);
+
+test.each(["renewable", "unusable", "expired"] as const)(
+  "a closed binding permits maintenance with a %s time sample",
+  async (mode) => {
+    const f = fixture();
+    const manager = await f.create();
+    const h = held(await f.acquire(manager)).handle;
+    const claim = f.bind(manager, h);
+    f.start(manager, false);
+    f.advance(mode === "expired" ? LEASE.expireMs : LEASE.windowMs);
+    if (mode === "unusable") f.usable(false);
+    expectGuard(claim, "lease");
+    const writes = f.write.mock.calls.length;
+    expect(await claimScope.run([claim], () => manager.update(h, {}))).toBe(
+      mode === "renewable" ? "applied" : mode === "unusable" ? "wait" : "lost",
+    );
+    expect(f.write).toHaveBeenCalledTimes(writes + (mode === "renewable" ? 1 : 0));
+    expect(f.gh.calls("update")).toHaveLength(mode === "renewable" ? 2 : 1);
+    expect(f.times).toHaveLength(1);
+    expectGuard(claim, mode === "renewable" ? undefined : mode === "unusable" ? "lease" : "lost");
+    expect(f.lost).toHaveBeenCalledTimes(mode === "expired" ? 1 : 0);
+  },
+);
