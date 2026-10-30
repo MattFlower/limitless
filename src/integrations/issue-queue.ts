@@ -5,7 +5,15 @@ import { CommentProcessed, ISSUE_CLAIM_STATUSES, type IssueRunSummary, linkedIss
 import { acceptanceRunRequest } from "../pipeline/acceptance.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
-import { commentRunRequest, type GhRunner, issueRunRequest, quotedJson, runGh } from "./github.ts";
+import {
+  ANSWER_UNSUPPORTED,
+  commentRunRequest,
+  type GhRunner,
+  issueRunRequest,
+  quotedJson,
+  reservedAnswer,
+  runGh,
+} from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
 import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
 import { ISSUE_TEXT_FIELDS, issueTextRefusal, issueTextSchema } from "./issue-trust.ts";
@@ -465,6 +473,10 @@ export function startIssueQueue(
                 factory.store.githubCommentProcessed(comment)
               )
                 continue;
+              if (reservedAnswer(request)) {
+                factory.store.recordGitHubComment(comment, null, ANSWER_UNSUPPORTED);
+                continue;
+              }
               try {
                 if (issue.labels.nodes.some((l) => l.name === "acceptance")) {
                   const reason = "acceptance ticket: build runs refused";
