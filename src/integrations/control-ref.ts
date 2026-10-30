@@ -4,6 +4,9 @@ import { claimGuard } from "./claim-guard.ts";
 import { createCompanionIO, type SharedStoreDeps, SharedStoreError } from "./shared-store.ts";
 
 export const CONTROL_REF_RESPONSE_LIMIT = 1_048_576;
+// Reserve 4 KiB for blob JSON, 4 escaped CRLF bytes per 60 base64 characters
+// (45 frame bytes), and the envelope's version, nonce and authentication tag.
+const maxPayloadBytes = Math.floor((CONTROL_REF_RESPONSE_LIMIT - 4096) / 64) * 45 - 29;
 
 export type ControlKind = "receipt" | "boundary" | "run-index" | "member" | "land-authority";
 export type ControlKey = Readonly<{ kind: ControlKind; id: string }>;
@@ -109,7 +112,8 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
     async write(key, before, plaintext, signal) {
       const captured = keySchema.safeParse(key);
       if (!captured.success || (before !== null && !oid.safeParse(before).success)) fail("invalid");
-      const bytes = plaintext instanceof Uint8Array ? Buffer.from(plaintext) : fail("invalid");
+      if (!(plaintext instanceof Uint8Array) || plaintext.byteLength > maxPayloadBytes) fail("invalid");
+      const bytes = Buffer.from(plaintext);
       const k = captured.data;
       const ref = `refs/control/${k.kind}/${k.id}`;
       const aad = Buffer.from(JSON.stringify(["limitless-control", 1, k.kind, k.id]));

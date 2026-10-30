@@ -928,6 +928,46 @@ test("writer construction, validation and captured mutable inputs preserve reade
   expect(await reader(remote).read(owned)).toEqual({ kind: "absent" });
 });
 
+test("payload boundary remains readable with wrapped base64 and blob JSON overhead, and allows updates", async () => {
+  for (const size of [734_370, 734_371]) {
+    const remote = new Remote();
+    const bytes = Buffer.alloc(size, 255);
+    let blobReads = 0;
+    remote.hook = async (call, next) => {
+      const response = await next();
+      if (!isRead("git/blobs/")(call)) return response;
+      blobReads++;
+      const body = `${(await response.text()).replaceAll("\\n", "\\r\\n")}${" ".repeat(3000)}`;
+      expect(Buffer.byteLength(body)).toBeLessThanOrEqual(CONTROL_REF_RESPONSE_LIMIT);
+      return new Response(body);
+    };
+    const result = await writer(remote).write(key, null, bytes);
+    expect(result.kind).toBe("applied");
+    if (result.kind !== "applied") throw new Error("boundary write was not applied");
+    expect(await reader(remote).read(key)).toEqual({ kind: "tip", tip: result.tip });
+    expect(result.tip.bytes).toEqual(bytes);
+    expect(await writer(remote).write(key, result.tip.sha, payload)).toMatchObject({
+      kind: "applied",
+      tip: { bytes: payload },
+    });
+    expect(await reader(remote).read(key)).toMatchObject({ kind: "tip", tip: { bytes: payload } });
+    expect(blobReads).toBe(3);
+  }
+});
+
+test("oversized payloads reject invalid before transport for creation and existing refs", async () => {
+  for (const existing of [false, true]) {
+    const remote = new Remote();
+    const before = existing ? seed(remote).sha : null;
+    const client = writer(remote);
+    for (const size of [734_372, 800 * 1024]) {
+      await rejects(client.write(key, before, Buffer.alloc(size)), "invalid");
+      expect(remote.calls).toHaveLength(0);
+      expect(remote.refs.get(ref(key)) ?? null).toBe(before);
+    }
+  }
+});
+
 test("writer checks private companion identity freshly and uses fixed private failure diagnostics", async () => {
   const remote = new Remote();
   const client = writer(remote);
