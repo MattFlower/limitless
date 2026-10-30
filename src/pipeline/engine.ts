@@ -84,6 +84,7 @@ import {
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, platformConfinement } from "../harness/sandbox.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
+import { rethrowClaimControl } from "../integrations/claim-errors.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -1261,7 +1262,11 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
   const branch = ctx.run.branch as string;
   const clean = async () =>
     (await worktreeGit(["git", "status", "--porcelain", "--untracked-files=all"], { cwd })).stdout === "";
-  const remoteSha = () => remoteBranchSha(ctx.repo, cwd, branch, ctx.signal).catch(() => undefined);
+  const remoteSha = () =>
+    remoteBranchSha(ctx.repo, cwd, branch, ctx.signal).catch((error) => {
+      rethrowClaimControl(error);
+      return undefined;
+    });
   return {
     remoteSha,
     async started(id) {
@@ -1282,6 +1287,7 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
           request.privateStringsDigest === privateStringsDigest(privateEntries(ctx, cwd))
         );
       } catch (error) {
+        rethrowClaimControl(error);
         throw new NeedsHumanError(`Cannot reconcile worker job: ${redactCredentials(String(error))}`);
       }
     },
@@ -1347,6 +1353,7 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
           await adoptWorkerCommit(ctx.deps.cfg.paths, ctx.repo, cwd, { ...request, sha }, ctx.signal);
         }
       } catch (error) {
+        rethrowClaimControl(error);
         throw new NeedsHumanError(
           `Cannot adopt worker commit ${sha} for round ${round}: ${redactCredentials((error as Error).message)}`,
         );
@@ -2742,6 +2749,7 @@ async function checkWorkflowPublication(ctx: RunContext, sha: string): Promise<v
       ctx.signal,
     );
   } catch (error) {
+    rethrowClaimControl(error);
     ctx.checkCancelled();
     throw new DeliveryHeadError((error as Error).message);
   }
@@ -2800,6 +2808,7 @@ async function checkPublication(
     const hit = findings.find((f) => f.rule === "private-string");
     if (hit) throw new PrivateError(hit.detail);
   } catch (error) {
+    rethrowClaimControl(error);
     if (
       githubUnavailable(error) ||
       error instanceof CancelledError ||
@@ -2958,12 +2967,17 @@ async function deliverReviewRound(
         // A barrier around the push: lookups from before it, or made while it runs, cannot record a
         // head or an approval afterwards, even if the push lands but its acknowledgement is lost.
         ctx.store.beginPrPush(prUrl, head, ctx.run.id);
-        let landed: string | null = head;
+        let landed: string | null = null;
         try {
           await pushExistingBranch(ctx.repo, cwd, branch, reviewedSha, ctx.signal, budget, head);
+          landed = head;
         } catch (error) {
+          rethrowClaimControl(error);
           // An uncertain outcome: what the remote holds decides.
-          landed = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget).catch(() => null);
+          landed = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget).catch((error) => {
+            rethrowClaimControl(error);
+            return null;
+          });
           if (landed !== head) throw error;
         } finally {
           ctx.store.endPrPush(prUrl, landed);
@@ -3187,6 +3201,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
                 else if (data.headRefOid !== verifiedSha)
                   reason = `superseded: PR head moved from ${verifiedSha} to ${data.headRefOid}`;
               } catch (error) {
+                rethrowClaimControl(error);
                 if (error instanceof InjectedFault || error instanceof SimulatedTermination) throw error;
                 ctx.checkCancelled();
                 confirmingHead = true;
@@ -3206,6 +3221,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             },
             { budget, signal: ctx.signal },
           ).catch(async (error: unknown) => {
+            rethrowClaimControl(error);
             if (error instanceof InjectedFault || error instanceof SimulatedTermination) throw error;
             ctx.checkCancelled();
             if (!confirmingHead) throw error;
