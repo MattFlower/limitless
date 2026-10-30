@@ -2765,10 +2765,9 @@ test("fresh heartbeats cannot perpetuate bundle 503s, including across store res
   }
 }, 60_000);
 
-async function until(predicate: () => boolean) {
-  const end = Date.now() + 10_000;
+async function until(predicate: () => boolean, deadline = Date.now() + 10_000) {
   while (!predicate()) {
-    if (Date.now() > end) throw new Error("Worker condition did not settle");
+    if (Date.now() > deadline) throw new Error("Worker condition did not settle");
     await Bun.sleep(5);
   }
 }
@@ -3566,6 +3565,8 @@ test.each(["legacy job", "orphan identities"] as const)(
 );
 
 test("worker startup retains legacy cleanup without termination evidence across restarts", async () => {
+  // Both restarts share the test's budget, leaving three seconds for shutdown.
+  const deadline = Date.now() + 27_000;
   const server = await listen();
   const remote = loadConfig({ home: join(home, "remote"), configDir: cfg.paths.configDir, raw: {} });
   const root = mkdtempSync(join(remote.paths.work, "worker-"));
@@ -3583,6 +3584,7 @@ test("worker startup retains legacy cleanup without termination evidence across 
   const req = await request(true);
   for (let attempt = 0; attempt < 2; attempt++) {
     const diagnostics: string[] = [];
+    let pollDrained = false;
     const id = enqueueAgent({
       runId: req.runId,
       parentSha: req.headSha,
@@ -3597,6 +3599,18 @@ test("worker startup retains legacy cleanup without termination evidence across 
       retryMs: 5,
       machineState: async () => ({ onAC: true, idleSeconds: 0 }),
       log: (text) => diagnostics.push(text),
+      request: async (...args) => {
+        const reply = await workerRequest(...args);
+        if (args[1] === "/worker/lease" && workers.agentJob(id)?.state === "done") {
+          // An abandoned coordinator poll could claim the next restart's job.
+          pollDrained = true;
+          await new Promise<void>((resolve) => {
+            if (controller.signal.aborted) resolve();
+            else controller.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        }
+        return reply;
+      },
       harnesses: {
         claude: fakeHarness((spec) => {
           expect(dirname(spec.cwd)).not.toBe(root);
@@ -3606,7 +3620,7 @@ test("worker startup retains legacy cleanup without termination evidence across 
       },
     });
     try {
-      await until(() => workers.agentJob(id)?.state === "done");
+      await until(() => workers.agentJob(id)?.state === "done" && pollDrained, deadline);
       controller.abort();
       await task;
       expect(diagnostics.some((text) => text.includes("missing worker discovery evidence"))).toBe(true);
@@ -7026,7 +7040,8 @@ test.each([
       commits: string[][] = [];
     let pushEnv: Record<string, string> | undefined,
       session = "",
-      lookups = 0;
+      lookups = 0,
+      reportSettled = false;
     const realProcess = proc.runProcess;
     const processes = spyOn(proc, "runProcess").mockImplementation((opts) => {
       argv.push(opts.cmd);
@@ -7064,7 +7079,12 @@ test.each([
         async request(...args) {
           if (args[1].endsWith("/events") || args[1].endsWith("/result") || args[1].endsWith("/failure"))
             transmitted.push(args[2]);
-          return workerRequest(...args);
+          try {
+            return await workerRequest(...args);
+          } finally {
+            if (args[1] === agentPath(id, "result") || args[1] === agentPath(id, "failure"))
+              reportSettled = true;
+          }
         },
         harnesses: {
           claude: fakeHarness(async (spec): Promise<FakeReply> => {
@@ -7102,8 +7122,11 @@ test.each([
     );
     try {
       await until(
-        () => workers.agentJob(id)?.state === "done" || workers.agentJob(id)?.failure_reason !== null,
+        () =>
+          reportSettled && (workers.agentJob(id)?.state === "done" || !!workers.agentJob(id)?.failure_reason),
       );
+      // A stored failure precedes its response; drain reporting and later polls before inspecting.
+      await worker.stop();
       const job = workers.agentJob(id);
       const published = [
         "create",
