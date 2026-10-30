@@ -37,6 +37,7 @@ import {
 import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.ts";
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
 import { ciDecision, headMoved } from "../integrations/ci-classifier.ts";
+import { rethrowClaimControl } from "../integrations/claim-errors.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { githubIdentity, githubUrlRepo } from "../integrations/github-identity.ts";
 import {
@@ -1231,7 +1232,9 @@ export class LandQueue {
     signal.throwIfAborted();
     this.assertClaim(entry.id);
     if (outcome !== "merged") {
-      await disableAutoMerge(entry.prUrl, cwd, signal).catch(() => undefined);
+      await disableAutoMerge(entry.prUrl, cwd, signal).catch((error) => {
+        rethrowClaimControl(error);
+      });
       throw new LandBlocked(failure ?? (outcome === "unavailable" ? "GitHub unavailable" : "merge failed"));
     }
     this.landed(entry, repo, sha, null);
