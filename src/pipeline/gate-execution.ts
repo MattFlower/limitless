@@ -11,6 +11,7 @@ import {
   type GateRequest,
   gateDigest,
   gateShutdown,
+  replayable,
 } from "../gates/executor.ts";
 import { lanExecutor } from "../gates/lan.ts";
 import { redactGateOutput } from "../gates/output.ts";
@@ -162,8 +163,9 @@ export async function resumeGateExecution(
     const job = pending.handle.kind === "inplace" ? workers.job(pending.handle.id) : null;
     const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
     try {
-      if (pending.handle.githubActions && (!pending.handle.githubActions.completed || pending.sha !== sha))
-        await blockInterrupted(pending.handle, executor, async () => {});
+      const actions = pending.handle.githubActions;
+      if (actions && (pending.sha !== sha || !replayable(actions, ctx.run.id, sha, pending.gateKey)))
+        await blockInterrupted(pending.handle, executor);
       await cancelGateExecution(
         pending.handle,
         pending.handle.kind === "inplace" ? lanExecutor(workers, [], true) : executor,
@@ -209,7 +211,7 @@ export async function runGateExecution(
       throw new Error(`Unavailable gate executor: ${pending.handle.kind}`);
     return structuredClone(replay.result);
   }
-  const completed = pending?.handle.githubActions?.completed;
+  const completed = replayable(pending?.handle.githubActions, ctx.run.id, sha, pending?.gateKey);
   let stored: ExecutionHandle | undefined;
   if (
     sameIdentity &&
@@ -219,9 +221,8 @@ export async function runGateExecution(
   ) {
     // Leave the previous identity durable until the next handle and its history replace it together.
     try {
-      // A changed configuration for the same attempt, or blocked work, never replaces Actions work.
-      if (pending.purpose === purpose || pending.handle.githubActions?.interrupted)
-        await blockInterrupted(pending.handle, executor, async () => {});
+      // A changed configuration for the same attempt never replaces Actions work.
+      if (pending.purpose === purpose) await blockInterrupted(pending.handle, executor);
       await cancelGateExecution(pending.handle, executor);
       if (pending.handle.githubActions?.cleanupFailed)
         throw new Error("GitHub Actions gate cleanup remains pending");
@@ -299,7 +300,7 @@ export async function runGateExecution(
     return result;
   } finally {
     // A termination before attach leaves the durable identity available for resume; so does
-    // any Actions handle until consumed: a failed one stays blocked and retries pending cleanup.
+    // failed remote cleanup, so a later resume or discard retries it.
     if (
       settled &&
       !(

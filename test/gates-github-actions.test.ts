@@ -1584,6 +1584,23 @@ test.each<[string, string, (f: Fixture) => unknown]>([
   ["request repository differs from the run", "refused", () => (req.repo = "other/repo")],
   ["no run record", "refused", (f) => (f.state.destination = undefined)],
   ["symbolic candidate SHA", "refused", () => (req.headSha = "HEAD")],
+  ...[41, 64].map((n): [string, string, (f: Fixture) => unknown] => [
+    `${n}-digit hexadecimal candidate branch`,
+    "refused",
+    async () => {
+      // Git resolves this name as a movable branch, not as the object ID it resembles.
+      await git("branch", "a".repeat(n));
+      req.headSha = "a".repeat(n);
+    },
+  ]),
+  [
+    "hexadecimal branch as metadata head",
+    "refused",
+    async (f) => {
+      await git("branch", "b".repeat(41), req.baseSha);
+      f.state.dispatchSha = "b".repeat(41);
+    },
+  ],
   ["hostile origin", "refused", () => git("config", "remote.origin.url", "https://github.com/evil/repo.git")],
   [
     "insteadOf rewrite",
@@ -1720,6 +1737,13 @@ test.each<[string, (f: Fixture) => Promise<unknown> | unknown]>([
   ["a dispatch command", () => (req.gates.checks[0] = { name: "test", run: `echo ${secret}` })],
   ["a failed inspection", (f) => (f.state.dispatchSha = "e".repeat(40))],
   [
+    "a GitHub diagnostic splitting protected text with terminal formatting",
+    (f) =>
+      (f.state.meta = () => {
+        throw new Error(`HTTP 404 for ${secret.slice(0, 6)}\x1b[31m${secret.slice(6)}\x1b[0m`);
+      }),
+  ],
+  [
     "a GitHub diagnostic echoing protected text",
     (f) =>
       (f.state.meta = () => {
@@ -1751,6 +1775,15 @@ test("protected text in a job log never reaches results or checkpoints", async (
   const persisted = JSON.stringify([run, f.saved]);
   expect(persisted).not.toContain(secret);
   expect(persisted).not.toContain(credential);
+});
+
+test("protected text split by terminal formatting in a job log never reaches results or checkpoints", async () => {
+  const f = fixture();
+  const colored = `${secret.slice(0, 6)}\x1b[1;31m${secret.slice(6)}\x1b[0m`;
+  f.state.logs.set(1, log(framed(), `failed near ${colored}\n${framed(0, 1)}`));
+  const run = await withPrivateString(() => f.run());
+  expect(run.checks[0]).toMatchObject({ ok: false, exitCode: 1 });
+  expect(JSON.stringify([run, f.saved])).not.toContain(secret);
 });
 
 test("a clean candidate publishes exactly the inspected SHAs and inputs, without environment values", async () => {
@@ -1872,3 +1905,48 @@ test.each(["sha", "configuration", "legacy binding"])(
     expect(f.saved.at(-1)?.githubActions?.interrupted).toBe("interrupted");
   },
 );
+
+test.each<[string, (p: ActionsProgress) => void]>([
+  ["missing owner", (p) => (p.owner = undefined)],
+  ["another run", (p) => (p.owner = "run-2")],
+  ["missing configuration digest", (p) => (p.gateKey = undefined)],
+  ["another configuration", (p) => (p.gateKey = "0".repeat(64))],
+  ["another SHA", (p) => (p.headSha = req.baseSha)],
+])("attach refuses a handle with %s before any publication", async (_name, mutate) => {
+  const f = fixture();
+  const h = await f.executor().start(req, signal());
+  if (!h.githubActions) throw new Error("Missing progress");
+  mutate(h.githubActions);
+  const error = await (async () => f.executor().attach(h, signal(), req, {}, f.persist).result)().catch(
+    (e: unknown) => e,
+  );
+  expect((error as GateBlockedError).classification).toBe("refused");
+  expect(published(f)).toEqual({ pushes: 0, dispatches: 0 });
+  expect(f.requests).toEqual([]);
+});
+
+test("a legacy completed handle advanced to another purpose never replays through the pipeline", async () => {
+  const f = fixture();
+  const { ctx, store } = await context(f);
+  try {
+    const original = await runGateExecution(ctx, "gates", "initial", cwd, req.gates);
+    const p = ctx.state.gateExecution?.handle.githubActions;
+    if (!p?.completed) throw new Error("Missing completed identity");
+    p.owner = undefined;
+    p.gateKey = undefined;
+    await ctx.save();
+    for (const purpose of ["regression-retry", "initial", "regression-retry"]) {
+      const restarted = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
+      const result = await runGateExecution(restarted, "gates", purpose, cwd, req.gates).catch((e) => e);
+      expect(result, purpose).toBeInstanceOf(GateBlockedError);
+      expect(result).not.toEqual(original);
+    }
+    const durable = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
+    expect(durable?.previous ?? []).toEqual([]);
+    expect(durable?.handle.githubActions?.interrupted).toBe("interrupted");
+    expect(f.dispatches()).toHaveLength(1);
+    expect(f.calls.filter((c) => c === "push")).toHaveLength(1);
+  } finally {
+    store.close();
+  }
+});

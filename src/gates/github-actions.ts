@@ -13,6 +13,7 @@ import { CommandError } from "../util/proc.ts";
 import { CI_CONFIG } from "./audit.ts";
 import type { GateCommand } from "./detect.ts";
 import {
+  bound,
   type ExecutionHandle,
   GateBlockedError,
   type GateExecutor,
@@ -79,6 +80,12 @@ const workflow = "limitless-gates.yml";
 const url = (repo: string) => `https://github.com/${repo}.git`;
 const same = (a: unknown, b: string) => typeof a === "string" && a.toLowerCase() === b.toLowerCase();
 const refuse = (message: string, cwd?: string) => new GateBlockedError("refused", message, cwd);
+/** A hexadecimal ref name is mutable: bind to the canonical commit ID the object store resolves. */
+const commit = async (cwd: string, sha: string, signal: AbortSignal) => {
+  const args = ["git", "rev-parse", "--verify", "--end-of-options", `${sha}^{commit}`];
+  const out = await worktreeGit(args, { cwd, signal, allowFail: true });
+  if (out.stdout.trim() !== sha) throw refuse("Gate SHA is not a canonical local commit ID");
+};
 
 export function githubActionsExecutor(deps: Dependencies): GateExecutor {
   /** Authorization is read live; private repositories also need paid minutes, discreet ones refuse. */
@@ -209,7 +216,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     async start(req, signal) {
       const repo = deps.destination(req.runId);
       if (!repo || !same(req.repo, repo)) throw refuse("Gate request does not match the run's repository");
-      if (!/^[a-f\d]{40,64}$/.test(req.headSha)) throw refuse("Candidate SHA is not an immutable object ID");
+      await commit(req.cwd, req.headSha, signal);
       admit(repo, false, signal); // Visibility is confirmed again before upload.
       // Remote URLs and rewrites in the candidate's Git configuration must not redirect any transport.
       const remotes = await worktreeGit(
@@ -244,7 +251,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     attach(handle, signal, req, _hooks, persist = async () => {}) {
       const p = handle.githubActions;
       if (!p || !req) throw new Error("Missing GitHub Actions gate request");
-      if (!same(deps.destination(req.runId), p.repo) || !same(req.repo, p.repo))
+      const owned = bound(p, req.runId, req.headSha, gateDigest(req.gates));
+      if (!owned || !same(deps.destination(req.runId), p.repo) || !same(req.repo, p.repo))
         throw refuse("GitHub Actions handle is bound to another repository");
       const controller = new AbortController();
       const abort = () => controller.abort(signal.reason);
@@ -324,17 +332,15 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
         await checkpoint();
         let visibility: unknown;
         if (!p.dispatchSha) {
-          const repo = await api<Record<string, unknown> | null>(p, "");
+          const repo = await api<{ default_branch: string; full_name?: unknown; private?: unknown }>(p, "");
           if (!same(repo?.full_name, p.repo)) throw refuse("GitHub repository identity is unavailable");
-          visibility = repo?.private;
-          const branch = repo?.default_branch;
-          if (typeof branch !== "string" || [p.dispatch, p.candidate].includes(branch))
-            throw refuse("Unsafe gate branch");
+          visibility = repo.private;
+          if ([p.dispatch, p.candidate].includes(repo.default_branch)) throw new Error("Unsafe gate branch");
           const ref = await api<{ object: { sha: string } }>(
             p,
-            `git/ref/heads/${encodeURIComponent(branch)}`,
+            `git/ref/heads/${encodeURIComponent(repo.default_branch)}`,
           );
-          if (!/^[a-f\d]{40,64}$/.test(ref.object.sha)) throw refuse("Malformed default branch head");
+          await commit(p.cwd, ref.object.sha, controller.signal);
           p.dispatchSha = ref.object.sha;
           await checkpoint();
           // Everything the destination does not already hold: identities, messages, every commit's content.
@@ -352,7 +358,6 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           for (const text of [...Object.values(inputs), ...[...setup, ...checks].map((c) => c.run)])
             checkPublicationText(text, "Dispatch input", entries);
           p.inputs = inputs;
-          await checkpoint();
         }
         if (!p.pushed) {
           await checkpoint();
@@ -416,7 +421,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
                     undefined,
                     p.repo,
                   );
-              const safe = redactPrivate(log || "", protectedEntries(p.cwd)); // Before parsing or storage.
+              const safe = redactPrivate(redactGateOutput(log || ""), protectedEntries(p.cwd)); // Before parsing or storage.
               mapped.set(index, parseJob(job, safe, setup, command, p.dispatchSha ?? ""));
             }
             if (run.status === "completed") {

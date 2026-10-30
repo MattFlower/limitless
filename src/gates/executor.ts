@@ -113,6 +113,12 @@ export const protectedEntries = (cwd?: string): PrivateStrings => [
   ...registeredCredentials().map((value) => ({ value, entry: 1 })),
 ];
 
+/** Actions work attaches only under its full binding and replays only completed, uninterrupted work. */
+export const bound = (p: ActionsProgress | undefined, run?: string, sha?: string, key?: string) =>
+  !!p?.owner && p.owner === run && p.headSha === sha && !!key && p.gateKey === key;
+export const replayable = (p: ActionsProgress | undefined, run?: string, sha?: string, key?: string) =>
+  p && !p.interrupted && bound(p, run, sha, key) ? p.completed : undefined;
+
 /** Operational failure, never a gate result or feedback; unredactable detail keeps only its class. */
 export class GateBlockedError extends Error {
   readonly classification: string;
@@ -120,27 +126,23 @@ export class GateBlockedError extends Error {
     super(`GitHub Actions gate blocked (${classification})`);
     this.classification = classification;
     try {
-      this.message = redactGateOutput(redactPrivate(`${this.message}: ${message}`, protectedEntries(cwd)));
+      this.message = redactPrivate(redactGateOutput(`${this.message}: ${message}`), protectedEntries(cwd));
     } catch {}
   }
 }
 
 /** Interrupted Actions work is cleaned up, then stays blocked: never replaced, redispatched or replayed. */
-export async function blockInterrupted(
-  handle: ExecutionHandle,
-  executor: GateExecutor | undefined,
-  persist: () => Promise<unknown>,
-): Promise<never> {
+export async function blockInterrupted(handle: ExecutionHandle, ex?: GateExecutor, save = async () => {}) {
   const p = handle.githubActions;
   try {
     // Recorded only once cleanup succeeds, so a failed or unavailable cleanup is retried.
-    if (!p?.interrupted || p.cleanupFailed) await cancelGateExecution(handle, executor);
+    if (!p?.interrupted || p.cleanupFailed) await cancelGateExecution(handle, ex);
     if (p?.cleanupFailed) throw new Error("cleanup remains pending");
     if (p) p.interrupted ??= "interrupted";
   } catch (error) {
     throw error instanceof GateBlockedError ? error : new GateBlockedError("cleanup", String(error), p?.cwd);
   } finally {
-    await persist();
+    await save();
   }
   throw new GateBlockedError(p?.interrupted ?? "interrupted", "interrupted execution is not replaced");
 }
@@ -299,10 +301,10 @@ export async function executeGate(
       ? localExecutor(hooks)
       : (injected ?? localExecutor(hooks));
   if (stored && stored.kind !== executor.kind) throw new Error(`Unavailable gate executor: ${stored.kind}`);
-  const p = stored?.githubActions;
-  const bound =
-    p?.completed && !p.interrupted && p.headSha === req.headSha && p.gateKey === gateDigest(req.gates);
-  if (stored?.kind === "github-actions" && !bound)
+  if (
+    stored?.githubActions &&
+    !replayable(stored.githubActions, req.runId, req.headSha, gateDigest(req.gates))
+  )
     await blockInterrupted(stored, executor, () => persist(stored));
   const handle = stored ?? (await executor.start(req, signal));
   if (!stored) await persist(handle);
