@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import type { RunEvent } from "../src/core/types.ts";
+import { BROWSER_TOOLS } from "../src/harness/browser-mcp.ts";
 import { selectCoveringTests } from "../src/pipeline/covering-tests.ts";
 import { applyGateEvidence, type GateEvidence } from "../src/pipeline/gate-evidence.ts";
 import { holdoutPrompt, specPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
@@ -7,6 +9,7 @@ import {
   applyBrowserContext,
   BROWSER_INCOMPLETE,
   blockedOnly,
+  browserSucceeded,
   normalizeVerify,
 } from "../src/pipeline/verification.ts";
 import { registerCredential } from "../src/util/proc.ts";
@@ -41,6 +44,57 @@ const blocked = VerifySchema.parse({
   })),
   overall: "pass",
   notes: "",
+});
+
+const browserCall = (name: string, id = "call"): RunEvent => ({
+  id: 1,
+  runId: "run",
+  invocationId: 1,
+  ts: 0,
+  type: "tool_call",
+  level: "info",
+  message: name,
+  data: { id, input: {} },
+});
+const browserResult = (level: RunEvent["level"] = "debug", id = "call"): RunEvent => ({
+  ...browserCall("result", id),
+  id: 2,
+  type: "tool_result",
+  level,
+});
+
+test.each(BROWSER_TOOLS)("successful granted browser tool %s is recognized for both harnesses", (tool) => {
+  for (const prefix of ["playwright.", "mcp__playwright__"])
+    expect(browserSucceeded([browserCall(`${prefix}${tool}`), browserResult()])).toBe(true);
+});
+
+test("browser success requires a matching granted call and a recorded successful result", () => {
+  const call = browserCall("playwright.browser_snapshot");
+  for (const events of [
+    [],
+    [call],
+    [browserResult()],
+    [call, browserResult("warn")],
+    [call, browserResult("error")],
+    [call, browserResult("info")],
+    [call, browserResult("debug", "unmatched")],
+    [browserResult(), call],
+    [{ ...call, data: null }, browserResult()],
+    [call, { ...browserResult(), data: {} }],
+    [call, { ...browserResult(), type: "stderr" as const }],
+    [call, browserCall("Read"), browserResult()],
+  ])
+    expect(browserSucceeded(events)).toBe(false);
+  for (const name of [
+    "Read",
+    "other.browser_snapshot",
+    "playwright.browser_run_code",
+    "mcp__playwright__browser_run_code",
+    "playwright.browser_snapshot_extra",
+    "mcp__playwright__browser_snapshot_extra",
+    "playwright.browser_snapshot: claimed success",
+  ])
+    expect(browserSucceeded([browserCall(name), browserResult()])).toBe(false);
 });
 
 test("browser markers default for older data and survive serialization; strict schemas require them", () => {

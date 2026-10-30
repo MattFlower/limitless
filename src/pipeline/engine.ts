@@ -191,6 +191,7 @@ import {
   applyBrowserContext,
   type BrowserContext,
   blockedOnly,
+  browserSucceeded,
   ENVIRONMENT_BLOCKED,
   normalizeVerify,
   preDeliveryVerifyArtifact,
@@ -2377,11 +2378,14 @@ async function oneRound(
             await checkVerifiedHead();
             const browserContext: BrowserContext = !preview
               ? "no_preview"
-              : ctx.store
-                    .listEvents(ctx.run.id, { invocationId: invocation.id, limit: Number.MAX_SAFE_INTEGER })
-                    .some((e) => (e.data as { code?: string } | null)?.code === "browser_unavailable")
-                ? "unavailable"
-                : "available";
+              : browserSucceeded(
+                    ctx.store.listEvents(ctx.run.id, {
+                      invocationId: invocation.id,
+                      limit: Number.MAX_SAFE_INTEGER,
+                    }),
+                  )
+                ? "available"
+                : "unavailable";
             const pending = {
               round,
               attempt,
