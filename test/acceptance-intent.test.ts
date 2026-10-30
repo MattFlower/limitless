@@ -2,25 +2,20 @@ import { expect, test } from "bun:test";
 import { type AcceptanceSnapshot, resolveIntent } from "../src/pipeline/acceptance.ts";
 
 const issue = (number: number, body: string) => ({ number, body, author: { login: "owner" } });
+// The ticket's intent lines start at line 4 of its body.
 const snapshot = (ticket: string, parent: string): AcceptanceSnapshot => ({
   ticket: issue(9, `# Acceptance\n\n## The original intent\n${ticket}\n\n## Tests\n> Not intent.`),
   parent: issue(1, parent),
 });
-const plan = `# Plan
-
-| Slice | Outcome |
-| --- | --- |
-| W4 | The queue skips untrusted issues. |
-`;
-const files: Record<string, string> = { "docs/PLAN.md": plan };
-const read = async (path: string) => {
-  const text = files[path];
-  if (text === undefined) throw new Error(`unresolvable source: ${path}: file not tracked at verified SHA`);
-  return text;
-};
-const resolve = (ticket: string, parent: string) => resolveIntent(snapshot(ticket, parent), read);
-const brief = (units: Awaited<ReturnType<typeof resolveIntent>>) =>
+const resolve = (ticket: string, parent: string) => resolveIntent(snapshot(ticket, parent));
+const texts = (ticket: string, parent: string) => resolve(ticket, parent).map((u) => u.text);
+const brief = (units: ReturnType<typeof resolveIntent>) =>
   units.map((u) => [u.id, u.text, u.class, u.sources.join(",")]);
+const goal = `#1's "Goal" section`;
+// The section's own lines start at line 2 of the parent.
+const inGoal = (body: string) => `## Goal\n${body}\n\n## End\n- Outside.`;
+const unsupported = (line: number, where: string, kind: string) =>
+  `unsupported Markdown in the intent: line ${line} of ${where}: ${kind}; normalize the ticket`;
 
 const epic784 = `## Goal
 Every acceptance ticket can be run by the factory.
@@ -32,394 +27,198 @@ Every acceptance ticket can be run by the factory.
 ## Where things stand
 Covering tests landed in #915.
 
-## Plan
-1. P4a-1: the engine run.
-
 ## Demo
 Run an acceptance ticket and see one verdict per requirement.
 
 ## Risks
-- A model could claim evidence it did not check.
+- A model could claim evidence it did not check.`;
 
-## Tracking
-- [ ] #900`;
-
-test("a #784-shaped parent yields only the quoted Goal and demo units", async () => {
-  const units = await resolve(
-    `From #1:\n\n> Every acceptance ticket can be run by the factory.\n\nIn short: the factory runs it.\n\n> Run an acceptance ticket and see one verdict per requirement.`,
-    epic784,
-  );
+test("a #784-shaped parent yields only the referenced Goal and Demo units", () => {
+  const units = resolve(`${goal}\n\nIn short: the factory runs it.\n\n#1's "Demo" section`, epic784);
   expect(brief(units)).toEqual([
-    ["U1", "Every acceptance ticket can be run by the factory.", "behaviour", "#1"],
-    ["U2", "Run an acceptance ticket and see one verdict per requirement.", "behaviour", "#1"],
+    ["U1", "Every acceptance ticket can be run by the factory.", "behaviour", '#1 "Goal"'],
+    ["U2", "Run an acceptance ticket and see one verdict per requirement.", "behaviour", '#1 "Demo"'],
   ]);
 });
 
-test("#819-shaped quotes from the parent and docs/PLAN.md, and decision bullets, resolve", async () => {
-  const parent =
-    "Intro paragraph\nspanning two lines.\n\n- Decision: keep polling.\n- Decision: no webhooks.";
-  const units = await resolve(
-    `> Intro paragraph spanning two lines.\n\nFrom docs/PLAN.md (docs):\n\n> The queue skips untrusted issues.\n\nFrom #1, the owner's decisions:\n\n- Decision: keep polling.\n- Decision: no webhooks.`,
-    parent,
-  );
-  expect(brief(units)).toEqual([
-    ["U1", "Intro paragraph spanning two lines.", "behaviour", "#1"],
-    ["U2", "The queue skips untrusted issues.", "docs", "docs/PLAN.md"],
-    ["U3", "Decision: keep polling.", "behaviour", "#1"],
-    ["U4", "Decision: no webhooks.", "behaviour", "#1"],
-  ]);
-  await expect(
-    resolve("From docs/MISSING.md:\n\n> The queue skips untrusted issues.", parent),
-  ).rejects.toThrow("unresolvable source: docs/MISSING.md");
-});
+test("a section's list items and paragraphs are its units, in order, and deeper headings are skipped", () => {
+  const parent = `## Goal
+Intro paragraph
+spanning two lines.
+- Dash item.
+* Star item.
++ Plus item with a red | blue pipe.
+1. Ordered item.
+2) Other ordered item.
 
-test("a quote absent from an existing PLAN is not a whole source unit", async () => {
-  await expect(
-    resolve("From docs/PLAN.md:\n\n> The queue accepts untrusted issues.", "- Parent requirement."),
-  ).rejects.toThrow("quote is not a whole source unit");
-});
+The service accepts red | blue tokens. <!-- kept as text -->
+### Detail
+Nested paragraph.
 
-test("quotes must equal one whole source unit", async () => {
-  const parent = "- The service retries failed deliveries three times.\n- Other item.";
-  await expect(resolve("> The service", parent)).rejects.toThrow("quote is not a whole source unit");
-  await expect(resolve("From #821:\n\n> Other item.", parent)).rejects.toThrow("#821 is not the parent");
-  const units = await resolve(
-    "> - The service retries failed deliveries\n>   three times.\n> - Other item.",
-    parent,
-  );
-  expect(units.map((u) => u.text)).toEqual([
-    "The service retries failed deliveries three times.",
-    "Other item.",
-  ]);
-});
+#### Deeper ##
+- Nested item.
 
-test("section references include subsections and dedupe quoted units", async () => {
-  const parent = `## Epic D: defects become issues
-- A defect opens an issue.
-
-### Details
-Each issue links its run.
-
-## Next epic
-- Excluded.
-
-## Epic W4
-- Docs explain the queue.`;
-  const units = await resolve(
-    `> A defect opens an issue.\n\n#1's "Epic D: defects become issues" section\n\n#1's "Epic W4" section (docs)`,
-    parent,
-  );
-  expect(brief(units)).toEqual([
-    ["U1", "A defect opens an issue.", "behaviour", '#1,#1 "Epic D: defects become issues"'],
-    ["U2", "Each issue links its run.", "behaviour", '#1 "Epic D: defects become issues"'],
-    ["U3", "Docs explain the queue.", "docs", '#1 "Epic W4"'],
-  ]);
-  await expect(resolve(`#1's "Same" section`, "## Same\n- a\n## Same\n- b")).rejects.toThrow(
-    "does not name exactly one heading",
-  );
-  await expect(resolve(`#1's "Absent" section`, "## Same\n- a")).rejects.toThrow(
-    "does not name exactly one heading",
-  );
-});
-
-test("a ticket with neither form resolves to no units", async () => {
-  await expect(resolve("Only prose about the intent.", "- a")).rejects.toThrow("resolves to no units");
-  await expect(
-    resolveIntent({ ticket: issue(9, "No intent section."), parent: issue(1, "- a") }, read),
-  ).rejects.toThrow("resolves to no units");
-});
-
-test("details cannot hide later units or terminate a selected section", async () => {
-  await expect(
-    resolve(
-      `#1's "Goal" section`,
-      "## Goal\n- Before.\n\n<details>\n## Hidden\n- Hidden.\n</details >\n\n- After.\n\n## End",
-    ),
-  ).rejects.toThrow("unsupported Markdown in the intent: HTML block or comment; normalize the ticket");
-});
-
-test("a hidden duplicate heading does not make a visible section ambiguous", async () => {
-  const units = await resolve(
-    `#1's "Goal" section`,
-    `<details>
-## Goal
-- Hidden context.
-</details>
-
-## Goal
-- Visible requirement.
-
+#1's "Other" section
 ## Next
-- Outside the section.`,
-  );
-  expect(units.map((u) => u.text)).toEqual(["Visible requirement."]);
+- Outside.`;
+  expect(texts(goal, parent)).toEqual([
+    "Intro paragraph spanning two lines.",
+    "Dash item.",
+    "Star item.",
+    "Plus item with a red | blue pipe.",
+    "Ordered item.",
+    "Other ordered item.",
+    "The service accepts red | blue tokens. <!-- kept as text -->",
+    "Nested paragraph.",
+    "Nested item.",
+    `#1's "Other" section`,
+  ]);
 });
 
-test("plain context mentioning a section reference creates no additional units", async () => {
-  const units = await resolve(
-    `> Required behaviour.\n\nThis check does not use #1's "Risks" section.`,
-    "## Goal\n- Required behaviour.\n\n## Risks\n- Context only.",
-  );
-  expect(units.map((u) => u.text)).toEqual(["Required behaviour."]);
-});
+test.each(["## Next", "# Top", "## Next ##", "##"])(
+  "a same or higher heading ends the section: %s",
+  (heading) => {
+    expect(texts(goal, `## Goal\n- Before.\n${heading}\n- Outside.`)).toEqual(["Before."]);
+  },
+);
 
-test("paragraph normalization cannot turn a wrapped mention into a reference line", async () => {
-  const units = await resolve(
-    `> Required behaviour.\n\n#1's "Risks"\nsection`,
-    "## Goal\n- Required behaviour.\n\n## Risks\n- Context only.",
-  );
-  expect(units.map((u) => u.text)).toEqual(["Required behaviour."]);
-});
-
-test("adjacent references preserve order, sources, docs classification and deduplication", async () => {
-  const units = await resolve(
-    `  #1's "Docs" section (docs)  \n#1's "Goal" section\n#1's "Docs" section (docs)`,
-    "## Goal\n- Behaviour.\n\n## Docs\n- Documentation.",
+test("(docs) marks exactly its section's units, and a shared text is one unit", () => {
+  const units = resolve(
+    `${goal}\n#1's "Docs" section (docs)  \n${goal}`,
+    "## Goal\n- Behaviour.\n- Shared.\n\n## Docs\n- Documentation.\n- Shared.",
   );
   expect(brief(units)).toEqual([
-    ["U1", "Documentation.", "docs", '#1 "Docs"'],
-    ["U2", "Behaviour.", "behaviour", '#1 "Goal"'],
+    ["U1", "Behaviour.", "behaviour", '#1 "Goal"'],
+    ["U2", "Shared.", "behaviour", '#1 "Goal",#1 "Docs"'],
+    ["U3", "Documentation.", "docs", '#1 "Docs"'],
   ]);
 });
 
-const unsupported = (construct: string) =>
-  `unsupported Markdown in the intent: ${construct}; normalize the ticket`;
-
-const unsupportedCases = [
-  ["inline comment", "- Must also check delivery. <!-- explanation -->", "HTML block or comment"],
-  ["short backtick closer", "````md\n```\n## Hidden\n- Hidden.\n````", "fence"],
-  ["different fence character", "```md\n~~~\n## Hidden\n- Hidden.\n```", "fence"],
-  ["tilde fence with backticks", "~~~md\n```\n## Hidden\n~~~", "fence"],
-  ["commented heading or reference", '<!--\n## Hidden\n#1\'s "Other" section\n-->', "HTML block or comment"],
-  ["HTML block", "<div>\n## Hidden\n</div>", "HTML block or comment"],
-  ["details", "<details>\n## Hidden\n</details >", "HTML block or comment"],
-  ["setext equals", "End\n===", "setext heading"],
-  ["setext dashes", "End\n---", "setext heading"],
-  ["quoted setext", "> End\n> ===", "setext heading"],
-  ["list-item setext", "- End\n  ===", "setext heading"],
-  ["indented code", "    code", "indented code or heading"],
-  ["indented heading", "    ## End", "indented code or heading"],
-  ["quoted fence", "> ```md\n> hidden\n> ```", "fence"],
-  ["list-item fence", "- ```md\n  ## Hidden\n  ```", "fence"],
-  ["list-item HTML", "- <details>\n  ## Hidden\n  </details>", "HTML block or comment"],
-] as const;
-
-test("inline source comments preserve the entire visible requirement", async () => {
-  const parent =
-    "- Before.\n- Must also <!-- explanation\n  continued --> check delivery.\n\n  Keep its original reason.";
-  await expect(resolve("> check delivery.", parent)).rejects.toThrow("quote is not a whole source unit");
-  await expect(resolve("> Must also check delivery.", parent)).rejects.toThrow(
-    "quote is not a whole source unit",
+test("the referenced heading must be the parent's one column-0 ATX heading with that text", () => {
+  const ambiguous = 'section "Goal" does not name exactly one heading of #1';
+  expect(() => resolve(goal, "## Goal\n- a\n## Goal\n- b")).toThrow(ambiguous);
+  expect(() => resolve(goal, "# Goal\n- a\n\n### Goal ###\n- b")).toThrow(ambiguous);
+  expect(() => resolve(goal, "<details>\n\n## Goal\n- Hidden.\n</details>\n\n## Goal\n- Shown.")).toThrow(
+    ambiguous,
   );
-  expect(brief(await resolve("> Must also check delivery. Keep its original reason.", parent))).toEqual([
-    ["U1", "Must also check delivery. Keep its original reason.", "behaviour", "#1"],
-  ]);
+  expect(() => resolve(goal, "## Absent\n- a")).toThrow(ambiguous);
+  expect(() => resolve(goal, "  ## Goal\n- a")).toThrow(ambiguous);
+  expect(() => resolve(goal, "Goal\n====\n- a")).toThrow(ambiguous);
+  // Only column-0 headings are candidates, and closing hashes need a preceding space.
+  expect(texts(goal, "  ## Goal\n- Indented.\n\n## Goal\n- Required.")).toEqual(["Required."]);
   expect(
-    (await resolve("> Must also check delivery.", "- Must also check delivery. <!-- explanation -->")).map(
-      (u) => u.text,
+    texts(
+      `#1's "Goal#" section`,
+      "## Goal\n- Outside.\n## Goal#\n- Required.\n\n##No space\n####### Too many",
     ),
-  ).toEqual(["Must also check delivery."]);
-  expect(
-    (await resolve("> Mustcheck delivery.", "- Must<!-- explanation\n-->check delivery.")).map((u) => u.text),
-  ).toEqual(["Mustcheck delivery."]);
-});
-
-test("inline comments on the selected heading also refuse resolution", async () => {
-  await expect(resolve(`#1's "Goal" section`, "## Goal <!-- explanation -->\n- Before.")).rejects.toThrow(
-    unsupported("HTML block or comment"),
+  ).toEqual(["Required.", "##No space ####### Too many"]);
+  expect(() => resolve(`#821's "Goal" section`, "## Goal\n- a")).toThrow(
+    "unresolvable source: #821 is not the parent",
   );
-  await expect(
-    resolveIntent(
-      {
-        ticket: issue(9, "## The original intent <!-- explanation -->\n> Before."),
-        parent: issue(1, "- Before."),
-      },
-      read,
-    ),
-  ).rejects.toThrow(unsupported("HTML block or comment"));
-});
-
-test.each(["- The service accepts red | blue tokens.", "The service accepts red | blue tokens."])(
-  "a literal pipe does not fragment a whole source unit: %s",
-  async (body) => {
-    await expect(resolve("> blue tokens.", body)).rejects.toThrow("quote is not a whole source unit");
-    expect((await resolve("> The service accepts red | blue tokens.", body)).map((u) => u.text)).toEqual([
-      "The service accepts red | blue tokens.",
-    ]);
-    expect((await resolve(`#1's "Goal" section`, `## Goal\n${body}`)).map((u) => u.text)).toEqual([
-      "The service accepts red | blue tokens.",
-    ]);
-  },
-);
-
-test("table delimiters distinguish bare table cells from ordinary pipes", async () => {
-  const body = "Colour | Requirement\n--- | ---\nBlue | The service accepts blue tokens.";
-  expect((await resolve("> The service accepts blue tokens.", body)).map((u) => u.text)).toEqual([
-    "The service accepts blue tokens.",
-  ]);
-});
-
-test.each(unsupportedCases)(
-  "selected sections refuse %s before a later heading",
-  async (_name, md, reason) => {
-    await expect(
-      resolve(`#1's "Goal" section`, `## Goal\nBefore.\n\n${md}\n\n- After.\n\n## End\n- Outside.`),
-    ).rejects.toThrow(unsupported(reason));
-    await expect(
-      resolve(`> Before.\n\n${md}\n\n> After.`, "- Before.\n- After.\n\n## Other\n- Other."),
-    ).rejects.toThrow(unsupported(reason));
-  },
-);
-
-test.each(["  ## Goal", "   ## Goal ###"])(
-  "a visible duplicate heading is ambiguous: %s",
-  async (heading) => {
-    await expect(
-      resolve(`#1's "Goal" section`, `## Goal\n- Before.\n\n${heading}\n- Other.`),
-    ).rejects.toThrow("does not name exactly one heading");
-  },
-);
-
-test("a matching setext heading outside the selected range makes the reference ambiguous", async () => {
-  await expect(resolve(`#1's "Goal" section`, "Goal\n====\n\n## Goal\n- Before.")).rejects.toThrow(
-    "does not name exactly one heading",
-  );
-  await expect(resolve(`#1's "Goal" section`, "## Goal\n- Before.\n\nGoal\n====")).rejects.toThrow(
-    unsupported("setext heading"),
-  );
-});
-
-test.each(["## Goal#", "  ## End", "   ## End ###", "##"])(
-  "a valid ATX boundary ends the selected section: %s",
-  async (heading) => {
-    expect(
-      brief(await resolve(`#1's "Goal" section`, `  ## Goal ###\nBefore.\n\n${heading}\n- Outside.`)),
-    ).toEqual([["U1", "Before.", "behaviour", '#1 "Goal"']]);
-  },
-);
-
-test.each(["  ## In list", "   ## In list ###", "1.  Before.\n\n    ## In list"])(
-  "a heading inside a list item cannot truncate a section or a quoted item: %s",
-  async (heading) => {
-    const body = `${heading.startsWith("1.") ? heading : `- Before.\n\n${heading}`}\n  Never omit.\n\n- After.`;
-    const reason = unsupported("heading inside a list item");
-    await expect(resolve(`#1's "Goal" section`, `## Goal\n${body}\n\n## End`)).rejects.toThrow(reason);
-    await expect(resolve(`> Before.\n\n${body}`, "- Before.\n- After.")).rejects.toThrow(reason);
-    await expect(resolve("> Before.", body)).rejects.toThrow(reason);
-    expect((await resolve("> After.", body)).map((u) => u.text)).toEqual(["After."]);
-  },
-);
-
-test("a heading ends a table, so the following paragraph stays one whole unit", async () => {
-  const body =
-    "| Kind | Value |\n| --- | --- |\n| Old | Done. |\n## Goal | details\nThe service accepts red | blue tokens.";
-  await expect(resolve("> blue tokens.", body)).rejects.toThrow("quote is not a whole source unit");
-  expect((await resolve("> The service accepts red | blue tokens.", body)).map((u) => u.text)).toEqual([
-    "The service accepts red | blue tokens.",
-  ]);
-  expect((await resolve(`#1's "Goal | details" section`, body)).map((u) => u.text)).toEqual([
-    "The service accepts red | blue tokens.",
-  ]);
-  expect((await resolve("> Done.", body)).map((u) => u.text)).toEqual(["Done."]);
-});
-
-test("attached trailing hashes and invalid ATX markers remain distinct", async () => {
-  const units = await resolve(
-    `#1's "Goal#" section`,
-    "## Goal\n- Outside.\n## Goal#\n- Required.\n##No space\n####### Too many",
-  );
-  expect(units.map((u) => u.text)).toEqual(["Required.", "##No space ####### Too many"]);
 });
 
 test.each([
-  "````md\n```\n## Goal\n````",
-  "~~~md\n```\n## Goal\n~~~",
-  "```md\n``` extra\n## Goal\n```",
-  "<!--\n## Goal\n-->",
-])("heading discovery and quote sources ignore hidden content: %s", async (hidden) => {
-  const body = `${hidden}\n\n## Goal\n- Before.`;
-  expect((await resolve(`#1's "Goal" section`, body)).map((u) => u.text)).toEqual(["Before."]);
-  expect((await resolve("> Before.", body)).map((u) => u.text)).toEqual(["Before."]);
-  await expect(resolve("> Goal", body)).rejects.toThrow("quote is not a whole source unit");
-});
-
-test.each(["```\n~~~", "````\n```", "<!--\nnever closed", "<!-- closed --> <!-- unclosed"])(
-  "unclosed fences and comments refuse source scanning: %s",
-  async (hidden) => {
-    const body = `## Goal\n- Before.\n\n## End\n${hidden}`;
-    await expect(resolve(`#1's "Goal" section`, body)).rejects.toThrow("unresolvable source");
-    await expect(resolve("> Before.", body)).rejects.toThrow("unresolvable source");
-  },
-);
-
-test("CRLF sources use the same fence and heading boundaries", async () => {
-  const body = "~~~md\r\n```\r\n## Goal\r\n~~~\r\n\r\n## Goal\r\n- Required.\r\n";
-  expect((await resolve(`#1's "Goal" section`, body)).map((u) => u.text)).toEqual(["Required."]);
-  expect((await resolve("> Required.", body)).map((u) => u.text)).toEqual(["Required."]);
-});
-
-test("adjacent physical lead-ins use the last source and class", async () => {
-  await expect(
-    resolve("From #1:\nFrom docs/PLAN.md (docs):\n\n> Parent only.", "- Parent only."),
-  ).rejects.toThrow("quote is not a whole source unit");
-  expect(
-    brief(
-      await resolve(
-        "Context for the quote.\nFrom #1:\nFrom docs/PLAN.md (docs):\n> The queue skips untrusted issues.\nFrom #1:\n> Parent only.",
-        "- Parent only.",
-      ),
-    ),
-  ).toEqual([
-    ["U1", "The queue skips untrusted issues.", "docs", "docs/PLAN.md"],
-    ["U2", "Parent only.", "behaviour", "#1"],
-  ]);
-});
-
-test.each(["#1", "docs/PLAN.md"])("a %s list item includes all continuation paragraphs", async (source) => {
-  const body =
-    "- Retry failed deliveries.\n\n  Never retry a permanent rejection.\n    Keep the original reason.\n\n- Other item.";
-  const partial = snapshot(`From ${source}:\n\n> Retry failed deliveries.`, body);
-  await expect(resolveIntent(partial, async () => body)).rejects.toThrow("quote is not a whole source unit");
-  const complete = snapshot(
-    `From ${source} (docs):\n\n> - Retry failed deliveries.\n>\n>   Never retry a permanent rejection.\n>     Keep the original reason.`,
-    body,
+  ["a fence hiding the only heading", "```md\n## Goal\n- Example only.\n## End\n```\n\n## Other", 1],
+  ["an indented tilde fence", "Intro.\n\n   ~~~\n   code\n   ~~~\n\n## Goal\n- Required.", 3],
+])("%s before the referenced section makes the parent unresolvable", (_name, parent, line) => {
+  expect(() => resolve(goal, parent)).toThrow(
+    `unresolvable source: line ${line} of #1: fence before the section`,
   );
-  expect(brief(await resolveIntent(complete, async () => body))).toEqual([
-    [
-      "U1",
-      "Retry failed deliveries. Never retry a permanent rejection. Keep the original reason.",
-      "docs",
-      source,
-    ],
-  ]);
-  expect((await resolve(`#1's "Goal" section`, `## Goal\n${body}`)).map((u) => u.text)).toEqual([
-    "Retry failed deliveries. Never retry a permanent rejection. Keep the original reason.",
-    "Other item.",
+});
+
+test("a fence before the ticket's intent heading refuses, and lines after a section are not scanned", () => {
+  expect(() =>
+    resolveIntent({
+      ticket: issue(9, `\`\`\`\n## The original intent\n${goal}\n\`\`\`\n\n## Tests`),
+      parent: issue(1, "## Goal\n- a"),
+    }),
+  ).toThrow("unresolvable source: line 1 of the ticket: fence before the section");
+  expect(texts(goal, "## Goal\n- Before.\n\n## End\n> Quote.\n<details>\n```\nunclosed")).toEqual([
+    "Before.",
   ]);
 });
 
-test("a paragraph after a list is a separate whole unit", async () => {
-  const body = "- First item.\n\nSeparate paragraph.\n\n- Second item.";
-  expect((await resolve("> First item.\n\n> Separate paragraph.", body)).map((u) => u.text)).toEqual([
-    "First item.",
-    "Separate paragraph.",
-  ]);
-});
-
-test("escaped pipes refuse intent rows, reference rows and quoted source fragments", async () => {
-  const row = "| The service accepts red \\| blue tokens. |";
-  const reason = unsupported("escaped pipe in a table row");
-  await expect(resolve(`> Before.\n\n${row}`, "- Before.")).rejects.toThrow(reason);
-  await expect(resolve(`#1's "Goal" section`, `## Goal\n${row}`)).rejects.toThrow(reason);
-  for (const source of ["#1", "docs/PLAN.md"]) {
-    for (const quote of ["blue tokens.", "The service accepts red \\| blue tokens."]) {
-      await expect(
-        resolveIntent(snapshot(`From ${source}:\n> ${quote}`, row), async () => row),
-      ).rejects.toThrow(reason);
-    }
+test("CRLF and CR line endings keep line boundaries", () => {
+  for (const eol of ["\r\n", "\r"]) {
+    const units = resolveIntent({
+      ticket: issue(9, ["## The original intent", goal, ""].join(eol)),
+      parent: issue(1, ["## Goal", "- Required.", "## End", "- Outside."].join(eol)),
+    });
+    expect(units.map((u) => u.text)).toEqual(["Required."]);
   }
-  expect((await resolve("> Before.", `${row}\n\n- Before.`)).map((u) => u.text)).toEqual(["Before."]);
-  expect(
-    (await resolve("> The service accepts red or blue tokens.", row.replace("\\|", "or"))).map((u) => u.text),
-  ).toEqual(["The service accepts red or blue tokens."]);
+});
+
+test("the intent's prose and list items are context; only whole reference lines resolve", () => {
+  const parent = "## Goal\n- Required behaviour.\n\n## Risks\n- Context only.";
+  expect(texts(`${goal}\n\nThis check does not use #1's "Risks" section.\n- Nor this.`, parent)).toEqual([
+    "Required behaviour.",
+  ]);
+  expect(texts(`${goal}\n\n#1's "Risks"\nsection`, parent)).toEqual(["Required behaviour."]);
+  expect(() => resolve("Only prose about the intent.", parent)).toThrow("resolves to no units");
+  expect(() => resolveIntent({ ticket: issue(9, "No intent section."), parent: issue(1, parent) })).toThrow(
+    "resolves to no units",
+  );
+});
+
+const thematic = "thematic break, setext underline or table delimiter";
+// Review round 3's reproductions as referenced sections, then round 3's own cases.
+const sectionCases: [string, string, number, string][] = [
+  ["lazy list item", "- Retry.\nNever omit.", 3, "list item continuation"],
+  ["tab after a list marker", "-\tRetry.\n\n    Never omit.", 2, "malformed list item"],
+  ["nested list item", "- Retry.\n  - Never omit.", 3, "indented line"],
+  ["fenced item", "- Retry.\n\n  ```\n  example\n  ```\n\n  Never omit.", 4, "indented line"],
+  ["details item", "- Retry.\n\n  <details>example</details>\n\n  Never omit.", 4, "indented line"],
+  ["setext underline in an item", "- Retry.\n  ===\n\n  Never omit.", 3, "indented line"],
+  ["lazy quote", "> Retry.\nNever omit.", 2, "blockquote"],
+  ["nested quotes", "> First.\n>> Second.", 2, "blockquote"],
+  ["escaped row in a continuation", "- Retry.\n\n  | A \\| B |", 4, "indented line"],
+  ["thematic breaks", "Before.\n\n---\n\n***\n\nAfter.", 4, thematic],
+  ["link definition", "Before.\n\n[policy]: https://example.com", 4, "link definition"],
+  ["short backtick closer", "````md\n```\n## Hidden\n- Hidden.\n````", 2, "fence"],
+  ["tilde fence", "~~~md\n```\n## Hidden\n~~~", 2, "fence"],
+  ["HTML comment", "<!--\n## Hidden\n-->", 2, "HTML"],
+  ["details", "<details>\n## Hidden\n</details >", 2, "HTML"],
+  ["setext equals", "End\n===", 3, thematic],
+  ["setext dashes", "End\n---", 3, thematic],
+  ["indented code", "    code", 2, "indented line"],
+  ["tab-indented code", "\tcode", 2, "indented line"],
+  ["indented heading", "  ## End", 2, "indented line"],
+  ["heading inside an item", "- Before.\n\n  ## In list\n  Never omit.", 4, "indented line"],
+  ["list-item fence", "- ```md\n  ## Hidden\n  ```", 3, "indented line"],
+  ["table row", "| The service accepts red \\| blue tokens. |", 2, "table row"],
+  ["bare table", "Colour | Requirement\n--- | ---\nBlue | The service accepts blue tokens.", 3, thematic],
+  ["spaced thematic break", "Before.\n\n* * *", 4, thematic],
+  ["underscore break", "___", 2, thematic],
+  ["footnote definition", "Before.\n\n[^1]: Note.", 4, "link definition"],
+  ["empty ordered marker", "Before.\n\n1.", 4, "malformed list item"],
+  ["empty plus marker", "+", 2, "malformed list item"],
+];
+const ticketCases: [string, string, number, string][] = [
+  ["quote lead-in", "From #1:\n\n> - Unit one.", 4, "quote lead-in"],
+  [
+    "file lead-in after prose",
+    "Context.\nFrom docs/PLAN.md (docs):\n> The queue skips untrusted issues.",
+    5,
+    "quote lead-in",
+  ],
+  ["quoted unit", `${goal}\n\n> Before.`, 6, "blockquote"],
+  ["indented reference", `  ${goal}`, 4, "indented line"],
+  ["fence in the intent", `\`\`\`\n${goal}\n\`\`\``, 4, "fence"],
+];
+
+test.each([
+  ...sectionCases.map(([name, body, line, kind]) => [
+    name,
+    goal,
+    inGoal(body),
+    unsupported(line, "#1", kind),
+  ]),
+  ...ticketCases.map(([name, intent, line, kind]) => [
+    name,
+    intent,
+    "## Goal\n- Before.",
+    unsupported(line, "the ticket", kind),
+  ]),
+])("%s refuses, naming its line and kind", (_name, ticket, parent, message) => {
+  expect(() => resolve(ticket, parent)).toThrow(message);
 });

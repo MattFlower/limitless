@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
@@ -46,7 +46,7 @@ const parent = `## Goal
 
 ## Docs
 - Unit three.`;
-const ticket = `## The original intent\nFrom #1:\n\n> - Unit one.\n> - Unit two.\n\n#1's "Docs" section (docs)`;
+const ticket = `## The original intent\n#1's "Goal" section\n\n#1's "Docs" section (docs)`;
 type Item = {
   unit: string;
   verdict: string;
@@ -80,8 +80,6 @@ test("fails", () => expect(1).toBe(2));
 test${".skip"}("skipped", () => {});
 `,
   );
-  mkdirSync(join(repoDir, "docs"), { recursive: true });
-  writeFileSync(join(repoDir, "docs/PLAN.md"), "- The queue skips untrusted issues.\n");
   if (options.junit)
     writeFileSync(
       join(repoDir, "junit-evidence.sh"),
@@ -222,8 +220,8 @@ test.each(["stale", "missing"] as const)(
   async (junit) => {
     const t = await setup({
       junit,
-      parent: "- Required behaviour.",
-      ticket: "## The original intent\n> Required behaviour.",
+      parent: "## Goal\n- Required behaviour.",
+      ticket: `## The original intent\n#1's "Goal" section`,
     });
     t.reply(() => ({ structured: output([{ unit: "U1", verdict: "met", tests: ["passes"] }]) }));
     expect(await t.execute()).toBe("needs_human");
@@ -245,19 +243,6 @@ test.each(["stale", "missing"] as const)(
     await t.published();
   },
 );
-
-test("a quote absent from the tracked PLAN at the checked SHA fails before the model", async () => {
-  const t = await setup({
-    ticket: "## The original intent\nFrom docs/PLAN.md:\n\n> The queue accepts untrusted issues.",
-  });
-  expect(await t.execute()).toBe("failed");
-  expect(t.f.store.getRun(t.run.id)?.error).toContain("quote is not a whole source unit");
-  expect(t.state()?.acceptance?.sha).toBe(t.sha);
-  expect(t.calls()).toBe(0);
-  expect(t.targeted).toHaveLength(0);
-  expect(t.state()?.acceptance?.outcome).toBeUndefined();
-  await t.published();
-});
 
 const adversarialParent = `## Goal
 ${Array.from({ length: 8 }, (_, i) => `- Behaviour ${i + 1}.`).join("\n")}
@@ -353,7 +338,7 @@ test.each(["reader", "setup", "intent"] as const)(
     registerCredential("acceptance-setup-test", secret);
     const t = await setup({
       ...(mode === "setup" ? { setup: `echo ${secret}; exit 3` } : {}),
-      ...(mode === "intent" ? { ticket: "## The original intent\n> - Unit" } : {}),
+      ...(mode === "intent" ? { ticket: "## The original intent\nFrom docs/PLAN.md:\n\n> - Unit" } : {}),
     });
     t.reply(() => ({ fault: "throw", error: "model unavailable" }));
     expect(await t.execute()).toBe("failed");
@@ -363,7 +348,7 @@ test.each(["reader", "setup", "intent"] as const)(
         ? "Acceptance reader failed"
         : mode === "setup"
           ? "Acceptance setup failed"
-          : "quote is not a whole source unit",
+          : "unsupported Markdown in the intent: line 2 of the ticket: quote lead-in; normalize the ticket",
     );
     expect(error).not.toContain(secret);
     expect(t.calls()).toBe(mode === "reader" ? 2 : 0);
@@ -382,31 +367,22 @@ const parsedMetAll = AcceptanceSchema.parse(metAll);
 
 test.each([
   [
-    "inline comment",
-    "## Goal\n- Before.\n- Must also check delivery. <!-- explanation -->",
-    `#1's "Goal" section`,
-    "HTML block or comment",
-  ],
-  [
     "nested fence",
     "## Goal\n- Before.\n\n````md\n```\n## Hidden\n- Hidden.\n````\n\n- After.\n\n## End\n- Outside.",
-    `#1's "Goal" section`,
-    "fence",
+    "line 4 of #1: fence",
   ],
   [
     "list-contained heading",
     "## Goal\n- Before.\n\n  ## In list\n  Never omit.\n\n- After.",
-    `#1's "Goal" section`,
-    "heading inside a list item",
+    "line 4 of #1: indented line",
   ],
   [
-    "escaped pipe source",
-    "| The service accepts red \\| blue tokens. |",
-    "> blue tokens.",
-    "escaped pipe in a table row",
+    "escaped pipe row",
+    "## Goal\n- Before.\n| The service accepts red \\| blue tokens. |",
+    "line 3 of #1: table row",
   ],
-])("%s fails before invocation, covering tests or publication", async (_name, parent, intent, reason) => {
-  const t = await setup({ parent, ticket: `## The original intent\n${intent}` });
+])("%s fails before invocation, covering tests or publication", async (_name, parent, reason) => {
+  const t = await setup({ parent, ticket: `## The original intent\n#1's "Goal" section` });
   t.reply(() => ({ structured: output([{ unit: "U1", verdict: "met", tests: ["passes"] }]) }));
   expect(await t.execute()).toBe("failed");
   expect(t.f.store.getRun(t.run.id)?.error).toContain(

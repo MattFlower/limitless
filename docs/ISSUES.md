@@ -46,46 +46,40 @@ missing or unresolved blockers prevent work.
 ## Acceptance intent
 
 Acceptance runs resolve a stable manifest from trusted ticket and parent snapshots before any
-model call. In `## The original intent`, quote whole parent or checked-SHA file units, naming
-the source with a physical `From #123:` or `From docs/PLAN.md:` line, or reference a parent
-section with `#123's "Goal" section`. The nearest preceding `From` line selects the source,
-even immediately after prose or another lead-in. A `(docs)` suffix on the lead-in or section
-reference marks those units as documentation requirements; other units require test evidence.
-Plain context prose does not create requirements. Duplicate normalized texts share one unit.
+model call. The ticket's `## The original intent` section names sections of the parent with
+lines of the form `#123's "Goal" section`, optionally followed by ` (docs)`; #123 must be the
+parent. Every list item and paragraph of a referenced section is a requirement unit. A `(docs)`
+suffix marks that section's units as documentation requirements; other units require test
+evidence. Other prose and list items in the intent section are context. Duplicate normalized
+texts share one unit.
 
-The intentional fail-closed grammar replaces the earlier fence/details exclusion rule.
-The ticket's intent section and referenced parent sections support ATX headings, list items
-with indented continuation lines and paragraphs, paragraphs, blockquotes, table rows and blank
-lines. A list item is one whole unit, including its continuation paragraphs. Quoting only its
-first paragraph is refused. Table rows without escaped pipes supply whole cell units. Rows
-have explicit outer pipes or belong to a delimiter-backed table; a literal pipe in a list
-item, heading or ordinary paragraph does not split that unit into cells, and a heading ends a
-table.
+Quoting parent or file text (a `From #123:` or `From docs/PLAN.md:` line followed by `>` quotes)
+is not supported: it was cut from #981's scope, and a lead-in or a quote refuses the run. Put the
+requirements in a section of the parent and reference it.
 
-Selected sections are scanned sequentially: a fence (three or more backticks or tildes), HTML
-block/comment or details tag starting with `<` (including inline HTML comments), setext
-underline directly beneath paragraph text, heading inside a list item, or four-space
-indentation outside list continuations fails the run before the model.
-The reason is `unsupported Markdown in the intent: <construct>; normalize the ticket`.
-An escaped pipe in a selected table row, or a source row used for a quotation, fails with
-`unsupported Markdown in the intent: escaped pipe in a table row; normalize the ticket`.
-Normalize the trusted ticket/source rather than relying on hidden content being omitted.
+The intent section and every referenced section use one strict line grammar. Each line must be:
+- blank;
+- an ATX heading: one to six `#` at column 0, then a space or the end of the line. A heading at
+  the section's level or higher ends the section; a deeper heading is skipped and isn't a unit;
+- a list item at column 0: `-`, `*`, `+`, or one to nine digits and `.` or `)`, then a space and
+  text. The unit is that one line; a list item never continues onto the next line;
+- a paragraph line at column 0. Consecutive paragraph lines form one unit, which ends at a blank
+  line, a heading or a list item;
+- in the intent section only, a section reference.
 
-ATX headings have one to six hashes, at most three leading spaces, and a space or the end
-of the line after the opening hashes. Closing hashes require a preceding space: `Goal` and
-`Goal#` are distinct. Section references require exactly one matching ATX heading in the
-whole parent; a matching setext heading is ambiguous. Nested headings stay in the section
-until an equal or higher level heading. Unsupported content refuses before a later apparent
-heading can truncate the range.
+Any other line fails the run before the model with `unsupported Markdown in the intent: line <n>
+of <#N or the ticket>: <kind>; normalize the ticket`. That covers a line starting with a space or
+a tab (continuations, nested lists, indented code), a line starting with `>`, `|` or `<`, a fence
+(three or more backticks or tildes), a line made only of `-`, `*`, `_`, `=`, `|`, `:` and spaces
+(thematic breaks, setext underlines and table delimiter rows), a `[label]:` link or footnote
+definition, a list marker without a space and text, a paragraph line directly under a list item,
+and, in the intent section, a `From …:` lead-in. The scan covers the whole section, so an
+unsupported line refuses before any later heading could end it.
 
-Quote sources are distinct from selected sections: unrelated fences, HTML and details may
-remain in the parent or checked-SHA file. Fenced and commented text cannot supply source units
-or headings. A source list item containing a heading cannot be quoted.
-Inline source comments preserve all surrounding visible text as part of the
-whole unit, including list continuation paragraphs. A closing fence must use the opening
-character, be at least as long, and have only spaces after it. Unclosed fences/comments make
-the source unresolvable. File sources still undergo containment and tracked-membership
-checks at the checked SHA.
+The referenced heading must be the parent's only column-0 ATX heading with that text (`Goal` and
+`Goal#` differ), or the run refuses. Lines outside the section aren't scanned, except that a fence
+anywhere before it fails with `unresolvable source`, because a heading inside the fence can't be
+told apart from a real one. The ticket's intent heading follows the same rules.
 
 ## Queue configuration
 
