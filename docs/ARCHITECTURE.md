@@ -131,8 +131,9 @@ verify attempt; reused round results do not start one. Build and seed use scratc
 reserved environment keys are enforced, and readiness stays on the loopback preview origin. The
 server and scratch are torn down on success, failure or cancellation. Eligible local invocations
 request pinned, pre-provisioned Playwright MCP tooling (see [OPERATIONS](OPERATIONS.md#preview-browser-tooling));
-the current pin cannot confine redirects or output filenames, so browser setup fails closed with an
-invocation warning even when tooling is installed. Older runs without
+on macOS the server and its Chromium run under a factory Seatbelt profile that confines its
+connections, reads, writes and IPC ([probe](browser-mcp-probes.md)); every other path, and any setup
+failure, gets no browser and an invocation warning. Older runs without
 a snapshot restore it once from their recorded base SHA on resume, before any model calls; the
 edited worktree configuration is never used.
 

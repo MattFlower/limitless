@@ -27,8 +27,23 @@ export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 /** A command could not run confined: an operational failure, never a gate or grading result. */
 export { ConfinementError } from "./read-policy.ts";
 
+// Chromium's child processes check in with the browser under this name (pinned build's bundle id).
+const CHROMIUM_RENDEZVOUS = String.raw`^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$`;
+
 /** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
-export function seatbeltProfile(roots: WriteRoots): string {
+export function seatbeltProfile(
+  roots: WriteRoots,
+  browser?: { host: string; port: number; links?: string[] },
+): string {
+  if (
+    browser &&
+    (browser.host !== "127.0.0.1" ||
+      !Number.isInteger(browser.port) ||
+      browser.port < 1 ||
+      browser.port > 65535 ||
+      !roots.allowRead?.length)
+  )
+    throw new ConfinementError("Invalid browser confinement policy");
   if (
     roots.daemonPort !== undefined &&
     (!Number.isInteger(roots.daemonPort) || roots.daemonPort < 1 || roots.daemonPort > 65535)
@@ -43,7 +58,9 @@ export function seatbeltProfile(roots: WriteRoots): string {
       })
       .join(" ");
   const ancestors = ancestorReadPolicy(roots.allowRead ?? [], roots.denyRead ?? []);
-  const specificDenies = specificReadDenies(roots.allowRead ?? [], roots.denyRead ?? []);
+  const specificDenies = browser
+    ? (roots.denyRead ?? [])
+    : specificReadDenies(roots.allowRead ?? [], roots.denyRead ?? []);
   const readHoles = [...specificDenies, ...(roots.commands?.root ?? [])].filter((deny) =>
     (roots.allowRead ?? []).some((allow) => {
       const rel = relative(allow, deny);
@@ -53,6 +70,28 @@ export function seatbeltProfile(roots: WriteRoots): string {
   return [
     "(version 1)",
     "(allow default)",
+    ...(browser
+      ? [
+          "(deny network-outbound)",
+          // Seatbelt accepts only * or localhost as a host; ip4 localhost is the IPv4 loopback.
+          `(allow network-outbound (remote ip4 "localhost:${browser.port}"))`,
+          "(deny file-read*)",
+          // dyld opens the root directory to find its shared cache; that reveals only top-level names.
+          '(allow file-read-data (literal "/"))',
+          // dyld reaches runtime libraries through these symlinks; their targets need their own allowance.
+          ...(browser.links?.length ? [`(allow file-read-metadata ${paths(browser.links, "literal")})`] : []),
+          // With Chromium's own sandbox off this bounds its IPC. The pinned build needs only these
+          // (docs/browser-mcp-probes.md): LaunchServices check-in, which TransformProcessType aborts
+          // without; the GPU process's Metal shader compiler; and Chromium's child-process rendezvous.
+          "(deny mach-lookup)",
+          `(allow mach-lookup (global-name "com.apple.coreservices.launchservicesd") (xpc-service-name "com.apple.MTLCompilerService") (global-name-regex #"${CHROMIUM_RENDEZVOUS}"))`,
+          "(deny mach-register)",
+          `(allow mach-register (global-name-regex #"${CHROMIUM_RENDEZVOUS}"))`,
+          "(deny appleevent-send)",
+          "(deny ipc-posix*)",
+          "(deny ipc-sysv*)",
+        ]
+      : []),
     // Seatbelt's localhost selector covers IPv4 and IPv6 loopback.
     ...(roots.daemonPort ? [`(deny network-outbound (remote ip "localhost:${roots.daemonPort}"))`] : []),
     "(deny signal)",
@@ -75,7 +114,9 @@ export function seatbeltProfile(roots: WriteRoots): string {
         ]
       : []),
     // realpath/Git inspect every ancestor; literal metadata grants do not allow directory listings.
-    ...(ancestors.literals.length ? [`(allow file-read* ${paths(ancestors.literals, "literal")})`] : []),
+    ...(!browser && ancestors.literals.length
+      ? [`(allow file-read* ${paths(ancestors.literals, "literal")})`]
+      : []),
     ...(ancestors.metadata.length
       ? [`(allow file-read-metadata ${paths(ancestors.metadata, "literal")})`]
       : []),
