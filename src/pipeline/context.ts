@@ -117,6 +117,8 @@ export interface RunState {
   worktreePath?: string;
   /** The commit the coordinator last confirmed on the run's own branch on GitHub; absent means never published. */
   publishedSha?: string;
+  /** Agent-created history must remain in the scanned range, even when later iterations replace their own commits. */
+  iterationBase?: string;
   workerCommitRound?: number;
   /** Exact intended delivery commit saved before a push whose outcome may need reconciliation. */
   publishingSha?: string;

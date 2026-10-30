@@ -14,6 +14,7 @@ import {
   pushExistingBranch,
 } from "../src/git/repos.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
+import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { reportStructure } from "../src/pipeline/report-privacy.ts";
 import * as proc from "../src/util/proc.ts";
@@ -48,6 +49,67 @@ const { start, githubFixture, registerGithub } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([false, true])("iteration privacy follows the final tree (retained=%s)", async (retained) => {
+    const bare = await githubFixture();
+    const secret = `private-${crypto.randomUUID()}.example`;
+    let implementations = 0;
+    let superseded = "";
+    let blob = "";
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") return { structured: approve };
+      if (++implementations === 2) {
+        superseded = await repos.headSha(s.cwd);
+        blob = (await sh(["git", "rev-parse", "HEAD:config.txt"], { cwd: s.cwd })).stdout.trim();
+      }
+      return {
+        files: {
+          "farewell.txt": implementations === 1 ? "BAD\n" : "goodbye\n",
+          "config.txt": implementations === 1 || retained ? `${secret}\n` : "public.example\n",
+        },
+      };
+    });
+    mkdirSync(f.cfg.paths.configDir, { recursive: true });
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), secret);
+    registerGithub(f, bare);
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+      retained ? "needs_human" : "succeeded",
+    );
+    const done = f.store.getRun(run.id);
+    const state = f.store.getRunState<RunState>(run.id);
+    if (!done?.headSha || !state?.worktreePath) throw new Error("Missing iteration state");
+    const cwd = retained ? state.worktreePath : bare;
+    const range = `${done.baseSha}..${done.headSha}`;
+    expect((await sh(["git", "rev-list", "--count", "--no-merges", range], { cwd })).stdout.trim()).toBe("1");
+    if (retained) {
+      expect(done.error).toContain("private string");
+      await expect(checkPrivateRange(cwd, range, [{ value: secret, entry: 1 }])).rejects.toThrow(
+        "private string",
+      );
+      expect(
+        (await sh(["git", "show-ref", `refs/heads/${done.branch}`], { cwd: bare, allowFail: true })).exitCode,
+      ).not.toBe(0);
+    } else {
+      expect(implementations).toBe(2);
+      await checkPrivateRange(cwd, range, [{ value: secret, entry: 1 }]);
+      expect(state.gateEvidence?.sha).toBe(done.headSha);
+      expect((await sh(["git", "rev-parse", `refs/heads/${done.branch}`], { cwd: bare })).stdout.trim()).toBe(
+        done.headSha,
+      );
+      expect((await sh(["git", "show", `${done.headSha}:farewell.txt`], { cwd: bare })).stdout).toBe(
+        "goodbye\n",
+      );
+    }
+    for (const object of [superseded, blob]) {
+      expect(object).toMatch(/^[a-f0-9]{40,64}$/);
+      expect((await sh(["git", "cat-file", "-e", object], { cwd: bare, allowFail: true })).exitCode).not.toBe(
+        0,
+      );
+    }
+  });
+
   test.each(["PR", "verified draft"])(
     "%s bodies sanitize paths before summary cuts and privacy checks",
     async (mode) => {

@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { recordWorktree } from "../src/git/command.ts";
 import { completeMerge, mergeGit, prepareMerge } from "../src/git/merge.ts";
+import { commitAll, headSha } from "../src/git/repos.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { sh } from "../src/util/proc.ts";
@@ -144,6 +145,18 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(existsSync(join(home, "driver-ran"))).toBe(true);
       writeFileSync(join(cwd, "greeting.txt"), "both intents\n");
       await completeMerge(cwd, before, base);
+      const merge = await headSha(cwd);
+      writeFileSync(join(cwd, "repair.txt"), "first repair\n");
+      await commitAll(cwd, "repair one", { boundary: before });
+      writeFileSync(join(cwd, "repair.txt"), "final repair\n");
+      const repaired = await commitAll(cwd, "repair two", { boundary: before });
+      expect((await mergeGit(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout.trim()).toBe(
+        `${repaired} ${merge}`,
+      );
+      expect((await mergeGit(cwd, ["rev-list", "--parents", "-n", "1", merge])).stdout.trim()).toBe(
+        `${merge} ${before} ${base}`,
+      );
+      expect((await mergeGit(cwd, ["show", "HEAD:repair.txt"])).stdout).toBe("final repair\n");
       expect(existsSync(sentinel)).toBe(false);
     } finally {
       delete process.env.LIMITLESS_MERGE_TEST_SECRET;

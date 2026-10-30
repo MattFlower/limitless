@@ -69,6 +69,7 @@ import {
   githubWait,
   headSha,
   isAncestor,
+  iterationBoundary,
   mergeBase,
   mergePullRequest,
   type PullRequestIdentity,
@@ -852,6 +853,16 @@ function commitIdentity(ctx: RunContext) {
   return repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet ? "operator" : "factory";
 }
 
+async function iterationPublicationBase(ctx: RunContext): Promise<string> {
+  const base =
+    ctx.state.publishedSha ??
+    reviewRound(ctx)?.reviewedSha ??
+    ctx.state.verification?.headSha ??
+    (ctx.run.baseSha as string);
+  const floor = ctx.state.iterationBase;
+  return floor && (await isAncestor(ctx.state.worktreePath as string, base, floor)) ? floor : base;
+}
+
 function draftTitle(ctx: RunContext) {
   return repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet
     ? ctx.run.title
@@ -1304,6 +1315,10 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
         ctx.state.publishedSha = parentSha;
         await ctx.save();
       }
+      // The worker protocol preserves parentSha. Keep unpublished repairs local so they can
+      // replace that parent before verification rather than publish its superseded history.
+      if ((await iterationBoundary(cwd, await iterationPublicationBase(ctx), ctx.signal)) !== parentSha)
+        return null;
       const identity = async (variable: string) => {
         const result = await worktreeGit(["git", "var", variable], { cwd, allowFail: true });
         return result.exitCode === 0 ? /^(.+) <([^<>]+)> -?\d+ [+-]\d{4}\n?$/.exec(result.stdout) : null;
@@ -1474,6 +1489,10 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             ? null
             : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
         if (result.status !== "ok") ctx.log(`Implementer ended with ${result.status}`, "warn");
+        const at = await headSha(cwd);
+        const expected =
+          ctx.state.workerCommitRound === round ? ctx.state.publishedSha : (ctx.run.headSha ?? baseSha);
+        if (!merge && at !== expected) ctx.state.iterationBase = at;
         ctx.state.implementationReadyRound = round;
         delete ctx.state.agentJob;
         await ctx.save("implementation-ready");
@@ -1493,7 +1512,9 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       const sha =
         merge && previousHead
           ? await completeMerge(cwd, previousHead, baseSha, mergeMessage(ctx, baseSha), commitIdentity(ctx))
-          : await commitAll(cwd, commitMessage(ctx, round));
+          : await commitAll(cwd, commitMessage(ctx, round), {
+              boundary: await iterationPublicationBase(ctx),
+            });
       ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
       ctx.state.implementedRound = round;
       await ctx.save("implementation-committed");
@@ -1568,6 +1589,18 @@ async function oneRound(
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
+  else if (round >= 0 && !resolution) {
+    // Older checkpoints can contain several completed iterations. Ignore interrupted gate
+    // writes, consolidate their committed tree, and let SHA-keyed checks establish new evidence.
+    const sha = await commitAll(cwd, commitMessage(ctx, round), {
+      boundary: await iterationPublicationBase(ctx),
+      committedOnly: true,
+    });
+    if (sha) {
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha });
+      await ctx.save("iterations-consolidated");
+    }
+  }
   const ciRound = reviewRound(ctx);
   if (ciRound?.kind === "ci" && (await headSha(cwd)) === ciRound.reviewedSha) {
     ctx.state.needsHumanReason =
@@ -3069,6 +3102,39 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const budget = deliveryBudget(ctx);
     if (ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review)
       await reconcilePublication(ctx, cwd, budget);
+    if (
+      success &&
+      !ctx.state.pendingRebaseSha &&
+      ctx.state.conflictRound === undefined &&
+      ctx.state.implementedRound === ctx.state.round
+    ) {
+      const head = await headSha(cwd);
+      const boundary = await iterationBoundary(cwd, await iterationPublicationBase(ctx), ctx.signal);
+      const parents = await worktreeGit(["git", "rev-list", "--parents", "-n", "1", head], { cwd });
+      if (head !== boundary && parents.stdout.trim() !== `${head} ${boundary}`) {
+        await assertDeliveryHead(ctx, head);
+        if (ctx.repo.kind === "github") {
+          const branch = review?.grant.owner.branch ?? ctx.run.deliveryBranch ?? (ctx.run.branch as string);
+          const expected =
+            ctx.state.publishedSha ??
+            review?.reviewedSha ??
+            (ctx.run.deliveryBranch ? ctx.run.baseSha : null);
+          const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
+          if (remote === head) {
+            ctx.state.publishedSha = head;
+            await ctx.save();
+          } else if (remote !== expected)
+            throw new DeliveryHeadError(
+              "Delivery refused: remote branch moved before iteration consolidation",
+            );
+        }
+        if (ctx.state.publishedSha !== head) {
+          // Persist the return to verification before changing Git, including on older runs.
+          await ctx.setPhase("loop");
+          return { summary: "Rechecking consolidated iteration history", value: undefined };
+        }
+      }
+    }
     const runner = ctx.deps.gh ?? runGh;
     const gh: GhRunner = (args, signal, stdin) =>
       withGitHubRetry(async () => (await runner(args, signal, stdin, ctx.repo.slug)) ?? "", {
@@ -3340,7 +3406,6 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.state.publishingSha = head;
     await ctx.save("delivery-publishing");
     if (
-      !ctx.state.githubWait ||
       ctx.state.publishedSha !== head ||
       (await remoteBranchSha(ctx.repo, cwd, ctx.run.branch as string, ctx.signal, budget)) !== head
     )

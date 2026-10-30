@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } fro
 import { join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
+import * as gitCommand from "../src/git/command.ts";
 import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { NeedsHumanError, type RunState } from "../src/pipeline/context.ts";
@@ -57,6 +58,139 @@ const {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    "between iterations",
+    "commit checkpoint",
+    "git mutation",
+    "verified",
+    "pushed",
+    "legacy",
+    "legacy completed",
+    "legacy verified",
+    "legacy published",
+    "unchanged",
+  ])("consolidated iteration restart at %s reuses completed work", async (boundary) => {
+    const bare = await githubFixture();
+    let implementations = 0;
+    let firstIteration = "";
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      if (++implementations === 2) firstIteration = await repos.headSha(s.cwd);
+      return { files: { "farewell.txt": implementations === 1 ? "BAD\n" : "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    f.deps.faults =
+      boundary === "verified" || boundary === "legacy verified" || boundary === "legacy published"
+        ? { "stage:deliver:before": { action: "kill" } }
+        : boundary === "between iterations"
+          ? { "stage:implement:before": { action: "kill", when: (c) => c.round === 1 } }
+          : boundary === "pushed" || boundary === "git mutation"
+            ? undefined
+            : {
+                "store:save": {
+                  action: "kill",
+                  when: (c) => c.round === 1 && c.checkpoint === "implementation-committed",
+                },
+              };
+    const realPush = repos.pushBranch;
+    const realGit = gitCommand.worktreeGit;
+    let interrupted = false;
+    const mutation = spyOn(gitCommand, "worktreeGit").mockImplementation(async (args, ...rest) => {
+      const result = await realGit(args, ...rest);
+      if (boundary === "git mutation" && !interrupted && args[1] === "update-ref" && args[2] === "HEAD") {
+        interrupted = true;
+        throw new SimulatedTermination("Git ref updated before run checkpoint");
+      }
+      return result;
+    });
+    let pushes = 0;
+    const push = spyOn(repos, "pushBranch").mockImplementation(async (...args) => {
+      pushes++;
+      await realPush(...args);
+      if (boundary === "pushed" && pushes === 1)
+        throw new SimulatedTermination("push completed before acknowledgement");
+    });
+    let reopened: Store | undefined;
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
+      const state = f.store.getRunState<RunState>(run.id);
+      if (!state?.worktreePath) throw new Error("Missing interrupted iteration");
+      const cwd = state.worktreePath;
+      const checked = state.gateEvidence?.sha;
+      let before = await repos.headSha(cwd);
+      if (boundary.startsWith("legacy")) {
+        // A pre-change run has ordinary iteration commits and no consolidation fields.
+        await sh(["git", "update-ref", "HEAD", firstIteration, before], { cwd });
+        await repos.commitAll(cwd, "old second iteration");
+        before = await repos.headSha(cwd);
+        expect(
+          (
+            await sh(["git", "rev-list", "--count", `${f.store.getRun(run.id)?.baseSha}..HEAD`], { cwd })
+          ).stdout.trim(),
+        ).toBe("2");
+        if (boundary !== "legacy") state.implementedRound = 1;
+        if (boundary === "legacy verified" || boundary === "legacy published") {
+          if (!state.gateEvidence) throw new Error("Missing legacy gate evidence");
+          state.gateEvidence.sha = before;
+          state.reviewedSha = before;
+          state.lastVerifiedSha = before;
+          if (state.completedChecks) state.completedChecks.sha = before;
+        }
+        f.store.updateRun(run.id, { headSha: before }, state);
+        if (boundary === "legacy published")
+          await sh(["git", "push", bare, `HEAD:refs/heads/${f.store.getRun(run.id)?.branch}`], { cwd });
+        if (boundary === "legacy completed")
+          writeFileSync(join(cwd, "greeting.txt"), "interrupted gate output\n");
+      }
+      if (boundary === "unchanged") {
+        state.implementedRound = undefined;
+        f.store.setRunState(run.id, state);
+      }
+      reopened = new Store(f.cfg.paths.db);
+      expect(
+        await executeRun(
+          { ...f.deps, store: reopened, faults: undefined },
+          run.id,
+          new AbortController().signal,
+        ),
+      ).toBe("succeeded");
+      const done = reopened.getRun(run.id);
+      if (!done?.headSha) throw new Error("Missing delivered head");
+      const final = reopened.getRunState<RunState>(run.id);
+      expect(implementations).toBe(2);
+      expect(pushes).toBe(boundary === "legacy published" ? 0 : 1);
+      expect(
+        (
+          await sh(["git", "rev-list", "--count", `${done.baseSha}..${done.headSha}`], { cwd: bare })
+        ).stdout.trim(),
+      ).toBe(boundary === "legacy published" ? "2" : "1");
+      expect((await sh(["git", "show", `${done.headSha}:farewell.txt`], { cwd: bare })).stdout).toBe(
+        "goodbye\n",
+      );
+      expect((await sh(["git", "show", `${done.headSha}:greeting.txt`], { cwd: bare })).stdout).toBe(
+        "hello\n",
+      );
+      expect(final?.gateEvidence?.sha).toBe(done?.headSha);
+      expect(
+        (await sh(["git", "rev-parse", `refs/heads/${done?.branch}`], { cwd: bare })).stdout.trim(),
+      ).toBe(done?.headSha);
+      if (boundary === "verified" || boundary === "pushed") expect(done.headSha).toBe(checked ?? "missing");
+      if (
+        ["commit checkpoint", "git mutation", "unchanged", "verified", "pushed", "legacy published"].includes(
+          boundary,
+        )
+      )
+        expect(done?.headSha).toBe(before);
+    } finally {
+      push.mockRestore();
+      mutation.mockRestore();
+      reopened?.close();
+    }
+  });
+
   test.each(["missing audit", "stale audit", "verified fallback", "skipped audit"])(
     "workflow publication refuses %s before any push",
     async (scenario) => {

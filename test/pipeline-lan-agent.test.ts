@@ -88,6 +88,7 @@ function boot(
     executor?: AgentExecutor;
     review?: (s: AgentSpec) => Promise<void>;
     reviewReply?: (s: AgentSpec) => Promise<FakeReply>;
+    implementReply?: (s: AgentSpec) => Promise<FakeReply>;
     faults?: FaultPlan;
     deferStart?: boolean;
     localImplement?: boolean;
@@ -114,7 +115,7 @@ function boot(
           return (await options.reviewReply?.(s)) ?? { structured: approve };
         }
         locals++;
-        return { files: { "farewell.txt": "local goodbye\n" } };
+        return (await options.implementReply?.(s)) ?? { files: { "farewell.txt": "local goodbye\n" } };
       }),
     },
     agentExecutor:
@@ -378,10 +379,10 @@ async function report(f: Factory, job: AgentJobRow, req: AgentJobRequest, sha: s
     sha,
   );
 }
-async function publish(bare: string, req: AgentJobRequest, wrong = false) {
+async function publish(bare: string, req: AgentJobRequest, wrong = false, contents?: string) {
   await sh(["git", "fetch", bare, req.parentSha], { cwd: repoDir });
   await sh(["git", "reset", "--hard", req.parentSha], { cwd: repoDir });
-  writeFileSync(join(repoDir, "farewell.txt"), `worker goodbye ${req.parentSha}\n`);
+  writeFileSync(join(repoDir, "farewell.txt"), contents ?? `worker goodbye ${req.parentSha}\n`);
   const commit = req.commit;
   if (!commit) throw new Error("Missing publication");
   await sh(["git", "add", "."], { cwd: repoDir });
@@ -498,6 +499,105 @@ test("a quota result is adopted before invoke dispatches the next candidate", as
     await finish();
   }
 });
+
+test.each([false, true])(
+  "adopted worker ancestry survives restart and local privacy repairs (retained=%s)",
+  async (retained) => {
+    const bare = await githubFixture();
+    const secret = `private-${crypto.randomUUID()}.example`;
+    let f: Factory;
+    let localCalls = 0;
+    let superseded = "";
+    let blob = "";
+    const executor: AgentExecutor = {
+      kind: "test",
+      run: (call, local) =>
+        call.role === "implement" && call.round === 1
+          ? local()
+          : lanAgentExecutor(f.workers, f.cfg).run(call, local),
+    };
+    const implementReply = async (s: AgentSpec): Promise<FakeReply> => {
+      if (++localCalls === 2) {
+        superseded = await headSha(s.cwd);
+        blob = (await sh(["git", "rev-parse", "HEAD:config.txt"], { cwd: s.cwd })).stdout.trim();
+      }
+      return {
+        files: {
+          "farewell.txt": localCalls === 1 ? "BAD\n" : "goodbye\n",
+          "config.txt": localCalls === 1 || retained ? `${secret}\n` : "public.example\n",
+        },
+      };
+    };
+    ({ f } = boot({
+      executor,
+      implementReply,
+      faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "worker-commit-adopted" } },
+    }));
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), secret);
+    registerGithub(f, bare);
+    const adopt = spyOn(repos, "adoptWorkerCommit");
+    const push = spyOn(repos, "pushBranch");
+    const finish = simulated(f, async (job, req) =>
+      report(f, job, req, await publish(bare, req, false, "BAD\n")),
+    );
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      await wait(
+        () => f.store.listStages(run.id).some((s) => s.name === "implement" && s.status === "cancelled"),
+        {
+          timeoutMs: 10_000,
+          pollMs: null,
+          subscribe: (wake) => f.store.subscribe(wake),
+        },
+      );
+      await finish();
+      await f.stop();
+      const adopted = jobs(f)[0]?.result_sha;
+      if (!adopted) throw new Error("Missing worker publication");
+      expect(adopt).toHaveBeenCalledTimes(1);
+      f.store.close();
+      ({ f } = boot({ executor, implementReply, deferStart: true }));
+      f.cfg.maxRounds = 1;
+      f.start();
+      expect(await waitFor(f, run.id, ["succeeded", "needs_human", "failed"])).toBe(
+        retained ? "needs_human" : "succeeded",
+      );
+      const done = f.store.getRun(run.id);
+      const state = f.store.getRunState<RunState>(run.id);
+      if (!done?.headSha || !state?.worktreePath) throw new Error("Missing repaired worker state");
+      expect(jobs(f)).toHaveLength(1);
+      expect(adopt).toHaveBeenCalledTimes(1);
+      expect(localCalls).toBe(2);
+      const cwd = retained ? state.worktreePath : bare;
+      expect(
+        (await sh(["git", "rev-list", "--parents", "-n", "1", done.headSha], { cwd })).stdout.trim(),
+      ).toBe(`${done.headSha} ${adopted}`);
+      const remoteHead = (
+        await sh(["git", "rev-parse", `refs/heads/${done.branch}`], { cwd: bare })
+      ).stdout.trim();
+      if (retained) {
+        expect(done.error).toContain("private string");
+        expect(push).not.toHaveBeenCalled();
+        expect(remoteHead).toBe(adopted);
+      } else {
+        expect(push).toHaveBeenCalledTimes(1);
+        expect(remoteHead).toBe(state.gateEvidence?.sha as string);
+        expect(remoteHead).toBe(done.headSha);
+        await repos.checkPrivateRange(bare, `${adopted}..${remoteHead}`, [{ value: secret, entry: 1 }]);
+      }
+      for (const object of [superseded, blob]) {
+        expect(object).toMatch(/^[a-f0-9]{40,64}$/);
+        expect(
+          (await sh(["git", "cat-file", "-e", object], { cwd: bare, allowFail: true })).exitCode,
+        ).not.toBe(0);
+      }
+    } finally {
+      await finish();
+      adopt.mockRestore();
+      push.mockRestore();
+    }
+  },
+);
 
 test.each(["worker-commit-adopted", "implementation-ready", "different target"])(
   "restart reuses the done result at %s",

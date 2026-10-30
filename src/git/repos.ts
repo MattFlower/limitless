@@ -645,20 +645,78 @@ export async function clearInterruptedRebase(cwd: string, expected: boolean): Pr
     throw new Error("interrupted rebase could not be aborted");
 }
 
-/** Commit everything in the worktree. Returns the new sha, or null when there was nothing to commit. */
+/** The first-parent publication boundary, retaining base merges as immutable commits. */
+export async function iterationBoundary(
+  cwd: string,
+  boundary: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (!(await isAncestor(cwd, boundary, await headSha(cwd))))
+    throw new Error("Iteration publication boundary is not an ancestor of HEAD");
+  const history = await worktreeGit(["git", "rev-list", "--first-parent", "--parents", `${boundary}..HEAD`], {
+    cwd,
+    signal,
+  });
+  for (const line of history.stdout.trim().split("\n")) {
+    const [sha, ...parents] = line.split(" ");
+    if (sha && parents.length > 1) return sha;
+  }
+  return boundary;
+}
+
+/** Commit everything; replace only iteration history above an explicitly supplied boundary. */
 export async function commitAll(
   cwd: string,
   message: string,
-  options: { env?: Record<string, string>; signal?: AbortSignal; verbatim?: boolean } = {},
+  options: {
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+    verbatim?: boolean;
+    boundary?: string;
+    committedOnly?: boolean;
+  } = {},
 ): Promise<string | null> {
   const opts = { cwd, env: options.env, signal: options.signal };
-  if (worktreeGitScope.getStore() !== false) {
+  if (!options.committedOnly && worktreeGitScope.getStore() !== false) {
     const index = await worktreeGit(["git", "rev-parse", "--git-path", "index"], opts);
     rmSync(resolve(cwd, index.stdout.trim()), { force: true });
     await worktreeGit(["git", "read-tree", "HEAD"], opts);
   }
-  await stageAll(opts);
-  const status = await worktreeGit(["git", "status", "--porcelain"], opts);
+  if (!options.committedOnly) await stageAll(opts);
+  const status = options.committedOnly
+    ? { stdout: "" }
+    : await worktreeGit(["git", "status", "--porcelain"], opts);
+  if (options.boundary) {
+    const head = await headSha(cwd);
+    const parent = await iterationBoundary(cwd, options.boundary, options.signal);
+    if (head !== parent) {
+      const parents = await worktreeGit(["git", "rev-list", "--parents", "-n", "1", head], opts);
+      if (!status.stdout.trim() && parents.stdout.trim() === `${head} ${parent}`) return null;
+      const tree = await worktreeGit(
+        options.committedOnly ? ["git", "rev-parse", "HEAD^{tree}"] : ["git", "write-tree"],
+        opts,
+      );
+      const author = await worktreeGit(["git", "show", "-s", "--format=%an%x00%ae%x00%aI", head], opts);
+      const [name, email, date] = author.stdout.trimEnd().split("\0");
+      if (!name || !email || !date) throw new Error("Cannot inspect iteration author");
+      const commit = await worktreeGit(
+        ["git", "commit-tree", tree.stdout.trim(), "-p", parent, "-m", message],
+        {
+          ...opts,
+          env: {
+            ...(options.env ?? (process.env as Record<string, string>)),
+            GIT_AUTHOR_NAME: name,
+            GIT_AUTHOR_EMAIL: email,
+            GIT_AUTHOR_DATE: date,
+          },
+        },
+      );
+      const sha = commit.stdout.trim();
+      // One atomic ref update: a restart after it sees the final tree and reuses this commit.
+      await worktreeGit(["git", "update-ref", "HEAD", sha, head], opts);
+      return sha;
+    }
+  }
   if (!status.stdout.trim()) return null;
   await worktreeGit(
     [
