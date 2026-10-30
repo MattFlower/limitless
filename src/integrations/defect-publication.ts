@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import { z } from "zod";
 import type { Repo } from "../core/types.ts";
 import { loadPrivateStrings, type PrivateStrings } from "../gates/private.ts";
@@ -8,7 +9,13 @@ import type { GitHubIdentity } from "./github-identity.ts";
 
 const blocked = { status: "blocked", diagnostic: "Defect publication blocked" } as const;
 const text = (bytes = 256) => z.string().refine((v) => Buffer.byteLength(v) <= bytes);
-const identity = text().refine((v) => !!v.trim() && !/\[redacted[^\]]*\]/iu.test(v));
+const privateIp = /^(?:127\.|10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|::1$)/u;
+const identity = text().refine((v) => {
+  const url = URL.parse(v);
+  if (url?.protocol === "file:" || /\[redacted[^\]]*\]|^\s*(?:[/~]|[a-z]:|\\\\)/iu.test(v)) return false;
+  const host = (url?.hostname ?? "").toLowerCase().replace(/^\[|\]$|\.$/gu, "");
+  return !!v.trim() && !/^localhost$|\.local$/u.test(host) && !(isIP(host) && privateIp.test(host));
+});
 const slug = identity.refine((v) =>
   /^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?\/(?!\.{1,2}$)[a-z0-9_.-]+$/iu.test(v),
 );

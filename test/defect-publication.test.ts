@@ -94,8 +94,8 @@ test("canonical array hashing excludes occurrence evidence and preserves exact c
   const local = await prepared(finding, { repos: [{ ...repo, kind: "local", slug: "example/product" }] });
   expect(local.signature).toBe(hash("gate", "local", repo.id, "setup", "check", "lint"));
   // Phase is deliberately the closed D0 enum. Delimiters in other components remain unambiguous.
-  const left = await prepared({ ...finding, class: "a:b", checkIdentity: "c" });
-  const right = await prepared({ ...finding, class: "a", checkIdentity: "b:c" });
+  const left = await prepared({ ...finding, class: "a:bb", checkIdentity: "c" });
+  const right = await prepared({ ...finding, class: "a", checkIdentity: "bb:c" });
   expect(left.signature).not.toBe(right.signature);
   for (const output of ["first output", "different output"])
     expect(await prepareDefectPublication({ ...finding, output } as DefectEvidence, deps())).toEqual(refused);
@@ -197,7 +197,7 @@ test("envelope accepts only the complete reserved first line and requested kind"
     ` ${body}`,
     `\n${body}`,
     `text\n${body}`,
-    body.replace("\n", "\r\n"),
+    body.replaceAll("\n", "\r\n"),
     body.replace(" -->", ":extra -->"),
     body.replace(":issue:", ":other:"),
     body.replace(/:[a-f0-9]{64}:/, `:${"A".repeat(64)}:`),
@@ -207,6 +207,106 @@ test("envelope accepts only the complete reserved first line and requested kind"
     `${first}x`,
   ])
     expect(parseDefectEnvelope(invalid, "issue")).toBeUndefined();
+});
+
+test.each([
+  { checkIdentity: "/home/example/project/check.sh" },
+  { runRefs: ["http://127.0.0.1:7400/runs/run-1"] },
+  { landRefs: ["file:///home/example/project/land-1"] },
+] satisfies Partial<DefectEvidence>[])(
+  "structural guard rejects reported leak %j with empty privacy registries",
+  async (change) => {
+    expect(await prepareDefectPublication({ ...finding, ...change }, deps())).toEqual(refused);
+  },
+);
+
+test.each([
+  "~/project/check.sh",
+  "~other/project/check.sh",
+  "C:\\project\\check.sh",
+  "d:/project/check.sh",
+  "C:check.sh",
+  "\\\\server\\share\\check.sh",
+  "//server/share/check.sh",
+  "FiLe:///project/check.sh",
+  " \tFiLe:///project/check.sh",
+  "fi\tle:///home/example/check",
+  "fi\nle:///home/example/check",
+  "f\r\ni\tle:project/check",
+  " \n/home/example/project/check.sh",
+  "https://LOCALHOST:7400/check",
+  "https://localhost.:7400/check",
+  "https://127.255.255.255/check",
+  "http://127.1/check",
+  "http://0x7f000001/check",
+  "https://10.0.0.0/check",
+  "https://10.255.255.255/check",
+  "https://172.16.0.0/check",
+  "https://172.31.255.255/check",
+  "https://192.168.0.0/check",
+  "https://192.168.255.255/check",
+  "https://169.254.0.0/check",
+  "https://169.254.255.255/check",
+  "https://[::1]:7400/check",
+  "https://[0:0:0:0:0:0:0:1]/check",
+  "https://HOST.LoCaL:7400/check",
+  "https://host.local./check",
+  "https://public.example@localhost/check",
+])("structural guard rejects prohibited identity %s", async (checkIdentity) => {
+  expect(await prepareDefectPublication({ ...finding, checkIdentity }, deps())).toEqual(refused);
+});
+
+test("structural guard covers every reference entry and registered local source identities", async () => {
+  for (const field of ["runRefs", "landRefs"])
+    expect(
+      await prepareDefectPublication(
+        { ...finding, [field]: ["opaque-reference", "https://10.0.0.0/reference"] },
+        deps(),
+      ),
+    ).toEqual(refused);
+  for (const id of ["/home/example/project", "https://host.local/source", "\\\\server\\share"])
+    expect(
+      await prepareDefectPublication(
+        { ...finding, sourceId: id },
+        deps({ repos: [{ ...repo, kind: "local", id }] }),
+      ),
+    ).toEqual(refused);
+});
+
+test.each([
+  "opaque:check:identity",
+  " lint ",
+  "relative/check.sh",
+  "https://172.15.0.1/check",
+  "https://172.32.0.1/check",
+  "https://9.255.255.255/check",
+  "https://11.0.0.0/check",
+  "https://126.255.255.255/check",
+  "https://128.0.0.0/check",
+  "https://192.167.255.255/check",
+  "https://192.169.0.0/check",
+  "https://169.253.255.255/check",
+  "https://169.255.0.0/check",
+  "https://[::2]:7400/check",
+  "https://Example.COM:443/check",
+  "https://host.local.example/check",
+  "https://localhost.example/check",
+  "https://10.example.com/check",
+  "https://example.com/localhost/127.0.0.1/file:///home/example",
+])("structural guard preserves accepted identity and references %s", async (value) => {
+  const result = await prepared({ ...finding, checkIdentity: value, runRefs: [value], landRefs: [value] });
+  expect(suppliedData(result.body)).toMatchObject({
+    checkIdentity: value,
+    runRefs: [value],
+    landRefs: [value],
+  });
+  expect(result.signature).toBe(hash("gate", "github", "example/product", "setup", "check", value));
+  const local = await prepared(
+    { ...finding, sourceId: value },
+    { repos: [{ ...repo, kind: "local", id: value }] },
+  );
+  expect(suppliedData(local.body).sourceIdentity).toBe(value);
+  expect(local.signature).toBe(hash("gate", "local", value, "setup", "check", "lint"));
 });
 
 test("strict allowlist and all component, identity and reference bounds refuse without clipping", async () => {
