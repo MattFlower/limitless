@@ -397,6 +397,7 @@ for (const phase of ["headers", "body"] as const)
         const caller = new AbortController();
         const reached = deferred<void>();
         let requestSignal: AbortSignal | null | undefined;
+        let bodyCancelled = false;
         remote.hook = async (call, next) => {
           if (!(path === "metadata" ? isMeta(call) : isRead(`git/${path}`)(call))) return next();
           requestSignal = call.init.signal;
@@ -410,6 +411,9 @@ for (const phase of ["headers", "body"] as const)
                 pull() {
                   reached.resolve();
                   return new Promise(() => undefined);
+                },
+                cancel() {
+                  bodyCancelled = true;
                 },
               },
               { highWaterMark: 0 },
@@ -431,6 +435,7 @@ for (const phase of ["headers", "body"] as const)
         if (cancelled) await rejects(pending, "aborted");
         else expect(await pending).toEqual({ kind: "unconfirmed" });
         expect(requestSignal?.aborted).toBe(true);
+        expect(bodyCancelled).toBe(phase === "body");
         expect(handles).toHaveLength(remote.calls.length);
         for (const handle of handles) expect(handle.disposed).toBe(1);
         for (const call of remote.calls) {
@@ -728,6 +733,7 @@ for (const phase of ["headers", "body"])
         const reached = deferred<void>();
         const handles: { controller: AbortController; disposed: number }[] = [];
         let stalled: AbortSignal | null | undefined;
+        let bodyCancelled = false;
         remote.hook = async (call, next) => {
           if (path === "reconcile" && isCas(call)) return json({ errors: [] });
           const at =
@@ -748,6 +754,9 @@ for (const phase of ["headers", "body"])
                 pull() {
                   reached.resolve();
                   return new Promise(() => undefined);
+                },
+                cancel() {
+                  bodyCancelled = true;
                 },
               },
               { highWaterMark: 0 },
@@ -774,6 +783,7 @@ for (const phase of ["headers", "body"])
               : { kind: "unchanged", tip: null },
           );
         expect(stalled?.aborted).toBe(true);
+        expect(bodyCancelled).toBe(phase === "body");
         expect(handles).toHaveLength(remote.calls.length);
         for (const h of handles) expect(h.disposed).toBe(1);
         expect(remote.calls.filter(isCas)).toHaveLength(path === "prepare" ? 0 : 1);
