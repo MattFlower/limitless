@@ -4,7 +4,14 @@ import type { EpicAttention, Run } from "../core/types.ts";
 import { CommentProcessed, ISSUE_CLAIM_STATUSES, type IssueRunSummary, linkedIssues } from "../db/store.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
-import { commentRunRequest, type GhRunner, issueRunRequest, runGh } from "./github.ts";
+import {
+  ANSWER_UNSUPPORTED,
+  commentRunRequest,
+  type GhRunner,
+  issueRunRequest,
+  reservedAnswer,
+  runGh,
+} from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
 import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
 import { issueTextRefusal } from "./issue-trust.ts";
@@ -453,6 +460,10 @@ export function startIssueQueue(
                 factory.store.githubCommentProcessed(comment)
               )
                 continue;
+              if (reservedAnswer(request)) {
+                factory.store.recordGitHubComment(comment, null, ANSWER_UNSUPPORTED);
+                continue;
+              }
               try {
                 const req = commentRunRequest(
                   {

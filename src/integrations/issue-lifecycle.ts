@@ -4,7 +4,8 @@ import type { Run } from "../core/types.ts";
 import { linkedIssues, type Store } from "../db/store.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
-import { redactCredentials } from "../util/proc.ts";
+import type { RunState } from "../pipeline/context.ts";
+import { redactCredentials, registeredCredentials } from "../util/proc.ts";
 import type { GhRunner } from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
 
@@ -24,7 +25,7 @@ const exhausted = Symbol("lifecycle call budget exhausted");
 const desiredLabel = (run: Run) =>
   run.merged
     ? "none"
-    : run.status === "needs_human"
+    : ["waiting_input", "needs_human"].includes(run.status)
       ? labels[1]
       : run.status === "failed"
         ? labels[2]
@@ -58,19 +59,37 @@ export async function reconcileIssueLifecycle(
     before?.();
     return gh(["api", ...args], signal, undefined, repo);
   };
-  const logFailure = (run: Run, repo: string, number: number, error: unknown) => {
-    if (!signal.aborted && error !== exhausted)
-      log(redactCredentials(`Issue lifecycle ${repo}#${number} run ${run.id}: ${String(error)}`));
+  const logFailure = (
+    code: "field-withheld" | "body-suppressed" | "labels-failed" | "publication-failed",
+    error?: unknown,
+  ) => {
+    if (!signal.aborted && error !== exhausted) log(`Issue lifecycle: ${code}`);
   };
-  const checkBody = (run: Run, body: string) => {
+  const openQuestions = (run: Run) => store.listQuestions(run.id).filter((q) => q.answer === null);
+  const questionSet = (run: Run) =>
+    openQuestions(run)
+      .map((q) => q.id)
+      .join(",");
+  const markerFor = (id: string, event: string, repo: string, number: number) =>
+    lifecycleMarker(
+      id,
+      event.startsWith("questions:") ? `questions:${repo.toLowerCase()}#${number}:${event.slice(10)}` : event,
+    );
+  const inspection = (run: Run) => {
     const worktree = publicationWorktree(store.getRunState(run.id) ?? {});
     const roots = [...worktree, store.getRepo(run.repoId)?.localPath ?? ""];
+    const entries = [
+      ...registeredCredentials().map((value) => ({ value, entry: 0 })),
+      ...loadPrivateStrings(cfg.paths.configDir, [...roots, cfg.paths.repos, cfg.paths.work]),
+    ];
+    return { roots, entries };
+  };
+  const checkBody = (run: Run, body: string, marker: string, checks = inspection(run)) => {
+    const { roots, entries } = checks;
     const checked = sanitizePublication(redactCredentials(body), roots, cfg.paths.home);
-    checkPublicationText(
-      checked,
-      "Issue lifecycle comment",
-      loadPrivateStrings(cfg.paths.configDir, [...roots, cfg.paths.repos, cfg.paths.work]),
-    );
+    if (body.split("\n")[0] !== marker || checked.split("\n")[0] !== marker)
+      throw new Error("invalid-envelope");
+    checkPublicationText(checked, "", entries);
     return checked;
   };
   const observe = (run: Run, repo: string, number: number) => {
@@ -78,6 +97,18 @@ export async function reconcileIssueLifecycle(
     const save = (effect: string, state: string, details = {}) => {
       store.setIssueLifecycleEffect(run.id, repo, number, effect, state, details);
     };
+    let checked: ReturnType<typeof inspection> | undefined;
+    const inspect = () => (checked ??= inspection(run));
+    const field = (text: string) => {
+      try {
+        checkPublicationText(text, "", inspect().entries);
+        return text;
+      } catch {
+        logFailure("field-withheld");
+        return "[withheld; see the UI]";
+      }
+    };
+
     const link = `${cfg.uiUrl}/runs/${run.id}`;
     const events = new Map<string, string>([["started", `started: see ${link}.`]]);
     if (run.prUrl) {
@@ -85,7 +116,23 @@ export async function reconcileIssueLifecycle(
       const pr = match?.[1]?.toLowerCase() === repo.toLowerCase() ? ` ${run.prUrl}` : "";
       events.set("pr", `opened a PR${pr}: see ${link}.`);
     }
-    if (run.status === "needs_human") events.set("needs_human", `needs you: see ${link}.`);
+    if (run.status === "needs_human" && !effects.has("comment:needs_human")) {
+      const state = store.getRunState<RunState>(run.id);
+      const reason = [state?.needsHumanReason, state?.terminalReason, run.error].find(
+        (value) => typeof value === "string" && value.trim(),
+      );
+      events.set(
+        "needs_human",
+        `needs you: see ${link}.\n${repoSettings(cfg, repo).discreet ? "" : field(reason ?? "See the UI for details.")}`,
+      );
+    }
+    const questions = run.status === "waiting_input" ? openQuestions(run) : [];
+    const ids = questions.map((q) => q.id).join(",");
+    if (questions.length && !effects.has(`comment:questions:${ids}`))
+      events.set(
+        `questions:${ids}`,
+        `has questions. Answer in the UI: ${link}\n${questions.map((q) => `Question ${q.id}: ${repoSettings(cfg, repo).discreet ? "" : field(q.question)}`).join("\n")}`,
+      );
     if (run.status === "failed") events.set("failed", `failed: see ${link}.`);
     if (run.status === "cancelled") events.set("cancelled", `was cancelled: see ${link}.`);
     for (const [event, text] of events) {
@@ -96,11 +143,12 @@ export async function reconcileIssueLifecycle(
         continue;
       }
       try {
-        const body = checkBody(run, `${lifecycleMarker(run.id, event)}\nLimitless run ${run.id} ${text}`);
+        const marker = markerFor(run.id, event, repo, number);
+        const body = checkBody(run, `${marker}\nLimitless run ${run.id} ${text}`, marker, inspect());
         save(effect, "pending", { body });
-      } catch (error) {
+      } catch {
         save(effect, "done");
-        logFailure(run, repo, number, error);
+        logFailure("body-suppressed");
       }
     }
     if (!effects.has("labels")) save("labels", "pending");
@@ -115,22 +163,24 @@ export async function reconcileIssueLifecycle(
     });
   }
   const work = runs.flatMap((snapshot) =>
-    linkedIssues(snapshot, store)
-      .filter(({ repo }) => lifecycleManaged(cfg, repo))
-      .flatMap((issue) =>
-        ["labels", ...eventOrder].map((effect) => ({
-          snapshot,
-          ...issue,
-          effect,
-          key: JSON.stringify([snapshot.id, issue.repo.toLowerCase(), issue.number, effect]),
-        })),
-      ),
+    [
+      ...linkedIssues(snapshot, store)
+        .filter(({ repo }) => lifecycleManaged(cfg, repo))
+        .flatMap((issue) => ["labels", ...eventOrder].map((effect) => ({ ...issue, effect }))),
+      // Prior links still need recovery of uncertain question POSTs.
+      ...store.pendingIssueQuestionEffects(snapshot.id).map((e) => ({ ...e, effect: e.effect.slice(8) })),
+    ].map((issue) => ({
+      snapshot,
+      ...issue,
+      key: JSON.stringify([snapshot.id, issue.repo.toLowerCase(), issue.number, issue.effect]),
+    })),
   );
   const cursor = cursors.get(store);
   const start = Math.max(0, work.findIndex((w) => w.key === cursor?.key) + (cursor?.deferred ? 0 : 1));
   const ordered = [...work.slice(start), ...work.slice(0, start)];
-  const postingLogin = async (repo: string) => {
+  const postingLogin = async (repo: string, eligible: () => boolean) => {
     const identity = await (opts.identity ?? githubIdentity)(repo);
+    if (!eligible()) return null;
     if (identity.kind === "app") return identity.botLogin;
     // Look up the owner only when the POST can follow in this poll.
     reserve(2);
@@ -148,15 +198,29 @@ export async function reconcileIssueLifecycle(
           if (e.effect.startsWith("label:") && e.state === "pending") save(e.effect, "done");
         save("labels", target);
       });
+    const questions = task.startsWith("questions:");
+    const eligible = () => {
+      const current = store.getRun(snapshot.id);
+      return (
+        !!current &&
+        lifecycleManaged(cfg, repo) &&
+        !repoSettings(cfg, repo).discreet &&
+        linkedIssues(current, store).some(
+          (i) => i.repo.toLowerCase() === repo.toLowerCase() && i.number === number,
+        ) &&
+        (!questions || (current.status === "waiting_input" && questionSet(current) === task.slice(10)))
+      );
+    };
     let run = store.getRun(snapshot.id);
     if (
       !run ||
-      !linkedIssues(run, store).some(
-        (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
-      )
+      (!questions &&
+        !linkedIssues(run, store).some(
+          (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
+        ))
     )
       continue;
-    if (task !== "labels") observe(run, repo, number);
+    if (task !== "labels" && eligible()) observe(run, repo, number);
     const effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
     if (task === "labels") {
       try {
@@ -282,29 +346,24 @@ export async function reconcileIssueLifecycle(
           return;
         }
         freshLabels.delete(key);
-        logFailure(snapshot, repo, number, error);
+        logFailure("labels-failed", error);
       }
       continue;
     }
     const effect = `comment:${task}`;
     const pending = effects.get(effect);
-    if (pending?.state !== "pending") continue;
-    if (repoSettings(cfg, repo).discreet) {
+    if (!pending || !["pending", "recovering"].includes(pending.state)) continue;
+    // Supersession survives pagination pauses even if the run later resumes waiting.
+    let stale = pending.state === "recovering" || !eligible();
+    if (stale && !pending.page) {
       save(effect, "done");
       continue;
     }
+    if (stale) save(effect, "recovering", { page: pending.page });
     try {
-      let body: string;
-      try {
-        if (!pending.body) throw new Error("missing lifecycle comment body");
-        body = checkBody(run, pending.body);
-      } catch (error) {
-        save(effect, "done");
-        logFailure(run, repo, number, error);
-        continue;
-      }
+      // Recovery depends only on the checkpoint, even if its body is no longer publishable.
+      const marker = markerFor(run.id, task, repo, number);
       if (pending.page) {
-        const marker = body.split("\n")[0] ?? "";
         let page = pending.page;
         while (page) {
           const comments = z
@@ -316,18 +375,46 @@ export async function reconcileIssueLifecycle(
               }),
             )
             .parse(JSON.parse(String(await call(repo, [`${path}/comments?per_page=100&page=${page}`]))));
-          const found = comments.find((c) => c.user?.login === pending.login && c.body.includes(marker));
+          stale ||= !eligible();
+          const found = comments.find(
+            (c) => c.user?.login === pending.login && c.body.split("\n")[0] === marker,
+          );
           if (found) {
             save(effect, "done", { commentId: found.id });
             break;
           }
+          if (stale && comments.length < 100) {
+            save(effect, "done");
+            break;
+          }
           page = comments.length === 100 ? page + 1 : 0;
-          save(effect, "pending", { page });
+          save(effect, stale ? "recovering" : "pending", { page });
         }
-        if (page) continue; // A matching factory comment was found.
+        if (page) continue; // Recovered or superseded an uncertain POST.
       }
-      const login = await postingLogin(repo);
+      if (stale || !eligible()) {
+        save(effect, "done");
+        continue;
+      }
+      const login = await postingLogin(repo, eligible);
+      if (!eligible()) {
+        save(effect, "done");
+        continue;
+      }
       if (!login) throw new Error("cannot identify lifecycle comment author");
+      let body: string;
+      try {
+        if (!pending.body) throw new Error("missing lifecycle comment body");
+        body = checkBody(run, pending.body, marker);
+      } catch {
+        save(effect, "done");
+        logFailure("body-suppressed");
+        continue;
+      }
+      if (!eligible()) {
+        save(effect, "done");
+        continue;
+      }
       save(effect, "pending", { body, login });
       const created = z.object({ id: z.number().int().positive() }).parse(
         JSON.parse(
@@ -344,7 +431,11 @@ export async function reconcileIssueLifecycle(
         cursors.set(store, { key, deferred: true });
         return;
       }
-      logFailure(run, repo, number, error);
+      if (questions && !eligible()) {
+        const checkpoint = store.issueLifecycleEffects(run.id, repo, number).find((e) => e.effect === effect);
+        save(effect, checkpoint?.page ? "recovering" : "done", { page: checkpoint?.page ?? 0 });
+      }
+      logFailure("publication-failed", error);
     }
   }
 }

@@ -1424,9 +1424,9 @@ export class Store {
           AND e.effect = 'observed'
           AND e.state = json_array(runs.status, runs.pr_url, runs.merged, runs.pr_closed_unmerged))
         OR EXISTS (SELECT 1 FROM issue_lifecycle_effects e WHERE e.run_id = runs.id AND
-          (e.state = 'pending' OR (e.effect = 'labels' AND e.state != CASE
+          (e.state IN ('pending','recovering') OR (e.effect = 'labels' AND e.state != CASE
             WHEN runs.merged THEN 'none'
-            WHEN runs.status = 'needs_human' THEN 'limitless:needs-you'
+            WHEN runs.status IN ('waiting_input','needs_human') THEN 'limitless:needs-you'
             WHEN runs.status = 'failed' THEN 'limitless:failed'
             WHEN runs.status = 'cancelled' OR (runs.status IN ('succeeded','resolved')
               AND (runs.pr_url IS NULL OR runs.pr_closed_unmerged)) THEN 'none'
@@ -1460,6 +1460,14 @@ export class Store {
       login: string | null;
       page: number;
     }[];
+  }
+
+  pendingIssueQuestionEffects(run: string) {
+    return this.db
+      .query<{ repo: string; number: number; effect: string }, [string]>(
+        "SELECT repo, number, effect FROM issue_lifecycle_effects WHERE run_id = ? AND state IN ('pending','recovering') AND effect LIKE 'comment:questions:%' ORDER BY repo, number, effect",
+      )
+      .all(run);
   }
 
   issueLifecycleEffect(run: string, repo: string, number: number, effect: string): string | null {
