@@ -148,9 +148,9 @@ test("CRLF and CR line endings keep line boundaries", () => {
   }
 });
 
-test("the intent's prose and list items are context; only whole reference lines resolve", () => {
+test("the intent's prose is context; only whole reference lines resolve", () => {
   const parent = "## Goal\n- Required behaviour.\n\n## Risks\n- Context only.";
-  expect(texts(`${goal}\n\nThis check does not use #1's "Risks" section.\n- Nor this.`, parent)).toEqual([
+  expect(texts(`${goal}\n\nThis check does not use #1's "Risks" section.`, parent)).toEqual([
     "Required behaviour.",
   ]);
   expect(texts(`${goal}\n\n#1's "Risks"\nsection`, parent)).toEqual(["Required behaviour."]);
@@ -204,6 +204,13 @@ const ticketCases: [string, string, number, string][] = [
   ["quoted unit", `${goal}\n\n> Before.`, 6, "blockquote"],
   ["indented reference", `  ${goal}`, 4, "indented line"],
   ["fence in the intent", `\`\`\`\n${goal}\n\`\`\``, 4, "fence"],
+  // A requirement written as a list item next to a reference would otherwise be dropped silently.
+  [
+    "list item beside a reference",
+    `${goal}\n- A requirement of its own.`,
+    5,
+    "list item; only section references produce units",
+  ],
 ];
 
 test.each([

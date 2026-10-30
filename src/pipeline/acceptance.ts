@@ -135,7 +135,9 @@ function scanSection(md: string, heading: string, where: string, intent = false)
     else {
       const refused = refusedLines.find(([form]) => form.test(line));
       if (refused) refuse(refused[1]);
-      if (item) out.push({ text: item[1] ?? "" });
+      // In the ticket only references produce units, so a requirement written as a list item would vanish.
+      if (item && intent) refuse("list item; only section references produce units");
+      else if (item) out.push({ text: item[1] ?? "" });
       else if (/^(?:[-*+]|\d{1,9}[.)])(?:\s|$)/.test(line)) refuse("malformed list item");
       else if (intent && /^From .*:$/.test(line)) refuse("quote lead-in");
       else if (reference) out.push({ text: line, reference });
