@@ -25,7 +25,7 @@ import {
   readRetryFiles,
 } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
-import { gateProvenance } from "../gates/executor.ts";
+import { type ExecutionHandle, gateProvenance } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
@@ -3486,8 +3486,10 @@ async function mergeForDelivery(
           attempt.result ??
           (await (async () => {
             const workers = new Map<string, string | null | undefined>();
+            let primaryHandle: ExecutionHandle | undefined;
             const execute = (purpose: string, gates: GateConfig, hooks: GateHooks = gateEvents(ctx)) =>
               runGateExecution(ctx, "gates", purpose, cwd, gates, hooks, env, (handle, run) => {
+                if (purpose === "rebase") primaryHandle = handle;
                 const worker = postMergeWorker(ctx, handle);
                 for (const check of [...gates.checks, ...run.setup]) workers.set(check.name, worker);
               });
@@ -3504,6 +3506,18 @@ async function mergeForDelivery(
               run.checks.some((r) => r.timedOut) &&
               run.checks.every((r) => r.ok || r.timedOut || r.docsOnly?.mode === "skipped");
             let after = await execute("rebase", docs.gates);
+            const observedHandles = ctx.store
+              .failureObservations({ finalized: false })
+              .filter(
+                (r) =>
+                  r.run_id === ctx.run.id &&
+                  r.purpose === "rebase" &&
+                  r.sha === sha &&
+                  r.round === ctx.state.round &&
+                  (!primaryHandle ||
+                    (r.handle_kind === primaryHandle.kind && r.handle_id === primaryHandle.id)),
+              )
+              .map((r) => ({ kind: r.handle_kind, id: r.handle_id }));
             ctx.checkCancelled();
             if (timeoutOnly(after)) {
               const first = after;
@@ -3557,7 +3571,24 @@ async function mergeForDelivery(
                   fallbackSetup: docs.gates.setup,
                 }),
               ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
-              (c) => isSlowRegression(c, initial, reference?.checks ?? []),
+              (c) => {
+                const slow = isSlowRegression(c, initial, reference?.checks ?? []);
+                if (slow)
+                  for (const handle of observedHandles)
+                    ctx.store.db
+                      .query(
+                        "UPDATE failure_observations SET slow_regression=1 WHERE run_id=? AND round=? AND sha=? AND handle_kind=? AND handle_id=? AND purpose='rebase' AND phase='check' AND name=? AND finalized_at IS NULL",
+                      )
+                      .run(
+                        ctx.run.id,
+                        ctx.state.round,
+                        sha,
+                        handle.kind,
+                        handle.id,
+                        redactGateOutput(c.name),
+                      );
+                return slow;
+              },
             );
             ctx.checkCancelled();
             for (const c of comparison) {
@@ -3586,6 +3617,15 @@ async function mergeForDelivery(
         const { setupOk, timedOut, comparison } = checked;
         await confirmPostMerge(ctx, cwd, docs.gates, comparison, attempt.deadline, sha, () =>
           ctx.save("post-merge-confirmed"),
+        );
+        await ctx.save("post-merge-confirmed", () =>
+          ctx.store.observations.finalize(ctx.run.id, {
+            round: ctx.state.round,
+            sha,
+            stageId: ctx.stageId ?? 0,
+            purpose: "rebase",
+            comparisons: comparison,
+          }),
         );
         ctx.checkCancelled();
         for (const c of comparison) {
