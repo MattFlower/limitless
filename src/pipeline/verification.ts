@@ -1,6 +1,60 @@
+import type { RunEvent } from "../core/types.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
+import { BROWSER_TOOLS } from "../harness/browser-mcp.ts";
 import { promptJson, redactHoldoutText } from "./prompts.ts";
 import { type Holdout, requirementCitationIssue, rowKind, type Spec, type Verify } from "./schemas.ts";
+
+export type BrowserContext = "available" | "unavailable" | "no_preview";
+export const BROWSER_INCOMPLETE =
+  "Factory: a ready preview and browser were available for this attempt, but browser verification was not completed.";
+export const browserToolNames = new Set(
+  BROWSER_TOOLS.flatMap((name) => [`playwright.${name}`, `mcp__playwright__${name}`]),
+);
+
+export function browserSucceeded(events: RunEvent[]): boolean {
+  // An explicit infrastructure limitation takes precedence over any successful tool result.
+  if (events.some((e) => (e.data as { code?: string } | null)?.code === "browser_unavailable")) return false;
+  const calls = new Set<string>();
+  for (const event of events) {
+    const data = event.data as { id?: unknown; toolUseId?: unknown; browserTool?: string } | null;
+    const id = data?.toolUseId ?? data?.id;
+    if (typeof id !== "string") continue;
+    if (event.type === "tool_call") {
+      if (browserToolNames.has(data?.browserTool ?? event.message)) calls.add(id);
+      else calls.delete(id);
+    }
+    // onAgentEvent records successful results at debug level and failed results at warn level.
+    if (event.type === "tool_result" && event.level === "debug" && calls.has(id)) return true;
+  }
+  return false;
+}
+
+export function applyBrowserContext(
+  verify: Verify,
+  spec: Spec,
+  holdout: Holdout,
+  context?: BrowserContext,
+): Verify {
+  if (context !== "available") return verify;
+  const marked = new Set(
+    [...spec.acceptance_criteria, ...holdout.scenarios].filter((c) => c.browser === true).map((c) => c.id),
+  );
+  return {
+    ...verify,
+    criteria: verify.criteria.map((c) => {
+      if (c.status !== "blocked" || !marked.has(c.id)) return c;
+      const { gateEvidence: _gate, ...row } = c;
+      return {
+        ...row,
+        status: "unclear",
+        blockedReason: null,
+        covering_tests: [],
+        evidence: `${BROWSER_INCOMPLETE}\n${redactGateOutput(c.evidence)}`,
+        publicSummary: rowKind(c.id, spec, holdout) === "holdout" ? BROWSER_INCOMPLETE : c.publicSummary,
+      };
+    }),
+  };
+}
 
 export function preDeliveryVerifyArtifact(
   verify: Verify & { modelId: string; round: number; attempt: number; sha?: string; modelOutput?: Verify },

@@ -26,16 +26,22 @@ test("repository settings default, normalize slugs and honor custom prefixes", (
     '[repos."acme/widgets"]\ndiscreet = true\n[repos."Acme/Tools"]\ndiscreet = true\nbranch_prefix = "feat/"',
   );
   expect(repoSettings(cfg, "ACME/Widgets")).toEqual({
+    githubActions: false,
+    githubActionsPaidMinutes: false,
     discreet: true,
     branchPrefix: "change/",
     landRequiresApproval: false,
   });
   expect(repoSettings(cfg, "acme/tools")).toEqual({
+    githubActions: false,
+    githubActionsPaidMinutes: false,
     discreet: true,
     branchPrefix: "feat/",
     landRequiresApproval: false,
   });
   expect(repoSettings(cfg, "other/repo")).toEqual({
+    githubActions: false,
+    githubActionsPaidMinutes: false,
     discreet: false,
     branchPrefix: "change/",
     landRequiresApproval: false,
@@ -49,6 +55,8 @@ test("unknown repository keys warn while known settings still apply", () => {
       '[repos."Acme/Widgets"]\ndiscreet = true\nbranch_prefix = "feat/"\nland_requires_approval = true',
     );
     expect(repoSettings(cfg, "acme/widgets")).toEqual({
+      githubActions: false,
+      githubActionsPaidMinutes: false,
       discreet: true,
       branchPrefix: "feat/",
       landRequiresApproval: true,
