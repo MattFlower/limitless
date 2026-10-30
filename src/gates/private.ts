@@ -203,19 +203,37 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
           return decoded;
         })
       : layer;
+  const all = decodedLayers(text, decodeBase64);
+  if (!all) return null;
+  const normalized = new Map([...new Set(all)].map((layer) => [layer, normalize(layer)]));
+  return all.map((layer) => normalized.get(layer) ?? "");
+}
+/** Shared decoder traversal; prepared callers supply bounded retention and base64 matching. */
+export function decodedLayers(
+  text: string,
+  decodeBase64: (text: string) => string,
+  retain?: (form: string) => void,
+): string[] | null {
   const rounds = (current: string, slashes: boolean): string[] | null => {
-    const layers = [current];
+    const layers: string[] = [];
+    const keep = (...forms: string[]) => {
+      for (const form of forms) retain?.(form);
+      layers.push(...forms);
+    };
+    keep(current);
     for (let round = 0; round < 5; round++) {
       // Unrelated runs must not change decoding convergence or cause a refusal.
       // Keep the text before backslash and HTML decoding too, since a protected value can contain either.
       const percentDecoded = decodePercent(current);
       const unescaped = decodeBackslashes(percentDecoded, slashes);
       const expanded = decodeHTML(unescaped);
+      // Prepared checks inspect HTML before selective base64 replacement.
+      if (retain) keep(expanded);
       // Keep line breaks too: report quotations and multiline credentials depend on them.
-      layers.push(percentDecoded, unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
+      keep(percentDecoded, unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
       const next = decodeBase64(expanded);
-      if (next === current) return [...layers, next];
-      layers.push(next);
+      keep(next);
+      if (next === current) return layers;
       current = next;
     }
     return null;
@@ -226,10 +244,9 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
   const slashed = kept?.some((layer) => layer.includes("\\/")) ? rounds(text, true) : kept;
   if (!kept || !slashed) return null;
   const all = kept === slashed ? kept : [...kept, ...slashed];
-  const normalized = new Map([...new Set(all)].map((layer) => [layer, normalize(layer)]));
-  return all.map((layer) => normalized.get(layer) ?? "");
+  return all;
 }
-function stripPartialEscapes(text: string): string {
+export function stripPartialEscapes(text: string): string {
   let end = text.length;
   while (end > 0) {
     const last = text[end - 1];
