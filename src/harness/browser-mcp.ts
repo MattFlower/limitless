@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   accessSync,
   constants,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -11,6 +12,9 @@ import {
 } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
+import { dyldLinks } from "./dyld-links.ts";
+import { homeReadPolicy, policySpellings } from "./read-policy.ts";
+import { SANDBOX_EXEC, seatbeltProfile } from "./sandbox.ts";
 import { validateScratch } from "./scratch.ts";
 import type { AgentSpec } from "./types.ts";
 
@@ -18,7 +22,7 @@ export const BROWSER_MCP_VERSION = "0.0.83";
 const CORE_VERSION = "1.64.0-alpha-1790635538000";
 const FLAGS = [
   "--headless",
-  "--sandbox",
+  "--no-sandbox",
   "--user-data-dir",
   "--output-dir",
   "--allowed-origins",
@@ -48,12 +52,13 @@ export const BROWSER_TOOLS = [
   "browser_take_screenshot",
 ];
 
-// The server runs outside the agent sandbox, and upstream documents its guards as convenience
-// guardrails, not a security boundary. No browser starts while any of these remains.
-export const CONFINEMENT_GAPS = [
-  "--allowed-origins does not stop redirects or other browser connections leaving the preview origin",
-  "explicit filenames on output tools bypass --output-dir and can write into the checkout",
-];
+// Gaps not yet proven closed on the paths that apply the factory profile; any entry disables the
+// browser. Upstream flags are convenience guards: --allowed-origins does not stop redirects or other
+// connections leaving the preview origin, and output filenames are not held to --output-dir. The
+// profile closes both, shown by the unconfined probe in test/browser-mcp-seatbelt.test.ts against the
+// pinned build (docs/browser-mcp-probes.md); factory gates skip that probe, and a skip is not evidence.
+// Paths that cannot apply the profile (Claude editors, non-macOS) stay disabled before this check.
+export const CONFINEMENT_GAPS: readonly string[] = [];
 
 export const browserCache = (home: string) => join(home, "tools", `playwright-mcp-${BROWSER_MCP_VERSION}`);
 const inside = (root: string, path: string) => {
@@ -69,6 +74,7 @@ function installation(root: string) {
     node: string;
     browser: string;
     hashes: string[];
+    libraries?: string[];
   };
   const cli = realpathSync(join(packagePath(root, "@playwright/mcp"), "cli.js"));
   const core = realpathSync(join(packagePath(root, "playwright-core"), "lib/coreBundle.js"));
@@ -91,15 +97,40 @@ function installation(root: string) {
     if (!statSync(path).isFile()) throw new Error("browser installation needs executable files");
     accessSync(path, constants.X_OK);
   }
-  return { node, cli, browser };
+  const libraries = record.libraries?.map((path) => realpathSync(path));
+  return { node, cli, browser, libraries };
 }
 
 /** Explicit operator action only; never called by invocation setup or an MCP server. */
 export async function provisionBrowserMcp(root: string, runner = runProcess): Promise<void> {
+  const recordRuntime = async (node: string) => {
+    const result = await runner({
+      cmd: [node, "-e", "console.log(JSON.stringify(process.report.getReport().sharedObjects))"],
+      cwd: root,
+      env: agentEnv(),
+      timeoutMs: 30_000,
+    });
+    if (result.exitCode !== 0 || result.timedOut || result.cancelled)
+      throw new Error("Cannot inspect browser Node runtime");
+    const libraries: unknown = JSON.parse(result.stdout);
+    if (!Array.isArray(libraries) || !libraries.every((path) => typeof path === "string" && isAbsolute(path)))
+      throw new Error("Invalid browser Node runtime libraries");
+    const path = join(root, "ready.json");
+    const record = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    // System dyld-cache images need not exist as regular files; the system allowances cover them.
+    record.libraries = libraries
+      .filter((path: string) => !path.startsWith("/usr/lib/") && !path.startsWith("/System/"))
+      .map((path: string) => realpathSync(path));
+    writeFileSync(path, JSON.stringify(record), { mode: 0o600 });
+  };
+  let existing: ReturnType<typeof installation> | undefined;
   try {
-    installation(root);
-    return;
+    existing = installation(root);
   } catch {}
+  if (existing) {
+    if (!existing.libraries) await recordRuntime(existing.node);
+    return;
+  }
   mkdirSync(root, { recursive: true, mode: 0o700 });
   root = realpathSync(root);
   const node = Bun.which("node");
@@ -146,6 +177,7 @@ export async function provisionBrowserMcp(root: string, runner = runProcess): Pr
     }),
     { mode: 0o600 },
   );
+  await recordRuntime(realpathSync(node));
   installation(root);
 }
 
@@ -159,41 +191,77 @@ export function browserMcp(
   spec: AgentSpec,
   harness: "claude" | "codex",
   gaps: readonly string[] = CONFINEMENT_GAPS,
+  platform: string = process.platform,
 ): BrowserMcpServer | undefined {
-  if (!spec.browser || spec.noTools) return;
+  if (!spec.browser) return;
   try {
+    if (spec.noTools) throw new Error("tool-less invocations get no MCP servers");
     if (harness === "claude" && spec.mode === "edit")
       throw new Error("Claude editor outer confinement cannot launch the browser safely");
+    if (platform !== "darwin") throw new Error(`Browser confinement unavailable on ${platform}`);
+    // The profile confines the preview's socket, IPv4 loopback and its port, not its web origin.
     const url = new URL(spec.browser.previewUrl);
-    if (
-      !/^https?:$/.test(url.protocol) ||
-      url.username ||
-      url.password ||
-      !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)
-    )
-      throw new Error("preview URL must be HTTP(S) loopback without credentials");
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password)
+      throw new Error("browser previews must be http://127.0.0.1:<port>");
     const scratch = validateScratch(spec);
     const cache = realpathSync(spec.browser.cacheDir);
     const cwd = realpathSync(spec.cwd);
     if ([scratch, cwd].some((path) => inside(path, cache) || inside(cache, path)))
       throw new Error("browser cache overlaps agent write roots");
-    const { node, cli, browser } = installation(cache);
-    if ([scratch, cwd].some((path) => inside(path, node)))
+    const { node, cli, browser, libraries } = installation(cache);
+    const links = libraries ? dyldLinks(node, libraries) : [];
+    if (
+      [node, ...(libraries ?? []), ...links].some((runtime) =>
+        [scratch, cwd].some((path) => inside(path, runtime)),
+      )
+    )
       throw new Error("browser runtime is agent-writable");
     if (gaps.length)
       throw new Error(`@playwright/mcp@${BROWSER_MCP_VERSION} is not confined: ${gaps.join("; ")}`);
+    if (!libraries) throw new Error("Browser Node runtime needs operator provisioning");
     const directory = mkdtempSync(join(scratch, "browser-"));
     const profile = join(directory, "profile"),
       output = join(directory, "output");
     for (const path of [profile, output]) mkdirSync(path, { mode: 0o700 });
+    const readable = [
+      directory,
+      cache,
+      node,
+      ...libraries,
+      // What the pinned build needs to start and render, measured by removal (docs/browser-mcp-probes.md).
+      // /System/Volumes/Data, which aliases user files including other invocations' scratch, stays denied.
+      ...[
+        "/System/Library", // frameworks and system fonts
+        "/usr/lib", // system libraries
+        "/usr/share/icu", // CoreFoundation's ICU data
+        "/usr/share/langid", // language identification data; Chromium aborts without it
+        "/dev/null", // OPENSSL_CONF below
+      ].filter(existsSync),
+    ];
+    const policy = seatbeltProfile(
+      {
+        write: [directory],
+        protect: [],
+        ...homeReadPolicy(readable, false, spec.denyRead),
+        allowRead: policySpellings(readable),
+      },
+      { host: url.hostname, port: Number(url.port), links },
+    );
     // --allowed-origins restricts browser requests; --allowed-hosts would only govern the MCP HTTP
     // transport, which stdio does not use.
     return {
-      command: node,
+      // Agents start MCP servers in their checkout, which the profile denies; Node needs a readable cwd.
+      command: "/usr/bin/env",
       args: [
+        "-C",
+        directory,
+        SANDBOX_EXEC,
+        "-p",
+        policy,
+        node,
         cli,
         "--headless",
-        "--sandbox",
+        "--no-sandbox",
         "--user-data-dir",
         profile,
         "--output-dir",
@@ -205,7 +273,20 @@ export function browserMcp(
         "--block-service-workers",
         "--no-webmcp",
       ],
-      env: { PLAYWRIGHT_BROWSERS_PATH: join(cache, "browsers"), PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1" },
+      env: {
+        HOME: directory,
+        TMPDIR: directory,
+        TMP: directory,
+        TEMP: directory,
+        XDG_CACHE_HOME: directory,
+        XDG_CONFIG_HOME: directory,
+        // Chromium on macOS ignores TMPDIR; without this its profile lock cannot create its socket.
+        MAC_CHROMIUM_TMPDIR: directory,
+        // Node aborts when it cannot read an OpenSSL configuration, and Homebrew's is outside the profile.
+        OPENSSL_CONF: "/dev/null",
+        PLAYWRIGHT_BROWSERS_PATH: join(cache, "browsers"),
+        PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1",
+      },
     };
   } catch (error) {
     spec.onEvent({

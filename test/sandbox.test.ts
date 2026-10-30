@@ -56,6 +56,43 @@ import { test } from "./read-policy-support.ts";
 setDefaultTimeout(30_000);
 
 const darwin = process.platform === "darwin";
+
+test("browser restrictions are optional and reject unbounded endpoints", () => {
+  const roots = { write: ["/scratch/browser"], protect: [], allowRead: ["/scratch/browser", "/runtime"] };
+  const gate = seatbeltProfile(roots);
+  const browser = seatbeltProfile(roots, { host: "127.0.0.1", port: 8080, links: ["/opt/pkg"] });
+  // The browser's read and IPC restrictions never reach gate profiles.
+  for (const rule of [
+    "(deny network-outbound)",
+    "(deny file-read*)",
+    '(allow file-read-data (literal "/"))',
+    '(allow file-read-metadata (literal "/opt/pkg"))',
+    "(deny mach-lookup)",
+    "(deny mach-register)",
+    "(deny appleevent-send)",
+    "(deny ipc-posix*)",
+    "(deny ipc-sysv*)",
+  ]) {
+    expect(gate).not.toContain(rule);
+    expect(browser).toContain(rule);
+  }
+  expect(gate).not.toContain("launchservicesd");
+  expect(browser.split("\n").filter((line) => line.startsWith("(allow network-outbound"))).toEqual([
+    '(allow network-outbound (remote ip4 "localhost:8080"))',
+  ]);
+  for (const endpoint of [
+    { host: "example.com", port: 80 },
+    { host: "localhost", port: 8080 },
+    { host: "::1", port: 8080 },
+    { host: "127.0.0.1", port: 0 },
+    { host: "127.0.0.1", port: 65536 },
+    { host: "127.0.0.1", port: 1.5 },
+  ])
+    expect(() => seatbeltProfile(roots, endpoint)).toThrow("Invalid browser confinement");
+  expect(() => seatbeltProfile({ write: [], protect: [] }, { host: "127.0.0.1", port: 80 })).toThrow(
+    "Invalid browser confinement",
+  );
+});
 let root: string;
 let cache: string;
 let work: string;
