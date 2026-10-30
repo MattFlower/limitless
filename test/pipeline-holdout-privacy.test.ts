@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
@@ -221,6 +222,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(JSON.parse(event?.text ?? "{}").data.input.command).toBe(`echo ${secret}; ${observed}`);
     expect(f.store.listEvents(run.id).find((e) => e.id === event?.eventId)?.data).toEqual({
       id: "private-tool",
+      toolUseId: createHash("sha256").update("private-tool").digest("hex"),
       input: {
         command:
           'echo [private detail]; [private detail] [private detail] [private detail] "[private detail]" [private detail] [6 private details withheld]',

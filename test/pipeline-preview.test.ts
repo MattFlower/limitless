@@ -6,8 +6,11 @@ import { type GateExecutor, gateProvenance, localExecutor } from "../src/gates/e
 import type { GateRun } from "../src/gates/run.ts";
 import { browserCache, browserMcp } from "../src/harness/browser-mcp.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
+import type { AgentSpec } from "../src/harness/types.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
+import { VerifySchema } from "../src/pipeline/schemas.ts";
+import { BROWSER_INCOMPLETE, ENVIRONMENT_BLOCKED } from "../src/pipeline/verification.ts";
 import { sh } from "../src/util/proc.ts";
 import { fakeBrowserCache } from "./browser-mcp-support.ts";
 import { deferred } from "./evals-support.ts";
@@ -48,7 +51,241 @@ const { start, previewFixture, wait } = pipelineSetup({
   },
 });
 
+const browserSpec = {
+  ...spec,
+  acceptance_criteria: spec.acceptance_criteria.map((c) => ({ ...c, browser: true })),
+};
+const browserBlocked = {
+  ...pass,
+  overall: "fail",
+  criteria: pass.criteria.map((c) =>
+    c.id === "AC-1"
+      ? {
+          ...c,
+          status: "blocked",
+          blockedReason: "sandbox",
+          evidence: "Browser verification not completed",
+          covering_tests: [{ file: "ui.test.ts", name: "UI interaction" }],
+        }
+      : c,
+  ),
+};
+
+function successfulBrowser(agent: AgentSpec) {
+  agent.onEvent({ type: "tool_call", id: "browser-check", name: "playwright.browser_snapshot", input: {} });
+  agent.onEvent({ type: "tool_result", id: "browser-check", output: "UI snapshot", isError: false });
+}
+
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    "available",
+    "unavailable",
+    "unavailable before success",
+    "unavailable after success",
+    "unmarked",
+    "no preview",
+    "handshake failure",
+    "failed browser",
+    "unrelated tool",
+    "unmatched result",
+    "invocation transition",
+  ] as const)("browser verdict uses current invocation infrastructure: %s", async (mode) => {
+    await previewFixture();
+    let verifies = 0;
+    let implementsCount = 0;
+    let runId = "";
+    const completesBrowser = mode === "available" || mode === "invocation transition";
+    const f = start((agent) => {
+      const role = roleOf(agent);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: mode === "unmarked" ? spec : browserSpec };
+      if (role === "holdout")
+        return {
+          structured: { scenarios: holdout.scenarios.map((s) => ({ ...s, browser: s.id === "H-1" })) },
+        };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        verifies++;
+        if (mode === "no preview" || (completesBrowser && implementsCount > 1)) {
+          expect(agent.browser).toBeUndefined();
+          expect(agent.prompt).not.toContain("# Browser");
+          if (mode === "no preview") successfulBrowser(agent);
+        } else {
+          expect(agent.prompt).toContain(agent.browser?.previewUrl ?? "missing preview");
+          if (
+            mode === "unavailable" ||
+            mode === "unavailable before success" ||
+            mode === "unavailable after success"
+          ) {
+            if (mode === "unavailable after success") successfulBrowser(agent);
+            agent.onEvent({
+              type: "warning",
+              id: "browser-unavailable",
+              code: "browser_unavailable",
+              text: "Browser disabled: remote invocation",
+            });
+            if (mode === "unavailable before success") successfulBrowser(agent);
+          } else {
+            expect(browserMcp(agent, "codex", [], "darwin")).toBeDefined();
+            if (mode === "handshake failure")
+              agent.onEvent({ type: "stderr", text: "MCP startup failed during handshake" });
+            else if (mode === "failed browser" || mode === "unrelated tool" || mode === "unmatched result") {
+              agent.onEvent({
+                type: "tool_call",
+                id: "browser_call",
+                name: mode === "unrelated tool" ? "Read" : "playwright.browser_snapshot",
+                input: {},
+              });
+              agent.onEvent({
+                type: "tool_result",
+                id: mode === "unmatched result" ? "unrelated_call" : "browser_call",
+                output: "tool result",
+                isError: mode === "failed browser",
+              });
+            } else if (mode !== "invocation transition" || verifies === 2) successfulBrowser(agent);
+          }
+        }
+        return { structured: completesBrowser && implementsCount > 1 ? pass : browserBlocked };
+      }
+      implementsCount++;
+      if (implementsCount > 1) {
+        const state = f.store.getRunState<RunState>(runId);
+        expect(state?.feedback).toContain("AC-1");
+        expect(state?.feedback).toContain(BROWSER_INCOMPLETE);
+        expect(state?.environmentRetryRound).toBe(mode === "invocation transition" ? 0 : undefined);
+        // The earlier successful preview stage cannot supply a preview for the next diff.
+        rmSync(join(agent.cwd, "ui/change.txt"));
+        return { files: { "greeting.txt": "changed outside preview paths\n" } };
+      }
+      // Seed another invocation's success before either reader; it cannot authorize attempt 0.
+      if (mode === "invocation transition") successfulBrowser(agent);
+      return { files: { [mode === "no preview" ? "greeting.txt" : "ui/change.txt"]: "visible\n" } };
+    });
+    await fakeBrowserCache(browserCache(f.deps.cfg.paths.home));
+    const run = await f.createRun({ repo: repoDir, prompt: "Change the UI", profile: "standard" });
+    runId = run.id;
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+      completesBrowser ? "succeeded" : "needs_human",
+    );
+    const state = f.store.getRunState<RunState>(run.id);
+    expect(state?.spec?.acceptance_criteria[0]?.browser).toBe(mode !== "unmarked");
+    expect(state?.holdout?.scenarios[0]?.browser).toBe(true);
+    if (completesBrowser) {
+      expect(implementsCount).toBe(2);
+      const converted = state?.verifyResults?.[mode === "invocation transition" ? 1 : 0];
+      expect(converted).toMatchObject({
+        attempt: mode === "invocation transition" ? 1 : 0,
+        browserContext: "available",
+        overall: "fail",
+      });
+      expect(converted?.criteria[0]).toMatchObject({
+        status: "unclear",
+        blockedReason: null,
+        covering_tests: [],
+      });
+      expect(converted?.criteria[0]?.evidence).toContain(BROWSER_INCOMPLETE);
+      expect(converted?.criteria[0]?.evidence).toContain("Browser verification not completed");
+      expect(converted?.modelOutput?.criteria[0]?.status).toBe("blocked");
+      expect(state?.verifyResults?.at(-1)?.browserContext).toBe("no_preview");
+      if (mode === "invocation transition") {
+        expect(state?.verifyResults?.map((v) => [v.round, v.attempt, v.browserContext])).toEqual([
+          [0, 0, "unavailable"],
+          [0, 1, "available"],
+          [1, 0, "no_preview"],
+        ]);
+        expect(state?.verifyResults?.[0]?.criteria[0]?.status).toBe("blocked");
+        expect(state?.verifyResults?.[0]?.modelId).not.toBe(converted?.modelId);
+        expect(state?.environmentRetryRound).toBe(0);
+      } else {
+        expect(state?.verifyResults?.some((v) => v.attempt === 1)).toBe(false);
+        expect(state?.environmentRetryRound).toBeUndefined();
+      }
+      expect(f.store.getRun(run.id)?.error ?? "").not.toContain(ENVIRONMENT_BLOCKED);
+    } else {
+      expect(verifies).toBe(2);
+      expect(implementsCount).toBe(1);
+      expect(state?.environmentRetryRound).toBe(0);
+      expect(state?.verifyResults?.map((v) => v.attempt)).toEqual([0, 1]);
+      expect(state?.verifyResults?.at(-1)?.browserContext).toBe(
+        mode === "unmarked" ? "available" : mode === "no preview" ? "no_preview" : "unavailable",
+      );
+      expect(state?.verifyResults?.every((v) => v.criteria[0]?.status === "blocked")).toBe(true);
+      expect(state?.feedback ?? "").not.toContain(BROWSER_INCOMPLETE);
+      expect(state?.lastVerify?.criteria[0]?.status).toBe("blocked");
+      expect(f.store.getRun(run.id)?.error).toContain(ENVIRONMENT_BLOCKED);
+      expect(f.store.getRun(run.id)?.error).not.toContain("Preview setup failed");
+      expect(f.store.listStages(run.id).some((s) => s.name === "preview" && s.status === "failed")).toBe(
+        false,
+      );
+      if (mode === "handshake failure") {
+        const events = f.store.listEvents(run.id, { limit: Number.MAX_SAFE_INTEGER });
+        expect(events.some((e) => e.type === "stderr" && e.message.includes("handshake"))).toBe(true);
+        expect(events.some((e) => (e.data as { code?: string } | null)?.code === "browser_unavailable")).toBe(
+          false,
+        );
+      }
+    }
+    expect(state?.coveringTestRuns ?? []).toHaveLength(mode === "available" ? 0 : 1);
+  });
+
+  test.each(["available", "legacy"] as const)(
+    "pending browser verdict resumes without starting a preview: %s",
+    async (context) => {
+      let verifies = 0;
+      const f = start((agent) => {
+        const role = roleOf(agent);
+        if (role === "triage") return { structured: triage() };
+        if (role === "spec") return { structured: browserSpec };
+        if (role === "holdout") return { structured: holdout };
+        if (role === "review") return { structured: approve };
+        if (role === "verify") {
+          verifies++;
+          expect(agent.browser).toBeUndefined();
+          expect(agent.prompt).not.toContain("# Browser");
+          return { structured: verifies === 1 ? pass : browserBlocked };
+        }
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      await f.stop();
+      f.deps.faults = { "store:save": { action: "kill", when: (c) => c.checkpoint === "verify-result" } };
+      const run = await f.createRun({ repo: repoDir, prompt: "Change the UI", profile: "standard" });
+      const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
+      expect(await execute()).toBe("running");
+      const state = f.store.getRunState<RunState>(run.id);
+      if (!state?.pendingVerify) throw new Error("Missing pending verifier output");
+      expect(state.pendingVerify.browserContext).toBe("no_preview");
+      // Seed an interrupted attempt whose live browser belonged to the previous process.
+      state.pendingVerify.modelOutput = VerifySchema.parse(browserBlocked);
+      if (context === "available") state.pendingVerify.browserContext = "available";
+      else delete state.pendingVerify.browserContext;
+      f.store.setRunState(run.id, state);
+      f.deps.faults =
+        context === "available"
+          ? { "stage:implement:before": { action: "kill", when: (c) => c.round === 1 } }
+          : undefined;
+      expect(await execute()).toBe(context === "available" ? "running" : "needs_human");
+      const resumed = f.store.getRunState<RunState>(run.id);
+      expect(f.store.listStages(run.id).some((s) => s.name === "preview")).toBe(false);
+      expect(resumed?.pendingVerify).toBeUndefined();
+      expect(resumed?.verifyResults?.[0]?.browserContext).toBe(
+        context === "available" ? "available" : undefined,
+      );
+      expect(resumed?.verifyResults?.[0]?.criteria[0]?.status).toBe(
+        context === "available" ? "unclear" : "blocked",
+      );
+      expect(resumed?.verifyResults?.[0]?.modelOutput?.criteria[0]?.status).toBe("blocked");
+      expect(resumed?.coveringTestRuns ?? []).toHaveLength(context === "available" ? 0 : 1);
+      expect(resumed?.environmentRetryRound).toBe(context === "available" ? undefined : 0);
+      expect(verifies).toBe(context === "available" ? 1 : 2);
+      if (context === "available") expect(resumed?.feedback).toContain(BROWSER_INCOMPLETE);
+      else {
+        expect(resumed?.verifyResults?.at(-1)?.browserContext).toBe("no_preview");
+        expect(f.store.getRun(run.id)?.error).toContain(ENVIRONMENT_BLOCKED);
+        expect(f.store.getRun(run.id)?.error).not.toContain("Preview setup failed");
+      }
+    },
+  );
+
   test("only live-preview verify and implement tool invocations request a browser", async () => {
     const captured: boolean[] = [];
     const f = start((agent) => {
@@ -298,6 +535,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(existsSync(join(cwd, ".setup/order"))).toBe(false);
         expect(existsSync(join(home, "preview-steps"))).toBe(false);
         expect(verified).toBe(false);
+        expect(
+          f.store
+            .getRunState<RunState>(run.id)
+            ?.verifyResults?.some((v) => v.browserContext === "available") ?? false,
+        ).toBe(false);
         expect(beforePreview).toBe(-1);
       } else {
         expect(verified).toBe(true);
