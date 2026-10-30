@@ -3,6 +3,7 @@ import type { Config } from "../config.ts";
 import type { AgentJobRequest, WorkerStore } from "../db/workers.ts";
 import { gateShutdown } from "../gates/executor.ts";
 import type { AgentResult } from "../harness/types.ts";
+import { rethrowClaimControl } from "../integrations/claim-errors.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { AgentEvents, AgentResultReport } from "../workers/agent-protocol.ts";
 import type { AgentCall, AgentExecutor, AgentPublication } from "./agent-executor.ts";
@@ -88,6 +89,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
             (await publication?.resume(request as AgentPublication))
           );
         } catch (error) {
+          rethrowClaimControl(error);
           job = workers.agentJob(id);
           if (spec.signal.aborted) return cancelled(id);
           if (job?.state === "done") continue;
@@ -112,6 +114,7 @@ export function lanAgentExecutor(workers: WorkerStore, cfg: Config): AgentExecut
           try {
             prepared = readonly ? call.checkout : await publication?.prepare();
           } catch (error) {
+            rethrowClaimControl(error);
             if (
               error instanceof NeedsHumanError ||
               error instanceof SimulatedTermination ||
