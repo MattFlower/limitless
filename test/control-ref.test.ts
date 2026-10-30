@@ -1,9 +1,12 @@
 import { expect, test } from "bun:test";
 import { createCipheriv, createDecipheriv } from "node:crypto";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
+import { bindClaim, claimGuard, claimScope } from "../src/integrations/claim-guard.ts";
 import {
   CONTROL_REF_RESPONSE_LIMIT,
   type ControlKey,
+  type ControlRefOutcome,
+  createControlRefClient,
   createControlRefReader,
 } from "../src/integrations/control-ref.ts";
 import {
@@ -13,18 +16,22 @@ import {
   SharedStoreError,
   type SharedStoreErrorCode,
 } from "../src/integrations/shared-store.ts";
+import { LEASE, windowOpen } from "../src/util/claim-clock.ts";
 import {
   dataKey,
   deferred,
   entry,
   isCas,
   isMeta,
+  isPost,
   isRead,
   json,
   never,
   Remote,
+  synthetic,
   token,
   writes,
+  zeros,
 } from "./shared-store-fake.ts";
 
 const key: ControlKey = { kind: "receipt", id: "0123456789abcdef".repeat(4) };
@@ -39,6 +46,8 @@ const deps = (remote: Remote): SharedStoreDeps => ({
 });
 const reader = (remote: Remote, overrides: Partial<SharedStoreDeps> = {}) =>
   createControlRefReader({ ...deps(remote), ...overrides });
+const writer = (remote: Remote, overrides: Partial<SharedStoreDeps> = {}) =>
+  createControlRefClient({ ...deps(remote), ...overrides });
 function encrypted(k = key) {
   const nonce = Buffer.alloc(12, 7);
   const cipher = createCipheriv("aes-256-gcm", dataKey, nonce).setAAD(aad(k));
@@ -520,4 +529,504 @@ test("transport exceptions cannot impersonate HTTP absence; claim exceptions sur
       .put("abc123", "manifest", "a".repeat(32), payload)
       .catch((e: unknown) => e),
   ).toBe(claim);
+});
+
+for (const existing of [false, true])
+  test(`independent writers race with exact CAS and parents from ${existing ? "a tip" : "absence"}`, async () => {
+    const remote = new Remote();
+    const before = existing ? seed(remote).sha : null;
+    const reached = deferred<void>();
+    const gates = [deferred<void>(), deferred<void>()];
+    let count = 0;
+    remote.hook = async (call, next) => {
+      if (isCas(call)) {
+        const gate = gates[count++];
+        if (count === 2) reached.resolve();
+        await gate?.promise;
+      }
+      return next();
+    };
+    const other = Buffer.from("different control bytes");
+    const a = writer(remote).write(key, before, payload);
+    const b = writer(remote).write(key, before, other);
+    await reached.promise;
+    gates[0]?.resolve();
+    const winner = await a;
+    expect(winner).toMatchObject({ kind: "applied", tip: { bytes: payload } });
+    if (winner.kind !== "applied") throw new Error("Expected confirmed winner");
+    gates[1]?.resolve();
+    expect(await b).toEqual({ kind: "moved", tip: winner.tip });
+    const selected = await reader(remote).read(key);
+    expect(selected).toEqual({ kind: "tip", tip: winner.tip });
+    expect(remote.unconditional).toBe(false);
+    const attempts = remote.calls.filter(isCas);
+    expect(attempts).toHaveLength(2);
+    for (const call of attempts) {
+      const sha = call.body.variables?.u?.[0]?.afterOid ?? "";
+      expect(call.body.variables).toEqual({
+        r: "repository-id",
+        u: [{ name: ref(key), beforeOid: before ?? zeros, afterOid: sha, force: false }],
+      });
+      expect(remote.commits.get(sha)?.parents).toEqual(before ? [before] : []);
+    }
+    for (const call of remote.calls.filter(isPost("git/commits"))) {
+      expect(call.body).toEqual({
+        message: "limitless-control: 1",
+        tree: expect.any(String),
+        parents: before ? [before] : [],
+        author: synthetic,
+        committer: synthetic,
+      });
+    }
+    for (const call of remote.calls.filter(isPost("git/trees")))
+      expect(call.body).toEqual({ tree: [entry("control", expect.any(String))] });
+    for (const call of remote.calls) {
+      expect(call.init.headers).toEqual({
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      });
+      expect(call.init.redirect).toBe("manual");
+      expect(call.init.signal?.aborted).toBe(true);
+    }
+    const uploads = remote.calls.filter(isPost("git/blobs"));
+    expect(uploads).toHaveLength(2);
+    expect(uploads[0]?.body).toEqual({ content: expect.any(String), encoding: "base64" });
+    expect(createCompanionIO(deps(remote)).open(aad(key), uploads[0]?.body.content ?? "")).toEqual(payload);
+    expect(createCompanionIO(deps(remote)).open(aad(key), uploads[1]?.body.content ?? "")).toEqual(other);
+    expect(JSON.stringify(remote.calls.map((c) => c.body))).not.toContain(other.toString());
+  });
+
+test("ambiguous dispatch reconciles selected authenticated bytes once and never retries", async () => {
+  for (const existing of [false, true]) {
+    for (const evidence of [
+      "attempt",
+      "equivalent",
+      "original",
+      "different",
+      "absent",
+      "unavailable",
+      "corrupt",
+      "unsupported",
+      "missing",
+    ]) {
+      const remote = new Remote();
+      const before = existing ? seed(remote).sha : null;
+      let after: string | undefined = before ?? undefined;
+      remote.hook = async (call, next) => {
+        if (!isCas(call)) {
+          if (remote.calls.some(isCas) && evidence === "unavailable") return json({}, 503);
+          return next();
+        }
+        if (evidence === "attempt") {
+          await next();
+          after = remote.refs.get(ref(key));
+        } else if (["equivalent", "different", "corrupt", "unsupported", "missing"].includes(evidence)) {
+          const bytes = evidence === "different" ? Buffer.from("other") : payload;
+          const content = createCompanionIO(deps(remote)).seal(aad(key), bytes);
+          after = seed(remote, key, evidence === "corrupt" ? "!" : content).sha;
+          if (evidence === "unsupported") {
+            const commit = remote.commits.get(after);
+            if (commit) commit.message = "limitless-control: 2";
+          }
+          if (evidence === "missing") remote.commits.delete(after);
+        } else if (evidence === "absent") {
+          remote.refs.delete(ref(key));
+          after = undefined;
+        }
+        throw new Error("private dispatch failure");
+      };
+      const result = await writer(remote).write(key, before, payload);
+      const original = before ? { sha: before, bytes: payload } : null;
+      const expected: ControlRefOutcome = ["attempt", "equivalent"].includes(evidence)
+        ? { kind: "applied", tip: { sha: after ?? "", bytes: payload } }
+        : evidence === "original" || (evidence === "absent" && !existing)
+          ? { kind: "unchanged", tip: original }
+          : evidence === "different"
+            ? { kind: "moved", tip: { sha: after ?? "", bytes: Buffer.from("other") } }
+            : { kind: "unconfirmed" };
+      expect(result).toEqual(expected);
+      expect(remote.calls.filter(isCas)).toHaveLength(1);
+      expect(remote.calls.filter(isMeta)).toHaveLength(2);
+      expect(remote.calls.filter(isRead("git/ref/"))).toHaveLength(evidence === "unavailable" ? 1 : 2);
+    }
+  }
+  for (const response of [
+    () => json({}),
+    () => new Response("{"),
+    () => json({ errors: [{ message: "private" }] }),
+    () => json({}, 500),
+  ]) {
+    const remote = new Remote();
+    remote.hook = async (call, next) => (isCas(call) ? response() : next());
+    expect(await writer(remote).write(key, null, payload)).toEqual({ kind: "unchanged", tip: null });
+    expect(remote.calls.filter(isCas)).toHaveLength(1);
+    expect(remote.calls.filter(isRead("git/ref/"))).toHaveLength(2);
+  }
+});
+
+test("initial mismatch, disappearance, corruption and unavailability never upload or replace", async () => {
+  const remote = new Remote();
+  const { sha, blob } = seed(remote);
+  expect(await writer(remote).write(key, null, payload)).toEqual({
+    kind: "moved",
+    tip: { sha, bytes: payload },
+  });
+  expect(await writer(remote).write(key, "a".repeat(40), payload)).toEqual({
+    kind: "moved",
+    tip: { sha, bytes: payload },
+  });
+  remote.blobs.set(blob, "!");
+  await rejects(writer(remote).write(key, sha, payload), "corrupt");
+  remote.refs.clear();
+  expect(await writer(remote).write(key, sha, payload)).toEqual({ kind: "unconfirmed" });
+  for (const at of [isMeta, isRead("git/ref/")]) {
+    remote.hook = async (call, next) => (at(call) ? json({}, 503) : next());
+    expect(await writer(remote).write(key, null, payload)).toEqual({ kind: "unconfirmed" });
+  }
+  expect(writes(remote.calls)).toHaveLength(0);
+});
+
+for (const path of ["git/blobs", "git/trees", "git/commits"])
+  test(`preparation at ${path} is not persistence; operational failures observe unchanged`, async () => {
+    for (const existing of [false, true]) {
+      const remote = new Remote();
+      const before = existing ? seed(remote).sha : null;
+      const reached = deferred<void>();
+      const gate = deferred<void>();
+      remote.hook = async (call, next) => {
+        const result = await next();
+        if (isPost(path)(call)) {
+          reached.resolve();
+          await gate.promise;
+          throw new Error("private preparation failure");
+        }
+        return result;
+      };
+      const pending = writer(remote).write(key, before, Buffer.from("new value"));
+      expect(
+        await Promise.race([reached.promise.then(() => "prepared"), pending.then(() => "settled")]),
+      ).toBe("prepared");
+      expect(await reader(remote).read(key)).toEqual(
+        before ? { kind: "tip", tip: { sha: before, bytes: payload } } : { kind: "absent" },
+      );
+      gate.resolve();
+      expect(await pending).toEqual({
+        kind: "unchanged",
+        tip: before ? { sha: before, bytes: payload } : null,
+      });
+      expect(remote.calls.filter(isCas)).toHaveLength(0);
+      expect(remote.refs.get(ref(key))).toBe(before ?? undefined);
+    }
+  });
+
+for (const phase of ["headers", "body"])
+  for (const path of ["prepare", "cas", "reconcile"])
+    for (const cancel of [false, true])
+      test(`writer ${path} ${phase} stall: ${cancel ? "caller cancellation" : "complete-response deadline"}`, async () => {
+        const remote = new Remote();
+        const caller = new AbortController();
+        const reached = deferred<void>();
+        const handles: { controller: AbortController; disposed: number }[] = [];
+        let stalled: AbortSignal | null | undefined;
+        remote.hook = async (call, next) => {
+          if (path === "reconcile" && isCas(call)) return json({ errors: [] });
+          const at =
+            path === "prepare"
+              ? isPost("git/commits")(call)
+              : path === "cas"
+                ? isCas(call)
+                : isRead("git/ref/")(call) && remote.calls.some(isCas);
+          if (!at) return next();
+          stalled = call.init.signal;
+          if (phase === "headers") {
+            reached.resolve();
+            return never();
+          }
+          return new Response(
+            new ReadableStream(
+              {
+                pull() {
+                  reached.resolve();
+                  return new Promise(() => undefined);
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+          );
+        };
+        const pending = writer(remote, {
+          deadline: (ms) => {
+            expect(ms).toBe(30_000);
+            const h = { controller: new AbortController(), disposed: 0 };
+            handles.push(h);
+            return { signal: h.controller.signal, dispose: () => h.disposed++ };
+          },
+        }).write(key, null, payload, caller.signal);
+        await reached.promise;
+        expect(handles.at(-1)?.disposed).toBe(0);
+        if (cancel) caller.abort();
+        else handles.at(-1)?.controller.abort();
+        if (cancel && path === "prepare") await rejects(pending, "aborted");
+        else
+          expect(await pending).toEqual(
+            path === "reconcile" || (cancel && path === "cas")
+              ? { kind: "unconfirmed" }
+              : { kind: "unchanged", tip: null },
+          );
+        expect(stalled?.aborted).toBe(true);
+        expect(handles).toHaveLength(remote.calls.length);
+        for (const h of handles) expect(h.disposed).toBe(1);
+        expect(remote.calls.filter(isCas)).toHaveLength(path === "prepare" ? 0 : 1);
+        expect(remote.calls.filter(isRead("git/ref/"))).toHaveLength(
+          path === "reconcile" || (path === "cas" && !cancel) ? 2 : 1,
+        );
+      });
+
+const handle = {
+  repo: "example/project",
+  ref: "refs/limitless/claims/1",
+  run: "run-a",
+  member: "m-0123456789abcdef",
+  generation: 1,
+};
+for (const change of ["lost", "suspend", "expired", "cancelled", "identity", "valid"])
+  test(`ambient claim ${change} during preparation retains scope and blocks invalid CAS`, async () => {
+    const remote = new Remote();
+    const ready = deferred<void>();
+    const resume = deferred<void>();
+    const anchor = { inclusive: 1_000, exclusive: 1_000 };
+    let now = { ...anchor };
+    let cancelled = false;
+    let failure: ClaimWaitError | undefined;
+    let checks = 0;
+    const claim = bindClaim(
+      {
+        windowOpen: () => {
+          checks++;
+          if (failure) throw failure;
+          return windowOpen(anchor, now);
+        },
+      },
+      handle,
+      () => cancelled,
+    );
+    remote.hook = async (call, next) => {
+      const response = await next();
+      if (isPost("git/commits")(call)) {
+        ready.resolve();
+        await resume.promise;
+      }
+      if (isCas(call)) claimGuard(); // Transport also observes the retained ambient scope.
+      return response;
+    };
+    const pending = claimScope
+      .run([claim], () => writer(remote).write(key, null, payload))
+      .catch((e: unknown) => e);
+    await ready.promise;
+    expect(checks).toBe(0);
+    if (change === "lost") claim.onLost(handle, null);
+    if (change === "suspend") now.inclusive += LEASE.suspendToleranceMs + 1;
+    if (change === "expired")
+      now = { inclusive: anchor.inclusive + LEASE.windowMs, exclusive: anchor.exclusive + LEASE.windowMs };
+    if (change === "cancelled") cancelled = true;
+    if (change === "identity") failure = new ClaimWaitError("unavailable");
+    resume.resolve();
+    const result = await pending;
+    if (change === "valid") expect(result).toMatchObject({ kind: "applied" });
+    else if (failure) expect(result).toBe(failure);
+    else if (change === "lost") expect(result).toBeInstanceOf(ClaimLostError);
+    else
+      expect(result).toMatchObject({
+        name: "ClaimWaitError",
+        reason: change === "cancelled" ? "cancelled" : "lease",
+      });
+    expect(remote.calls.filter(isCas)).toHaveLength(change === "valid" ? 1 : 0);
+    expect(anchor).toEqual({ inclusive: 1_000, exclusive: 1_000 });
+  });
+
+test("claim-control exceptions from preparation, CAS and reconciliation escape by identity", async () => {
+  for (const at of ["upload", "commit", "cas", "reconcile"])
+    for (const body of [false, true]) {
+      const remote = new Remote();
+      const error = new ClaimLostError();
+      remote.hook = async (call, next) => {
+        if (at === "reconcile" && isCas(call)) return json({ errors: [] });
+        const matched =
+          at === "upload"
+            ? isPost("git/blobs")(call)
+            : at === "commit"
+              ? isPost("git/commits")(call)
+              : at === "cas"
+                ? isCas(call)
+                : isRead("git/ref/")(call) && remote.calls.some(isCas);
+        if (!matched) return next();
+        if (!body) throw error;
+        return new Response(
+          new ReadableStream({
+            pull() {
+              throw error;
+            },
+          }),
+        );
+      };
+      expect(
+        await writer(remote)
+          .write(key, null, payload)
+          .catch((e: unknown) => e),
+      ).toBe(error);
+      expect(remote.calls.filter(isCas)).toHaveLength(at === "upload" || at === "commit" ? 0 : 1);
+    }
+});
+
+test("writer construction, validation and captured mutable inputs preserve reader contracts", async () => {
+  const remote = new Remote();
+  const inert = () => {
+    throw new Error("eager IO");
+  };
+  createControlRefClient({ ...deps(remote), request: inert, random: inert, deadline: inert });
+  for (const invalid of [{ repo: "" }, { token: "" }, { dataKey: new Uint8Array(31) }])
+    expect(() => writer(remote, invalid)).toThrow("Shared store error: configuration");
+  for (const invalid of [
+    undefined,
+    "",
+    "f".repeat(39),
+    "f".repeat(41),
+    "F".repeat(40),
+    `${"f".repeat(40)}\n`,
+    "g".repeat(40),
+  ])
+    await rejects(writer(remote).write(key, invalid as string, payload), "invalid");
+  for (const invalid of [null, {}, { ...key, kind: "blob" }, { ...key, id: key.id.toUpperCase() }])
+    await rejects(writer(remote).write(invalid as ControlKey, null, payload), "invalid");
+  await rejects(writer(remote).write(key, null, "plaintext" as unknown as Uint8Array), "invalid");
+  const caller = new AbortController();
+  caller.abort();
+  await rejects(writer(remote).write(key, null, payload, caller.signal), "aborted");
+  expect(remote.calls).toHaveLength(0);
+  const owned = { ...key };
+  const bytes = Buffer.from(payload);
+  const secret = Uint8Array.from(dataKey);
+  const ready = deferred<void>();
+  const resume = deferred<void>();
+  remote.hook = async (call, next) => {
+    if (isMeta(call)) {
+      ready.resolve();
+      await resume.promise;
+    }
+    return next();
+  };
+  const client = writer(remote, { dataKey: secret });
+  secret.fill(0);
+  const pending = client.write(owned, null, bytes);
+  await ready.promise;
+  owned.kind = "member";
+  owned.id = "f".repeat(64);
+  bytes.fill(0);
+  resume.resolve();
+  expect(await pending).toMatchObject({ kind: "applied", tip: { bytes: payload } });
+  expect(await reader(remote).read(key)).toMatchObject({ kind: "tip", tip: { bytes: payload } });
+  expect(await reader(remote).read(owned)).toEqual({ kind: "absent" });
+});
+
+test("writer checks private companion identity freshly and uses fixed private failure diagnostics", async () => {
+  const remote = new Remote();
+  const client = writer(remote);
+  expect(await client.write(key, null, payload)).toMatchObject({ kind: "applied" });
+  const before = remote.refs.get(ref(key)) ?? "";
+  for (const metadata of [
+    { id: "repository-id", nameWithOwner: "Example/Companion", isPrivate: false },
+    { id: "repository-id", nameWithOwner: "other/companion", isPrivate: true },
+  ]) {
+    remote.metadata = metadata;
+    const count = remote.calls.length;
+    await rejects(client.write(key, before, payload), "configuration");
+    expect(remote.calls.slice(count)).toHaveLength(1);
+  }
+  for (const at of [isMeta, isPost("git/blobs"), isCas]) {
+    const fresh = new Remote();
+    fresh.hook = async (call, next) => {
+      if (at(call)) throw new Error(`private server text ${token} ${payload.toString("hex")}`);
+      return next();
+    };
+    const result = await writer(fresh).write(key, null, payload);
+    expect(result).toEqual(at === isMeta ? { kind: "unconfirmed" } : { kind: "unchanged", tip: null });
+  }
+});
+
+test("writer response bounds apply during preparation, CAS and reconciliation", async () => {
+  for (const path of ["prepare", "cas", "reconcile"]) {
+    const remote = new Remote();
+    const wire = streamed([Buffer.alloc(CONTROL_REF_RESPONSE_LIMIT), Buffer.from("x")]);
+    remote.hook = async (call, next) => {
+      if (path === "reconcile" && isCas(call)) return json({ errors: [] });
+      const at =
+        path === "prepare"
+          ? isPost("git/blobs")(call)
+          : path === "cas"
+            ? isCas(call)
+            : isRead("git/ref/")(call) && remote.calls.some(isCas);
+      return at ? wire.response : next();
+    };
+    expect(await writer(remote).write(key, null, payload)).toEqual(
+      path === "reconcile" ? { kind: "unconfirmed" } : { kind: "unchanged", tip: null },
+    );
+    expect(wire.state).toMatchObject({ pulls: 2, cancelled: true });
+  }
+});
+
+for (const path of ["git/blobs", "git/commits"])
+  test(`caller abort after successful ${path} response cannot acknowledge preparation`, async () => {
+    const remote = new Remote();
+    const caller = new AbortController();
+    let prepared = false;
+    remote.hook = async (call, next) => {
+      const response = await next();
+      if (isPost(path)(call)) prepared = true;
+      return response;
+    };
+    await rejects(
+      writer(remote, {
+        deadline: () => ({
+          signal: new AbortController().signal,
+          dispose() {
+            if (prepared) caller.abort();
+          },
+        }),
+      }).write(key, null, payload, caller.signal),
+      "aborted",
+    );
+    expect(prepared).toBe(true);
+    expect(remote.calls.filter(isCas)).toHaveLength(0);
+    expect(await reader(remote).read(key)).toEqual({ kind: "absent" });
+  });
+
+test("unchanged after a dispatch deadline is an observation; the outstanding CAS can still apply", async () => {
+  const remote = new Remote();
+  const reached = deferred<void>();
+  const resume = deferred<void>();
+  const completed = deferred<void>();
+  const handles: AbortController[] = [];
+  remote.hook = async (call, next) => {
+    if (!isCas(call)) return next();
+    reached.resolve();
+    await resume.promise;
+    const response = await next();
+    completed.resolve();
+    return response;
+  };
+  const pending = writer(remote, {
+    deadline: () => {
+      const controller = new AbortController();
+      handles.push(controller);
+      return { signal: controller.signal, dispose() {} };
+    },
+  }).write(key, null, payload);
+  await reached.promise;
+  handles.at(-1)?.abort();
+  expect(await pending).toEqual({ kind: "unchanged", tip: null });
+  expect(await reader(remote).read(key)).toEqual({ kind: "absent" });
+  resume.resolve();
+  await completed.promise;
+  expect(await reader(remote).read(key)).toMatchObject({ kind: "tip", tip: { bytes: payload } });
+  expect(remote.calls.filter(isCas)).toHaveLength(1);
 });
