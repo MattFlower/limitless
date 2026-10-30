@@ -119,7 +119,7 @@ function scanSection(md: string, heading: string, where: string, intent = false)
   const level = atx(lines[start] ?? "")?.level ?? 0;
   const out: { text: string; reference?: RegExpExecArray }[] = [];
   let previous: "item" | "para" | "other" = "other";
-  let parent: string | undefined;
+  let ancestors: string[] = [];
   for (let i = start + 1; i < lines.length; i++) {
     const line = lines[i] ?? "";
     const refuse = (kind: string) => {
@@ -129,18 +129,21 @@ function scanSection(md: string, heading: string, where: string, intent = false)
     };
     const h = atx(line);
     const item = listItem.exec(line);
-    const child = !intent && line.startsWith("  ") ? listItem.exec(line.slice(2)) : null;
+    const indent = /^ +/.exec(line)?.[0].length ?? 0;
+    const child = !intent && indent > 0 && indent % 2 === 0 ? listItem.exec(line.slice(indent)) : null;
     const reference = intent ? sectionReference.exec(line) : null;
     const last = out.at(-1);
     if (!line) previous = "other";
     else if (h && h.level <= level) break;
     else if (h) previous = "other";
     else {
-      const refused = refusedLines.find(([form]) => form.test(child ? line.slice(2) : line));
+      const refused = refusedLines.find(([form]) => form.test(child ? line.slice(indent) : line));
       if (refused) refuse(refused[1]);
       if (child) {
-        if (previous !== "item" || parent === undefined) refuse("orphan sub-item");
-        out.push({ text: `${parent} — ${child[1] ?? ""}` });
+        if (previous !== "item" || indent / 2 > ancestors.length) refuse("orphan sub-item");
+        ancestors.length = indent / 2;
+        ancestors.push(child[1] ?? "");
+        out.push({ text: ancestors.join(" — ") });
       }
       // In the ticket only references produce units, so a requirement written as a list item would vanish.
       else if (item && intent) refuse("list item; only section references produce units");
@@ -148,8 +151,8 @@ function scanSection(md: string, heading: string, where: string, intent = false)
       else if (item && previous === "para" && /^\d/.test(line) && !/^0*1[.)]/.test(line))
         refuse("numbered line inside a paragraph");
       else if (item) {
-        parent = item[1] ?? "";
-        out.push({ text: parent });
+        ancestors = [item[1] ?? ""];
+        out.push({ text: ancestors[0] ?? "" });
       } else if (/^(?:[-*+]|\d{1,9}[.)])(?:\s|$)/.test(line)) refuse("malformed list item");
       else if (intent && /^From .*:$/.test(line)) refuse("quote lead-in");
       else if (reference) out.push({ text: line, reference });
