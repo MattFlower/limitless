@@ -240,7 +240,9 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
       const c = parse(contextSchema, { runId, role, key: e.key }, "invalid");
       await repository(signal);
       const sha = (await state(c.runId, signal))?.entries.get(c.key) ?? fail("missing");
-      const bytes = open(c, await content(sha, signal));
+      const retained = await content(sha, signal);
+      if (signal?.aborted) fail("aborted");
+      const bytes = open(c, retained);
       if (sha256(bytes) !== e.digest || (e.size !== undefined && bytes.length !== e.size)) fail("corrupt");
       return signal?.aborted ? fail("aborted") : bytes;
     },

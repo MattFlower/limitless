@@ -1058,6 +1058,30 @@ describe("ambiguous outcomes and crash recovery", () => {
 });
 
 describe("cancellation and deadlines", () => {
+  test("cancellation: get abort takes precedence over validation after its complete body", async () => {
+    const remote = new Remote();
+    const payload = bytesOf("cancelled read");
+    const { blob } = await remote.client().put(runId, role, keyA, payload);
+    const sha = remote.retained(runId).get(keyA) ?? "";
+    const frame = Buffer.from(remote.blobs.get(sha) ?? "", "base64");
+    frame[frame.length - 1] = (frame[frame.length - 1] ?? 0) ^ 1;
+    remote.blobs.set(sha, frame.toString("base64"));
+    const controller = new AbortController();
+    let readingBlob = false;
+    intercept(remote, isRead("git/blobs/"), async (_call, next) => {
+      readingBlob = true;
+      return next();
+    });
+    const client = remote.client({
+      deadline: () => ({
+        signal: new AbortController().signal,
+        // Disposal marks complete body consumption, before get validates the envelope.
+        dispose: () => readingBlob && controller.abort(),
+      }),
+    });
+    await rejects(client.get(runId, role, blob, controller.signal), "aborted");
+  });
+
   for (const stage of ["metadata", "upload", "commit", "the gap before CAS"] as const)
     test(`cancellation: abort during ${stage} rejects aborted without a ref mutation`, async () => {
       const remote = new Remote();
