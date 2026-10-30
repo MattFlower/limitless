@@ -9,8 +9,10 @@ import type { GateComparison } from "../src/gates/run.ts";
 import * as repos from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
+import { bindClaim, claimScope } from "../src/integrations/claim-guard.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { buildLoop } from "../src/pipeline/engine.ts";
+import * as gateExecution from "../src/pipeline/gate-execution.ts";
 import * as previews from "../src/pipeline/preview.ts";
 import * as snapshots from "../src/pipeline/snapshots.ts";
 import * as proc from "../src/util/proc.ts";
@@ -84,6 +86,44 @@ const pairs = ["ordinary+wait", "ordinary+loss", "wait+loss"].flatMap((pair) => 
   pair,
   pair.split("+").reverse().join("+"),
 ]);
+
+test.each(["wait", "loss"])("gate worker preserves original %s through failed cleanup", async (kind) => {
+  const ctx = await context();
+  const error = failure(kind);
+  let closed = false;
+  let refusals = 0;
+  const claim = bindClaim(
+    {
+      windowOpen: () => {
+        if (closed) throw refusals++ === 0 ? error : failure(kind);
+        return true;
+      },
+    },
+    { repo: ctx.repo.slug, ref: "refs/limitless/claims/1", run: ctx.run.id, member: "m", generation: 1 },
+    () => false,
+  );
+  const gates = spyOn(gateExecution, "runGateExecution").mockImplementation(async () => {
+    closed = true;
+    return { setupOk: true, setup: [], checks: [], sha: ctx.run.baseSha ?? undefined, trackedClean: true };
+  });
+  const cleanup = spyOn(repos, "discardChanges").mockRejectedValue(new Error("gate cleanup refused"));
+  const delivery = spyOn(ctx, "setPhase");
+  try {
+    expect(await claimScope.run([claim], () => buildLoop(ctx)).catch((e) => e)).toBe(error);
+    expect(gates).toHaveBeenCalledTimes(1);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(ctx.store.listStages(ctx.run.id).find((s) => s.name === "gates")?.status).toBe("cancelled");
+    expect(ctx.store.listEvents(ctx.run.id).some((e) => e.message.includes("gate cleanup refused"))).toBe(
+      true,
+    );
+    expect(ctx.state).toMatchObject({ phase: "loop", round: 0, roundsOnImplementer: 0 });
+    expect(delivery).not.toHaveBeenCalled();
+  } finally {
+    gates.mockRestore();
+    cleanup.mockRestore();
+    delivery.mockRestore();
+  }
+});
 
 // Replace only stage workers, retaining the real loop, allSettled, cleanup and head-check paths.
 function workers(ctx: RunContext, run: (name: StageName) => Promise<unknown>) {

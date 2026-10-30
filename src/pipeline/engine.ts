@@ -1641,6 +1641,7 @@ async function oneRound(
           let cmp: GateComparison[];
           let testScripts: Record<string, string> = {};
           let baseTimeout = false;
+          let interruption: ClaimControlError | undefined;
           try {
             const env = gateEnv();
             if ((await resumeGateExecution(ctx, "gates", "initial", cwd, env))?.kind !== "inplace")
@@ -1757,10 +1758,17 @@ async function oneRound(
                 r.timedOut &&
                 findGateCounterpart(r, after.checks, ctx.state.baseline?.checks ?? [])?.timedOut,
             );
+          } catch (error) {
+            if (error instanceof ClaimControlError) interruption = error;
+            throw error;
           } finally {
             // Gates may have produced files (build output, formatter fixes); don't let them leak into the diff.
             if (ctx.state.gateExecution?.handle.kind !== "inplace")
               await discardChanges(cwd).catch((error: unknown) => {
+                if (interruption) {
+                  ctx.log(redactCredentials(`Gate cleanup failed: ${String(error)}`), "warn");
+                  return;
+                }
                 if (ctx.state.implementerIssue && error instanceof CommandError)
                   throw new WorktreeCleanError(error.message, { cause: error });
                 throw error;
