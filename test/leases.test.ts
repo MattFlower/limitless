@@ -960,6 +960,60 @@ test.each(["confirmed", "recovered acquisition", "loop-reconciled acquisition"] 
   },
 );
 
+test("recovery advancing generations cannot authorize a reconstructed stale callback", async () => {
+  const f = fixture();
+  const before = f.confirmed();
+  f.store.markLeaseLost(repo, ref);
+  const next = { ...record, generation: 2 };
+  const applied = f.gh.seed(next);
+  f.store.beginLeaseIntent(repo, ref, want.run, {
+    op: "acquire",
+    before: before.sha,
+    record: next,
+    commit: applied.sha,
+  });
+  expect(f.row()).toMatchObject({
+    confirmed: { generation: 1, state: "lost" },
+    intent: { op: "acquire", record: next, commit: applied.sha },
+  });
+  const expected = f.capture();
+  expect(expected).toEqual({ repo, ref, run: want.run, member, generation: 1 });
+  const manager = await f.create();
+  expect(f.row()).toMatchObject({
+    confirmed: { generation: 2, tip: applied.sha, state: "held" },
+    intent: null,
+  });
+  // Reconstruct the old callback with its identity from before recovery changed the row.
+  const stale = f.bind(manager, expected);
+  const current = f.bind(manager, f.capture());
+  expectGuard(stale, "lease");
+  expectGuard(current, "lease");
+  f.start(manager);
+  f.advance(LEASE.renewMs);
+  await f.tick();
+  expect(f.gh.calls("update")).toHaveLength(1);
+  expect(f.times).toHaveLength(1);
+  expect(f.row()).toMatchObject({ confirmed: { generation: 2, state: "held" }, intent: null });
+  expect(manager.windowOpen(current.handle)).toBe(true);
+  const currentPublication = mock(() => {});
+  claimScope.run([current], () => {
+    claimGuard();
+    currentPublication();
+  });
+  expect(currentPublication).toHaveBeenCalledTimes(1);
+  const stalePublication = mock(() => {});
+  const staleCallback = () =>
+    claimScope.run([stale], () => {
+      claimGuard();
+      stalePublication();
+    });
+  expect(staleCallback).toThrow(ClaimWaitError);
+  expect(staleCallback).toThrow(expect.objectContaining({ reason: "lease" }));
+  expect(stalePublication).not.toHaveBeenCalled();
+  expect(stale.lost).toBe(false);
+  expect(f.lost).not.toHaveBeenCalled();
+});
+
 test.each([false, true])(
   "the first tick renews a recovered acquisition (pending at start: %s)",
   async (pending) => {
