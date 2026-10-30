@@ -2,10 +2,12 @@ import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "b
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadConfig } from "../src/config.ts";
 import type { Repo } from "../src/core/types.ts";
 import * as command from "../src/git/command.ts";
 import { ConfinementError, gitConfinement } from "../src/git/confinement.ts";
 import * as hardening from "../src/git/hardening.ts";
+import * as repos from "../src/git/repos.ts";
 import {
   githubRetry,
   mergePullRequest,
@@ -13,6 +15,8 @@ import {
   pushExistingBranch,
   remoteBranchSha,
 } from "../src/git/repos.ts";
+import { ClaimLostError } from "../src/integrations/claim-errors.ts";
+import * as github from "../src/integrations/github-identity.ts";
 import * as proc from "../src/util/proc.ts";
 import { CommandError, sh } from "../src/util/proc.ts";
 
@@ -286,5 +290,167 @@ test("explicit run-branch lease permits updates and rewinds and recovers an alre
     await expect(pushBranch(repo, work, branch, head, undefined, undefined, null)).rejects.toBe(refusal);
   } finally {
     spy.mockRestore();
+  }
+});
+
+test.each([
+  "allocation",
+  "range",
+  "push",
+  "readback",
+  "find",
+  "create",
+  "edit",
+  "lookup",
+  "guard",
+  "async guard",
+  "merge",
+])(
+  "publication preserves claim interruption without retries, reconciliation or failure reporting at %s",
+  async (boundary) => {
+    // Command-like details must not trigger already-exists recovery or transient retries.
+    const sentinel = Object.assign(new ClaimLostError(), {
+      message: "HTTP 502: a PR already exists",
+      stderr: "HTTP 502: a PR already exists",
+      timedOut: true,
+    });
+    let guards = 0;
+    const guard = () => {
+      guards++;
+      if (boundary === "async guard") return Promise.reject(sentinel);
+      throw sentinel;
+    };
+    const head = (await git(work, "rev-parse", "HEAD")).stdout.trim();
+    const commands: string[][] = [];
+    const url = "https://github.com/test/repo/pull/1";
+    const onFailure = spyOn({ failed() {} }, "failed");
+    const gh = spyOn(github, "githubSh").mockImplementation(async (cmd) => {
+      commands.push(cmd);
+      if (cmd.includes("view"))
+        return {
+          stdout: JSON.stringify({ state: "OPEN", headRefOid: head, title: "PR", body: "body" }),
+          stderr: "",
+          exitCode: 0,
+        };
+      if (cmd.includes("list") && ["create", "edit"].includes(boundary))
+        return { stdout: boundary === "edit" ? url : "", stderr: "", exitCode: 0 };
+      throw sentinel;
+    });
+    const execute = command.cacheGit;
+    const transport = spyOn(command, "cacheGit").mockImplementation(async (cmd, ...rest) => {
+      if (cmd.includes("push") || cmd.includes("ls-remote")) {
+        commands.push(cmd);
+        if (boundary === "readback" && cmd.includes("push")) throw new Error("push failed");
+        throw sentinel;
+      }
+      return execute(cmd, ...rest);
+    });
+    const cfg = loadConfig({ home: dir, raw: {} });
+    const refs = spyOn(command, "worktreeGit");
+    try {
+      let attempt: Promise<unknown>;
+      if (boundary === "allocation") {
+        refs.mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+        attempt = repos.createWorktree(cfg.paths, repo, "run", "Feature", "main", {
+          cfg: {
+            repos: {
+              [repo.slug.toLowerCase()]: {
+                discreet: true,
+                branchPrefix: "change/",
+                landRequiresApproval: false,
+              },
+            },
+          },
+          gh: async () => {
+            commands.push(["gh", "pr", "list"]);
+            throw sentinel;
+          },
+        });
+      } else if (boundary === "range")
+        attempt = repos.deliveryPublicationRange(
+          repo,
+          work,
+          "limitless/run-feature",
+          head,
+          head,
+          undefined,
+          undefined,
+          { runId: "run", published: false },
+        );
+      else if (["push", "readback"].includes(boundary)) attempt = repos.pushBranch(repo, work, "new");
+      else if (boundary === "lookup") attempt = repos.findPullRequest(repo, "new", work);
+      else if (["guard", "async guard", "merge"].includes(boundary))
+        attempt = repos.mergePullRequest(url, work, head, undefined, undefined, [], {
+          onFailure,
+          guard: boundary === "merge" ? undefined : guard,
+        });
+      else
+        attempt = repos.createPullRequest(repo, {
+          branch: "new",
+          base: "main",
+          title: "PR",
+          body: "body",
+          cwd: work,
+        });
+      await expect(attempt).rejects.toBe(sentinel);
+      expect(onFailure).not.toHaveBeenCalled();
+      expect(guards).toBe(["guard", "async guard"].includes(boundary) ? 1 : 0);
+      expect(
+        commands.map((cmd) =>
+          cmd.includes("ls-remote") ? "readback" : cmd.includes("push") ? "push" : cmd[2],
+        ),
+      ).toEqual(
+        boundary === "readback"
+          ? ["push", "readback"]
+          : boundary === "push"
+            ? ["push"]
+            : boundary === "range"
+              ? ["readback"]
+              : ["guard", "async guard"].includes(boundary)
+                ? ["view"]
+                : boundary === "merge"
+                  ? ["view", "merge"]
+                  : boundary === "create"
+                    ? ["list", "create"]
+                    : boundary === "edit"
+                      ? ["list", "edit"]
+                      : ["list"],
+      );
+    } finally {
+      refs.mockRestore();
+      transport.mockRestore();
+      gh.mockRestore();
+    }
+  },
+);
+
+test("ordinary lookup failures retain absence, creation and merge outcomes", async () => {
+  const failure = new CommandError("refused", 1, "", "rejected", false);
+  const commands: string[][] = [];
+  const onFailure = spyOn({ failed() {} }, "failed");
+  const url = "https://github.com/test/repo/pull/1";
+  const gh = spyOn(github, "githubSh").mockImplementation(async (cmd) => {
+    commands.push(cmd);
+    if (cmd.includes("create")) return { stdout: url, stderr: "", exitCode: 0 };
+    throw failure;
+  });
+  try {
+    expect(await repos.findPullRequest(repo, "new", work)).toBeNull();
+    expect(
+      await repos.createPullRequest(repo, {
+        branch: "new",
+        base: "main",
+        title: "PR",
+        body: "body",
+        cwd: work,
+      }),
+    ).toBe(url);
+    expect(
+      await repos.mergePullRequest(url, work, "a".repeat(40), undefined, undefined, [], { onFailure }),
+    ).toBe("failed");
+    expect(onFailure).toHaveBeenCalledTimes(1);
+    expect(commands.filter((cmd) => cmd.includes("create"))).toHaveLength(1);
+  } finally {
+    gh.mockRestore();
   }
 });
