@@ -645,12 +645,15 @@ exec '${realGit}' "$@"
       }, 5);`,
     );
     let writerPid: number | undefined;
-    const attempts: { state: RunState | null; prompt: string }[] = [];
+    const attempts: { state: RunState | null; prompt: string; committed?: string }[] = [];
     const f = factory(undefined, async (s) => {
       if (s.mode !== "edit") return answer(s);
       attempts.push({ state: f.store.getRunState<RunState>(id), prompt: s.prompt });
       if (attempts.length > 1) {
         rmSync(active);
+        const attempt = attempts.at(-1);
+        if (attempt)
+          attempt.committed = (await sh(["git", "show", "HEAD:ui/change.txt"], { cwd: s.cwd })).stdout;
         return answer(s);
       }
       writeFileSync(active, "");
@@ -709,7 +712,10 @@ exec '${realGit}' "$@"
         });
       }
       const cwd = f.store.getRunState<RunState>(id)?.worktreePath ?? "";
-      expect((await sh(["git", "show", "HEAD~1:ui/change.txt"], { cwd })).stdout).toBe("partial\n");
+      // The next round started from the committed partial work; its repair replaced that commit.
+      expect(attempts[1]?.committed).toBe("partial\n");
+      const range = `${f.store.getRun(id)?.baseSha}..HEAD`;
+      expect((await sh(["git", "rev-list", "--count", range], { cwd })).stdout.trim()).toBe("1");
       expect(existsSync(join(cwd, "node_modules/.ci-check-final.log"))).toBe(false);
       history(f, id);
     } finally {
@@ -731,11 +737,17 @@ test("implement timeout preserves partial work and uses task feedback in the nex
     '[gates]\nchecks = [{name="check",run="! test -f ui/change.txt || grep -qx done ui/change.txt"}]\n',
   );
   await sh(["git", "commit", "-qam", "check completed implementation"], { cwd: source });
-  const attempts: { state: RunState | null; prompt: string }[] = [];
+  const attempts: { state: RunState | null; prompt: string; committed?: string }[] = [];
   const diagnostic = `session ${status}`;
-  const f = factory(undefined, (s) => {
+  const f = factory(undefined, async (s) => {
     if (s.mode !== "edit") return answer(s);
-    attempts.push({ state: f.store.getRunState<RunState>(id), prompt: s.prompt });
+    attempts.push({
+      state: f.store.getRunState<RunState>(id),
+      prompt: s.prompt,
+      ...(attempts.length
+        ? { committed: (await sh(["git", "show", "HEAD:ui/change.txt"], { cwd: s.cwd })).stdout }
+        : {}),
+    });
     return attempts.length === 1
       ? { status, error: diagnostic, files: { "ui/change.txt": "partial\n" } }
       : answer(s);
@@ -764,7 +776,11 @@ test("implement timeout preserves partial work and uses task feedback in the nex
   expect(state?.implementerIssue).toBeNull();
   const cwd = state?.worktreePath ?? "";
   expect(existsSync(cwd)).toBe(true);
-  expect((await sh(["git", "show", "HEAD~1:ui/change.txt"], { cwd })).stdout).toBe("partial\n");
+  // The next round started from the committed partial work; its repair replaced that commit.
+  expect(attempts[1]?.committed).toBe("partial\n");
+  const range = `${f.store.getRun(id)?.baseSha}..HEAD`;
+  expect((await sh(["git", "rev-list", "--count", range], { cwd })).stdout.trim()).toBe("1");
+  expect((await sh(["git", "show", "HEAD:ui/change.txt"], { cwd })).stdout).toBe("done\n");
   expect(readFileSync(join(cwd, "ui/change.txt"), "utf8")).toBe("done\n");
   history(f, id);
 });

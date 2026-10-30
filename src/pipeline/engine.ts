@@ -853,6 +853,10 @@ function commitIdentity(ctx: RunContext) {
   return repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet ? "operator" : "factory";
 }
 
+/**
+ * The newest commit the factory may not replace: published, reviewed or external history, or
+ * commits an implementer made itself. Factory iteration commits above it are replaceable.
+ */
 async function iterationPublicationBase(ctx: RunContext): Promise<string> {
   const base =
     ctx.state.publishedSha ??
@@ -1489,6 +1493,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             ? null
             : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
         if (result.status !== "ok") ctx.log(`Implementer ended with ${result.status}`, "warn");
+        // An implementer that committed itself keeps that history; only factory commits are replaced.
         const at = await headSha(cwd);
         const expected =
           ctx.state.workerCommitRound === round ? ctx.state.publishedSha : (ctx.run.headSha ?? baseSha);
@@ -1589,18 +1594,6 @@ async function oneRound(
 
   // --- implement (skipped when resuming a round whose implementation already landed)
   if (round >= 0 && ctx.state.implementedRound !== round) await implementStage(ctx, round);
-  else if (round >= 0 && !resolution) {
-    // Older checkpoints can contain several completed iterations. Ignore interrupted gate
-    // writes, consolidate their committed tree, and let SHA-keyed checks establish new evidence.
-    const sha = await commitAll(cwd, commitMessage(ctx, round), {
-      boundary: await iterationPublicationBase(ctx),
-      committedOnly: true,
-    });
-    if (sha) {
-      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha });
-      await ctx.save("iterations-consolidated");
-    }
-  }
   const ciRound = reviewRound(ctx);
   if (ciRound?.kind === "ci" && (await headSha(cwd)) === ciRound.reviewedSha) {
     ctx.state.needsHumanReason =
@@ -3102,39 +3095,6 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     const budget = deliveryBudget(ctx);
     if (ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review)
       await reconcilePublication(ctx, cwd, budget);
-    if (
-      success &&
-      !ctx.state.pendingRebaseSha &&
-      ctx.state.conflictRound === undefined &&
-      ctx.state.implementedRound === ctx.state.round
-    ) {
-      const head = await headSha(cwd);
-      const boundary = await iterationBoundary(cwd, await iterationPublicationBase(ctx), ctx.signal);
-      const parents = await worktreeGit(["git", "rev-list", "--parents", "-n", "1", head], { cwd });
-      if (head !== boundary && parents.stdout.trim() !== `${head} ${boundary}`) {
-        await assertDeliveryHead(ctx, head);
-        if (ctx.repo.kind === "github") {
-          const branch = review?.grant.owner.branch ?? ctx.run.deliveryBranch ?? (ctx.run.branch as string);
-          const expected =
-            ctx.state.publishedSha ??
-            review?.reviewedSha ??
-            (ctx.run.deliveryBranch ? ctx.run.baseSha : null);
-          const remote = await remoteBranchSha(ctx.repo, cwd, branch, ctx.signal, budget);
-          if (remote === head) {
-            ctx.state.publishedSha = head;
-            await ctx.save();
-          } else if (remote !== expected)
-            throw new DeliveryHeadError(
-              "Delivery refused: remote branch moved before iteration consolidation",
-            );
-        }
-        if (ctx.state.publishedSha !== head) {
-          // Persist the return to verification before changing Git, including on older runs.
-          await ctx.setPhase("loop");
-          return { summary: "Rechecking consolidated iteration history", value: undefined };
-        }
-      }
-    }
     const runner = ctx.deps.gh ?? runGh;
     const gh: GhRunner = (args, signal, stdin) =>
       withGitHubRetry(async () => (await runner(args, signal, stdin, ctx.repo.slug)) ?? "", {

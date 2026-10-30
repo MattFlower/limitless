@@ -65,9 +65,6 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "verified",
     "pushed",
     "legacy",
-    "legacy completed",
-    "legacy verified",
-    "legacy published",
     "unchanged",
   ])("consolidated iteration restart at %s reuses completed work", async (boundary) => {
     const bare = await githubFixture();
@@ -82,7 +79,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     await f.stop();
     registerGithub(f, bare);
     f.deps.faults =
-      boundary === "verified" || boundary === "legacy verified" || boundary === "legacy published"
+      boundary === "verified"
         ? { "stage:deliver:before": { action: "kill" } }
         : boundary === "between iterations"
           ? { "stage:implement:before": { action: "kill", when: (c) => c.round === 1 } }
@@ -121,8 +118,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
       const cwd = state.worktreePath;
       const checked = state.gateEvidence?.sha;
       let before = await repos.headSha(cwd);
-      if (boundary.startsWith("legacy")) {
-        // A pre-change run has ordinary iteration commits and no consolidation fields.
+      if (boundary === "legacy") {
+        // A pre-change run interrupted before committing its second iteration has ordinary iteration commits.
         await sh(["git", "update-ref", "HEAD", firstIteration, before], { cwd });
         await repos.commitAll(cwd, "old second iteration");
         before = await repos.headSha(cwd);
@@ -131,19 +128,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
             await sh(["git", "rev-list", "--count", `${f.store.getRun(run.id)?.baseSha}..HEAD`], { cwd })
           ).stdout.trim(),
         ).toBe("2");
-        if (boundary !== "legacy") state.implementedRound = 1;
-        if (boundary === "legacy verified" || boundary === "legacy published") {
-          if (!state.gateEvidence) throw new Error("Missing legacy gate evidence");
-          state.gateEvidence.sha = before;
-          state.reviewedSha = before;
-          state.lastVerifiedSha = before;
-          if (state.completedChecks) state.completedChecks.sha = before;
-        }
         f.store.updateRun(run.id, { headSha: before }, state);
-        if (boundary === "legacy published")
-          await sh(["git", "push", bare, `HEAD:refs/heads/${f.store.getRun(run.id)?.branch}`], { cwd });
-        if (boundary === "legacy completed")
-          writeFileSync(join(cwd, "greeting.txt"), "interrupted gate output\n");
       }
       if (boundary === "unchanged") {
         state.implementedRound = undefined;
@@ -161,12 +146,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
       if (!done?.headSha) throw new Error("Missing delivered head");
       const final = reopened.getRunState<RunState>(run.id);
       expect(implementations).toBe(2);
-      expect(pushes).toBe(boundary === "legacy published" ? 0 : 1);
+      expect(pushes).toBe(1);
       expect(
         (
           await sh(["git", "rev-list", "--count", `${done.baseSha}..${done.headSha}`], { cwd: bare })
         ).stdout.trim(),
-      ).toBe(boundary === "legacy published" ? "2" : "1");
+      ).toBe("1");
       expect((await sh(["git", "show", `${done.headSha}:farewell.txt`], { cwd: bare })).stdout).toBe(
         "goodbye\n",
       );
@@ -178,11 +163,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         (await sh(["git", "rev-parse", `refs/heads/${done?.branch}`], { cwd: bare })).stdout.trim(),
       ).toBe(done?.headSha);
       if (boundary === "verified" || boundary === "pushed") expect(done.headSha).toBe(checked ?? "missing");
-      if (
-        ["commit checkpoint", "git mutation", "unchanged", "verified", "pushed", "legacy published"].includes(
-          boundary,
-        )
-      )
+      if (["commit checkpoint", "git mutation", "unchanged", "verified", "pushed"].includes(boundary))
         expect(done?.headSha).toBe(before);
     } finally {
       push.mockRestore();
