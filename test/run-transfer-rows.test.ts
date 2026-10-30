@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Store } from "../src/db/store.ts";
 import { decodeRunTransferRows, encodeRunTransferRows } from "../src/pipeline/run-transfer-rows.ts";
 import { fixture, head, rejects, repo, sha } from "./run-transfer-support.ts";
 
@@ -197,6 +198,7 @@ test("both row boundaries reject malformed declared fields without normalization
     ["run", "titleProvenance", "unknown"],
     ["run", "flow", 3],
     ["run", "sourceRef", []],
+    ["run", "models", []],
     ["run", "undeclared", true],
     ["stages", "name", "bogus"],
     ["stages", "round", -1],
@@ -245,4 +247,107 @@ test("strict wire envelopes, required nullable fields and relational ordinals", 
   const input = fixture();
   Object.assign(input.invocations[0] ?? {}, { stageId: 999 });
   rejects(() => encodeRunTransferRows(input, repo));
+});
+
+test("Store-created and reloaded GitHub runs encode with undefined optional fields", () => {
+  const store = new Store(":memory:");
+  try {
+    const storedRepo = store.upsertRepo(repo);
+    const created = store.createRun(storedRepo, { repo: repo.slug, prompt: "Store request", source: "cli" });
+    for (const run of [created, store.getRun(created.id)]) {
+      if (!run) throw new Error("Expected stored run");
+      expect(Object.hasOwn(run, "githubWait")).toBe(true);
+      expect(run.githubWait).toBeUndefined();
+      const wire = encodeRunTransferRows({ run, stages: [], invocations: [], questions: [] }, storedRepo);
+      expect(wire.run).not.toHaveProperty("githubWait");
+      expect(decodeRunTransferRows(wire, storedRepo)).toEqual(wire);
+      expect(wire.run).toMatchObject({
+        id: created.id,
+        prompt: "Store request",
+        createdAt: created.createdAt,
+      });
+    }
+  } finally {
+    store.close();
+  }
+});
+
+test("declared undefined domain options are omitted without changing inputs or wire strictness", () => {
+  const input = fixture();
+  for (const key of [
+    "models",
+    "flow",
+    "githubWait",
+    "titleProvenance",
+    "noBaselineCache",
+    "allow",
+  ] as const) {
+    Object.assign(input.run, { [key]: undefined });
+    const absent = structuredClone(input);
+    delete absent.run[key];
+    expect(encodeRunTransferRows(input, repo)).toEqual(encodeRunTransferRows(absent, repo));
+    expect(Object.hasOwn(input.run, key)).toBe(true);
+    const wire = encodeRunTransferRows(absent, repo);
+    Object.assign(wire.run, { [key]: undefined });
+    rejects(() => decodeRunTransferRows(wire, repo));
+  }
+  input.run.models = {
+    triage: undefined,
+    spec: undefined,
+    holdout: undefined,
+    implement: undefined,
+    review: ["model"],
+    verify: undefined,
+  };
+  input.run.titleProvenance = null;
+  const wire = encodeRunTransferRows(input, repo);
+  expect(wire.run.models).toEqual({ review: ["model"] });
+  expect(wire.run.titleProvenance).toBeNull();
+  expect(Object.hasOwn(input.run.models, "triage")).toBe(true);
+  Object.assign(wire.run.models ?? {}, { triage: undefined });
+  rejects(() => decodeRunTransferRows(wire, repo));
+  Object.assign(input.run, { undeclared: undefined });
+  rejects(() => encodeRunTransferRows(input, repo));
+});
+
+test.each(["stages", "invocations", "questions"] as const)(
+  "%s containers must be arrays on both row boundaries",
+  (collection) => {
+    for (const value of [null, {}, "rows", 3]) {
+      const input = fixture(),
+        wire = encodeRunTransferRows(input, repo);
+      Object.assign(input, { [collection]: value });
+      Object.assign(wire, { [collection]: value });
+      rejects(() => encodeRunTransferRows(input, repo));
+      rejects(() => decodeRunTransferRows(wire, repo));
+    }
+  },
+);
+
+test("row dependency refusal precedes invalid fields and undeclared envelope members", () => {
+  const input = fixture(),
+    wire = encodeRunTransferRows(input, repo);
+  for (const rows of [input, wire]) {
+    rows.run.dependsOn = ["unresolved"];
+    Object.assign(rows.stages[0] ?? {}, { name: "invalid" });
+    Object.assign(rows, { undeclared: undefined });
+  }
+  rejects(() => encodeRunTransferRows(input, repo), "unsupported");
+  rejects(() => decodeRunTransferRows(wire, repo), "unsupported");
+});
+
+test.each(["stages", "invocations", "questions"] as const)(
+  "%s ordinals must be contiguous even with an existing stage reference",
+  (collection) => {
+    const wire = encodeRunTransferRows(fixture(), repo);
+    Object.assign(wire[collection][1] ?? {}, { ordinal: 3 });
+    if (collection === "stages") Object.assign(wire.invocations[1] ?? {}, { stageOrdinal: 3 });
+    rejects(() => decodeRunTransferRows(wire, repo));
+  },
+);
+
+test("empty row collections remain valid", () => {
+  const input = { ...fixture(), stages: [], invocations: [], questions: [] };
+  const wire = encodeRunTransferRows(input, repo);
+  expect(decodeRunTransferRows(wire, repo)).toEqual(wire);
 });

@@ -186,3 +186,84 @@ test("strict follow-up fields carry no approval, publication authority or local 
   });
   expect(encodeRunTransfer(input, repo, dependency)).toHaveProperty("followUp.deliveredSha", null);
 });
+
+test("follow-up owner optional absence and undefined are equivalent without mutating the owner", () => {
+  const { input, dependency } = followUpFixture();
+  if (!dependency.owner) throw new Error("Expected owner");
+  for (const key of [
+    "models",
+    "flow",
+    "githubWait",
+    "titleProvenance",
+    "noBaselineCache",
+    "allow",
+  ] as const) {
+    Object.assign(dependency.owner, { [key]: undefined });
+    const absent = structuredClone(dependency);
+    if (!absent.owner) throw new Error("Expected owner");
+    delete absent.owner[key];
+    expect(encodeRunTransfer(input, repo, dependency)).toEqual(encodeRunTransfer(input, repo, absent));
+    expect(Object.hasOwn(dependency.owner, key)).toBe(true);
+  }
+  dependency.owner.models = { triage: undefined, review: ["model"] };
+  dependency.owner.titleProvenance = null;
+  const wire = encodeRunTransfer(input, repo, dependency);
+  expect(wire).toHaveProperty("followUp.owner.models", { review: ["model"] });
+  expect(wire).toHaveProperty("followUp.owner.titleProvenance", null);
+  expect(Object.hasOwn(dependency.owner.models, "triage")).toBe(true);
+  if (!("followUp" in wire)) throw new Error("Expected history");
+  Object.assign(wire.followUp.owner, { githubWait: undefined });
+  rejects(() => decodeRunTransfer(wire, repo));
+});
+
+test.each(["primary", "owner"] as const)(
+  "%s dependency preflight precedes competing failures and missing rounds",
+  (subject) => {
+    const { input, dependency } = followUpFixture();
+    input.stages = fixture().stages.map((stage) => ({ ...stage, runId: input.run.id }));
+    const wire = encodeRunTransfer(input, repo, dependency);
+    if (!dependency.owner || !("followUp" in wire)) throw new Error("Expected owner");
+    (subject === "primary" ? input.run : dependency.owner).dependsOn = ["unresolved"];
+    (subject === "primary" ? wire.run : wire.followUp.owner).dependsOn = ["unresolved"];
+    Object.assign(input.stages[0] ?? {}, { name: "invalid" });
+    Object.assign(wire.stages[0] ?? {}, { name: "invalid" });
+    rejects(() => encodeRunTransfer(input, repo, dependency), "unsupported");
+    rejects(() => decodeRunTransfer(wire, repo), "unsupported");
+    Object.assign(input, { undeclared: true });
+    Object.assign(wire, { undeclared: true });
+    rejects(() => encodeRunTransfer(input, repo, dependency), "unsupported");
+    rejects(() => decodeRunTransfer(wire, repo), "unsupported");
+    dependency.round = null;
+    Reflect.deleteProperty(wire.followUp, "createdAt");
+    rejects(() => encodeRunTransfer(input, repo, dependency), "unsupported");
+    rejects(() => decodeRunTransfer(wire, repo), "unsupported");
+  },
+);
+
+test.each(["stages", "invocations", "questions"] as const)(
+  "%s containers must be arrays on both follow-up boundaries",
+  (collection) => {
+    for (const value of [null, {}, "rows", 3]) {
+      const input = fixture(),
+        wire = encodeRunTransfer(input, repo);
+      Object.assign(input, { [collection]: value });
+      Object.assign(wire, { [collection]: value });
+      rejects(() => encodeRunTransfer(input, repo));
+      rejects(() => decodeRunTransfer(wire, repo));
+    }
+  },
+);
+
+test("owner dependency preflight tolerates malformed primary records", () => {
+  for (const malformed of [null, {}, "run", 3]) {
+    const { input, dependency } = followUpFixture();
+    const wire = encodeRunTransfer(input, repo, dependency);
+    if (!dependency.owner || !("followUp" in wire)) throw new Error("Expected owner");
+    dependency.owner.dependsOn = ["unresolved"];
+    wire.followUp.owner.dependsOn = ["unresolved"];
+    Object.assign(input, { run: malformed });
+    Object.assign(wire, { run: malformed });
+    rejects(() => encodeRunTransfer(input, repo, { ...dependency, round: null }), "unsupported");
+    rejects(() => decodeRunTransfer(wire, repo), "unsupported");
+  }
+});

@@ -1,8 +1,29 @@
 import { z } from "zod";
 import type { Repo, Run, RunDetail } from "../core/types.ts";
-import { RunTransferError } from "./run-transfer-errors.ts";
+import { RunTransferError, rethrowRunTransfer } from "./run-transfer-errors.ts";
 import * as json from "./run-transfer-json.ts";
-
+export const boundary =
+  <A extends unknown[], T>(action: (...args: A) => T) =>
+  (...args: A): T => {
+    try {
+      return action(...args);
+    } catch (error) {
+      try {
+        if (!(error instanceof RunTransferError)) rethrowRunTransfer(error, "invalid");
+      } catch (caught) {
+        rethrowRunTransfer(caught, "invalid");
+      }
+      throw error;
+    }
+  };
+const member = (value: unknown, key: string): unknown =>
+  value && typeof value === "object" && key in value ? Reflect.get(value, key) : undefined;
+export function preflight(value: unknown, owner?: unknown) {
+  for (const run of [member(value, "run"), owner ?? member(member(value, "followUp"), "owner")]) {
+    const dependencies = member(run, "dependsOn");
+    if (Array.isArray(dependencies) && dependencies.length) throw new RunTransferError("unsupported");
+  }
+}
 type Words<S extends string> = S extends `${infer K} ${infer Rest}` ? K | Words<Rest> : S;
 export function fields<S extends string, T extends z.ZodType>(keys: S, schema: T): Record<Words<S>, T> {
   return Object.fromEntries(keys.split(" ").map((key) => [key, schema])) as Record<Words<S>, T>;
@@ -15,7 +36,6 @@ export const oid = z.string().transform(json.parseTransferOid);
 const object = z.strictObject;
 const text = z.string();
 const nullableText = text.nullable();
-const nullableTime = counter.nullable();
 const stageName = oneOf(
   "prepare triage clarify spec plan holdout implement gates audit review preview verify accept deliver",
 );
@@ -38,7 +58,7 @@ const runSchema = object({
   ...fields("baseSha headSha", oid.nullable()),
   ...fields("costUsd costEquivUsd", z.number()),
   ...fields("tokensIn tokensOut priority createdAt", counter),
-  ...fields("mergedAt startedAt finishedAt", nullableTime),
+  ...fields("mergedAt startedAt finishedAt", counter.nullable()),
   resolution: object({
     kind: oneOf("merged done_elsewhere superseded wont_do pr_closed"),
     ...fields("ref note", nullableText),
@@ -60,7 +80,7 @@ const stageSchema = object({
   status: oneOf("running succeeded failed skipped cancelled"),
   summary: nullableText,
   startedAt: counter,
-  finishedAt: nullableTime,
+  finishedAt: counter.nullable(),
 });
 const invocationSchema = object({
   ...row,
@@ -74,24 +94,23 @@ const invocationSchema = object({
   fast: z.boolean(),
   ...fields("fastModeState fastModeDisabledReason error", nullableText),
   startedAt: counter,
-  finishedAt: nullableTime,
+  finishedAt: counter.nullable(),
 });
 const questionSchema = object({
   ...row,
   question: text,
   ...fields("answer answeredBy", nullableText),
   askedAt: counter,
-  answeredAt: nullableTime,
+  answeredAt: counter.nullable(),
 });
-const rowsSchema = (repo: Repo) =>
-  object({
-    run: z.unknown().transform((value) => decodeTransferRun(value, repo)),
-    stages: z.array(stageSchema),
-    invocations: z.array(invocationSchema),
-    questions: z.array(questionSchema),
-  });
+const rowsSchema = object({
+  run: runSchema,
+  stages: z.array(stageSchema),
+  invocations: z.array(invocationSchema),
+  questions: z.array(questionSchema),
+});
 export type PortableRun = z.infer<typeof runSchema>;
-export type TransferRows = z.infer<ReturnType<typeof rowsSchema>>;
+export type TransferRows = z.infer<typeof rowsSchema>;
 export type TransferRowInput = Pick<RunDetail, "run" | "stages" | "invocations" | "questions">;
 export function parseRecord<T>(schema: z.ZodType<T>, value: unknown): T {
   json.parseTransferJson(value);
@@ -99,59 +118,65 @@ export function parseRecord<T>(schema: z.ZodType<T>, value: unknown): T {
   if (!result.success) throw new RunTransferError("invalid");
   return result.data;
 }
-export function decodeTransferRun(value: unknown, repo: Repo, code: "invalid" | "incomplete" = "invalid") {
-  json.parseTransferJson(value);
-  if (value && typeof value === "object") {
-    if ("dependsOn" in value && Array.isArray(value.dependsOn) && value.dependsOn.length)
+export const decodeTransferRun = boundary(
+  (value: unknown, repo: Repo, code: "invalid" | "incomplete" = "invalid") => {
+    preflight({ run: value });
+    const flow = member(value, "flow");
+    if (typeof flow === "string" && !["build", "verify-change", "acceptance"].includes(flow))
       throw new RunTransferError("unsupported");
+    const run = parseRecord(runSchema, value);
+    const ref = run.sourceRef;
+    if (ref?.kind === "pull_request") {
+      json.parseTransferOid(ref.baseSha);
+      json.parseTransferOid(ref.headSha);
+    }
+    if (ref?.kind === "review-round" && "reviewedSha" in ref) json.parseTransferOid(ref.reviewedSha);
+    if (repo.kind !== "github") throw new RunTransferError("unsupported");
     if (
-      "flow" in value &&
-      typeof value.flow === "string" &&
-      !["build", "verify-change", "acceptance"].includes(value.flow as string)
+      run.repoSlug !== repo.slug ||
+      ((ref?.kind === "issue" || ref?.kind === "pull_request") &&
+        (ref.repo !== repo.slug || json.parseTransferCounter(ref.number) === 0))
     )
-      throw new RunTransferError("unsupported");
-  }
-  const run = parseRecord(runSchema, value);
-  const ref = run.sourceRef;
-  if (ref?.kind === "pull_request") {
-    json.parseTransferOid(ref.baseSha);
-    json.parseTransferOid(ref.headSha);
-  }
-  if (ref?.kind === "review-round" && "reviewedSha" in ref) json.parseTransferOid(ref.reviewedSha);
-  if (repo.kind !== "github") throw new RunTransferError("unsupported");
-  if (
-    run.repoSlug !== repo.slug ||
-    ((ref?.kind === "issue" || ref?.kind === "pull_request") &&
-      (ref.repo !== repo.slug || json.parseTransferCounter(ref.number) === 0))
-  )
-    throw new RunTransferError(code);
-  return run;
-}
-export function encodeTransferRun(run: Run, repo: Repo, code: "invalid" | "incomplete" = "invalid") {
-  json.parseTransferJson(run);
-  const { repoId, ...portable } = run;
-  const result = decodeTransferRun(portable, repo, code);
-  if (repoId !== repo.id) throw new RunTransferError(code);
-  return result;
-}
-export function decodeRunTransferRows(value: unknown, repo: Repo): TransferRows {
-  const rows = parseRecord(rowsSchema(repo), value);
+      throw new RunTransferError(code);
+    return run;
+  },
+);
+export const encodeTransferRun = boundary(
+  (run: Run, repo: Repo, code: "invalid" | "incomplete" = "invalid") => {
+    preflight({ run });
+    const { repoId, ...portable } = run;
+    for (const [key, schema] of Object.entries(runSchema.shape))
+      if (schema.isOptional() && Reflect.get(portable, key) === undefined)
+        Reflect.deleteProperty(portable, key);
+    if (portable.models && typeof portable.models === "object" && !Array.isArray(portable.models)) {
+      portable.models = { ...portable.models };
+      for (const key of ["triage", "spec", "holdout", "implement", "review", "verify"] as const)
+        if (portable.models[key] === undefined) delete portable.models[key];
+    }
+    const result = decodeTransferRun(portable, repo, code);
+    if (repoId !== repo.id) throw new RunTransferError(code);
+    return result;
+  },
+);
+export const decodeRunTransferRows = boundary((value: unknown, repo: Repo): TransferRows => {
+  preflight(value);
+  decodeTransferRun(member(value, "run"), repo);
+  const rows = parseRecord(rowsSchema, value);
   const hasStage = (n: number) => rows.stages.some((s) => s.ordinal === n);
   for (const collection of [rows.stages, rows.invocations, rows.questions]) {
-    if (
-      new Set(collection.map((r) => r.ordinal)).size !== collection.length ||
-      collection.some((r) => r.runId !== rows.run.id)
-    )
+    const ordinals = new Set(collection.map((r) => r.ordinal));
+    if (collection.some((r, i) => r.runId !== rows.run.id || !ordinals.has(i + 1)))
       throw new RunTransferError("invalid");
   }
   if (rows.invocations.some((i) => i.stageOrdinal !== null && !hasStage(i.stageOrdinal)))
     throw new RunTransferError("invalid");
   return rows;
-}
-export function encodeRunTransferRows(input: TransferRowInput, repo: Repo): TransferRows {
-  parseRecord(object(fields("run stages invocations questions", z.unknown())), input);
+});
+export const encodeRunTransferRows = boundary((input: TransferRowInput, repo: Repo): TransferRows => {
+  preflight(input);
   const run = encodeTransferRun(input.run, repo);
   const ordered = <T extends { id: number }>(rows: T[]): T[] => {
+    if (!Array.isArray(rows)) throw new RunTransferError("invalid");
     const ids = rows.map((r) => parseRecord(ordinal, r.id));
     if (new Set(ids).size !== rows.length) throw new RunTransferError("invalid");
     return [...rows].sort((a, b) => a.id - b.id);
@@ -159,6 +184,7 @@ export function encodeRunTransferRows(input: TransferRowInput, repo: Repo): Tran
   const stages = ordered(input.stages);
   const stageOrdinals = new Map(stages.map((s, i) => [s.id, i + 1]));
   const result = {
+    ...input,
     run,
     stages: stages.map(({ id: _id, ...s }, i) => ({ ...s, ordinal: i + 1 })),
     invocations: ordered(input.invocations).map(({ id: _id, stageId, sessionId: _session, ...v }, i) => ({
@@ -169,4 +195,4 @@ export function encodeRunTransferRows(input: TransferRowInput, repo: Repo): Tran
     questions: ordered(input.questions).map(({ id: _id, ...q }, i) => ({ ...q, ordinal: i + 1 })),
   };
   return decodeRunTransferRows(result, repo);
-}
+});

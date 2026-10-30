@@ -63,16 +63,20 @@ const envelopeSchema = z.strictObject({
   ...r.fields("run stages invocations questions", z.unknown()),
   followUp: z.unknown().optional(),
 });
-export function decodeRunTransfer(value: unknown, repo: Repo) {
+export const decodeRunTransfer = r.boundary((value: unknown, repo: Repo) => {
+  r.preflight(value);
   const { followUp, ...data } = r.parseRecord(envelopeSchema, value);
   const rows = r.decodeRunTransferRows(data, repo);
   const dependency = decodeFollowUp(followUp, rows.run, repo);
   return dependency === undefined ? rows : { ...rows, followUp: dependency };
-}
-export function encodeRunTransfer(input: r.TransferRowInput, repo: Repo, dependency?: FollowUpInput) {
-  const rows = r.encodeRunTransferRows(input, repo);
-  if (!dependency) return decodeRunTransfer(rows, repo);
-  if (!dependency.owner || !dependency.round) throw new RunTransferError("incomplete");
-  const owner = r.encodeTransferRun(dependency.owner, repo, "incomplete");
-  return decodeRunTransfer({ ...rows, followUp: { ...dependency.round, owner } }, repo);
-}
+});
+export const encodeRunTransfer = r.boundary(
+  (input: r.TransferRowInput, repo: Repo, dependency?: FollowUpInput) => {
+    r.preflight(input, dependency?.owner);
+    const rows = r.encodeRunTransferRows(input, repo);
+    if (!dependency) return decodeRunTransfer(rows, repo);
+    if (!dependency.owner || !dependency.round) throw new RunTransferError("incomplete");
+    const owner = r.encodeTransferRun(dependency.owner, repo, "incomplete");
+    return decodeRunTransfer({ ...rows, followUp: { ...dependency.round, owner } }, repo);
+  },
+);
