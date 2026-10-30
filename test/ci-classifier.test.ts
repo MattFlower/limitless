@@ -7,7 +7,7 @@ import { ciDecision, ciSignature } from "../src/integrations/ci-classifier.ts";
 import { normalizePr } from "../src/integrations/github-poller.ts";
 import * as proc from "../src/util/proc.ts";
 import { registerCredential } from "../src/util/proc.ts";
-import { assertionLog, ciEvidence, junit, reportZip } from "./ci-evidence-support.ts";
+import { assertionLog, bunJunit, ciEvidence, junit, reportZip } from "./ci-evidence-support.ts";
 import { pollerHarness, respond, SHA, url } from "./github-poller-support.ts";
 
 let h: ReturnType<typeof pollerHarness>;
@@ -130,19 +130,32 @@ function failure(n = 1, name = "test", conclusion = "timed_out") {
   return { node, check, job, state, observe, rerun };
 }
 
-function unrelatedFailure() {
+function unrelatedFailure(repeated = false) {
   const f = failure(1, "test", "failure");
   f.state.log = assertionLog;
   f.job.steps = [{ name: "Test", status: "completed", conclusion: "failure" }];
   const evidence = ciEvidence(h.gh, "o/r", 1, SHA, f.job);
+  if (repeated) {
+    evidence.prXml = bunJunit;
+    evidence.mainXml = bunJunit
+      .replace(/<failure\b[^>]*>[\s\S]*?<\/failure>/, "")
+      .replaceAll('failures="1"', 'failures="0"');
+    f.state.log = assertionLog.replace("0 pass", "2 pass\n1 skip").replace("1 test across", "4 tests across");
+    h.gh.responses.set("repos/o/r/actions/artifacts/81/zip", () =>
+      respond(200, reportZip(evidence.prXml, "signed")),
+    );
+    h.gh.responses.set("repos/o/r/actions/artifacts/82/zip", () =>
+      respond(200, reportZip(evidence.mainXml, "signed")),
+    );
+  }
   return { ...f, evidence };
 }
 
 test.each(["success", "failure"])(
-  "unrelated assertion reruns once across restart, then %s",
+  "unrelated Bun table assertion reruns once across restart, then %s",
   async (result) => {
     h = pollerHarness();
-    const f = unrelatedFailure();
+    const f = unrelatedFailure(true);
     h.start(15);
     await h.advance(0);
     expect(reruns().map((c) => c.path)).toEqual(["repos/o/r/actions/jobs/21/rerun"]);
@@ -156,11 +169,11 @@ test.each(["success", "failure"])(
       history: "no_retry",
       handle_kind: "github-actions",
       handle_id: '["o/r",1,1,21]',
-      failed_files: '["test/example.test.ts"]',
+      failed_files: '["repeated.test.ts"]',
     });
     expect(JSON.parse(observations[0]?.reason ?? "{}")).toMatchObject({
       tests: [
-        { file: "test/example.test.ts", identity: '["test/example.test.ts",["suite"],"outer","asserts"]' },
+        { file: "repeated.test.ts", identity: '["repeated.test.ts",["repeated.test.ts"],"","table %s"]' },
       ],
       main: { sha: mainSha, run: 90, attempt: 1, job: 91 },
       artifacts: [81],
@@ -186,6 +199,51 @@ test.each(["success", "failure"])(
     expect(h.store.failureObservations({ class: "flaky" })).toEqual(observations);
   },
 );
+
+test.each([
+  "main-mixed-failure",
+  "main-mixed-skipped",
+  "duplicate-report",
+  "duplicate-artifact",
+  "local-header",
+  "summary-disagrees",
+  "changed",
+  "missing",
+])("repeated Bun evidence (%s) retains needs-fix", async (kind) => {
+  h = pollerHarness();
+  const f = unrelatedFailure(true);
+  const e = f.evidence;
+  if (kind === "main-mixed-failure") e.mainXml = bunJunit;
+  if (kind === "main-mixed-skipped")
+    e.mainXml = bunJunit
+      .replace(/<failure\b[^>]*>[\s\S]*?<\/failure>/, "<skipped/>")
+      .replaceAll('failures="1"', 'failures="0"')
+      .replaceAll('skipped="1"', 'skipped="2"');
+  if (kind === "duplicate-report")
+    h.gh.responses.set("repos/o/r/actions/artifacts/82/zip", () =>
+      respond(200, reportZip([e.mainXml, e.mainXml], "signed")),
+    );
+  if (kind === "duplicate-artifact" && e.mainArtifacts[0]) {
+    e.mainArtifacts.push({ ...e.mainArtifacts[0], id: 83 });
+    h.gh.responses.set("repos/o/r/actions/artifacts/83/zip", () => respond(200, reportZip(e.mainXml)));
+  }
+  if (kind === "local-header")
+    h.gh.responses.set("repos/o/r/actions/artifacts/81/zip", () => {
+      const zip = Buffer.from(reportZip(e.prXml, "signed"));
+      zip.writeUInt16LE(9, 6);
+      return respond(200, zip);
+    });
+  if (kind === "summary-disagrees")
+    f.state.log = f.state.log.replace("2 pass", "1 pass").replace("4 tests", "3 tests");
+  if (kind === "changed") e.files = [{ filename: "repeated.test.ts", status: "modified" }];
+  if (kind === "missing") e.prArtifacts = [];
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(0);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  expect(fixEvidence()).not.toBeNull();
+  expect(h.store.failureObservations({ class: "flaky" })).toHaveLength(0);
+});
 
 test("an earlier transient claim also consumes the unrelated-test allowance", async () => {
   h = pollerHarness();

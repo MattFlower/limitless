@@ -1,6 +1,6 @@
 import { inflateRawSync } from "node:zlib";
 import { z } from "zod";
-import { RunnerFailureEvidence } from "../gates/attribution.ts";
+import { type AttributedTestCounts, RunnerFailureEvidence } from "../gates/attribution.ts";
 
 const limit = 16 * 1024 * 1024;
 const id = z.number().int().positive();
@@ -55,16 +55,18 @@ export function ciTestPath(raw: string): string | undefined {
 
 const children = (node: Bun.XML.Node) =>
   node.children.filter((child): child is Bun.XML.Node => typeof child === "object" && "name" in child);
+const countKeys = ["tests", "failures", "errors", "skipped"] as const;
+const outcomesBySeverity = ["pass", "skipped", "failure", "error"];
 
-/** A complete report: counters, unique structured identities and no suite-level errors. */
+/** Validate occurrence totals independently of identities merged within this report. */
 export function ciTestReport(xml: string) {
   if (Buffer.byteLength(xml) > limit || /<!DOCTYPE|<!ENTITY/i.test(xml)) throw new Error("Unsafe JUnit");
   const root = Bun.XML.parse(xml, { compact: false });
   if (!["testsuite", "testsuites"].includes(root.name)) throw new Error("Invalid JUnit root");
   const tests = new Map<string, { file: string; outcome: string }>();
-  const visit = (node: Bun.XML.Node, suites: string[] = [], inheritedFile?: string): number[] => {
+  const visit = (node: Bun.XML.Node, suites: string[] = [], inheritedFile?: string): AttributedTestCounts => {
     const file = node.attributes.file ?? inheritedFile;
-    const counts = [0, 0, 0, 0];
+    const counts = { tests: 0, failures: 0, errors: 0, skipped: 0 };
     if (node.name === "testcase") {
       const path = file && ciTestPath(file);
       if (!path || !node.attributes.name) throw new Error("Missing testcase identity");
@@ -84,12 +86,13 @@ export function ciTestReport(xml: string) {
         node.attributes.classname ?? null,
         node.attributes.name,
       ]);
-      if (tests.has(identity)) throw new Error("Duplicate testcase identity");
-      tests.set(identity, { file: path, outcome });
-      counts[0] = 1;
-      counts[1] = Number(outcome === "failure");
-      counts[2] = Number(outcome === "error");
-      counts[3] = Number(outcome === "skipped");
+      const previous = tests.get(identity)?.outcome ?? "pass";
+      if (outcomesBySeverity.indexOf(outcome) >= outcomesBySeverity.indexOf(previous))
+        tests.set(identity, { file: path, outcome });
+      counts.tests = 1;
+      counts.failures = Number(outcome === "failure");
+      counts.errors = Number(outcome === "error");
+      counts.skipped = Number(outcome === "skipped");
     }
     for (const child of children(node)) {
       if (["testsuite", "testcase"].includes(child.name) && node.name !== "testcase") {
@@ -98,28 +101,24 @@ export function ciTestReport(xml: string) {
           node.name === "testsuite" ? [...suites, node.attributes.name ?? ""] : suites,
           file,
         );
-        nested.forEach((count, index) => {
-          counts[index] = (counts[index] ?? 0) + count;
-        });
+        for (const key of countKeys) counts[key] += nested[key];
       } else if (
         !["failure", "error", "skipped", "system-out", "system-err", "properties"].includes(child.name) ||
         (node.name !== "testcase" && ["failure", "error", "skipped"].includes(child.name))
       )
         throw new Error("Unknown JUnit evidence");
     }
-    ["tests", "failures", "errors", "skipped"].forEach((key, index) => {
-      const value = node.attributes[key];
-      if (
-        (node === root && index < 3 && value === undefined) ||
-        (value !== undefined && (!/^\d+$/.test(value) || Number(value) !== counts[index]))
-      )
-        throw new Error("Incomplete JUnit counts");
-    });
+    if (node.name !== "testcase")
+      for (const key of countKeys) {
+        const value = node.attributes[key];
+        if (value === undefined ? counts[key] !== 0 : !/^\d+$/.test(value) || Number(value) !== counts[key])
+          throw new Error("Incomplete JUnit counts");
+      }
     return counts;
   };
-  visit(root);
+  const counts = visit(root);
   if (!tests.size) throw new Error("Empty JUnit report");
-  return tests;
+  return { tests, counts };
 }
 
 /** Read ZIP members in memory, bounded before decompression; never extract artifact paths. */
@@ -162,6 +161,30 @@ export function ciArtifactXml(value: unknown): string[] {
     names.add(name);
     const start = offset + 30 + zip.readUInt16LE(offset + 26) + zip.readUInt16LE(offset + 28);
     if (start + packed > zip.readUInt32LE(end + 16)) throw new Error("Truncated ZIP entry");
+    for (const [local, central] of [
+      [4, 6],
+      [6, 8],
+      [8, 10],
+    ] as const)
+      if (zip.readUInt16LE(offset + local) !== zip.readUInt16LE(at + central))
+        throw new Error("Conflicting ZIP header");
+    for (const [local, central] of [
+      [14, 16],
+      [18, 20],
+      [22, 24],
+    ] as const) {
+      const value = zip.readUInt32LE(offset + local);
+      if (value !== zip.readUInt32LE(at + central) && (!(flags & 8) || value !== 0))
+        throw new Error("Conflicting ZIP sizes or CRC");
+    }
+    if (flags & 8) {
+      let descriptor = start + packed;
+      if (zip.readUInt32LE(descriptor) === 0x08074b50) descriptor += 4;
+      if (descriptor + 12 > zip.readUInt32LE(end + 16)) throw new Error("Truncated ZIP descriptor");
+      for (const [index, central] of [16, 20, 24].entries())
+        if (zip.readUInt32LE(descriptor + index * 4) !== zip.readUInt32LE(at + central))
+          throw new Error("Conflicting ZIP descriptor");
+    }
     const data = zip.subarray(start, start + packed);
     const content = method === 8 ? inflateRawSync(data, { maxOutputLength: limit }) : data;
     if (content.length !== bytes || Bun.hash.crc32(content) !== zip.readUInt32LE(at + 16))
@@ -307,6 +330,7 @@ export async function unrelatedCiTests(
       .parse(await read(`actions/runs/${r.id}/artifacts?per_page=100&page=1`));
     if (artifacts.total_count !== artifacts.artifacts.length) throw new Error("Incomplete artifacts");
     const tests = new Map<string, { file: string; outcome: string }>();
+    const counts = { tests: 0, failures: 0, errors: 0, skipped: 0 };
     const ids: number[] = [];
     for (const artifact of artifacts.artifacts) {
       const created = Date.parse(artifact.created_at);
@@ -325,30 +349,24 @@ export async function unrelatedCiTests(
         artifact.workflow_run.head_sha !== r.head_sha
       )
         throw new Error("Unavailable or ambiguous JUnit artifact");
-      for (const xml of ciArtifactXml(await read(`actions/artifacts/${artifact.id}/zip`)))
-        for (const [identity, test] of ciTestReport(xml)) {
+      for (const xml of ciArtifactXml(await read(`actions/artifacts/${artifact.id}/zip`))) {
+        const report = ciTestReport(xml);
+        for (const key of countKeys) counts[key] += report.counts[key];
+        for (const [identity, test] of report.tests) {
           if (tests.has(identity)) throw new Error("Conflicting JUnit reports");
           tests.set(identity, test);
         }
+      }
       ids.push(artifact.id);
     }
     if (!tests.size) throw new Error("Missing JUnit reports");
-    return { tests, ids, job };
+    return { tests, counts, ids, job };
   };
   const failed = await reports(run, origin.id);
   // JUnit counters alone can omit runner/load failures. Corroborate the entire failing execution.
   const runner = new RunnerFailureEvidence();
   for (const line of testExecution(log)) runner.observe(line);
-  const outcomes = [...failed.tests.values()];
-  if (
-    !runner.agrees({
-      tests: outcomes.length,
-      failures: outcomes.filter((t) => t.outcome === "failure").length,
-      errors: outcomes.filter((t) => t.outcome === "error").length,
-      skipped: outcomes.filter((t) => t.outcome === "skipped").length,
-    })
-  )
-    throw new Error("Incomplete runner evidence");
+  if (!runner.agrees(failed.counts)) throw new Error("Incomplete runner evidence");
   const main = await reports(latest);
   const tests = [...failed.tests].filter(([, test]) => ["failure", "error"].includes(test.outcome));
   if (

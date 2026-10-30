@@ -1,34 +1,61 @@
+import { readFileSync } from "node:fs";
 import { deflateRawSync } from "node:zlib";
 import { type fakeGitHub, respond } from "./github-poller-support.ts";
 
+// Captured from Bun 1.4.3; only the hostname was replaced with a public placeholder.
+export const bunJunit = readFileSync(
+  new URL("./fixtures/bun-1.4.3-repeated-junit.xml", import.meta.url),
+  "utf8",
+);
+
 /** Inline reports, compressed exactly as an Actions artifact, without filesystem/network clients. */
-export function reportZip(xml: string): Uint8Array {
-  const name = Buffer.from("junit.xml");
-  const text = Buffer.from(xml);
-  const compressed = deflateRawSync(text);
-  const local = Buffer.alloc(30);
-  local.writeUInt32LE(0x04034b50);
-  local.writeUInt16LE(20, 4);
-  local.writeUInt16LE(8, 8);
-  local.writeUInt32LE(Bun.hash.crc32(text), 14);
-  local.writeUInt32LE(compressed.length, 18);
-  local.writeUInt32LE(text.length, 22);
-  local.writeUInt16LE(name.length, 26);
-  const directory = Buffer.alloc(46);
-  directory.writeUInt32LE(0x02014b50);
-  directory.writeUInt16LE(20, 6);
-  directory.writeUInt16LE(8, 10);
-  directory.writeUInt32LE(Bun.hash.crc32(text), 16);
-  directory.writeUInt32LE(compressed.length, 20);
-  directory.writeUInt32LE(text.length, 24);
-  directory.writeUInt16LE(name.length, 28);
+export function reportZip(xml: string | string[], descriptor?: "signed" | "unsigned"): Uint8Array {
+  const entries: Buffer[] = [];
+  const directories: Buffer[] = [];
+  let offset = 0;
+  for (const [index, report] of (typeof xml === "string" ? [xml] : xml).entries()) {
+    const name = Buffer.from(`junit${index}.xml`);
+    const text = Buffer.from(report);
+    const compressed = deflateRawSync(text);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(descriptor ? 8 : 0, 6);
+    local.writeUInt16LE(8, 8);
+    if (!descriptor) {
+      local.writeUInt32LE(Bun.hash.crc32(text), 14);
+      local.writeUInt32LE(compressed.length, 18);
+      local.writeUInt32LE(text.length, 22);
+    }
+    local.writeUInt16LE(name.length, 26);
+    const directory = Buffer.alloc(46);
+    directory.writeUInt32LE(0x02014b50);
+    directory.writeUInt16LE(20, 6);
+    directory.writeUInt16LE(descriptor ? 8 : 0, 8);
+    directory.writeUInt16LE(8, 10);
+    directory.writeUInt32LE(Bun.hash.crc32(text), 16);
+    directory.writeUInt32LE(compressed.length, 20);
+    directory.writeUInt32LE(text.length, 24);
+    directory.writeUInt16LE(name.length, 28);
+    directory.writeUInt32LE(offset, 42);
+    const trailer = Buffer.alloc(descriptor === "signed" ? 16 : descriptor ? 12 : 0);
+    if (descriptor) {
+      if (descriptor === "signed") trailer.writeUInt32LE(0x08074b50);
+      directory.copy(trailer, descriptor === "signed" ? 4 : 0, 16, 28);
+    }
+    const entry = Buffer.concat([local, name, compressed, trailer]);
+    entries.push(entry);
+    directories.push(directory, name);
+    offset += entry.length;
+  }
+  const directory = Buffer.concat(directories);
   const end = Buffer.alloc(22);
   end.writeUInt32LE(0x06054b50);
-  end.writeUInt16LE(1, 8);
-  end.writeUInt16LE(1, 10);
-  end.writeUInt32LE(directory.length + name.length, 12);
-  end.writeUInt32LE(local.length + name.length + compressed.length, 16);
-  return Buffer.concat([local, name, compressed, directory, name, end]);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...entries, directory, end]);
 }
 
 export const junit = (outcome = "failure", file = "test/example.test.ts", name = "asserts") =>
