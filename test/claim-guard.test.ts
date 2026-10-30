@@ -6,6 +6,7 @@ import {
   ClaimLostError,
   ClaimWaitError,
   rethrowClaimControl,
+  selectClaimControl,
 } from "../src/integrations/claim-errors.ts";
 import { bindClaim, claimGuard, claimScope, type ScopedClaim } from "../src/integrations/claim-guard.ts";
 import { type ClaimRecord, createClaimClient } from "../src/integrations/claim-ref.ts";
@@ -460,7 +461,13 @@ test("source boundaries keep the primitive disabled in production", async () => 
       ]);
       continue;
     }
-    expect(source).not.toMatch(/\b(?:bindClaim|claimGuard)\b|claimScope\.run\b/);
+    expect(source).not.toMatch(/\bbindClaim\b|claimScope\.run\b/);
+    if (/\bclaimGuard\b/.test(source))
+      expect([
+        "src/integrations/github-identity.ts",
+        "src/git/repos.ts",
+        "src/pipeline/context.ts",
+      ]).toContain(path);
     if (/\bclaimScope\b/.test(source)) {
       expect(allowed.has(path)).toBe(true);
       expect(source.replace(/import .*claimScope.*\n/, "").replaceAll("claimScope.exit", "")).not.toMatch(
@@ -470,4 +477,22 @@ test("source boundaries keep the primitive disabled in production", async () => 
     }
   }
   expect(references.sort()).toEqual([...allowed].sort());
+});
+
+test("claim rejection selection preserves identity, priority and input-order ties", () => {
+  const ordinary = new Error("ordinary");
+  const wait = new ClaimWaitError("lease");
+  const loss = new ClaimLostError();
+  for (const pair of [
+    [ordinary, wait],
+    [ordinary, loss],
+    [wait, loss],
+  ]) {
+    const selected = pair.includes(loss) ? loss : wait;
+    expect(selectClaimControl(pair)).toBe(selected);
+    expect(selectClaimControl([...pair].reverse())).toBe(selected);
+  }
+  expect(selectClaimControl([ordinary, null, undefined])).toBeUndefined();
+  expect(selectClaimControl([wait, new ClaimWaitError("cancelled")])).toBe(wait);
+  expect(selectClaimControl([loss, new ClaimLostError()])).toBe(loss);
 });

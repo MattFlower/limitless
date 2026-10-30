@@ -4,8 +4,11 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Role } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import * as repos from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
+import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
+import { bindClaim, claimScope } from "../src/integrations/claim-guard.ts";
 import { CancelledError, NoCapacityError, RunContext } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { SimulatedTermination } from "../src/pipeline/faults.ts";
@@ -105,6 +108,132 @@ describe("routing bounded slot waits", () => {
     return { clock, cfg, tracker, router, calls, controller, context, run, invoke, events };
   }
 
+  test.each(["claim", "rejected", "unavailable"])(
+    "admission cleanup owns the slot during preflight: %s",
+    async (kind) => {
+      const f = fixture();
+      const entered = deferred<void>();
+      const resume = Promise.withResolvers<boolean>();
+      const error = kind === "claim" ? new ClaimWaitError("lease") : new Error("preflight rejected");
+      let closed = false;
+      const claim = bindClaim(
+        {
+          windowOpen: () => {
+            if (closed) throw error;
+            return true;
+          },
+        },
+        { repo: "wait/repo", ref: "refs/limitless/claims/1", run: f.run.id, member: "m", generation: 1 },
+        () => false,
+      );
+      const preflight = spyOn(f.tracker, "preflight").mockImplementation(() => {
+        entered.resolve();
+        return resume.promise;
+      });
+      const acquire = f.tracker.acquireFirst.bind(f.tracker);
+      let releases = 0;
+      const admission = spyOn(f.tracker, "acquireFirst").mockImplementation(async (...args) => {
+        const slot = await acquire(...args);
+        if (!slot) return slot;
+        return {
+          ...slot,
+          release: () => {
+            releases++;
+            slot.release();
+          },
+        };
+      });
+      try {
+        const work = claimScope.run([claim], () => f.invoke()).catch((e) => e);
+        await entered.promise;
+        expect(f.tracker.status("alpha")?.inFlight).toBe(1);
+        if (kind === "rejected") resume.reject(error);
+        else {
+          closed = kind === "claim";
+          resume.resolve(kind !== "unavailable");
+        }
+        if (kind === "unavailable") f.controller.abort();
+        const outcome = await work;
+        if (kind !== "unavailable") expect(outcome).toBe(error);
+        expect(releases).toBe(1);
+        expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
+        expect(f.calls).toHaveLength(0);
+      } finally {
+        preflight.mockRestore();
+        admission.mockRestore();
+      }
+    },
+  );
+
+  test.each([false, true])(
+    "invoke and stage preserve claim control with signal aborted=%s",
+    async (abort) => {
+      const error = new ClaimLostError();
+      const f = fixture(models, policy, () => {
+        if (abort) f.controller.abort();
+        throw error;
+      });
+      const work = f.context.stage("triage", async (stage) => {
+        const value = await f.context.invoke({
+          role: "triage",
+          stage,
+          prompt: "wait",
+          mode: "readonly",
+          noTools: true,
+          complexity: "small",
+        });
+        return { value, summary: "unreachable" };
+      });
+      expect(await work.catch((e) => e)).toBe(error);
+      expect(f.calls).toHaveLength(1);
+      expect(f.context.store.listStages(f.run.id).at(-1)?.status).toBe("cancelled");
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    },
+  );
+
+  test.each([false, true])(
+    "executor interruption survives reader cleanup with signal aborted=%s",
+    async (abort) => {
+      const f = fixture();
+      const error = new ClaimLostError();
+      let executions = 0;
+      f.context.state.worktreePath = repoDir;
+      f.context.deps.agentExecutor = {
+        kind: "fake",
+        run: async () => {
+          executions++;
+          if (abort) f.controller.abort();
+          throw error;
+        },
+      };
+      const cleanup = spyOn(repos, "discardChanges").mockRejectedValue(new Error("reader cleanup failed"));
+      try {
+        const work = f.context.stage("review", async (stage) => ({
+          value: await f.context.invoke({
+            role: "review",
+            stage,
+            prompt: "review",
+            mode: "readonly",
+            complexity: "small",
+            privateOutput: true,
+          }),
+          summary: "unreachable",
+        }));
+        expect(await work.catch((e) => e)).toBe(error);
+        expect(executions).toBe(1);
+        expect(f.calls).toHaveLength(0);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+        expect(f.context.store.listStages(f.run.id).at(-1)?.status).toBe("cancelled");
+        expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+        expect(
+          f.context.store.listEvents(f.run.id).some((e) => e.message.includes("reader cleanup failed")),
+        ).toBe(true);
+      } finally {
+        cleanup.mockRestore();
+      }
+    },
+  );
   test.each([false, true])(
     "implement dispatch history survives a crash inside the harness and database reopen (pinned=%s)",
     async (pinned) => {

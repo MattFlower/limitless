@@ -84,7 +84,7 @@ import {
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, platformConfinement } from "../harness/sandbox.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
-import { rethrowClaimControl } from "../integrations/claim-errors.ts";
+import { ClaimControlError, rethrowClaimControl, selectClaimControl } from "../integrations/claim-errors.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -1108,7 +1108,7 @@ function profile(ctx: RunContext): ResolvedProfile {
   return ctx.run.resolvedProfile ?? "standard";
 }
 
-async function buildLoop(ctx: RunContext): Promise<void> {
+export async function buildLoop(ctx: RunContext): Promise<void> {
   if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha) {
     const review = reviewRound(ctx);
     const tip = ctx.state.reviewBaseSha;
@@ -1164,6 +1164,8 @@ async function buildLoop(ctx: RunContext): Promise<void> {
       ctx.checkCancelled();
       const round = ctx.state.round;
       const passed = await oneRound(ctx, round, holdout);
+      const interruption = selectClaimControl([await holdout]);
+      if (interruption) throw interruption;
       if (passed) {
         await ctx.setPhase("deliver");
         return;
@@ -1175,6 +1177,8 @@ async function buildLoop(ctx: RunContext): Promise<void> {
     throw new NeedsHumanError(
       `Still failing after ${ctx.state.round} implementation rounds. Last feedback:\n${ctx.state.feedback ?? ""}`,
     );
+  } catch (error) {
+    throw selectClaimControl([error, await holdout]) ?? error;
   } finally {
     if (holdout) await holdout;
   }
@@ -1195,14 +1199,26 @@ async function withBaseSnapshot<T>(
   const worktree = ctx.state.worktreePath;
   if (!worktree || !baseSha) throw new Error("A base snapshot needs the run worktree and a base commit");
   const snapshot = createSnapshotParent();
+  let interruption: ClaimControlError | undefined;
+  const cleanup = () => {
+    try {
+      assertProcessesStopped();
+      rmSync(snapshot, { recursive: true, force: true });
+    } catch (error) {
+      if (!interruption) throw error;
+      ctx.log(redactCredentials(`Snapshot cleanup failed: ${String(error)}`), "warn");
+    }
+  };
   try {
     const base = join(snapshot, "base");
     mkdirSync(base);
     await exportCommit(worktree, baseSha, base, ctx.signal);
     return await fn(base);
+  } catch (error) {
+    if (error instanceof ClaimControlError) interruption = error;
+    throw error;
   } finally {
-    assertProcessesStopped();
-    rmSync(snapshot, { recursive: true, force: true });
+    cleanup();
   }
 }
 
@@ -1807,6 +1823,7 @@ async function oneRound(
     },
   );
   const comparison = await checks.catch(async (error: unknown) => {
+    rethrowClaimControl(error);
     ctx.checkCancelled();
     if (!(error instanceof WorktreeCleanError) || !ctx.state.implementerIssue) throw error;
     ctx.state.feedback = redactPrivate(
@@ -2244,6 +2261,7 @@ async function oneRound(
   const stopPreview = async () => {
     await preview?.stop();
   };
+  let interruption: ClaimControlError | undefined;
   try {
     const verifiedSha = await headSha(cwd);
     const checkVerifiedHead = async () => {
@@ -2451,9 +2469,16 @@ async function oneRound(
       try {
         try {
           results = await Promise.allSettled([reviewStage(), verifyAttempt(pending?.attempt ?? 0)]);
+          interruption = selectClaimControl(
+            results.map((m) => (m.status === "rejected" ? m.reason : undefined)),
+          );
+          if (interruption) throw interruption;
         } finally {
           ctx.parallelChecks = false;
-          await discardChanges(cwd);
+          await discardChanges(cwd).catch((error: unknown) => {
+            if (!interruption) throw error;
+            ctx.log(redactCredentials(`Reader cleanup failed: ${String(error)}`), "warn");
+          });
         }
         // Fixed error precedence, independent of completion order. Both stages have settled.
         if (results[0].status === "rejected") throw results[0].reason;
@@ -2469,6 +2494,7 @@ async function oneRound(
             throw error;
         }
       } catch (error) {
+        rethrowClaimControl(error);
         // A reader or cleanup error must not hide a commit moved by its sibling.
         if (
           !(error instanceof CancelledError || error instanceof SimulatedTermination) &&
@@ -2583,9 +2609,15 @@ async function oneRound(
     }
     await recordVerified(ctx, await headSha(cwd));
     return true;
+  } catch (error) {
+    if (error instanceof ClaimControlError) interruption = error;
+    throw error;
   } finally {
     ctx.previewUrl = undefined;
-    await stopPreview();
+    await stopPreview().catch((error: unknown) => {
+      if (!interruption) throw error;
+      ctx.log(redactCredentials(`Preview cleanup failed: ${String(error)}`), "warn");
+    });
   }
 }
 

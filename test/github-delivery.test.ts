@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import * as subprocess from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +18,6 @@ import {
 } from "../src/git/repos.ts";
 import { ClaimLostError } from "../src/integrations/claim-errors.ts";
 import * as github from "../src/integrations/github-identity.ts";
-import * as proc from "../src/util/proc.ts";
 import { CommandError, sh } from "../src/util/proc.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -78,7 +78,7 @@ test.each([false, true])(
     const release = Promise.withResolvers<void>();
     const cacheGit = command.cacheGit;
     const harden = hardening.harden;
-    const execute = proc.sh;
+    const execute = subprocess.spawn;
     let preparingPush = false;
     let owned = true;
     let guards = 0;
@@ -97,10 +97,14 @@ test.each([false, true])(
       }
       return result;
     });
-    const transport = spyOn(proc, "sh").mockImplementation((cmd, opts) => {
-      if (cmd.includes("push")) throw new Error("unexpected push");
-      return execute(cmd, opts);
-    });
+    const transport = spyOn(subprocess, "spawn").mockImplementation(((
+      bin: string,
+      args: readonly string[],
+      opts: subprocess.SpawnOptions,
+    ) => {
+      if (args.includes("push")) throw new Error("unexpected push");
+      return execute(bin, args, opts);
+    }) as typeof subprocess.spawn);
     const result = pushExistingBranch(
       repo,
       work,
@@ -122,7 +126,9 @@ test.each([false, true])(
       release.resolve();
       expect(await outcome).toBe(refused);
       expect(guards).toBe(1);
-      expect(transport.mock.calls.filter(([cmd]) => cmd.includes("push"))).toEqual([]);
+      expect(transport.mock.calls.filter(([, args]) => Array.isArray(args) && args.includes("push"))).toEqual(
+        [],
+      );
     } finally {
       release.resolve();
       await outcome;
