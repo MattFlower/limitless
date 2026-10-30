@@ -1,3 +1,4 @@
+import type { CiFailure } from "../core/types.ts";
 import {
   classifyObservation,
   type FailureClass,
@@ -6,6 +7,7 @@ import {
 } from "../gates/failure-class.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import type { GateComparison } from "../gates/run.ts";
+import type { CiTestEvidence } from "../integrations/ci-test-evidence.ts";
 import type { Store } from "./store.ts";
 
 export interface FailureObservation {
@@ -44,6 +46,46 @@ export interface FailureObservation {
 export type ObservationFilter = { repo?: string; since?: number; class?: FailureClass; finalized?: boolean };
 export class FailureObservations {
   constructor(private readonly store: Store) {}
+  /** Eligibility evidence is not a successful retry: retain the failed execution and no_retry history. */
+  ciFlaky(
+    repo: string,
+    runId: string | null,
+    failure: CiFailure,
+    job: { id: number; run_id: number; run_attempt: number },
+    evidence: CiTestEvidence,
+    excerpt: string,
+  ): void {
+    const owner = runId ?? `ci:${failure.prUrl}:${failure.sha}`;
+    const handle = JSON.stringify([repo, job.run_id, job.run_attempt, job.id]);
+    this.insert({
+      run_id: owner,
+      repo,
+      stage_id: 0,
+      round: 0,
+      sha: failure.sha,
+      handle_kind: "github-actions",
+      handle_id: handle,
+      phase: "check",
+      name: redactGateOutput(failure.check),
+      command: "",
+      location: null,
+      os: null,
+      load_per_core: null,
+      observed_at: Date.now(),
+      exit_code: 1,
+      timed_out: 0,
+      confinement: 0,
+      duration_ms: 0,
+      failed_files: redactGateOutput(JSON.stringify(evidence.tests.map((t) => t.file))),
+      output_tail: redactGateOutput(excerpt),
+      signature: redactGateOutput(failure.signature),
+      setup_eligible: 0,
+    });
+    this.store.db
+      .query(`UPDATE failure_observations SET class='flaky', history='no_retry',
+      reason=?, finalized_at=? WHERE run_id=? AND handle_kind='github-actions' AND handle_id=? AND finalized_at IS NULL`)
+      .run(redactGateOutput(JSON.stringify(evidence)), Date.now(), owner, handle);
+  }
   read(filter: ObservationFilter = {}): FailureObservation[] {
     return this.store.db
       .query<FailureObservation, (string | number | null)[]>(
