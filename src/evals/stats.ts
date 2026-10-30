@@ -3,6 +3,7 @@ import { StoredReviewSchema } from "../pipeline/schemas.ts";
 import { evidenceTarget, recordedTarget } from "../router/targets.ts";
 import type { ReviewCase } from "./cases.ts";
 import type { gradeReview } from "./graders/review.ts";
+import type { JudgedMetrics } from "./judge.ts";
 
 export interface StatsOptions {
   delta?: number;
@@ -146,6 +147,7 @@ function roleMetrics(run: EvalRun, rows: EvalTrial[], cases: ReviewCase[] = [], 
       run.role === "review"
         ? {
             defectRecall: { ...rate(matched, total), ci: wilson(matched, total) },
+            ...({} as { judged?: JudgedMetrics }),
             falseBlock: rate(clean.filter((r) => r.falseBlock).length, clean.length),
             ...(original
               ? {

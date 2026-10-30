@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { EvalRequestSchema } from "../evals/cases.ts";
 import { policyDiff, proposedOverlay, renderEvidence } from "../evals/evidence.ts";
 import { formatEvalReport } from "../evals/format.ts";
+import { type JudgeJob, JudgeRequestSchema } from "../evals/judge.ts";
 import {
   OVERRIDES_PATH,
   parseOverrides,
@@ -16,6 +17,7 @@ import type { EvalReport } from "../evals/stats.ts";
 import { type EvalReviewSystem, parseEvalReviewSystems } from "../pipeline/review-system.ts";
 import { DEFAULT_POLICY, REMOVED_MODELS } from "../router/catalog.ts";
 import { overlayPolicy, parsePolicy, validatePolicy } from "../router/policy.ts";
+import { parseTarget } from "../router/targets.ts";
 
 export { formatEvalReport } from "../evals/format.ts";
 
@@ -88,10 +90,38 @@ export async function evalCommand(
     }
     return;
   }
-  if (args.length !== 2 || !value || !["run", "report", "regrade", "resume", "cancel"].includes(action ?? ""))
+  if (
+    args.length !== 2 ||
+    !value ||
+    !["run", "report", "regrade", "resume", "cancel", "judge"].includes(action ?? "")
+  )
     throw new Error(
-      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval report <eval-id> [--json] | eval regrade <eval-id> | eval resume <eval-id> | eval cancel <eval-id>",
+      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval report <eval-id> [--json] | eval judge <eval-id> --judges model[@effort],model[@effort] [--max-usd N] | eval regrade <eval-id> | eval resume <eval-id> | eval cancel <eval-id>",
     );
+  if (action === "judge") {
+    const request = JudgeRequestSchema.parse({
+      judges: typeof flags.judges === "string" ? flags.judges.split(",") : [],
+      ...(flags["max-usd"] === undefined
+        ? {}
+        : {
+            maxUsd:
+              typeof flags["max-usd"] === "string" && flags["max-usd"].trim()
+                ? Number(flags["max-usd"])
+                : Number.NaN,
+          }),
+    });
+    for (const judge of request.judges) parseTarget(judge);
+    const path = `/api/evals/${encodeURIComponent(value)}`;
+    let job = await io.api<JudgeJob>(`${path}/judge`, { method: "POST", body: JSON.stringify(request) });
+    while (job.status === "running") {
+      await io.wait(500);
+      job = await io.api<JudgeJob>(`${path}/judge`);
+    }
+    if (job.status === "failed") throw new Error(job.error ?? "judging failed");
+    io.print(JSON.stringify(job.result));
+    io.print(formatEvalReport(await io.api<EvalReport>(path)));
+    return;
+  }
   if (action === "resume") {
     const { id } = await io.api<{ id: string }>(`/api/evals/${encodeURIComponent(value)}/resume`, {
       method: "POST",
