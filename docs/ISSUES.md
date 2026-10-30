@@ -14,15 +14,34 @@ For issue-linked runs in enabled queue repositories, each poll reconciles:
 |---|---|---|
 | Run starts | in-progress; remove needs-you and failed | Run id and UI link |
 | PR opened | in-progress | PR link; PR body carries `Closes #n` |
-| needs_human | needs-you; remove in-progress | Fixed needs-you text, run id and UI link |
+| waiting_input | needs-you; remove in-progress | Open questions with database IDs and UI instructions |
+| needs_human | needs-you; remove in-progress | Reason, run id and UI link |
 | Failed | failed; remove in-progress | Fixed failed text, run id and UI link |
 | Cancelled | remove in-progress | Cancellation |
 | PR merged | remove in-progress and needs-you | None; GitHub closes the issue |
 
-Comments contain only fixed event text, the run id and UI link, plus a validated same-repository
-PR URL for the PR event. Reasons and other free-form run text are never published. The exact
-body, including its dedupe marker, is credential-redacted, sanitized for local paths, and checked
-against private strings. A blocked body is recorded done without posting, with the reason logged.
+While waiting for input, a linked run publishes its unanswered questions in ascending database-ID
+order, once per open-question set across polls and restarts. Partial answers publish the remaining
+set without renumbering. Answer in the UI using the comment's run link; GitHub answering is not
+supported in this slice. Existing waiting runs publish outstanding questions after upgrade.
+Needs-human comments select the first nonempty reason from persisted `needsHumanReason`,
+`terminalReason`, then the run error, otherwise fixed UI-only text.
+
+Each complete original question or selected reason is inspected against registered credentials
+and configured private strings using supported decoding, before any transformation. A match or
+inspection failure withholds the entire field as `[withheld; see the UI]`; a withheld reason never
+falls through to another reason. The complete outgoing body, including marker and UI link, is
+credential-redacted, sanitized for local paths, and inspected again, including at delivery. A failed
+final inspection suppresses the comment durably. Diagnostics use fixed codes without private text.
+
+Recovery accepts only an exact factory-generated first-line marker from the checkpointed posting
+identity. Question markers identify the run, linked repository/issue and sorted question IDs;
+markers embedded in question or reason text never acknowledge delivery. Transformations that
+alter the marker suppress publication. Unsent stale question sets are superseded; uncertain POSTs
+are recovered before rechecking the saved body's privacy or closing the checkpoint, even if
+inspection is unavailable. New POSTs still require current inspection and eligibility; stale sets
+are never reposted. Accepted comments remain visible. Completed historical comments are preserved,
+and pending legacy comments retain their stored text.
 
 Observed events are recorded before delivery and have durable checkpoints, including comment
 ids and posting identities; restarts do not duplicate comments. Pre-existing runs receive only
@@ -184,12 +203,20 @@ commands: a trusted issue `issue_comment.created` delivery hints a poll, coalesc
 already running, and is recorded as ignored. Hints wait at least 30 seconds from the previous
 tick's start and honor rate-limit reset deadlines. After an API failure, hints cannot shorten
 the regular polling retry delay. Owner comments on pull requests, including in queue repositories,
-and issue comments outside queue repositories still start runs directly through webhooks and
+and issue comments outside queue repositories still start ordinary runs directly through webhooks and
 record the same comment id.
 
 Managed issue runs use polling lifecycle comments instead of legacy notifier comments.
-Marked queue runs outside managed repositories keep suppressing legacy comments. GitHub
-questions and approvals remain later slices.
+Marked queue runs outside managed repositories keep suppressing legacy comments.
+
+The exact lowercase first request word `answer` is reserved after slash or supported bot-mention
+extraction, including bare or malformed answer arguments. It neither starts a run nor answers a
+question. Eligible polling commands receive one durable unsupported refusal record; webhooks
+ignore them, including on PRs, closed issues and unmanaged repositories. Neither path sends a
+rejection reply. Untrusted, bot and edited polling comments remain silently ignored and unrecorded.
+`answer:` and `Answer` are ordinary request words. Answer consumption and approvals remain later
+slices. Older daemons lack this reservation and may treat answer commands as run requests;
+a rollback must not advertise GitHub answering as supported.
 
 ## Epic attention
 

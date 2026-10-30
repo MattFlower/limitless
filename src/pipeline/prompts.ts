@@ -88,7 +88,7 @@ Produce:
 - summary: what will be built and why, in 2–4 sentences.
 - requirements: precise, implementation-relevant requirements.
 - acceptance_criteria: ${min}–${max} observable, independently testable criteria (ids AC-1, AC-2, ...). Each needs a concrete how_to_verify (a command to run, a test to add, a behavior to observe). Cover edge cases the requester would expect, not just the happy path. Do not write criteria that only restate the repository's automated checks (lint, typecheck, the whole test suite): the factory runs those on every round. Require a specific new test only where behavior is new or at risk of regression, not for every criterion.
-  Every acceptance criterion must be verifiable inside the run's own checkout using the repository's commands and tests. Criteria requiring a person, the orchestrator, a browser, live external services, a deploy, or a later event are not allowed. Put such concerns under assumptions or out_of_scope.
+  Every acceptance criterion must be verifiable inside the run's own checkout using the repository's commands and tests or its UI preview. Set browser true only for checks that need viewing or interacting with the UI preview, and false otherwise. Criteria requiring a person, the orchestrator, a browser outside the UI preview, live external services, a deploy, or a later event are not allowed. Put such concerns under assumptions or out_of_scope.
 - assumptions: decisions you made where the request was silent.
 - out_of_scope: tempting things that should NOT be done.
 - blocking_questions: only if the task truly cannot proceed sensibly without an answer; otherwise empty.
@@ -107,6 +107,7 @@ Rules:
 - Write steps from the repository root with relative paths; never use this checkout's absolute path.
 - Return 1–8 scenarios with sequential IDs H-1, H-2, ... Fewer, well-grounded scenarios beat many speculative ones.
 - Include an edge or failure case only when the request or specification implies it, and mark it edge_case true; mark every other scenario edge_case false.
+- Set browser true only for checks that need viewing or interacting with the UI preview, and false otherwise.
 
 Each scenario needs a short description, concrete steps or inputs, and an expected observable outcome. Keep scenario text out of files, including temporary ones: return it only in the JSON object.\n\n# Original request\n${quoteRequest(input.prompt)}\n\n# Specification\n${renderSpec(input.spec)}`;
 }
@@ -720,6 +721,7 @@ attributionEvidence must record change (what changed, with base/head file:line e
 }
 
 export function verifyPrompt(input: {
+  previewUrl?: string;
   allowLocalBinding?: boolean;
   prompt: string;
   spec: Spec;
@@ -732,6 +734,14 @@ export function verifyPrompt(input: {
   // sandbox fails for environmental reasons and used to mark such criteria unmet.
   const checks = input.checks?.length
     ? `\n# Repository checks (already run by the factory on this HEAD)\n${input.checks.map((c) => `- ${c.name} \`${c.result.command}\`: ${docsGateSummary(c) ?? (c.result.ok ? "pass" : `FAIL (${c.verdict.replaceAll("_", " ")})`)}`).join("\n")}\nDo not rerun these full commands as evidence: your sandbox differs from the factory's environment. Run targeted tests and commands for behavior. Leave all gate citation and coverage decisions to the engine; do not mark a criterion met based on these results or supply gate provenance.\n`
+    : "";
+  const browser = input.previewUrl
+    ? `\n# Browser\nUse the available browser tools at ${input.previewUrl}. For every marked browser check (${
+        [...input.spec.acceptance_criteria, ...input.holdout.scenarios]
+          .filter((c) => c.browser === true)
+          .map((c) => c.id)
+          .join(", ") || "none"
+      }), resize the viewport and record observations at both 1280 × 800 and 375 × 812 CSS pixels. For interactions, record the actions taken and the results observed at both sizes. Screenshots may be taken for your own inspection but are not retained. A screenshot alone does not establish interactive correctness. If browser tools are actually unavailable, report the row blocked with blockedReason "environment" and the observed reason.\n`
     : "";
   return `You are the acceptance verifier for an automated coding pipeline. Decide whether the implementation on this branch actually satisfies each acceptance criterion. Be skeptical: verify by running commands, executing the code, and reading the implementation — never by trusting comments, commit messages, or the implementer's claims.
 
@@ -746,7 +756,7 @@ ${input.spec.acceptance_criteria.map((a) => `- **${a.id}** ${a.criterion}\n  - h
 
 # Blind holdout scenarios
 ${input.holdout.scenarios.map((s) => `- **${s.id}** ${s.description}\n  - steps: ${s.steps}\n  - expected: ${s.expected}`).join("\n")}
-${checks}
+${checks}${browser}
 The change is \`git diff ${input.baseSha}..HEAD\`. Do not modify repository files (create temporary fixtures and redirect supported build/test outputs under TMPDIR only, also supplied as TMP and TEMP).
 For each acceptance criterion and holdout scenario return met / unmet / unclear / blocked with concrete evidence (the command you ran and what you observed, or file:line references) and publicSummary. For each H-id, publicSummary must be a short description of observed behavior without private inputs, expected values, or scenario text; use an empty string for public criteria. Use blocked when an environmental permission or sandbox restriction, or an unavailable required platform or tool, prevents verification from executing. Expected permission-denial tests, genuine assertion failures and implementation-caused failures are not environment blocks; report defects as unmet and use \`unclear\` for missing evidence the run could have produced or an indeterminate outcome. For unmet holdouts, describe the observed failure in evidence without repeating the scenario text or private inputs.
 For a sandbox-blocked criterion, you may supply covering_tests with up to 3 existing tracked test files and exact test titles that cover the criterion (at most 10 tests per round). The factory will run these tests itself.
