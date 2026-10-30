@@ -135,9 +135,9 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
     from one under the home, which is where the deploy's release checkout lives (#500).
   - Deny lists hold files (credential stores) as well as directories. Code that walks them must
     not assume a directory (#501: the Codex probe made canaries inside `~/.npmrc`).
-  - Before landing a confinement change, run the full suite unconfined from a checkout under the
-    real home, as the deploy does. Gates, land checks and CI skip the real-Seatbelt tests, and a
-    `/tmp` checkout hides home-deny failures.
+  - Before landing a confinement, service or deploy change, run the full suite unconfined from a
+    checkout under the real home, as the deploy does. Gates, land checks and CI skip the
+    real-Seatbelt tests, and a `/tmp` checkout hides home-deny failures.
 - **Subprocesses** go through `sh`/`runProcess` (`src/util/proc.ts`): abort signals, timeouts, the
   per-run process scope and descendant cleanup depend on it. The few direct spawns (preview servers,
   the SSH tunnel, `gate-slot`) manage their own lifecycle; don't add more without a reason. Agent

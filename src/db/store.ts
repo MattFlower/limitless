@@ -57,6 +57,7 @@ import { redactGateOutput } from "../gates/output.ts";
 import { githubWait } from "../git/github-wait.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { PrSnapshot } from "../integrations/github-poller.ts";
+import { leaseMethods } from "../integrations/lease-store.ts";
 import { ACCEPTANCE_BLOCK, type AcceptanceSnapshot } from "../pipeline/acceptance.ts";
 import { initialRunState, type RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
@@ -519,6 +520,16 @@ function buildUpdate(patch: object, columns: Record<string, string>): { sets: st
 }
 
 export class Store {
+  private readonly leases = leaseMethods(this);
+  readonly leaseRow = this.leases.leaseRow;
+  readonly beginLeaseIntent = this.leases.beginLeaseIntent;
+  readonly setLeaseIntentCommit = this.leases.setLeaseIntentCommit;
+  readonly confirmLease = this.leases.confirmLease;
+  readonly dropLeaseIntent = this.leases.dropLeaseIntent;
+  readonly markLeaseLost = this.leases.markLeaseLost;
+  readonly forgetLease = this.leases.forgetLease;
+  readonly leaseRowsWithIntent = this.leases.leaseRowsWithIntent;
+  readonly heldLeaseRows = this.leases.heldLeaseRows;
   readonly observations = new FailureObservations(this);
   failureObservations(filter: ObservationFilter = {}) {
     return this.observations.read(filter);
