@@ -90,7 +90,8 @@ export function preparePrivacyPolicy(
   const units = [...entries.map(({ value }) => value), ...variants.keys()];
   if (units.reduce((sum, value) => sum + value.length, 0) > limits.variantsTotal)
     return refuse("variants-total");
-  const minimum = Math.ceil((Math.min(...originals.map((value) => Buffer.byteLength(value))) * 4) / 3);
+  const bytes = [...originals, ...variants.keys()].map((value) => Buffer.byteLength(value));
+  const minimum = Math.ceil((Math.min(...bytes) * 4) / 3);
   const candidates = originals.length
     ? new RegExp(`(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{${Math.max(1, minimum)},}=*`, "g")
     : undefined;

@@ -208,7 +208,6 @@ export function normalizedLayers(text: string, entries: PrivateStrings = []): st
   const normalized = new Map([...new Set(all)].map((layer) => [layer, normalize(layer)]));
   return all.map((layer) => normalized.get(layer) ?? "");
 }
-/** Shared decoder traversal; prepared callers supply bounded retention and base64 matching. */
 export function decodedLayers(
   text: string,
   decodeBase64: (text: string) => string,

@@ -70,7 +70,7 @@ test("decoded credentials work without a private policy and keep original-length
       expect(checkPrepared(prepared, encode(secret))).toEqual(match(true, []));
       expect(checkPrepared(prepared, encode("ordinary clean field"))).toEqual({ clean: true });
     }
-  for (const secret of ["s/ort77", 'q"ort77', "eight888", "long\r\ncredential/tail"]) {
+  for (const secret of ["s/ort77", 'q"ort77', "eight888", "long\r\ncredential/tail", "ab\r\ncd\r\nef"]) {
     const prepared = preparePrivacyPolicy(snapshot([], [secret]));
     const lf = secret.replace(/\r\n/g, "\n");
     for (const value of [
@@ -81,6 +81,7 @@ test("decoded credentials work without a private policy and keep original-length
       JSON.stringify(lf).slice(1, -1).replaceAll("/", "\\/"),
     ]) {
       expect(checkPrepared(prepared, value)).toEqual(match(true, []));
+      expect(checkPrepared(prepared, b64(value))).toEqual(match(true, []));
       expect(checkPrepared(prepared, `unrelated:${value}:tail`)).toEqual(
         secret.length >= 8 ? match(true, []) : { clean: true },
       );
@@ -99,7 +100,7 @@ test("preparation is reused and generations remain bound to captured snapshots",
   const old = capturePrivacySnapshot(registry);
   const prepared = preparePrivacyPolicy(old, { counters });
   for (let i = 0; i < 10; i++)
-    checkPrepared(prepared, Array.from({ length: 30 }, (_, n) => b64(`clean field ${n}`)).join(":"));
+    checkPrepared(prepared, Array.from({ length: 30 }, (_, n) => b64(`ordinary clean field ${n}`)).join(":"));
   expect(counters).toEqual({ preparations: 1, normalizations: 1 });
   expect(isCurrentPrivacyGeneration(prepared, registry)).toBe(true);
   registry.addCredential(word);
