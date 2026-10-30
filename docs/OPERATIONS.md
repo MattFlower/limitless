@@ -57,7 +57,8 @@ spawn MCP servers outside the agent's command sandbox, so the factory confines t
 
 On macOS the launch configuration wraps Node and its Chromium child together in the factory's
 `seatbeltProfile`, started through `/usr/bin/env -C` in the invocation's browser directory.
-Outbound connections are allowed only to the preview's loopback address family and port, writes
+Previews must be `http://127.0.0.1:<port>`. Outbound connections are allowed only to that IPv4
+loopback port (the preview's socket, not its web origin), writes
 only to that browser directory, and reads only to that directory, the pinned cache, the recorded
 Node runtime (with the symlinks dyld traverses to reach it, as metadata) and the system resources
 the pinned build needs, with every credential and private-path denial kept. Mach lookups, Apple

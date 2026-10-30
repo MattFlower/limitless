@@ -72,10 +72,12 @@ test.skipIf(seatbeltSkip !== null)(
       hostname: "127.0.0.1",
       port: 0,
       fetch(request) {
-        const path = new URL(request.url).pathname;
+        const { pathname: path, port } = new URL(request.url);
         if (path === "/redirect") return Response.redirect(`${elsewhere}/redirect-target`);
         // TEST-NET-1: nothing answers there, so an unconfined browser would hang instead of failing fast.
         if (path === "/external") return Response.redirect("http://192.0.2.1/external-target");
+        // Same port, other hostname: an accepted residual, since it reaches this same server.
+        if (path === "/rename") return Response.redirect(`http://localhost:${port}/renamed`);
         if (path === "/own") return new Response("own-fetch-ok");
         if (path === "/download")
           return new Response("download", {
@@ -94,6 +96,15 @@ test.skipIf(seatbeltSkip !== null)(
         </script></body>`,
           { headers: { "Content-Type": "text/html" } },
         );
+      },
+    });
+    // Another process holding the preview's port on ::1, which `localhost` also resolves to.
+    const sibling6 = Bun.serve({
+      hostname: "::1",
+      port: preview.port,
+      fetch(request) {
+        escaped.push(`[::1]${new URL(request.url).pathname}`);
+        return new Response("escaped");
       },
     });
     // Like Claude, the client offers its checkout as a root, which the server then treats as a workspace
@@ -203,13 +214,16 @@ test.skipIf(seatbeltSkip !== null)(
         expect(redirect.isError, path).toBe(true);
         expect(JSON.stringify(redirect), path).toContain("net::ERR_ACCESS_DENIED");
       }
+      // The boundary is the preview's socket, not its web origin: the renamed request may reach the
+      // preview itself, but nothing else (checked with the other listeners below).
+      await call("browser_navigate", { url: `${spec.browser.previewUrl}/rename` });
       await call("browser_navigate", { url: `file://${join(cwd, "private.txt")}` });
       expect(JSON.stringify(await call("browser_snapshot"))).not.toContain("private probe");
       await call("browser_navigate", { url: `${spec.browser.previewUrl}/download` });
       for (let i = 0; i < 50 && !existsSync(join(output, "d.txt")); i++) await Bun.sleep(100);
       expect(readFileSync(join(output, "d.txt"), "utf8")).toBe("download");
       expect(readdirSync(cwd).sort()).toEqual(["existing.png", "private.txt"]);
-      // WebSocket, beacon, fetch and redirect attempts never reached the other loopback port.
+      // WebSocket, beacon, fetch and redirect attempts never reached another port or ::1.
       expect(escaped).toEqual([]);
     } finally {
       if (transport) {
@@ -221,6 +235,7 @@ test.skipIf(seatbeltSkip !== null)(
       }
       preview.stop(true);
       other.stop(true);
+      sibling6.stop(true);
       rmSync(scratchParent(scratch), { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     }

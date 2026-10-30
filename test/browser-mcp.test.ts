@@ -258,31 +258,21 @@ test("browser system reads exclude checkout and sibling scratch through Data-vol
   }
 });
 
-test.each([
-  ["http://127.0.0.1:43210/x?q=1", "http://127.0.0.1:43210"],
-  ["http://127.0.0.1", "http://127.0.0.1"],
-  ["https://[::1]", "https://[::1]"],
-  ["https://LOCALHOST:443/x", "https://localhost"],
-  ["http://[::1]:43210/x", "http://[::1]:43210"],
-])("a loopback preview allows exactly its own origin: %s", async (url, origin) => {
+test("a preview allows exactly its own IPv4 loopback port", async () => {
   const { spec, scratch } = await fixture();
   if (!spec.browser) throw new Error("missing browser request");
-  spec.browser.previewUrl = url;
+  spec.browser.previewUrl = "http://127.0.0.1:43210/x?q=1";
   const server = browserMcp(spec, "codex", [], "darwin");
   const args = server?.args ?? [];
-  expect(args[args.indexOf("--allowed-origins") + 1]).toBe(origin);
-  const parsed = new URL(url);
+  expect(args.filter((arg) => arg === "--allowed-origins")).toEqual(["--allowed-origins"]);
+  expect(args[args.indexOf("--allowed-origins") + 1]).toBe("http://127.0.0.1:43210");
   expect(policy(server)).toContain("(deny network-outbound)");
-  const allows = policy(server)
-    .split("\n")
-    .filter((line) => line.startsWith("(allow network-outbound"));
-  const port = parsed.port || (parsed.protocol === "https:" ? 443 : 80);
-  // Only the preview's own address family: a 127.0.0.1 preview cannot reach ::1, and vice versa.
-  const families = { "127.0.0.1": ["ip4"], "[::1]": ["ip6"], localhost: ["ip4", "ip6"] }[parsed.hostname];
-  expect(families).toBeDefined();
-  expect(allows).toEqual(
-    (families ?? []).map((family) => `(allow network-outbound (remote ${family} "localhost:${port}"))`),
-  );
+  // A 127.0.0.1 preview cannot reach ::1, where another process may hold the same port.
+  expect(
+    policy(server)
+      .split("\n")
+      .filter((line) => line.startsWith("(allow network-outbound")),
+  ).toEqual(['(allow network-outbound (remote ip4 "localhost:43210"))']);
   // Seatbelt compiles the profile before applying it; exit 65 means it rejected a rule. The control
   // sits in the readable browser directory, and exit 0 also shows dyld starts under the profile
   // (without the root-directory read it aborts with 134).
@@ -298,9 +288,27 @@ test.each([
     expect(compiled.stderr).not.toContain("Backtrace");
     expect(compiled.exitCode === 0 || compiled.exitCode === 71, compiled.stderr).toBe(true);
   }
-  expect(args.filter((arg) => arg === "--allowed-origins")).toHaveLength(1);
   for (const flag of ["--user-data-dir", "--output-dir"])
     expect(args[args.indexOf(flag) + 1]?.startsWith(`${scratch}/browser-`)).toBe(true);
+});
+
+test.each([
+  "http://127.0.0.1",
+  "https://127.0.0.1:43210",
+  "https://[::1]",
+  "https://LOCALHOST:443/x",
+  "http://[::1]:43210/x",
+  "http://localhost:43210",
+])("a preview other than http://127.0.0.1:<port> gets no browser: %s", async (url) => {
+  const { spec } = await fixture();
+  const events: AgentEvent[] = [];
+  spec.onEvent = (event) => events.push(event);
+  if (!spec.browser) throw new Error("missing browser request");
+  spec.browser.previewUrl = url;
+  expect(browserMcp(spec, "codex", [], "darwin")).toBeUndefined();
+  expect(events).toEqual([
+    expect.objectContaining({ text: "Browser disabled: browser previews must be http://127.0.0.1:<port>" }),
+  ]);
 });
 
 test.each(["claude", "codex"] as const)(
@@ -375,9 +383,9 @@ test.each([
   if (failure === "scratch missing") spec.scratchDir = undefined;
   if (failure === "invalid URL") spec.browser.previewUrl = "not a URL";
   if (failure === "remote URL") spec.browser.previewUrl = "http://example.com:43210";
-  if (failure === "credential URL") spec.browser.previewUrl = "http://user:password@localhost:43210";
+  if (failure === "credential URL") spec.browser.previewUrl = "http://user:password@127.0.0.1:43210";
   if (failure === "file URL") spec.browser.previewUrl = "file:///etc/hosts";
-  if (failure === "zero port") spec.browser.previewUrl = "http://localhost:0";
+  if (failure === "zero port") spec.browser.previewUrl = "http://127.0.0.1:0";
   if (failure === "rejected profile path") {
     const path = join(root, 'scratch-"');
     mkdirSync(path);

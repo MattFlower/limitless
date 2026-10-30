@@ -40,10 +40,12 @@ out of it. Every assertion passed (`1 pass, 41 expect() calls`), and three repea
 | A redirect to an external origin (`192.0.2.1`, TEST-NET-1) fails with `net::ERR_ACCESS_DENIED` | pass |
 | `file://` navigation to a checkout file does not show it | pass |
 | A download lands in the output directory, not the checkout | pass |
+| A redirect that changes only the hostname (to `localhost:<port>`) reaches the preview server and nothing else: a listener on `[::1]:<port>` receives nothing | pass |
 | The other loopback port received no request: no WebSocket, `sendBeacon`, fetch or redirect | pass |
 
 Negative controls (each appended one rule to the generated profile) show the assertions depend on
-it: `(allow network-outbound)` let the redirect and the WebSocket reach the other port; reading the
+it: `(allow network-outbound)` let the redirect and the WebSocket reach the other port;
+allowing IPv6 loopback let the hostname-change redirect reach the `[::1]` listener; reading the
 checkout made the denied reads succeed; `(allow mach-lookup)` made the IPC checks fail; with the
 checkout readable and writable, a screenshot was written into it. With reads widened but the write
 deny kept, the checkout screenshots still failed (EPERM on `open`).
@@ -128,11 +130,16 @@ pinned Chromium, ephemeral local servers and the real screenshot tools.
 Before landing, also run `bun run check` unconfined from that checkout under the
 real home, as required for shared confinement-policy changes.
 
-Seatbelt network rules accept only `*` or `localhost` as the host, so the profile
-selects the preview's loopback address by family: `(remote ip4 "localhost:<port>")`
-for `127.0.0.1`, `(remote ip6 "localhost:<port>")` for `[::1]`, and both for
-`localhost`. No other port, address family or destination is allowed. Unit tests
-compile each loopback form with `sandbox-exec`.
+Browser previews must be `http://127.0.0.1:<port>`, which is what the preview service produces;
+any other host or scheme gets no browser. Seatbelt network rules accept only `*` or `localhost` as
+the host, so the profile allows exactly `(remote ip4 "localhost:<port>")`: no other port, no IPv6,
+no other destination. Unit tests compile it with `sandbox-exec`.
+
+The boundary is the preview's socket, not its web origin. Seatbelt cannot see HTTP hostnames, and
+the pinned server's origin check does not recheck redirects, so a redirect that changes only the
+hostname on the same port (for example to `http://localhost:<port>`) loads from the same preview
+server under another origin. That is an accepted residual: it reaches no other process, since IPv6
+loopback, where another process could hold the same port, stays denied.
 
 Claude editors, LAN workers and unsupported platforms remain excluded independently
 of the gap list.

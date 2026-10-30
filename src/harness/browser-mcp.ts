@@ -199,14 +199,10 @@ export function browserMcp(
     if (harness === "claude" && spec.mode === "edit")
       throw new Error("Claude editor outer confinement cannot launch the browser safely");
     if (platform !== "darwin") throw new Error(`Browser confinement unavailable on ${platform}`);
+    // The profile confines the preview's socket, IPv4 loopback and its port, not its web origin.
     const url = new URL(spec.browser.previewUrl);
-    if (
-      !/^https?:$/.test(url.protocol) ||
-      url.username ||
-      url.password ||
-      !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)
-    )
-      throw new Error("preview URL must be HTTP(S) loopback without credentials");
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password)
+      throw new Error("browser previews must be http://127.0.0.1:<port>");
     const scratch = validateScratch(spec);
     const cache = realpathSync(spec.browser.cacheDir);
     const cwd = realpathSync(spec.cwd);
@@ -249,11 +245,7 @@ export function browserMcp(
         ...homeReadPolicy(readable, false, spec.denyRead),
         allowRead: policySpellings(readable),
       },
-      {
-        host: url.hostname === "[::1]" ? "::1" : url.hostname,
-        port: Number(url.port || (url.protocol === "https:" ? 443 : 80)),
-        links,
-      },
+      { host: url.hostname, port: Number(url.port), links },
     );
     // --allowed-origins restricts browser requests; --allowed-hosts would only govern the MCP HTTP
     // transport, which stdio does not use.

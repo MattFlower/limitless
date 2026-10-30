@@ -27,17 +27,17 @@ export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 /** A command could not run confined: an operational failure, never a gate or grading result. */
 export { ConfinementError } from "./read-policy.ts";
 
-/** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
 // Chromium's child processes check in with the browser under this name (pinned build's bundle id).
 const CHROMIUM_RENDEZVOUS = String.raw`^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$`;
 
+/** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
 export function seatbeltProfile(
   roots: WriteRoots,
   browser?: { host: string; port: number; links?: string[] },
 ): string {
   if (
     browser &&
-    (!["127.0.0.1", "localhost", "::1"].includes(browser.host) ||
+    (browser.host !== "127.0.0.1" ||
       !Number.isInteger(browser.port) ||
       browser.port < 1 ||
       browser.port > 65535 ||
@@ -73,14 +73,8 @@ export function seatbeltProfile(
     ...(browser
       ? [
           "(deny network-outbound)",
-          // Seatbelt rejects literal IPs ("host must be * or localhost"), so the address family selects
-          // the preview's loopback address: ip4 for 127.0.0.1, ip6 for ::1, both for localhost.
-          ...(browser.host === "::1"
-            ? []
-            : [`(allow network-outbound (remote ip4 "localhost:${browser.port}"))`]),
-          ...(browser.host === "127.0.0.1"
-            ? []
-            : [`(allow network-outbound (remote ip6 "localhost:${browser.port}"))`]),
+          // Seatbelt accepts only * or localhost as a host; ip4 localhost is the IPv4 loopback.
+          `(allow network-outbound (remote ip4 "localhost:${browser.port}"))`,
           "(deny file-read*)",
           // dyld opens the root directory to find its shared cache; that reveals only top-level names.
           '(allow file-read-data (literal "/"))',

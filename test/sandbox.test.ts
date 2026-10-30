@@ -60,7 +60,7 @@ const darwin = process.platform === "darwin";
 test("browser restrictions are optional and reject unbounded endpoints", () => {
   const roots = { write: ["/scratch/browser"], protect: [], allowRead: ["/scratch/browser", "/runtime"] };
   const gate = seatbeltProfile(roots);
-  const browser = seatbeltProfile(roots, { host: "localhost", port: 8080, links: ["/opt/pkg"] });
+  const browser = seatbeltProfile(roots, { host: "127.0.0.1", port: 8080, links: ["/opt/pkg"] });
   // The browser's read and IPC restrictions never reach gate profiles.
   for (const rule of [
     "(deny network-outbound)",
@@ -77,23 +77,19 @@ test("browser restrictions are optional and reject unbounded endpoints", () => {
     expect(browser).toContain(rule);
   }
   expect(gate).not.toContain("launchservicesd");
-  expect(browser).toContain('(allow network-outbound (remote ip4 "localhost:8080"))');
-  expect(browser).toContain('(allow network-outbound (remote ip6 "localhost:8080"))');
-  expect(browser).toContain("(deny file-read*)");
-  const allows = (host: string) =>
-    seatbeltProfile(roots, { host, port: 8080 })
-      .split("\n")
-      .filter((line) => line.startsWith("(allow network-outbound"));
-  expect(allows("127.0.0.1")).toEqual(['(allow network-outbound (remote ip4 "localhost:8080"))']);
-  expect(allows("::1")).toEqual(['(allow network-outbound (remote ip6 "localhost:8080"))']);
+  expect(browser.split("\n").filter((line) => line.startsWith("(allow network-outbound"))).toEqual([
+    '(allow network-outbound (remote ip4 "localhost:8080"))',
+  ]);
   for (const endpoint of [
     { host: "example.com", port: 80 },
-    { host: "localhost", port: 0 },
-    { host: "::1", port: 65536 },
-    { host: "localhost", port: 1.5 },
+    { host: "localhost", port: 8080 },
+    { host: "::1", port: 8080 },
+    { host: "127.0.0.1", port: 0 },
+    { host: "127.0.0.1", port: 65536 },
+    { host: "127.0.0.1", port: 1.5 },
   ])
     expect(() => seatbeltProfile(roots, endpoint)).toThrow("Invalid browser confinement");
-  expect(() => seatbeltProfile({ write: [], protect: [] }, { host: "localhost", port: 80 })).toThrow(
+  expect(() => seatbeltProfile({ write: [], protect: [] }, { host: "127.0.0.1", port: 80 })).toThrow(
     "Invalid browser confinement",
   );
 });
