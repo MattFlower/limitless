@@ -3,7 +3,8 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evalCommand, formatEvalReport } from "../src/cli/eval.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { evalFixture } from "./evals-support.ts";
+import { reviewCase } from "./evals-reading-support.ts";
+import { evalFixture, verifierModel } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -707,4 +708,81 @@ test("eval resume and cancel CLI print the new run ID and the cancelled status",
   expect(posted).toEqual(["POST /api/evals/eval-old/resume", "POST /api/evals/eval-old/cancel"]);
   expect(printed).toEqual(["eval-new (resumes eval-old)", "eval-old: interrupted"]);
   await expect(evalCommand(["resume"], {}, io)).rejects.toThrow("eval resume <eval-id>");
+});
+
+test("eval judge validates input, starts a background job and polls through HTTP", async () => {
+  const f = await evalFixture([verifierModel]);
+  try {
+    writeFileSync(f.casePath, JSON.stringify({ role: "review", version: 1, cases: [reviewCase] }));
+    const run = f.factory.store.createEvalRun({ role: "review", models: [], k: 1, maxUsd: 1 }, []);
+    const other = f.factory.store.createEvalRun({ role: "triage", models: [], k: 1, maxUsd: 1 }, []);
+    f.factory.store.updateEvalRun(other.id, "completed");
+    const routes = createHttpRoutes(f.factory);
+    const printed: string[] = [];
+    const seen: string[] = [];
+    const io = {
+      async api<T>(path: string, init?: RequestInit): Promise<T> {
+        seen.push(`${init?.method ?? "GET"} ${path}`);
+        const id = path.split("/")[3] ?? "";
+        const route = path.endsWith("/judge")
+          ? (routes["/api/evals/:id/judge"] as Record<string, Route>)[init?.method ?? "GET"]
+          : (routes["/api/evals/:id"] as Route);
+        if (!route) throw new Error("route missing");
+        const response = await route(
+          requestWithParams(
+            `http://localhost${path}`,
+            { ...init, headers: { "content-type": "application/json" } },
+            { id },
+          ),
+          localServer,
+        );
+        const result = await response.json();
+        if (!response.ok) throw new Error((result as { error: string }).error);
+        return result as T;
+      },
+      print: (text: string) => printed.push(text),
+      wait: async () => f.factory.evals.wait(run.id),
+    };
+    for (const judges of ["candidate-a", "candidate-a,candidate-b,verifier-c", "candidate-a,verifier-c@"])
+      await expect(evalCommand(["judge", run.id], { judges }, io)).rejects.toThrow();
+    expect(seen).toHaveLength(0);
+    for (const status of ["queued", "running"] as const) {
+      f.factory.store.updateEvalRun(run.id, status);
+      await expect(evalCommand(["judge", run.id], { judges: "candidate-a,verifier-c" }, io)).rejects.toThrow(
+        `still ${status}`,
+      );
+    }
+    f.factory.store.updateEvalRun(run.id, "completed");
+    await expect(evalCommand(["judge", run.id], { judges: "candidate-a,candidate-b" }, io)).rejects.toThrow(
+      "different vendors",
+    );
+    await expect(evalCommand(["judge", run.id], { judges: "candidate-a,unknown" }, io)).rejects.toThrow(
+      "unknown model",
+    );
+    await expect(evalCommand(["judge", other.id], { judges: "candidate-a,verifier-c" }, io)).rejects.toThrow(
+      "only review",
+    );
+    expect(f.calls).toHaveLength(0);
+    for (const maxUsd of ["invalid", "", "-1", true])
+      await expect(
+        evalCommand(["judge", run.id], { judges: "candidate-a,verifier-c", "max-usd": maxUsd }, io),
+      ).rejects.toThrow();
+    seen.length = 0;
+    await evalCommand(["judge", run.id], { judges: "candidate-a,verifier-c", "max-usd": "0" }, io);
+    expect(seen).toEqual([
+      `POST /api/evals/${run.id}/judge`,
+      `GET /api/evals/${run.id}/judge`,
+      `GET /api/evals/${run.id}`,
+    ]);
+    expect(JSON.parse(printed[0] ?? "{}")).toMatchObject({
+      trialsJudged: 0,
+      reused: 0,
+      modelCalls: 0,
+      spendUsd: 0,
+    });
+    expect(printed[1]).toContain(run.id);
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
 });
