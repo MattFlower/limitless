@@ -540,7 +540,12 @@ export async function runClaude(
   if (spec.jsonSchema && parser.structured === null) {
     const recovered = extractJson(parser.finalText || parser.lastAssistantText);
     if (recovered === null) {
-      return { ...base, status: "error", error: "agent did not return the required structured output" };
+      return {
+        ...base,
+        status: "error",
+        invalidOutput: true,
+        error: "agent did not return the required structured output",
+      };
     }
     return { ...base, structured: recovered, status: "ok", error: null };
   }

@@ -18,6 +18,7 @@ export interface FakeReply {
   quota?: AgentResult["quota"];
   text?: string;
   structured?: unknown;
+  invalidOutput?: boolean;
   /** Files to write (relative to the spec cwd) — simulates an implementing agent. */
   files?: Record<string, string>;
   error?: string;
@@ -66,6 +67,7 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
       sessionId: reply.sessionId === undefined ? "fake-session" : reply.sessionId,
       finalText: reply.text ?? "",
       structured: reply.structured ?? null,
+      invalidOutput: reply.invalidOutput,
       error: reply.error ?? null,
       costUsd: reply.costUsd ?? 0,
       costEquivUsd: reply.costEquivUsd ?? 0.001,

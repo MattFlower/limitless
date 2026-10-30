@@ -1039,7 +1039,12 @@ export async function runCodex(
     return { ...base, status: unavailable ? "unavailable" : "error", error: failure };
   }
   if (spec.jsonSchema && structured === null) {
-    return { ...base, status: "error", error: "agent did not return valid structured output" };
+    return {
+      ...base,
+      status: "error",
+      invalidOutput: true,
+      error: "agent did not return valid structured output",
+    };
   }
   return { ...base, status: "ok", error: null };
 }

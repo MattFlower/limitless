@@ -507,6 +507,68 @@ describe("CodexStreamParser", () => {
 
 // Tool-enabled editors run confined (#323): they need scratch, and a fake runner that swaps the
 // command keeps the sandbox's startup wrapper (the identity backend adds no profile).
+test.each(["claude", "codex"] as const)(
+  "%s marks only malformed structured completions as invalid output",
+  async (harness) => {
+    const dir = mkdtempSync(join(tmpdir(), "limitless-structured-"));
+    try {
+      for (const completed of [true, false]) {
+        const result = await (harness === "claude" ? runClaude : runCodex)(
+          {
+            cwd: dir,
+            prompt: "judge",
+            mode: "readonly",
+            noTools: true,
+            jsonSchema: { type: "object" },
+            target: {
+              modelId: `${harness}/test`,
+              provider: harness,
+              harness,
+              model: "test",
+              vendor: harness === "claude" ? "anthropic" : "openai",
+              tier: 4,
+              billing: "subscription",
+            },
+            timeoutMs: 10_000,
+            idleTimeoutMs: 10_000,
+            maxToolCalls: 0,
+            signal: new AbortController().signal,
+            logPath: join(dir, "log"),
+            onEvent: () => {},
+          },
+          async (opts) => {
+            if (completed) {
+              const events =
+                harness === "claude"
+                  ? [{ type: "result", result: "malformed" }]
+                  : [
+                      { type: "item.completed", item: { type: "agent_message", text: "malformed" } },
+                      { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } },
+                    ];
+              for (const event of events) opts.onStdoutLine?.(JSON.stringify(event));
+            }
+            return {
+              exitCode: completed ? 0 : 1,
+              signal: null,
+              truncated: false,
+              durationMs: 1,
+              stdout: "",
+              stderr: completed ? "" : "invocation failed",
+              timedOut: false,
+              idleTimedOut: false,
+              cancelled: false,
+            };
+          },
+        );
+        expect(result.status).toBe("error");
+        expect(result.invalidOutput).toBe(completed ? true : undefined);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
 const confinedEdit = <T>(cwd: string, run: (scratchDir: string) => Promise<T>) =>
   confinementScope.run(fakeConfinement, () =>
     withScratch(cwd, (scratchDir) => {

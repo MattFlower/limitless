@@ -219,7 +219,12 @@ test("blind redacted prompts; stored report and regrade retain both scores and i
   }
 });
 
-test.each([false, true])("invalid output retries once; eventual success=%s", async (succeeds) => {
+test.each([
+  [false, false],
+  [false, true],
+  [true, false],
+  [true, true],
+])("invalid output retries once; eventual success=%s, error status=%s", async (succeeds, errorStatus) => {
   const f = await fixture();
   try {
     const counts = new Map<string, number>();
@@ -227,7 +232,10 @@ test.each([false, true])("invalid output retries once; eventual success=%s", asy
       const count = (counts.get(spec.target.modelId) ?? 0) + 1;
       counts.set(spec.target.modelId, count);
       return spec.target.modelId === "candidate-a" && (!succeeds || count % 2 === 1)
-        ? { text: "malformed" }
+        ? {
+            text: "malformed",
+            ...(errorStatus ? ({ status: "error", invalidOutput: true } as const) : {}),
+          }
         : { structured: judgment("F1") };
     });
     await f.judge();
@@ -389,22 +397,29 @@ test("shutdown aborts in-flight judges and releases provider slots", async () =>
   }
 });
 
-test("invocation errors leave absent judgments that a later judge run retries", async () => {
-  const f = await fixture();
-  try {
-    f.respond((spec) =>
-      spec.target.modelId === "candidate-a" ? { fault: "throw" } : { structured: judgment("F1") },
-    );
-    await f.judge();
-    expect(f.calls).toHaveLength(4);
-    expect(f.report().summaries[0]?.judged).toMatchObject({ unjudged: 2, recall: { denominator: 0 } });
-    f.respond(() => ({ structured: judgment("F1") }));
-    expect(await f.judge()).toMatchObject({ judged: 2, reused: 2, unjudged: 0 });
-    expect(f.calls).toHaveLength(6);
-  } finally {
-    await f.close();
-  }
-});
+test.each(["throw", "error"] as const)(
+  "invocation %s leaves absent judgments without retrying",
+  async (failure) => {
+    const f = await fixture();
+    try {
+      f.respond((spec) =>
+        spec.target.modelId === "candidate-a"
+          ? failure === "throw"
+            ? { fault: "throw" }
+            : { status: "error", error: "invocation failed" }
+          : { structured: judgment("F1") },
+      );
+      await f.judge();
+      expect(f.calls).toHaveLength(4);
+      expect(f.report().summaries[0]?.judged).toMatchObject({ unjudged: 2, recall: { denominator: 0 } });
+      f.respond(() => ({ structured: judgment("F1") }));
+      expect(await f.judge()).toMatchObject({ judged: 2, reused: 2, unjudged: 0 });
+      expect(f.calls).toHaveLength(6);
+    } finally {
+      await f.close();
+    }
+  },
+);
 
 test("an incomplete judge pair contributes no scored golds", () => {
   for (const pair of [[], [judgment("F1")]])
