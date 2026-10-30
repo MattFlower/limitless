@@ -186,6 +186,7 @@ const unsupported = (construct: string) =>
   `unsupported Markdown in the intent: ${construct}; normalize the ticket`;
 
 const unsupportedCases = [
+  ["inline comment", "- Must also check delivery. <!-- explanation -->", "HTML block or comment"],
   ["short backtick closer", "````md\n```\n## Hidden\n- Hidden.\n````", "fence"],
   ["different fence character", "```md\n~~~\n## Hidden\n- Hidden.\n```", "fence"],
   ["tilde fence with backticks", "~~~md\n```\n## Hidden\n~~~", "fence"],
@@ -202,6 +203,61 @@ const unsupportedCases = [
   ["list-item fence", "- ```md\n  ## Hidden\n  ```", "fence"],
   ["list-item HTML", "- <details>\n  ## Hidden\n  </details>", "HTML block or comment"],
 ] as const;
+
+test("inline source comments preserve the entire visible requirement", async () => {
+  const parent =
+    "- Before.\n- Must also <!-- explanation\n  continued --> check delivery.\n\n  Keep its original reason.";
+  await expect(resolve("> check delivery.", parent)).rejects.toThrow("quote is not a whole source unit");
+  await expect(resolve("> Must also check delivery.", parent)).rejects.toThrow(
+    "quote is not a whole source unit",
+  );
+  expect(brief(await resolve("> Must also check delivery. Keep its original reason.", parent))).toEqual([
+    ["U1", "Must also check delivery. Keep its original reason.", "behaviour", "#1"],
+  ]);
+  expect(
+    (await resolve("> Must also check delivery.", "- Must also check delivery. <!-- explanation -->")).map(
+      (u) => u.text,
+    ),
+  ).toEqual(["Must also check delivery."]);
+  expect(
+    (await resolve("> Mustcheck delivery.", "- Must<!-- explanation\n-->check delivery.")).map((u) => u.text),
+  ).toEqual(["Mustcheck delivery."]);
+});
+
+test("inline comments on the selected heading also refuse resolution", async () => {
+  await expect(resolve(`#1's "Goal" section`, "## Goal <!-- explanation -->\n- Before.")).rejects.toThrow(
+    unsupported("HTML block or comment"),
+  );
+  await expect(
+    resolveIntent(
+      {
+        ticket: issue(9, "## The original intent <!-- explanation -->\n> Before."),
+        parent: issue(1, "- Before."),
+      },
+      read,
+    ),
+  ).rejects.toThrow(unsupported("HTML block or comment"));
+});
+
+test.each(["- The service accepts red | blue tokens.", "The service accepts red | blue tokens."])(
+  "a literal pipe does not fragment a whole source unit: %s",
+  async (body) => {
+    await expect(resolve("> blue tokens.", body)).rejects.toThrow("quote is not a whole source unit");
+    expect((await resolve("> The service accepts red | blue tokens.", body)).map((u) => u.text)).toEqual([
+      "The service accepts red | blue tokens.",
+    ]);
+    expect((await resolve(`#1's "Goal" section`, `## Goal\n${body}`)).map((u) => u.text)).toEqual([
+      "The service accepts red | blue tokens.",
+    ]);
+  },
+);
+
+test("table delimiters distinguish bare table cells from ordinary pipes", async () => {
+  const body = "Colour | Requirement\n--- | ---\nBlue | The service accepts blue tokens.";
+  expect((await resolve("> The service accepts blue tokens.", body)).map((u) => u.text)).toEqual([
+    "The service accepts blue tokens.",
+  ]);
+});
 
 test.each(unsupportedCases)(
   "selected sections refuse %s before a later heading",

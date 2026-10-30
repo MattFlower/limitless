@@ -92,7 +92,7 @@ const unsupported = (construct: string) =>
   `unsupported Markdown in the intent: ${construct}; normalize the ticket`;
 const escapedPipe = unsupported("escaped pipe in a table row");
 const quoteLine = (line: string) => line.replace(/^(?: {0,3}>[ \t]?)+/, "");
-const tableRow = (line: string) => line.includes("|");
+const tableSeparator = (line = "") => /^ *\|? *:?-+:? *(?:\| *:?-+:? *)+\|? *$/.test(line);
 const setext = (line: string) => /^ {0,3}(?:=+|-+)\s*$/.test(line);
 function atx(line: string) {
   const h = /^ {0,3}(#{1,6})(?= |$)(.*)$/.exec(line);
@@ -103,45 +103,81 @@ function listItem(line: string) {
   return m ? { text: m[3] ?? "", continuation: line.length - (m[3]?.length ?? 0) } : undefined;
 }
 
+/** Explicitly bounded rows or a delimiter-backed table; a prose/list pipe is just text. */
+function tableRows(lines: (string | null | undefined)[]): Set<number> {
+  const rows = new Set<number>();
+  let previous = false;
+  let inTable = false;
+  lines.forEach((line, i) => {
+    const body = quoteLine(line ?? "");
+    const candidate = body.includes("|") && !listItem(body);
+    if (!candidate) inTable = false;
+    else if (tableSeparator(body)) {
+      if (previous) rows.add(i - 1);
+      rows.add(i);
+      inTable = true;
+    } else if (inTable || /^ *\|.*\| *$/.test(body)) rows.add(i);
+    previous = candidate;
+  });
+  return rows;
+}
+
 /** One fence/comment scanner for heading discovery and quote sources. Keep physical line positions. */
 function sourceLines(md: string) {
   let fence: string | undefined;
   let comment = false;
+  let commentLine: number | undefined;
   let details = 0;
-  const lines = md.split(/\r?\n/).map((line) => {
+  const lines: (string | null | undefined)[] = [];
+  md.split(/\r?\n/).forEach((line, i) => {
+    lines.push(undefined);
     const body = quoteLine(line);
     const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(body);
     if (fence) {
       const delimiter = marker?.[1] ?? "";
       if (delimiter[0] === fence[0] && delimiter.length >= fence.length && /^ *$/.test(marker?.[2] ?? ""))
         fence = undefined;
-      return undefined;
+      return;
     }
     if (comment || body.includes("<!--")) {
+      const target = commentLine ?? i;
+      let visible = "";
       let offset = 0;
       while (offset < body.length) {
         const at = body.indexOf(comment ? "-->" : "<!--", offset);
+        const end = at < 0 ? body.length : at + (comment ? 3 : 4);
+        if (!comment) visible += body.slice(offset, at < 0 ? end : at);
+        offset = end;
         if (at < 0) break;
-        offset = at + (comment ? 3 : 4);
         comment = !comment;
       }
-      return undefined;
+      // Join across comment newlines so neither a word nor a list item is fragmented.
+      lines[i] = null;
+      lines[target] =
+        target === i
+          ? visible.trim()
+            ? line.slice(0, line.length - body.length) + visible
+            : null
+          : (lines[target] ?? "") + visible;
+      commentLine = comment ? target : undefined;
+      return;
     }
     if (details || /^\s*<details\b/i.test(body)) {
       details += (body.match(/<details\b/gi)?.length ?? 0) - (body.match(/<\/details\s*>/gi)?.length ?? 0);
-      return undefined;
+      return;
     }
     if (marker) {
       fence = marker[1];
-      return undefined;
+      return;
     }
-    return /^\s*</.test(body) ? undefined : line;
+    lines[i] = /^\s*</.test(body) ? undefined : line;
   });
   return { lines, unclosed: !!fence || comment || details > 0 };
 }
 
 /** Validate raw lines before considering a later heading as a section boundary. */
 function sectionEnd(lines: string[], start: number, level: number): number {
+  const rows = tableRows(lines);
   const continuations: number[] = [];
   let paragraph = false;
   for (let i = start; i < lines.length; i++) {
@@ -158,19 +194,19 @@ function sectionEnd(lines: string[], start: number, level: number): number {
     const h = atx(raw);
     const reason = /^ *(`{3,}|~{3,})/.test(content)
       ? "fence"
-      : /^ *</.test(content)
+      : /^ *</.test(content) || content.includes("<!--")
         ? "HTML block or comment"
         : paragraph && setext(body)
           ? "setext heading"
           : indent >= 4 && !continuations.length
             ? "indented code or heading"
-            : tableRow(body) && body.includes("\\|")
+            : rows.has(i) && body.includes("\\|")
               ? "escaped pipe in a table row"
               : undefined;
     if (reason) throw new Error(unsupported(reason));
-    if (h && h.level <= level) return i;
+    if (i > start && h && h.level <= level) return i;
     if (item) continuations.push(item.continuation);
-    paragraph = !atx(content) && !tableRow(content);
+    paragraph = !atx(content) && !rows.has(i);
   }
   return lines.length;
 }
@@ -179,6 +215,7 @@ function sectionEnd(lines: string[], start: number, level: number): number {
 export function markdownUnits(md: string, references = false): Block[] {
   const scanned = sourceLines(md);
   if (scanned.unclosed) throw new Error("unresolvable source: unclosed fence, comment or details");
+  const rows = tableRows(scanned.lines);
   const out: Block[] = [];
   let current: Block | undefined;
   let continuation: number | undefined;
@@ -188,8 +225,8 @@ export function markdownUnits(md: string, references = false): Block[] {
     current = undefined;
     continuation = undefined;
   };
-  const separator = (s = "") => /^[\s|:-]+$/.test(s) && s.includes("-") && s.includes("|");
   scanned.lines.forEach((line, i) => {
+    if (line === null) return;
     if (line === undefined) {
       flush();
       return;
@@ -221,10 +258,10 @@ export function markdownUnits(md: string, references = false): Block[] {
       current.text += ` ${body}`;
       return;
     }
-    if (tableRow(body)) {
+    if (!item && rows.has(i)) {
       flush();
       if (body.includes("\\|")) out.push({ text: norm(body), kind: "cell", refusal: escapedPipe });
-      else if (!separator(body) && !separator(scanned.lines[i + 1])) {
+      else if (!tableSeparator(body) && !tableSeparator(scanned.lines[i + 1] ?? "")) {
         for (const cell of body
           .trim()
           .replace(/^\||\|\s*$/g, "")
@@ -253,17 +290,22 @@ export function markdownUnits(md: string, references = false): Block[] {
 function section(md: string, heading: string): string | undefined {
   const scanned = sourceLines(md);
   const heads = scanned.lines.flatMap((line, i) => {
-    const h = line === undefined ? undefined : atx(line);
+    const h = typeof line === "string" ? atx(line) : undefined;
     return h ? [{ ...h, i }] : [];
   });
   const hits = heads.filter((h) => h.text === norm(heading));
   const hit = hits[0];
   const raw = md.split(/\r?\n/);
-  const end = hit ? sectionEnd(raw, hit.i + 1, hit.level) : raw.length;
+  const end = hit ? sectionEnd(raw, hit.i, hit.level) : raw.length;
   if (scanned.unclosed) throw new Error("unresolvable source: unclosed fence, comment or details");
   const setextMatch = scanned.lines.some((line, i) => {
     const previous = scanned.lines[i - 1];
-    return line !== undefined && setext(line) && previous !== undefined && norm(previous) === norm(heading);
+    return (
+      typeof line === "string" &&
+      setext(line) &&
+      typeof previous === "string" &&
+      norm(previous) === norm(heading)
+    );
   });
   if (hits.length !== 1 || !hit || setextMatch) return undefined;
   return raw.slice(hit.i + 1, end).join("\n");

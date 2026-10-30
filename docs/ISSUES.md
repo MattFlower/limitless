@@ -57,11 +57,14 @@ The intentional fail-closed grammar replaces the earlier fence/details exclusion
 The ticket's intent section and referenced parent sections support ATX headings, list items
 with indented continuation lines and paragraphs, paragraphs, blockquotes, table rows and blank
 lines. A list item is one whole unit, including its continuation paragraphs. Quoting only its
-first paragraph is refused. Table rows without escaped pipes supply whole cell units.
+first paragraph is refused. Table rows without escaped pipes supply whole cell units. Rows
+have explicit outer pipes or belong to a delimiter-backed table; a literal pipe in a list
+item or ordinary paragraph does not split that unit into cells.
 
 Selected sections are scanned sequentially: a fence (three or more backticks or tildes), HTML
-block/comment or details tag starting with `<`, setext underline directly beneath paragraph
-text, or four-space indentation outside list continuations fails the run before the model.
+block/comment or details tag starting with `<` (including inline HTML comments), setext
+underline directly beneath paragraph text, or four-space indentation outside list
+continuations fails the run before the model.
 The reason is `unsupported Markdown in the intent: <construct>; normalize the ticket`.
 An escaped pipe in a selected table row, or a source row used for a quotation, fails with
 `unsupported Markdown in the intent: escaped pipe in a table row; normalize the ticket`.
@@ -76,9 +79,11 @@ heading can truncate the range.
 
 Quote sources are distinct from selected sections: unrelated fences, HTML and details may
 remain in the parent or checked-SHA file. Fenced and commented text cannot supply source units
-or headings. A closing fence must use the opening character, be at least as long, and have
-only spaces after it. Unclosed fences/comments make the source unresolvable. File sources
-still undergo containment and tracked-membership checks at the checked SHA.
+or headings. Inline source comments preserve all surrounding visible text as part of the
+whole unit, including list continuation paragraphs. A closing fence must use the opening
+character, be at least as long, and have only spaces after it. Unclosed fences/comments make
+the source unresolvable. File sources still undergo containment and tracked-membership
+checks at the checked SHA.
 
 ## Queue configuration
 

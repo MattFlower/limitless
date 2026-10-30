@@ -382,6 +382,12 @@ const parsedMetAll = AcceptanceSchema.parse(metAll);
 
 test.each([
   [
+    "inline comment",
+    "## Goal\n- Before.\n- Must also check delivery. <!-- explanation -->",
+    `#1's "Goal" section`,
+    "HTML block or comment",
+  ],
+  [
     "nested fence",
     "## Goal\n- Before.\n\n````md\n```\n## Hidden\n- Hidden.\n````\n\n- After.\n\n## End\n- Outside.",
     `#1's "Goal" section`,
