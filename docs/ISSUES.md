@@ -43,6 +43,45 @@ list markers (`-`, `*`, `+`, `1.`), and several references such as `Blocked by #
 Every issue reference on such a line is a blocker. All blockers must be closed;
 missing or unresolved blockers prevent work.
 
+## Acceptance intent
+
+Acceptance runs resolve a stable manifest from trusted ticket and parent snapshots before any
+model call. The ticket's `## The original intent` section names sections of the parent with
+lines of the form `#123's "Goal" section`, optionally followed by ` (docs)`; #123 must be the
+parent. Every list item and paragraph of a referenced section is a requirement unit. A `(docs)`
+suffix marks that section's units as documentation requirements; other units require test
+evidence, and a unit referenced both ways requires tests. Other prose in the intent section is context;
+a list item there refuses, since only references produce units. Units whose text is identical as
+written share one unit.
+
+Quoting parent or file text (a `From #123:` or `From docs/PLAN.md:` line followed by `>` quotes)
+is not supported: it was cut from #981's scope, and a lead-in or a quote refuses the run. Put the
+requirements in a section of the parent and reference it.
+
+The intent section and every referenced section use one strict line grammar. Each line must be:
+- blank;
+- an ATX heading: one to six `#` at column 0, then a space or the end of the line. A heading at
+  the section's level or higher ends the section; a deeper heading is skipped and isn't a unit;
+- a list item at column 0: `-`, `*`, `+`, or one to nine digits and `.` or `)`, then a space and
+  text. The unit is that one line; a list item never continues onto the next line;
+- a paragraph line at column 0. Consecutive paragraph lines form one unit, which ends at a blank
+  line, a heading or a list item;
+- in the intent section only, a section reference.
+
+Any other line fails the run before the model with `unsupported Markdown in the intent: line <n>
+of <#N or the ticket>: <kind>; normalize the ticket`. That covers a line starting with a space or
+a tab (continuations, nested lists, indented code), a line starting with `>`, `|` or `<`, a fence
+(three or more backticks or tildes), a line made only of `-`, `*`, `_`, `=`, `|`, `:` and spaces
+(thematic breaks, setext underlines and table delimiter rows), a `[label]:` link or footnote
+definition, a list marker without a space and text, a paragraph line directly under a list item,
+and, in the intent section, a `From …:` lead-in. The scan covers the whole section, so an
+unsupported line refuses before any later heading could end it.
+
+The referenced heading must be the parent's only column-0 ATX heading with that text (`Goal` and
+`Goal#` differ), or the run refuses. Lines outside the section aren't scanned, except that a fence
+anywhere before it fails with `unresolvable source`, because a heading inside the fence can't be
+told apart from a real one. The ticket's intent heading follows the same rules.
+
 ## Queue configuration
 
 The queue is off by default. **Do not enable it for any repository until Q0's probe

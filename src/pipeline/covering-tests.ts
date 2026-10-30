@@ -25,9 +25,16 @@ const controls = (text: string) =>
   [...text].some((c) => c.charCodeAt(0) < 32 || (c.charCodeAt(0) >= 127 && c.charCodeAt(0) <= 159));
 
 export function selectCoveringTests(verify: Verify) {
+  return selectCoveringRequests(
+    verify.criteria.map((c) =>
+      c.status === "blocked" && c.blockedReason === "sandbox" ? (c.covering_tests ?? []) : [],
+    ),
+  );
+}
+
+export function selectCoveringRequests(items: Test[][]) {
   let count = 0;
-  return verify.criteria.map((c) => {
-    const requested = c.status === "blocked" && c.blockedReason === "sandbox" ? (c.covering_tests ?? []) : [];
+  return items.map((requested) => {
     const tests = requested.slice(0, 3).filter(() => ++count <= 10);
     return {
       tests,
@@ -66,7 +73,26 @@ export async function coveringTestCommand(test: Test, cfg: GateConfig | undefine
   if (!/\.(?:test|spec)\.[cm]?[jt]sx?$/.test(test.file)) return { reason: "file is not a test file" };
   if (!test.name.trim() || test.name.length > MAX_TEST_IDENTITY_LENGTH || controls(test.name))
     return { reason: "invalid test name" };
-  if (!/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha)) return { reason: "invalid verified SHA" };
+  const reason = await trackedAtShaRefusal(test.file, cwd, sha);
+  if (reason) return { reason };
+
+  // Place the literal filter directly after `bun test`.
+  const filter = ` -t '${coveringPattern(test.name).replaceAll("'", "'\\''")}'`;
+  const command = retry
+    .replace("{files}", () => quoteRetryFiles([test.file]))
+    .replace(/^[\t ]*bun[\t ]+test(?=[\t ]|$)/, (prefix) => prefix + filter);
+  return singleBunTest(command)
+    ? { command }
+    : { reason: "expanded command is not a single bun test invocation" };
+}
+
+export async function citedFileRefusal(file: string, cwd: string, sha: string) {
+  if (!validRetryFiles([file], cwd)) return "file outside repository or invalid retry file";
+  return trackedAtShaRefusal(file, cwd, sha);
+}
+
+export async function trackedAtShaRefusal(file: string, cwd: string, sha: string) {
+  if (!/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha)) return "invalid verified SHA";
   const tracked = await worktreeGit(
     [
       "git",
@@ -77,21 +103,21 @@ export async function coveringTestCommand(test: Test, cfg: GateConfig | undefine
       "-z",
       sha,
       "--",
-      test.file.replace(/^\.\//, ""),
+      file.replace(/^\.\//, ""),
     ],
     { cwd, allowFail: true },
   );
-  if (tracked.exitCode !== 0 || !tracked.stdout.split("\0").includes(test.file.replace(/^\.\//, "")))
-    return { reason: "file not tracked at verified SHA" };
+  if (tracked.exitCode !== 0 || !tracked.stdout.split("\0").includes(file.replace(/^\.\//, "")))
+    return "file not tracked at verified SHA";
+}
 
-  // Place the literal filter directly after `bun test`.
-  const filter = ` -t '${coveringPattern(test.name).replaceAll("'", "'\\''")}'`;
-  const command = retry
-    .replace("{files}", () => quoteRetryFiles([test.file]))
-    .replace(/^[\t ]*bun[\t ]+test(?=[\t ]|$)/, (prefix) => prefix + filter);
-  return singleBunTest(command)
-    ? { command }
-    : { reason: "expanded command is not a single bun test invocation" };
+export function succeededCoveringStages(ctx: RunContext) {
+  return (ctx.state.coveringTestRuns ?? [])
+    .filter((r) => {
+      const stage = ctx.store.getStage(r.stageId);
+      return stage?.runId === ctx.run.id && stage.name === "gates" && stage.status === "succeeded";
+    })
+    .map((r) => r.stageId);
 }
 
 export function coveringTestRefusal(
@@ -126,11 +152,27 @@ export async function runCoveringTests(
   sha: string,
   checkHead: () => Promise<void>,
 ) {
+  return runCoveringRequests(
+    ctx,
+    verify.criteria.map((c) =>
+      c.status === "blocked" && c.blockedReason === "sandbox" ? (c.covering_tests ?? []) : [],
+    ),
+    sha,
+    checkHead,
+  );
+}
+
+export async function runCoveringRequests(
+  ctx: RunContext,
+  items: Test[][],
+  sha: string,
+  checkHead: () => Promise<void>,
+) {
   const cwd = ctx.state.worktreePath as string;
   const cfg = ctx.state.gatesConfig;
   ctx.state.coveringTestRuns ??= [];
   const records = ctx.state.coveringTestRuns;
-  for (const { tests } of selectCoveringTests(verify))
+  for (const { tests } of selectCoveringRequests(items))
     for (const test of tests) {
       let record = records.find((r) => r.verifiedSha === sha && r.file === test.file && r.name === test.name);
       if (record?.result || record?.reason) continue;
