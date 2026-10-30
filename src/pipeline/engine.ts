@@ -188,7 +188,10 @@ import { outOfRunCriteria, specCriteriaRange } from "./spec-criteria.ts";
 import { specScopeViolation } from "./spec-scope.ts";
 import { triageDecisions } from "./triage-decisions.ts";
 import {
+  applyBrowserContext,
+  type BrowserContext,
   blockedOnly,
+  browserSucceeded,
   ENVIRONMENT_BLOCKED,
   normalizeVerify,
   preDeliveryVerifyArtifact,
@@ -732,7 +735,8 @@ async function prepare(ctx: RunContext): Promise<void> {
       const buildSha = ctx.deps.buildSha;
       if (!hasGates) ctx.state.baseline = null;
       // Without a known build the gate environment can't be keyed: never read or write the cache.
-      else if (!buildSha) ctx.state.baseline = await runBaseline();
+      else if (!buildSha || ctx.deps.gateExecutor?.kind === "github-actions")
+        ctx.state.baseline = await runBaseline();
       else {
         const executor =
           cfg.gateExecutor === "lan" && cfg.workers.repos.includes(ctx.repo.slug) ? "lan" : "local";
@@ -2248,10 +2252,12 @@ async function oneRound(
         ? gateEvidence
         : undefined;
     };
-    const resolveVerify = (value: Verify) =>
+    const browserOutput = (value: Verify, context?: BrowserContext) =>
+      applyBrowserContext(value, ctx.state.spec as Spec, ctx.state.holdout as Holdout, context);
+    const resolveVerify = (value: Verify, context?: BrowserContext) =>
       normalizeVerify(
         applyGateEvidence(
-          value,
+          browserOutput(value, context),
           ctx.state.spec as Spec,
           ctx.state.holdout as Holdout,
           verifiedSha,
@@ -2305,11 +2311,11 @@ async function oneRound(
         ? pending
         : undefined;
     };
-    const executeCovering = (value: Verify) =>
+    const executeCovering = (value: Verify, context?: BrowserContext) =>
       runCoveringTests(
         ctx,
         applyGateEvidence(
-          value,
+          browserOutput(value, context),
           ctx.state.spec as Spec,
           ctx.state.holdout as Holdout,
           verifiedSha,
@@ -2320,7 +2326,7 @@ async function oneRound(
         checkVerifiedHead,
       );
     const pending = pendingVerify(0) ?? pendingVerify(1);
-    if (pending) await executeCovering(pending.modelOutput);
+    if (pending) await executeCovering(pending.modelOutput, pending.browserContext);
     const prepareVerification = async () => {
       if (pendingVerify(0) || pendingVerify(1)) return;
       try {
@@ -2345,7 +2351,7 @@ async function oneRound(
         "verify",
         async (stage) => {
           const obtainOutput = async () => {
-            const { result, target } = await ctx.invoke({
+            const { result, target, invocation } = await ctx.invoke({
               role: "verify",
               allowLocalBinding: true,
               stage,
@@ -2355,6 +2361,7 @@ async function oneRound(
               timeoutMs: readingTimeout(diff.added + diff.removed, 25),
               prompt: (allowLocalBinding) =>
                 verifyPrompt({
+                  previewUrl: ctx.previewUrl,
                   allowLocalBinding,
                   prompt: ctx.run.prompt,
                   spec: ctx.state.spec as Spec,
@@ -2370,25 +2377,36 @@ async function oneRound(
             });
             if (!ctx.parallelChecks) await discardChanges(cwd);
             await checkVerifiedHead();
+            const browserContext: BrowserContext = !preview
+              ? "no_preview"
+              : browserSucceeded(
+                    ctx.store.listEvents(ctx.run.id, {
+                      invocationId: invocation.id,
+                      limit: Number.MAX_SAFE_INTEGER,
+                    }),
+                  )
+                ? "available"
+                : "unavailable";
             const pending = {
               round,
               attempt,
               sha: verifiedSha,
               modelOutput: VerifySchema.parse(result.structured),
               modelId: target.modelId,
+              browserContext,
             };
             ctx.state.pendingVerify = pending;
             await ctx.save("covering-test-request");
             return pending;
           };
-          const { modelOutput, modelId } = pendingVerify(attempt) ?? (await obtainOutput());
-          await executeCovering(modelOutput);
+          const { modelOutput, modelId, browserContext } = pendingVerify(attempt) ?? (await obtainOutput());
+          await executeCovering(modelOutput, browserContext);
           await checkVerifiedHead();
-          const v = resolveVerify(modelOutput);
+          const v = resolveVerify(modelOutput, browserContext);
           ctx.state.lastVerify = { ...v, modelId };
           ctx.state.verifyResults = [
             ...(ctx.state.verifyResults ?? []),
-            { ...v, modelId, round, attempt, sha: verifiedSha, modelOutput },
+            { ...v, modelId, round, attempt, sha: verifiedSha, modelOutput, browserContext },
           ];
           ctx.state.pendingVerify = undefined;
           await ctx.save("verify-result");
@@ -2480,7 +2498,7 @@ async function oneRound(
       if (!(await rejectReview(results[0].value, feedback))) return false;
     } else {
       verify = original
-        ? resolveVerify(VerifySchema.parse(original))
+        ? resolveVerify(VerifySchema.parse(original), recorded?.browserContext)
         : await verifyAttempt(pending?.attempt ?? 0);
     }
     if (recorded) {

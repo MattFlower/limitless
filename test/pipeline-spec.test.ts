@@ -91,7 +91,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     expect(prompts).toHaveLength(oversized ? 2 : 1);
     if (oversized) expect(prompts[1]).toContain("For small complexity, use at most 3 criteria");
-    expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+    expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual({
+      ...expected,
+      acceptance_criteria: expected.acceptance_criteria.map((c) => ({ ...c, browser: false })),
+    });
     expect(f.store.getArtifact(run.id, "spec.md")).toContain(renderSpec(expected));
     const warnings = f.store.listEvents(run.id).filter((e) => e.message?.startsWith("Kept oversized spec"));
     expect(warnings).toHaveLength(oversized && finalCount === 7 ? 1 : 0);
@@ -162,7 +165,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(f.store.getRun(run.id)?.error).toContain("invalid spec scope");
         return;
       }
-      expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual(expected);
+      expect(f.store.getRunState<RunState>(run.id)?.spec).toEqual({
+        ...expected,
+        acceptance_criteria: expected.acceptance_criteria.map((c) => ({ ...c, browser: false })),
+      });
       const artifact = f.store.getArtifact(run.id, "spec.md");
       expect(artifact).toContain(expected.summary);
       if (scenario !== "clean") expect(artifact).toContain(other.how_to_verify);

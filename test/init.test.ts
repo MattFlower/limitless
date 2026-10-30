@@ -639,6 +639,8 @@ discreet = true
         ...(mode === "on" ? { "acme/lib": { discreet: true } } : {}),
       });
       expect(f.d.config.repos?.["acme/app"]).toEqual({
+        githubActions: false,
+        githubActionsPaidMinutes: false,
         landRequiresApproval: true,
         branchPrefix: "custom/",
         discreet: mode === "on",

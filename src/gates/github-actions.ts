@@ -1,18 +1,30 @@
 /**
- * Each handle dispatches at most once. Restart discards interrupted work before starting a new handle.
+ * Each handle dispatches at most once. Restart cleans up interrupted work, which then stays blocked.
  * A run visible only after cleanup's bounded window may run unobserved: it has contents: read,
  * no secrets, and nothing consumes its result. Nothing selects this executor until remote-gate
  * configuration is available.
  */
 import { randomUUID } from "node:crypto";
+import type { RepoSettings } from "../config.ts";
 import { worktreeGit } from "../git/command.ts";
+import { checkPrivatePublication } from "../git/repos.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import { CommandError } from "../util/proc.ts";
 import { CI_CONFIG } from "./audit.ts";
 import type { GateCommand } from "./detect.ts";
-import { type ExecutionHandle, type GateExecutor, gateShutdown } from "./executor.ts";
+import {
+  bound,
+  type ExecutionHandle,
+  GateBlockedError,
+  type GateExecutor,
+  gateDigest,
+  gateShutdown,
+  protectedEntries,
+} from "./executor.ts";
 import { extractFailures } from "./failures.ts";
 import { redactGateOutput } from "./output.ts";
+import { PrivateError, redactPrivate } from "./private.ts";
+import { checkPublicationText } from "./publication.ts";
 import type { GateResult, GateRun } from "./run.ts";
 
 export interface ActionsProgress {
@@ -34,13 +46,22 @@ export interface ActionsProgress {
   runId?: number;
   /** Cleanup is pending or failed; retain the identity until termination and branch deletion succeed. */
   cleanupFailed?: boolean;
+  /** Bound run and gate configuration, inputs frozen after inspection, and a blocked interruption's class. */
+  owner?: string;
+  gateKey?: string;
+  inputs?: Record<string, string>;
+  interrupted?: string;
+  diagnostic?: string;
 }
 interface Dependencies {
   gh: GhRunner;
+  /** The daemon-owned repository of a run, never derived from the request or candidate Git config. */
+  destination: (runId: string | undefined) => string | undefined;
+  settings: (repo: string) => RepoSettings;
   /** Ensure both refs point at these SHAs, atomically; refuse refs at other SHAs. */
-  push: (progress: ActionsProgress) => Promise<void>;
+  push: (progress: ActionsProgress, url: string) => Promise<void>;
   /** Delete only while the ref still points at sha (a remote force-with-lease); an absent or moved ref resolves. */
-  delete: (progress: ActionsProgress, branch: string, sha: string) => Promise<void>;
+  delete: (progress: ActionsProgress, branch: string, sha: string, url: string) => Promise<void>;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
   pollMs: number;
@@ -57,8 +78,25 @@ interface Run {
   status: string;
 }
 const workflow = "limitless-gates.yml";
+const url = (repo: string) => `https://github.com/${repo}.git`;
+const same = (a: unknown, b: string) => typeof a === "string" && a.toLowerCase() === b.toLowerCase();
+const refuse = (message: string, cwd?: string) => new GateBlockedError("refused", message, cwd);
+/** A hexadecimal ref name is mutable: bind to the canonical commit ID the object store resolves. */
+const commit = async (cwd: string, sha: string, signal: AbortSignal) => {
+  const args = ["git", "rev-parse", "--verify", "--end-of-options", `${sha}^{commit}`];
+  const out = await worktreeGit(args, { cwd, signal, allowFail: true });
+  if (out.stdout.trim() !== sha) throw refuse("Gate SHA is not a canonical local commit ID");
+};
 
 export function githubActionsExecutor(deps: Dependencies): GateExecutor {
+  /** Authorization is read live; private repositories also need paid minutes, discreet ones refuse. */
+  const admit = (repo: string, visibility: unknown, signal: AbortSignal) => {
+    signal.throwIfAborted();
+    const s = deps.settings(repo);
+    const paid = !visibility || s.githubActionsPaidMinutes;
+    if (s.discreet || !s.githubActions || typeof visibility !== "boolean" || !paid)
+      throw refuse(`GitHub Actions is not authorized for ${repo}`);
+  };
   const api = async <T>(
     p: ActionsProgress,
     path: string,
@@ -119,6 +157,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     const p = handle.githubActions;
     if (!p) throw new Error("Missing GitHub Actions progress");
     p.cleanupFailed = true;
+    if (p.owner !== undefined && !same(deps.destination(p.owner), p.repo))
+      throw refuse("GitHub Actions handle is bound to another repository");
     if (signal && gateShutdown(signal)) throw signal.reason;
     const cleanupSignal = signal?.aborted ? undefined : signal;
     const ids = new Set([...(p.cleanupRunIds ?? []), ...(p.runId ? [p.runId] : [])]);
@@ -145,7 +185,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
         const run = await api<Run>(p, `actions/runs/${id}`, "GET", undefined, cleanupSignal);
         if (run.status === "completed") break;
         if (deps.now() >= deadline)
-          throw new Error("Workflow termination unconfirmed: cleanup deadline expired");
+          throw new GateBlockedError("cleanup", "Workflow termination unconfirmed: cleanup deadline expired");
         await wait(Math.min(deps.pollMs, deadline - deps.now()), signal, true);
       }
     }
@@ -157,15 +197,16 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     ]) {
       if (!branch || !sha) continue;
       try {
-        await deps.delete(p, branch, sha);
+        await deps.delete(p, branch, sha, url(p.repo));
       } catch (error) {
         failures.push(error);
       }
     }
     if (failures.length)
-      throw new AggregateError(
-        failures,
+      throw new GateBlockedError(
+        "cleanup",
         `GitHub Actions gate cleanup failed: ${failures.map(String).join("; ")}`,
+        p.cwd,
       );
     p.cleanupFailed = undefined;
   };
@@ -174,21 +215,33 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     freshCheckoutFor: () => true,
     discard,
     async start(req, signal) {
-      signal.throwIfAborted();
+      const repo = deps.destination(req.runId);
+      if (!repo || !same(req.repo, repo)) throw refuse("Gate request does not match the run's repository");
+      await commit(req.cwd, req.headSha, signal);
+      admit(repo, false, signal); // Visibility is confirmed again before upload.
+      // Remote URLs and rewrites in the candidate's Git configuration must not redirect any transport.
+      const remotes = await worktreeGit(
+        ["git", "config", "--get-regexp", "^(remote\\..*\\.(push)?url|url\\..*\\.(push)?insteadof)$"],
+        { cwd: req.cwd, signal, allowFail: true },
+      );
+      for (const line of remotes.stdout.split("\n").filter(Boolean))
+        if (!line.startsWith("remote.") || line.split(" ")[1] !== url(repo))
+          throw refuse("Candidate Git configuration redirects the gate destination");
       const diff = await worktreeGit(
         ["git", "diff", "--no-renames", "--name-only", "-z", req.baseSha, req.headSha, "--"],
         { cwd: req.cwd, signal },
       );
       const unsafe = diff.stdout.split("\0").filter((file) => CI_CONFIG.test(file));
-      if (unsafe.length)
-        throw new Error(redactGateOutput(`Candidate changes CI configuration: ${unsafe.join(", ")}`));
+      if (unsafe.length) throw refuse(`Candidate changes CI configuration: ${unsafe.join(", ")}`, req.cwd);
       const id = randomUUID();
       return {
         kind: "github-actions",
         id,
         startedAt: deps.now(),
         githubActions: {
-          repo: req.repo,
+          repo,
+          owner: req.runId,
+          gateKey: gateDigest(req.gates),
           cwd: req.cwd,
           headSha: req.headSha,
           candidate: `limitless-gates/${id}/candidate`,
@@ -199,6 +252,9 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     attach(handle, signal, req, _hooks, persist = async () => {}) {
       const p = handle.githubActions;
       if (!p || !req) throw new Error("Missing GitHub Actions gate request");
+      const owned = bound(p, req.runId, req.headSha, gateDigest(req.gates), req.repo);
+      if (!owned || !same(deps.destination(req.runId), p.repo) || !same(req.repo, p.repo))
+        throw refuse("GitHub Actions handle is bound to another repository");
       const controller = new AbortController();
       const abort = () => controller.abort(signal.reason);
       signal.addEventListener("abort", abort, { once: true });
@@ -275,19 +331,39 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
         if (p.completed) return structuredClone(p.completed);
         alive();
         await checkpoint();
+        let visibility: unknown;
         if (!p.dispatchSha) {
-          const repo = await api<{ default_branch: string }>(p, "");
+          const repo = await api<{ default_branch: string; full_name?: unknown; private?: unknown }>(p, "");
+          if (!same(repo?.full_name, p.repo)) throw refuse("GitHub repository identity is unavailable");
+          visibility = repo.private;
           if ([p.dispatch, p.candidate].includes(repo.default_branch)) throw new Error("Unsafe gate branch");
           const ref = await api<{ object: { sha: string } }>(
             p,
             `git/ref/heads/${encodeURIComponent(repo.default_branch)}`,
           );
+          await commit(p.cwd, ref.object.sha, controller.signal);
           p.dispatchSha = ref.object.sha;
           await checkpoint();
+          // Everything the destination does not already hold: identities, messages, every commit's content.
+          const entries = protectedEntries(p.cwd);
+          await checkPrivatePublication(p.cwd, entries, { commits: `${p.dispatchSha}..${p.headSha}` });
+          const inputs = {
+            sha: p.headSha,
+            candidate: p.candidate,
+            setup: JSON.stringify(setup),
+            checks: JSON.stringify(
+              checks.map((c, index) => ({ ...c, index, minutes: Math.ceil((c.timeoutSec ?? 900) / 60) })),
+            ),
+            setup_minutes: String(Math.max(1, Math.ceil(setup.reduce((n, c) => n + c.timeoutSec, 0) / 60))),
+          };
+          for (const text of [...Object.values(inputs), ...[...setup, ...checks].map((c) => c.run)])
+            checkPublicationText(text, "Dispatch input", entries);
+          p.inputs = inputs;
         }
         if (!p.pushed) {
           await checkpoint();
-          await deps.push(p);
+          admit(p.repo, visibility, controller.signal);
+          await deps.push(p, url(p.repo));
           p.pushed = true;
           await checkpoint();
         }
@@ -297,30 +373,13 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           p.dispatchIntent = true;
           p.visibilityDeadline = Math.min(deadline, deps.now() + deps.discardVisibilityMs);
           await checkpoint();
+          admit(p.repo, visibility, controller.signal);
           try {
             const response = await api<{ workflow_run_id?: number } | null>(
               p,
               `actions/workflows/${workflow}/dispatches`,
               "POST",
-              {
-                ref: p.dispatch,
-                return_run_details: true,
-                inputs: {
-                  sha: p.headSha,
-                  candidate: p.candidate,
-                  setup: JSON.stringify(setup),
-                  checks: JSON.stringify(
-                    checks.map((c, index) => ({
-                      ...c,
-                      index,
-                      minutes: Math.ceil((c.timeoutSec ?? 900) / 60),
-                    })),
-                  ),
-                  setup_minutes: String(
-                    Math.max(1, Math.ceil(setup.reduce((n, c) => n + c.timeoutSec, 0) / 60)),
-                  ),
-                },
-              },
+              { ref: p.dispatch, return_run_details: true, inputs: p.inputs },
             );
             p.dispatchSent = true;
             p.runId = response?.workflow_run_id;
@@ -333,7 +392,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           p.visibilityDeadline ??= Math.min(deadline, deps.now() + deps.discardVisibilityMs);
           await checkpoint();
           await discoverUntil(p, p.visibilityDeadline, controller.signal);
-          if (!p.runId) throw new Error("Dispatch unconfirmed: discovery deadline expired");
+          if (!p.runId) throw new GateBlockedError("dispatch", "Dispatch unconfirmed by the deadline");
           p.dispatchSent = true;
           await checkpoint();
         }
@@ -363,13 +422,19 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
                     undefined,
                     p.repo,
                   );
-              mapped.set(index, parseJob(job, log || "", setup, command));
+              const safe = redactPrivate(redactGateOutput(log || ""), protectedEntries(p.cwd)); // Before parsing or storage.
+              mapped.set(index, parseJob(job, safe, setup, command, p.dispatchSha ?? ""));
             }
             if (run.status === "completed") {
               alive();
               if (seen.size !== checks.length || mapped.size !== checks.length)
                 throw new Error("Missing gate matrix job");
               const results = checks.map((_, index) => mapped.get(index));
+              // Only supervisor records are results; a command without one is unavailable evidence.
+              const ran = (r?: { setup: GateResult[]; check: GateResult }) =>
+                r?.setup.every((s) => s.ok) ? [...r.setup, r.check] : (r?.setup ?? []);
+              if (results.flatMap(ran).some((r) => r.incomplete))
+                throw new GateBlockedError("incomplete", "GitHub Actions did not record every command");
               const failed = results.find((r) => r?.setup.some((s) => !s.ok));
               p.completed = failed
                 ? { setupOk: false, setup: failed.setup, checks: [] }
@@ -386,6 +451,18 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           await pause(deps.pollMs);
         }
       })()
+        .catch(async (error: unknown) => {
+          if (gateShutdown(controller.signal)) throw error;
+          const aborted = controller.signal.aborted;
+          const kind = error instanceof PrivateError ? "refused" : aborted ? "cancelled" : "operational";
+          const blocked =
+            error instanceof GateBlockedError ? error : new GateBlockedError(kind, String(error), p.cwd);
+          p.cleanupFailed = true; // The rejection checkpoint must also retain its cleanup debt.
+          const { classification, message } = blocked;
+          if (!p.completed) Object.assign(p, { interrupted: classification, diagnostic: message });
+          await checkpoint();
+          throw blocked;
+        })
         .finally(async () => {
           // A completed, cleaned-up handle owes nothing: replaying it must not need GitHub.
           if (gateShutdown(controller.signal) || (p.completed && !p.cleanupFailed)) return;
@@ -395,7 +472,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           } catch (error) {
             p.cleanupFailed = true;
             await checkpoint();
-            throw error;
+            if (!p.interrupted) throw new GateBlockedError("cleanup", String(error), p.cwd);
           }
         })
         .finally(() => signal.removeEventListener("abort", abort));
@@ -418,7 +495,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
   };
 }
 
-function parseJob(job: Job, log: string, setup: GateCommand[], check: GateCommand) {
+function parseJob(job: Job, log: string, setup: GateCommand[], check: GateCommand, workflowSha: string) {
   const sections = new Map<string, string[]>();
   for (const line of log.split(/\r?\n/)) {
     const [, step, content] = line.match(/^[^\t]+\t([^\t]+)\t(?:\S+ )?(.*)$/) ?? [];
@@ -438,6 +515,9 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
     for (const record of records) {
       const m = record.match(/^LIMITLESS:[a-f\d]{32}:(\d+):(\d+):(\d+):(true|false)$/);
       const index = Number(m?.[1]);
+      const prior = values.get(index);
+      if (prior && (prior.exit !== Number(m?.[2]) || prior.timeout !== (m?.[4] === "true")))
+        throw new GateBlockedError("contradictory-records", "Contradictory gate records");
       if (!m || !commands[index] || values.has(index)) throw new Error("Malformed gate record");
       values.set(index, { exit: Number(m[2]), ms: Number(m[3]), timeout: m[4] === "true" });
     }
@@ -451,6 +531,7 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
       const timedOut = v?.timeout || (!v && job.conclusion === "timed_out");
       const ok = !!v && v.exit === 0 && !timedOut && !incomplete;
       return {
+        executor: { kind: "github-actions" as const, workflowSha, runsOn: "ubuntu-24.04" },
         name: c.name,
         command: c.run,
         ok,
@@ -465,10 +546,13 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
   };
   const setupResults = parse("Setup", setup);
   const failure = setupResults.findIndex((r) => !r.ok);
+  const result = parse("Check", [check])[0];
+  if (failure >= 0 && result?.ok)
+    throw new GateBlockedError("contradictory-records", "Check passed after setup failed");
   return {
     setup: failure < 0 ? setupResults : setupResults.slice(0, failure + 1),
     check:
-      parse("Check", [check])[0] ??
+      result ??
       (() => {
         throw new Error("Missing check");
       })(),
