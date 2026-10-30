@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { ghClient, startGitHubPoller } from "../src/integrations/github-poller.ts";
 import { githubToken } from "../src/integrations/github-token.ts";
 import * as proc from "../src/util/proc.ts";
+import { junit, reportZip } from "./ci-evidence-support.ts";
 import { pollerHarness } from "./github-poller-support.ts";
 
 let dir: string;
@@ -95,16 +96,20 @@ test.each(["non-zero exit", "timeout", "signal", "empty output", "process error"
   },
 );
 
-test("successful token lookup registers the credential before using it", async () => {
+test.each(["json", "zip"])("authenticated %s downloads preserve their response bodies", async (kind) => {
   const token = `fake-token-${randomUUID()}`;
   fakeGh(` ${token} `, 0);
   const fetch = spyOn(globalThis, "fetch").mockImplementation((async (_url, init) => {
     expect(new Headers(init?.headers).get("authorization")).toBe(`bearer ${token}`);
     expect(proc.redactCredentials(`credential: ${token}`)).toBe("credential: [redacted]");
-    return Response.json({ login: "test" });
+    return kind === "zip"
+      ? new Response(new Uint8Array(reportZip(junit())))
+      : Response.json({ login: "test" });
   }) as typeof globalThis.fetch);
   try {
-    expect((await ghClient("user")).body).toEqual({ login: "test" });
+    expect((await ghClient(kind === "zip" ? "repos/o/r/actions/artifacts/1/zip" : "user")).body).toEqual(
+      kind === "zip" ? reportZip(junit()) : { login: "test" },
+    );
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(proc.redactCredentials(token)).toBe("[redacted]");
   } finally {
