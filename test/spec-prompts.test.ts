@@ -36,7 +36,7 @@ test("spec prompt confines the read-only rule to investigation", () => {
   expect(prompt).toContain("verifiable inside the run's own checkout");
   expect(prompt).toContain("using the repository's commands and tests");
   expect(prompt).toContain(
-    "a person, the orchestrator, a browser, live external services, a deploy, or a later event",
+    "a person, the orchestrator, a browser outside the UI preview, live external services, a deploy, or a later event",
   );
   expect(prompt).toContain("Put such concerns under assumptions or out_of_scope");
 });

@@ -52,12 +52,13 @@ export const SpecSchema = z.object({
       id: z.string().regex(/^AC-\d+$/, { error: (i) => `Invalid id ${i.input}: use AC-n` }),
       criterion: z.string().describe("Observable, testable statement of behavior"),
       how_to_verify: z.string().describe("Concrete command, test, or inspection that proves it"),
+      browser: z.boolean().default(false),
     }),
   ),
   out_of_scope: z.array(z.string()),
   blocking_questions: z.array(z.string()),
 });
-export type Spec = z.infer<typeof SpecSchema>;
+export type Spec = z.input<typeof SpecSchema>;
 export const AcceptanceSchema = z.strictObject({
   items: z.array(
     z.strictObject({
@@ -90,6 +91,7 @@ export const HoldoutSchema = z
           expected: z.string().trim().min(1),
           // Informational: holdouts include edge cases only when the request or spec implies them.
           edge_case: z.boolean(),
+          browser: z.boolean().default(false),
         }),
       )
       .min(1)
@@ -101,7 +103,7 @@ export const HoldoutSchema = z
         ctx.addIssue({ code: "custom", path: ["scenarios", i, "id"], message: "IDs must be sequential H-n" });
     });
   });
-export type Holdout = z.infer<typeof HoldoutSchema>;
+export type Holdout = z.input<typeof HoldoutSchema>;
 
 /** Shorter than this (trimmed) with no findings, a first review's summary is a placeholder. */
 export const MIN_REVIEW_SUMMARY = 40;

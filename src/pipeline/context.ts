@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
@@ -55,6 +56,7 @@ import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 import type { SizeReport } from "./size.ts";
+import { type BrowserContext, browserToolNames } from "./verification.ts";
 
 export interface Checkpointer {
   writeState(runId: string, state: RunState): void;
@@ -213,7 +215,14 @@ export interface RunState {
   lastGates?: GateComparison[];
   gateEvidence?: GateEvidence;
   coveringTestRuns?: CoveringTestRun[];
-  pendingVerify?: { round: number; attempt: number; sha: string; modelOutput: Verify; modelId: string };
+  pendingVerify?: {
+    round: number;
+    attempt: number;
+    sha: string;
+    modelOutput: Verify;
+    modelId: string;
+    browserContext?: BrowserContext;
+  };
   gateTimeoutReruns?: number;
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
@@ -238,6 +247,7 @@ export interface RunState {
     sha?: string;
     /** Parsed verifier output, before engine substitution; retained privately for restart. */
     modelOutput?: Verify;
+    browserContext?: BrowserContext;
   })[];
   /** Round whose retry is reserved; a restart resumes it, and a recorded attempt 1 ends retrying. */
   environmentRetryRound?: number;
@@ -1314,6 +1324,10 @@ export class RunContext {
     redact?: (value: string) => string,
   ): void {
     const runId = this.run.id;
+    const toolUseId =
+      ev.type === "tool_call" || ev.type === "tool_result"
+        ? createHash("sha256").update(ev.id).digest("hex")
+        : undefined;
     const add = (
       type: RunEvent["type"],
       message: string,
@@ -1331,6 +1345,8 @@ export class RunContext {
             ? JSON.parse(
                 JSON.stringify(data, (_key, value: unknown) =>
                   typeof value === "string" &&
+                  !(_key === "toolUseId" && value === toolUseId) &&
+                  !(_key === "browserTool" && browserToolNames.has(value)) &&
                   !(_key === "code" && (value === "signal_attempt" || value === "browser_unavailable"))
                     ? redact(value)
                     : value,
@@ -1364,6 +1380,9 @@ export class RunContext {
         add("tool_call", `${ev.name}${command ? `: ${command.slice(0, 300)}` : ""}`, {
           id: ev.id,
           input: ev.input,
+          browserTool: browserToolNames.has(ev.name) ? ev.name : undefined,
+          // Fingerprints correlate calls/results without exposing private tool-use IDs.
+          toolUseId,
         });
         break;
       }
@@ -1371,7 +1390,7 @@ export class RunContext {
         add(
           "tool_result",
           ev.output.slice(0, 400),
-          { id: ev.id, output: ev.output },
+          { id: ev.id, output: ev.output, toolUseId },
           ev.isError ? "warn" : "debug",
         );
         break;
