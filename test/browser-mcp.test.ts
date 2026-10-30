@@ -252,33 +252,12 @@ test("browser read allowlist and private denials enclose only its own writable d
   }
 });
 
-test("browser system reads exclude checkout and sibling scratch through Data-volume paths", async () => {
-  const { spec, cwd, scratch } = await fixture();
-  // Model macOS system directories on Linux too; the generated profile is the output under test.
-  const system = (path: unknown): path is string =>
-    typeof path === "string" && (path === "/System" || path.startsWith("/System/"));
-  const exists = fs.existsSync,
-    realpath = fs.realpathSync,
-    lstat = fs.lstatSync;
-  const directory = lstat(scratch);
-  const mocks = [
-    spyOn(fs, "existsSync").mockImplementation((path) => system(path) || exists(path)),
-    spyOn(fs, "realpathSync").mockImplementation(
-      new Proxy(realpath, {
-        apply(target, receiver, args) {
-          return system(args[0]) ? args[0] : Reflect.apply(target, receiver, args);
-        },
-      }),
-    ),
-    spyOn(fs, "lstatSync").mockImplementation(
-      new Proxy(lstat, {
-        apply(target, receiver, args) {
-          return system(args[0]) ? directory : Reflect.apply(target, receiver, args);
-        },
-      }),
-    ),
-  ];
-  try {
+// The Data-volume aliases exist only on macOS. On Linux, browserMcp stops before the profile,
+// and mocking node:fs reaches only some of the modules that read these paths.
+test.skipIf(process.platform !== "darwin")(
+  "browser system reads exclude checkout and sibling scratch through Data-volume paths (macOS)",
+  async () => {
+    const { spec, cwd, scratch } = await fixture();
     const server = browserMcp(spec, "codex", [], "darwin");
     if (!server) throw new Error("missing server");
     const reads = policy(server)
@@ -292,10 +271,8 @@ test("browser system reads exclude checkout and sibling scratch through Data-vol
       expect(allowed(file)).toBe(false);
       expect(allowed(`/System/Volumes/Data${file}`)).toBe(false);
     }
-  } finally {
-    for (const mock of mocks) mock.mockRestore();
-  }
-});
+  },
+);
 
 test("a preview allows exactly its own IPv4 loopback port", async () => {
   const { spec, scratch } = await fixture();
