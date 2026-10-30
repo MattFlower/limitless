@@ -74,6 +74,7 @@ export interface ReportInput {
   state: Pick<
     RunState,
     | "flow"
+    | "acceptance"
     | "implementerReport"
     | "spec"
     | "holdout"
@@ -174,6 +175,22 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
         .join("\n"),
     ),
   ];
+  const acceptance = state.acceptance?.outcome;
+  if (acceptance)
+    blocks.push(
+      "## Acceptance",
+      `Checked \`${acceptance.sha}\`: ${acceptance.summary}`,
+      ...acceptance.units.map((u) =>
+        reportText(
+          "verifier",
+          [
+            `- ${u.unit}: ${u.verdict}${u.refusals.length ? ` (${u.refusals.join("; ")})` : ""}`,
+            ...u.citations.map((c) => `  - ${c}`),
+            ...(u.note ? [`  - model note (unverified): ${u.note}`] : []),
+          ].join("\n"),
+        ),
+      ),
+    );
   const size = state.sizeReport;
   if (size) {
     let text = `Size unavailable: ${"unavailable" in size ? size.unavailable : "error" in size ? size.error : ""}`;

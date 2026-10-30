@@ -157,7 +157,7 @@ function refusal(
   return undefined;
 }
 
-const coveringCitation = (run: CoveringTestRun, sha: string): string =>
+export const coveringCitation = (run: CoveringTestRun, sha: string): string =>
   `Factory covering test ${run.file} › ${run.name} passed at ${sha} (stage ${run.stageId}); command: ${run.result?.executedCommand ?? run.result?.command}`;
 type Binding = {
   evidence: string;
