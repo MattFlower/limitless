@@ -446,7 +446,7 @@ test("client IO clears scope through awaits and ambiguous-result readback", asyn
   ]);
 });
 
-test("source boundaries keep the primitive disabled in production", async () => {
+test("source boundaries permit guarded control IO without production claim bindings", async () => {
   const allowed = new Set(["src/integrations/claim-ref.ts", "src/integrations/leases.ts"]);
   const references: string[] = [];
   for await (const path of new Bun.Glob("src/**/*.ts").scan({
@@ -464,6 +464,7 @@ test("source boundaries keep the primitive disabled in production", async () => 
     expect(source).not.toMatch(/\bbindClaim\b|claimScope\.run\b/);
     if (/\bclaimGuard\b/.test(source))
       expect([
+        "src/integrations/control-ref.ts",
         "src/integrations/github-identity.ts",
         "src/git/repos.ts",
         "src/pipeline/context.ts",
