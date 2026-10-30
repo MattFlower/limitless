@@ -48,6 +48,10 @@ checkout made the denied reads succeed; `(allow mach-lookup)` made the IPC check
 checkout readable and writable, a screenshot was written into it. With reads widened but the write
 deny kept, the checkout screenshots still failed (EPERM on `open`).
 
+Every granted UI tool (navigate, back, snapshot, click, type, fill form, select, press key, hover,
+drag, wait, tabs, close, resize, dialog, console, network requests, screenshot) also ran without
+error under the final profile, and no Chromium process outlived the server.
+
 After this run both `CONFINEMENT_GAPS` entries were removed.
 
 ## What the profile allows, and why
@@ -103,6 +107,13 @@ and restricted. Crash reporting is off (crashpad cannot check in), which is harm
   Apple Events, the LaunchServices databases (`lsd.*`) and every other service stay denied.
 - Seatbelt does not gate `exec` on file reads, so a process may execute a binary it cannot read;
   it still runs under this profile.
+- The profile starts from `(allow default)` and restricts network, file, signal and IPC operations
+  only. IOKit user clients (the GPU process needs them), binding and accepting sockets, and sysctl
+  reads stay allowed.
+- The allowlist was measured on one macOS release with this Chrome build and Homebrew Node; another
+  coordinator, macOS release or pin needs the probe re-run. If a Homebrew upgrade keeps the old keg,
+  its `opt` link moves to the new one and dyld no longer reaches the recorded libraries; Node then
+  aborts at start and the browser fails closed without a specific diagnostic.
 
 ## Running the probe
 

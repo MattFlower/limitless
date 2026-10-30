@@ -200,8 +200,11 @@ test("browser read allowlist and private denials enclose only its own writable d
         profile.indexOf("(allow file-read*"),
       );
     }
-    for (const name of ["TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"])
+    // Chromium on macOS takes its temporary directory from MAC_CHROMIUM_TMPDIR, not TMPDIR.
+    for (const name of ["TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "MAC_CHROMIUM_TMPDIR"])
       expect(server.env[name]).toBe(directory);
+    // Node aborts on an OpenSSL configuration the profile cannot read.
+    expect(server.env.OPENSSL_CONF).toBe("/dev/null");
     const second = browserMcp(spec, "codex", [], "darwin");
     expect(second?.env.HOME).not.toBe(directory);
     expect(policy(second)).not.toContain(`(subpath "${directory}")`);
@@ -280,11 +283,14 @@ test.each([
   expect(allows).toEqual(
     (families ?? []).map((family) => `(allow network-outbound (remote ${family} "localhost:${port}"))`),
   );
-  // Seatbelt compiles the profile before applying it; exit 65 means it rejected a rule. Exit 0 also
-  // shows dyld can start under the generated profile (it aborted before the root-directory read).
+  // Seatbelt compiles the profile before applying it; exit 65 means it rejected a rule. The control
+  // sits in the readable browser directory, and exit 0 also shows dyld starts under the profile
+  // (without the root-directory read it aborts with 134).
   if (process.platform === "darwin") {
+    const control = join(server?.env.HOME ?? "", "true");
+    fs.copyFileSync("/usr/bin/true", control);
     const compiled = await runProcess({
-      cmd: [SANDBOX_EXEC, "-p", policy(server), "/usr/bin/true"],
+      cmd: [SANDBOX_EXEC, "-p", policy(server), control],
       cwd: scratch,
       env: agentEnv(),
       timeoutMs: 10_000,
