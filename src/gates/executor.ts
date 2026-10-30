@@ -1,13 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
 import { withScratch } from "../harness/scratch.ts";
+import { registeredCredentials } from "../util/proc.ts";
 import type { GateConfig } from "./detect.ts";
 import type { ActionsProgress } from "./github-actions.ts";
 import { lanExecutor } from "./lan.ts";
 import { redactGateData, redactGateOutput } from "./output.ts";
+import { loadPrivateStrings, type PrivateStrings, redactPrivate } from "./private.ts";
 import {
   type GateHooks,
   type GateResult,
@@ -102,6 +104,51 @@ export async function gateProvenance(cwd: string, signal: AbortSignal, checkedSh
     // A completed gate still returns its result when Git inspection is unavailable.
   }
   return { trackedClean: false, provenanceError: "execution provenance could not be confirmed" };
+}
+
+export const gateDigest = (cfg: GateConfig) => createHash("sha256").update(JSON.stringify(cfg)).digest("hex");
+export const protectedEntries = (cwd?: string): PrivateStrings => [
+  ...loadPrivateStrings(undefined, [cwd]),
+  ...registeredCredentials().map((value) => ({ value, entry: 1 })),
+];
+
+type Binding = ActionsProgress | undefined;
+export const bound = (p: Binding, run?: string, sha?: string, key?: string, repo?: string) => {
+  if (!p?.owner || !key || p.repo?.toLowerCase() !== repo?.toLowerCase()) return false;
+  return p.owner === run && p.headSha === sha && p.gateKey === key;
+};
+export const replayable = (p: Binding, run?: string, sha?: string, key?: string, repo?: string) =>
+  p && !p.interrupted && bound(p, run, sha, key, repo) ? p.completed : undefined;
+
+/** Operational failure, never a gate result or feedback; unredactable detail keeps only its class. */
+export class GateBlockedError extends Error {
+  readonly classification: string;
+  constructor(classification: string, message: string, cwd?: string) {
+    super(`GitHub Actions gate blocked (${classification})`);
+    this.classification = classification;
+    try {
+      this.message = redactPrivate(redactGateOutput(`${this.message}: ${message}`), protectedEntries(cwd));
+    } catch {}
+  }
+}
+
+/** Interrupted Actions work is cleaned up, then stays blocked: never replaced, redispatched or replayed. */
+export async function blockInterrupted(handle: ExecutionHandle, ex?: GateExecutor, save = async () => {}) {
+  const p = handle.githubActions;
+  try {
+    if (!p?.interrupted || p.cleanupFailed) await cancelGateExecution(handle, ex);
+    if (p?.cleanupFailed) throw new Error("cleanup remains pending");
+    if (p) p.interrupted ??= "interrupted";
+  } catch (error) {
+    if (!p?.interrupted)
+      throw error instanceof GateBlockedError
+        ? error
+        : new GateBlockedError("cleanup", String(error), p?.cwd);
+  } finally {
+    await save();
+  }
+  const message = p?.diagnostic ?? "interrupted execution is not replaced";
+  throw new GateBlockedError(p?.interrupted ?? "interrupted", message, p?.cwd);
 }
 
 /** Shutdown detaches durable jobs; owner cancellation discards them. */
@@ -242,7 +289,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
 
 /**
  * Start, checkpoint, attach and cancel through the same path for all daemon gates.
- * Interrupted Actions handles are discarded before replacement; completed results are reused.
+ * Interrupted Actions handles stay blocked; completed results bound to this request are reused.
  */
 export async function executeGate(
   req: GateRequest,
@@ -258,16 +305,11 @@ export async function executeGate(
       ? localExecutor(hooks)
       : (injected ?? localExecutor(hooks));
   if (stored && stored.kind !== executor.kind) throw new Error(`Unavailable gate executor: ${stored.kind}`);
-  if (stored?.kind === "github-actions" && !stored.githubActions?.completed) {
-    try {
-      await cancelGateExecution(stored, executor);
-      if (stored.githubActions?.cleanupFailed) throw new Error("GitHub Actions gate cleanup remains pending");
-    } catch (error) {
-      await persist(stored);
-      throw error;
-    }
-    stored = undefined;
-  }
+  if (
+    stored?.kind === "github-actions" &&
+    !replayable(stored.githubActions, req.runId, req.headSha, gateDigest(req.gates), req.repo)
+  )
+    await blockInterrupted(stored, executor, () => persist(stored));
   const handle = stored ?? (await executor.start(req, signal));
   if (!stored) await persist(handle);
   let execution: Execution<GateRun>;
