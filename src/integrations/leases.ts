@@ -1,5 +1,6 @@
 import { ISSUE_CLAIM_STATUSES, type Store } from "../db/store.ts";
 import { type ClockSource, LEASE, windowOpen } from "../util/claim-clock.ts";
+import { claimScope } from "./claim-guard.ts";
 import type { Anchor, ClaimClient, ClaimRecord, ClaimTip } from "./claim-ref.ts";
 import type { GhRunner } from "./github.ts";
 import {
@@ -61,7 +62,7 @@ export async function createLeaseManager(deps: {
     hooks?.onLost(h, tip);
   }
   const recovering = store.leaseRowsWithIntent();
-  const recovery = await recoverLeases({ client, store });
+  const recovery = await claimScope.exit(() => recoverLeases({ client, store }));
   for (const row of recovering) {
     const after = store.leaseRow(row.repo, row.ref);
     if (recovery.superseded.includes(row.ref) && after?.confirmed?.state === "lost" && !after.intent)
@@ -222,7 +223,7 @@ export async function createLeaseManager(deps: {
     if (result.kind === "superseded") return "lost";
     return result.kind === "held" ? "applied" : "wait";
   }
-  return {
+  const manager: LeaseManager = {
     async acquire(repo, ref, want, opts, signal) {
       const result = await operate(canonicalRepo(repo), ref, want, opts.takeover, { signal });
       return typeof result === "string" ? refused : result;
@@ -239,12 +240,23 @@ export async function createLeaseManager(deps: {
         if (!loss.delivered) next.onLost(loss.handle, loss.tip);
         loss.delivered = true;
       }
-      const id = timer.set(async () => {
-        for (const row of store.leaseRowsWithIntent())
-          await locked(row.repo, row.ref, () => reconcile(row.repo, row.ref));
-        for (const h of store.heldLeaseRows().map(handle)) if (next.active(h)) await mutate(h, {});
-      }, LEASE.renewMs);
+      const id = timer.set(
+        () =>
+          claimScope.exit(async () => {
+            for (const row of store.leaseRowsWithIntent())
+              await locked(row.repo, row.ref, () => reconcile(row.repo, row.ref));
+            for (const h of store.heldLeaseRows().map(handle)) if (next.active(h)) await mutate(h, {});
+          }),
+        LEASE.renewMs,
+      );
       return () => timer.clear(id);
     },
+  };
+  return {
+    ...manager,
+    acquire: (...args) => claimScope.exit(() => manager.acquire(...args)),
+    update: (...args) => claimScope.exit(() => manager.update(...args)),
+    release: (...args) => claimScope.exit(() => manager.release(...args)),
+    start: (...args) => claimScope.exit(() => manager.start(...args)),
   };
 }
