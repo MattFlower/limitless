@@ -132,9 +132,12 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
   if (fullName.split("/")[0] !== owner) return { note: "repository owner is not configured owner" };
   const base = { repo: fullName, source: "github" as const };
   const issue = object(p.issue);
+  const acceptance =
+    Array.isArray(issue?.labels) && issue.labels.some((l) => object(l)?.name === "acceptance");
   const pr = object(p.pull_request);
   if (event === "issues" && action === "labeled") {
     if (string(object(p.label)?.name) !== "limitless") return { note: "other label" };
+    if (acceptance) return { note: "acceptance ticket: build runs refused" };
     if (login(p.sender) !== owner || login(issue?.user) !== owner)
       return { note: "actor or issue author is not owner" };
     const id = number(issue?.number);
@@ -158,6 +161,7 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
     if (!id || title === null || body === null || (issue?.body !== null && string(issue?.body) === null))
       return { note: "malformed comment or issue", error: true };
     if (!body.startsWith("/limitless ") || !body.slice(11).trim()) return { note: "other comment" };
+    if (acceptance) return { note: "acceptance ticket: build runs refused" };
     if (reservedAnswer(body.slice(11))) return { note: ANSWER_UNSUPPORTED };
     return {
       note: "owner command",
@@ -316,6 +320,20 @@ export function githubWebhook(
           p?.action === "created" &&
           !!author &&
           queue.trusted.some((t) => t.toLowerCase() === author.toLowerCase());
+        const body = string(object(p?.comment)?.body);
+        const labels = object(p?.issue)?.labels;
+        if (
+          hint &&
+          body?.startsWith("/limitless ") &&
+          body.slice(11).trim() &&
+          !reservedAnswer(body.slice(11)) &&
+          Array.isArray(labels) &&
+          labels.some((l) => object(l)?.name === "acceptance")
+        ) {
+          const note = "acceptance ticket: build runs refused";
+          factory.store.finishInbox(id, "ignored", note);
+          return new Response(note, { status: 200 });
+        }
         if (hint) pollNow?.();
         const note = hint ? "Issue queue poll requested" : "Issue queue comment ignored";
         factory.store.finishInbox(id, "ignored", note);

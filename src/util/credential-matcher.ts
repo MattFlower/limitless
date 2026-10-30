@@ -283,3 +283,31 @@ export function registerCredentialVariant(text: string, substring: boolean): voi
 }
 export const credentialMatcher = (): CredentialMatcher =>
   (compiled ??= new CredentialMatcher(new Map(variants)));
+/** Original length determines eligibility, including for longer escaped variants. */
+export function credentialVariants(secret: string): string[] {
+  const values = [secret, secret.replace(/\r\n/g, "\n")];
+  const variants = values.flatMap((s) => {
+    const json = JSON.stringify(s).slice(1, -1);
+    return s.includes("/") ? [s, json, json.replaceAll("/", "\\/")] : [s, json];
+  });
+  return [...new Set(variants)];
+}
+export function createCredentialRegistry(onAdd?: (value: string) => void) {
+  const values = new Set<string>();
+  return {
+    get generation() {
+      return values.size;
+    },
+    has: (value: string) => values.has(value),
+    values: () => [...values],
+    add: (value: string) => {
+      if (value && !values.has(value)) {
+        values.add(value);
+        onAdd?.(value);
+      }
+    },
+  };
+}
+export const credentialRegistry = createCredentialRegistry((secret) => {
+  for (const variant of credentialVariants(secret)) registerCredentialVariant(variant, secret.length >= 8);
+});
