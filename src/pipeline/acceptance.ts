@@ -82,87 +82,191 @@ export function acceptanceRunRequest({
 
 const norm = (text: string) => text.replace(/\s+/g, " ").trim();
 const sectionReference = /^#(\d+)'s "([^"]+)" section( \(docs\))?$/;
-type Block = { text: string; kind: "quote" | "item" | "para" | "cell" | "reference" };
+type Block = {
+  text: string;
+  kind: "quote" | "item" | "para" | "cell" | "reference" | "lead";
+  refusal?: string;
+};
+const leadIn = /^From (#\d+|[\w-]+(?:[./][\w-]+)+)\b.*:$/;
+const unsupported = (construct: string) =>
+  `unsupported Markdown in the intent: ${construct}; normalize the ticket`;
+const escapedPipe = unsupported("escaped pipe in a table row");
+const quoteLine = (line: string) => line.replace(/^(?: {0,3}>[ \t]?)+/, "");
+const tableRow = (line: string) => line.includes("|");
+const setext = (line: string) => /^ {0,3}(?:=+|-+)\s*$/.test(line);
+function atx(line: string) {
+  const h = /^ {0,3}(#{1,6})(?= |$)(.*)$/.exec(line);
+  return h ? { level: h[1]?.length ?? 0, text: norm((h[2] ?? "").replace(/ +#+ *$/, "")) } : undefined;
+}
+function listItem(line: string) {
+  const m = /^( *)(?:[-*+]|\d+[.)])([ \t]+)(.*)$/.exec(line);
+  return m ? { text: m[3] ?? "", continuation: line.length - (m[3]?.length ?? 0) } : undefined;
+}
 
-/** Whole units: list items, paragraphs, blockquote paragraphs and table cells; no fences or <details>. */
+/** One fence/comment scanner for heading discovery and quote sources. Keep physical line positions. */
+function sourceLines(md: string) {
+  let fence: string | undefined;
+  let comment = false;
+  let details = 0;
+  const lines = md.split(/\r?\n/).map((line) => {
+    const body = quoteLine(line);
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(body);
+    if (fence) {
+      const delimiter = marker?.[1] ?? "";
+      if (delimiter[0] === fence[0] && delimiter.length >= fence.length && /^ *$/.test(marker?.[2] ?? ""))
+        fence = undefined;
+      return undefined;
+    }
+    if (comment || body.includes("<!--")) {
+      let offset = 0;
+      while (offset < body.length) {
+        const at = body.indexOf(comment ? "-->" : "<!--", offset);
+        if (at < 0) break;
+        offset = at + (comment ? 3 : 4);
+        comment = !comment;
+      }
+      return undefined;
+    }
+    if (details || /^\s*<details\b/i.test(body)) {
+      details += (body.match(/<details\b/gi)?.length ?? 0) - (body.match(/<\/details\s*>/gi)?.length ?? 0);
+      return undefined;
+    }
+    if (marker) {
+      fence = marker[1];
+      return undefined;
+    }
+    return /^\s*</.test(body) ? undefined : line;
+  });
+  return { lines, unclosed: !!fence || comment || details > 0 };
+}
+
+/** Validate raw lines before considering a later heading as a section boundary. */
+function sectionEnd(lines: string[], start: number, level: number): number {
+  const continuations: number[] = [];
+  let paragraph = false;
+  for (let i = start; i < lines.length; i++) {
+    const raw = lines[i] ?? "";
+    const body = quoteLine(raw.replace(/\t/g, "    "));
+    if (!body.trim()) {
+      paragraph = false;
+      continue;
+    }
+    const indent = /^ */.exec(body)?.[0].length ?? 0;
+    while (continuations.length && indent < (continuations.at(-1) ?? 0)) continuations.pop();
+    const item = listItem(body);
+    const content = item?.text ?? body;
+    const h = atx(raw);
+    const reason = /^ *(`{3,}|~{3,})/.test(content)
+      ? "fence"
+      : /^ *</.test(content)
+        ? "HTML block or comment"
+        : paragraph && setext(body)
+          ? "setext heading"
+          : indent >= 4 && !continuations.length
+            ? "indented code or heading"
+            : tableRow(body) && body.includes("\\|")
+              ? "escaped pipe in a table row"
+              : undefined;
+    if (reason) throw new Error(unsupported(reason));
+    if (h && h.level <= level) return i;
+    if (item) continuations.push(item.continuation);
+    paragraph = !atx(content) && !tableRow(content);
+  }
+  return lines.length;
+}
+
+/** Whole units share list continuation and normalization rules in tickets and quote sources. */
 export function markdownUnits(md: string, references = false): Block[] {
+  const scanned = sourceLines(md);
+  if (scanned.unclosed) throw new Error("unresolvable source: unclosed fence, comment or details");
   const out: Block[] = [];
   let current: Block | undefined;
-  let fence = "";
-  let details = 0;
+  let continuation: number | undefined;
+  let currentQuoted = false;
   const flush = () => {
     if (current && norm(current.text)) out.push({ ...current, text: norm(current.text) });
     current = undefined;
+    continuation = undefined;
   };
-  const lines = md
-    .split("\n")
-    .map((line) => ({ quoted: /^\s*>/.test(line), body: line.trim().replace(/^(?:>\s?)+/, "") }));
   const separator = (s = "") => /^[\s|:-]+$/.test(s) && s.includes("-") && s.includes("|");
-  lines.forEach(({ quoted, body }, i) => {
-    const marker = /^(`{3,}|~{3,})/.exec(body.trim())?.[1];
-    if (fence || marker) {
-      flush();
-      if (!fence) fence = marker?.slice(0, 3) ?? "";
-      else if (marker?.startsWith(fence)) fence = "";
-      return;
-    }
-    if (details || /^<details\b/i.test(body)) {
-      flush();
-      details += (body.match(/<details\b/gi)?.length ?? 0) - (body.match(/<\/details>/gi)?.length ?? 0);
-      return;
-    }
-    if (!body.trim() || /^#{1,6}\s/.test(body)) {
+  scanned.lines.forEach((line, i) => {
+    if (line === undefined) {
       flush();
       return;
     }
-    if (!quoted && references && sectionReference.test(body)) {
-      flush();
-      out.push({ text: body, kind: "reference" });
+    const quoted = /^ {0,3}>/.test(line);
+    const body = quoteLine(line.replace(/\t/g, "    "));
+    if (!body.trim()) {
+      if (continuation === undefined) flush();
       return;
     }
-    if (body.startsWith("|")) {
+    const indent = /^ */.exec(body)?.[0].length ?? 0;
+    const item = listItem(body);
+    if (!quoted && references && (sectionReference.test(body.trim()) || leadIn.test(body.trim()))) {
       flush();
-      if (separator(body) || separator(lines[i + 1]?.body)) return;
-      for (const cell of body.replace(/^\||\|\s*$/g, "").split("|"))
-        if (norm(cell)) out.push({ text: norm(cell), kind: "cell" });
+      out.push({ text: body.trim(), kind: leadIn.test(body.trim()) ? "lead" : "reference" });
+      return;
+    }
+    if (atx(quoteLine(line)) || setext(body)) {
+      flush();
+      return;
+    }
+    if (
+      current &&
+      continuation !== undefined &&
+      quoted === currentQuoted &&
+      indent >= continuation &&
+      !item
+    ) {
+      current.text += ` ${body}`;
+      return;
+    }
+    if (tableRow(body)) {
+      flush();
+      if (body.includes("\\|")) out.push({ text: norm(body), kind: "cell", refusal: escapedPipe });
+      else if (!separator(body) && !separator(scanned.lines[i + 1])) {
+        for (const cell of body
+          .trim()
+          .replace(/^\||\|\s*$/g, "")
+          .split("|"))
+          if (norm(cell)) out.push({ text: norm(cell), kind: "cell" });
+      }
       return;
     }
     const kind = quoted ? "quote" : "para";
-    const item = /^(?:[-*+]|\d+[.)])\s+(.*)$/.exec(body);
     if (item) {
       flush();
-      current = { text: item[1] ?? "", kind: quoted ? "quote" : "item" };
-    } else if (current && (current.kind === kind || (current.kind === "item" && !quoted)))
-      current.text += ` ${body}`;
+      current = { text: item.text, kind: quoted ? "quote" : "item" };
+      continuation = item.continuation;
+    } else if (current && continuation === undefined && current.kind === kind) current.text += ` ${body}`;
     else {
       flush();
       current = { text: body, kind };
     }
+    currentQuoted = quoted;
   });
   flush();
   return out;
 }
 
-/** The text under the one heading named `heading`, up to the next heading of the same or a higher level. */
+/** Match headings globally, then validate the selected range sequentially without exclusions. */
 function section(md: string, heading: string): string | undefined {
-  const lines = md.split("\n");
-  let fence = false;
-  let details = 0;
-  const heads: { i: number; level: number; text: string }[] = [];
-  lines.forEach((line, i) => {
-    if (!fence && (details || /^\s*<details\b/i.test(line))) {
-      details += (line.match(/<details\b/gi)?.length ?? 0) - (line.match(/<\/details>/gi)?.length ?? 0);
-      return;
-    }
-    if (/^\s*(`{3,}|~{3,})/.test(line)) fence = !fence;
-    const h = !fence && /^(#{1,6})\s+(.*?)[\s#]*$/.exec(line);
-    if (h) heads.push({ i, level: h[1]?.length ?? 0, text: norm(h[2] ?? "") });
+  const scanned = sourceLines(md);
+  const heads = scanned.lines.flatMap((line, i) => {
+    const h = line === undefined ? undefined : atx(line);
+    return h ? [{ ...h, i }] : [];
   });
   const hits = heads.filter((h) => h.text === norm(heading));
   const hit = hits[0];
-  if (hits.length !== 1 || !hit) return undefined;
-  const end = heads.find((h) => h.i > hit.i && h.level <= hit.level)?.i ?? lines.length;
-  return lines.slice(hit.i + 1, end).join("\n");
+  const raw = md.split(/\r?\n/);
+  const end = hit ? sectionEnd(raw, hit.i + 1, hit.level) : raw.length;
+  if (scanned.unclosed) throw new Error("unresolvable source: unclosed fence, comment or details");
+  const setextMatch = scanned.lines.some((line, i) => {
+    const previous = scanned.lines[i - 1];
+    return line !== undefined && setext(line) && previous !== undefined && norm(previous) === norm(heading);
+  });
+  if (hits.length !== 1 || !hit || setextMatch) return undefined;
+  return raw.slice(hit.i + 1, end).join("\n");
 }
 
 /** Resolve the ticket's intent into units from trusted text only; throws the refusal reason. */
@@ -193,7 +297,7 @@ export async function resolveIntent(
   };
   for (const block of markdownUnits(section(ticket.body, "The original intent") ?? "", true)) {
     const ref = block.kind === "reference" && sectionReference.exec(block.text);
-    const from = /^From (#\d+|[\w-]+(?:[./][\w-]+)+)\b.*:$/.exec(block.text);
+    const from = block.kind === "lead" && leadIn.exec(block.text);
     if (ref) {
       if (Number(ref[1]) !== parent.number)
         throw new Error(`unresolvable source: #${ref[1]} is not the parent`);
@@ -201,11 +305,15 @@ export async function resolveIntent(
       if (body === undefined)
         throw new Error(`section "${ref[2]}" does not name exactly one heading of #${ref[1]}`);
       for (const unit of markdownUnits(body)) add(unit.text, !!ref[3], `#${ref[1]} "${ref[2]}"`);
-    } else if (block.kind === "para" && from)
-      lead = { source: from[1] ?? "", docs: block.text.endsWith("(docs):") };
+    } else if (from) lead = { source: from[1] ?? "", docs: block.text.endsWith("(docs):") };
     else if (block.kind === "quote" || block.kind === "item") {
-      if (!(await unitsOf(lead.source)).some((unit) => unit.text === block.text))
-        throw new Error(`quote is not a whole source unit: ${block.text.slice(0, 120)}`);
+      const sourceUnits = await unitsOf(lead.source);
+      const match = sourceUnits.find((unit) => !unit.refusal && unit.text === block.text);
+      if (!match) {
+        // Refused rows cannot supply evidence, including a fragment created by splitting an escaped pipe.
+        const refused = sourceUnits.find((unit) => unit.refusal && unit.text.includes(block.text));
+        throw new Error(refused?.refusal ?? `quote is not a whole source unit: ${block.text.slice(0, 120)}`);
+      }
       add(block.text, lead.docs, lead.source);
     }
   }

@@ -93,22 +93,12 @@ test("quotes must equal one whole source unit", async () => {
   ]);
 });
 
-test("section references include subsections and dedupe quoted units, excluding fences and details", async () => {
+test("section references include subsections and dedupe quoted units", async () => {
   const parent = `## Epic D: defects become issues
 - A defect opens an issue.
 
 ### Details
 Each issue links its run.
-
-\`\`\`
-- not a unit
-\`\`\`
-
-<details>
-<summary>More</summary>
-
-- hidden item
-</details>
 
 ## Next epic
 - Excluded.
@@ -139,25 +129,13 @@ test("a ticket with neither form resolves to no units", async () => {
   ).rejects.toThrow("resolves to no units");
 });
 
-test("section boundaries ignore headings inside excluded details blocks", async () => {
-  const units = await resolve(
-    `#1's "Goal" section`,
-    `## Goal
-- Required before details.
-
-<details>
-<summary>Context</summary>
-
-## Hidden heading
-- Hidden context.
-</details>
-
-- Required after details.
-
-## Next
-- Outside the section.`,
-  );
-  expect(units.map((u) => u.text)).toEqual(["Required before details.", "Required after details."]);
+test("details cannot hide later units or terminate a selected section", async () => {
+  await expect(
+    resolve(
+      `#1's "Goal" section`,
+      "## Goal\n- Before.\n\n<details>\n## Hidden\n- Hidden.\n</details >\n\n- After.\n\n## End",
+    ),
+  ).rejects.toThrow("unsupported Markdown in the intent: HTML block or comment; normalize the ticket");
 });
 
 test("a hidden duplicate heading does not make a visible section ambiguous", async () => {
@@ -202,4 +180,165 @@ test("adjacent references preserve order, sources, docs classification and dedup
     ["U1", "Documentation.", "docs", '#1 "Docs"'],
     ["U2", "Behaviour.", "behaviour", '#1 "Goal"'],
   ]);
+});
+
+const unsupported = (construct: string) =>
+  `unsupported Markdown in the intent: ${construct}; normalize the ticket`;
+
+const unsupportedCases = [
+  ["short backtick closer", "````md\n```\n## Hidden\n- Hidden.\n````", "fence"],
+  ["different fence character", "```md\n~~~\n## Hidden\n- Hidden.\n```", "fence"],
+  ["tilde fence with backticks", "~~~md\n```\n## Hidden\n~~~", "fence"],
+  ["commented heading or reference", '<!--\n## Hidden\n#1\'s "Other" section\n-->', "HTML block or comment"],
+  ["HTML block", "<div>\n## Hidden\n</div>", "HTML block or comment"],
+  ["details", "<details>\n## Hidden\n</details >", "HTML block or comment"],
+  ["setext equals", "End\n===", "setext heading"],
+  ["setext dashes", "End\n---", "setext heading"],
+  ["quoted setext", "> End\n> ===", "setext heading"],
+  ["list-item setext", "- End\n  ===", "setext heading"],
+  ["indented code", "    code", "indented code or heading"],
+  ["indented heading", "    ## End", "indented code or heading"],
+  ["quoted fence", "> ```md\n> hidden\n> ```", "fence"],
+  ["list-item fence", "- ```md\n  ## Hidden\n  ```", "fence"],
+  ["list-item HTML", "- <details>\n  ## Hidden\n  </details>", "HTML block or comment"],
+] as const;
+
+test.each(unsupportedCases)(
+  "selected sections refuse %s before a later heading",
+  async (_name, md, reason) => {
+    await expect(
+      resolve(`#1's "Goal" section`, `## Goal\nBefore.\n\n${md}\n\n- After.\n\n## End\n- Outside.`),
+    ).rejects.toThrow(unsupported(reason));
+    await expect(
+      resolve(`> Before.\n\n${md}\n\n> After.`, "- Before.\n- After.\n\n## Other\n- Other."),
+    ).rejects.toThrow(unsupported(reason));
+  },
+);
+
+test.each(["  ## Goal", "   ## Goal ###"])(
+  "a visible duplicate heading is ambiguous: %s",
+  async (heading) => {
+    await expect(
+      resolve(`#1's "Goal" section`, `## Goal\n- Before.\n\n${heading}\n- Other.`),
+    ).rejects.toThrow("does not name exactly one heading");
+  },
+);
+
+test("a matching setext heading outside the selected range makes the reference ambiguous", async () => {
+  await expect(resolve(`#1's "Goal" section`, "Goal\n====\n\n## Goal\n- Before.")).rejects.toThrow(
+    "does not name exactly one heading",
+  );
+  await expect(resolve(`#1's "Goal" section`, "## Goal\n- Before.\n\nGoal\n====")).rejects.toThrow(
+    unsupported("setext heading"),
+  );
+});
+
+test.each(["## Goal#", "  ## End", "   ## End ###", "##"])(
+  "a valid ATX boundary ends the selected section: %s",
+  async (heading) => {
+    expect(
+      brief(await resolve(`#1's "Goal" section`, `  ## Goal ###\n- Before.\n\n${heading}\n- Outside.`)),
+    ).toEqual([["U1", "Before.", "behaviour", '#1 "Goal"']]);
+  },
+);
+
+test("attached trailing hashes and invalid ATX markers remain distinct", async () => {
+  const units = await resolve(
+    `#1's "Goal#" section`,
+    "## Goal\n- Outside.\n## Goal#\n- Required.\n##No space\n####### Too many",
+  );
+  expect(units.map((u) => u.text)).toEqual(["Required.", "##No space ####### Too many"]);
+});
+
+test.each([
+  "````md\n```\n## Goal\n````",
+  "~~~md\n```\n## Goal\n~~~",
+  "```md\n``` extra\n## Goal\n```",
+  "<!--\n## Goal\n-->",
+])("heading discovery and quote sources ignore hidden content: %s", async (hidden) => {
+  const body = `${hidden}\n\n## Goal\n- Before.`;
+  expect((await resolve(`#1's "Goal" section`, body)).map((u) => u.text)).toEqual(["Before."]);
+  expect((await resolve("> Before.", body)).map((u) => u.text)).toEqual(["Before."]);
+  await expect(resolve("> Goal", body)).rejects.toThrow("quote is not a whole source unit");
+});
+
+test.each(["```\n~~~", "````\n```", "<!--\nnever closed", "<!-- closed --> <!-- unclosed"])(
+  "unclosed fences and comments refuse source scanning: %s",
+  async (hidden) => {
+    const body = `## Goal\n- Before.\n\n## End\n${hidden}`;
+    await expect(resolve(`#1's "Goal" section`, body)).rejects.toThrow("unresolvable source");
+    await expect(resolve("> Before.", body)).rejects.toThrow("unresolvable source");
+  },
+);
+
+test("CRLF sources use the same fence and heading boundaries", async () => {
+  const body = "~~~md\r\n```\r\n## Goal\r\n~~~\r\n\r\n## Goal\r\n- Required.\r\n";
+  expect((await resolve(`#1's "Goal" section`, body)).map((u) => u.text)).toEqual(["Required."]);
+  expect((await resolve("> Required.", body)).map((u) => u.text)).toEqual(["Required."]);
+});
+
+test("adjacent physical lead-ins use the last source and class", async () => {
+  await expect(
+    resolve("From #1:\nFrom docs/PLAN.md (docs):\n\n> Parent only.", "- Parent only."),
+  ).rejects.toThrow("quote is not a whole source unit");
+  expect(
+    brief(
+      await resolve(
+        "Context for the quote.\nFrom #1:\nFrom docs/PLAN.md (docs):\n> The queue skips untrusted issues.\nFrom #1:\n> Parent only.",
+        "- Parent only.",
+      ),
+    ),
+  ).toEqual([
+    ["U1", "The queue skips untrusted issues.", "docs", "docs/PLAN.md"],
+    ["U2", "Parent only.", "behaviour", "#1"],
+  ]);
+});
+
+test.each(["#1", "docs/PLAN.md"])("a %s list item includes all continuation paragraphs", async (source) => {
+  const body =
+    "- Retry failed deliveries.\n\n  Never retry a permanent rejection.\n    Keep the original reason.\n\n- Other item.";
+  const partial = snapshot(`From ${source}:\n\n> Retry failed deliveries.`, body);
+  await expect(resolveIntent(partial, async () => body)).rejects.toThrow("quote is not a whole source unit");
+  const complete = snapshot(
+    `From ${source} (docs):\n\n> - Retry failed deliveries.\n>\n>   Never retry a permanent rejection.\n>     Keep the original reason.`,
+    body,
+  );
+  expect(brief(await resolveIntent(complete, async () => body))).toEqual([
+    [
+      "U1",
+      "Retry failed deliveries. Never retry a permanent rejection. Keep the original reason.",
+      "docs",
+      source,
+    ],
+  ]);
+  expect((await resolve(`#1's "Goal" section`, `## Goal\n${body}`)).map((u) => u.text)).toEqual([
+    "Retry failed deliveries. Never retry a permanent rejection. Keep the original reason.",
+    "Other item.",
+  ]);
+});
+
+test("a paragraph after a list is a separate whole unit", async () => {
+  const body = "- First item.\n\nSeparate paragraph.\n\n- Second item.";
+  expect((await resolve("> First item.\n\n> Separate paragraph.", body)).map((u) => u.text)).toEqual([
+    "First item.",
+    "Separate paragraph.",
+  ]);
+});
+
+test("escaped pipes refuse intent rows, reference rows and quoted source fragments", async () => {
+  const row = "| The service accepts red \\| blue tokens. |";
+  const reason = unsupported("escaped pipe in a table row");
+  await expect(resolve(`> Before.\n\n${row}`, "- Before.")).rejects.toThrow(reason);
+  await expect(resolve(`#1's "Goal" section`, `## Goal\n${row}`)).rejects.toThrow(reason);
+  for (const source of ["#1", "docs/PLAN.md"]) {
+    for (const quote of ["blue tokens.", "The service accepts red \\| blue tokens."]) {
+      await expect(
+        resolveIntent(snapshot(`From ${source}:\n> ${quote}`, row), async () => row),
+      ).rejects.toThrow(reason);
+    }
+  }
+  expect((await resolve("> Before.", `${row}\n\n- Before.`)).map((u) => u.text)).toEqual(["Before."]);
+  expect(
+    (await resolve("> The service accepts red or blue tokens.", row.replace("\\|", "or"))).map((u) => u.text),
+  ).toEqual(["The service accepts red or blue tokens."]);
 });

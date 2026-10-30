@@ -380,6 +380,34 @@ const metAll = output([
 ]);
 const parsedMetAll = AcceptanceSchema.parse(metAll);
 
+test.each([
+  [
+    "nested fence",
+    "## Goal\n- Before.\n\n````md\n```\n## Hidden\n- Hidden.\n````\n\n- After.\n\n## End\n- Outside.",
+    `#1's "Goal" section`,
+    "fence",
+  ],
+  [
+    "escaped pipe source",
+    "| The service accepts red \\| blue tokens. |",
+    "> blue tokens.",
+    "escaped pipe in a table row",
+  ],
+])("%s fails before invocation, covering tests or publication", async (_name, parent, intent, reason) => {
+  const t = await setup({ parent, ticket: `## The original intent\n${intent}` });
+  t.reply(() => ({ structured: output([{ unit: "U1", verdict: "met", tests: ["passes"] }]) }));
+  expect(await t.execute()).toBe("failed");
+  expect(t.f.store.getRun(t.run.id)?.error).toContain(
+    `unsupported Markdown in the intent: ${reason}; normalize the ticket`,
+  );
+  expect(t.calls()).toBe(0);
+  expect(t.targeted).toEqual([]);
+  expect(t.state()?.coveringTestRuns ?? []).toEqual([]);
+  expect(t.state()?.acceptance?.outcome).toBeUndefined();
+  expect(t.f.store.getArtifact(t.run.id, "acceptance.json")).toBeNull();
+  await t.published();
+});
+
 test.each(["manifest", "output", "covering-test", "outcome"] as const)(
   "a restart after the %s checkpoint resumes without repeating it",
   async (boundary) => {

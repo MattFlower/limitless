@@ -43,6 +43,43 @@ list markers (`-`, `*`, `+`, `1.`), and several references such as `Blocked by #
 Every issue reference on such a line is a blocker. All blockers must be closed;
 missing or unresolved blockers prevent work.
 
+## Acceptance intent
+
+Acceptance runs resolve a stable manifest from trusted ticket and parent snapshots before any
+model call. In `## The original intent`, quote whole parent or checked-SHA file units, naming
+the source with a physical `From #123:` or `From docs/PLAN.md:` line, or reference a parent
+section with `#123's "Goal" section`. The nearest preceding `From` line selects the source,
+even immediately after prose or another lead-in. A `(docs)` suffix on the lead-in or section
+reference marks those units as documentation requirements; other units require test evidence.
+Plain context prose does not create requirements. Duplicate normalized texts share one unit.
+
+The intentional fail-closed grammar replaces the earlier fence/details exclusion rule.
+The ticket's intent section and referenced parent sections support ATX headings, list items
+with indented continuation lines and paragraphs, paragraphs, blockquotes, table rows and blank
+lines. A list item is one whole unit, including its continuation paragraphs. Quoting only its
+first paragraph is refused. Table rows without escaped pipes supply whole cell units.
+
+Selected sections are scanned sequentially: a fence (three or more backticks or tildes), HTML
+block/comment or details tag starting with `<`, setext underline directly beneath paragraph
+text, or four-space indentation outside list continuations fails the run before the model.
+The reason is `unsupported Markdown in the intent: <construct>; normalize the ticket`.
+An escaped pipe in a selected table row, or a source row used for a quotation, fails with
+`unsupported Markdown in the intent: escaped pipe in a table row; normalize the ticket`.
+Normalize the trusted ticket/source rather than relying on hidden content being omitted.
+
+ATX headings have one to six hashes, at most three leading spaces, and a space or the end
+of the line after the opening hashes. Closing hashes require a preceding space: `Goal` and
+`Goal#` are distinct. Section references require exactly one matching ATX heading in the
+whole parent; a matching setext heading is ambiguous. Nested headings stay in the section
+until an equal or higher level heading. Unsupported content refuses before a later apparent
+heading can truncate the range.
+
+Quote sources are distinct from selected sections: unrelated fences, HTML and details may
+remain in the parent or checked-SHA file. Fenced and commented text cannot supply source units
+or headings. A closing fence must use the opening character, be at least as long, and have
+only spaces after it. Unclosed fences/comments make the source unresolvable. File sources
+still undergo containment and tracked-membership checks at the checked SHA.
+
 ## Queue configuration
 
 The queue is off by default. **Do not enable it for any repository until Q0's probe
