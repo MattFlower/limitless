@@ -10,14 +10,18 @@ import { ChatRequestSchema } from "../concierge.ts";
 import { parseSince } from "../core/since.ts";
 import type { CreateRunRequest, HealthResponse, RunModels, RunStatus, StreamMessage } from "../core/types.ts";
 import { computeProviderStatistics, computeStats } from "../db/stats.ts";
+import { IssueClaimed } from "../db/store.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
-import { runGh } from "../integrations/github.ts";
+import { ensureCache, fetchBase, resolveRepo } from "../git/repos.ts";
+import { type GhRunner, runGh } from "../integrations/github.ts";
+import { ISSUE_TEXT_FIELDS, issueTextSchema } from "../integrations/issue-trust.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
 import { landWire } from "../land/wire.ts";
+import { acceptanceRunRequest, resolveIntent } from "../pipeline/acceptance.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
 import { ghPrHistory, shadowReport } from "../pipeline/shadow-report.ts";
 import { redactCredentials } from "../util/proc.ts";
@@ -51,6 +55,7 @@ function profileStacks({ traces }: SamplingProfileStackTraces): string {
 }
 
 export interface HttpExtras {
+  gh?: GhRunner;
   apiToken?: string;
   /** An invocation capability is valid only for the gate-slot endpoint. */
   gateSlotCapability?: (req: Request) => boolean;
@@ -554,6 +559,56 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       const report = factory.evals.report(req.params.id ?? "", { delta: factory.evalSettings.delta });
       return report ? json(report) : error("eval not found", 404);
     }),
+    "/api/acceptance": {
+      POST: handle(async (req) => {
+        const { repo, number, check } = z
+          .object({
+            repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+            number: z.number().int().positive(),
+            check: z.boolean().optional(),
+          })
+          .parse(await body<unknown>(req));
+        try {
+          const [owner, name] = repo.split("/");
+          const query = `query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) {
+            issue(number:${number}) { title ${ISSUE_TEXT_FIELDS} parent { ${ISSUE_TEXT_FIELDS} } } } }`;
+          const gh = extras.gh ?? runGh;
+          const raw = await gh(["api", "graphql", "-f", `query=${query}`], req.signal, undefined, repo);
+          const result = JSON.parse(String(raw));
+          if (result.errors?.length) throw new Error("GitHub acceptance query failed");
+          const ticket = issueTextSchema
+            .extend({ title: z.string(), parent: issueTextSchema.nullable() })
+            .parse(result.data?.repository?.issue);
+          const snapshot = acceptanceRunRequest({
+            ticket,
+            parent: ticket.parent,
+            trusted: factory.cfg.githubQueue?.trusted ?? [],
+          });
+          if (check) {
+            const resolved = await resolveRepo(store, repo, factory.cfg.githubMerge);
+            await ensureCache(factory.cfg.paths, resolved, req.signal);
+            const sha = await fetchBase(factory.cfg.paths, resolved, resolved.defaultBranch, req.signal);
+            return json({ ok: true, sha, units: resolveIntent(snapshot) });
+          }
+          return json(
+            await factory.createAcceptanceRun(
+              {
+                repo,
+                title: ticket.title,
+                prompt: ticket.body || "Acceptance check",
+                source: "cli",
+                sourceRef: { kind: "issue", repo, number, via: "cli" },
+              },
+              snapshot,
+            ),
+            201,
+          );
+        } catch (e) {
+          if (check) return json({ ok: false, reason: (e as Error).message });
+          return error((e as Error).message, e instanceof IssueClaimed ? 409 : 400);
+        }
+      }),
+    },
     "/api/runs": {
       GET: handle((req) => {
         const url = new URL(req.url);

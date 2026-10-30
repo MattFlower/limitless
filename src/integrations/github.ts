@@ -129,9 +129,12 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
   if (fullName.split("/")[0] !== owner) return { note: "repository owner is not configured owner" };
   const base = { repo: fullName, source: "github" as const };
   const issue = object(p.issue);
+  const acceptance =
+    Array.isArray(issue?.labels) && issue.labels.some((l) => object(l)?.name === "acceptance");
   const pr = object(p.pull_request);
   if (event === "issues" && action === "labeled") {
     if (string(object(p.label)?.name) !== "limitless") return { note: "other label" };
+    if (acceptance) return { note: "acceptance ticket: build runs refused" };
     if (login(p.sender) !== owner || login(issue?.user) !== owner)
       return { note: "actor or issue author is not owner" };
     const id = number(issue?.number);
@@ -155,6 +158,7 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
     if (!id || title === null || body === null || (issue?.body !== null && string(issue?.body) === null))
       return { note: "malformed comment or issue", error: true };
     if (!body.startsWith("/limitless ") || !body.slice(11).trim()) return { note: "other comment" };
+    if (acceptance) return { note: "acceptance ticket: build runs refused" };
     return {
       note: "owner command",
       request: commentRunRequest(

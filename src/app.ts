@@ -26,6 +26,7 @@ import { type Harness, protectCredentials } from "./harness/types.ts";
 import { configureGitHubIdentity } from "./integrations/github-identity.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
+import type { AcceptanceSnapshot } from "./pipeline/acceptance.ts";
 import type { EngineDeps, RunState } from "./pipeline/context.ts";
 import { lanAgentExecutor } from "./pipeline/lan-agent.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
@@ -405,6 +406,17 @@ export class Factory {
       type: "log",
       message: `Run created from ${run.source}${run.requestedBy ? ` by ${run.requestedBy}` : ""}`,
     });
+    return run;
+  }
+
+  async createAcceptanceRun(
+    req: CreateRunRequest,
+    snapshot: AcceptanceSnapshot,
+    admission?: () => string | null,
+  ): Promise<Run> {
+    const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
+    const run = this.store.createAcceptanceRun(repo, req, snapshot, admission);
+    this.store.addEvent({ runId: run.id, type: "log", message: `Run created from ${run.source}` });
     return run;
   }
 
