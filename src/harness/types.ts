@@ -60,6 +60,8 @@ export interface AgentSpec {
   jsonSchema?: Record<string, unknown>;
   /** Runtime validation for HTTP structured completions. */
   schema?: ZodType;
+  /** Caller-owned HTTP repair budget: issue only this attempt (0 = schema, 1 = plain JSON). */
+  structuredAttempt?: 0 | 1;
   /** Typed questions for the decisions harness; only roles with a decisions mapping pass one. */
   decisionTask?: DecisionTask;
   resumeSessionId?: string;
@@ -103,8 +105,8 @@ export interface AgentResult {
   fastModeState?: string | null;
   fastModeDisabledReason?: string | null;
   status: InvocationStatus;
-  /** Structured CLI rejection before the session could run; absent in older reports. */
-  failureClass?: "authentication";
+  /** Structured failure classification; absent in older reports. */
+  failureClass?: "authentication" | "malformed";
   finalText: string;
   structured: unknown;
   sessionId: string | null;

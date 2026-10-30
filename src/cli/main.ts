@@ -36,6 +36,7 @@ Usage:
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
   limitless eval report <eval-id> [--json]
+  limitless eval judge <eval-id> --judges model[@effort],model[@effort] [--max-usd N]
   limitless eval resume <eval-id>         Continue an interrupted or failed eval; unchanged finished trials carry over
   limitless eval cancel <eval-id>         Stop scheduling an eval's trials; it ends interrupted
   limitless eval regrade <eval-id>        Recompute a review eval's grades from stored outputs (no model calls)
@@ -309,6 +310,7 @@ async function main(): Promise<void> {
       name: { type: "string" },
       evals: { type: "string" },
       models: { type: "string" },
+      judges: { type: "string" },
       origin: { type: "string" },
       "base-origin": { type: "string" },
       vendor: { type: "string" },

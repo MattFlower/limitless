@@ -52,6 +52,7 @@ import {
   MAX_RUN_IDS,
   TERMINAL_STATUSES,
 } from "../core/types.ts";
+import type { JudgeJob, Judgment } from "../evals/judge.ts";
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { githubWait } from "../git/github-wait.ts";
@@ -655,6 +656,31 @@ export class Store {
         diagnostic.kind,
         text,
       );
+  }
+
+  evalJudgment(key: string): Judgment | null {
+    const row = this.db.query("SELECT matches_json FROM eval_judgments WHERE cache_key = ?").get(key) as {
+      matches_json: string;
+    } | null;
+    return row ? JSON.parse(row.matches_json) : null;
+  }
+  saveEvalJudgment(key: string, model: string, effort: string, matches: Judgment, cost: number): void {
+    this.db
+      .query("INSERT OR IGNORE INTO eval_judgments VALUES (?, ?, ?, ?, ?, ?)")
+      .run(key, model, effort, JSON.stringify(matches), cost, Date.now());
+  }
+  evalJudges(id: string): JudgeJob | null {
+    const row = this.db.query("SELECT job_json FROM eval_judges WHERE eval_run_id = ?").get(id) as {
+      job_json: string;
+    } | null;
+    return row ? JSON.parse(row.job_json) : null;
+  }
+  saveEvalJudges(id: string, job: JudgeJob): void {
+    this.db
+      .query(
+        "INSERT INTO eval_judges VALUES (?, ?) ON CONFLICT(eval_run_id) DO UPDATE SET job_json = excluded.job_json",
+      )
+      .run(id, JSON.stringify(job));
   }
 
   createEvalRun(
