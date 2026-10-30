@@ -8,7 +8,7 @@ import { canonicalRepo } from "./lease-store.ts";
 
 // Codes `put` throws instead of classifying them as a retention outcome.
 type Thrown = "configuration" | "invalid" | "unsupported" | "conflict";
-export type SharedStoreErrorCode = Thrown | "missing" | "corrupt" | "unavailable" | "aborted";
+export type SharedStoreErrorCode = Thrown | "missing" | "corrupt" | "unavailable" | "aborted" | "limit";
 export class SharedStoreError extends Error {
   constructor(readonly code: SharedStoreErrorCode) {
     super(redactCredentials(`Shared store error: ${code}`));
