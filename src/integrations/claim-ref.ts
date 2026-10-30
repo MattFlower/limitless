@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { RunStatus } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { CommandError, redactCredentials } from "../util/proc.ts";
+import { claimScope } from "./claim-guard.ts";
 import type { GhRunner } from "./github.ts";
 
 export type ClaimKind = "issue" | "pr" | "run";
@@ -233,7 +234,10 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
       }
     },
   };
-  return client;
+  return {
+    read: (...args) => claimScope.exit(() => client.read(...args)),
+    write: (...args) => claimScope.exit(() => client.write(...args)),
+  };
 }
 export function memberId(store: Store): string {
   const existing = store.getSetting<string | null>("member.id", null);

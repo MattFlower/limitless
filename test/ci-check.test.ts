@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { agentEnv, sh, recoveryProcessStopped as stopped } from "../src/util/proc.ts";
+import { agentEnv, runProcess, sh, recoveryProcessStopped as stopped } from "../src/util/proc.ts";
 
 const wrapper = resolve("scripts/ci-check.sh");
 const linuxTest = test.skipIf(process.platform !== "linux");
@@ -112,70 +112,104 @@ test("CI file-start markers bypass parallel Bun buffering and are opt-in", async
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "ci-test-start-")));
   const marker = join(dir, "starts");
   const pidFile = join(dir, "hang.pid");
+  const ready = join(dir, "ok.ready");
+  const timeoutPid = join(dir, "timeout.pid");
+  const stderr = join(dir, "stderr");
   const setup = resolve("test/setup.ts");
   try {
     writeFileSync(join(dir, "bunfig.toml"), "");
-    writeFileSync(join(dir, "ok.test.ts"), 'import { test } from "bun:test"; test("ok", () => {});');
+    writeFileSync(
+      join(dir, "ok.test.ts"),
+      `import { test } from "bun:test"; import { writeFileSync } from "node:fs";
+       writeFileSync(${JSON.stringify(ready)}, "ready"); test("ok", () => {});`,
+    );
     writeFileSync(
       join(dir, "hang.test.ts"),
       `import { test } from "bun:test"; import { writeFileSync } from "node:fs";
        writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
        test("hang", () => Bun.sleep(60000), 120000);`,
     );
-    for (const enabled of [false, true]) {
+    for (const enabled of [false, true, ...(process.platform === "linux" ? ["wrapper"] : [])]) {
+      for (const file of [ready, pidFile, timeoutPid, stderr]) rmSync(file, { force: true });
       writeFileSync(marker, "");
       const env = agentEnv();
       delete env.LIMITLESS_CI_TEST_LOG;
       if (enabled) env.LIMITLESS_CI_TEST_LOG = marker;
-      // runProcess owns cancellation of this deliberately hanging synthetic suite.
-      const result = await sh([process.execPath, "test", "--parallel=2", "--preload", setup, dir], {
+      const nested = [process.execPath, "test", "--parallel=2", "--preload", setup, dir];
+      // runProcess captures stderr with a socket, which Linux cannot reopen via /proc (ENXIO).
+      // Give the step shell a real log fd so the preload reaches the hang, as it does in CI.
+      const cmd =
+        enabled === "wrapper"
+          ? [
+              "bash",
+              "-c",
+              'exec 2>>"$1"; shift; export LIMITLESS_CI_TEST_LOG="/proc/$$/fd/2"; bash "$@"',
+              "fixture",
+              stderr,
+              wrapper,
+              "8s",
+              "bash",
+              "-c",
+              'ps -o ppid= -p "$PPID" > "$1"; shift; exec "$@"',
+              "fixture",
+              timeoutPid,
+              ...nested,
+            ]
+          : nested;
+      const controller = new AbortController();
+      const running = runProcess({
+        cmd,
         cwd: dir,
-        env,
-        allowFail: true,
-        timeoutMs: 1000,
+        env: { ...env, CI_CHECK_GRACE: "1s" },
+        signal: controller.signal,
+        timeoutMs: 10_000,
       });
-      expect(result.exitCode).not.toBe(0);
-      const starts = readFileSync(marker, "utf8");
-      if (enabled) {
-        expect(starts).toContain(`[test:start] ${join(dir, "hang.test.ts")}`);
-        expect(starts).toContain(`[test:start] ${join(dir, "ok.test.ts")}`);
-      } else {
-        expect(starts).toBe("");
-        expect(result.stdout + result.stderr).not.toContain("[test:start]");
+      let finished = false;
+      const markFinished = () => {
+        finished = true;
+      };
+      void running.then(markFinished, markFinished);
+      try {
+        const deadline = Date.now() + 5_000;
+        while ((!existsSync(ready) || !existsSync(pidFile)) && !finished && Date.now() < deadline)
+          await Bun.sleep(10);
+        expect(existsSync(ready) && existsSync(pidFile), "both fixtures started before deadline").toBe(true);
+        expect(finished).toBe(false);
+        const pid = Number(readFileSync(pidFile, "utf8"));
+        expect(stopped(pid)).toBe(false);
+        const starts = readFileSync(enabled === "wrapper" ? stderr : marker, "utf8");
+        if (enabled) {
+          expect(starts).toContain(`[test:start] ${join(dir, "hang.test.ts")}`);
+          expect(starts).toContain(`[test:start] ${join(dir, "ok.test.ts")}`);
+        } else expect(starts).toBe("");
+        // Exercise GNU timeout's alarm/TERM/grace path as soon as startup is complete.
+        if (enabled === "wrapper") {
+          const timeout = Number(readFileSync(timeoutPid, "utf8"));
+          expect(Number.isSafeInteger(timeout) && timeout > 1).toBe(true);
+          process.kill(timeout, "SIGALRM");
+        } else controller.abort();
+        const result = await running;
+        expect(result.exitCode).not.toBe(0);
+        if (!enabled) expect(result.stdout + result.stderr).not.toContain("[test:start]");
+        if (enabled === "wrapper") {
+          const diagnostics = readFileSync(stderr, "utf8");
+          expect(result.exitCode, result.stdout + result.stderr + diagnostics).toBe(137);
+          expect(diagnostics).toContain(`[test:start] ${join(dir, "hang.test.ts")}`);
+          expect(diagnostics).toContain(`[test:start] ${join(dir, "ok.test.ts")}`);
+          expect(result.stdout).toContain("runner process tree (PID PPID COMMAND)");
+          expect(result.stdout).toMatch(new RegExp(`\\b${pid}\\s+\\d+\\s+`));
+          expect(stopped(pid)).toBe(true);
+        }
+      } finally {
+        controller.abort();
+        await running;
       }
     }
-    if (process.platform === "linux") {
-      const stderr = join(dir, "stderr");
-      // sh() captures stderr with a socket, which Linux cannot reopen via /proc (ENXIO).
-      // Give the step shell a real log fd so the preload reaches the hang, as it does in CI.
-      const result = await sh(
-        [
-          "bash",
-          "-c",
-          'exec 2>>"$1"; shift; export LIMITLESS_CI_TEST_LOG="/proc/$$/fd/2"; bash "$@"',
-          "fixture",
-          stderr,
-          wrapper,
-          "1s",
-          process.execPath,
-          "test",
-          "--parallel=2",
-          "--preload",
-          setup,
-          dir,
-        ],
-        { cwd: dir, env: agentEnv({ CI_CHECK_GRACE: "1s" }), allowFail: true, timeoutMs: 10_000 },
-      );
-      const diagnostics = readFileSync(stderr, "utf8");
-      expect(result.exitCode, result.stdout + result.stderr + diagnostics).toBe(137);
-      expect(diagnostics).toContain(`[test:start] ${join(dir, "hang.test.ts")}`);
-      expect(diagnostics).toContain(`[test:start] ${join(dir, "ok.test.ts")}`);
-      expect(result.stdout).toContain("runner process tree (PID PPID COMMAND)");
-      const pid = Number(readFileSync(pidFile, "utf8"));
-      expect(result.stdout).toMatch(new RegExp(`\\b${pid}\\s+\\d+\\s+`));
-      expect(stopped(pid)).toBe(true);
-    }
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    try {
+      if (existsSync(pidFile)) stopFixture(Number(readFileSync(pidFile, "utf8")));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
-}, 15_000);
+}, 30_000);
