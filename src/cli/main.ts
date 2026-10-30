@@ -34,6 +34,7 @@ Usage:
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
         review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
+  limitless eval judge <eval-id> --judges model[@effort],model[@effort] [--max-usd X]
   limitless eval report <eval-id> [--json]
   limitless eval resume <eval-id>         Continue an interrupted or failed eval; unchanged finished trials carry over
   limitless eval cancel <eval-id>         Stop scheduling an eval's trials; it ends interrupted
@@ -308,6 +309,7 @@ async function main(): Promise<void> {
       name: { type: "string" },
       evals: { type: "string" },
       models: { type: "string" },
+      judges: { type: "string" },
       origin: { type: "string" },
       "base-origin": { type: "string" },
       vendor: { type: "string" },

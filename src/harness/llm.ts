@@ -87,7 +87,7 @@ export const runLlm: Harness = async (spec) => {
   if (spec.systemAppend) messages.push({ role: "system", content: spec.systemAppend });
   messages.push({ role: "user", content: spec.prompt });
   let lastError = "invalid structured response";
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < (spec.structuredRetries === 0 ? 1 : 2); attempt++) {
     if (signal.aborted)
       return finish(
         failure(spec.signal.aborted ? "cancelled" : "timeout", "completion interrupted", usage, spec.target),
@@ -177,5 +177,5 @@ export const runLlm: Harness = async (spec) => {
       return finish(failure("unavailable", "completion transport failure", usage, spec.target));
     }
   }
-  return finish(failure("error", lastError, usage, spec.target));
+  return finish({ ...failure("error", lastError, usage, spec.target), invalidOutput: true });
 };

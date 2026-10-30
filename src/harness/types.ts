@@ -60,6 +60,8 @@ export interface AgentSpec {
   jsonSchema?: Record<string, unknown>;
   /** Runtime validation for HTTP structured completions. */
   schema?: ZodType;
+  /** Let a caller with its own validation own the single repair attempt. */
+  structuredRetries?: 0;
   /** Typed questions for the decisions harness; only roles with a decisions mapping pass one. */
   decisionTask?: DecisionTask;
   resumeSessionId?: string;
@@ -107,6 +109,7 @@ export interface AgentResult {
   failureClass?: "authentication";
   finalText: string;
   structured: unknown;
+  invalidOutput?: boolean;
   sessionId: string | null;
   usage: Usage;
   numTurns: number;

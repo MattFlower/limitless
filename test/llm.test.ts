@@ -322,3 +322,10 @@ test("catalog oMLX thinking and authentication survive HTTP repair", async () =>
     store.close();
   }
 });
+
+test("caller-owned validation disables harness repair and identifies invalid output", async () => {
+  reply = () => Response.json({ choices: [{ message: { content: "invalid" } }] });
+  const result = await runLlm({ ...spec(), structuredRetries: 0 });
+  expect(result).toMatchObject({ status: "error", invalidOutput: true });
+  expect(requests).toHaveLength(1);
+});

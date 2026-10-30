@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { EvalRequestSchema } from "../evals/cases.ts";
 import { policyDiff, proposedOverlay, renderEvidence } from "../evals/evidence.ts";
 import { formatEvalReport } from "../evals/format.ts";
+import type { JudgeJob } from "../evals/judge.ts";
 import {
   OVERRIDES_PATH,
   parseOverrides,
@@ -88,10 +89,43 @@ export async function evalCommand(
     }
     return;
   }
-  if (args.length !== 2 || !value || !["run", "report", "regrade", "resume", "cancel"].includes(action ?? ""))
+  if (
+    args.length !== 2 ||
+    !value ||
+    !["run", "report", "regrade", "resume", "cancel", "judge"].includes(action ?? "")
+  )
     throw new Error(
-      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval report <eval-id> [--json] | eval regrade <eval-id> | eval resume <eval-id> | eval cancel <eval-id>",
+      "usage: limitless eval run <role> --models model[@effort],model[@effort] | eval run review --systems <file.json> | eval judge <eval-id> --judges model[@effort],model[@effort] [--max-usd X] | eval report <eval-id> [--json] | eval regrade <eval-id> | eval resume <eval-id> | eval cancel <eval-id>",
     );
+  const numeric = (key: string) => {
+    const raw = flags[key];
+    if (raw === undefined) return undefined;
+    if (typeof raw !== "string" || !raw.trim() || !Number.isFinite(Number(raw)))
+      throw new Error(`--${key} must be a finite number`);
+    return Number(raw);
+  };
+  if (action === "judge") {
+    const judges = typeof flags.judges === "string" ? flags.judges.split(",") : [];
+    if (judges.length !== 2 || judges.some((j) => !j.trim()))
+      throw new Error("--judges requires exactly two judges");
+    const maxUsd = numeric("max-usd");
+    if (maxUsd !== undefined && maxUsd < 0) throw new Error("--max-usd must be nonnegative");
+    const path = `/api/evals/${encodeURIComponent(value)}`;
+    let job = await io.api<JudgeJob>(`${path}/judge`, {
+      method: "POST",
+      body: JSON.stringify({ judges, maxUsd }),
+    });
+    while (job.status === "running") {
+      await io.wait(500);
+      job = await io.api<JudgeJob>(`${path}/judge`);
+    }
+    if (job.error) throw new Error(job.error);
+    io.print(
+      `Judged ${job.judged}; reused from storage ${job.reused}; unjudged trials ${job.unjudged}; spend $${job.spend.toFixed(4)}.`,
+    );
+    io.print(formatEvalReport(await io.api<EvalReport>(path)));
+    return;
+  }
   if (action === "resume") {
     const { id } = await io.api<{ id: string }>(`/api/evals/${encodeURIComponent(value)}/resume`, {
       method: "POST",
@@ -142,13 +176,6 @@ export async function evalCommand(
     throw new Error(
       "--models model[@effort],model[@effort] (or, for review, --systems <file.json>) is required",
     );
-  const numeric = (key: string) => {
-    const raw = flags[key];
-    if (raw === undefined) return undefined;
-    if (typeof raw !== "string" || !raw.trim() || !Number.isFinite(Number(raw)))
-      throw new Error(`--${key} must be a finite number`);
-    return Number(raw);
-  };
   const request = {
     role: value,
     replayFinders: flags["replay-finders"],

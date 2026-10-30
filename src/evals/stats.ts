@@ -3,6 +3,7 @@ import { StoredReviewSchema } from "../pipeline/schemas.ts";
 import { evidenceTarget, recordedTarget } from "../router/targets.ts";
 import type { ReviewCase } from "./cases.ts";
 import type { gradeReview } from "./graders/review.ts";
+import type { summarizeJudged } from "./judge.ts";
 
 export interface StatsOptions {
   delta?: number;
@@ -308,11 +309,13 @@ export function summarize(
     cascadeFallback,
     reviewCases = [],
     reviewGrader,
+    judged,
     ...options
   }: StatsOptions & {
     cascadeFallback?: string;
     reviewCases?: ReviewCase[];
     reviewGrader?: typeof gradeReview;
+    judged?: (rows: EvalTrial[]) => ReturnType<typeof summarizeJudged>;
   } = {},
 ) {
   const settings = statsOptions(options);
@@ -368,6 +371,7 @@ export function summarize(
       system,
       effort: rows[0]?.effort ?? null,
       ...roleMetrics(run, rows, labeledCases, reviewGrader),
+      ...(judged ? { judged: judged(rows) } : {}),
       ...(singleSample
         ? {
             singleSample: {

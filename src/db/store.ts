@@ -52,6 +52,7 @@ import {
   MAX_RUN_IDS,
   TERMINAL_STATUSES,
 } from "../core/types.ts";
+import type { JudgeRef, Judgment } from "../evals/judge.ts";
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { githubWait } from "../git/github-wait.ts";
@@ -772,6 +773,39 @@ export class Store {
     return (
       this.db.query("SELECT * FROM eval_trials WHERE eval_run_id = ? ORDER BY rowid").all(id) as Row[]
     ).map(toEvalTrial);
+  }
+
+  evalJudges(id: string): JudgeRef[] | null {
+    const row = this.db
+      .query("SELECT judges_json FROM eval_judge_pairs WHERE eval_run_id = ?")
+      .get(id) as Row | null;
+    return row ? JSON.parse(row.judges_json as string) : null;
+  }
+  setEvalJudges(id: string, judges: JudgeRef[]): void {
+    this.db
+      .query(
+        "INSERT INTO eval_judge_pairs (eval_run_id, judges_json) VALUES (?, ?) ON CONFLICT(eval_run_id) DO UPDATE SET judges_json = excluded.judges_json",
+      )
+      .run(id, JSON.stringify(judges));
+  }
+  evalJudgment(key: string): Judgment | null {
+    const row = this.db.query("SELECT matches_json FROM eval_judgments WHERE key = ?").get(key) as Row | null;
+    return row ? JSON.parse(row.matches_json as string) : null;
+  }
+  recordEvalJudgment(
+    key: string,
+    judge: JudgeRef,
+    caseId: string,
+    version: number,
+    matches: Judgment,
+    costUsd: number,
+  ): void {
+    caseId = redactCredentials(caseId);
+    this.db
+      .query(
+        "INSERT OR IGNORE INTO eval_judgments (key, model_id, effort, case_id, prompt_version, matches_json, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(key, judge.modelId, judge.effort, caseId, version, JSON.stringify(matches), costUsd, Date.now());
   }
 
   cachedEvalTrials(key: string): EvalTrial[] {

@@ -61,6 +61,7 @@ import {
   nextImplementTarget,
   RETRY_FEEDBACK_GRADE,
 } from "./implement.ts";
+import { type JudgeJob, judgeTrials, summarizeJudged } from "./judge.ts";
 import {
   gradeCase,
   prepareCase,
@@ -138,6 +139,7 @@ interface TrialCoordination {
 export class EvalRunner {
   private readonly active = new Map<string, { controller: AbortController; done: Promise<void> }>();
   private stopping = false;
+  private readonly judging = new Map<string, JudgeJob>();
   /** Per-provider cap shared by all eval runs, so production work keeps a slot where the provider has two or more. */
   private readonly evalSlots = new Map<string, Semaphore>();
   /** Requested concurrency of each executing run, which sizes `evalSlots`. */
@@ -314,7 +316,17 @@ export class EvalRunner {
       run.role === "review"
         ? loadRoleCases("review", this.casePath).cases.flatMap((item) => ("defects" in item ? [item] : []))
         : [];
-    const labels = { reviewCases, reviewGrader: gradeReview };
+    const judges = this.deps.store.evalJudges(id);
+    const labels = {
+      reviewCases,
+      reviewGrader: gradeReview,
+      ...(judges
+        ? {
+            judged: (rows: EvalTrial[]) =>
+              summarizeJudged(run, rows, reviewCases, judges, (key) => this.deps.store.evalJudgment(key)),
+          }
+        : {}),
+    };
     return { run, summaries: summarize(run, trials, { cascadeFallback, ...labels, ...options }), trials };
   }
 
@@ -372,6 +384,88 @@ export class EvalRunner {
       this.deps.store.recordEvalTrial(updated);
     }
     return result;
+  }
+
+  judge(id: string, refs: unknown, maxUsd?: number): JudgeJob | null {
+    const { store, router, tracker } = this.deps;
+    const run = store.getEvalRun(id);
+    if (!run) return null;
+    if (this.stopping) throw new Error("daemon is stopping");
+    if (run.role !== "review") throw new Error("only review evals can be judged");
+    if (run.status === "queued" || run.status === "running") throw new Error(`eval is still ${run.status}`);
+    if (this.judging.get(id)?.status === "running") throw new Error("judging already in progress");
+    if (!Array.isArray(refs) || refs.length !== 2 || refs.some((r) => typeof r !== "string"))
+      throw new Error("exactly two judges are required");
+    const resolved = refs.map((ref: string) => router.resolveFor("summarize", ref));
+    if (resolved[0]?.model.vendor === resolved[1]?.model.vendor)
+      throw new Error("judges must have different vendors");
+    const targets = resolved.map(({ model, effort }) => router.toTarget(model, effort ?? null));
+    for (const target of targets) {
+      if (!this.deps.harnesses[selectHarness("summarize", target).harnessName])
+        throw new Error("judge harness unavailable");
+    }
+    const cap = maxUsd ?? run.maxUsd;
+    if (!Number.isFinite(cap) || cap < 0) throw new Error("maxUsd must be a nonnegative finite number");
+    const cases = loadRoleCases("review", this.casePath).cases.flatMap((c) => ("defects" in c ? [c] : []));
+    const judges = targets.map((t) => ({ modelId: t.modelId, effort: t.effort ?? null }));
+    store.setEvalJudges(id, judges);
+    const job: JudgeJob = { status: "running", judged: 0, reused: 0, unjudged: 0, spend: 0 };
+    const controller = new AbortController(),
+      signal = controller.signal;
+    const concurrency = run.concurrency ?? 1,
+      gates = new Map<string, Semaphore>();
+    const slot = async (provider: string) => {
+      let gate = gates.get(provider);
+      if (!gate) {
+        gate = new Semaphore(this.evalLimit(provider, concurrency));
+        gates.set(provider, gate);
+      }
+      const releases: (() => void)[] = [];
+      const releaseAll = () => {
+        for (const release of releases.reverse()) release();
+      };
+      try {
+        releases.push(await gate.acquire(signal));
+        releases.push(await this.evalSlot(provider).acquire(signal));
+        releases.push(await tracker.acquire(provider, signal));
+        return releaseAll;
+      } catch (error) {
+        releaseAll();
+        throw error;
+      }
+    };
+    const key = `judge:${id}`;
+    this.executing.set(key, concurrency);
+    this.resizeEvalSlots();
+    const done = Promise.resolve()
+      .then(() =>
+        confinementScope.run(this.deps.confinement ?? platformConfinement(this.deps.cfg.port), () =>
+          readPolicyScope.run(this.deps.cfg.readPolicy, () =>
+            judgeTrials(this.deps, run, cases, targets, judges, cap, job, signal, slot),
+          ),
+        ),
+      )
+      .then(() => {
+        job.status = "completed";
+      })
+      .catch((error) => {
+        job.status = "failed";
+        job.error = redactCredentials(String(error));
+      })
+      .finally(() => {
+        this.active.delete(key);
+        this.executing.delete(key);
+        this.resizeEvalSlots();
+      });
+    this.judging.set(id, job);
+    this.active.set(key, { controller, done });
+    return job;
+  }
+  judgeStatus(id: string): JudgeJob | null {
+    return this.judging.get(id) ?? null;
+  }
+  async waitJudge(id: string): Promise<void> {
+    await this.active.get(`judge:${id}`)?.done;
   }
 
   async wait(id: string): Promise<void> {

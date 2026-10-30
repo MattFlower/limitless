@@ -103,6 +103,15 @@ export function formatEvalReport(report: EvalReport): string {
           `  ${legacyGrades} trials graded before blocking recall are excluded from pass, recall and comparisons; \`limitless eval regrade ${report.run.id}\` recomputes them from stored output without model calls`,
         );
     }
+    if (m.judged) {
+      const j = m.judged;
+      roleLines.push(
+        metric("judged recall", j.recall),
+        ...j.perJudge.map((p) => metric(`judge ${p.judge} recall`, p.recall)),
+        `  judged contested=${j.contested}, under-rated=${j.underRated}, unjudged=${j.unjudged}`,
+        metric("judge agreement", j.agreement),
+      );
+    }
     if (m.singleSample) {
       const s = m.singleSample;
       roleLines.push(

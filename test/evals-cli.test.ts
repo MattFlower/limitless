@@ -708,3 +708,64 @@ test("eval resume and cancel CLI print the new run ID and the cancelled status",
   expect(printed).toEqual(["eval-new (resumes eval-old)", "eval-old: interrupted"]);
   await expect(evalCommand(["resume"], {}, io)).rejects.toThrow("eval resume <eval-id>");
 });
+
+test.each(["candidate-a", "a,b,c", "a,", ""])(
+  "eval judge refuses invalid judge count: %s",
+  async (judges) => {
+    let calls = 0;
+    await expect(
+      evalCommand(
+        ["judge", "eval-x"],
+        { judges },
+        {
+          api: async <T>() => {
+            calls++;
+            return {} as T;
+          },
+          print: () => {},
+          wait: async () => {},
+        },
+      ),
+    ).rejects.toThrow("exactly two judges");
+    expect(calls).toBe(0);
+  },
+);
+
+test("eval judge starts a daemon job, polls and prints counts then the report", async () => {
+  const calls: [string, string | undefined][] = [],
+    printed: string[] = [];
+  await evalCommand(
+    ["judge", "eval-x"],
+    { judges: "claude/opus@high,codex/luna", "max-usd": "0.5" },
+    {
+      api: async <T>(path: string, init?: RequestInit) => {
+        calls.push([path, init?.method]);
+        if (init?.method === "POST") {
+          expect(JSON.parse(String(init.body))).toEqual({
+            judges: ["claude/opus@high", "codex/luna"],
+            maxUsd: 0.5,
+          });
+          return { status: "running" } as T;
+        }
+        return (
+          path.endsWith("/judge")
+            ? { status: "completed", judged: 2, reused: 1, unjudged: 3, spend: 0.2 }
+            : {
+                run: { id: "eval-x", status: "completed", role: "review", k: 1, maxUsd: 1 },
+                trials: [],
+                summaries: [],
+              }
+        ) as T;
+      },
+      print: (s) => printed.push(s),
+      wait: async () => {},
+    },
+  );
+  expect(calls).toEqual([
+    ["/api/evals/eval-x/judge", "POST"],
+    ["/api/evals/eval-x/judge", undefined],
+    ["/api/evals/eval-x", undefined],
+  ]);
+  expect(printed[0]).toContain("Judged 2; reused from storage 1; unjudged trials 3; spend $0.2000");
+  expect(printed[1]).toContain("eval-x: completed");
+});
