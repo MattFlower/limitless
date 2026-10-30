@@ -100,6 +100,7 @@ export interface GateComparison {
   /** Coordinator-owned confirmation; result retains the worker failure and prior retries. */
   coordinatorConfirmation?: {
     worker?: string;
+    os?: string;
     originalVerdict: GateVerdict;
     reason: string;
     result?: GateResult;
