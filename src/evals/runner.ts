@@ -73,7 +73,7 @@ import {
   storedSchemaFor,
 } from "./prepare.ts";
 import { replayFinders, validateReplay } from "./replay.ts";
-import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
+import { candidateOf, type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
 /** The abort reason of `eval cancel`; any other abort is a daemon shutdown. */
 const CANCELLED = "cancelled";
@@ -324,7 +324,7 @@ export class EvalRunner {
           summary.review.judged = judgedMetrics(
             this.deps.store,
             run,
-            trials.filter((t) => (t.details.system ?? recordedTarget(t)) === summary.candidate),
+            trials.filter((t) => candidateOf(t) === summary.candidate),
             reviewCases,
             judges,
           );

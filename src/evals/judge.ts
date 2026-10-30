@@ -217,6 +217,7 @@ export async function judgeTrials(
           noTools: true,
           privateSession: true,
           schema: JudgmentSchema,
+          structuredAttempt: attempt === 0 ? 0 : 1,
           jsonSchema: toStrictJsonSchema(JudgmentSchema),
           timeoutMs: 10 * 60_000,
           idleTimeoutMs: 10 * 60_000,
@@ -234,7 +235,10 @@ export async function judgeTrials(
           error: redactCredentials(response.error ?? ""),
           exhaustedUntil: response.quota?.exhaustedUntil,
         });
-        if (response.status !== "ok") throw new Error("judge request failed");
+        if (response.status !== "ok") {
+          reason = response.failureClass === "malformed" ? "malformed" : "error";
+          throw new Error("judge request failed");
+        }
         reason = "malformed";
         const matches = normalizeJudgment(
           response.structured ?? extractJson(response.finalText),

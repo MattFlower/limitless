@@ -264,7 +264,7 @@ function implementMetrics(rows: EvalTrial[]) {
   };
 }
 /** A candidate is its review system when it has one, otherwise its evidence target. */
-const candidateOf = (trial: EvalTrial) => trial.details.system ?? evidenceTarget(trial);
+export const candidateOf = (trial: EvalTrial) => trial.details.system ?? evidenceTarget(trial);
 /**
  * How a decision model's trials escalate in production (declined, or any operational failure), and
  * the confidence cascade: each escalated trial replaced by the fallback's trial for the same case

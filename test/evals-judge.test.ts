@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import { gradeReview } from "../src/evals/graders/review.ts";
 import { JUDGE_RULE, normalizeJudgment } from "../src/evals/judge.ts";
 import { EvalRunner } from "../src/evals/runner.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
+import { runLlm } from "../src/harness/llm.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { StoredReviewSchema } from "../src/pipeline/schemas.ts";
 import { registerCredential } from "../src/util/proc.ts";
@@ -29,6 +30,7 @@ function fixture(
   concurrency = 1,
   maxConcurrent = 2,
   persistent = false,
+  legacy = false,
 ) {
   const home = mkdtempSync(join(tmpdir(), "eval-judging-test-"));
   const cfg = loadConfig({ home, configDir: join(home, "config") });
@@ -47,7 +49,7 @@ function fixture(
   const factory = new Factory(cfg, {
     store: new Store(persistent ? join(home, "db.sqlite") : ":memory:"),
     evalCasePath: casePath,
-    harnesses: { fake: harness },
+    harnesses: { fake: harness, llm: runLlm },
     providers: pair.map((id) => ({ id, label: id, harness: "fake", billing: "metered", maxConcurrent })),
     models: pair.map((id, i) => ({
       id,
@@ -79,7 +81,7 @@ function fixture(
       evalRunId: run.id,
       caseId: item.id,
       modelId: "private-eval-model",
-      effort: "default",
+      effort: legacy ? null : "default",
       trial: 0,
       cacheKey: `trial-${i}`,
       harness: "fake",
@@ -87,7 +89,7 @@ function fixture(
       output,
       pass: grade.pass,
       score: grade.score,
-      details: { grade, system: "SECRET_SYSTEM" },
+      details: { grade, ...(legacy ? {} : { system: "SECRET_SYSTEM" }) },
       costUsd: 2,
       costEquivUsd: 2,
       tokensIn: 10,
@@ -313,6 +315,93 @@ test("judgments persist across regrade/report and invalidate only edited cases",
     await f.close();
   }
 });
+
+test("legacy unknown-effort trials keep judged and unjudged metrics under their evidence identity", async () => {
+  const f = fixture(undefined, 1, 2, false, true);
+  try {
+    f.respond(() => ({ structured: { matches: [] } }));
+    expect((await f.judge()).unjudged).toHaveLength(1);
+    expect(f.report().summaries[0]).toMatchObject({
+      candidate: "private-eval-model (unknown effort)",
+      review: { judged: { unjudged: 1, recall: { numerator: 0, denominator: 0 } } },
+    });
+    f.respond(() => ({ structured: { matches: [match()] } }));
+    expect(await f.judge()).toMatchObject({ trialsJudged: 1, modelCalls: 2 });
+    expect(f.report().summaries[0]?.review?.judged).toMatchObject({
+      unjudged: 0,
+      recall: { numerator: 1, denominator: 1 },
+      perJudge: [{ numerator: 1 }, { numerator: 1 }],
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test.each(["invalid JSON", "invalid schema", "missing gold", "recovery", "format rejection", "budget"])(
+  "HTTP judges share the two-request budget with the adapter: %s",
+  async (mode) => {
+    const f = fixture();
+    const bodies: Record<string, unknown>[] = [];
+    const attempts = new Map<string, number>();
+    const transport = spyOn(globalThis, "fetch").mockImplementation((async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      const model = String(body.model);
+      const attempt = (attempts.get(model) ?? 0) + 1;
+      attempts.set(model, attempt);
+      if (mode === "format rejection" && attempt === 1) return new Response(null, { status: 400 });
+      const content =
+        (mode === "recovery" || mode === "format rejection") && attempt === 2
+          ? JSON.stringify({ matches: [match()] })
+          : mode === "invalid schema"
+            ? '{"wrong":true}'
+            : mode === "missing gold"
+              ? '{"matches":[]}'
+              : "invalid JSON";
+      return Response.json({
+        choices: [{ message: { content } }],
+        usage: { prompt_tokens: 1_000_000 },
+      });
+    }) as typeof fetch);
+    try {
+      for (const judge of pair) {
+        const provider = f.factory.tracker.def(judge);
+        if (!provider) throw new Error("fixture");
+        provider.openaiBaseUrl = "https://example.com/v1";
+      }
+      const result = await f.judge(mode === "budget" ? 0.5 : undefined);
+      const recovered = mode === "recovery" || mode === "format rejection";
+      expect([...attempts.values()]).toEqual(mode === "budget" ? [1, 1] : [2, 2]);
+      expect(result).toMatchObject({
+        modelCalls: mode === "budget" ? 2 : 4,
+        trialsJudged: Number(recovered),
+        spendUsd: mode === "format rejection" || mode === "budget" ? 2 : 4,
+        unjudged: recovered
+          ? []
+          : [
+              {
+                caseId: reviewCase.id,
+                modelId: "private-eval-model",
+                trial: 0,
+                reason: mode === "budget" ? "budget" : "malformed",
+              },
+            ],
+      });
+      for (const judge of pair) {
+        const requests = bodies.filter((body) => body.model === judge);
+        expect(requests[0]?.response_format).toBeDefined();
+        expect(requests[1]?.response_format).toBeUndefined();
+      }
+      expect(f.report().summaries[0]?.review?.judged).toMatchObject({
+        unjudged: Number(!recovered),
+        recall: { numerator: Number(recovered), denominator: Number(recovered) },
+      });
+    } finally {
+      transport.mockRestore();
+      await f.close();
+    }
+  },
+);
 
 test("budget stops new requests and never changes trial spend", async () => {
   const f = fixture([structuredClone(reviewCase), { ...structuredClone(reviewCase), id: "second" }]);

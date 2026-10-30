@@ -15,10 +15,12 @@ function failure(
   error: string,
   usage: Usage,
   target: ModelTarget,
+  failureClass?: AgentResult["failureClass"],
 ): AgentResult {
   const cost = priceOf(usage, target.price);
   return {
     status,
+    failureClass,
     error,
     finalText: "",
     structured: null,
@@ -54,7 +56,7 @@ export function effortFields(target: ModelTarget): Record<string, unknown> {
   }
 }
 
-/** One structured completion, with one bounded repair attempt for unsupported/invalid JSON. */
+/** One structured completion; callers may own the otherwise automatic bounded repair attempt. */
 export const runLlm: Harness = async (spec) => {
   const endpoint = spec.target.openai;
   const usage = emptyUsage();
@@ -87,7 +89,10 @@ export const runLlm: Harness = async (spec) => {
   if (spec.systemAppend) messages.push({ role: "system", content: spec.systemAppend });
   messages.push({ role: "user", content: spec.prompt });
   let lastError = "invalid structured response";
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let failureClass: AgentResult["failureClass"];
+  const first = spec.structuredAttempt ?? 0;
+  const end = spec.structuredAttempt === undefined ? 2 : first + 1;
+  for (let attempt = first; attempt < end; attempt++) {
     if (signal.aborted)
       return finish(
         failure(spec.signal.aborted ? "cancelled" : "timeout", "completion interrupted", usage, spec.target),
@@ -159,13 +164,14 @@ export const runLlm: Harness = async (spec) => {
           structured: valid.data,
           sessionId: null,
           usage,
-          numTurns: attempt + 1,
+          numTurns: attempt - first + 1,
           costUsd: spec.target.billing === "metered" ? cost : 0,
           costEquivUsd: cost,
           quota: null,
         });
       }
       lastError = "completion failed schema validation";
+      failureClass = "malformed";
       messages.push({
         role: "user",
         content: "Your previous answer was invalid. Return only a JSON object matching the requested schema.",
@@ -177,5 +183,5 @@ export const runLlm: Harness = async (spec) => {
       return finish(failure("unavailable", "completion transport failure", usage, spec.target));
     }
   }
-  return finish(failure("error", lastError, usage, spec.target));
+  return finish(failure("error", lastError, usage, spec.target, failureClass));
 };
