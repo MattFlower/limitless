@@ -6,7 +6,7 @@ import { linkedIssues, type Store } from "../db/store.ts";
 import { githubUrlRepo } from "../integrations/github-identity.ts";
 import { lifecycleMarker } from "../integrations/issue-lifecycle.ts";
 import { deliveryMarker } from "./markers.ts";
-import { rethrowRunTransfer } from "./run-transfer-errors.ts";
+import { RunTransferError, rethrowRunTransfer } from "./run-transfer-errors.ts";
 
 const runId = z.string().regex(/^[0-9a-z]{6,40}$/);
 const repo = z.string().regex(/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i);
@@ -151,6 +151,8 @@ export function effectId(id: string, intent: EffectIntent): string {
   return `fx1-${hash(canonical({ runId: runId.parse(id), intent: intentSchema.parse(intent) })).slice(0, 32)}`;
 }
 export function formatManifest(m: PortableManifest): string {
+  if (typeof m.schema === "number" && m.schema !== 1 && m.schema !== 2)
+    throw new RunTransferError("unsupported");
   if (m.schema === 1) return canonical(manifestSchema.parse(m));
   try {
     return canonical(manifestV2Schema.parse(m));
@@ -174,7 +176,9 @@ export function parseManifest(text: string): PortableManifest | "malformed" | { 
     )
       return { unsupported: value.schema };
     const parsed = portableManifestSchema.safeParse(value);
-    return parsed.success ? parsed.data : "malformed";
+    if (!parsed.success) return "malformed";
+    if (parsed.data.schema === 2 && canonical(parsed.data) !== text) return "malformed";
+    return parsed.data;
   } catch {
     return "malformed";
   }

@@ -18,6 +18,7 @@ import {
   manifestDigest,
   parseManifest,
 } from "../src/pipeline/portable.ts";
+import { RunTransferError } from "../src/pipeline/run-transfer-errors.ts";
 import { sh } from "../src/util/proc.ts";
 import { feedRound } from "./feed-support.ts";
 
@@ -352,6 +353,50 @@ test("manifest version 2 round trips every current phase without conversion", ()
 // Independently specified sorted JSON; digest calculated with Python hashlib.sha256 over UTF-8.
 const canonicalFixture =
   '{"baseSha":null,"blobs":{"artifacts":[],"objects":[],"state":{"digest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","key":"0123456789abcdef0123456789abcdef","size":0}},"createdBy":"mémber 🌱","effects":[],"generation":0,"headSha":null,"key":{"kind":"run","repo":"owner/repo","runId":"abc123"},"phase":"prepare","previous":null,"round":0,"runId":"abc123","schema":1,"sequence":0}';
+
+test.each<[string, (text: string) => string]>([
+  ["duplicate schema", (text) => text.replace('"schema":', '"schema":999,"schema":')],
+  ["duplicate nested key", (text) => text.replace('"size":0', '"size":99,"size":0')],
+  ["whitespace", (text) => ` ${text}\n`],
+  [
+    "reordered keys",
+    (text) => JSON.stringify(Object.fromEntries(Object.entries(JSON.parse(text)).reverse())),
+  ],
+  ["alternate number notation", (text) => text.replace('"generation":0', '"generation":0e0')],
+  ["alternate string escape", (text) => text.replace('"prepare"', '"prepar\\u0065"')],
+])("manifest spelling %s is rejected only for V2", (_name, spelling) => {
+  const v1 = manifest();
+  const v2: ManifestV2 = { ...v1, schema: 2 };
+  const canonicalV2 = canonicalFixture.replace('"schema":1', '"schema":2');
+  expect(formatManifest(v2)).toBe(canonicalV2);
+  expect(parseManifest(canonicalV2)).toEqual(v2);
+  expect(parseManifest(spelling(canonicalV2))).toBe("malformed");
+  expect(parseManifest(spelling(canonicalFixture))).toEqual(v1);
+});
+
+test.each([3, 999])("manifest version %s stays unsupported at every entry point", (schema) => {
+  for (const value of [{ ...manifest(), schema }, { schema }, { schema, phase: null, runId: false }]) {
+    expect(parseManifest(JSON.stringify(value))).toEqual({ unsupported: schema });
+    for (const action of [formatManifest, manifestDigest]) {
+      let caught: unknown;
+      try {
+        action(value as unknown as ManifestV2);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(RunTransferError);
+      expect(caught).toMatchObject({ code: "unsupported", message: "Run transfer format is unsupported" });
+    }
+  }
+});
+
+test.each([1, 2])("malformed supported manifest version %s stays malformed", (schema) => {
+  const value = { schema, phase: null };
+  expect(parseManifest(JSON.stringify(value))).toBe("malformed");
+  for (const action of [formatManifest, manifestDigest])
+    expect(() => action(value as unknown as ManifestV2)).toThrow();
+});
+
 test("canonical manifest has fixed platform-independent UTF-8 bytes and digest", () => {
   expect(formatManifest(manifest())).toBe(canonicalFixture);
   expect(manifestDigest(manifest())).toBe("7dae3026e4e9c02a60a6c132cb596c490d954e7579d9197f6ef119a7e544a1b0");

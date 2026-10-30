@@ -9,7 +9,7 @@ export type TransferJsonValue =
   | { [key: string]: TransferJsonValue };
 
 export function parseTransferCounter(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || Object.is(value, -0))
     throw new RunTransferError("invalid");
   return value;
 }
@@ -39,7 +39,8 @@ export function parseTransferOid(value: unknown): string {
 // Serialize members directly: JSON.stringify would reorder numeric-looking object keys.
 function canonical(value: unknown, ancestors: Set<object>): string {
   if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+  if (typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0))
+    return JSON.stringify(value);
   if (typeof value !== "object" || value === null || ancestors.has(value))
     throw new RunTransferError("invalid");
   const array = Array.isArray(value);

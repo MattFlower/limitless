@@ -88,3 +88,28 @@ test("transfer scalar boundaries preserve spelling and reject without coercion",
   for (const [parse, values] of cases)
     for (const value of values) expect(() => parse(value)).toThrow("Run transfer data is invalid");
 });
+
+test("transfer counters and JSON reject negative zero at every depth", () => {
+  const cases: [(value: unknown) => unknown, unknown[]][] = [
+    [parseTransferCounter, [-0]],
+    [parseTransferJson, [-0, [-0], { nested: { value: -0 } }]],
+    [encodeTransferJson, [-0, [-0], { nested: { value: -0 } }]],
+  ];
+  for (const [parse, values] of cases) {
+    for (const value of values) {
+      let caught: unknown;
+      try {
+        parse(value);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(RunTransferError);
+      expect(caught).toMatchObject({ code: "invalid", message: "Run transfer data is invalid" });
+    }
+  }
+  expect(parseTransferCounter(0)).toBe(0);
+  for (const value of [0, [0], { nested: { value: 0 } }]) {
+    expect(parseTransferJson(value)).toEqual(value);
+    expect(new TextDecoder().decode(encodeTransferJson(value))).toBe(JSON.stringify(value));
+  }
+});

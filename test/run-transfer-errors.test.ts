@@ -87,3 +87,34 @@ test("transfer boundaries replace ordinary failures and control-name lookalikes"
     expect(String(normalized)).not.toContain("sentinel");
   }
 });
+
+test("transfer boundaries contain exceptions while inspecting caught values", () => {
+  const sentinel = ["private", "inspection", "sentinel"].join("-");
+  const hostile = new Proxy(
+    {},
+    {
+      getPrototypeOf: () => {
+        throw new Error(sentinel);
+      },
+    },
+  );
+  const value = new Proxy(
+    {},
+    {
+      ownKeys: () => {
+        throw hostile;
+      },
+    },
+  );
+  for (const action of [
+    () => rethrowRunTransfer(hostile, "unavailable"),
+    () => encodeTransferJson(value),
+    () => parseTransferJson(value),
+  ]) {
+    const normalized = caught(action);
+    expect(normalized).toBeInstanceOf(RunTransferError);
+    expect(normalized).toMatchObject({ code: "invalid", message: "Run transfer data is invalid" });
+    expect(normalized).not.toHaveProperty("cause");
+    expect(String(normalized)).not.toContain(sentinel);
+  }
+});

@@ -1,4 +1,4 @@
-import { rethrowClaimControl } from "../integrations/claim-errors.ts";
+import { ClaimControlError, rethrowClaimControl } from "../integrations/claim-errors.ts";
 
 const diagnostics = {
   missing: "Run transfer data is missing",
@@ -20,6 +20,17 @@ export class RunTransferError extends Error {
 }
 
 export function rethrowRunTransfer(error: unknown, code: RunTransferErrorCode): never {
-  rethrowClaimControl(error);
+  try {
+    rethrowClaimControl(error);
+  } catch (caught) {
+    let control: boolean;
+    try {
+      control = caught === error && caught instanceof ClaimControlError;
+    } catch {
+      throw new RunTransferError("invalid");
+    }
+    if (control) throw caught;
+    throw new RunTransferError("invalid");
+  }
   throw new RunTransferError(code);
 }
