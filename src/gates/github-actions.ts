@@ -9,7 +9,7 @@ import type { RepoSettings } from "../config.ts";
 import { worktreeGit } from "../git/command.ts";
 import { checkPrivatePublication } from "../git/repos.ts";
 import type { GhRunner } from "../integrations/github.ts";
-import { CommandError, registeredCredentials } from "../util/proc.ts";
+import { CommandError } from "../util/proc.ts";
 import { CI_CONFIG } from "./audit.ts";
 import type { GateCommand } from "./detect.ts";
 import {
@@ -18,10 +18,11 @@ import {
   type GateExecutor,
   gateDigest,
   gateShutdown,
+  protectedEntries,
 } from "./executor.ts";
 import { extractFailures } from "./failures.ts";
 import { redactGateOutput } from "./output.ts";
-import { loadPrivateStrings, PrivateError, type PrivateStrings, redactPrivate } from "./private.ts";
+import { PrivateError, redactPrivate } from "./private.ts";
 import { checkPublicationText } from "./publication.ts";
 import type { GateResult, GateRun } from "./run.ts";
 
@@ -44,18 +45,16 @@ export interface ActionsProgress {
   runId?: number;
   /** Cleanup is pending or failed; retain the identity until termination and branch deletion succeed. */
   cleanupFailed?: boolean;
-  /** Binding to the run that resolved `repo` and to the gate configuration; inputs frozen after inspection. */
+  /** Bound run and gate configuration, inputs frozen after inspection, and a blocked interruption's class. */
   owner?: string;
   gateKey?: string;
   inputs?: Record<string, string>;
-  /** Classification of an interrupted execution; it stays blocked after cleanup. */
   interrupted?: string;
 }
 interface Dependencies {
   gh: GhRunner;
   /** The daemon-owned repository of a run, never derived from the request or candidate Git config. */
   destination: (runId: string | undefined) => string | undefined;
-  /** Live operator settings, re-read before each remote side effect. */
   settings: (repo: string) => RepoSettings;
   /** Ensure both refs point at these SHAs, atomically; refuse refs at other SHAs. */
   push: (progress: ActionsProgress, url: string) => Promise<void>;
@@ -79,21 +78,16 @@ interface Run {
 const workflow = "limitless-gates.yml";
 const url = (repo: string) => `https://github.com/${repo}.git`;
 const same = (a: unknown, b: string) => typeof a === "string" && a.toLowerCase() === b.toLowerCase();
-const refuse = (message: string) => new GateBlockedError("refused", message);
-const protectedEntries = (cwd: string): PrivateStrings => [
-  ...loadPrivateStrings(undefined, [cwd]),
-  ...registeredCredentials().map((value) => ({ value, entry: 1 })),
-];
+const refuse = (message: string, cwd?: string) => new GateBlockedError("refused", message, cwd);
 
 export function githubActionsExecutor(deps: Dependencies): GateExecutor {
   /** Authorization is read live; private repositories also need paid minutes, discreet ones refuse. */
   const admit = (repo: string, visibility: unknown, signal: AbortSignal) => {
     signal.throwIfAborted();
     const s = deps.settings(repo);
-    if (s.discreet || !s.githubActions || typeof visibility !== "boolean")
+    const paid = !visibility || s.githubActionsPaidMinutes;
+    if (s.discreet || !s.githubActions || typeof visibility !== "boolean" || !paid)
       throw refuse(`GitHub Actions is not authorized for ${repo}`);
-    if (visibility && !s.githubActionsPaidMinutes)
-      throw refuse(`Paid Actions minutes are not authorized for ${repo}`);
   };
   const api = async <T>(
     p: ActionsProgress,
@@ -204,6 +198,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
       throw new GateBlockedError(
         "cleanup",
         `GitHub Actions gate cleanup failed: ${failures.map(String).join("; ")}`,
+        p.cwd,
       );
     p.cleanupFailed = undefined;
   };
@@ -214,22 +209,22 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
     async start(req, signal) {
       const repo = deps.destination(req.runId);
       if (!repo || !same(req.repo, repo)) throw refuse("Gate request does not match the run's repository");
+      if (!/^[a-f\d]{40,64}$/.test(req.headSha)) throw refuse("Candidate SHA is not an immutable object ID");
       admit(repo, false, signal); // Visibility is confirmed again before upload.
       // Remote URLs and rewrites in the candidate's Git configuration must not redirect any transport.
       const remotes = await worktreeGit(
         ["git", "config", "--get-regexp", "^(remote\\..*\\.(push)?url|url\\..*\\.(push)?insteadof)$"],
         { cwd: req.cwd, signal, allowFail: true },
       );
-      const redirects = remotes.stdout
-        .split("\n")
-        .filter((line) => line && (!line.startsWith("remote.") || line.split(" ")[1] !== url(repo)));
-      if (redirects.length) throw refuse("Candidate Git configuration redirects the gate destination");
+      for (const line of remotes.stdout.split("\n").filter(Boolean))
+        if (!line.startsWith("remote.") || line.split(" ")[1] !== url(repo))
+          throw refuse("Candidate Git configuration redirects the gate destination");
       const diff = await worktreeGit(
         ["git", "diff", "--no-renames", "--name-only", "-z", req.baseSha, req.headSha, "--"],
         { cwd: req.cwd, signal },
       );
       const unsafe = diff.stdout.split("\0").filter((file) => CI_CONFIG.test(file));
-      if (unsafe.length) throw refuse(`Candidate changes CI configuration: ${unsafe.join(", ")}`);
+      if (unsafe.length) throw refuse(`Candidate changes CI configuration: ${unsafe.join(", ")}`, req.cwd);
       const id = randomUUID();
       return {
         kind: "github-actions",
@@ -421,7 +416,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
                     undefined,
                     p.repo,
                   );
-              mapped.set(index, parseJob(job, log || "", setup, command, p.dispatchSha ?? ""));
+              const safe = redactPrivate(log || "", protectedEntries(p.cwd)); // Before parsing or storage.
+              mapped.set(index, parseJob(job, safe, setup, command, p.dispatchSha ?? ""));
             }
             if (run.status === "completed") {
               alive();
@@ -466,12 +462,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
           const aborted = controller.signal.aborted;
           const kind = error instanceof PrivateError ? "refused" : aborted ? "cancelled" : "operational";
           const blocked =
-            error instanceof GateBlockedError ? error : new GateBlockedError(kind, String(error));
-          try {
-            blocked.message = redactPrivate(blocked.message, protectedEntries(p.cwd));
-          } catch {
-            blocked.message = `GitHub Actions gate blocked (${blocked.classification})`;
-          }
+            error instanceof GateBlockedError ? error : new GateBlockedError(kind, String(error), p.cwd);
           // A completed result may replay once cleanup succeeds; anything else stays blocked.
           if (!p.completed) p.interrupted = blocked.classification;
           await checkpoint();

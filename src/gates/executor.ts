@@ -4,10 +4,12 @@ import { join } from "node:path";
 import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
 import { withScratch } from "../harness/scratch.ts";
+import { registeredCredentials } from "../util/proc.ts";
 import type { GateConfig } from "./detect.ts";
 import type { ActionsProgress } from "./github-actions.ts";
 import { lanExecutor } from "./lan.ts";
 import { redactGateData, redactGateOutput } from "./output.ts";
+import { loadPrivateStrings, type PrivateStrings, redactPrivate } from "./private.ts";
 import {
   type GateHooks,
   type GateResult,
@@ -106,13 +108,20 @@ export async function gateProvenance(cwd: string, signal: AbortSignal, checkedSh
 
 export const gateDigest = (gates: GateConfig) =>
   createHash("sha256").update(JSON.stringify(gates)).digest("hex");
+export const protectedEntries = (cwd?: string): PrivateStrings => [
+  ...loadPrivateStrings(undefined, [cwd]),
+  ...registeredCredentials().map((value) => ({ value, entry: 1 })),
+];
 
-/** Operational failure: never a gate result, a local substitute or implementation feedback. */
+/** Operational failure, never a gate result or feedback; unredactable detail keeps only its class. */
 export class GateBlockedError extends Error {
   readonly classification: string;
-  constructor(classification: string, message: string) {
-    super(redactGateOutput(`GitHub Actions gate blocked (${classification}): ${message}`));
+  constructor(classification: string, message: string, cwd?: string) {
+    super(`GitHub Actions gate blocked (${classification})`);
     this.classification = classification;
+    try {
+      this.message = redactGateOutput(redactPrivate(`${this.message}: ${message}`, protectedEntries(cwd)));
+    } catch {}
   }
 }
 
@@ -129,7 +138,7 @@ export async function blockInterrupted(
     if (p?.cleanupFailed) throw new Error("cleanup remains pending");
     if (p) p.interrupted ??= "interrupted";
   } catch (error) {
-    throw error instanceof GateBlockedError ? error : new GateBlockedError("cleanup", String(error));
+    throw error instanceof GateBlockedError ? error : new GateBlockedError("cleanup", String(error), p?.cwd);
   } finally {
     await persist();
   }

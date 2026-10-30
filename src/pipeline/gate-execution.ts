@@ -162,7 +162,7 @@ export async function resumeGateExecution(
     const job = pending.handle.kind === "inplace" ? workers.job(pending.handle.id) : null;
     const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
     try {
-      if (pending.handle.githubActions && !pending.handle.githubActions.completed)
+      if (pending.handle.githubActions && (!pending.handle.githubActions.completed || pending.sha !== sha))
         await blockInterrupted(pending.handle, executor, async () => {});
       await cancelGateExecution(
         pending.handle,
@@ -219,6 +219,9 @@ export async function runGateExecution(
   ) {
     // Leave the previous identity durable until the next handle and its history replace it together.
     try {
+      // A changed configuration for the same attempt, or blocked work, never replaces Actions work.
+      if (pending.purpose === purpose || pending.handle.githubActions?.interrupted)
+        await blockInterrupted(pending.handle, executor, async () => {});
       await cancelGateExecution(pending.handle, executor);
       if (pending.handle.githubActions?.cleanupFailed)
         throw new Error("GitHub Actions gate cleanup remains pending");

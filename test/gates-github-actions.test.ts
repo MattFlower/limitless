@@ -963,7 +963,7 @@ test("review regression: completion survives restart before the caller saves gat
   }
 });
 
-test.each(["sha", "stage", "round", "purpose"])(
+test.each(["stage", "round", "purpose"])(
   "completed result cannot satisfy a different %s",
   async (mismatch) => {
     const f = fixture();
@@ -972,7 +972,6 @@ test.each(["sha", "stage", "round", "purpose"])(
       await runGateExecution(ctx, "gates", "initial", cwd, req.gates);
       const pending = ctx.state.gateExecution;
       if (!pending) throw new Error("Missing completed identity");
-      if (mismatch === "sha") pending.sha = "old";
       if (mismatch === "stage") pending.stage = "prepare";
       if (mismatch === "round") pending.round++;
       if (mismatch === "purpose") pending.purpose = "baseline";
@@ -980,6 +979,46 @@ test.each(["sha", "stage", "round", "purpose"])(
       const restarted = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
       await runGateExecution(restarted, "gates", "initial", cwd, req.gates);
       expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.each(["sha", "configuration", "configuration after failed cleanup"])(
+  "a completed result with a changed %s stays blocked through the pipeline",
+  async (change) => {
+    const f = fixture();
+    const { ctx, store } = await context(f);
+    try {
+      const remove = f.deps.delete;
+      let failing = change.endsWith("failed cleanup");
+      f.deps.delete = async (p, branch, sha, url) => {
+        if (failing && branch === p.dispatch) throw new Error("lease rejected");
+        await remove(p, branch, sha, url);
+      };
+      const first = runGateExecution(ctx, "gates", "initial", cwd, req.gates);
+      if (failing) await expect(first).rejects.toThrow("lease rejected");
+      else await first;
+      // Cleanup can now finish, yet the changed configuration must not replace the work.
+      failing = false;
+      const pending = ctx.state.gateExecution;
+      if (!pending?.handle.githubActions?.completed) throw new Error("Missing completed identity");
+      if (change === "sha") pending.sha = "old";
+      await ctx.save();
+      const gates = change === "sha" ? req.gates : { ...req.gates, setup: ["other install"] };
+      for (const attempt of [1, 2]) {
+        const restarted = new RunContext(ctx.deps, ctx.run, ctx.repo, signal());
+        const error = await runGateExecution(restarted, "gates", "initial", cwd, gates).catch((e) => e);
+        expect(error, `attempt ${attempt}`).toBeInstanceOf(GateBlockedError);
+      }
+      expect(f.calls.filter((call) => call === "dispatch")).toHaveLength(1);
+      expect(f.calls.filter((call) => call === "push")).toHaveLength(1);
+      const durable = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
+      expect(durable?.handle.id).toBe(pending.handle.id);
+      expect(durable?.handle.githubActions?.interrupted).toBe("interrupted");
+      expect(durable?.handle.githubActions?.cleanupFailed).toBeUndefined();
+      expect(f.remote.size).toBe(0);
     } finally {
       store.close();
     }
@@ -1544,6 +1583,7 @@ test.each<[string, string, (f: Fixture) => unknown]>([
   ["option-like metadata head", "refused", (f) => (f.state.dispatchSha = "--output=/dev/null")],
   ["request repository differs from the run", "refused", () => (req.repo = "other/repo")],
   ["no run record", "refused", (f) => (f.state.destination = undefined)],
+  ["symbolic candidate SHA", "refused", () => (req.headSha = "HEAD")],
   ["hostile origin", "refused", () => git("config", "remote.origin.url", "https://github.com/evil/repo.git")],
   [
     "insteadOf rewrite",
@@ -1657,6 +1697,13 @@ async function commit(files: Record<string, string>, message = "change", env: Re
 
 test.each<[string, (f: Fixture) => Promise<unknown> | unknown]>([
   ["a filename", () => commit({ [`${secret}.txt`]: "x\n" })],
+  [
+    "a CI configuration filename",
+    async () => {
+      mkdirSync(join(cwd, ".github/workflows"), { recursive: true });
+      await commit({ [`.github/workflows/${secret}.yml`]: "on: push\n" });
+    },
+  ],
   ["a blob", () => commit({ "notes.txt": `${secret}\n` })],
   ["a base64 blob", () => commit({ "notes.txt": `${Buffer.from(secret).toString("base64")}\n` })],
   ["a registered credential", () => commit({ "notes.txt": `${credential}\n` })],
@@ -1692,6 +1739,18 @@ test.each<[string, (f: Fixture) => Promise<unknown> | unknown]>([
     expect(persisted).not.toContain(credential);
     expect(persisted).not.toContain(Buffer.from(secret).toString("base64"));
   });
+});
+
+test("protected text in a job log never reaches results or checkpoints", async () => {
+  registerCredential("ACTIONS_PUBLICATION_TEST", credential);
+  const f = fixture();
+  f.state.logs.set(1, log(framed(), `failed near ${secret} using ${credential}\n${framed(0, 1)}`));
+  const run = await withPrivateString(() => f.run());
+  expect(run.checks[0]).toMatchObject({ ok: false, exitCode: 1 });
+  expect(run.checks[0]?.output).toContain("failed near");
+  const persisted = JSON.stringify([run, f.saved]);
+  expect(persisted).not.toContain(secret);
+  expect(persisted).not.toContain(credential);
 });
 
 test("a clean candidate publishes exactly the inspected SHAs and inputs, without environment values", async () => {
