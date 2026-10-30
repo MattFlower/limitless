@@ -1875,7 +1875,6 @@ export async function createPullRequest(
     const create = ["gh", "pr", "create", "--repo", repo.slug, "--head", opts.branch, "--base", opts.base];
     const args = [...create, "--title", opts.title, "--body-file", "-", ...(opts.draft ? ["--draft"] : [])];
     const res = await githubSh(args, { cwd, stdin: opts.body, signal }, repo.slug).catch(async (e) => {
-      rethrowClaimControl(e);
       if (!(e instanceof CommandError && e.stderr.includes("already exists"))) throw e;
       reportedExisting = true;
       const again = await find();
@@ -1999,7 +1998,6 @@ export async function mergePullRequest(
         try {
           await opts.guard?.();
         } catch (cause) {
-          rethrowClaimControl(cause);
           throw new GitHubGuardError("Merge guard refused", { cause });
         }
         return githubSh(cmd, { cwd, signal, stdin: body }, repo).then(

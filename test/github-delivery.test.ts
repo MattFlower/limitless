@@ -293,10 +293,33 @@ test("explicit run-branch lease permits updates and rewinds and recovers an alre
   }
 });
 
-test.each(["allocation", "range", "push", "readback", "find", "create", "edit", "lookup", "guard", "merge"])(
-  "publication preserves claim interruption at %s",
+test.each([
+  "allocation",
+  "range",
+  "push",
+  "readback",
+  "find",
+  "create",
+  "edit",
+  "lookup",
+  "guard",
+  "async guard",
+  "merge",
+])(
+  "publication preserves claim interruption without retries, reconciliation or failure reporting at %s",
   async (boundary) => {
-    const sentinel = new ClaimLostError();
+    // Command-like details must not trigger already-exists recovery or transient retries.
+    const sentinel = Object.assign(new ClaimLostError(), {
+      message: "HTTP 502: a PR already exists",
+      stderr: "HTTP 502: a PR already exists",
+      timedOut: true,
+    });
+    let guards = 0;
+    const guard = () => {
+      guards++;
+      if (boundary === "async guard") return Promise.reject(sentinel);
+      throw sentinel;
+    };
     const head = (await git(work, "rev-parse", "HEAD")).stdout.trim();
     const commands: string[][] = [];
     const url = "https://github.com/test/repo/pull/1";
@@ -356,15 +379,10 @@ test.each(["allocation", "range", "push", "readback", "find", "create", "edit", 
         );
       else if (["push", "readback"].includes(boundary)) attempt = repos.pushBranch(repo, work, "new");
       else if (boundary === "lookup") attempt = repos.findPullRequest(repo, "new", work);
-      else if (["guard", "merge"].includes(boundary))
+      else if (["guard", "async guard", "merge"].includes(boundary))
         attempt = repos.mergePullRequest(url, work, head, undefined, undefined, [], {
           onFailure,
-          guard:
-            boundary === "guard"
-              ? () => {
-                  throw sentinel;
-                }
-              : undefined,
+          guard: boundary === "merge" ? undefined : guard,
         });
       else
         attempt = repos.createPullRequest(repo, {
@@ -376,6 +394,7 @@ test.each(["allocation", "range", "push", "readback", "find", "create", "edit", 
         });
       await expect(attempt).rejects.toBe(sentinel);
       expect(onFailure).not.toHaveBeenCalled();
+      expect(guards).toBe(["guard", "async guard"].includes(boundary) ? 1 : 0);
       expect(
         commands.map((cmd) =>
           cmd.includes("ls-remote") ? "readback" : cmd.includes("push") ? "push" : cmd[2],
@@ -387,7 +406,7 @@ test.each(["allocation", "range", "push", "readback", "find", "create", "edit", 
             ? ["push"]
             : boundary === "range"
               ? ["readback"]
-              : boundary === "guard"
+              : ["guard", "async guard"].includes(boundary)
                 ? ["view"]
                 : boundary === "merge"
                   ? ["view", "merge"]
