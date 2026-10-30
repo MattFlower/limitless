@@ -4,14 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
-import type { ReviewFinding, Run, RunDetail } from "../src/core/types.ts";
+import type { ReviewFinding, Run, RunDetail, Stage, StageName } from "../src/core/types.ts";
 import { checkPrivateText } from "../src/gates/private.ts";
 import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
-import type { RunState } from "../src/pipeline/context.ts";
+import { ClaimLostError } from "../src/integrations/claim-errors.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { type FaultPlan, SimulatedTermination } from "../src/pipeline/faults.ts";
 import { ENVIRONMENT_BLOCKED } from "../src/pipeline/verification.ts";
@@ -1751,3 +1752,154 @@ test("discreet environment-blocked rounds sanitize model attribution before comm
   expect(body).not.toContain(roundId);
   expect(pr.calls.filter((args) => args[1] === "edit")).toHaveLength(0);
 });
+
+test.each([
+  "refused",
+  "readback interrupted",
+  "success",
+  "confirmed",
+  "different",
+  "unknown",
+  "workflow",
+  "publication",
+])("review push closes its barrier with the confirmed outcome: %s", async (outcome) => {
+  const original = await delivered();
+  const roundId = (await changes(original.id)).body.round?.id as string;
+  const sentinel = new ClaimLostError();
+  const failure = new Error("Push failed");
+  let attempted = false;
+  let readbacks = 0;
+  const remote = repos.remoteBranchSha;
+  const lookup = spyOn(repos, "remoteBranchSha").mockImplementation(async (...args) => {
+    if (!attempted) return remote(...args);
+    readbacks++;
+    if (outcome === "readback interrupted") throw sentinel;
+    if (outcome === "unknown") throw new Error("Readback failed");
+    return outcome === "different" ? "f".repeat(40) : (factory.store.getRun(roundId)?.headSha ?? null);
+  });
+  const push = spyOn(repos, "pushExistingBranch").mockImplementation(async () => {
+    attempted = true;
+    if (outcome === "refused") throw sentinel;
+    if (outcome !== "success") throw failure;
+  });
+  const end = spyOn(factory.store, "endPrPush");
+  if (outcome === "workflow") spyOn(repos, "assertWorkflowPublication").mockRejectedValue(sentinel);
+  if (outcome === "publication") spyOn(repos, "deliveryPublicationRange").mockRejectedValue(sentinel);
+  const errors = captureDeliveryErrors();
+  await executeRun(factory.deps, roundId, new AbortController().signal);
+  const confirmed = ["success", "confirmed"].includes(outcome);
+  const head = factory.store.getRun(roundId)?.headSha;
+  if (["workflow", "publication"].includes(outcome)) {
+    expect(errors[0]).toBe(sentinel);
+    expect(push).not.toHaveBeenCalled();
+    expect(end).not.toHaveBeenCalled();
+    expect(factory.store.reviewRound(roundId)?.deliveredSha).toBeNull();
+    return;
+  }
+  expect(end).toHaveBeenCalledTimes(1);
+  expect(end).toHaveBeenCalledWith(
+    PR_URL,
+    confirmed ? head : outcome === "different" ? "f".repeat(40) : null,
+  );
+  expect(readbacks).toBe(["success", "refused"].includes(outcome) ? 0 : 1);
+  expect(factory.store.reviewRound(roundId)?.deliveredSha).toBe(confirmed ? head : null);
+  expect(errors[0]).toBe(
+    confirmed ? undefined : ["refused", "readback interrupted"].includes(outcome) ? sentinel : failure,
+  );
+  push.mockRestore();
+  lookup.mockRestore();
+});
+
+function captureDeliveryErrors() {
+  // Observe the delivery callback before executeRun's out-of-scope run-state mapping.
+  const stage = RunContext.prototype.stage;
+  const errors: unknown[] = [];
+  spyOn(RunContext.prototype, "stage").mockImplementation(function <T>(
+    this: RunContext,
+    name: StageName,
+    fn: (row: Stage) => Promise<{ summary: string; value: T }>,
+    ...rest: [number?, boolean?, boolean?, ((value: T, row: Stage, sha?: string) => void)?]
+  ) {
+    return stage.bind(this)<T>(
+      name,
+      async (row) => {
+        try {
+          return await fn(row);
+        } catch (error) {
+          if (name === "deliver") errors.push(error);
+          throw error;
+        }
+      },
+      ...rest,
+    );
+  });
+  return errors;
+}
+
+test.each(["head", "head aborted", "comment", "comment aborted"])(
+  "verdict preserves claim interruption at %s",
+  async (boundary) => {
+    const original = await delivered();
+    const repo = factory.store.getRepo(original.repoId);
+    if (!repo) throw new Error("Missing repo");
+    const head = await remoteHead();
+    await repos.ensureCache(factory.cfg.paths, repo);
+    const wt = await repos.createWorktree(factory.cfg.paths, repo, original.id, "Verify", BRANCH);
+    factory.store.updateRun(original.id, {
+      status: "queued",
+      baseBranch: BRANCH,
+      baseSha: head,
+    });
+    factory.store.db
+      .query(
+        "UPDATE runs SET delivery_branch = ?, source = ?, requested_by = ?, github_webhook_verified = 1, source_ref = ? WHERE id = ?",
+      )
+      .run(
+        BRANCH,
+        "github",
+        "dependabot[bot]",
+        JSON.stringify({ kind: "pull_request", repo: repo.slug, number: 5, headSha: head }),
+        original.id,
+      );
+    factory.store.setRunState(original.id, {
+      feedback: null,
+      toolCommands: [],
+      phase: "deliver",
+      flow: "verify-change",
+      worktreePath: wt.path,
+      verification: { baseSha: head, headSha: head },
+      reviewedSha: head,
+      previewConfig: null,
+      slottedCommands: [],
+      answers: [],
+      round: 0,
+      roundsOnImplementer: 0,
+      triedImplementers: [],
+    } satisfies RunState);
+    const sentinel = new ClaimLostError();
+    const commands: string[][] = [];
+    const controller = new AbortController();
+    factory.deps.gh = async (args) => {
+      commands.push(args);
+      if ((boundary.startsWith("head") && args[1] === "view") || args[1] === "comment") {
+        if (boundary.endsWith("aborted")) controller.abort();
+        throw sentinel;
+      }
+      return JSON.stringify({ headRefOid: head });
+    };
+    const errors = captureDeliveryErrors();
+    const saves = spyOn(RunContext.prototype, "save");
+    await executeRun(factory.deps, original.id, controller.signal);
+    expect(errors[0]).toBe(sentinel);
+    expect(commands.filter((args) => args[1] === "comment")).toHaveLength(
+      boundary.startsWith("head") ? 0 : 1,
+    );
+    const state = factory.store.getRunState<RunState>(original.id);
+    expect(state?.verdictCommentPosted).not.toBe(true);
+    expect(state?.deliveryComplete).not.toBe(true);
+    expect(state?.terminalReason).toBeUndefined();
+    expect(saves.mock.calls.map(([reason]) => reason)).not.toContain("verification-stale");
+    expect(saves.mock.calls.map(([reason]) => reason)).not.toContain("verification-comment-posted");
+    expect(saves.mock.calls.map(([reason]) => reason)).not.toContain("delivery-complete");
+  },
+);

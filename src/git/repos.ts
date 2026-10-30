@@ -23,6 +23,7 @@ import type { PrivateStrings } from "../gates/private.ts";
 import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
+import { rethrowClaimControl } from "../integrations/claim-errors.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import { GitHubIdentityError, githubSh, githubUrlRepo } from "../integrations/github-identity.ts";
 import { checkDiscreetBranch, DiscreetError } from "../pipeline/markers.ts";
@@ -426,6 +427,7 @@ export async function createWorktree(
           )
             continue;
         } catch (cause) {
+          rethrowClaimControl(cause);
           throw new Error(`Cannot allocate branch ${name}: PR lookup failed`, { cause });
         }
         branch = candidate;
@@ -1149,6 +1151,7 @@ export async function deliveryPublicationRange(
   const opts = { cwd, signal, budget };
   const marked = discreet && checkDiscreetBranch(branch, discreet.runId, true);
   const remote = await remoteSh(["git", "ls-remote", url, `refs/heads/${branch}`], opts).catch((error) => {
+    rethrowClaimControl(error);
     if (marked && !signal?.aborted)
       throw new DiscreetError("Discreet mode cannot establish branch-name publication status");
     throw error;
@@ -1688,7 +1691,14 @@ export async function pushBranch(
       }),
     );
   } catch (error) {
-    if ((await remoteBranchSha(repo, cwd, branch, signal, budget).catch(() => null)) !== head) throw error;
+    rethrowClaimControl(error);
+    if (
+      (await remoteBranchSha(repo, cwd, branch, signal, budget).catch((error) => {
+        rethrowClaimControl(error);
+        return null;
+      })) !== head
+    )
+      throw error;
   }
 }
 
@@ -1843,8 +1853,12 @@ export async function createPullRequest(
       ? lookupIdentityPr(repo, opts.branch, cwd, opts.identity, signal)
       : githubSh(prLookup(repo, opts.branch), { cwd, signal }, repo.slug).then(
           (r) => lookupUrl(r.stdout, opts.identity),
-          (e) =>
-            e instanceof GitHubIdentityError || isTransient(e) || signal?.aborted ? Promise.reject(e) : "",
+          (e) => {
+            rethrowClaimControl(e);
+            return e instanceof GitHubIdentityError || isTransient(e) || signal?.aborted
+              ? Promise.reject(e)
+              : "";
+          },
         );
   let existing = false;
   let reportedExisting = false;
@@ -1861,6 +1875,7 @@ export async function createPullRequest(
     const create = ["gh", "pr", "create", "--repo", repo.slug, "--head", opts.branch, "--base", opts.base];
     const args = [...create, "--title", opts.title, "--body-file", "-", ...(opts.draft ? ["--draft"] : [])];
     const res = await githubSh(args, { cwd, stdin: opts.body, signal }, repo.slug).catch(async (e) => {
+      rethrowClaimControl(e);
       if (!(e instanceof CommandError && e.stderr.includes("already exists"))) throw e;
       reportedExisting = true;
       const again = await find();
@@ -1878,6 +1893,7 @@ export async function createPullRequest(
       undefined,
       repo.slug,
     ).catch((e) => {
+      rethrowClaimControl(e);
       if (e instanceof GitHubIdentityError || signal?.aborted) throw e;
     });
   return url;
@@ -1910,6 +1926,7 @@ export async function findPullRequest(
     },
     repo.slug,
   ).catch((e) => {
+    rethrowClaimControl(e);
     if (e instanceof GitHubIdentityError || signal?.aborted) throw e;
     return null;
   });
@@ -1982,6 +1999,7 @@ export async function mergePullRequest(
         try {
           await opts.guard?.();
         } catch (cause) {
+          rethrowClaimControl(cause);
           throw new GitHubGuardError("Merge guard refused", { cause });
         }
         return githubSh(cmd, { cwd, signal, stdin: body }, repo).then(
@@ -1996,6 +2014,7 @@ export async function mergePullRequest(
       },
       { budget, signal },
     ).catch((e) => {
+      rethrowClaimControl(e);
       if (e instanceof GitHubGuardError) throw e.cause;
       if (e instanceof GitHubIdentityError || signal?.aborted) throw e;
       const cause = e instanceof GitHubUnavailableError ? (e.cause ?? e) : e;
