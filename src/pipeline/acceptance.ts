@@ -107,7 +107,8 @@ function atx(line: string) {
  * the heading isn't unique. The whole section is scanned, so no later heading can hide a refusal.
  */
 function scanSection(md: string, heading: string, where: string, intent = false) {
-  const lines = md.split(/\r\n?|\n/).map((line) => line.trimEnd());
+  // Trim only ASCII spaces and tabs, as GitHub does: a trailing NBSP keeps `##\u00a0` from being a heading.
+  const lines = md.split(/\r\n?|\n/).map((line) => line.replace(/[ \t]+$/, ""));
   const hits = lines.flatMap((line, i) => (atx(line)?.text === norm(heading) ? [i] : []));
   if (hits.length !== 1) return undefined;
   const start = hits[0] ?? 0;
@@ -137,6 +138,9 @@ function scanSection(md: string, heading: string, where: string, intent = false)
       if (refused) refuse(refused[1]);
       // In the ticket only references produce units, so a requirement written as a list item would vanish.
       if (item && intent) refuse("list item; only section references produce units");
+      // Only an ordered list starting at 1 can interrupt a paragraph; `2.` there is paragraph text.
+      else if (item && previous === "para" && /^\d/.test(line) && !/^0*1[.)]/.test(line))
+        refuse("numbered line inside a paragraph");
       else if (item) out.push({ text: item[1] ?? "" });
       else if (/^(?:[-*+]|\d{1,9}[.)])(?:\s|$)/.test(line)) refuse("malformed list item");
       else if (intent && /^From .*:$/.test(line)) refuse("quote lead-in");
@@ -153,6 +157,8 @@ function scanSection(md: string, heading: string, where: string, intent = false)
 /** Resolve the ticket's section references into the parent's units, from trusted text only. */
 export function resolveIntent({ ticket, parent }: AcceptanceSnapshot): AcceptanceUnit[] {
   const units: AcceptanceUnit[] = [];
+  // Deduplicate on the text as written: normalizing whitespace would merge distinct code spans.
+  const written = new Map<string, AcceptanceUnit>();
   for (const { reference } of scanSection(ticket.body, "The original intent", "the ticket", true) ?? []) {
     if (!reference) continue;
     const [, number, heading = "", docs] = reference;
@@ -163,10 +169,21 @@ export function resolveIntent({ ticket, parent }: AcceptanceSnapshot): Acceptanc
     const section = scanSection(parent.body, heading, `#${number}`);
     if (!section) throw new Error(`section "${heading}" does not name exactly one heading of #${number}`);
     for (const unit of section) {
-      const text = norm(unit.text);
-      const found = units.find((u) => u.text === text);
-      if (found && !found.sources.includes(source)) found.sources.push(source);
-      if (!found) units.push({ id: `U${units.length + 1}`, text, class: evidence, sources: [source] });
+      const found = written.get(unit.text);
+      if (found) {
+        if (!found.sources.includes(source)) found.sources.push(source);
+        // Behaviour dominates, so referencing a section with (docs) first can't weaken its units.
+        if (evidence === "behaviour") found.class = "behaviour";
+        continue;
+      }
+      const added: AcceptanceUnit = {
+        id: `U${units.length + 1}`,
+        text: norm(unit.text),
+        class: evidence,
+        sources: [source],
+      };
+      units.push(added);
+      written.set(unit.text, added);
     }
   }
   if (!units.length) throw new Error("the ticket's original intent resolves to no units");

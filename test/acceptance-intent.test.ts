@@ -229,3 +229,25 @@ test.each([
 ])("%s refuses, naming its line and kind", (_name, ticket, parent, message) => {
   expect(() => resolve(ticket, parent)).toThrow(message);
 });
+
+test("round 4 review: edge spellings never drop, split or merge a requirement", () => {
+  // Only ASCII spaces and tabs trim: `##` followed by NBSP is paragraph text, so nothing after it is lost.
+  expect(texts(goal, inGoal("Before.\n## \nNever omit."))).toEqual(["Before. ## Never omit."]);
+  // `2.` inside a paragraph is text on GitHub; splitting it off would quote part of a rendered paragraph.
+  expect(() => resolve(goal, inGoal("Keep the rejection\n2. Never retry."))).toThrow(
+    unsupported(3, "#1", "numbered line inside a paragraph"),
+  );
+  // A list starting at 1 may interrupt a paragraph, as on GitHub.
+  expect(texts(goal, inGoal("Keep the rejection.\n1. Never retry."))).toEqual([
+    "Keep the rejection.",
+    "Never retry.",
+  ]);
+  // Code spans keep their spacing, so these are two requirements, not one.
+  expect(texts(goal, inGoal("Use `a  b`.\n\nUse `a b`."))).toHaveLength(2);
+});
+
+test("a unit referenced with and without (docs) requires behaviour evidence in either order", () => {
+  const parent = "## Goal\n- Required.";
+  for (const ticket of [`${goal} (docs)\n${goal}`, `${goal}\n${goal} (docs)`])
+    expect(brief(resolve(ticket, parent))).toEqual([["U1", "Required.", "behaviour", '#1 "Goal"']]);
+});

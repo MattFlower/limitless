@@ -50,8 +50,9 @@ model call. The ticket's `## The original intent` section names sections of the 
 lines of the form `#123's "Goal" section`, optionally followed by ` (docs)`; #123 must be the
 parent. Every list item and paragraph of a referenced section is a requirement unit. A `(docs)`
 suffix marks that section's units as documentation requirements; other units require test
-evidence. Other prose and list items in the intent section are context. Duplicate normalized
-texts share one unit.
+evidence, and a unit referenced both ways requires tests. Other prose in the intent section is context;
+a list item there refuses, since only references produce units. Units whose text is identical as
+written share one unit.
 
 Quoting parent or file text (a `From #123:` or `From docs/PLAN.md:` line followed by `>` quotes)
 is not supported: it was cut from #981's scope, and a lead-in or a quote refuses the run. Put the
