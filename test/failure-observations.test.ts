@@ -1,5 +1,6 @@
+import { Database } from "bun:sqlite";
 import { expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FailureObservation } from "../src/db/failure-observations.ts";
@@ -13,6 +14,9 @@ function row(
   at: number,
 ): Omit<FailureObservation, "id" | "class" | "history" | "finalized_at" | "interim"> {
   return {
+    purpose: "initial",
+    slow_regression: 0,
+    reason: null,
     run_id: id,
     repo: "test/repo",
     stage_id: 1,
@@ -200,3 +204,130 @@ test.skipIf(!sqlite)("migration with Homebrew SQLite (when installed)", async ()
   const result = await sh(["bun", "-e", source], { cwd: process.cwd() });
   expect(JSON.parse(result.stdout)).toEqual([{ worker_os: null }]);
 });
+
+test("completion finalizers isolate initial, rebase and land observations", () => {
+  const store = new Store(":memory:");
+  try {
+    insert(store, { ...row("run", null, 0), handle_id: "initial" });
+    insert(store, { ...row("run", null, 0), purpose: "rebase", handle_id: "rebase" });
+    insert(store, { ...row("land:1", null, 0), purpose: "land", handle_id: "1:1" });
+    finalize(store, "run");
+    expect(store.failureObservations().map((r) => r.history)).toEqual(["no_retry", null, null]);
+    store.transaction(() =>
+      store.observations.finalize("run", {
+        round: 0,
+        sha: "head",
+        stageId: 1,
+        purpose: "rebase",
+        comparisons: [],
+      }),
+    );
+    expect(store.failureObservations().map((r) => r.history)).toEqual(["no_retry", "no_retry", null]);
+    const finalized = store.failureObservations();
+    store.transaction(() => store.observations.finalize("run"));
+    expect(store.failureObservations()).toEqual(finalized);
+  } finally {
+    store.close();
+  }
+});
+
+test("D0a observations retain evidence and get additive source defaults", () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("CREATE TABLE gate_jobs (id TEXT)");
+    db.exec(
+      readFileSync(
+        new URL("../src/db/migrations/20261027T134454-failure-observations.sql", import.meta.url),
+        "utf8",
+      ),
+    );
+    const { purpose: _purpose, slow_regression: _slow, reason: _reason, ...legacy } = row("old", null, 0);
+    const columns = Object.keys(legacy);
+    db.query(
+      `INSERT INTO failure_observations (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
+    ).run(...Object.values(legacy));
+    db.exec(
+      readFileSync(
+        new URL("../src/db/migrations/20261029T072309-failure-observation-sources.sql", import.meta.url),
+        "utf8",
+      ),
+    );
+    expect(
+      db.query("SELECT purpose,slow_regression,reason,signature FROM failure_observations").get(),
+    ).toEqual({ purpose: "initial", slow_regression: 0, reason: null, signature: "same failure" });
+  } finally {
+    db.close();
+  }
+});
+
+test.each(["linux", null])(
+  "rebase completion matches worker evidence and saves confirmation reason (%s)",
+  (os) => {
+    const store = new Store(":memory:");
+    try {
+      insert(store, {
+        ...row("run", "worker", 0),
+        purpose: "rebase",
+        phase: "check",
+        setup_eligible: 0,
+        os,
+        slow_regression: 1,
+      });
+      const worker = {
+        name: "setup:0",
+        command: "missing-tool",
+        ok: false,
+        exitCode: 1,
+        output: "worker failure",
+        durationMs: 9,
+      };
+      const result = {
+        ...worker,
+        command: "targeted retry",
+        ok: true,
+        exitCode: 0,
+        output: "coordinator pass",
+      };
+      const complete = () =>
+        store.transaction(() =>
+          store.observations.finalize("run", {
+            purpose: "rebase",
+            round: 0,
+            sha: "head",
+            stageId: 1,
+            comparisons: [
+              {
+                name: worker.name,
+                verdict: "flaky",
+                blocking: false,
+                result,
+                firstAttempt: worker,
+                coordinatorConfirmation: {
+                  os: "darwin",
+                  originalVerdict: "regressed",
+                  reason: "pass",
+                  result,
+                },
+              },
+            ],
+          }),
+        );
+      complete();
+      const observed = store.failureObservations()[0];
+      if (!observed) throw new Error("Missing rebase observation");
+      expect(observed).toMatchObject({
+        class: os ? "platform" : "unclassified",
+        reason: os ? null : "worker OS unknown",
+        history: "confirmed_passed",
+        slow_regression: 1,
+        signature: "same failure",
+        output_tail: "command not found",
+      });
+      expect(observed?.finalized_at).toBeNumber();
+      complete();
+      expect(store.failureObservations()).toEqual([observed]);
+    } finally {
+      store.close();
+    }
+  },
+);

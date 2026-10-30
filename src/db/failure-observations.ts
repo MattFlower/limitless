@@ -9,6 +9,9 @@ import type { GateComparison } from "../gates/run.ts";
 import type { Store } from "./store.ts";
 
 export interface FailureObservation {
+  purpose: "initial" | "rebase" | "land";
+  slow_regression: number;
+  reason: string | null;
   id: number;
   run_id: string;
   repo: string;
@@ -57,7 +60,13 @@ export class FailureObservations {
         Number(!!filter.finalized),
       );
   }
-  insert(row: Omit<FailureObservation, "id" | "class" | "history" | "finalized_at" | "interim">): void {
+  insert(
+    row: Omit<
+      FailureObservation,
+      "id" | "class" | "history" | "finalized_at" | "interim" | "purpose" | "slow_regression" | "reason"
+    > &
+      Partial<Pick<FailureObservation, "purpose" | "slow_regression">>,
+  ): void {
     const columns = Object.keys(row);
     this.store.db
       .query(
@@ -68,7 +77,13 @@ export class FailureObservations {
   }
   finalize(
     runId: string,
-    completion?: { round: number; sha: string; stageId: number; comparisons: GateComparison[] },
+    completion?: {
+      round: number;
+      sha: string;
+      stageId: number;
+      comparisons: GateComparison[];
+      purpose?: FailureObservation["purpose"];
+    },
   ): void {
     const rows = this.store.db
       .query<FailureObservation, [string]>(
@@ -76,19 +91,35 @@ export class FailureObservations {
       )
       .all(runId);
     for (const row of rows) {
+      if (completion && row.purpose !== (completion.purpose ?? "initial")) continue;
       if (completion && (row.round !== completion.round || row.sha !== completion.sha)) continue;
       if (!completion && row.finalized_at !== null) continue;
       const c = completion?.comparisons.find(
         (c) =>
           c.verdict !== "not_run" &&
           redactGateOutput(c.name) === row.name &&
-          redactGateOutput(c.result.command) === row.command,
+          redactGateOutput((c.firstAttempt ?? c.result.firstAttempt ?? c.result).command) === row.command,
       );
-      const history = completion ? observationHistory(c, row.stage_id !== completion.stageId) : "interrupted";
+      const history = completion
+        ? observationHistory(
+            c,
+            row.stage_id !== completion.stageId &&
+              (row.purpose === "initial" || (row.purpose === "rebase" && !c?.coordinatorConfirmation)),
+          )
+        : "interrupted";
       const cls = classifyObservation({ ...row, history }, c);
       this.store.db
-        .query("UPDATE failure_observations SET class=?,history=?,finalized_at=?,interim=? WHERE id=?")
-        .run(cls, history, Date.now(), Number(!completion), row.id);
+        .query(
+          "UPDATE failure_observations SET class=?,reason=?,history=?,finalized_at=?,interim=? WHERE id=?",
+        )
+        .run(
+          cls.class,
+          cls.reason === undefined ? null : redactGateOutput(cls.reason),
+          history,
+          Date.now(),
+          Number(!completion),
+          row.id,
+        );
     }
     if (rows.some((r) => r.setup_eligible)) this.promote();
   }

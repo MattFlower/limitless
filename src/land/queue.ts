@@ -9,7 +9,7 @@ import { ACTIVE_LAND_STATES } from "../core/types.ts";
 import { linkedIssues, type Store } from "../db/store.ts";
 import { detectGates } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
-import { executeGate, type GateExecutor } from "../gates/executor.ts";
+import { type ExecutionHandle, executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
@@ -55,6 +55,7 @@ import {
 } from "../integrations/github-poller.ts";
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
 import type { RunState } from "../pipeline/context.ts";
+import { observeGateFailures } from "../pipeline/gate-execution.ts";
 import { checkDiscreetCommits, hasFactoryMark } from "../pipeline/markers.ts";
 import { renderReportArtifacts, verifiedFailureState } from "../pipeline/report.ts";
 import { stripReportManifest } from "../pipeline/report-privacy.ts";
@@ -110,6 +111,8 @@ export interface LandClock {
 
 export interface LandDeps {
   gateExecutor?: GateExecutor;
+  buildSha?: string;
+  loadSource?: () => number;
   store: Store;
   paths: Paths;
   cfg?: Pick<Config, "repos"> & Partial<Pick<Config, "uiUrl" | "dependabotRouting">>;
@@ -849,7 +852,24 @@ export class LandQueue {
           ),
       };
       await gateSlotScope(async () => {
-        const run = docs.annotate(await executeGate(request, signal, hooks, gateExecutor));
+        let handle: ExecutionHandle | undefined;
+        const run = docs.annotate(
+          await executeGate(request, signal, hooks, gateExecutor, undefined, async (h) => {
+            handle = h;
+          }),
+        );
+        const identity = {
+          run_id: `land:${entry.id}`,
+          repo: entry.repo,
+          stage_id: 0,
+          round: entry.attempts,
+          sha: request.headSha,
+          handle_kind: "land",
+          handle_id: `${entry.id}:${entry.attempts}`,
+          purpose: "land" as const,
+        };
+        if (handle)
+          observeGateFailures(this.store, identity, handle, run, this.deps.buildSha, this.deps.loadSource);
         signal.throwIfAborted();
         this.owned(entry.id, () => this.store.updateLandEntry(entry.id, { logPath: log }));
         const selected = run.setupOk
@@ -897,7 +917,28 @@ export class LandQueue {
           appendFileSync(log, `${message}\n`);
           if (entry.runId) this.store.addEvent({ runId: entry.runId, type: "gate", level: "warn", message });
         }
-        if (failed.length) throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
+        const finalize = () =>
+          this.store.observations.finalize(identity.run_id, {
+            round: entry.attempts,
+            sha: request.headSha,
+            stageId: 0,
+            purpose: "land",
+            comparisons: [...run.setup, ...run.checks].map((r) => ({
+              name: r.name,
+              result: retries.get(r) ?? r,
+              firstAttempt: r,
+              verdict: confinementFailed(retries.get(r) ?? r) ? "confinement_error" : "regressed",
+              blocking: true,
+              ...(retries.has(r) ? { retryOriginal: { verdict: "regressed" as const, blocking: true } } : {}),
+            })),
+          });
+        if (failed.length) {
+          this.owned(entry.id, () => {
+            finalize();
+            this.block(entry.id, `${failed.map((c) => c.name).join(", ")} failed (${log})`);
+          });
+          throw new LandBlocked(`${failed.map((c) => c.name).join(", ")} failed (${log})`);
+        }
         for (const check of run.checks) {
           if (check.docsOnly?.mode !== "targeted") continue;
           const message = redactGateOutput(
@@ -911,6 +952,7 @@ export class LandQueue {
             `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,
           );
           this.owned(entry.id, () => {
+            finalize();
             this.store.updateLandEntry(entry.id, { reason });
             if (entry.runId)
               this.store.addEvent({
