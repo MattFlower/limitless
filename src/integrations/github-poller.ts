@@ -40,7 +40,12 @@ export const ghClient: GitHubClient = async (path, body, signal, repo) => {
   return {
     status: res.status,
     headers: res.headers,
-    body: path.endsWith("/logs") && res.ok ? await res.text() : await res.json().catch(() => null),
+    body:
+      path.endsWith("/zip") && res.ok
+        ? new Uint8Array(await res.arrayBuffer())
+        : path.endsWith("/logs") && res.ok
+          ? await res.text()
+          : await res.json().catch(() => null),
   };
 };
 

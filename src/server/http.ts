@@ -538,6 +538,16 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       const ids = new URL(req.url).searchParams.get("evals");
       return json(factory.evalPolicy(ids === null ? undefined : ids.split(",")));
     }),
+    "/api/evals/:id/judge": {
+      POST: handle(async (req) => {
+        const job = factory.evals.judge(req.params.id ?? "", await body<unknown>(req));
+        return job ? json(job, 202) : error("eval not found", 404);
+      }),
+      GET: handle((req) => {
+        const job = factory.evals.judgeStatus(req.params.id ?? "");
+        return job ? json(job) : error("judge job not found", 404);
+      }),
+    },
     "/api/evals/:id/regrade": {
       POST: handle((req) => {
         const result = factory.evals.regrade(req.params.id ?? "");
