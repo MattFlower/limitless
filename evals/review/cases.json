@@ -1,7 +1,7 @@
 {
   "role": "review",
   "version": 1,
-  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 were initially labelled clean from merged PRs with no known defect; see the 2026-10-03 corrections and labelHistory. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 were retained as clean on that audit, superseded by the independent 2026-10-03 adjudication below. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change. 2026-10-03: under evals/review/LABELS.md, independent medium-or-higher adjudication and orchestrator verification corrected review-033, review-036, review-037 and review-039 to real. Each preserves its original clean label in labelHistory. review-010 and review-034 remain clean (low severity only); review-038 remains clean (finding not a defect). Reports show current and original labels from stored outputs without model calls. M5.2 (2026-10-08): appended cases from orchestrator reviews and MERGE controls with fixed-seed PR splits, adjudicated under LABELS.md; cases left without a gold defect were dropped, and the per-case outcomes are in LABELS.md. Routing and prompt decisions use dev cases only. 2026-10-14: a clean-case audit under LABELS.md relabelled review-088 and review-096 real; review-078 and review-082 stay clean (see LABELS.md).",
+  "notes": "Gold labels checked by the orchestrator. Real cases come from this repository's history: defects our reviewers flagged and the next round fixed, or that the orchestrator caught after all gates passed. Required defects count toward recall; optional ones (genuine but low impact) are neither required nor false positives. Clean cases are merged heads with no later fix; grade them on false blocks (request_changes or any blocker/major finding). A finding matches a defect when it names the same file and a line within the range ±5 (file-level findings with line 0 match on file alone only for completeness defects). v1.1 (2026-09-26): review-013/014/015 were labelled clean but the first sweep found real defects in them (verified ones required, others optional); the clean set is now the three small sandbox diffs and needs more genuinely clean cases. v2 (2026-09-28, issue #115): review-016..031 are escaped defects (approved heads whose defects were found later by orchestrator review agents, production or the review eval); review-032..039 were initially labelled clean from merged PRs with no known defect; see the 2026-10-03 corrections and labelHistory. Severity maps high/medium/low to blocker/major/minor; required = high and medium. review-014's two Discord defects are now required (confirmed by failing tests in PR #19). Cases whose base..head history contains evals/* carry snapshot: true and need the sanitized-snapshot mode. v2 excludes cases whose only defects are low severity (every defect optional): under verdict-based pass grading they would reward blocking on a minor finding. Re-add them once the grader supports detection-only cases. v2.1 (2026-10-01): gold audit. review-012 relabelled real: keycap and punctuation-based emoji are corrupted, contrary to the request. review-036 and review-039 were retained as clean on that audit, superseded by the independent 2026-10-03 adjudication below. v3 (2026-10-01): review-h01..h19 are a HELD-OUT clean set for validating panel and verifier defaults (M4.5 close-out); run them only for that decision (--cases), never tune on them. Each is a factory-built PR as landed, with no later fix found by a line-level survey of later commits, PRs and issues (PRs landed under two days before 2026-10-01, PRs with open review findings and hand-built PRs excluded). Spec, implementer report and gates are included only when the landed diff equals the run's final round; otherwise the case carries the request alone, so the reviewer never judges against a spec the landed code deliberately departs from. Pre-registered audit rule: after the validation run, a blocked held-out case counts as a false block unless the blocking claim is reproduced as a real defect of at least medium consequence, judged for all systems alike; false blocks are reported per case (blocked in a majority of trials) as well as per trial. v3.1 (2026-10-02): the pre-registered audit of the held-out validation run (eval-mur0xwft29pa) reproduced real defects of at least medium consequence in review-h04, h05, h07, h08, h09 and h10, so they are relabelled real; 13 held-out cases stay clean. Defects that only affect runs saved by the previous release (upgrade window) count, because they fail any such run after the deploy that ships the change. 2026-10-03: under evals/review/LABELS.md, independent medium-or-higher adjudication and orchestrator verification corrected review-033, review-036, review-037 and review-039 to real. Each preserves its original clean label in labelHistory. review-010 and review-034 remain clean (low severity only); review-038 remains clean (finding not a defect). Reports show current and original labels from stored outputs without model calls. M5.2 (2026-10-08): appended cases from orchestrator reviews and MERGE controls with fixed-seed PR splits, adjudicated under LABELS.md; cases left without a gold defect were dropped, and the per-case outcomes are in LABELS.md. Routing and prompt decisions use dev cases only. 2026-10-14: a clean-case audit under LABELS.md relabelled review-088 and review-096 real; review-078 and review-082 stay clean (see LABELS.md). 2026-10-30: a held-out clean-case audit relabelled review-068, review-092 and review-108 real (see LABELS.md).",
   "cases": [
     {
       "id": "review-001",
@@ -7207,7 +7207,7 @@
     },
     {
       "id": "review-068",
-      "kind": "clean",
+      "kind": "real",
       "repo": "MattFlower/limitless",
       "base": "30ccde9b500fde9d7a384761cf8a44f5452f1927",
       "head": "3a56260dc92506a6feb585a1bbfb338370f13f38",
@@ -7220,7 +7220,48 @@
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/pipeline/gate-evidence.ts",
+          "lines": [74, 104],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "Gate substitution refuses a candidate gate whenever any file in it was skipped, so the repository's normal confined suite, which intentionally skips real-Seatbelt tests, can never supply evidence for a sandbox-blocked loopback test, and the reported needs_human failure remains.",
+          "required": true,
+          "foundBy": "held-out clean-case audit 2026-10-30 (blocks by stored M5.2 held-out systems)",
+          "adjudication": "confirmed"
+        },
+        {
+          "file": "src/gates/test-coverage.ts",
+          "lines": [37, 47],
+          "severity": "blocker",
+          "category": "security",
+          "summary": "The coverage parser treats any test-printed line that names a test file followed by a colon as a runner file header, so output from the change under test can make a file that never ran count as passed and turn a blocked criterion into met factory evidence.",
+          "required": true,
+          "foundBy": "held-out clean-case audit 2026-10-30 (blocks by stored M5.2 held-out systems)",
+          "adjudication": "confirmed"
+        },
+        {
+          "file": "src/pipeline/engine.ts",
+          "lines": [1520, 1524],
+          "severity": "minor",
+          "category": "error-handling",
+          "summary": "Gate evidence now requires the gate stage to have succeeded, so a hard crash between the gate checkpoint and stage completion leaves cached gate results whose evidence is rejected on resume.",
+          "required": false,
+          "foundBy": "held-out clean-case audit 2026-10-30 (blocks by stored M5.2 held-out systems)",
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "clean",
+          "to": "real",
+          "on": "2026-10-30",
+          "rule": "evals/review/LABELS.md (held-out clean-case audit, 2026-10-30)",
+          "by": "blind adjudication 2026-10-29 (codex/sol-6.1 high and claude/opus), reproduction re-run by the orchestrator 2026-10-30",
+          "evidence": "Head src/pipeline/gate-evidence.ts:74 rejects a check with any skippedFiles and :104 requires every check to pass that guard. Re-run: applyGateEvidence with test/server.test.ts passed and an unrelated test/sandbox.test.ts skipped returns \"blocked ... without retries or skipped tests\"; without the skipped file it returns \"met\". Fixed later on main by #647. Head src/gates/test-coverage.ts:37 accepts any `<x>.test.ts:` line as a header and :47 any `(pass)` line; run.ts feeds stdout and stderr into it. Re-run: a real `bun test` of one test that prints `test/missing.test.ts:` and `(pass) fabricated` gives passedFiles [\"test/missing.test.ts\"]. Base has neither the substitution nor the parser. Kept as an optional minor, not gold: a crash between checkpoint and finishStage (needs a hard kill between two synchronous writes; minor)."
+        }
+      ]
     },
     {
       "id": "review-069",
@@ -7925,7 +7966,7 @@
     },
     {
       "id": "review-092",
-      "kind": "clean",
+      "kind": "real",
       "repo": "MattFlower/limitless",
       "base": "4c50ba4a4abff33458b84ad6f42f6761247b1211",
       "head": "ea99825fe90b80e68a839c913efb886eaa73cce3",
@@ -7938,7 +7979,48 @@
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": "src/harness/types.ts",
+          "lines": [212, 219],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "When a call's result changes, the loop detector resets its count but keeps the earlier same-key entries in the window, which the request says must be dropped, so a command failing with identical output between progressing polls is never stopped before the tool-call budget.",
+          "required": true,
+          "foundBy": "held-out clean-case audit 2026-10-30 (blocks by stored M5.2 held-out systems)",
+          "adjudication": "confirmed"
+        },
+        {
+          "file": "src/harness/types.ts",
+          "lines": [183, 185],
+          "severity": "minor",
+          "category": "logic",
+          "summary": "Window eviction deletes the remembered result of a call that left the window, so a genuine repeat loop is stopped at most one call early.",
+          "required": false,
+          "foundBy": "held-out clean-case audit 2026-10-30 (blocks by stored M5.2 held-out systems)",
+          "adjudication": "confirmed"
+        },
+        {
+          "file": "src/harness/types.ts",
+          "lines": [230, 230],
+          "severity": "minor",
+          "category": "logic",
+          "summary": "A threshold call whose result never arrives defers the loop stop until the next tool call or the end of the invocation.",
+          "required": false,
+          "foundBy": "held-out clean-case audit 2026-10-30 (blocks by stored M5.2 held-out systems)",
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "clean",
+          "to": "real",
+          "on": "2026-10-30",
+          "rule": "evals/review/LABELS.md (held-out clean-case audit, 2026-10-30)",
+          "by": "blind adjudication 2026-10-29 (codex/sol-6.1 high and claude/opus), reproduction re-run by the orchestrator 2026-10-30",
+          "evidence": "Head src/harness/types.ts:217 only sets `same = 0` on a changed result and never removes earlier same-key entries from `recent`; the request requires dropping them. Re-run: LoopDetector(1000) on [poll a with changing output, poll b with changing output, Bash failing with identical output] x12 returns no stop after 12 identical failing calls (36 calls) and finish() returns null. Not gold: window eviction forgetting the previous identical result (stops a genuine repeat loop at most one call early; minor), pending identical calls finalized by an unrelated call (also at base), never-returning poll deferring a stop (minor)."
+        }
+      ]
     },
     {
       "id": "review-093",
@@ -8473,7 +8555,7 @@
     },
     {
       "id": "review-108",
-      "kind": "clean",
+      "kind": "real",
       "repo": "MattFlower/limitless",
       "base": "12303dd707f3b33b11b92ebfcfe8e951af7e39fc",
       "head": "6b967a5d611fd5f2017650134aa2d0ae261e7115",
@@ -8486,7 +8568,38 @@
         "implementerReport": "",
         "gates": []
       },
-      "defects": []
+      "defects": [
+        {
+          "file": ".limitless.toml",
+          "lines": [10, 10],
+          "severity": "major",
+          "category": "correctness",
+          "summary": "The change runs the repository's test gate as a parallel `bun test` command with a worker-count substitution, which gate-evidence's command recogniser rejects, so every candidate gate on this repository records no test command and sandbox-blocked verification criteria can no longer be satisfied by gate evidence.",
+          "required": true,
+          "foundBy": "held-out clean-case audit 2026-10-30 (blocks by stored M5.2 held-out systems)",
+          "adjudication": "confirmed"
+        },
+        {
+          "file": "src/gates/run.ts",
+          "lines": [70, 70],
+          "severity": "minor",
+          "category": "other",
+          "summary": "The gate environment now carries the test worker count, but the baseline cache key ignores it, so a baseline recorded under one worker count is reused under another.",
+          "required": false,
+          "foundBy": "held-out clean-case audit 2026-10-30 (blocks by stored M5.2 held-out systems)",
+          "adjudication": "confirmed"
+        }
+      ],
+      "labelHistory": [
+        {
+          "from": "clean",
+          "to": "real",
+          "on": "2026-10-30",
+          "rule": "evals/review/LABELS.md (held-out clean-case audit, 2026-10-30)",
+          "by": "blind adjudication 2026-10-29 (codex/sol-6.1 high and claude/opus), reproduction re-run by the orchestrator 2026-10-30",
+          "evidence": "Head .limitless.toml:10 runs `bun test --parallel=$(bun scripts/test-workers.ts)` (base: `bun test`); src/pipeline/gate-evidence.ts:13-16, unchanged, accepts only /^bun test(?: [\\w./-]+)*$/. Re-run in the head checkout: gateTestCommand(head command, package.json scripts) returns null; gateTestCommand(\"bun test\") returns \"bun test\". Both adjudicators showed applyGateEvidence then refuses with \"do not cover every required verification step\". Not gold: worker count missing from the baseline cache key (flake classification only; minor), measurements missing from the PR description (process)."
+        }
+      ]
     },
     {
       "id": "review-109",
@@ -8676,10 +8789,7 @@
       "defects": [
         {
           "file": "src/db/migrations/20261009T223115-owner-diagnostics.sql",
-          "lines": [
-            4,
-            9
-          ],
+          "lines": [4, 9],
           "severity": "major",
           "category": "performance",
           "summary": "The owner_diagnostics foreign keys cascade on delete without an index on event_id or invocation_id, so the daemon's synchronous debug-event cleanup scans the whole table for every deleted event and slows as owner rows grow.",
@@ -8826,10 +8936,7 @@
       "defects": [
         {
           "file": "src/pipeline/engine.ts",
-          "lines": [
-            1790,
-            1795
-          ],
+          "lines": [1790, 1795],
           "severity": "major",
           "category": "delivery",
           "summary": "A resumed delivery whose base advanced again after a completed factory merge is refused, because the check requires the second merge's first parent to be the reviewed commit instead of the earlier factory merge.",
@@ -8874,10 +8981,7 @@
       "defects": [
         {
           "file": "src/integrations/mcp.ts",
-          "lines": [
-            235,
-            235
-          ],
+          "lines": [235, 235],
           "severity": "major",
           "category": "correctness",
           "summary": "Against an older daemon that ignores the new repo parameter, limitless_list_runs returns other repositories' runs as matches, because the proxy never checks that the filter was applied.",
