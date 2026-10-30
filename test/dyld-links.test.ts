@@ -98,6 +98,13 @@ test("load commands come only from well-formed 64-bit Mach-O images", () => {
   expect(parse(patched((image) => image.writeUInt32LE(0, 16)))).toThrow("Unconsumed");
   // A name that starts inside the dylib_command's fixed fields.
   expect(parse(patched((image) => image.writeUInt32LE(12, 40)))).toThrow("Invalid");
+  // A run path that starts inside the rpath_command's fixed fields.
+  expect(parse(patched((image) => image.writeUInt32LE(8, 40), machO([], ["/a/lib"])))).toThrow("Invalid");
+  // A lazy dependency (LC_LAZY_LOAD_DYLIB) is optional, like a weak one.
+  expect(parse(patched((image) => image.writeUInt32LE(0x20, 32), machO(["/a/liblazy.dylib"])))()).toEqual({
+    dylibs: [{ name: "/a/liblazy.dylib", optional: true }],
+    rpaths: [],
+  });
   // A name whose terminator is the first byte after its command (the next command's type).
   const unterminated = Buffer.alloc(32 + 32 + 16);
   unterminated.writeUInt32LE(0xfeedfacf, 0);
@@ -110,4 +117,29 @@ test("load commands come only from well-formed 64-bit Mach-O images", () => {
   unterminated.writeUInt32LE(0x100, 64); // an unrelated command whose type begins with a zero byte
   unterminated.writeUInt32LE(16, 68);
   expect(parse(unterminated)).toThrow("Invalid");
+});
+
+test("an @rpath dependency resolves through the first run path where it exists", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "dyld-order-")));
+  roots.push(root);
+  const node = join(root, "bin/node");
+  write(node, machO(["@rpath/libq.dylib"], [join(root, "first"), join(root, "second")]));
+  write(join(root, "first/libq.1.dylib"), machO());
+  link(join(root, "first/libq.dylib"), "libq.1.dylib");
+  write(join(root, "second/libq.dylib"), machO());
+  // dyld loads the first existing candidate; the second is not what the runtime recorded.
+  expect(dyldLinks(node, [node, join(root, "first/libq.1.dylib")])).toEqual([join(root, "first/libq.dylib")]);
+  expect(() => dyldLinks(node, [node, join(root, "second/libq.dylib")])).toThrow(
+    "browser runtime changed: @rpath/libq.dylib resolves to an unrecorded path",
+  );
+});
+
+test("an absent lazy dependency does not refuse the runtime", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "dyld-lazy-")));
+  roots.push(root);
+  const node = join(root, "bin/node");
+  const image = machO([join(root, "absent/liblazy.dylib")]);
+  image.writeUInt32LE(0x20, 32); // LC_LAZY_LOAD_DYLIB
+  write(node, image);
+  expect(dyldLinks(node, [node])).toEqual([]);
 });

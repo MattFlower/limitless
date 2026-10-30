@@ -116,6 +116,13 @@ and restricted. Crash reporting is off (crashpad cannot check in), which is harm
   coordinator, macOS release or pin needs the probe re-run. A Homebrew upgrade that moves an `opt`
   link, even with the old keg kept, makes setup refuse with "browser runtime changed: … reprovision
   the browser cache".
+- `dyld-links.ts` models only the lookups a thin, single-architecture Homebrew Node uses: `@rpath` from
+  the image's own and the executable's run paths, `@loader_path`, `@executable_path`, and the first
+  candidate that exists. It doesn't follow run paths inherited through intermediate libraries, pick
+  among candidates by architecture, recognize shared-cache images named through `@rpath`, or tell an
+  unused lazy dependency that exists on disk from a loaded one. A runtime that needs any of those
+  refuses setup with a named reason (it fails closed); reprovision the cache with a standard
+  Homebrew Node.
 
 ## Running the probe
 
