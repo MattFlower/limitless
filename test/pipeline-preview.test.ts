@@ -5,6 +5,7 @@ import type { Factory } from "../src/app.ts";
 import { type GateExecutor, gateProvenance, localExecutor } from "../src/gates/executor.ts";
 import type { GateRun } from "../src/gates/run.ts";
 import { browserCache, browserMcp } from "../src/harness/browser-mcp.ts";
+import { readPolicyScope } from "../src/harness/read-policy.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { sh } from "../src/util/proc.ts";
@@ -82,53 +83,72 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(captured).toEqual([true, true, false, false, false]);
   });
 
-  test.each(["unconfined pin", "missing cache", "incompatible cache", "invalid URL", "scratch failure"])(
-    "no browser persists an invocation diagnostic: %s",
-    async (failure) => {
-      const f = start((agent) => {
-        const request =
-          failure === "scratch failure" ? { ...agent, scratchDir: join(home, "missing-scratch") } : agent;
-        // Other cases waive the confinement gate so only the injected failure disables the browser.
-        expect(browserMcp(request, "codex", failure === "unconfined pin" ? undefined : [])).toBeUndefined();
-        return { text: "continued without browser" };
-      });
-      await f.stop();
-      const cache = browserCache(f.deps.cfg.paths.home);
-      await fakeBrowserCache(cache);
-      if (failure === "missing cache") rmSync(cache, { recursive: true });
-      if (failure === "incompatible cache")
-        writeFileSync(join(cache, "node_modules/@playwright/mcp/package.json"), '{"version":"0.0.1"}');
-      const run = await f.createRun({ repo: repoDir, prompt: "UI diagnostic" });
-      const repo = f.store.getRepo(run.repoId);
-      if (!repo) throw new Error("missing repo");
-      const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
-      ctx.previewUrl = failure === "invalid URL" ? "http://example.com" : "http://127.0.0.1:43210";
-      const stage = f.store.startStage(run.id, "verify", 0);
-      const outcome = await ctx.invoke({
-        role: "verify",
-        stage,
-        cwd: repoDir,
-        mode: "readonly",
-        complexity: "small",
-        prompt: "diagnostic",
-      });
-      expect(outcome.result.status).toBe("ok");
+  test.each([
+    "unresolved gap",
+    "missing cache",
+    "incompatible cache",
+    "invalid URL",
+    "scratch failure",
+    "read policy unavailable",
+    "rejected profile",
+  ])("no browser persists an invocation diagnostic: %s", async (failure) => {
+    const f = start((agent) => {
+      const request =
+        failure === "scratch failure" ? { ...agent, scratchDir: join(home, "missing-scratch") } : agent;
+      // Other cases clear the gaps, so only the injected failure disables the browser.
+      const setup = () =>
+        browserMcp(
+          request,
+          "codex",
+          failure === "unresolved gap" ? ["browser redirects leave the preview"] : [],
+          "darwin",
+        );
       expect(
-        f.store.listEvents(run.id).filter((event) => event.message.startsWith("Browser disabled:")),
-      ).toEqual([
-        expect.objectContaining({
-          invocationId: outcome.invocation.id,
-          level: "warn",
-          data: { code: "browser_unavailable", id: "browser-unavailable" },
-          message: expect.stringMatching(
-            failure === "unconfined pin"
-              ? /Browser disabled: .+ not confined: .+redirects/
-              : /Browser disabled: .+/,
-          ),
-        }),
-      ]);
-    },
-  );
+        failure === "read policy unavailable" ? readPolicyScope.run(undefined, setup) : setup(),
+      ).toBeUndefined();
+      return { text: "continued without browser" };
+    });
+    await f.stop();
+    const cache = browserCache(f.deps.cfg.paths.home);
+    await fakeBrowserCache(cache);
+    if (failure === "missing cache") rmSync(cache, { recursive: true });
+    if (failure === "incompatible cache")
+      writeFileSync(join(cache, "node_modules/@playwright/mcp/package.json"), '{"version":"0.0.1"}');
+    const run = await f.createRun({ repo: repoDir, prompt: "UI diagnostic" });
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+    ctx.previewUrl =
+      failure === "invalid URL"
+        ? "http://example.com"
+        : failure === "rejected profile"
+          ? "http://127.0.0.1:0"
+          : "http://127.0.0.1:43210";
+    const stage = f.store.startStage(run.id, "verify", 0);
+    const outcome = await ctx.invoke({
+      role: "verify",
+      stage,
+      cwd: repoDir,
+      mode: "readonly",
+      complexity: "small",
+      prompt: "diagnostic",
+    });
+    expect(outcome.result.status).toBe("ok");
+    expect(
+      f.store.listEvents(run.id).filter((event) => event.message.startsWith("Browser disabled:")),
+    ).toEqual([
+      expect.objectContaining({
+        invocationId: outcome.invocation.id,
+        level: "warn",
+        data: { code: "browser_unavailable", id: "browser-unavailable" },
+        message: expect.stringMatching(
+          failure === "unresolved gap"
+            ? /Browser disabled: .+ not confined: .+redirects/
+            : /Browser disabled: .+/,
+        ),
+      }),
+    ]);
+  });
   test.each(["remote", "local", "local fallback", "local retry", "setup failure"] as const)(
     "preview prepares coordinator setup: %s",
     async (executor) => {
@@ -319,8 +339,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
           expect(stage?.status).toBe("succeeded");
           const url = stage?.summary?.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0] ?? "";
           expect(agent.browser?.previewUrl).toBe(url);
-          expect(browserMcp(agent, "codex")).toBeUndefined();
-          const browser = browserMcp(agent, "codex", []);
+          const browser = browserMcp(agent, "codex", [], "darwin");
           expect(browser?.args[(browser?.args.indexOf("--allowed-origins") ?? -2) + 1]).toBe(url);
           const response = await fetch(`${url}/health`);
           expect(await response.text()).toBe("seeded\n");
