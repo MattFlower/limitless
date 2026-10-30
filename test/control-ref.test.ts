@@ -6,6 +6,7 @@ import {
   CONTROL_REF_RESPONSE_LIMIT,
   type ControlKey,
   type ControlRefOutcome,
+  type ControlRefRead,
   createControlRefClient,
   createControlRefReader,
 } from "../src/integrations/control-ref.ts";
@@ -692,6 +693,70 @@ test("initial mismatch, disappearance, corruption and unavailability never uploa
 });
 
 for (const path of ["git/blobs", "git/trees", "git/commits"])
+  test(`preparation at ${path} and successful commit creation await CAS persistence`, async () => {
+    for (const existing of [false, true]) {
+      const remote = new Remote();
+      const before = existing ? seed(remote).sha : null;
+      const prepared = deferred<void>();
+      const preparationGate = deferred<void>();
+      const dispatched = deferred<void>();
+      const casGate = deferred<void>();
+      const bytes = Buffer.from("new value");
+      remote.hook = async (call, next) => {
+        if (isCas(call)) {
+          dispatched.resolve();
+          await casGate.promise;
+        }
+        const response = await next();
+        if (isPost(path)(call)) {
+          prepared.resolve();
+          await preparationGate.promise;
+        }
+        return response;
+      };
+      const pending = writer(remote).write(key, before, bytes);
+      let settled = false;
+      const settlement = pending.then(
+        () => {
+          settled = true;
+          return "settled";
+        },
+        () => {
+          settled = true;
+          return "rejected";
+        },
+      );
+      const original: ControlRefRead = before
+        ? { kind: "tip", tip: { sha: before, bytes: payload } }
+        : { kind: "absent" };
+      try {
+        expect(await Promise.race([prepared.promise.then(() => "prepared"), settlement])).toBe("prepared");
+        expect(await reader(remote).read(key)).toEqual(original);
+        expect(settled).toBe(false);
+        preparationGate.resolve();
+        expect(await Promise.race([dispatched.promise.then(() => "dispatched"), settlement])).toBe(
+          "dispatched",
+        );
+        // All successful preparation responses reached the writer; CAS has not applied yet.
+        expect(await reader(remote).read(key)).toEqual(original);
+        expect(settled).toBe(false);
+        expect(remote.calls.filter(isPost("git/commits"))).toHaveLength(1);
+        expect(remote.calls.filter(isCas)).toHaveLength(1);
+        expect(remote.unconditional).toBe(false);
+        casGate.resolve();
+        const result = await pending;
+        expect(result).toMatchObject({ kind: "applied", tip: { bytes } });
+        if (result.kind !== "applied") throw new Error("Expected confirmed persistence");
+        expect(await reader(remote).read(key)).toEqual({ kind: "tip", tip: result.tip });
+      } finally {
+        preparationGate.resolve();
+        casGate.resolve();
+        await settlement;
+      }
+    }
+  });
+
+for (const path of ["git/blobs", "git/trees", "git/commits"])
   test(`preparation at ${path} is not persistence; operational failures observe unchanged`, async () => {
     for (const existing of [false, true]) {
       const remote = new Remote();
@@ -799,6 +864,39 @@ const handle = {
   member: "m-0123456789abcdef",
   generation: 1,
 };
+const preparationSteps = [
+  ["metadata", isMeta],
+  ["initial read", isRead("git/ref/")],
+  ["upload", isPost("git/blobs")],
+  ["tree", isPost("git/trees")],
+  ["commit", isPost("git/commits")],
+] as const;
+for (const [boundary, at] of preparationSteps)
+  for (const response of ["success", "503"])
+    test(`ambient claim lost after ${boundary} ${response} stops preparation`, async () => {
+      const remote = new Remote();
+      const ready = deferred<void>();
+      const resume = deferred<void>();
+      const claim = bindClaim({ windowOpen: () => true }, handle, () => false);
+      remote.hook = async (call, next) => {
+        if (!at(call)) return next();
+        const result = response === "success" ? await next() : json({}, 503);
+        ready.resolve();
+        await resume.promise;
+        return result;
+      };
+      const pending = claimScope
+        .run([claim], () => writer(remote).write(key, null, payload))
+        .catch((e: unknown) => e);
+      await ready.promise;
+      const calls = [...remote.calls];
+      claim.onLost(handle, null);
+      resume.resolve();
+      expect(await pending).toBeInstanceOf(ClaimLostError);
+      expect(remote.calls).toEqual(calls);
+      expect(remote.calls.filter(isCas)).toHaveLength(0);
+    });
+
 for (const change of ["lost", "suspend", "expired", "cancelled", "identity", "valid"])
   test(`ambient claim ${change} during preparation retains scope and blocks invalid CAS`, async () => {
     const remote = new Remote();
@@ -808,11 +906,9 @@ for (const change of ["lost", "suspend", "expired", "cancelled", "identity", "va
     let now = { ...anchor };
     let cancelled = false;
     let failure: ClaimWaitError | undefined;
-    let checks = 0;
     const claim = bindClaim(
       {
         windowOpen: () => {
-          checks++;
           if (failure) throw failure;
           return windowOpen(anchor, now);
         },
@@ -833,7 +929,6 @@ for (const change of ["lost", "suspend", "expired", "cancelled", "identity", "va
       .run([claim], () => writer(remote).write(key, null, payload))
       .catch((e: unknown) => e);
     await ready.promise;
-    expect(checks).toBe(0);
     if (change === "lost") claim.onLost(handle, null);
     if (change === "suspend") now.inclusive += LEASE.suspendToleranceMs + 1;
     if (change === "expired")
@@ -855,21 +950,21 @@ for (const change of ["lost", "suspend", "expired", "cancelled", "identity", "va
   });
 
 test("claim-control exceptions from preparation, CAS and reconciliation escape by identity", async () => {
-  for (const at of ["upload", "commit", "cas", "reconcile"])
+  for (const at of ["metadata", "initial read", "upload", "tree", "commit", "cas", "reconcile"])
     for (const body of [false, true]) {
       const remote = new Remote();
       const error = new ClaimLostError();
+      const claim = bindClaim({ windowOpen: () => true }, handle, () => false);
       remote.hook = async (call, next) => {
         if (at === "reconcile" && isCas(call)) return json({ errors: [] });
-        const matched =
-          at === "upload"
-            ? isPost("git/blobs")(call)
-            : at === "commit"
-              ? isPost("git/commits")(call)
-              : at === "cas"
-                ? isCas(call)
-                : isRead("git/ref/")(call) && remote.calls.some(isCas);
+        const step = preparationSteps.find(([boundary]) => boundary === at);
+        const matched = step
+          ? step[1](call)
+          : at === "cas"
+            ? isCas(call)
+            : isRead("git/ref/")(call) && remote.calls.some(isCas);
         if (!matched) return next();
+        claim.onLost(handle, null);
         if (!body) throw error;
         return new Response(
           new ReadableStream({
@@ -880,11 +975,11 @@ test("claim-control exceptions from preparation, CAS and reconciliation escape b
         );
       };
       expect(
-        await writer(remote)
-          .write(key, null, payload)
+        await claimScope
+          .run([claim], () => writer(remote).write(key, null, payload))
           .catch((e: unknown) => e),
       ).toBe(error);
-      expect(remote.calls.filter(isCas)).toHaveLength(at === "upload" || at === "commit" ? 0 : 1);
+      expect(remote.calls.filter(isCas)).toHaveLength(at === "cas" || at === "reconcile" ? 1 : 0);
     }
 });
 

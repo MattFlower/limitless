@@ -120,9 +120,15 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
       let observed: ControlRefTip | null = null;
       let stage = 0; // 0: reading initial state, 1: observed, 2: CAS dispatched.
       const unchanged = (): ControlRefOutcome => ({ kind: "unchanged", tip: observed });
+      const check = () => {
+        if (signal?.aborted) fail("aborted");
+        claimGuard();
+      };
       try {
         const repository = await io.repository(signal);
+        check();
         const initial = await read(k, signal, false);
+        check();
         if (initial.kind === "unconfirmed") return { kind: "unconfirmed" };
         observed = initial.kind === "tip" ? initial.tip : null;
         if (observed && observed.sha !== before) return { kind: "moved", tip: observed };
@@ -131,8 +137,10 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
         const created = z.object({ sha: oid });
         const upload = { content: io.seal(aad, bytes), encoding: "base64" };
         const blob = parse(created, await io.call("git/blobs", upload, signal)).sha;
+        check();
         const entry = { path: "control", mode: "100644", type: "blob", sha: blob };
         const tree = parse(created, await io.call("git/trees", { tree: [entry] }, signal)).sha;
+        check();
         const author = { name: "limitless", email: "factory@example.invalid" };
         const body = {
           message: "limitless-control: 1",
@@ -142,14 +150,14 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
           committer: author,
         };
         const commit = parse(created, await io.call("git/commits", body, signal)).sha;
+        check();
         const variables = {
           r: repository,
           u: [{ name: ref, beforeOid: observed?.sha ?? "0".repeat(40), afterOid: commit, force: false }],
         };
         const query =
           "mutation($r:ID!,$u:[RefUpdate!]!){updateRefs(input:{repositoryId:$r,refUpdates:$u}){clientMutationId}}";
-        if (signal?.aborted) fail("aborted");
-        claimGuard();
+        check();
         stage = 2;
         const response = await io.call(null, { query, variables }, signal).catch((e: unknown) => {
           rethrowClaimControl(e);
@@ -169,6 +177,7 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
         return { kind: "moved", tip: after.tip };
       } catch (e) {
         rethrowClaimControl(e);
+        if (stage < 2) check();
         if (signal?.aborted) {
           if (stage < 2) fail("aborted");
           return { kind: "unconfirmed" };
