@@ -28,7 +28,13 @@ export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 export { ConfinementError } from "./read-policy.ts";
 
 /** Seatbelt: restrict writes, signals and policy reads; later specific read rules preserve exceptions. */
-export function seatbeltProfile(roots: WriteRoots, browser?: { host: string; port: number }): string {
+// Chromium's child processes check in with the browser under this name (pinned build's bundle id).
+const CHROMIUM_RENDEZVOUS = String.raw`^com\.google\.chrome\.for\.testing\.MachPortRendezvousServer\.[0-9]+$`;
+
+export function seatbeltProfile(
+  roots: WriteRoots,
+  browser?: { host: string; port: number; links?: string[] },
+): string {
   if (
     browser &&
     (!["127.0.0.1", "localhost", "::1"].includes(browser.host) ||
@@ -76,6 +82,20 @@ export function seatbeltProfile(roots: WriteRoots, browser?: { host: string; por
             ? []
             : [`(allow network-outbound (remote ip6 "localhost:${browser.port}"))`]),
           "(deny file-read*)",
+          // dyld opens the root directory to find its shared cache; that reveals only top-level names.
+          '(allow file-read-data (literal "/"))',
+          // dyld reaches runtime libraries through these symlinks; their targets need their own allowance.
+          ...(browser.links?.length ? [`(allow file-read-metadata ${paths(browser.links, "literal")})`] : []),
+          // With Chromium's own sandbox off this bounds its IPC. The pinned build needs only these
+          // (docs/browser-mcp-probes.md): LaunchServices check-in, which TransformProcessType aborts
+          // without; the GPU process's Metal shader compiler; and Chromium's child-process rendezvous.
+          "(deny mach-lookup)",
+          `(allow mach-lookup (global-name "com.apple.coreservices.launchservicesd") (xpc-service-name "com.apple.MTLCompilerService") (global-name-regex #"${CHROMIUM_RENDEZVOUS}"))`,
+          "(deny mach-register)",
+          `(allow mach-register (global-name-regex #"${CHROMIUM_RENDEZVOUS}"))`,
+          "(deny appleevent-send)",
+          "(deny ipc-posix*)",
+          "(deny ipc-sysv*)",
         ]
       : []),
     // Seatbelt's localhost selector covers IPv4 and IPv6 loopback.

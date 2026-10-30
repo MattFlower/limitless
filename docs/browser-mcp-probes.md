@@ -31,7 +31,9 @@ under the real home. The test uses the production MCP configuration and gap list
 the pinned server and its pinned Chromium, ephemeral local servers, and actual
 screenshot tools. It checks allowed navigation and screenshots, blocked off-port
 fetch and redirect, and denied screenshot creation and overwrite in the checkout.
-`LIMITLESS_HOME` selects the provisioned tool-cache home, as in the provisioning script.
+`LIMITLESS_BROWSER_MCP_CACHE` selects a provisioned cache directory; it defaults to
+`~/.limitless/tools/playwright-mcp-0.0.83`. The probe ignores `LIMITLESS_HOME`, which `test/setup.ts`
+points at a temporary home.
 No test provisions packages or downloads browsers.
 Before landing, also run `bun run check` unconfined from that checkout under the
 real home, as required for shared confinement-policy changes.

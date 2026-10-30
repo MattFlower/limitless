@@ -19,10 +19,11 @@ import { SANDBOX_EXEC } from "../src/harness/sandbox.ts";
 import type { AgentEvent } from "../src/harness/types.ts";
 import { protectPrivateFile } from "../src/util/private-reads.ts";
 import { agentEnv, registerCredential, runProcess } from "../src/util/proc.ts";
-import { browserInstaller, browserSpec, fakeBrowserCache } from "./browser-mcp-support.ts";
+import { browserInstaller, browserSpec, fakeBrowserCache, machO } from "./browser-mcp-support.ts";
 import { test } from "./read-policy-support.ts";
 
 const roots: string[] = [];
+const policy = (server?: { args: string[] }) => server?.args[server.args.indexOf("-p") + 1] ?? "";
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -62,12 +63,13 @@ test("provisioning pins the package and installs chromium once, then resolves on
   const events: AgentEvent[] = [];
   spec.onEvent = (event) => events.push(event);
   const server = browserMcp(spec, "codex", [], "darwin");
-  expect(server?.command).toBe("/usr/bin/sandbox-exec");
-  expect(server?.args[0]).toBe("-p");
-  expect(server?.args[2]).toBe(realpathSync(Bun.which("node") ?? ""));
+  // The server starts in its own browser directory, not the agent's unreadable checkout.
+  expect(server?.command).toBe("/usr/bin/env");
+  expect(server?.args.slice(0, 4)).toEqual(["-C", server?.env.HOME ?? "", SANDBOX_EXEC, "-p"]);
+  expect(server?.args[5]).toBe(realpathSync(Bun.which("node") ?? ""));
   expect(server?.args).toContain("--no-sandbox");
   expect(server?.args).not.toContain("--sandbox");
-  expect(server?.args.slice(3, 5)).toEqual([
+  expect(server?.args.slice(6, 8)).toEqual([
     join(cache, "node_modules/@playwright/mcp/cli.js"),
     "--headless",
   ]);
@@ -92,7 +94,7 @@ test("operator provisioning records runtime libraries for an existing cache with
   delete record.libraries;
   writeFileSync(manifest, JSON.stringify(record));
   const library = join(root, "runtime-library");
-  writeFileSync(library, "library");
+  writeFileSync(library, machO());
   const alias = join(root, "runtime-alias");
   symlinkSync(library, alias);
   const before = fake.calls.length;
@@ -103,10 +105,33 @@ test("operator provisioning records runtime libraries for an existing cache with
   expect(fake.calls.slice(before)).toHaveLength(1);
   expect(fake.calls[before]?.cmd).toContain("-e");
   const server = browserMcp(spec, "codex", [], "darwin");
-  expect(server?.args[1]).toContain(`(subpath "${library}")`);
-  expect(server?.args[1]).not.toContain(`(subpath "${root}")`);
+  expect(policy(server)).toContain(`(subpath "${library}")`);
+  expect(policy(server)).not.toContain(`(subpath "${root}")`);
   rmSync(library);
   expect(browserMcp(spec, "codex", [], "darwin")).toBeUndefined();
+});
+
+// Writes a recorded runtime whose first library reaches the second through a symlink at `alias`.
+function linkedRuntime(cache: string, runtime: string, alias: string) {
+  mkdirSync(runtime);
+  const [first, second] = [join(runtime, "liba.dylib"), join(runtime, "libb.dylib")];
+  writeFileSync(first, machO([join(alias, "libb.dylib")]));
+  writeFileSync(second, machO());
+  symlinkSync(runtime, alias);
+  const path = join(cache, "ready.json");
+  writeFileSync(
+    path,
+    JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), libraries: [first, second] }),
+  );
+}
+
+test("dyld's symlink lookups to the runtime are readable only as metadata", async () => {
+  const { root, cache, spec } = await fixture();
+  linkedRuntime(cache, join(root, "runtime"), join(root, "opt-link"));
+  const profile = policy(browserMcp(spec, "codex", [], "darwin"));
+  expect(profile).toContain(`(allow file-read-metadata (literal "${join(root, "opt-link")}"))`);
+  expect(profile).not.toContain(`(subpath "${join(root, "opt-link")}")`);
+  expect(profile).toContain('(allow file-read-data (literal "/"))');
 });
 
 test("provisioning requires no-sandbox even when sandbox is advertised", async () => {
@@ -136,13 +161,18 @@ test.each([
   // With the gaps cleared, exactly the paths that apply the profile get a browser.
   expect(!!browserMcp(spec, harness, [], platform)).toBe(enabled);
   expect(events).toHaveLength(enabled ? 0 : 1);
-  for (const variant of [{ noTools: true }, { browser: undefined }]) {
-    expect(browserMcp({ ...spec, ...variant }, harness, [], platform)).toBeUndefined();
-  }
+  expect(browserMcp({ ...spec, browser: undefined }, harness, [], platform)).toBeUndefined();
   expect(events).toHaveLength(enabled ? 0 : 1);
+  // A requested browser that a tool-less invocation cannot use is reported, not dropped silently.
+  expect(browserMcp({ ...spec, noTools: true }, harness, [], platform)).toBeUndefined();
+  expect(events.at(-1)).toMatchObject({
+    code: "browser_unavailable",
+    text: expect.stringContaining("tool-less"),
+  });
+  events.length = 0;
   // Until the unconfined probes clear the production gap list, no path gets a browser.
   expect(browserMcp(spec, harness, undefined, platform)).toBeUndefined();
-  expect(events).toHaveLength(enabled ? 1 : 2);
+  expect(events).toHaveLength(1);
 });
 
 test("browser read allowlist and private denials enclose only its own writable directory", async () => {
@@ -156,23 +186,25 @@ test("browser read allowlist and private denials enclose only its own writable d
       () => browserMcp(spec, "codex", [], "darwin"),
     );
     if (!server) throw new Error("missing server");
-    const policy = server.args[1] ?? "";
+    const profile = policy(server);
     const directory = server.env.HOME ?? "";
-    expect(policy).toContain("(deny file-read*)");
-    expect(policy).toContain("(deny file-write*)");
-    expect(policy).toContain(`(allow file-read* (subpath "${directory}") (subpath "${cache}")`);
-    expect(policy).toContain(`(allow file-write* (subpath "${directory}")`);
-    expect(policy).not.toContain(`(subpath "${cwd}")`);
-    expect(policy).not.toContain(`(subpath "${scratch}")`);
-    expect(policy).not.toContain(`(literal "${root}/package.json")`);
+    expect(profile).toContain("(deny file-read*)");
+    expect(profile).toContain("(deny file-write*)");
+    expect(profile).toContain(`(allow file-read* (subpath "${directory}") (subpath "${cache}")`);
+    expect(profile).toContain(`(allow file-write* (subpath "${directory}")`);
+    expect(profile).not.toContain(`(subpath "${cwd}")`);
+    expect(profile).not.toContain(`(subpath "${scratch}")`);
+    expect(profile).not.toContain(`(literal "${root}/package.json")`);
     for (const path of [privateFile, join(root, ".ssh"), join(root, "configured-private")]) {
-      expect(policy.lastIndexOf(`(subpath "${path}")`)).toBeGreaterThan(policy.indexOf("(allow file-read*"));
+      expect(profile.lastIndexOf(`(subpath "${path}")`)).toBeGreaterThan(
+        profile.indexOf("(allow file-read*"),
+      );
     }
     for (const name of ["TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"])
       expect(server.env[name]).toBe(directory);
     const second = browserMcp(spec, "codex", [], "darwin");
     expect(second?.env.HOME).not.toBe(directory);
-    expect(second?.args[1]).not.toContain(`(subpath "${directory}")`);
+    expect(policy(second)).not.toContain(`(subpath "${directory}")`);
   } finally {
     release();
   }
@@ -207,7 +239,9 @@ test("browser system reads exclude checkout and sibling scratch through Data-vol
   try {
     const server = browserMcp(spec, "codex", [], "darwin");
     if (!server) throw new Error("missing server");
-    const reads = (server.args[1] ?? "").split("\n").filter((line) => line.startsWith("(allow file-read* "));
+    const reads = policy(server)
+      .split("\n")
+      .filter((line) => line.startsWith("(allow file-read* "));
     const subpaths = reads.flatMap((line) => [...line.matchAll(/\(subpath "([^"]+)"\)/g)].map((m) => m[1]));
     const allowed = (path: string) =>
       subpaths.some((root) => root && (path === root || path.startsWith(`${root}/`)));
@@ -231,11 +265,14 @@ test.each([
   const { spec, scratch } = await fixture();
   if (!spec.browser) throw new Error("missing browser request");
   spec.browser.previewUrl = url;
-  const args = browserMcp(spec, "codex", [], "darwin")?.args ?? [];
+  const server = browserMcp(spec, "codex", [], "darwin");
+  const args = server?.args ?? [];
   expect(args[args.indexOf("--allowed-origins") + 1]).toBe(origin);
   const parsed = new URL(url);
-  expect(args[1]).toContain("(deny network-outbound)");
-  const allows = (args[1] ?? "").split("\n").filter((line) => line.startsWith("(allow network-outbound"));
+  expect(policy(server)).toContain("(deny network-outbound)");
+  const allows = policy(server)
+    .split("\n")
+    .filter((line) => line.startsWith("(allow network-outbound"));
   const port = parsed.port || (parsed.protocol === "https:" ? 443 : 80);
   // Only the preview's own address family: a 127.0.0.1 preview cannot reach ::1, and vice versa.
   const families = { "127.0.0.1": ["ip4"], "[::1]": ["ip6"], localhost: ["ip4", "ip6"] }[parsed.hostname];
@@ -243,10 +280,11 @@ test.each([
   expect(allows).toEqual(
     (families ?? []).map((family) => `(allow network-outbound (remote ${family} "localhost:${port}"))`),
   );
-  // Seatbelt compiles the profile before applying it; exit 65 means it rejected the rule.
+  // Seatbelt compiles the profile before applying it; exit 65 means it rejected a rule. Exit 0 also
+  // shows dyld can start under the generated profile (it aborted before the root-directory read).
   if (process.platform === "darwin") {
     const compiled = await runProcess({
-      cmd: [SANDBOX_EXEC, "-p", args[1] ?? "", "/usr/bin/true"],
+      cmd: [SANDBOX_EXEC, "-p", policy(server), "/usr/bin/true"],
       cwd: scratch,
       env: agentEnv(),
       timeoutMs: 10_000,
@@ -299,6 +337,7 @@ test.each([
   "private cache",
   "runtime in checkout",
   "runtime metadata missing",
+  "runtime link in checkout",
   "Claude editor",
 ])("browser fails closed: %s", async (failure) => {
   const { root, spec, cache, scratch, cwd } = await fixture();
@@ -349,6 +388,7 @@ test.each([
     }
     writeFileSync(path, JSON.stringify(record));
   }
+  if (failure === "runtime link in checkout") linkedRuntime(cache, join(root, "runtime"), join(cwd, "link"));
   if (failure === "Claude editor") spec.mode = "edit";
   const secret = "browser-secret-" + "fixture";
   registerCredential("browser-test", secret);

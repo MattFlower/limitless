@@ -72,18 +72,19 @@ test("both harnesses serialize the confined pinned browser over stdio and honour
       };
       const scratch = realpathSync(scratchDir);
       const expectServer = (server: { command: string; args: string[]; env: Record<string, string> }) => {
-        expect(server.command).toBe("/usr/bin/sandbox-exec");
-        expect(server.args[0]).toBe("-p");
-        expect(server.args[1]).toContain("(deny file-read*)");
-        expect(server.args[2]).toBe(realpathSync(Bun.which("node") ?? ""));
+        expect(server.command).toBe("/usr/bin/env");
+        expect(server.args.slice(0, 4)).toEqual(["-C", server.env.HOME ?? "", "/usr/bin/sandbox-exec", "-p"]);
+        const policy = server.args[4] ?? "";
+        expect(policy).toContain("(deny file-read*)");
+        expect(server.args[5]).toBe(realpathSync(Bun.which("node") ?? ""));
         expect(server.args).toContain("--no-sandbox");
         expect(server.args).not.toContain("--sandbox");
-        expect(server.args[3]).toBe(join(cache, "node_modules/@playwright/mcp/cli.js"));
+        expect(server.args[6]).toBe(join(cache, "node_modules/@playwright/mcp/cli.js"));
         expect(server.args).toContain("--headless");
         const value = (flag: string) => server.args[server.args.indexOf(flag) + 1] ?? "";
         expect(value("--allowed-origins")).toBe("http://127.0.0.1:43210");
-        expect(server.args[1]).toContain('(allow network-outbound (remote ip4 "localhost:43210"))');
-        expect(server.args[1]).not.toContain("remote ip6");
+        expect(policy).toContain('(allow network-outbound (remote ip4 "localhost:43210"))');
+        expect(policy).not.toContain("remote ip6");
         expect(server.args).not.toContain("--allowed-hosts");
         expect(value("--executable-path")).toBe(join(cache, "browsers/chromium"));
         for (const flag of ["--user-data-dir", "--output-dir"]) {
@@ -157,7 +158,18 @@ test("both harnesses serialize the confined pinned browser over stdio and honour
             });
           else expect(argsClaude[argsClaude.indexOf("--tools") + 1]).toBe("");
         }
-        expect(events).toEqual([]);
+        // Each builder reports that the tool-less variant's browser request was dropped.
+        expect(events).toEqual([
+          expect.objectContaining({
+            code: "browser_unavailable",
+            text: expect.stringContaining("tool-less"),
+          }),
+          expect.objectContaining({
+            code: "browser_unavailable",
+            text: expect.stringContaining("tool-less"),
+          }),
+        ]);
+        events.length = 0;
         // With the gaps cleared, the real builders emit the confined server on macOS.
         browserSetup.mockImplementation((spec, harness) => original(spec, harness, [], "darwin"));
         const enabledClaude = buildClaudeArgs(spec, "session");

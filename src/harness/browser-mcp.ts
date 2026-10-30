@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { agentEnv, redactCredentials, runProcess } from "../util/proc.ts";
+import { dyldLinks } from "./dyld-links.ts";
 import { homeReadPolicy, policySpellings } from "./read-policy.ts";
 import { SANDBOX_EXEC, seatbeltProfile } from "./sandbox.ts";
 import { validateScratch } from "./scratch.ts";
@@ -194,8 +195,9 @@ export function browserMcp(
   gaps: readonly string[] = CONFINEMENT_GAPS,
   platform: string = process.platform,
 ): BrowserMcpServer | undefined {
-  if (!spec.browser || spec.noTools) return;
+  if (!spec.browser) return;
   try {
+    if (spec.noTools) throw new Error("tool-less invocations get no MCP servers");
     if (harness === "claude" && spec.mode === "edit")
       throw new Error("Claude editor outer confinement cannot launch the browser safely");
     if (platform !== "darwin") throw new Error(`Browser confinement unavailable on ${platform}`);
@@ -213,7 +215,12 @@ export function browserMcp(
     if ([scratch, cwd].some((path) => inside(path, cache) || inside(cache, path)))
       throw new Error("browser cache overlaps agent write roots");
     const { node, cli, browser, libraries } = installation(cache);
-    if ([node, ...(libraries ?? [])].some((runtime) => [scratch, cwd].some((path) => inside(path, runtime))))
+    const links = libraries ? dyldLinks(node, libraries) : [];
+    if (
+      [node, ...(libraries ?? []), ...links].some((runtime) =>
+        [scratch, cwd].some((path) => inside(path, runtime)),
+      )
+    )
       throw new Error("browser runtime is agent-writable");
     if (gaps.length)
       throw new Error(`@playwright/mcp@${BROWSER_MCP_VERSION} is not confined: ${gaps.join("; ")}`);
@@ -227,20 +234,14 @@ export function browserMcp(
       cache,
       node,
       ...libraries,
+      // What the pinned build needs to start and render, measured by removal (docs/browser-mcp-probes.md).
+      // /System/Volumes/Data, which aliases user files including other invocations' scratch, stays denied.
       ...[
-        // /System/Volumes/Data aliases user files, including other invocations' scratch.
-        "/System/Library",
-        "/usr/lib",
-        "/usr/share",
-        "/Library/Fonts",
-        "/Library/Apple/System/Library",
-        "/private/var/db/timezone",
-        "/private/var/db/dyld",
-        "/private/etc/localtime",
-        "/dev/null",
-        "/dev/zero",
-        "/dev/random",
-        "/dev/urandom",
+        "/System/Library", // frameworks and system fonts
+        "/usr/lib", // system libraries
+        "/usr/share/icu", // CoreFoundation's ICU data
+        "/usr/share/langid", // language identification data; Chromium aborts without it
+        "/dev/null", // OPENSSL_CONF below
       ].filter(existsSync),
     ];
     const policy = seatbeltProfile(
@@ -253,13 +254,18 @@ export function browserMcp(
       {
         host: url.hostname === "[::1]" ? "::1" : url.hostname,
         port: Number(url.port || (url.protocol === "https:" ? 443 : 80)),
+        links,
       },
     );
     // --allowed-origins restricts browser requests; --allowed-hosts would only govern the MCP HTTP
     // transport, which stdio does not use.
     return {
-      command: SANDBOX_EXEC,
+      // Agents start MCP servers in their checkout, which the profile denies; Node needs a readable cwd.
+      command: "/usr/bin/env",
       args: [
+        "-C",
+        directory,
+        SANDBOX_EXEC,
         "-p",
         policy,
         node,
@@ -284,6 +290,10 @@ export function browserMcp(
         TEMP: directory,
         XDG_CACHE_HOME: directory,
         XDG_CONFIG_HOME: directory,
+        // Chromium on macOS ignores TMPDIR; without this its profile lock cannot create its socket.
+        MAC_CHROMIUM_TMPDIR: directory,
+        // Node aborts when it cannot read an OpenSSL configuration, and Homebrew's is outside the profile.
+        OPENSSL_CONF: "/dev/null",
         PLAYWRIGHT_BROWSERS_PATH: join(cache, "browsers"),
         PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1",
       },

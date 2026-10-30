@@ -60,9 +60,23 @@ const darwin = process.platform === "darwin";
 test("browser restrictions are optional and reject unbounded endpoints", () => {
   const roots = { write: ["/scratch/browser"], protect: [], allowRead: ["/scratch/browser", "/runtime"] };
   const gate = seatbeltProfile(roots);
-  expect(gate).not.toContain("(deny network-outbound)");
-  expect(gate).not.toContain("(deny file-read*)");
-  const browser = seatbeltProfile(roots, { host: "localhost", port: 8080 });
+  const browser = seatbeltProfile(roots, { host: "localhost", port: 8080, links: ["/opt/pkg"] });
+  // The browser's read and IPC restrictions never reach gate profiles.
+  for (const rule of [
+    "(deny network-outbound)",
+    "(deny file-read*)",
+    '(allow file-read-data (literal "/"))',
+    '(allow file-read-metadata (literal "/opt/pkg"))',
+    "(deny mach-lookup)",
+    "(deny mach-register)",
+    "(deny appleevent-send)",
+    "(deny ipc-posix*)",
+    "(deny ipc-sysv*)",
+  ]) {
+    expect(gate).not.toContain(rule);
+    expect(browser).toContain(rule);
+  }
+  expect(gate).not.toContain("launchservicesd");
   expect(browser).toContain('(allow network-outbound (remote ip4 "localhost:8080"))');
   expect(browser).toContain('(allow network-outbound (remote ip6 "localhost:8080"))');
   expect(browser).toContain("(deny file-read*)");
