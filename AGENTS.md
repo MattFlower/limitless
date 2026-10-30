@@ -135,9 +135,9 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
     from one under the home, which is where the deploy's release checkout lives (#500).
   - Deny lists hold files (credential stores) as well as directories. Code that walks them must
     not assume a directory (#501: the Codex probe made canaries inside `~/.npmrc`).
-  - Before landing a confinement change, run the full suite unconfined from a checkout under the
-    real home, as the deploy does. Gates, land checks and CI skip the real-Seatbelt tests, and a
-    `/tmp` checkout hides home-deny failures.
+  - Before landing a confinement, service or deploy change, run the full suite unconfined from a
+    checkout under the real home, as the deploy does. Gates, land checks and CI skip the
+    real-Seatbelt tests, and a `/tmp` checkout hides home-deny failures.
 - **Subprocesses** go through `sh`/`runProcess` (`src/util/proc.ts`): abort signals, timeouts, the
   per-run process scope and descendant cleanup depend on it. The few direct spawns (preview servers,
   the SSH tunnel, `gate-slot`) manage their own lifecycle; don't add more without a reason. Agent
@@ -200,6 +200,14 @@ The deterministic audit (`src/gates/audit.ts`) runs on every factory change.
   `--allow <category>` on the run. Allowances never bypass protected paths or a failed binary
   inspection. If your change really needs one, say so in your report instead of working around the
   rule.
+- CI configuration changes (`.github/workflows/**`, root `.gitlab-ci.yml`, `.circleci/**`) block
+  unless the requester grants `Allow: workflows` on its own line or `--allow workflows` (API: `allow`).
+  An older daemon rejects `--allow workflows` from a newer CLI. Ungranted factory edits are never
+  pushed, including needs-human drafts and follow-up rounds. Verify-change keeps the author's
+  already-pushed edits advisory; factory repairs require the allowance, even in the same file.
+  Manual `scripts/land-pr.sh` checks its pinned push commit against the PR base and requires the
+  operator's explicit `--allow workflows` argument; PR text cannot grant it. For example:
+  `scripts/land-pr.sh 123 "Update CI" ./merge-worktree --allow workflows`.
 - The executable bit and mode changes count too: an executable or mode-changed file needs
   `Allow: binary` unless its content is reviewable text (strict UTF-8, no DEL and no control bytes
   besides tab, newline, form feed and carriage return), and an executable or mode-changed image always

@@ -1,6 +1,7 @@
 import { redactGateOutput } from "../gates/output.ts";
 import { confinementFailed, type GateComparison, type GateRun } from "../gates/run.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../gates/test-coverage.ts";
+import { type CoveringTestRun, coveringTestRefusal, selectCoveringTests } from "./covering-tests.ts";
 import type { Holdout, Spec, Verify } from "./schemas.ts";
 
 /** Factory provenance, saved with the completed candidate gate stage (never baseline checks). */
@@ -156,6 +157,93 @@ function refusal(
   return undefined;
 }
 
+const coveringCitation = (run: CoveringTestRun, sha: string): string =>
+  `Factory covering test ${run.file} › ${run.name} passed at ${sha} (stage ${run.stageId}); command: ${run.result?.executedCommand ?? run.result?.command}`;
+type Binding = {
+  evidence: string;
+  gateEvidence: NonNullable<Verify["criteria"][number]["gateEvidence"]>;
+};
+
+function gateBinding(
+  id: string,
+  spec: Spec,
+  holdout: Holdout,
+  sha: string,
+  gates?: GateEvidence,
+  baseline?: GateRun | null,
+): Binding | { reason: string } {
+  if (!gates) return { reason: "no completed candidate gate stage for this run" };
+  if (gates.sha !== sha || !/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha))
+    return { reason: "candidate gates did not check the exact verified SHA" };
+  if (!gates.checks.length)
+    return { reason: "candidate gate checks did not all pass cleanly without retries or skipped tests" };
+  const reason = gates.checks.map((check) => refusal(check, gates, baseline)).find(Boolean);
+  if (reason) return { reason };
+  const definitions = [
+    ...spec.acceptance_criteria
+      .filter((ac) => ac.id === id)
+      .map((ac) => ({ steps: ac.how_to_verify, expected: ac.criterion })),
+    ...holdout.scenarios
+      .filter((scenario) => scenario.id === id)
+      .map((scenario) => ({ steps: scenario.steps, expected: scenario.expected })),
+  ];
+  if (definitions.length !== 1) return { reason: "criterion has no unique verification definition" };
+  const definition = definitions[0];
+  // Exit success attests only to tests passing, never to an additional observable outcome.
+  if (
+    !definition ||
+    !/^(?:(?:the|all|both|targeted|covered|project|gate)\s+)*(?:[\w./-]+\s+)?tests?(?:\s+suite)?\s+pass(?:es)?[.!]?$/i.test(
+      definition.expected.trim(),
+    )
+  )
+    return { reason: "required outcome is not solely that tests pass" };
+  const commands = verificationCommands(definition.steps);
+  const covering = commands.map((command) => gates.checks.find((check) => covers(check, command)));
+  if (!commands.length || covering.some((check) => !check))
+    return { reason: "candidate gate checks do not cover every required verification step" };
+  const checks = [...new Set(covering)].filter((check) => check !== undefined);
+  const checkNames = checks.map((check) => check.name).join(", ");
+  const checkCommands = checks.map((check) => check.result.command).join("; ");
+  const inheritedSkips = checks.reduce(
+    (count, check) => count + (check.result.testCoverage?.skippedTests?.length ?? 0),
+    0,
+  );
+  const citation = `Factory gate ${checkNames} passed at ${sha} (stage ${gates.stageId}); commands: ${checkCommands}${inheritedSkips ? `; ${inheritedSkips} inherited skips` : ""}`;
+  return {
+    evidence: redactGateOutput(citation),
+    gateEvidence: {
+      stageId: gates.stageId,
+      sha,
+      check: checkNames,
+      command: checkCommands,
+    },
+  };
+}
+
+function citationRefusal(
+  citation: Binding["gateEvidence"],
+  sha: string,
+  covering: { runs: CoveringTestRun[]; succeededStageIds: number[] } | undefined,
+  gate: Binding | { reason: string },
+): string | undefined {
+  if (citation.sha !== sha) return "citation is for a different verified SHA";
+  const run = covering?.runs.find((r) => r.stageId === citation.stageId);
+  if (run) {
+    const reason = coveringTestRefusal(run, sha, covering?.succeededStageIds ?? []);
+    if (reason) return reason;
+    return citation.check === redactGateOutput(`${run.file} › ${run.name}`) &&
+      citation.command === redactGateOutput(run.result?.executedCommand ?? run.result?.command ?? "")
+      ? undefined
+      : "covering-test identity or command does not match the factory record";
+  }
+  if ("reason" in gate) return `no eligible factory gate record: ${gate.reason}`;
+  return citation.stageId === gate.gateEvidence.stageId &&
+    citation.check === gate.gateEvidence.check &&
+    citation.command === gate.gateEvidence.command
+    ? undefined
+    : "gate stage, check or command does not match the factory record";
+}
+
 /** Only structured sandbox blocks qualify; provenance and coverage come from factory records. */
 export function applyGateEvidence(
   verify: Verify,
@@ -164,63 +252,72 @@ export function applyGateEvidence(
   sha: string,
   gates?: GateEvidence,
   baseline?: GateRun | null,
+  coveringTests?: { runs: CoveringTestRun[]; succeededStageIds: number[] },
 ): Verify {
+  // A claimed met row with test requests still needs every requested factory execution.
+  const selected = selectCoveringTests({
+    ...verify,
+    criteria: verify.criteria.map((row) =>
+      row.status === "met" && row.covering_tests?.length
+        ? { ...row, status: "blocked", blockedReason: "sandbox" }
+        : row,
+    ),
+  });
   return {
     ...verify,
-    criteria: verify.criteria.map((blocked) => {
-      if (blocked.status !== "blocked" || blocked.blockedReason !== "sandbox") return blocked;
-      const refuse = (reason: string) => ({
-        ...blocked,
-        evidence: redactGateOutput(`Factory gate substitution unavailable: ${reason}.`),
+    criteria: verify.criteria.map((row, index) => {
+      const sandbox = row.status === "blocked" && row.blockedReason === "sandbox";
+      const requested = !!row.covering_tests?.length;
+      if (!row.gateEvidence && !sandbox && !(row.status === "met" && requested)) return row;
+      const gate = gateBinding(row.id, spec, holdout, sha, gates, baseline);
+      const selection = selected[index];
+      const runs =
+        selection?.tests.map((test) =>
+          coveringTests?.runs.find(
+            (r) => r.verifiedSha === sha && r.file === test.file && r.name === test.name,
+          ),
+        ) ?? [];
+      const failures = runs.map((run, i) => {
+        const reason = coveringTestRefusal(run, sha, coveringTests?.succeededStageIds ?? []);
+        return reason ? `covering test ${selection?.tests[i]?.file}: ${reason}` : undefined;
       });
-      if (!gates) return refuse("no completed candidate gate stage for this run");
-      if (gates.sha !== sha || !/^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(sha))
-        return refuse("candidate gates did not check the exact verified SHA");
-      if (!gates.checks.length)
-        return refuse("candidate gate checks did not all pass cleanly without retries or skipped tests");
-      const reason = gates.checks.map((check) => refusal(check, gates, baseline)).find(Boolean);
-      if (reason) return refuse(reason);
-      const definitions = [
-        ...spec.acceptance_criteria
-          .filter((ac) => ac.id === blocked.id)
-          .map((ac) => ({ steps: ac.how_to_verify, expected: ac.criterion })),
-        ...holdout.scenarios
-          .filter((scenario) => scenario.id === blocked.id)
-          .map((scenario) => ({ steps: scenario.steps, expected: scenario.expected })),
-      ];
-      if (definitions.length !== 1) return refuse("criterion has no unique verification definition");
-      const definition = definitions[0];
-      // Exit success attests only to tests passing, never to an additional observable outcome.
-      if (
-        !definition ||
-        !/^(?:(?:the|all|both|targeted|covered|project|gate)\s+)*(?:[\w./-]+\s+)?tests?(?:\s+suite)?\s+pass(?:es)?[.!]?$/i.test(
-          definition.expected.trim(),
-        )
-      )
-        return refuse("required outcome is not solely that tests pass");
-      const commands = verificationCommands(definition.steps);
-      const covering = commands.map((command) => gates.checks.find((check) => covers(check, command)));
-      if (!commands.length || covering.some((check) => !check))
-        return refuse("candidate gate checks do not cover every required verification step");
-      const checks = [...new Set(covering)].filter((check) => check !== undefined);
-      const checkNames = checks.map((check) => check.name).join(", ");
-      const checkCommands = checks.map((check) => check.result.command).join("; ");
-      const inheritedSkips = checks.reduce(
-        (count, check) => count + (check.result.testCoverage?.skippedTests?.length ?? 0),
-        0,
-      );
-      const citation = `Factory gate ${checkNames} passed at ${sha} (stage ${gates.stageId}); commands: ${checkCommands}${inheritedSkips ? `; ${inheritedSkips} inherited skips` : ""}`;
-      return {
-        ...blocked,
-        status: "met" as const,
-        evidence: redactGateOutput(citation),
-        gateEvidence: {
-          stageId: gates.stageId,
-          sha,
-          check: checkNames,
-          command: checkCommands,
-        },
-      };
+      const coveringFailure =
+        selection?.reason ??
+        failures.find(Boolean) ??
+        (requested && !runs.length ? "no factory record" : undefined);
+      const refuse = (prefix: string, reason: string) => ({
+        ...row,
+        status: "blocked" as const,
+        gateEvidence: undefined,
+        evidence: redactGateOutput(`${prefix}: ${reason}.`),
+      });
+      if (row.gateEvidence) {
+        const reason = citationRefusal(row.gateEvidence, sha, coveringTests, gate) ?? coveringFailure;
+        if (reason) return refuse("Factory citation unavailable", reason);
+        if (!sandbox && !requested) return row;
+      }
+      if (requested) {
+        if (coveringFailure)
+          return refuse(
+            "Factory gate substitution unavailable",
+            `${"reason" in gate ? `${gate.reason}; ` : ""}${coveringFailure}`,
+          );
+        const first = runs[0];
+        if (first?.result)
+          return {
+            ...row,
+            status: "met" as const,
+            evidence: redactGateOutput(runs.map((r) => (r ? coveringCitation(r, sha) : "")).join("; ")),
+            gateEvidence: {
+              stageId: first.stageId,
+              sha,
+              check: redactGateOutput(`${first.file} › ${first.name}`),
+              command: redactGateOutput(first.result.executedCommand ?? first.result.command),
+            },
+          };
+      }
+      if ("reason" in gate) return refuse("Factory gate substitution unavailable", gate.reason);
+      return { ...row, status: "met" as const, ...gate };
     }),
   };
 }

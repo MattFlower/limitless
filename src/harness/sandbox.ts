@@ -385,7 +385,7 @@ export const killedByCancel = (result: ProcResult): boolean =>
 
 /** Keep installed toolchains readable; writable package caches belong to the suite scratch. */
 export async function runConfined(
-  opts: Omit<ProcOptions, "cmd"> & { command: string; onStarted?: () => void },
+  opts: Omit<ProcOptions, "cmd"> & { command: string; args?: string[]; onStarted?: () => void },
   verify?: () => Promise<void>,
   run = runProcess,
 ): Promise<ProcResult> {
@@ -415,7 +415,9 @@ export async function runConfined(
     return runSandboxed(
       {
         ...opts,
-        cmd: ["/bin/sh", "-c", opts.command],
+        cmd: opts.args
+          ? ["/bin/sh", "-c", `${opts.command} "$@"`, "gate", ...opts.args]
+          : ["/bin/sh", "-c", opts.command],
         env: {
           ...opts.env,
           GIT_OPTIONAL_LOCKS: "0",

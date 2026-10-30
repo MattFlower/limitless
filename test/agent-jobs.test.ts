@@ -8,6 +8,7 @@ import { Store } from "../src/db/store.ts";
 import { type AgentJobRequest, WorkerStore } from "../src/db/workers.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import type { Capabilities } from "../src/workers/protocol.ts";
+import { PreviousHeartbeat } from "./previous-heartbeat.ts";
 
 const releaseSha = "f".repeat(40);
 const request: AgentJobRequest = {
@@ -556,3 +557,28 @@ test.each(["match", "differs", "unknown"] as const)(
     if (parity !== "match") expect(workers.agentJob(id)?.state).toBe("queued");
   },
 );
+
+test("every stored capabilities row parses with the previous release's schema; Linux rows live in capabilities_ext", () => {
+  pair("mac");
+  beat("mac", { ...caps(), confinement: "seatbelt" });
+  pair("linux");
+  beat("linux", { ...caps(), os: "linux", confinement: "bwrap-landlock", freeSlots: 1 });
+  const rows = store.db
+    .query<{ name: string; capabilities: string | null; capabilities_ext: string | null }, []>(
+      "SELECT name,capabilities,capabilities_ext FROM workers ORDER BY name",
+    )
+    .all();
+  for (const row of rows) if (row.capabilities) PreviousHeartbeat.parse(JSON.parse(row.capabilities));
+  expect(rows.map((r) => [r.name, r.capabilities !== null, r.capabilities_ext !== null])).toEqual([
+    ["linux", false, true],
+    ["mac", true, false],
+  ]);
+  // This release still reads both: the Linux worker is available for gate jobs and reports its backend.
+  const linux = workers.worker("linux");
+  if (!linux) throw new Error("Missing worker");
+  expect(workers.available(linux)).toBe(true);
+  expect(workers.list().find((w) => w.name === "linux")?.capabilities).toMatchObject({
+    os: "linux",
+    confinement: "bwrap-landlock",
+  });
+});

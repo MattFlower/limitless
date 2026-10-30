@@ -177,13 +177,18 @@ export async function waitFor(
   await waitUntil(
     () => {
       status = f.store.getRun(runId)?.status;
-      return status !== undefined && statuses.includes(status);
+      // A rejection is terminal before rollback and draft reporting finish.
+      return (
+        status !== undefined &&
+        statuses.includes(status) &&
+        (status !== "needs_human" || !f.scheduler.activeRunIds.includes(runId))
+      );
     },
     {
       signal,
       timeoutMs,
       description: `timed out waiting for ${statuses.join("|")}`,
-      pollMs: null,
+      pollMs: statuses.includes("needs_human") ? 25 : null,
       subscribe: (wake) =>
         f.store.subscribe((msg) => {
           if (msg.kind === "run") wake();

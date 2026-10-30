@@ -156,6 +156,8 @@ async function runGit(
   prefix.push(...hookFlags(hooks));
   // Signing and signature display run gpg or ssh-keygen, which the confinement profile denies.
   prefix.push("-c", "commit.gpgSign=false", "-c", "log.showSignature=false");
+  // Explicit -S still reaches this shell-free command, even with routine signing off.
+  if (process.platform === "linux") prefix.push("-c", "gpg.ssh.defaultKeyCommand=/dev/null");
   const env = {
     ...(opts.env ?? (process.env as Record<string, string>)),
     LIMITLESS_GIT_EMPTY_HOOK: "",
@@ -177,7 +179,9 @@ async function runGit(
       return { stdout: error.stdout, stderr: error.stderr, exitCode: error.exitCode };
     }
   }
-  const inspection = ["diff", "log"].includes(cmd[command] ?? "");
+  const inspection = ["diff", "log", ...(process.platform === "linux" ? ["show"] : [])].includes(
+    cmd[command] ?? "",
+  );
   if (inspection) {
     // Attributes from the empty tree, whose id depends on the repository's object format.
     const empty = emptyTree ?? (await hashEmptyTree(prefix, { ...opts, env }, execute));
@@ -318,7 +322,14 @@ export async function emptyHookFlags(git: string[], opts: Parameters<typeof sh>[
 async function hookKeys(git: string[], opts: Parameters<typeof sh>[1], execute = gitSh): Promise<string[]> {
   // Config lookup cannot run hooks; errors other than "no matching keys" must fail closed.
   const hooks = await execute(
-    [...git, "config", "--null", "--name-only", "--get-regexp", "^(hook|filter)\\."],
+    [
+      ...git,
+      "config",
+      "--null",
+      "--name-only",
+      "--get-regexp",
+      process.platform === "linux" ? "^(hook|filter)\\.|^diff\\..*\\.textconv$" : "^(hook|filter)\\.",
+    ],
     {
       ...opts,
       allowFail: false,

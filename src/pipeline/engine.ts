@@ -3,7 +3,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import { repoSettings } from "../config.ts";
 import { assertExistingBranchDelivery, assertFactoryBranchPush, isBranchName } from "../core/delivery.ts";
-import type { ResolvedProfile, Run, RunStatus } from "../core/types.ts";
+import { type ResolvedProfile, type Run, type RunStatus, TERMINAL_STATUSES } from "../core/types.ts";
 import { type AuditFinding, auditDiff } from "../gates/audit.ts";
 import {
   BASELINE_CACHE_TTL_MS,
@@ -26,6 +26,7 @@ import {
 } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
 import { gateProvenance } from "../gates/executor.ts";
+import { formatGateOutput } from "../gates/failures.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
 import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
 import { loadPrivateStrings, PrivateError, privateStringsDigest, redactPrivate } from "../gates/private.ts";
@@ -41,12 +42,14 @@ import {
   retryBaselineFailures,
   retryRegressions,
   runLocalGates,
+  validateRetry,
 } from "../gates/run.ts";
 import { gateSlotScope } from "../gates/slots.ts";
 import { WorktreeCleanError, worktreeGit, worktreeGitScope } from "../git/command.ts";
 import { completeMerge, mergeGit, prepareMerge, requireMerge, validateMerge } from "../git/merge.ts";
 import {
   adoptWorkerCommit,
+  assertWorkflowPublication,
   checkoutCommitted,
   checkPrivateRange,
   commitAll,
@@ -100,21 +103,30 @@ import {
   prepareReaderCheckout,
 } from "./agent-executor.ts";
 import { reusableAgentGate } from "./agent-gate.ts";
+import { statedBudget } from "./budget.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
 import {
   CancelledError,
   type EngineDeps,
   invokeGuard,
+  localCheckpointer,
   NeedsHumanError,
   NoCapacityError,
   ParkedError,
   Preempted,
   RunContext,
   type RunState,
+  redactPostMergeComparisons,
 } from "./context.ts";
+import { runCoveringTests } from "./covering-tests.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
-import { gateCommandScope, resumeGateExecution, runGateExecution } from "./gate-execution.ts";
+import {
+  consumeGateExecution,
+  gateCommandScope,
+  resumeGateExecution,
+  runGateExecution,
+} from "./gate-execution.ts";
 import {
   checkDiscreetCommits,
   DiscreetError,
@@ -122,6 +134,7 @@ import {
   discreetModelText,
   hasFactoryMark,
 } from "./markers.ts";
+import { confirmPostMerge, postMergeWorker } from "./post-merge-confirmation.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -168,6 +181,7 @@ import {
   type Verify,
   VerifySchema,
 } from "./schemas.ts";
+import { measureSize } from "./size.ts";
 import { createSnapshotParent } from "./snapshots.ts";
 import { outOfRunCriteria, specCriteriaRange } from "./spec-criteria.ts";
 import { specScopeViolation } from "./spec-scope.ts";
@@ -194,10 +208,11 @@ export async function executeRun(
 ): Promise<RunStatus> {
   const run = deps.store.getRun(runId);
   if (!run) return "failed";
-  if (finalizeRecordedCancellation(deps.store, runId)) return "cancelled";
+  const checkpointer = deps.checkpointer ?? localCheckpointer(deps.store);
+  if (finalizeRecordedCancellation(deps.store, runId, checkpointer)) return "cancelled";
   const repo = deps.store.getRepo(run.repoId);
   if (!repo) {
-    deps.store.updateRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
+    checkpointer.writeRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
@@ -231,19 +246,22 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
   if (ctx.state.phase !== "deliver") ctx.state.githubWait = undefined;
-  ctx.run = deps.store.updateRun(
-    runId,
-    {
-      status: "running",
-      error: null,
-      ...(run.startedAt ? {} : { startedAt: Date.now() }),
-    },
-    ctx.state,
-  );
+  // A recorded rejection is already terminal; resume only finishes its rollback.
+  if (!ctx.state.postMergeRejection)
+    ctx.run = ctx.checkpointer.writeRun(
+      runId,
+      {
+        status: "running",
+        error: null,
+        ...(run.startedAt ? {} : { startedAt: Date.now() }),
+      },
+      ctx.state,
+    );
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
 
   try {
     await recoverScopedProcesses();
+    if (ctx.state.postMergeRejection) await rollbackRejectedMerge(ctx);
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
     if (
@@ -305,7 +323,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.checkCancelled();
     await ctx.setPhase("done");
     ctx.checkCancelled();
-    ctx.run = deps.store.updateRun(runId, { status: "succeeded", stage: null, finishedAt: Date.now() });
+    ctx.run = ctx.checkpointer.writeRun(runId, { status: "succeeded", stage: null, finishedAt: Date.now() });
     // Terminal success ends the cancellation window before destructive worktree cleanup.
     if (ctx.repo.kind === "github" && ctx.state.worktreePath) {
       try {
@@ -318,22 +336,37 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     return "succeeded";
   } catch (e) {
     const terminationError = processScope.getStore()?.terminationError;
-    if (terminationError && ctx.state.needsHumanReason !== terminationError.message) {
+    if (
+      terminationError &&
+      !ctx.state.postMergeRejection &&
+      ctx.state.needsHumanReason !== terminationError.message
+    ) {
       ctx.state.feedback = redactGateOutput(
         `${ctx.state.implementerIssue ?? "Invocation ended"}\n${terminationError.message}`,
       );
       ctx.state.needsHumanReason = terminationError.message;
       // Shutdown can re-queue this run. Persist the cleanup block even with an aborted
       // signal, so a fresh process scope on resume cannot start another round.
-      deps.store.setRunState(runId, ctx.state);
+      ctx.checkpointer.writeState(runId, ctx.state);
     }
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
+    if (ctx.state.postMergeRejection && (signal.aborted || !(e instanceof NeedsHumanError))) {
+      ctx.log(`Rejected post-merge rollback interrupted: ${(e as Error).message}`, "warn");
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
+    }
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
-      deps.store.updateRun(runId, { status: "queued", stage: null });
+      ctx.checkpointer.writeRun(runId, { status: "queued", stage: null });
       return "queued";
     }
     const cancelled = (): RunStatus => {
+      const rejected = ctx.state.postMergeRejection?.reason;
+      if (rejected) {
+        // A recorded rejection is terminal; shutdown during draft reporting must not requeue it.
+        const status = finalizePostMergeRejection(ctx, rejected);
+        ctx.log(`Draft reporting interrupted; rejected post-merge run stays ${status}`, "warn");
+        return status;
+      }
       const reason = ctx.state.terminalReason?.startsWith("superseded:")
         ? ctx.state.terminalReason
         : undefined;
@@ -346,7 +379,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
       const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
       if (!shutdown) clearGitHubWait(ctx.state);
-      deps.store.updateRun(
+      ctx.checkpointer.writeRun(
         runId,
         {
           status,
@@ -361,7 +394,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (e instanceof CancelledError || signal.aborted) return cancelled();
     if (e instanceof ParkedError) {
       ctx.state.parked = true;
-      ctx.run = deps.store.updateRun(runId, { status: "queued", stage: null }, ctx.state);
+      ctx.run = ctx.checkpointer.writeRun(runId, { status: "queued", stage: null }, ctx.state);
       ctx.log(`Run parked at phase "${ctx.state.phase}" for deploy`);
       return "queued";
     }
@@ -386,7 +419,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       if (deps.store.getRun(runId)?.error?.startsWith("cancelled by")) return cancelled();
       const reason = redactCredentials((e as Error).message).slice(0, 300);
       ctx.state.githubWait = { since, nextAttemptAt: now + githubWait.intervalMs, reason };
-      ctx.run = deps.store.updateRun(runId, { status: "queued", stage: null }, ctx.state);
+      ctx.run = ctx.checkpointer.writeRun(runId, { status: "queued", stage: null }, ctx.state);
       ctx.log(
         `GitHub unavailable; delivery retries at ${new Date(ctx.state.githubWait.nextAttemptAt).toISOString()}, gives up at ${new Date(since + githubWait.maxMs).toISOString()}: ${reason}`,
         "warn",
@@ -399,7 +432,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         : "";
     if (ctx.state.githubWait) {
       ctx.state.githubWait = undefined;
-      deps.store.setRunState(runId, ctx.state);
+      ctx.checkpointer.writeState(runId, ctx.state);
     }
     const verifiedFailure =
       verifiedSha &&
@@ -420,7 +453,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
       );
       ctx.state.needsHumanReason = message;
-      deps.store.setRunState(runId, ctx.state);
+      ctx.checkpointer.writeState(runId, ctx.state);
     }
     const failureStage =
       ctx.state.conflictRound !== undefined
@@ -503,10 +536,12 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ) {
       ctx.state.needsHumanReason = redactCredentials(message);
       ctx.state.terminalReason = ctx.state.needsHumanReason;
-      deps.store.setRunState(runId, ctx.state);
+      ctx.checkpointer.writeState(runId, ctx.state);
     }
+    if (ctx.state.postMergeRejection)
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
-    deps.store.updateRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
+    ctx.checkpointer.writeRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
     return status;
   }
 }
@@ -596,13 +631,13 @@ async function prepare(ctx: RunContext): Promise<void> {
       (reusingWorktree && ctx.state.flow !== "verify-change"
         ? (ctx.run.baseSha ?? (await headSha(wt.path)))
         : wt.baseSha);
-    ctx.run = store.updateRun(ctx.run.id, { baseBranch: base, baseSha, branch: wt.branch });
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { baseBranch: base, baseSha, branch: wt.branch });
     const verification = ctx.state.verification;
     const env = gateEnv();
     const resuming =
       (await resumeGateExecution(ctx, "prepare", "baseline", wt.path, env))?.kind === "inplace";
     if (verification) {
-      ctx.run = store.updateRun(ctx.run.id, { baseSha: verification.headSha });
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { baseSha: verification.headSha });
       if (!resuming) await resetTo(wt.path, verification.baseSha);
     }
     if (!resuming) await discardChanges(wt.path);
@@ -765,7 +800,7 @@ async function prepare(ctx: RunContext): Promise<void> {
       }
     }
     if (review?.kind === "conflict") {
-      ctx.run = store.updateRun(ctx.run.id, { resolvedProfile: "quick" });
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { resolvedProfile: "quick" });
       const tip =
         ctx.state.reviewBaseSha ??
         (await fetchBase(cfg.paths, ctx.repo, review.owner.baseBranch ?? ctx.repo.defaultBranch, ctx.signal));
@@ -885,7 +920,7 @@ async function triage(ctx: RunContext): Promise<void> {
     const t = TriageSchema.parse(result.structured);
     ctx.state.triage = t;
     const profile: ResolvedProfile = ctx.run.profile === "auto" ? t.suggested_profile : ctx.run.profile;
-    ctx.run = ctx.store.updateRun(ctx.run.id, {
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, {
       title:
         ctx.run.titleProvenance === "defaulted" ||
         (ctx.run.titleProvenance == null && ctx.run.title === ctx.run.prompt.split("\n")[0]?.slice(0, 80))
@@ -917,7 +952,7 @@ async function triage(ctx: RunContext): Promise<void> {
 async function waitForAnswers(ctx: RunContext): Promise<void> {
   const pending = () => ctx.store.listQuestions(ctx.run.id).filter((q) => q.answer === null);
   if (!pending().length) return;
-  ctx.run = ctx.store.updateRun(ctx.run.id, { status: "waiting_input" });
+  ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { status: "waiting_input" });
   ctx.log(`Waiting for answers to ${pending().length} question(s)`, "warn");
   await new Promise<void>((resolve, reject) => {
     const check = () => {
@@ -945,7 +980,7 @@ async function waitForAnswers(ctx: RunContext): Promise<void> {
     };
     check();
   });
-  ctx.run = ctx.store.updateRun(ctx.run.id, { status: "running" });
+  ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { status: "running" });
 }
 
 async function clarify(ctx: RunContext): Promise<void> {
@@ -1081,7 +1116,7 @@ async function buildLoop(ctx: RunContext): Promise<void> {
     // Clear the legacy block with the findings round and its baseline in one database write.
     // The old engine must implement that round; resolution's cached checks belong to the prior one.
     ctx.state.needsHumanReason = undefined;
-    ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: sha }, ctx.state);
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { baseSha: sha }, ctx.state);
     await ctx.save("review-resolution-complete");
   }
   if (ctx.state.verification && !ctx.state.verification.initialComplete) {
@@ -1256,6 +1291,7 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
       const request: AgentPublication = {
         parentSha,
         baseSha: ctx.run.baseSha as string,
+        allow: ctx.run.allow,
         branch,
         commit: {
           message: `${commitMessage(ctx, round)}\n`,
@@ -1316,7 +1352,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
     if ((await headSha(cwd)) !== previousHead) {
       const sha = await validateMerge(cwd, previousHead, baseSha);
       ctx.state.implementedRound = round;
-      ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha }, ctx.state);
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha }, ctx.state);
       return;
     }
     await requireMerge(cwd, previousHead, baseSha);
@@ -1433,7 +1469,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
         merge && previousHead
           ? await completeMerge(cwd, previousHead, baseSha, mergeMessage(ctx, baseSha), commitIdentity(ctx))
           : await commitAll(cwd, commitMessage(ctx, round));
-      ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
+      ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
       ctx.state.implementedRound = round;
       await ctx.save("implementation-committed");
       return {
@@ -1629,12 +1665,13 @@ async function oneRound(
               ctx.checkCancelled();
               after = {
                 ...after,
-                checks: after.checks.map((r) => ({
-                  ...r,
-                  firstAttempt: r.reused
-                    ? r.firstAttempt
-                    : findGateCounterpart(r, after.checks, first.checks),
-                })),
+                checks: after.checks.map((r) => {
+                  const original = findGateCounterpart(r, after.checks, first.checks);
+                  return {
+                    ...(original?.timedOut && !r.reused ? validateRetry(r, original, checkedSha, after) : r),
+                    firstAttempt: r.reused ? r.firstAttempt : original,
+                  };
+                }),
               };
             }
             const changed = (await changeDiff()).files.flatMap((f) => (f.from ? [f.path, f.from] : [f.path]));
@@ -1737,6 +1774,12 @@ async function oneRound(
         }),
       )(),
     round,
+    false,
+    true,
+    (comparisons, stage, sha) => {
+      if (!sha) throw new Error("Missing gates completion SHA");
+      ctx.store.observations.finalize(ctx.run.id, { round, sha, stageId: stage.id, comparisons });
+    },
   );
   const comparison = await checks.catch(async (error: unknown) => {
     ctx.checkCancelled();
@@ -1760,7 +1803,8 @@ async function oneRound(
     async () => {
       const findings = auditDiff(diff, {
         configDir: ctx.deps.cfg.paths.configDir,
-        allow: ctx.run.allow ?? [],
+        // Already-pushed author edits are advisory; repairs are audited independently below.
+        allow: ctx.state.verification ? [...(ctx.run.allow ?? []), "workflows"] : (ctx.run.allow ?? []),
         taskClass: ctx.state.verification && ctx.run.taskClass === "question" ? null : ctx.run.taskClass,
         protectedPaths: gates.protectedPaths,
         toolCommands: ctx.state.toolCommands,
@@ -2193,6 +2237,15 @@ async function oneRound(
           verifiedSha,
           usableGates(),
           ctx.state.baseline,
+          {
+            runs: ctx.state.coveringTestRuns ?? [],
+            succeededStageIds: (ctx.state.coveringTestRuns ?? [])
+              .filter((r) => {
+                const stage = ctx.store.getStage(r.stageId);
+                return stage?.runId === ctx.run.id && stage.name === "gates" && stage.status === "succeeded";
+              })
+              .map((r) => r.stageId),
+          },
         ),
         ctx.state.spec as Spec,
         ctx.state.holdout as Holdout,
@@ -2231,7 +2284,30 @@ async function oneRound(
         ctx.previewUrl = preview.url;
       }
     };
+    const pendingVerify = (attempt: number) => {
+      const pending = ctx.state.pendingVerify;
+      return pending?.round === round && pending.sha === verifiedSha && pending.attempt === attempt
+        ? pending
+        : undefined;
+    };
+    const executeCovering = (value: Verify) =>
+      runCoveringTests(
+        ctx,
+        applyGateEvidence(
+          value,
+          ctx.state.spec as Spec,
+          ctx.state.holdout as Holdout,
+          verifiedSha,
+          usableGates(),
+          ctx.state.baseline,
+        ),
+        verifiedSha,
+        checkVerifiedHead,
+      );
+    const pending = pendingVerify(0) ?? pendingVerify(1);
+    if (pending) await executeCovering(pending.modelOutput);
     const prepareVerification = async () => {
+      if (pendingVerify(0) || pendingVerify(1)) return;
       try {
         if (!previewWillSetup) await prepareLocal();
         await preparePreview();
@@ -2253,45 +2329,60 @@ async function oneRound(
       return ctx.stage(
         "verify",
         async (stage) => {
-          const { result, target } = await ctx.invoke({
-            role: "verify",
-            allowLocalBinding: true,
-            stage,
-            mode: "readonly",
-            complexity: ctx.complexity,
-            constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
-            timeoutMs: readingTimeout(diff.added + diff.removed, 25),
-            prompt: (allowLocalBinding) =>
-              verifyPrompt({
-                allowLocalBinding,
-                prompt: ctx.run.prompt,
-                spec: ctx.state.spec as Spec,
-                holdout: ctx.state.holdout as Holdout,
-                baseSha,
-                checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
-              }),
-            jsonSchema: toStrictJsonSchema(VerifySchema),
-            schema: VerifySchema,
-            requireStructured: true,
-            privateSession: true,
-            redactHoldout: true,
-          });
-          if (!ctx.parallelChecks) await discardChanges(cwd);
+          const obtainOutput = async () => {
+            const { result, target } = await ctx.invoke({
+              role: "verify",
+              allowLocalBinding: true,
+              stage,
+              mode: "readonly",
+              complexity: ctx.complexity,
+              constraints: { avoidVendor: ctx.state.implementer?.vendor, excludeModels },
+              timeoutMs: readingTimeout(diff.added + diff.removed, 25),
+              prompt: (allowLocalBinding) =>
+                verifyPrompt({
+                  allowLocalBinding,
+                  prompt: ctx.run.prompt,
+                  spec: ctx.state.spec as Spec,
+                  holdout: ctx.state.holdout as Holdout,
+                  baseSha,
+                  checks: usableGates()?.sha === verifiedSha ? gateEvidence?.checks : undefined,
+                }),
+              jsonSchema: toStrictJsonSchema(VerifySchema),
+              schema: VerifySchema,
+              requireStructured: true,
+              privateSession: true,
+              redactHoldout: true,
+            });
+            if (!ctx.parallelChecks) await discardChanges(cwd);
+            await checkVerifiedHead();
+            const pending = {
+              round,
+              attempt,
+              sha: verifiedSha,
+              modelOutput: VerifySchema.parse(result.structured),
+              modelId: target.modelId,
+            };
+            ctx.state.pendingVerify = pending;
+            await ctx.save("covering-test-request");
+            return pending;
+          };
+          const { modelOutput, modelId } = pendingVerify(attempt) ?? (await obtainOutput());
+          await executeCovering(modelOutput);
           await checkVerifiedHead();
-          const modelOutput = VerifySchema.parse(result.structured);
           const v = resolveVerify(modelOutput);
-          ctx.state.lastVerify = { ...v, modelId: target.modelId };
+          ctx.state.lastVerify = { ...v, modelId };
           ctx.state.verifyResults = [
             ...(ctx.state.verifyResults ?? []),
-            { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha, modelOutput },
+            { ...v, modelId, round, attempt, sha: verifiedSha, modelOutput },
           ];
-          await ctx.save();
+          ctx.state.pendingVerify = undefined;
+          await ctx.save("verify-result");
           const publicSources = await ctx.publicHoldoutSources();
           ctx.artifact(
             attempt === 0 ? `verify-${round}.json` : `verify-${round}-retry.json`,
             "verify",
             preDeliveryVerifyArtifact(
-              { ...v, modelId: target.modelId, round, attempt, sha: verifiedSha },
+              { ...v, modelId, round, attempt, sha: verifiedSha },
               ctx.state.spec as Spec,
               ctx.state.holdout as Holdout,
               publicSources,
@@ -2300,7 +2391,7 @@ async function oneRound(
           const met = v.criteria.filter((c) => c.status === "met").length;
           const blocked = v.criteria.filter((c) => c.status === "blocked").length;
           return {
-            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met${blocked ? `, ${blocked} blocked` : ""} (${target.modelId})`,
+            summary: `${v.overall}: ${met}/${v.criteria.length} criteria met${blocked ? `, ${blocked} blocked` : ""} (${modelId})`,
             value: v,
           };
         },
@@ -2319,7 +2410,7 @@ async function oneRound(
       let results: [PromiseSettledResult<Review>, PromiseSettledResult<Verify>];
       try {
         try {
-          results = await Promise.allSettled([reviewStage(), verifyAttempt(0)]);
+          results = await Promise.allSettled([reviewStage(), verifyAttempt(pending?.attempt ?? 0)]);
         } finally {
           ctx.parallelChecks = false;
           await discardChanges(cwd);
@@ -2373,7 +2464,9 @@ async function oneRound(
       ).replace("### Checks not met", "### Acceptance criteria not yet met (verify)");
       if (!(await rejectReview(results[0].value, feedback))) return false;
     } else {
-      verify = original ? resolveVerify(VerifySchema.parse(original)) : await verifyAttempt(0);
+      verify = original
+        ? resolveVerify(VerifySchema.parse(original))
+        : await verifyAttempt(pending?.attempt ?? 0);
     }
     if (recorded) {
       Object.assign(recorded, verify);
@@ -2420,7 +2513,7 @@ async function oneRound(
         await ctx.save();
         throw new NeedsHumanError(detail);
       };
-      if (previous.some((v) => v.attempt === 1)) await stop();
+      if (previous.some((v) => v.attempt === 1) || pending?.attempt === 1) await stop();
       // A reserved retry that never recorded a result was interrupted; resume it, don't grant another.
       if (ctx.state.environmentRetryRound === round)
         ctx.log("Resuming interrupted verification retry", "warn");
@@ -2603,6 +2696,24 @@ function githubUnavailable(error: unknown): boolean {
   );
 }
 
+async function checkWorkflowPublication(ctx: RunContext, sha: string): Promise<void> {
+  const base = ctx.state.verification?.headSha ?? ctx.run.baseSha;
+  if (!base) throw new DeliveryHeadError("Workflow publication check requires a recorded base");
+  try {
+    await assertWorkflowPublication(
+      ctx.state.worktreePath as string,
+      base,
+      sha,
+      ctx.run.allow,
+      ctx.deps.cfg.paths.configDir,
+      ctx.signal,
+    );
+  } catch (error) {
+    ctx.checkCancelled();
+    throw new DeliveryHeadError((error as Error).message);
+  }
+}
+
 /** Check outgoing and visible text; `pr` also checks the title, branch and published range. */
 async function checkPublication(
   ctx: RunContext,
@@ -2611,6 +2722,7 @@ async function checkPublication(
   location = pr ? "PR body" : "PR comment",
 ) {
   const cwd = ctx.state.worktreePath as string;
+  if (pr) await checkWorkflowPublication(ctx, pr.sha);
   try {
     const entries = privateEntries(ctx, cwd);
     if (repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet) {
@@ -2685,6 +2797,30 @@ async function reconcilePublication(ctx: RunContext, cwd: string, budget: GitHub
   await ctx.save("delivery-reconciled");
 }
 
+export async function renderDeliveryReport(
+  ...[ctx, success, verifiedFailure]: Parameters<typeof buildReportArtifacts>
+) {
+  const cwd = ctx.state.worktreePath,
+    base = ctx.state.verification?.baseSha ?? ctx.run.baseSha;
+  const mode = ctx.state.flow === "verify-change" ? "merge-base" : "two-dot";
+  let head = "HEAD",
+    redact = redactCredentials;
+  if (!cwd || !base) ctx.state.sizeReport = { unavailable: !cwd ? "No worktree" : "No base SHA" };
+  else
+    try {
+      const entries = privateEntries(ctx, cwd);
+      redact = (text) => redactPrivate(text, entries);
+      head = await headSha(cwd);
+      const measured = await measureSize(cwd, base, head, mode, ctx.state.gatesConfig?.docs);
+      const stated = statedBudget(ctx.run.prompt, redact);
+      ctx.state.sizeReport = redactGateData({ ...measured, stated });
+    } catch (error) {
+      ctx.state.sizeReport = { base, head, mode, error: redact(redactCredentials(String(error))) };
+    }
+  ctx.checkpointer.writeState(ctx.run.id, ctx.state);
+  return buildReportArtifacts(ctx, success, verifiedFailure);
+}
+
 async function deliverVerifiedDraft(
   ctx: RunContext,
   sha: string,
@@ -2698,7 +2834,7 @@ async function deliverVerifiedDraft(
   const branch = ctx.run.branch;
   const base = ctx.run.baseBranch;
   if (!cwd || !branch || !base) throw new Error("Missing verified draft delivery details");
-  const rendered = buildReportArtifacts(ctx, false, { sha, stage, reason, base });
+  const rendered = await renderDeliveryReport(ctx, false, { sha, stage, reason, base });
   const body = publicationText(ctx, stripReportManifest(rendered.report));
   saveReport(ctx, rendered);
   ctx.checkCancelled();
@@ -2707,7 +2843,7 @@ async function deliverVerifiedDraft(
   // keep the draft below from finding it.
   if (!ctx.run.prUrl) {
     const found = await findPullRequest(ctx.repo, branch, cwd, ctx.signal, deliveryIdentity(ctx, sha));
-    if (found) ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: found });
+    if (found) ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: found });
   }
   ctx.checkCancelled();
   const budget = deliveryBudget(ctx);
@@ -2732,7 +2868,7 @@ async function deliverVerifiedDraft(
   });
   await ctx.save("delivery-pr-created");
   ctx.checkCancelled();
-  ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
+  ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: url });
   ctx.state.deliveryComplete = true;
   await ctx.save("delivery-complete");
   ctx.log(`Verified-work draft PR: ${url}`);
@@ -2907,7 +3043,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
           )
         : ctx.run.prUrl;
       if (identity && recordedUrl && !ctx.run.prUrl)
-        ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: recordedUrl });
+        ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: recordedUrl });
       const raw =
         identity && !recordedUrl
           ? "null"
@@ -2936,8 +3072,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       if (pr && typeof pr === "object" && "state" in pr && pr.state === "MERGED") {
         if (!("url" in pr) || typeof pr.url !== "string" || !pr.url)
           throw new Error("Merged PR lookup did not return a URL");
-        ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: pr.url, merged: true });
-        saveReport(ctx, buildReportArtifacts(ctx, true));
+        ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: pr.url, merged: true });
+        saveReport(ctx, await renderDeliveryReport(ctx, true));
         ctx.state.deliveryComplete = true;
         await ctx.save("delivery-complete");
         return { summary: `PR ${pr.url} — merged`, value: undefined };
@@ -2953,15 +3089,15 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     if (ctx.state.verification) {
       await discardChanges(cwd);
       if (!success) {
-        saveReport(ctx, buildReportArtifacts(ctx, false));
+        saveReport(ctx, await renderDeliveryReport(ctx, false));
         return { summary: "PR verification needs human review; no push", value: undefined };
       }
       if (!(await diffSince(cwd, ctx.state.verification.headSha)).files.length) {
-        ctx.run = ctx.store.updateRun(ctx.run.id, {
+        ctx.run = ctx.checkpointer.writeRun(ctx.run.id, {
           headSha: await headSha(cwd),
           prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef?.number}`,
         });
-        const rendered = buildReportArtifacts(ctx, true);
+        const rendered = await renderDeliveryReport(ctx, true);
         const report = rendered.report;
         if (!ctx.state.verdictCommentPosted) {
           const { marker, includes: hasMarker } = deliveryMarker(
@@ -3026,7 +3162,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
               if (reason) {
                 ctx.state.terminalReason = reason;
                 ctx.state.needsHumanReason = undefined;
-                saveReport(ctx, buildReportArtifacts(ctx, false));
+                saveReport(ctx, await renderDeliveryReport(ctx, false));
                 await ctx.save("verification-stale");
                 throw reason.startsWith("superseded:") ? new CancelledError() : new Error(reason);
               }
@@ -3043,7 +3179,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
             ctx.state.needsHumanReason = undefined;
-            saveReport(ctx, buildReportArtifacts(ctx, false));
+            saveReport(ctx, await renderDeliveryReport(ctx, false));
             await ctx.save("verification-stale");
             throw new Error(reason);
           });
@@ -3065,8 +3201,9 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         ? null
         : await commitAll(cwd, commitMessage(ctx));
     let head = sha ?? (await headSha(cwd));
+    await checkWorkflowPublication(ctx, head);
     if (success || blocked || ctx.state.phase === "deliver") await assertDeliveryHead(ctx, head);
-    ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: head });
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: head });
     if (success && ctx.repo.kind === "github" && !ctx.run.deliveryBranch && !review) {
       const baseBranch = ctx.run.baseBranch as string;
       const fetched = await fetchBase(ctx.deps.cfg.paths, ctx.repo, baseBranch, ctx.signal, budget);
@@ -3093,7 +3230,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       if (!ctx.state.rebaseNote && !(await isAncestor(cwd, ctx.run.baseSha as string, await headSha(cwd))))
         note("the branch does not contain the recorded base");
     }
-    const rendered = buildReportArtifacts(ctx, success);
+    const rendered = await renderDeliveryReport(ctx, success);
     const body = publicationText(ctx, stripReportManifest(rendered.report));
     const title = success ? ctx.run.title : draftTitle(ctx);
     // Failed existing-branch rounds only retain a local report; they publish no commits or PR text.
@@ -3141,7 +3278,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             head,
           );
         if (ctx.run.sourceRef?.kind === "pull_request" && typeof ctx.run.sourceRef.number === "number")
-          ctx.run = ctx.store.updateRun(ctx.run.id, {
+          ctx.run = ctx.checkpointer.writeRun(ctx.run.id, {
             prUrl: `https://github.com/${ctx.repo.slug}/pull/${ctx.run.sourceRef.number}`,
           });
       }
@@ -3183,7 +3320,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
       budget,
     });
     await ctx.save("delivery-pr-created");
-    ctx.run = ctx.store.updateRun(ctx.run.id, { prUrl: url });
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { prUrl: url });
     publish();
     ctx.log(`Pull request: ${url}`);
     if (!success) {
@@ -3204,7 +3341,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
         budget,
         privateEntries(ctx, cwd),
       );
-      if (outcome === "merged") ctx.run = ctx.store.updateRun(ctx.run.id, { merged: true });
+      if (outcome === "merged") ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { merged: true });
       summary += ` — ${outcome === "merged" ? "merged" : outcome === "auto" ? "auto-merge enabled" : `merge failed (left open)${outcome === "unavailable" ? ": GitHub unavailable" : ""}`}`;
       ctx.log(summary, outcome === "failed" || outcome === "unavailable" ? "warn" : "info");
     } else {
@@ -3234,6 +3371,34 @@ export type { RunState };
 
 class MergeRegressedError extends Error {}
 
+function finalizePostMergeRejection(ctx: RunContext, reason: string): RunStatus {
+  // Rollback and draft reporting await Git operations after publishing needs_human.
+  // Keep any terminal decision recorded meanwhile; the read and write must stay synchronous.
+  const current = ctx.store.getRun(ctx.run.id);
+  if (current && current.status !== "needs_human" && TERMINAL_STATUSES.includes(current.status))
+    return current.status;
+  return ctx.checkpointer.writeRun(ctx.run.id, {
+    status: "needs_human",
+    error: reason.slice(0, 2000),
+    finishedAt: Date.now(),
+  }).status;
+}
+
+async function rollbackRejectedMerge(ctx: RunContext): Promise<never> {
+  const rejected = ctx.state.postMergeRejection;
+  const cwd = ctx.state.worktreePath;
+  if (!rejected || !cwd) throw new Error("Missing rejected post-merge rollback details");
+  await mergeGit(cwd, ["reset", "--hard", rejected.head]);
+  await mergeGit(cwd, ["clean", "-fdq"]);
+  ctx.state.lastGates = ctx.state.preRebaseGates ?? ctx.state.lastGates;
+  ctx.state.pendingRebaseSha = undefined;
+  ctx.state.preRebaseGates = undefined;
+  ctx.state.preRebaseHead = undefined;
+  ctx.state.needsHumanReason = rejected.reason;
+  ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: rejected.head }, ctx.state);
+  throw new NeedsHumanError(rejected.reason);
+}
+
 /** Merge the pinned base, retaining the previously gated head for regression fallback. */
 async function mergeForDelivery(
   ctx: RunContext,
@@ -3248,6 +3413,7 @@ async function mergeForDelivery(
   );
   if (!ctx.state.pendingRebaseSha) {
     ctx.state.pendingRebaseSha = fetched;
+    ctx.state.postMergeGates = undefined;
     ctx.state.preRebaseGates = ctx.state.lastGates ?? [];
     ctx.state.preRebaseHead = head;
     await ctx.save();
@@ -3256,7 +3422,9 @@ async function mergeForDelivery(
   if (!before) throw new Error("Missing pre-merge HEAD");
   const env = gateEnv();
   const resuming = (await resumeGateExecution(ctx, "gates", "rebase", cwd, env))?.kind === "inplace";
-  const conflicts = await prepareMerge(cwd, before, fetched);
+  // A merge committed before a restart is only validated below, never prepared again.
+  const merging = (await headSha(cwd)) === before;
+  const conflicts = merging ? await prepareMerge(cwd, before, fetched) : [];
   if (conflicts.length) {
     ctx.state.conflictFiles = conflicts;
     ctx.state.round++;
@@ -3268,14 +3436,40 @@ async function mergeForDelivery(
     );
     ctx.state.phase = "loop";
     ctx.state.githubWait = undefined;
-    ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { baseSha: fetched, headSha: before }, ctx.state);
     return "conflict";
   }
-  if ((await headSha(cwd)) === before)
-    await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
+  if (merging) await completeMerge(cwd, before, fetched, mergeMessage(ctx, fetched), commitIdentity(ctx));
   await validateMerge(cwd, before, fetched);
   if (!resuming) await checkoutCommitted(cwd);
   const previous = ctx.state.preRebaseGates ?? [];
+  const sha = await headSha(cwd);
+  const saved = ctx.state.postMergeGates;
+  if (
+    !saved ||
+    saved.sha !== sha ||
+    saved.base !== fetched ||
+    saved.head !== before ||
+    saved.round !== ctx.state.round
+  ) {
+    ctx.state.postMergeGates = {
+      sha,
+      base: fetched,
+      head: before,
+      round: ctx.state.round,
+      // Bound coordinator confirmation slot wait and execution from this merge attempt's start.
+      deadline:
+        Date.now() +
+        (ctx.state.gatesConfig?.checks.reduce(
+          (sum, c) => sum + (c.timeoutSec ?? 900),
+          ctx.state.gatesConfig.setup.length * 900,
+        ) ?? 900) *
+          3_000,
+    };
+    await ctx.save();
+  }
+  const attempt = ctx.state.postMergeGates;
+  if (!attempt) throw new Error("Missing post-merge attempt");
   const postMergeScope = <T>(fn: () => Promise<T>) =>
     gateSlotScope(gateCommandScope(ctx, "gates", "rebase", cwd, fn));
   try {
@@ -3286,80 +3480,121 @@ async function mergeForDelivery(
           cwd,
           assertDistinctGateNames(ctx.state.gatesConfig as GateConfig),
           fetched,
-          await headSha(cwd),
+          sha,
         );
-        ctx.event({
-          runId: ctx.run.id,
-          type: "gate",
-          level: "info",
-          message: `Post-merge gate selection: ${JSON.stringify(redactGateData(docs.selection))}`,
-          data: docs.selection,
-        });
-        const timeoutOnly = (run: GateRun) =>
-          run.setupOk &&
-          ![...run.setup, ...run.checks].some(confinementFailed) &&
-          run.checks.some((r) => r.timedOut) &&
-          run.checks.every((r) => r.ok || r.timedOut || r.docsOnly?.mode === "skipped");
-        let after = await runGateExecution(ctx, "gates", "rebase", cwd, docs.gates, gateEvents(ctx), env);
-        ctx.checkCancelled();
-        if (timeoutOnly(after)) {
-          const first = after;
-          ctx.artifact(
-            `gates-rebase-timeout-${ctx.state.round}.json`,
-            "gates",
-            JSON.stringify(redactGateData(first)),
-          );
-          await checkoutCommitted(cwd);
-          after = await runGateExecution(ctx, "gates", "timeout", cwd, docs.gates, gateEvents(ctx));
-          ctx.checkCancelled();
-          after.checks = after.checks.map((r) => ({
-            ...r,
-            firstAttempt: findGateCounterpart(r, after.checks, first.checks),
-          }));
-        }
-        // A check fixed by the implementation must stay fixed after merging, even when
-        // it failed on the original base. Persist that regression in the evidence too.
-        const reference = previous.length
-          ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
-          : (ctx.state.baseline ?? null);
-        after = docs.annotate(after);
-        const initial = compareGates(reference, after).map((c) => ({
-          ...c,
-          firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
-        }));
-        const events = gateEvents(ctx);
-        const comparison = await retryRegressions(
-          initial,
-          cwd,
-          docs.gates,
-          [],
-          ctx.signal,
-          events.onWait,
-          (retry, options) =>
-            runGateExecution(
-              ctx,
-              "gates",
-              options?.targeted ? "regression-retry-targeted" : "regression-retry",
+        const checked =
+          attempt.result ??
+          (await (async () => {
+            const workers = new Map<string, string | null | undefined>();
+            const execute = (purpose: string, gates: GateConfig, hooks: GateHooks = gateEvents(ctx)) =>
+              runGateExecution(ctx, "gates", purpose, cwd, gates, hooks, env, (handle, run) => {
+                const worker = postMergeWorker(ctx, handle);
+                for (const check of [...gates.checks, ...run.setup]) workers.set(check.name, worker);
+              });
+            ctx.event({
+              runId: ctx.run.id,
+              type: "gate",
+              level: "info",
+              message: `Post-merge gate selection: ${JSON.stringify(redactGateData(docs.selection))}`,
+              data: docs.selection,
+            });
+            const timeoutOnly = (run: GateRun) =>
+              run.setupOk &&
+              ![...run.setup, ...run.checks].some(confinementFailed) &&
+              run.checks.some((r) => r.timedOut) &&
+              run.checks.every((r) => r.ok || r.timedOut || r.docsOnly?.mode === "skipped");
+            let after = await execute("rebase", docs.gates);
+            ctx.checkCancelled();
+            if (timeoutOnly(after)) {
+              const first = after;
+              ctx.artifact(
+                `gates-rebase-timeout-${ctx.state.round}.json`,
+                "gates",
+                JSON.stringify(redactGateData(first)),
+              );
+              await checkoutCommitted(cwd);
+              after = await execute("timeout", docs.gates);
+              ctx.checkCancelled();
+              after.checks = after.checks.map((r) => {
+                const original = findGateCounterpart(r, after.checks, first.checks);
+                return {
+                  ...(original?.timedOut ? validateRetry(r, original, sha, after) : r),
+                  firstAttempt: original,
+                };
+              });
+            }
+            // A check fixed by the implementation must stay fixed after merging, even when
+            // it failed on the original base. Persist that regression in the evidence too.
+            const reference = previous.length
+              ? { setupOk: true, setup: [], checks: previous.map((c) => c.result) }
+              : (ctx.state.baseline ?? null);
+            after = docs.annotate(after);
+            const initial = compareGates(reference, after).map((c) => ({
+              ...c,
+              firstAttempt: c.result.firstAttempt?.ok ? undefined : c.result.firstAttempt,
+              ...(c.result.firstAttempt?.timedOut
+                ? {
+                    retryOriginal: compareGates(reference, {
+                      setupOk: true,
+                      setup: [],
+                      checks: [c.result.firstAttempt],
+                    }).map(({ verdict, blocking }) => ({ verdict, blocking }))[0],
+                  }
+                : {}),
+            }));
+            const events = gateEvents(ctx);
+            const comparison = await retryRegressions(
+              initial,
               cwd,
-              retry,
-              { ...events, skipGateSlot: options?.skipGateSlot, fallbackSetup: docs.gates.setup },
-            ),
-          ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
-          (c) => isSlowRegression(c, initial, reference?.checks ?? []),
+              docs.gates,
+              [],
+              ctx.signal,
+              events.onWait,
+              (retry, options) =>
+                execute(options?.targeted ? "regression-retry-targeted" : "regression-retry", retry, {
+                  ...events,
+                  skipGateSlot: options?.skipGateSlot,
+                  fallbackSetup: docs.gates.setup,
+                }),
+              ctx.deps.gateExecutor?.freshCheckoutFor?.(ctx.repo.slug),
+              (c) => isSlowRegression(c, initial, reference?.checks ?? []),
+            );
+            ctx.checkCancelled();
+            for (const c of comparison) {
+              if (!c.firstAttempt || c.result === initial.find((before) => before.name === c.name)?.result)
+                continue;
+              const before = findGateCounterpart(c, comparison, reference?.checks ?? []);
+              if (!before) continue;
+              ctx.event({
+                runId: ctx.run.id,
+                type: "gate",
+                level: "warn",
+                message: `${c.name} post-merge re-check: ran ${(c.firstAttempt.durationMs / before.durationMs).toFixed(1)}x its pre-merge time (${c.firstAttempt.durationMs / 1000}s vs ${before.durationMs / 1000}s): ${c.verdict === "flaky" ? "pass (flaky, not blocking)" : "FAIL again"}`,
+                data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
+              });
+            }
+            attempt.result = redactGateData({
+              setupOk: after.setupOk,
+              timedOut: timeoutOnly(after),
+              comparison: redactPostMergeComparisons(comparison, Object.fromEntries(workers)),
+            });
+            consumeGateExecution(ctx);
+            await ctx.save("post-merge-confirmation-pending");
+            return attempt.result;
+          })());
+        ctx.checkCancelled();
+        const { setupOk, timedOut, comparison } = checked;
+        await confirmPostMerge(ctx, cwd, docs.gates, comparison, attempt.deadline, sha, () =>
+          ctx.save("post-merge-confirmed"),
         );
         ctx.checkCancelled();
         for (const c of comparison) {
-          if (!c.firstAttempt || c.result === initial.find((before) => before.name === c.name)?.result)
-            continue;
-          const before = findGateCounterpart(c, comparison, reference?.checks ?? []);
-          if (!before) continue;
-          ctx.event({
-            runId: ctx.run.id,
-            type: "gate",
-            level: "warn",
-            message: `${c.name} post-merge re-check: ran ${(c.firstAttempt.durationMs / before.durationMs).toFixed(1)}x its pre-merge time (${c.firstAttempt.durationMs / 1000}s vs ${before.durationMs / 1000}s): ${c.verdict === "flaky" ? "pass (flaky, not blocking)" : "FAIL again"}`,
-            data: { flaky: c.verdict === "flaky", firstAttempt: c.firstAttempt, retry: c.result },
-          });
+          const confirmation = c.coordinatorConfirmation;
+          if (confirmation)
+            ctx.log(
+              `${c.name} post-merge coordinator confirmation (${confirmation.worker ?? "unknown worker"}): ${confirmation.reason}`,
+              "warn",
+            );
         }
         await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
         await mergeGit(cwd, ["clean", "-fdq"]);
@@ -3371,7 +3606,7 @@ async function mergeForDelivery(
           JSON.stringify(redactGateData(comparison), null, 2),
         );
         const regressed =
-          !after.setupOk ||
+          !setupOk ||
           comparison.some((c) => c.blocking) ||
           previous.some((c) => {
             const current = findGateCounterpart(c, previous, comparison)?.result;
@@ -3379,7 +3614,14 @@ async function mergeForDelivery(
           });
         if (regressed)
           throw new MergeRegressedError(
-            timeoutOnly(after) ? "post-merge gate timed out" : "post-merge gates regressed",
+            (timedOut ? "post-merge gate timed out" : "post-merge gates regressed") +
+              comparison
+                .filter((c) => c.blocking && c.coordinatorConfirmation)
+                .map((c) => {
+                  const confirmation = c.coordinatorConfirmation;
+                  return `\n${c.name} coordinator confirmation (${confirmation?.worker ?? "unknown worker"}): ${confirmation?.reason}\n${confirmation?.result ? formatGateOutput(confirmation.result, 9_000) : ""}`;
+                })
+                .join(""),
           );
         return { summary: `${comparison.length} post-merge checks ok`, value: undefined };
       }),
@@ -3387,14 +3629,20 @@ async function mergeForDelivery(
     );
   } catch (error) {
     if (!(error instanceof MergeRegressedError)) throw error;
-    await mergeGit(cwd, ["reset", "--hard", before]);
-    await mergeGit(cwd, ["clean", "-fdq"]);
-    ctx.state.lastGates = previous;
-    ctx.state.pendingRebaseSha = undefined;
-    ctx.state.preRebaseGates = undefined;
-    ctx.state.preRebaseHead = undefined;
-    ctx.run = ctx.store.updateRun(ctx.run.id, { headSha: await headSha(cwd) }, ctx.state);
-    throw new NeedsHumanError(`${error.message} after merging onto ${fetched.slice(0, 8)}`);
+    ctx.state.postMergeRejection = {
+      reason: redactGateOutput(`${error.message} after merging onto ${fetched.slice(0, 8)}`),
+      sha,
+      base: fetched,
+      head: before,
+      round: ctx.state.round,
+    };
+    ctx.state.needsHumanReason = ctx.state.postMergeRejection.reason;
+    ctx.run = ctx.checkpointer.writeRun(
+      ctx.run.id,
+      { status: "needs_human", error: ctx.state.needsHumanReason.slice(0, 2000), finishedAt: Date.now() },
+      ctx.state,
+    );
+    return rollbackRejectedMerge(ctx);
   }
   const merged = await validateMerge(cwd, before, fetched);
   if (ctx.state.reviewedSha) {
@@ -3410,6 +3658,10 @@ async function mergeForDelivery(
   ctx.state.pendingRebaseSha = undefined;
   ctx.state.preRebaseGates = undefined;
   ctx.state.preRebaseHead = undefined;
-  ctx.run = ctx.store.updateRun(ctx.run.id, { baseSha: fetched, headSha: await headSha(cwd) }, ctx.state);
+  ctx.run = ctx.checkpointer.writeRun(
+    ctx.run.id,
+    { baseSha: fetched, headSha: await headSha(cwd) },
+    ctx.state,
+  );
   return "done";
 }

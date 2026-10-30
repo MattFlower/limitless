@@ -183,7 +183,7 @@ export interface RunResolution {
 }
 
 /** Blocking audit rules a requester may explicitly allow. */
-export type AuditAllowance = "submodules" | "gitattributes" | "binary";
+export type AuditAllowance = "submodules" | "gitattributes" | "binary" | "workflows";
 
 export interface Stage {
   id: number;
@@ -449,7 +449,13 @@ export interface RoutingChange {
   by: string;
 }
 
+export type EpicAttention = {
+  state: "unfiled" | "needs_approval" | "ready_for_acceptance";
+  items: string[];
+};
+
 export type FeedKind =
+  | "queue.epic_attention"
   | `ci.${"round_started" | "round_delivered" | "fix_cap_reached"}`
   | `conflict.${"round_started" | "round_delivered"}`
   | "run.warning"

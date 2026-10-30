@@ -23,7 +23,7 @@ export type AgentPublication = Required<
     | "privateStringsDigest"
   >
 > &
-  Pick<AgentJobRequest, "uiUrl">;
+  Pick<AgentJobRequest, "uiUrl" | "allow">;
 
 export interface AgentPublicationHooks {
   started(id: string): Promise<void>;

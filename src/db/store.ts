@@ -13,6 +13,7 @@ import type {
   ChatProposalFields,
   CiFailure,
   CreateRunRequest,
+  EpicAttention,
   EvalRun,
   EvalTrial,
   EventType,
@@ -56,11 +57,13 @@ import { redactGateOutput } from "../gates/output.ts";
 import { githubWait } from "../git/github-wait.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { PrSnapshot } from "../integrations/github-poller.ts";
+import { leaseMethods } from "../integrations/lease-store.ts";
 import type { RunState } from "../pipeline/context.ts";
 import type { ModelDef } from "../router/catalog.ts";
 import { protectDatabase } from "../util/private-reads.ts";
 import { type ProcessCleanup, type ProcessDiscovery, redactCredentials } from "../util/proc.ts";
 import { activity } from "../util/stall.ts";
+import { FailureObservations, type ObservationFilter } from "./failure-observations.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
 
@@ -337,15 +340,54 @@ export interface AgentGateRecord {
   comparison: unknown;
 }
 
-/** Issue numbers named by standalone `Closes #N` directives. */
-export const closedIssues = (prompt: string) =>
-  new Set([...prompt.matchAll(/\bcloses\s+#([1-9][0-9]*)(?![\w#])/gi)].map((m) => Number(m[1])));
+/** Issue numbers named by standalone `Closes #N` directives outside fenced blocks. */
+export function closedIssues(prompt: string): Set<number> {
+  const issues = new Set<number>();
+  let fence: string | undefined;
+  for (const line of prompt.split(/\r?\n/)) {
+    const [, marker, suffix] = /^[^\S\r\n]*(`{3,}|~{3,})(.*)$/.exec(line) ?? [];
+    if (fence) {
+      if (
+        marker &&
+        marker[0] === fence[0] &&
+        marker.length >= fence.length &&
+        /^[^\S\r\n]*$/.test(suffix ?? "")
+      )
+        fence = undefined;
+      continue;
+    }
+    if (marker) {
+      fence = marker;
+      continue;
+    }
+    const directive = /^[^\S\r\n]*closes[^\S\r\n]+#([1-9][0-9]*)[^\S\r\n]*$/i.exec(line);
+    if (directive) {
+      const number = Number(directive[1]);
+      if (Number.isSafeInteger(number)) issues.add(number);
+    }
+  }
+  return issues;
+}
 
 /** Follow admission rules: GitHub prompt text cannot add issue links. */
 export function linkedIssues(
-  run: Pick<Run, "sourceRef" | "source" | "prompt" | "repoSlug">,
+  run: Pick<Run, "sourceRef" | "source" | "prompt" | "repoSlug"> & Partial<Pick<Run, "id">>,
+  store: Store,
 ): { repo: string; number: number }[] {
+  const owner = run.id && store.issueLinkOwner(run.id);
+  if (owner) return issueLinks(owner);
+  return issueLinks(run);
+}
+
+type IssueLinkRun = Pick<Run, "sourceRef" | "source" | "prompt" | "repoSlug">;
+export type IssueRunSummary = Pick<Run, "id" | "status" | "createdAt" | "finishedAt"> & {
+  ownerId?: string;
+  ownerState?: Pick<Run, "status" | "finishedAt">;
+};
+
+function issueLinks(run: IssueLinkRun): { repo: string; number: number }[] {
   const ref = run.sourceRef;
+  if (ref?.kind === "review-round") return [];
   if (ref?.kind === "issue")
     return typeof ref.repo === "string" &&
       typeof ref.number === "number" &&
@@ -370,8 +412,25 @@ export class IssueClaimed extends Error {
     super(`Issue ${repo}#${number} is claimed by run ${run.id}`);
   }
 }
+export type GitHubComment = { repo: string; id: number };
+export class CommentProcessed extends Error {}
 
 const RUN_SELECT = "SELECT runs.*, repos.slug AS repo_slug FROM runs JOIN repos ON repos.id = runs.repo_id";
+
+export const LATEST_ISSUE_RUNS_SQL = `WITH RECURSIVE linked(id, owner, source, source_ref, prompt, repo_slug) AS (
+  SELECT runs.id, runs.id, runs.source, runs.source_ref, runs.prompt, repos.slug
+  FROM runs JOIN repos ON repos.id = runs.repo_id
+  WHERE (runs.repo_id IN (SELECT id FROM repos WHERE lower(slug) = lower(?1))
+    OR lower(json_extract(runs.source_ref, '$.repo')) = lower(?1))
+    AND NOT EXISTS (SELECT 1 FROM review_rounds WHERE run_id = runs.id)
+  UNION ALL
+  SELECT rr.run_id, linked.owner, linked.source, linked.source_ref, linked.prompt, linked.repo_slug
+  FROM linked JOIN review_rounds rr ON rr.source_run_id = linked.id
+) SELECT runs.id, runs.status, runs.created_at AS createdAt, runs.finished_at AS finishedAt,
+  linked.owner, owner.status AS ownerStatus, owner.finished_at AS ownerFinishedAt,
+  linked.source, linked.source_ref, linked.prompt, linked.repo_slug
+FROM linked CROSS JOIN runs ON runs.id = linked.id JOIN runs owner ON owner.id = linked.owner
+ORDER BY runs.created_at DESC, runs.rowid DESC`;
 
 export interface RunPatch {
   title?: string;
@@ -460,6 +519,20 @@ function buildUpdate(patch: object, columns: Record<string, string>): { sets: st
 }
 
 export class Store {
+  private readonly leases = leaseMethods(this);
+  readonly leaseRow = this.leases.leaseRow;
+  readonly beginLeaseIntent = this.leases.beginLeaseIntent;
+  readonly setLeaseIntentCommit = this.leases.setLeaseIntentCommit;
+  readonly confirmLease = this.leases.confirmLease;
+  readonly dropLeaseIntent = this.leases.dropLeaseIntent;
+  readonly markLeaseLost = this.leases.markLeaseLost;
+  readonly forgetLease = this.leases.forgetLease;
+  readonly leaseRowsWithIntent = this.leases.leaseRowsWithIntent;
+  readonly heldLeaseRows = this.leases.heldLeaseRows;
+  readonly observations = new FailureObservations(this);
+  failureObservations(filter: ObservationFilter = {}) {
+    return this.observations.read(filter);
+  }
   readonly db: Database;
   private listeners = new Set<Listener>();
   private pendingPublications: StreamMessage[] | null = null;
@@ -798,13 +871,13 @@ export class Store {
   }
 
   /** Buffer publications until the outermost store transaction commits; discard them on rollback. */
-  transaction<T>(fn: () => T): T {
+  transaction<T>(fn: () => T, immediate = false): T {
     if (this.pendingPublications) return fn();
     const messages: StreamMessage[] = [];
     this.pendingPublications = messages;
     let result: T;
     try {
-      result = this.db.transaction(fn)();
+      result = this.db.transaction(fn)[immediate ? "immediate" : "deferred"]();
     } finally {
       this.pendingPublications = null;
     }
@@ -1191,13 +1264,15 @@ export class Store {
     req: CreateRunRequest,
     verifiedGitHubWebhook = false,
     admission?: () => string | null,
+    comment?: GitHubComment,
   ): Run {
     if (req.sourceRef?.kind === "review-round")
       throw new Error("review rounds are created only by a review verdict");
-    return this.transaction(() => {
+    const result = this.transaction(() => {
+      if (comment && this.githubCommentProcessed(comment))
+        throw new CommentProcessed("Comment already processed");
       const refusal = admission?.();
       if (refusal) throw new Error(`Run admission refused: ${refusal}`);
-      const claims: { repo: string; number: number }[] = [];
       if (req.sourceRef?.kind === "issue") {
         const { repo, number } = req.sourceRef;
         if (
@@ -1207,14 +1282,99 @@ export class Store {
           number <= 0
         )
           throw new Error("issue sourceRef requires a repository and positive issue number");
-        claims.push({ repo, number });
-      } else if (req.source !== "github")
-        claims.push(...[...closedIssues(req.prompt)].map((number) => ({ repo: repo.slug, number })));
-      for (const claim of claims) {
-        const run = this.issueClaim(claim.repo, claim.number);
-        if (run) throw new IssueClaimed(claim.repo, claim.number, run);
       }
-      return this.insertRun(repo, req, verifiedGitHubWebhook);
+      for (const claim of linkedIssues(
+        {
+          prompt: req.prompt,
+          source: req.source ?? "ui",
+          sourceRef: req.sourceRef ?? null,
+          repoSlug: repo.slug,
+        },
+        this,
+      )) {
+        const run = this.issueClaim(claim.repo, claim.number);
+        if (run) {
+          const error = new IssueClaimed(claim.repo, claim.number, run);
+          if (!comment) throw error;
+          this.recordGitHubComment(comment, null, redactCredentials(error.message));
+          return error;
+        }
+      }
+      const run = this.insertRun(repo, req, verifiedGitHubWebhook);
+      if (comment) this.recordGitHubComment(comment, run.id, null);
+      return run;
+    });
+    // A final refusal must commit its record before surfacing the existing claim error.
+    if (result instanceof IssueClaimed) throw result;
+    return result;
+  }
+
+  githubCommentProcessed(comment: GitHubComment): boolean {
+    return !!this.db
+      .query("SELECT 1 FROM github_processed_comments WHERE repo = ? AND comment_id = ?")
+      .get(comment.repo.toLowerCase(), comment.id);
+  }
+
+  recordGitHubComment(comment: GitHubComment, run: string | null, note: string | null): void {
+    this.db
+      .query(`INSERT ${run ? "" : "OR IGNORE "}INTO github_processed_comments
+      (repo, comment_id, outcome, run_id, note, processed_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(comment.repo.toLowerCase(), comment.id, run ? "run" : "refused", run, note, Date.now());
+  }
+
+  githubCommentBoundary(repo: string, initial?: string): string | null {
+    if (initial)
+      this.db
+        .query("INSERT OR IGNORE INTO github_comment_boundaries VALUES (?, ?)")
+        .run(repo.toLowerCase(), initial);
+    return (
+      (
+        this.db
+          .query("SELECT github_at FROM github_comment_boundaries WHERE repo = ?")
+          .get(repo.toLowerCase()) as { github_at: string } | null
+      )?.github_at ?? null
+    );
+  }
+
+  /** Reconcile only a fully fetched repository snapshot; undefined observations preserve prior state. */
+  reconcileEpicAttention(
+    repo: string,
+    observations: ReadonlyMap<number, EpicAttention | null | undefined>,
+  ): void {
+    repo = repo.toLowerCase();
+    this.transaction(() => {
+      const saved = this.db
+        .query<{ epic: number; state: string }, [string]>(
+          "SELECT epic, state FROM queue_epic_attention WHERE repo = ?",
+        )
+        .all(repo);
+      const previous = new Map(saved.map((r) => [r.epic, r.state]));
+      for (const row of saved) {
+        if (!observations.has(row.epic) || observations.get(row.epic) === null)
+          this.db.query("DELETE FROM queue_epic_attention WHERE repo = ? AND epic = ?").run(repo, row.epic);
+      }
+      for (const [epic, attention] of observations) {
+        if (!attention || previous.get(epic) === attention.state) continue;
+        this.db
+          .query("INSERT OR REPLACE INTO queue_epic_attention VALUES (?, ?, ?)")
+          .run(repo, epic, attention.state);
+        const data = {
+          repo: redactCredentials(repo),
+          epic,
+          state: attention.state,
+          items: attention.items.map(redactCredentials),
+        };
+        this.addFeedItems([
+          {
+            kind: "queue.epic_attention",
+            runId: null,
+            repo: data.repo,
+            summary: `Epic #${epic}: ${attention.state}`,
+            data,
+            key: crypto.randomUUID(),
+          },
+        ]);
+      }
     });
   }
 
@@ -1225,15 +1385,14 @@ export class Store {
       WHERE runs.status IN (${ISSUE_CLAIM_STATUSES.map(() => "?").join(",")}) AND (
         (json_extract(runs.source_ref, '$.kind') = 'issue' AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
           AND json_extract(runs.source_ref, '$.number') = ?)
-        OR (lower(repos.slug) = lower(?) AND runs.prompt LIKE '%closes%'))`)
+        OR (lower(repos.slug) = lower(?) AND runs.prompt LIKE '%closes%')
+        OR runs.id IN (SELECT run_id FROM review_rounds))`)
       .all(...ISSUE_CLAIM_STATUSES, repo, number, repo) as Row[];
     return (
       candidates
         .map(toRun)
         .find((run) =>
-          run.sourceRef?.kind === "issue"
-            ? same(run.sourceRef.repo) && run.sourceRef.number === number
-            : run.source !== "github" && same(run.repoSlug) && closedIssues(run.prompt).has(number),
+          linkedIssues(run, this).some((issue) => same(issue.repo) && issue.number === number),
         ) ?? null
     );
   }
@@ -1327,35 +1486,70 @@ export class Store {
       AND ((json_extract(runs.source_ref, '$.kind') = 'issue'
         AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
         AND json_extract(runs.source_ref, '$.number') = ?)
-        OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%'))`)
+        OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%')
+        OR runs.id IN (SELECT run_id FROM review_rounds))`)
       .all(run.createdAt, run.createdAt, run.id, repo, number, repo) as Row[];
     return !rows
       .map(toRun)
       .some((candidate) =>
-        linkedIssues(candidate).some(
+        linkedIssues(candidate, this).some(
           (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
         ),
       );
   }
 
   latestIssueRun(repo: string, number: number): Run | null {
-    const rows = this.db
-      .query(`${RUN_SELECT} WHERE
-      (json_extract(runs.source_ref, '$.kind') = 'issue'
-        AND lower(json_extract(runs.source_ref, '$.repo')) = lower(?)
-        AND json_extract(runs.source_ref, '$.number') = ?)
-      OR (lower(repos.slug) = lower(?) AND runs.source != 'github' AND runs.prompt LIKE '%closes%')
-      ORDER BY runs.created_at DESC, runs.rowid DESC`)
-      .all(repo, number, repo) as Row[];
-    return (
-      rows
-        .map(toRun)
-        .find((run) =>
-          linkedIssues(run).some(
-            (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
-          ),
-        ) ?? null
-    );
+    const latest = this.latestIssueRuns(repo, [number]).get(number);
+    return latest ? this.getRun(latest.id) : null;
+  }
+
+  /** Ownership-only lookup for live publications; never hydrate an owner's full state. */
+  issueLinkOwner(id: string): IssueLinkRun | null {
+    const row = this.db
+      .query(`WITH RECURSIVE owners(id) AS (
+      SELECT source_run_id FROM review_rounds WHERE run_id = ?
+      UNION ALL SELECT rr.source_run_id FROM owners JOIN review_rounds rr ON rr.run_id = owners.id
+    ) SELECT runs.source, runs.source_ref, runs.prompt, repos.slug AS repoSlug
+      FROM owners JOIN runs ON runs.id = owners.id JOIN repos ON repos.id = runs.repo_id
+      WHERE NOT EXISTS (SELECT 1 FROM review_rounds WHERE run_id = runs.id)`)
+      .get(id) as (IssueLinkRun & { source_ref: string | null }) | null;
+    return row ? { ...row, sourceRef: parse(row.source_ref, null) } : null;
+  }
+
+  /** Roots supply linkage; authoritative round records propagate it, including through nested rounds. */
+  latestIssueRuns(repo: string, numbers: readonly number[]): Map<number, IssueRunSummary> {
+    const rows = this.db.query(LATEST_ISSUE_RUNS_SQL).all(repo) as (IssueRunSummary & {
+      owner: string;
+      ownerStatus: Run["status"];
+      ownerFinishedAt: number | null;
+      source: Run["source"];
+      source_ref: string | null;
+      prompt: string;
+      repo_slug: string;
+    })[];
+    const wanted = new Set(numbers);
+    const latest = new Map<number, IssueRunSummary>();
+    for (const row of rows) {
+      for (const issue of issueLinks({
+        ...row,
+        sourceRef: parse(row.source_ref, null),
+        repoSlug: row.repo_slug,
+      }))
+        if (
+          issue.repo.toLowerCase() === repo.toLowerCase() &&
+          wanted.has(issue.number) &&
+          !latest.has(issue.number)
+        )
+          latest.set(issue.number, {
+            id: row.id,
+            ownerId: row.owner,
+            ownerState: { status: row.ownerStatus, finishedAt: row.ownerFinishedAt },
+            status: row.status,
+            createdAt: row.createdAt,
+            finishedAt: row.finishedAt,
+          });
+    }
+    return latest;
   }
 
   /** `round`: the review handler's grant; such a run's prompt quotes findings, so it allows nothing itself. */
@@ -2084,8 +2278,16 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     state?: unknown,
     excludeFromSupersession: readonly string[] = [],
   ): Run {
-    if (patch.merged && !this.pendingPublications)
-      return this.transaction(() => this.updateRun(id, patch, state, excludeFromSupersession));
+    const terminal = patch.status && TERMINAL_STATUSES.includes(patch.status);
+    if ((patch.merged || terminal) && !this.pendingPublications)
+      return this.transaction(() => this.applyRunUpdate(id, patch, state, excludeFromSupersession), true);
+    return this.applyRunUpdate(id, patch, state, excludeFromSupersession);
+  }
+
+  private applyRunUpdate(
+    ...[id, patch, state, excludeFromSupersession = []]: Parameters<Store["updateRun"]>
+  ): Run {
+    if (patch.status && TERMINAL_STATUSES.includes(patch.status)) this.observations.finalize(id);
     const { sets, values } = buildUpdate(patch, RUN_PATCH_COLUMNS);
     if (state !== undefined) {
       sets.push("state_json = ?");
@@ -2215,15 +2417,20 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
 
   /** A merged run supersedes needs_human runs in its repository that close one of the same issues. */
   supersedeByIssue(merged: Run, exclude: readonly string[] = []): Run[] {
-    const issues = closedIssues(merged.prompt);
-    if (!issues.size) return [];
+    const issues = linkedIssues(merged, this);
+    if (!issues.length) return [];
     const input = { kind: "superseded", ref: merged.prUrl ?? merged.id, by: "system" } as const;
     return this.listRuns({ status: ["needs_human"], repoId: merged.repoId, limit: Number.MAX_SAFE_INTEGER })
       .filter(
         (r) =>
           r.id !== merged.id &&
           !exclude.includes(r.id) &&
-          [...closedIssues(r.prompt)].some((n) => issues.has(n)),
+          linkedIssues(r, this).some((issue) =>
+            issues.some(
+              (other) =>
+                other.repo.toLowerCase() === issue.repo.toLowerCase() && other.number === issue.number,
+            ),
+          ),
       )
       .flatMap((r) => this.resolveRun(r.id, input, { from: ["needs_human"] }) ?? []);
   }

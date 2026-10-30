@@ -147,12 +147,28 @@ export function privateStringsDigest(entries: PrivateStrings): string {
     .digest("hex");
 }
 const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
-const decoded = (text: string) =>
-  text
-    .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
-    // Diagnostics may JSON-quote a field's literal Unicode escapes.
-    .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
-export const base64Runs = /[A-Za-z0-9+/]+=*/g;
+/** Exported for decoder equivalence tests. Each backslash run is consumed once. */
+export function decodeBackslashes(text: string, slashes = true): string {
+  const pieces: string[] = [];
+  let cursor = 0;
+  for (let start = text.indexOf("\\"); start !== -1; ) {
+    let end = start + 1;
+    while (text[end] === "\\") end++;
+    const unicode = /^[uU]([0-9a-f]{4})/i.exec(text.slice(end, end + 5));
+    if ((slashes && text[end] === "/") || unicode) {
+      pieces.push(
+        text.slice(cursor, start),
+        unicode ? String.fromCharCode(Number.parseInt(unicode[1] ?? "", 16)) : "/",
+      );
+      cursor = end + (unicode ? 5 : 1);
+      end = cursor;
+    }
+    start = text.indexOf("\\", end);
+  }
+  return pieces.length ? pieces.join("") + text.slice(cursor) : text;
+}
+const decodePercent = (text: string) =>
+  text.replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString());
 /** The decoded text of a base64 run that holds a protected value; undefined for unrelated runs. */
 export function base64Match(run: string, entries: PrivateStrings): string | undefined {
   const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
@@ -169,22 +185,67 @@ export function base64Match(run: string, entries: PrivateStrings): string | unde
 }
 /** Raw and successively decoded forms, NFKC-normalized and lowercased; null when decoding never settles. */
 export function normalizedLayers(text: string, entries: PrivateStrings = []): string[] | null {
-  const layers = [text];
+  // Repeated log fields and convergence rounds share the same base64 checks.
+  const base64Cache = new Map<string, string>();
+  // base64Match leaves runs too short to hold a protected value unchanged, so the regex skips them.
+  const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
+  const candidates = entries.length
+    ? new RegExp(`(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{${Math.max(1, minimum)},}=*`, "g")
+    : undefined;
   const decodeBase64 = (layer: string) =>
-    layer.replace(base64Runs, (run) => base64Match(run, entries) ?? run);
-  for (let round = 0; round < 5; round++) {
-    // Unrelated runs must not change decoding convergence or cause a refusal.
-    // Keep the text before HTML decoding too, since a protected value can contain a literal reference.
-    const unescaped = decoded(text);
-    const expanded = decodeHTML(unescaped);
-    // Keep line breaks too: report quotations and multiline credentials depend on them.
-    layers.push(unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
-    const next = decodeBase64(expanded);
-    if (next === text) return [...layers, next].map(normalize);
-    layers.push(next);
-    text = next;
+    candidates
+      ? layer.replace(candidates, (run) => {
+          let decoded = base64Cache.get(run);
+          if (decoded === undefined) {
+            decoded = base64Match(run, entries) ?? run;
+            base64Cache.set(run, decoded);
+          }
+          return decoded;
+        })
+      : layer;
+  const rounds = (current: string, slashes: boolean): string[] | null => {
+    const layers = [current];
+    for (let round = 0; round < 5; round++) {
+      // Unrelated runs must not change decoding convergence or cause a refusal.
+      // Keep the text before backslash and HTML decoding too, since a protected value can contain either.
+      const percentDecoded = decodePercent(current);
+      const unescaped = decodeBackslashes(percentDecoded, slashes);
+      const expanded = decodeHTML(unescaped);
+      // Keep line breaks too: report quotations and multiline credentials depend on them.
+      layers.push(percentDecoded, unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
+      const next = decodeBase64(expanded);
+      if (next === current) return [...layers, next];
+      layers.push(next);
+      current = next;
+    }
+    return null;
+  };
+  // A protected value can contain a literal backslash-slash, so the rounds that keep "\/" still run. The
+  // rounds that decode it differ only once a layer holds "\/".
+  const kept = rounds(text, false);
+  const slashed = kept?.some((layer) => layer.includes("\\/")) ? rounds(text, true) : kept;
+  if (!kept || !slashed) return null;
+  const all = kept === slashed ? kept : [...kept, ...slashed];
+  const normalized = new Map([...new Set(all)].map((layer) => [layer, normalize(layer)]));
+  return all.map((layer) => normalized.get(layer) ?? "");
+}
+function stripPartialEscapes(text: string): string {
+  let end = text.length;
+  while (end > 0) {
+    const last = text[end - 1];
+    if (last === "%" || last === "\\" || last === "\ufffd") {
+      end--;
+      continue;
+    }
+    // Look behind at most three hex digits; consume backslashes individually to avoid ambiguity.
+    let start = end;
+    while (start > 0 && end - start < 3 && "0123456789abcdefABCDEF".includes(text.charAt(start - 1))) start--;
+    if (end - start <= 1 && text[start - 1] === "%") end = start - 1;
+    else if ((text[start - 1] === "u" || text[start - 1] === "U") && text[start - 2] === "\\")
+      end = start - 2;
+    else break;
   }
-  return null;
+  return text.slice(0, end);
 }
 /** A clipped value also protects any trailing fragment of a private string. */
 export function privateMatches(text: string, entries: PrivateStrings, truncated = false): PrivateStrings {
@@ -196,7 +257,7 @@ export function privateMatches(text: string, entries: PrivateStrings, truncated 
         if (layer.includes(protectedText)) return true;
         if (!truncated) return false;
         // A cutoff can split an escape or a UTF-8 percent sequence, hiding the decoded tail.
-        const tails = [layer, layer.replace(/(?:%[0-9a-f]?|\\+u[0-9a-f]{0,3}|\\+|\ufffd)+$/i, "")];
+        const tails = [layer, stripPartialEscapes(layer)];
         return tails.some((tail) => {
           for (let length = 1; length < protectedText.length && length <= tail.length; length++)
             if (tail.endsWith(protectedText.slice(0, length))) return true;

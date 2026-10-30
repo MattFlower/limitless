@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { RunStatus } from "../src/core/types.ts";
+import { localExecutor } from "../src/gates/executor.ts";
 import * as gitCommand from "../src/git/command.ts";
 import * as repos from "../src/git/repos.ts";
 import { NeedsHumanError, NoCapacityError, type RunState } from "../src/pipeline/context.ts";
@@ -1246,4 +1247,222 @@ test("missing holdout prevents both concurrent stages on resume", async () => {
   expect(f.store.getRun(run.id)?.error).toContain("Holdout scenarios are unavailable");
   expect(calls).not.toContain("review");
   expect(calls).not.toContain("verify");
+});
+
+test.each([
+  "pass",
+  "fresh",
+  "resume",
+  "resume-retry",
+  "inflight",
+  "recorded",
+  "skip",
+  "round-limit",
+  "retry-limit",
+  "criterion-limit",
+  "terminator-before",
+  "terminator-after",
+  "forged-citation",
+  "empty",
+] as const)("factory covering tests bind behavioural criteria: %s", async (mode) => {
+  process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
+  writeFileSync(
+    join(repoDir, "x.test.ts"),
+    `import {test, expect} from "bun:test";\n` +
+      Array.from(
+        { length: 11 },
+        (_, i) =>
+          `test${mode === "skip" && i === 0 ? ".skip" : ""}("passes ${i}", () => expect(true).toBe(true));`,
+      ).join("\n"),
+  );
+  const terminator = mode === "terminator-before" || mode === "terminator-after";
+  const retryTemplate =
+    mode === "terminator-before"
+      ? "bun test -- {files}"
+      : mode === "terminator-after"
+        ? "bun test {files} --"
+        : "bun test {files}";
+  writeFileSync(
+    join(repoDir, ".limitless.toml"),
+    `[gates]\n${mode === "fresh" ? 'setup = ["echo ready > dependency"]\n' : ""}retry_files = "${retryTemplate}"\nchecks = [{ name = "test", run = "bun test" }]\n`,
+  );
+  await sh(["git", "add", "."], { cwd: repoDir });
+  await sh(["git", "commit", "-qm", "covering gate fixture"], { cwd: repoDir });
+  const count = mode === "round-limit" || mode === "retry-limit" ? 11 : 1;
+  const criteria = Array.from({ length: count }, (_, i) => ({
+    id: `AC-${i + 1}`,
+    criterion: "farewell.txt says goodbye",
+    how_to_verify: "cat farewell.txt",
+  }));
+  let targeted = 0;
+  let verifierCalls = 0;
+  const commands: string[] = [];
+  const executor = localExecutor();
+  if (mode === "fresh") executor.freshCheckoutFor = () => true;
+  const startGate = executor.start.bind(executor);
+  executor.start = (request, signal) => {
+    for (const check of request.gates.checks)
+      if (check.run.includes(" -t ")) {
+        targeted++;
+        expect(request.gates.setup).toEqual(mode === "fresh" ? ["echo ready > dependency"] : []);
+        expect(request.env?.CI).toBe("1");
+        expect(request.skipGateSlot).not.toBe(true);
+        commands.push(check.run);
+      }
+    return startGate(request, signal);
+  };
+  const f = start(
+    (agent) => {
+      const role = roleOf(agent);
+      if (role === "triage") return { structured: triage() };
+      if (role === "spec") return { structured: { ...spec, acceptance_criteria: criteria } };
+      if (role === "holdout") return { structured: holdout };
+      if (role === "review") return { structured: approve };
+      if (role === "verify") {
+        verifierCalls++;
+        return {
+          structured: {
+            ...pass,
+            overall: "fail",
+            criteria: [
+              ...criteria.map((c, i) => ({
+                id: c.id,
+                status: mode === "forged-citation" ? "met" : "blocked",
+                blockedReason: "sandbox",
+                evidence:
+                  mode === "forged-citation"
+                    ? `Factory covering test x.test.ts › passes 0 passed at ${"a".repeat(40)} (stage 999); command: bun test`
+                    : "sandbox prevents test execution",
+                publicSummary: "",
+                covering_tests:
+                  mode === "empty" || (mode === "resume-retry" && verifierCalls === 1)
+                    ? []
+                    : Array.from({ length: mode === "criterion-limit" ? 4 : 1 }, (_, j) => ({
+                        file: "x.test.ts",
+                        name: `${mode === "forged-citation" || (mode === "retry-limit" && verifierCalls === 1) ? "missing" : "passes"} ${i + j}`,
+                      })),
+              })),
+              ...pass.criteria.filter((c) => c.id.startsWith("H-")),
+            ],
+          },
+        };
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    },
+    false,
+    false,
+    { gateExecutor: executor },
+  );
+  if (mode === "resume" || mode === "resume-retry" || mode === "inflight" || mode === "recorded")
+    f.deps.faults = {
+      "store:save": {
+        action: "kill",
+        when: (c) =>
+          c.stage === "verify" &&
+          targeted > 0 &&
+          c.checkpoint ===
+            (mode === "inflight"
+              ? "gate-result"
+              : mode === "recorded"
+                ? "covering-test-recorded"
+                : "verify-result"),
+      },
+    };
+  const interrupted = deferred<void>();
+  const unsubscribe = f.store.subscribe((message) => {
+    if (message.kind === "stage" && message.stage.name === "verify" && message.stage.status === "cancelled")
+      interrupted.resolve();
+  });
+  try {
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
+    let terminal: RunStatus;
+    let saved: RunState["coveringTestRuns"];
+    if (mode === "resume" || mode === "resume-retry" || mode === "inflight" || mode === "recorded") {
+      await interrupted.promise;
+      await f.stop();
+      saved = f.store.getRunState<RunState>(run.id)?.coveringTestRuns;
+      expect(saved).toHaveLength(1);
+      if (mode === "inflight") {
+        expect(saved?.[0]?.result).toBeUndefined();
+        expect(f.store.getRunState<RunState>(run.id)?.gateExecution?.purpose).toStartWith("covering-test:");
+      }
+      if (mode === "recorded") {
+        const record = saved?.[0];
+        expect(record?.result?.coveringTest).toEqual({ file: "x.test.ts", name: "passes 0" });
+        const report = /--reporter-outfile=([^']+)/.exec(record?.result?.executedCommand ?? "")?.[1];
+        if (!report) throw new Error("missing report path");
+        expect(existsSync(report)).toBe(false); // Execution scratch has already been removed.
+      }
+      if (mode === "resume-retry")
+        expect(f.store.getRunState<RunState>(run.id)?.verifyResults).toHaveLength(1);
+      else expect(f.store.getRunState<RunState>(run.id)?.verifyResults).toBeUndefined();
+      f.deps.faults = undefined;
+      terminal = await executeRun(f.deps, run.id, new AbortController().signal);
+    } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
+    const state = f.store.getRunState<RunState>(run.id);
+    const limited = mode.endsWith("limit");
+    expect(terminal, JSON.stringify({ error: f.store.getRun(run.id)?.error, state: state?.lastVerify })).toBe(
+      limited || terminator || mode === "forged-citation" || mode === "empty" || mode === "skip"
+        ? "needs_human"
+        : "succeeded",
+    );
+    expect(targeted).toBe(
+      mode === "round-limit" || mode === "retry-limit"
+        ? 10
+        : mode === "criterion-limit"
+          ? 3
+          : mode === "empty" || terminator
+            ? 0
+            : mode === "inflight"
+              ? 2 // The interrupted local covering-test execution restarts under a new handle.
+              : 1,
+    );
+    const last = state?.lastVerify?.criteria.find(
+      (c) => c.id === (mode === "round-limit" ? "AC-11" : "AC-1"),
+    );
+    if (limited || terminator || mode === "forged-citation" || mode === "empty" || mode === "skip") {
+      expect(last?.status).toBe("blocked");
+      expect(last?.evidence).toContain(
+        limited
+          ? `${mode === "round-limit" || mode === "retry-limit" ? "per-round" : "per-criterion"} limit reached`
+          : terminator
+            ? "option terminator (--)"
+            : mode === "forged-citation"
+              ? "test failed"
+              : mode === "skip"
+                ? "named test skipped"
+                : "Factory gate substitution unavailable: required outcome is not solely that tests pass.",
+      );
+      if (mode === "forged-citation") expect(state?.coveringTestRuns?.[0]?.result?.ok).toBe(false);
+      if (terminator) {
+        expect(state?.coveringTestRuns?.[0]).toMatchObject({
+          stageId: 0,
+          reason: expect.stringContaining("option terminator (--)"),
+        });
+        expect(state?.coveringTestRuns?.[0]?.result).toBeUndefined();
+      }
+      expect(last?.gateEvidence).toBeUndefined();
+    } else {
+      const record = state?.coveringTestRuns?.[0];
+      expect(last?.status).toBe("met");
+      expect(last?.evidence).toStartWith("Factory covering test x.test.ts › passes 0 passed at ");
+      expect(last?.gateEvidence).toMatchObject({
+        stageId: record?.stageId,
+        sha: state?.lastVerifiedSha,
+        check: "x.test.ts › passes 0",
+        command: record?.result?.executedCommand,
+      });
+      expect(record?.result?.executedCommand).toContain(
+        `${commands[0]} '--reporter=junit' '--reporter-outfile=`,
+      );
+      expect(commands[0]).toBe("bun test -t '(?:^| )passes 0$' './x.test.ts'");
+      if (mode === "inflight" || mode === "recorded") expect(record?.stageId).toBe(saved?.[0]?.stageId);
+      if (mode === "resume" || mode === "resume-retry" || mode === "recorded") {
+        expect(verifierCalls).toBe(mode === "resume-retry" ? 2 : 1);
+        expect(record).toEqual(saved?.[0]);
+      }
+    }
+  } finally {
+    unsubscribe();
+  }
 });

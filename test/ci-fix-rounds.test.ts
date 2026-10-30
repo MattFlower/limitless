@@ -6,12 +6,14 @@ import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import * as repos from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import { ciDecision } from "../src/integrations/ci-classifier.ts";
 import { normalizePr, startGitHubPoller } from "../src/integrations/github-poller.ts";
 import { LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
+import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
@@ -63,7 +65,7 @@ let calls: string[][];
 let comments: { body: string }[];
 let draft: boolean;
 let autoMerge: boolean;
-let mode: "pass" | "gates" | "review" | "audit" | "stop" | "blocked" | "unmet";
+let mode: "pass" | "gates" | "review" | "audit" | "stop" | "blocked" | "unmet" | "workflows";
 let implementCalls: number;
 let implementerReport: string;
 const remoteHead = () => git(join(root, "remote.git"), "rev-parse", branch);
@@ -149,6 +151,7 @@ beforeEach(async () => {
           files: {
             "greeting.txt": mode === "gates" ? "BAD\n" : "fixed feature\n",
             ...(mode === "audit" ? { "protected.txt": "rewritten\n" } : {}),
+            ...(mode === "workflows" ? { ".github/workflows/repair.yml": "on: push\njobs: {}\n" } : {}),
           },
           text: implementerReport,
         };
@@ -422,6 +425,29 @@ test.each(["gates", "review", "audit"] as const)("a failed %s never pushes or co
   mode = failure;
   const id = await start();
   expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+  expect(await remoteHead()).toBe(head);
+  expect(factory.store.reviewRound(id)?.deliveredSha).toBeNull();
+  expect(comments).toHaveLength(0);
+});
+
+test("a resumed CI fix rechecks workflows despite a stale passing audit", async () => {
+  const head = await remoteHead();
+  mode = "workflows";
+  const id = await start();
+  factory.store.db.query("UPDATE runs SET audit_allow = '[\"workflows\"]' WHERE id = ?").run(id);
+  factory.deps.faults = { "stage:deliver:before": { action: "kill" } };
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("running");
+  const state = factory.store.getRunState<RunState>(id);
+  if (state?.phase !== "deliver") throw new Error("missing CI delivery state");
+  state.lastAudit = [];
+  factory.store.setRunState(id, state);
+  factory.store.db.query("UPDATE runs SET audit_allow = '[]' WHERE id = ?").run(id);
+  factory.deps.faults = undefined;
+  const pushed = spyOn(repos, "pushExistingBranch");
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+  expect(factory.store.getRun(id)?.error).toContain(".github/workflows/repair.yml");
+  expect(factory.store.getRun(id)?.error).toContain("Allow: workflows");
+  expect(pushed).not.toHaveBeenCalled();
   expect(await remoteHead()).toBe(head);
   expect(factory.store.reviewRound(id)?.deliveredSha).toBeNull();
   expect(comments).toHaveLength(0);

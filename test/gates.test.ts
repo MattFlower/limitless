@@ -13,10 +13,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { decodeHTML } from "entities";
 import { parseAllow, validateAllow } from "../src/core/allow.ts";
 import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
-import { attributeRules, auditDiff, newlyHidden, unquote } from "../src/gates/audit.ts";
+import { attributeRules, auditDiff, CI_CONFIG, newlyHidden, unquote } from "../src/gates/audit.ts";
 import {
   baselineCacheKey,
   cacheableBaseline,
@@ -31,6 +32,7 @@ import { readJUnitSkips } from "../src/gates/junit.ts";
 import {
   canonical,
   checkPrivateText,
+  decodeBackslashes,
   loadPrivateStrings,
   privateMatches,
   redactPrivate,
@@ -53,12 +55,20 @@ import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
 import { ConfinementError } from "../src/harness/sandbox.ts";
 import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts.ts";
+import { loadOutputPrivacy, privateOutputData } from "../src/util/private-output.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { resolveTestWorkers } from "../src/util/test-workers.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { truncationEncodings } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
+import { seeded } from "./seeded.ts";
+
+const retrySeed = seeded(async (cwd) => {
+  await sh(["git", "init", "-q"], { cwd });
+  await sh(["git", "commit", "-qm", "retry fixture", "--allow-empty"], { cwd });
+  return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+});
 
 function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
@@ -591,6 +601,12 @@ describe("runGates / compareGates", () => {
     ]);
   });
 
+  test("incomplete execution stays blocking against a failing baseline", () => {
+    const baseline: GateRun = { setupOk: true, setup: [], checks: [r("test", false)] };
+    const after = { ...baseline, checks: [{ ...r("test", false), incomplete: "runner cancelled" }] };
+    expect(compareGates(baseline, after)[0]).toMatchObject({ verdict: "not_run", blocking: true });
+  });
+
   test.each([true, false])("targeted results are independent of full baseline (ok=%s)", (baseOk) => {
     const baseline: GateRun = { setupOk: true, setup: [], checks: [r("test", baseOk)] };
     const docsOnly = {
@@ -980,6 +996,7 @@ describe("gate slots and flaky retry", () => {
   /** Baseline passed (or not), then the check ran after the change and maybe once more. */
   async function retried(run: string, baselineOk = true) {
     const dir = tempDir({});
+    await retrySeed(dir);
     const cfg = config(run);
     const base = { name: "test", command: run, ok: baselineOk, exitCode: 0, durationMs: 1, output: "" };
     const cmp = compareGates({ setupOk: true, setup: [], checks: [base] }, await runGates(dir, cfg, signal));
@@ -1072,6 +1089,7 @@ describe("gate slots and flaky retry", () => {
 
   /** Baseline run plus its one retry; `runs` counts check invocations. */
   async function baseline(cfg: GateConfig, dir: string, abort = new AbortController()) {
+    await retrySeed(dir);
     const run = await retryBaselineFailures(await runGates(dir, cfg, signal), dir, cfg, abort.signal);
     const log = join(dir, "runs");
     const runs = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").length : 0;
@@ -1246,6 +1264,8 @@ describe("scratch output audit warnings", () => {
 describe("audit allowances and attribute rules", () => {
   test("only standalone Allow lines count, each kind independently", () => {
     expect(parseAllow("Vendor it\r\n  ALLOW:  Submodules \r\nmore")).toEqual(["submodules"]);
+    expect(parseAllow("Update CI\r\n  ALLOW: Workflows \r\nmore")).toEqual(["workflows"]);
+    expect(validateAllow(["workflows", "workflows"])).toEqual(["workflows"]);
     expect(parseAllow("allow:gitattributes\nAllow: submodules\nAllow: submodules")).toEqual([
       "submodules",
       "gitattributes",
@@ -1257,6 +1277,9 @@ describe("audit allowances and attribute rules", () => {
       "Allow: submodules, gitattributes",
       "Allow: everything",
       "Allow submodules",
+      "> Allow: workflows",
+      "Please Allow: workflows",
+      "Allow: workflows and binary",
     ])
       expect(parseAllow(text)).toEqual([]);
     expect(validateAllow(undefined)).toEqual([]);
@@ -1265,7 +1288,7 @@ describe("audit allowances and attribute rules", () => {
       "gitattributes",
     ]);
     expect(() => validateAllow(["submodules", "Submodules"])).toThrow('Invalid allow value "Submodules"');
-    expect(() => validateAllow([1])).toThrow("expected submodules,gitattributes,binary");
+    expect(() => validateAllow([1])).toThrow("expected submodules,gitattributes,binary,workflows");
   });
 
   test("built-in diff drivers are harmless alone but not beside a hiding attribute", () => {
@@ -1555,6 +1578,44 @@ describe("private strings", () => {
   });
 
   test.each([
+    "%",
+    "%4",
+    "%A",
+    "\\",
+    "\\".repeat(4),
+    "\\u",
+    "\\u0",
+    "\\u00",
+    "\\u002",
+    "\\\\u002",
+    "\\UabF",
+    "\ufffd",
+    "%4\\u00\ufffd",
+  ])("protects a clipped prefix before partial escape tail %j", (tail) => {
+    const entries = [{ value: ["synthetic", "protected", "value"].join("-"), entry: 3 }];
+    const text = `Public: synthetic-pro${tail}`;
+    expect(privateMatches(text, entries, true)).toEqual(entries);
+    expect(privateMatches(text, entries, false)).toEqual([]);
+  });
+
+  test.each(["!", "u12", "%zz", "%44", "\\u0000"])("does not strip non-partial escape tail %j", (tail) => {
+    const entries = [{ value: ["synthetic", "protected", "value"].join("-"), entry: 3 }];
+    const text = `Public: synthetic-pro${tail}`;
+    expect(privateMatches(text, entries, true)).toEqual([]);
+    expect(privateMatches(text, entries, false)).toEqual([]);
+  });
+
+  test("diagnostic backslash runs and malformed escapes have no private match", () => {
+    const entries = ["alpha", "bravo", "charlie", "echo"].map((part, entry) => ({
+      value: ["synthetic", part, "value"].join("-"),
+      entry: entry + 1,
+    }));
+    for (const n of [64, 25_000, 100_000, 400_000])
+      for (const suffix of ["!", "u12", "u00xz", ""])
+        expect(privateMatches(`diagnostic ${"\\".repeat(n)}${suffix}`, entries, true)).toEqual([]);
+  });
+
+  test.each([
     ["double URL", "%2573ecret-host.example"],
     ["Unicode-escaped percent", "\\u002573ecret-host.example"],
     ["URL of Unicode", "%5Cu0073ecret-host.example"],
@@ -1743,11 +1804,12 @@ describe("auditDiff", () => {
     ]);
   });
 
-  test("blocks newly skipped tests and flags suppressions", () => {
+  test.each(["skip", "only"])("blocks tests with .%s and flags suppressions", (mode) => {
+    const line = `  it.${mode}('does the thing', () => {`;
     const patch = [
       "diff --git a/src/a.test.ts b/src/a.test.ts",
       "+++ b/src/a.test.ts",
-      "+  it.skip('does the thing', () => {",
+      `+${line}`,
       "diff --git a/src/a.ts b/src/a.ts",
       "+++ b/src/a.ts",
       "+  // @ts-ignore",
@@ -1759,11 +1821,82 @@ describe("auditDiff", () => {
       ]),
       { taskClass: "bugfix", protectedPaths: [] },
     );
-    expect(f.find((x) => x.rule === "test-skipped")?.severity).toBe("block");
+    const skipped = f.find((x) => x.rule === "test-skipped");
+    expect(skipped).toMatchObject({ severity: "block", file: "src/a.test.ts" });
+    expect(skipped?.detail).toContain("test skipped/focused with .skip/.only");
+    expect(skipped?.detail).toContain(`"${line}"`);
+    expect(skipped?.detail).toContain("without the literal marker at the start of a source line");
+    expect(skipped?.detail).toContain("concatenation");
     expect(f.find((x) => x.rule === "suppression")?.severity).toBe("warn");
+
+    const fixturePatch = [
+      "diff --git a/src/a.test.ts b/src/a.test.ts",
+      "+++ b/src/a.test.ts",
+      `+writeFileSync(path, "it" + ".${mode}('fixture', () => {});");`,
+    ].join("\n");
+    expect(
+      auditDiff(diff(fixturePatch, [{ status: "M", path: "src/a.test.ts" }]), {
+        taskClass: "bugfix",
+        protectedPaths: [],
+      }).some((finding) => finding.rule === "test-skipped"),
+    ).toBe(false);
   });
 
-  test("blocks secrets and protected paths, warns on lockfiles and CI", () => {
+  test("skip markers inside template-literal fixtures still block with actionable detail", () => {
+    const line = ["test", '.skip("skipped", () => {});'].join("");
+    const patch = [
+      "diff --git a/src/a.test.ts b/src/a.test.ts",
+      "+++ b/src/a.test.ts",
+      '+writeFileSync(path, `import { test } from "bun:test";',
+      `+${line}`,
+      "+`);",
+    ].join("\n");
+    const findings = auditDiff(diff(patch, [{ status: "M", path: "src/a.test.ts" }]), {
+      taskClass: "bugfix",
+      protectedPaths: [],
+    });
+    expect(findings).toEqual([
+      {
+        rule: "test-skipped",
+        severity: "block",
+        file: "src/a.test.ts",
+        detail: `test skipped/focused with .skip/.only: "${line}". Fixture text requiring a skip marker should construct it without the literal marker at the start of a source line, for example through concatenation.`,
+      },
+    ]);
+  });
+
+  test("skip diagnostics redact private strings and registered credentials after terminal stripping", () => {
+    const privateValue = ["synthetic", "skip", "private"].join("-");
+    const credential = ["synthetic", "skip", "credential"].join("-");
+    proc.registerCredential("audit-skip-test", credential);
+    const configDir = tempDir({ "private-strings.txt": privateValue });
+    try {
+      for (const value of [privateValue, credential]) {
+        const colored = `${value.slice(0, 10)}\u001b[31m${value.slice(10)}\u001b[0m`;
+        const patch = [
+          "diff --git a/src/a.test.ts b/src/a.test.ts",
+          "+++ b/src/a.test.ts",
+          `+test.skip("${colored}", () => {});`,
+        ].join("\n");
+        const findings = auditDiff(diff(patch, [{ status: "M", path: "src/a.test.ts" }]), {
+          configDir,
+          taskClass: "bugfix",
+          protectedPaths: [],
+        });
+        expect(findings.find((finding) => finding.rule === "test-skipped")).toEqual({
+          rule: "test-skipped",
+          severity: "block",
+          file: "src/a.test.ts",
+          detail: "[redacted diagnostic]",
+        });
+        expect(JSON.stringify(findings)).not.toContain(value);
+      }
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks secrets, protected paths and CI, warns on lockfiles", () => {
     const patch = [
       "diff --git a/cfg.ts b/cfg.ts",
       "+++ b/cfg.ts",
@@ -1783,8 +1916,45 @@ describe("auditDiff", () => {
       secret: "block",
       "protected-path": "block",
       lockfile: "warn",
-      "ci-config": "warn",
+      "ci-config": "block",
     });
+  });
+
+  test("CI path scope and rename endpoints require the workflows allowance", () => {
+    const paths = [
+      ".github/workflows/ci.yml",
+      ".github/workflows/nested/ci.yml",
+      ".gitlab-ci.yml",
+      ".circleci/config.yml",
+    ];
+    for (const path of [
+      ...paths,
+      ".github/actions/action.yml",
+      "nested/.gitlab-ci.yml",
+      "nested/.github/workflows/ci.yml",
+      "nested/.circleci/config.yml",
+    ])
+      expect([path, CI_CONFIG.test(path)]).toEqual([path, paths.includes(path)]);
+    for (const path of paths)
+      for (const file of [
+        { status: "A", path },
+        { status: "M", path },
+        { status: "D", path },
+        { status: "R100", from: path, path: "ordinary.yml" },
+        { status: "R100", from: "ordinary.yml", path },
+      ]) {
+        const ctx = { taskClass: null, protectedPaths: [] };
+        const findings = auditDiff(diff("", [file]), ctx);
+        expect(findings).toContainEqual({
+          rule: "ci-config",
+          severity: "block",
+          file: path,
+          detail: "CI workflow changed. If this is intended, add `Allow: workflows` to the request.",
+        });
+        expect(
+          auditDiff(diff("", [file]), { ...ctx, allow: ["workflows"] }).some((f) => f.severity === "block"),
+        ).toBe(false);
+      }
   });
 
   test("lockfile changes are fine for dependency updates", () => {
@@ -2017,6 +2187,7 @@ const retryRegressions: typeof productionRetry = (cmp, cwd, cfg, changed, signal
 
 test.each([true, false])("docs-targeted regression retry retains its scope (ok=%s)", async (ok) => {
   const cwd = tempDir({ "doc_test.ts": "" });
+  const { value: sha } = await retrySeed(cwd);
   const command = "bun test './doc_test.ts'";
   const original: GateResult = {
     name: "test",
@@ -2055,6 +2226,8 @@ test.each([true, false])("docs-targeted regression retry retains its scope (ok=%
         return {
           setupOk: true,
           setup: [],
+          sha,
+          trackedClean: true,
           checks: [{ ...original, ok, exitCode: ok ? 0 : 1, docsOnly: undefined }],
         };
       },
@@ -2073,6 +2246,7 @@ test.each([true, false])("docs-targeted regression retry retains its scope (ok=%
 
 test.each(["baseline", "regression"])("standalone %s retries own scratch per check", async (kind) => {
   const cwd = tempDir({});
+  await retrySeed(cwd);
   const signal = new AbortController().signal;
   const cfg: GateConfig = {
     setup: [],
@@ -2488,6 +2662,7 @@ test.skipIf(seatbeltSkip !== null)(
 
 test("signal confinement covers setup, checks and baseline/regression retries; failure never becomes a pass", async () => {
   const cwd = tempDir({});
+  await retrySeed(cwd);
   const { backend, calls } = recordingConfinement();
   const signal = new AbortController().signal;
   const cfg: GateConfig = {
@@ -3365,4 +3540,170 @@ test.each([
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+test("percent-decoded private values retain literal backslashes before slashes", () => {
+  const entries = [{ value: String.raw`host\/path.example`, entry: 1 }];
+  expect(privateMatches("host%5c/path.example", entries)).toEqual(entries);
+});
+
+test.each([
+  String.raw`host\/p\u0061th.example`,
+  String.raw`h\u006fst%5c/p%61th.example`,
+  String.raw`host%5c/p\u0061th.example`,
+  String.raw`host\/p\u005cu0061th.example`,
+  String.raw`host\/p%255cu0061th.example`,
+  "host%5c/p%2561th.example",
+  String.raw`host\/p&amp;#x61;th.example`,
+])("Unicode-decoded private values retain literal backslashes before slashes: %s", (text) => {
+  const entries = [{ value: String.raw`host\/path.example`, entry: 1 }];
+  expect(privateMatches(text, entries)).toEqual(entries);
+});
+
+test("JSON slash runs match private entries and are withheld in output data", () => {
+  const root = mkdtempSync(join(tmpdir(), "private-slash-"));
+  const previous = process.env.LIMITLESS_CONFIG_DIR;
+  const entries = [{ value: "host/path.example", entry: 1 }];
+  try {
+    writeFileSync(join(root, "private-strings.txt"), entries[0]?.value ?? "");
+    process.env.LIMITLESS_CONFIG_DIR = root;
+    const privacy = loadOutputPrivacy();
+    if (!privacy) throw new Error("Missing output privacy filter");
+    for (const count of [1, 2, 3, 8]) {
+      const text = `host${"\\".repeat(count)}/path.example`;
+      expect(privateMatches(text, entries)).toEqual(entries);
+      expect(privateOutputData({ output: text, ordinary: "completed successfully" }, privacy)).toEqual({
+        output: "[withheld: private text]",
+        ordinary: "completed successfully",
+      });
+    }
+    writeFileSync(join(root, "private-strings.txt"), String.raw`host\/path.example`);
+    const literalPrivacy = loadOutputPrivacy();
+    if (!literalPrivacy) throw new Error("Missing output privacy filter");
+    for (const output of [
+      "host%5c/path.example",
+      String.raw`host\/p\u0061th.example`,
+      String.raw`h\u006fst%5c/p%61th.example`,
+      String.raw`host%5c/p\u0061th.example`,
+      String.raw`host\/p\u005cu0061th.example`,
+      String.raw`host\/p%255cu0061th.example`,
+    ])
+      expect(privateOutputData({ output, ordinary: "completed successfully" }, literalPrivacy)).toEqual({
+        output: "[withheld: private text]",
+        ordinary: "completed successfully",
+      });
+  } finally {
+    if (previous === undefined) delete process.env.LIMITLESS_CONFIG_DIR;
+    else process.env.LIMITLESS_CONFIG_DIR = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("private matching retains main's matches across short percent and backslash spellings", () => {
+  const entries = [
+    ...["", "\\/", "%", "%5c/", "\\", "/", "a", "h"].map((middle) => `host${middle}path.example`),
+    String.raw`host\/path example`,
+  ].map((value, i) => ({ value, entry: i + 1 }));
+  // Frozen from c06bce4946f2f9ccb37670638966dc4c8b292e7f; independent of production helpers.
+  const normalize = (text: string) => text.normalize("NFKC").toLowerCase();
+  const decoded = (text: string) =>
+    text
+      .replace(/(?:%[0-9a-f]{2})+/gi, (run) => Buffer.from(run.replaceAll("%", ""), "hex").toString())
+      .replace(/\\+u([0-9a-f]{4})/gi, (_escape, hex: string) =>
+        String.fromCharCode(Number.parseInt(hex, 16)),
+      );
+  const minimum = Math.ceil((Math.min(...entries.map(({ value }) => Buffer.byteLength(value))) * 4) / 3);
+  const decodeBase64 = (text: string) =>
+    text.replace(/[A-Za-z0-9+/]+=*/g, (run) => {
+      if (run.replace(/=+$/, "").length < minimum) return run;
+      for (let offset = 0; offset < 4; offset++) {
+        const plain = Buffer.from(run.slice(offset), "base64").toString();
+        const found = normalize(plain);
+        if (entries.some(({ value }) => found.includes(normalize(value)))) return plain;
+      }
+      return run;
+    });
+  const referenceMatches = (text: string) => {
+    const layers = [text];
+    for (let round = 0; round < 5; round++) {
+      const unescaped = decoded(text);
+      const expanded = decodeHTML(unescaped);
+      layers.push(unescaped, decodeBase64(expanded.replace(/\s+/g, " ")));
+      const next = decodeBase64(expanded);
+      if (next === text) {
+        const normalized = [...layers, next].map(normalize);
+        return entries.filter(({ value }) => normalized.some((layer) => layer.includes(normalize(value))));
+      }
+      layers.push(next);
+      text = next;
+    }
+    return [{ value: "", entry: 0 }];
+  };
+  const check = (text: string) => {
+    const expected = referenceMatches(text);
+    const actual = privateMatches(text, entries);
+    for (const entry of expected) expect(actual).toContainEqual(entry);
+  };
+  const visit = (middle: string, remaining: number) => {
+    check(`host${middle}path.example`);
+    if (remaining) for (const char of "%5c\\/u0ah") visit(middle + char, remaining - 1);
+  };
+  visit("", 5);
+  // A full Unicode escape cannot occur in the five-character exhaustive family.
+  for (const prefix of ["host", String.raw`h\u006fst`, "h%6fst"])
+    for (const middle of [
+      String.raw`\/`,
+      "%5c/",
+      String.raw`\u005c/`,
+      String.raw`\u005c%2f`,
+      "%5cu005c/",
+      String.raw`\u0025`,
+      String.raw`\u00255c/`,
+    ])
+      for (const suffix of [
+        "path.example",
+        String.raw`p\u0061th.example`,
+        "p%61th.example",
+        // Later rounds decode these nested escapes after a literal backslash-slash survives the first.
+        String.raw`p\u005cu0061th.example`,
+        "p%255cu0061th.example",
+        "p%2561th.example",
+        "p&amp;#x61;th.example",
+        "path\n\texample",
+        String.raw`path\u000aexample`,
+      ])
+        check(`${prefix}${middle}${suffix}`);
+});
+
+test("backslash decoder agrees with independent regex reference exhaustively and on seeded samples", () => {
+  // One replacement pass: output that itself spells an escape is not rescanned.
+  const reference = (text: string) =>
+    text.replace(/\\+(?:u([0-9a-f]{4})|\/)/gi, (_match, hex: string | undefined) =>
+      hex === undefined ? "/" : String.fromCharCode(Number.parseInt(hex, 16)),
+    );
+  const alphabet = "\\u/0afz!";
+  const visit = (text: string, remaining: number) => {
+    expect(decodeBackslashes(text)).toBe(reference(text));
+    if (remaining) for (const char of alphabet) visit(text + char, remaining - 1);
+  };
+  visit("", 6);
+  let seed = 880;
+  const random = (n: number) => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return Math.floor((seed / 2 ** 32) * n);
+  };
+  for (let i = 0; i < 2000; i++) {
+    let text = "";
+    for (let length = 7 + random(250); length > 0; length--) text += alphabet.charAt(random(alphabet.length));
+    expect(decodeBackslashes(text)).toBe(reference(text));
+  }
+  for (const text of [
+    String.raw`\U00AF\u0041`,
+    String.raw`\u005cu0041`,
+    String.raw`\u002f\u005c/`,
+    String.raw`\\u0000\uD800\uDC00`,
+    String.raw`\u00xz\u123`,
+    "trailing\\\\",
+  ])
+    expect(decodeBackslashes(text)).toBe(reference(text));
 });

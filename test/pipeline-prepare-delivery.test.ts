@@ -1,9 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
-import type { RunState } from "../src/pipeline/context.ts";
-import { sh } from "../src/util/proc.ts";
+import * as commands from "../src/git/command.ts";
+import { RunContext, type RunState } from "../src/pipeline/context.ts";
+import { renderDeliveryReport } from "../src/pipeline/engine.ts";
+import { registerCredential, sh } from "../src/util/proc.ts";
 import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
 
 let home: string;
@@ -130,6 +132,10 @@ esac
     expect(f.store.getRunState<RunState>(run.id)?.phase).toBe("deliver");
     const branch = f.store.getRun(run.id)?.branch;
     if (!branch) throw new Error("missing delivery branch");
+    const saved = f.store.getRunState<RunState>(run.id);
+    if (!saved) throw new Error("missing state");
+    saved.sizeReport = undefined;
+    f.store.setRunState(run.id, saved);
     f.store.close();
     if (scenario === "branch lookup") writeFileSync(stateFile, "MERGED");
     if (scenario === "open PR") writeFileSync(stateFile, "OPEN");
@@ -143,6 +149,9 @@ esac
     });
     expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
     const after = readFileSync(calls, "utf8").split("\n").filter(Boolean);
+    const size = resumed.store.getRunState<RunState>(run.id)?.sizeReport;
+    expect(size).toMatchObject({ source: { added: 1, removed: 0 } });
+    expect(resumed.store.getArtifact(run.id, "report.md")?.match(/^## Size$/gm)).toHaveLength(1);
     expect(resumed.store.getRun(run.id)?.prUrl).toBe(url);
     expect(resumed.store.getRun(run.id)?.merged).toBe(true);
     expect(after.filter((c) => c.startsWith("pr merge"))).toHaveLength(
@@ -159,6 +168,128 @@ esac
         allowFail: true,
       });
       expect(remote.exitCode).not.toBe(0);
+    }
+  });
+
+  test("size measurement errors preserve delivery outcomes and stay out of review", async () => {
+    const bare = await githubFixture();
+    const f = start((s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        expect(s.prompt).not.toContain("## Size");
+        return { structured: approve };
+      }
+      return { files: { "farewell.txt": "goodbye\n".repeat(5) } };
+    });
+    registerGithub(f, bare);
+    const git = commands.worktreeGit;
+    const secret = `size-${"credential".repeat(12)}`;
+    registerCredential("size-test", secret);
+    const runOne = async (fail: boolean) => {
+      const probe = spyOn(commands, "worktreeGit").mockImplementation((args, opts, retry) => {
+        if (fail && args.includes("--numstat") && args.includes("-z") && args.includes("-M"))
+          throw new Error(`measurement ${secret}`);
+        return git(args, opts, retry);
+      });
+      try {
+        const run = await f.createRun({
+          repo: "test/repo",
+          prompt: "Add farewell\n\nBudget: 1 line",
+          profile: "quick",
+        });
+        const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+        if (status !== "succeeded")
+          throw new Error(
+            JSON.stringify({
+              error: f.store.getRun(run.id)?.error,
+              audit: f.store.getRunState<RunState>(run.id)?.lastAudit,
+            }),
+          );
+        const state = f.store.getRunState<RunState>(run.id);
+        const report = f.store.getArtifact(run.id, "report.md");
+        expect(report).toContain("## Size");
+        if (fail) {
+          expect(report).toContain("Size unavailable: Error: measurement [redacted]");
+          expect(JSON.stringify(state?.sizeReport)).not.toContain(secret);
+        } else {
+          expect(state?.sizeReport).toMatchObject({ source: { added: 5, removed: 0 }, stated: { lines: 1 } });
+          expect(report).toContain("(500%)");
+        }
+        return {
+          round: state?.round,
+          audit: state?.lastAudit,
+          gates: state?.lastGates?.map((g) => [g.name, g.verdict, g.blocking]),
+          review: state?.lastReview,
+          pr: f.store.getRun(run.id)?.prUrl,
+        };
+      } finally {
+        probe.mockRestore();
+      }
+    };
+    const control = await runOne(false);
+    expect(await runOne(true)).toEqual(control);
+  });
+
+  test.each(["worktree", "base"])("missing %s saves unavailable without running git", async (missing) => {
+    const f = start(() => {
+      throw new Error("no agents");
+    });
+    const repo = f.store.upsertRepo({
+      slug: "test/repo",
+      kind: "local",
+      localPath: repoDir,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = f.store.createRun(repo, { repo: repo.slug, prompt: "Budget: 1 line" });
+    const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+    ctx.run.baseSha = missing === "base" ? null : "a".repeat(40);
+    ctx.state.worktreePath = missing === "worktree" ? undefined : repoDir;
+    const git = spyOn(commands, "worktreeGit");
+    try {
+      const result = await renderDeliveryReport(ctx, true);
+      expect(result.report).toContain(`Size unavailable: No ${missing === "base" ? "base SHA" : "worktree"}`);
+      expect(f.store.getRunState<RunState>(run.id)?.sizeReport).toEqual(ctx.state.sizeReport);
+      expect(git).not.toHaveBeenCalled();
+    } finally {
+      git.mockRestore();
+    }
+  });
+
+  test("HEAD lookup failure is recorded with redaction and no diff", async () => {
+    const f = start(() => {
+      throw new Error("no agents");
+    });
+    const repo = f.store.upsertRepo({
+      slug: "test/repo",
+      kind: "local",
+      localPath: repoDir,
+      url: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = f.store.createRun(repo, { repo: repo.slug, prompt: "request" });
+    const ctx = new RunContext(f.deps, run, repo, new AbortController().signal);
+    ctx.run.baseSha = "a".repeat(40);
+    ctx.state.worktreePath = repoDir;
+    const secret = `head-${"credential".repeat(10)}`;
+    registerCredential("size-head-test", secret);
+    const git = spyOn(commands, "worktreeGit").mockRejectedValue(new Error(`HEAD lookup ${secret}`));
+    try {
+      expect((await renderDeliveryReport(ctx, true)).report).toContain(
+        "Size unavailable: Error: HEAD lookup [redacted]",
+      );
+      expect(ctx.state.sizeReport).toMatchObject({
+        head: "HEAD",
+        mode: "two-dot",
+        error: "Error: HEAD lookup [redacted]",
+      });
+      expect(git).toHaveBeenCalledTimes(1);
+      expect(git.mock.calls[0]?.[0]).toEqual(["git", "rev-parse", "HEAD"]);
+    } finally {
+      git.mockRestore();
     }
   });
 

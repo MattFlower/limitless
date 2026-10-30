@@ -1,18 +1,28 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { worktreeGit } from "../git/command.ts";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
-import { type DocsSelection, quoteRetryFiles } from "./docs.ts";
-import { executeGate, type GateRunner } from "./executor.ts";
+import { type DocsSelection, quoteRetryFiles, singleBunTest } from "./docs.ts";
+import { executeGate, type GateRunner, gateProvenance } from "./executor.ts";
 import { FailureExcerpts } from "./failures.ts";
-import { type FailedTestFiles, readJUnit, readJUnitSkips, validRetryFiles } from "./junit.ts";
+import {
+  type CoveringTestEvidence,
+  type FailedTestFiles,
+  readCoveringJUnit,
+  readJUnit,
+  readJUnitSkips,
+  validRetryFiles,
+} from "./junit.ts";
 import {
   findGateCounterpart,
   launchFailure,
   launchFailureScan,
+  redactGateData,
   redactGateOutput,
   redactGateStreams,
 } from "./output.ts";
@@ -20,6 +30,14 @@ import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
 
 export interface GateResult {
+  /** Infrastructure stopped this command before a complete execution could be observed. */
+  incomplete?: string;
+  coveringTest?: CoveringTestEvidence;
+  /** Configured command plus factory-supplied arguments, when execution adds any. */
+  executedCommand?: string;
+  executionProvenance?: Pick<GateRun, "sha" | "trackedClean" | "provenanceError">;
+  /** Successful execution rejected as evidence; the failed result remains authoritative. */
+  retryAttempt?: GateResult;
   reused?: { executionId: string; treeHash: string; createdAt: number };
   name: string;
   command: string;
@@ -77,6 +95,17 @@ export interface GateComparison {
   result: GateResult;
   /** The matched baseline check could not provide usable comparison evidence. */
   baselineConfinementError?: boolean;
+  /** Post-merge execution: absent is local; null is LAN with unavailable attribution. */
+  postMergeWorker?: string | null;
+  /** Coordinator-owned confirmation; result retains the worker failure and prior retries. */
+  coordinatorConfirmation?: {
+    worker?: string;
+    originalVerdict: GateVerdict;
+    reason: string;
+    result?: GateResult;
+  };
+  retryProvenanceRejected?: boolean;
+  retryOriginal?: { verdict: GateVerdict; blocking: boolean };
   /** The failing run that triggered a retry. */
   firstAttempt?: GateResult;
 }
@@ -132,8 +161,17 @@ async function runOne(
   const scratch = invocationScratch.getStore();
   if (!scratch) throw new Error("Missing gate command scratch");
   const report = join(scratch, `gate-report-${randomUUID()}.xml`);
+  const existed = existsSync(report);
+  let reportBaseline = 0;
+  if (cmd.coveringTest) {
+    const sentinel = `${report}.sentinel`;
+    writeFileSync(sentinel, "", { flag: "wx" });
+    reportBaseline = statSync(sentinel).mtimeMs;
+  }
+  const args = cmd.coveringTest ? ["--reporter=junit", `--reporter-outfile=${report}`] : undefined;
   const res = await runConfined({
     command: cmd.run,
+    args,
     cwd,
     env: { ...env, LIMITLESS_GATE_REPORT: report },
     signal,
@@ -154,6 +192,12 @@ async function runOne(
   return {
     name: cmd.name,
     command: cmd.run,
+    ...(args
+      ? { executedCommand: `${cmd.run} ${args.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}` }
+      : {}),
+    ...(cmd.coveringTest
+      ? { coveringTest: readCoveringJUnit(report, cwd, cmd.coveringTest, reportBaseline, existed) }
+      : {}),
     ok,
     exitCode: res.exitCode,
     durationMs: res.durationMs,
@@ -210,7 +254,7 @@ export function runGates(
   hooks: GateHooks = {},
 ): Promise<GateRun> {
   return executeGate(
-    { repo: cwd, cwd, baseSha: "", headSha: "", gates: cfg, priority: hooks.priority },
+    { repo: cwd, cwd, baseSha: "", headSha: "HEAD", gates: cfg, priority: hooks.priority },
     signal,
     hooks,
   );
@@ -262,7 +306,7 @@ async function retryChecks(
       if (signal.aborted) break;
       checks.push(await withCommandScratch(cwd, () => runOne(check, cwd, signal)));
     }
-    return { setupOk: true, setup: [], checks };
+    return { setupOk: true, setup: [], checks, ...(await gateProvenance(cwd, signal)) };
   } finally {
     release();
   }
@@ -277,16 +321,29 @@ export const UNSLOTTED_RETRY_MAX_FILES = 5;
 export const UNSLOTTED_RETRY_MAX_SECONDS = 60;
 
 /** Share the targeted-only decision with land diagnostics; legacy evidence stays ineligible. */
-export function targetedRetrySkipReason(r: GateResult, cfg: GateConfig, cwd: string): string | undefined {
+export function targetedRetrySkipReason(
+  check: GateCommand | undefined,
+  r: GateResult,
+  cfg: GateConfig,
+  cwd: string,
+): string | undefined {
   if (confinementFailed(r)) return "confinement failure";
   if (r.timedOut) return "gate process timed out";
   if (r.exitCode == null) return "missing exit status";
   if (r.exitCode === 0) return "no nonzero exit status";
   if (r.failureAttributionComplete !== true)
     return `failure attribution incomplete: ${r.failureAttributionReason ?? "missing or inconsistent whole-stream/JUnit evidence"}`;
-  if (cfg.retryFiles?.split("{files}").length !== 2) return "unusable retry_files configuration";
+  const placeholderReason = "retry_files must contain {files} once as an unquoted standalone argument";
+  if (cfg.retryFiles?.split("{files}").length !== 2) return placeholderReason;
   if (!r.failedFiles?.length) return "absent retry files";
   if (!validRetryFiles(r.failedFiles, cwd)) return "invalid retry files";
+  if (!check || !singleBunTest(check.run) || !singleBunTest(r.command))
+    return "check is not a single bun test invocation";
+  if (!singleBunTest(cfg.retryFiles)) return "retry_files is not a single bun test invocation";
+  if (!singleBunTest(cfg.retryFiles, "{files}")) return placeholderReason;
+  const quoted = quoteRetryFiles(r.failedFiles);
+  if (!singleBunTest(cfg.retryFiles.replace("{files}", () => quoted)))
+    return "expanded retry_files is not a single bun test invocation";
   return undefined;
 }
 
@@ -297,6 +354,43 @@ function retrySetupFailure(original: GateResult, run: GateRun): GateResult {
     firstAttempt: original,
     output: `${original.output}\n\nRetry setup failed:\n$ ${failed?.command ?? "setup"}\n${failed?.failures ?? ""}\n${failed?.output ?? "No setup result"}`,
     confinementError: confinementFailed(original) || confinementFailed(failed),
+  };
+}
+
+/** A retry can clear a failure only on the checked, unchanged tracked tree. */
+export function validateRetry(
+  attempt: GateResult,
+  original: GateResult,
+  sha: string | undefined,
+  provenance = attempt.executionProvenance,
+  onReject?: (original: GateResult, reason: string) => void,
+): GateResult {
+  const { sha: executedSha, trackedClean, provenanceError } = provenance ?? {};
+  const result = {
+    ...attempt,
+    executionProvenance: redactGateData({ sha: executedSha, trackedClean, provenanceError }),
+  };
+  if (!attempt.ok || confinementFailed(attempt)) return result;
+  const reason =
+    !sha || !executedSha
+      ? "missing execution SHA provenance"
+      : executedSha !== sha
+        ? `execution SHA ${executedSha} does not match checked commit ${sha}`
+        : trackedClean !== true
+          ? "tracked checkout cleanliness was not confirmed"
+          : undefined;
+  if (!reason) return result;
+  const diagnostic = redactGateOutput(
+    `Retry rejected: ${reason}${provenanceError ? `; ${provenanceError}` : ""}`,
+  );
+  onReject?.(original, diagnostic);
+  return {
+    ...original,
+    firstAttempt: original,
+    retryAttempt: result,
+    confinementError: confinementFailed(original),
+    output: `${original.output}\n\n${diagnostic}`,
+    ...(original.failures ? { failures: `${original.failures}\n\n${diagnostic}` } : {}),
   };
 }
 
@@ -313,12 +407,15 @@ export async function retryFailures(
   onSkip?: (original: GateResult, reason: string) => void,
 ): Promise<Map<GateResult, GateResult>> {
   const results = new Map<GateResult, GateResult>();
+  const sha = await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal })
+    .then((r) => r.stdout.trim())
+    .catch(() => undefined);
   const targets = new Map<GateResult, GateResult>();
   const full: typeof failures = [];
   for (const entry of failures) {
     if (signal.aborted) break;
     const { check, original } = entry;
-    const skip = targetedOnly ? targetedRetrySkipReason(original, cfg, cwd) : undefined;
+    const skip = targetedOnly ? targetedRetrySkipReason(check, original, cfg, cwd) : undefined;
     if (targetedOnly && (original.ok || skip)) {
       if (skip) onSkip?.(original, skip);
       continue;
@@ -348,15 +445,21 @@ export async function retryFailures(
         results.set(original, retrySetupFailure(original, retried));
         continue;
       }
-      const attempt = retried.checks[0];
-      if (!attempt) continue;
-      targets.set(original, attempt);
+      const raw = retried.checks[0];
+      if (!raw) continue;
+      const attempt = validateRetry(raw, original, sha, retried, onSkip);
+      const target = attempt.retryAttempt ?? attempt;
+      targets.set(original, target);
       if (targetedOnly) {
-        results.set(original, { ...attempt, firstAttempt: original, targetedRetry: attempt });
+        results.set(original, { ...attempt, firstAttempt: original, targetedRetry: target });
         continue;
       }
-      if (confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
-        results.set(original, { ...original, firstAttempt: original, targetedRetry: attempt });
+      if ((raw.ok && !attempt.ok) || confinementFailed(attempt) || (!attempt.ok && !attempt.timedOut)) {
+        results.set(original, {
+          ...(raw.ok && !attempt.ok ? attempt : original),
+          firstAttempt: original,
+          targetedRetry: target,
+        });
         continue;
       }
     }
@@ -380,7 +483,11 @@ export async function retryFailures(
       }
       const result = retried.checks[index];
       if (result)
-        results.set(original, { ...result, firstAttempt: original, targetedRetry: targets.get(original) });
+        results.set(original, {
+          ...validateRetry(result, original, sha, retried, onSkip),
+          firstAttempt: original,
+          targetedRetry: targets.get(original),
+        });
     }
   }
   return results;
@@ -434,6 +541,10 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
     return out;
   }
   for (const r of after.checks) {
+    if (r.incomplete) {
+      out.push({ name: r.name, verdict: "not_run", blocking: true, result: r });
+      continue;
+    }
     if (r.docsOnly?.mode === "skipped") {
       out.push({ name: r.name, verdict: "not_run", blocking: false, result: r });
       continue;
@@ -533,6 +644,7 @@ export async function retryRegressions(
     const confinementError = confinementFailed(retry);
     return {
       ...c,
+      retryOriginal: c.retryOriginal ?? { verdict: c.verdict, blocking: c.blocking },
       verdict: confinementError ? "confinement_error" : retry.ok ? "flaky" : c.verdict,
       blocking: confinementError || !retry.ok,
       result: { ...retry, ...(c.result.docsOnly ? { docsOnly: c.result.docsOnly } : {}) },

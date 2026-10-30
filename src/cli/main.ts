@@ -27,7 +27,8 @@ Usage:
   limitless run "<prompt>" --repo <repo>  Queue a run (repo: owner/name or a local path)
         [--profile auto|quick|standard|deep] [--title <t>] [--after <run-id>[,<run-id>]] [-f|--follow]
         [--no-baseline-cache]  Always execute the baseline gates; a passing one refreshes the cache
-        [--allow submodules|gitattributes|binary]  Allow that blocked audit change (repeatable)
+        [--allow submodules|gitattributes|binary|workflows]  Allow that blocked audit change (repeatable)
+          Older daemons reject --allow workflows submitted by a newer CLI.
         [--model role=model[@effort][,fallback]]  Pin a role's chain (repeatable; | joins alternatives)
   limitless retry <run> [--model role=chain]  Retry, inheriting or replacing model chains
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
@@ -659,8 +660,14 @@ async function main(): Promise<void> {
       const port = resolveClientPort();
       if (rest[0] === "install") {
         const tunnel = values.tunnel === true;
-        const publicUrl = tunnel ? (await import("../config.ts")).loadConfig().publicUrl : null;
-        return svc.install(port, { tunnel, mtplx: values.mtplx === true, publicUrl });
+        const cfg = (await import("../config.ts")).loadConfig();
+        const publicUrl = tunnel ? cfg.publicUrl : null;
+        return svc.install(port, {
+          tunnel,
+          mtplx: values.mtplx === true,
+          publicUrl,
+          executor: cfg.executorEnabled,
+        });
       }
       if (rest[0] === "uninstall") return svc.uninstall();
       return svc.status(port);
@@ -679,6 +686,7 @@ async function main(): Promise<void> {
         throw new Error("usage: limitless deploy [ref] [--smoke] [--max-wait <seconds>] [--now]");
       return svc.deploy(resolveClientPort(), rest[0], values.smoke === true, {
         maxWaitMs,
+        executor: (await import("../config.ts")).loadConfig().executorEnabled,
         now: values.now === true,
       });
     }

@@ -19,7 +19,7 @@ import type {
   Stage,
   StageName,
 } from "../core/types.ts";
-import type { Store } from "../db/store.ts";
+import type { RunPatch, Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
@@ -45,14 +45,36 @@ import {
   runToolAgent,
 } from "./agent-executor.ts";
 import { runAgentGate } from "./agent-gate.ts";
+import type { CoveringTestRun } from "./covering-tests.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
+import { consumeGateExecution } from "./gate-execution.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
+import type { SizeReport } from "./size.ts";
+
+export interface Checkpointer {
+  writeState(runId: string, state: RunState): void;
+  writeRun(runId: string, patch: RunPatch, state?: RunState): Run;
+  /** Local: synchronous, returns void. Shared (#960): may return a promise. */
+  checkpoint(runId: string, label?: string): void | Promise<void>;
+}
+
+export function localCheckpointer(store: Store): Checkpointer {
+  return {
+    writeState: (runId, state) => {
+      store.setRunState(runId, state);
+    },
+    writeRun: (runId, patch, state) => store.updateRun(runId, patch, state),
+    checkpoint: () => {},
+  };
+}
 
 export interface EngineDeps {
+  loadSource?: () => number;
+  checkpointer?: Checkpointer;
   gateExecutor?: GateExecutor;
   agentExecutor?: AgentExecutor;
   confinement?: import("../harness/sandbox.ts").ConfinementBackend;
@@ -75,6 +97,7 @@ export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "delive
 
 /** Everything a run needs to resume after a restart. Persisted as runs.state_json. */
 export interface RunState {
+  sizeReport?: SizeReport;
   parked?: boolean;
   flow?: "build" | "verify-change";
   verification?: { baseSha: string; headSha: string; initialComplete?: boolean };
@@ -105,7 +128,16 @@ export interface RunState {
   reviewMode?: "single" | "panel";
   /** The shadow panel's base lenses, read at prepare with `[review] shadow = "panel"`, or why they could not be. */
   shadowLenses?: RepoReviewLens[] | { error: string };
-  gateExecution?: { stage: StageName; round: number; purpose: string; sha: string; handle: ExecutionHandle };
+  gateExecution?: {
+    stage: StageName;
+    round: number;
+    purpose: string;
+    sha: string;
+    handle: ExecutionHandle;
+    gateKey?: string;
+    /** Earlier attempts replay caller progress without executing or counting them again. */
+    previous?: { purpose: string; gateKey: string; result: GateRun }[];
+  };
   /** the worker implement job of this round; cleared in the implementation-ready save */
   agentJob?: { round: number; id: string };
   baseline?: GateRun | null;
@@ -141,6 +173,23 @@ export interface RunState {
   /** Pinned delivery merge target (legacy field name); gates must pass before this becomes run.baseSha. */
   pendingRebaseSha?: string;
   preRebaseGates?: GateComparison[];
+  /** Rejected delivery attempt; retained after rollback so resume cannot retry it. */
+  postMergeRejection?: { reason: string; sha: string; base: string; head: string; round: number };
+  /** Coordinator confirmation is scoped to this merge attempt, including its original deadline. */
+  postMergeGates?: {
+    sha: string;
+    base: string;
+    head: string;
+    round: number;
+    deadline: number;
+    result?: {
+      setupOk: boolean;
+      timedOut: boolean;
+      comparison: GateComparison[];
+      /** Legacy attribution; normalized onto comparison entries on load. */
+      workers?: Record<string, string | null | undefined>;
+    };
+  };
   /** Expected first merge parent; also the fallback head if clean-merge gates regress. */
   preRebaseHead?: string;
   /** Completed, gated delivery merges; scoped to the run and review that authorized them. */
@@ -161,6 +210,8 @@ export interface RunState {
   feedback: string | null;
   lastGates?: GateComparison[];
   gateEvidence?: GateEvidence;
+  coveringTestRuns?: CoveringTestRun[];
+  pendingVerify?: { round: number; attempt: number; sha: string; modelOutput: Verify; modelId: string };
   gateTimeoutReruns?: number;
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
@@ -298,14 +349,39 @@ const DEFAULT_TIMEOUTS: Record<Role, number> = {
   verify: 25 * 60_000,
 };
 
+/** Attach attribution before redaction; ambiguous sanitized names must never borrow a worker. */
+export function redactPostMergeComparisons(
+  checks: GateComparison[],
+  workers: Record<string, string | null | undefined> = {},
+): GateComparison[] {
+  const entries = Object.entries(workers);
+  return redactGateData(
+    checks.map((check) => {
+      const name = redactGateOutput(check.name);
+      const matches = entries.filter(([key]) => redactGateOutput(key) === name);
+      const worker =
+        matches.length === 1 && checks.filter((c) => redactGateOutput(c.name) === name).length === 1
+          ? matches[0]?.[1]
+          : matches.length
+            ? null
+            : undefined;
+      return {
+        ...check,
+        postMergeWorker: check.postMergeWorker !== undefined ? check.postMergeWorker : worker,
+      };
+    }),
+  );
+}
+
 export class RunContext {
   readonly deps: EngineDeps;
+  readonly checkpointer: Checkpointer;
   private readonly stageConfig = new AsyncLocalStorage<Config>();
   private readonly interruption = new AbortController();
   readonly signal: AbortSignal;
   termination?: SimulatedTermination;
   private readonly stageContext = new AsyncLocalStorage<Stage>();
-  private readonly faults: FaultInjector;
+  readonly faults: FaultInjector;
   private holdoutPublicSources?: { round: number; sources: Promise<string> };
   private foregroundStageDepth = 0;
   /** Defer shared-worktree cleanup until the review/verify pair has settled. */
@@ -334,6 +410,7 @@ export class RunContext {
     readonly drainEvents?: EventTarget,
   ) {
     const deps = liveDeps;
+    this.checkpointer = deps.checkpointer ?? localCheckpointer(deps.store);
     const thisContext = this;
     this.deps = new Proxy(deps, {
       get(target, key, receiver) {
@@ -361,6 +438,9 @@ export class RunContext {
       checks.map((check) => ({
         ...check,
         result: redactGateDiagnostics(check.result),
+        ...(check.coordinatorConfirmation
+          ? { coordinatorConfirmation: redactGateData(check.coordinatorConfirmation) }
+          : {}),
         ...(check.firstAttempt ? { firstAttempt: redactGateDiagnostics(check.firstAttempt) } : {}),
       }));
     const baseline = this.state.baseline;
@@ -371,6 +451,12 @@ export class RunContext {
     for (const field of ["preRebaseGates", "lastGates"] as const) {
       const checks = this.state[field];
       if (checks) this.state[field] = comparisons(checks);
+    }
+    if (this.state.postMergeGates?.result) {
+      const result = this.state.postMergeGates.result;
+      result.comparison = redactPostMergeComparisons(result.comparison, result.workers);
+      delete result.workers;
+      this.state.postMergeGates.result = redactGateData(result);
     }
     if (this.state.gateEvidence) this.state.gateEvidence.checks = comparisons(this.state.gateEvidence.checks);
     if (this.state.lastVerifiedEvidence?.lastGates)
@@ -450,7 +536,11 @@ export class RunContext {
     return [this.run.prompt, this.state.spec ? renderSpec(this.state.spec) : "", ...identifiers].join("\n");
   }
 
-  async save(checkpoint?: string): Promise<void> {
+  get stageId(): number | undefined {
+    return this.stageContext.getStore()?.id;
+  }
+
+  async save(checkpoint?: string, onComplete?: () => void): Promise<void> {
     if (this.state.phase !== "deliver" || this.state.deliveryComplete) this.state.githubWait = undefined;
     if (this.deps.faults) {
       const stage = this.stageContext.getStore();
@@ -461,10 +551,18 @@ export class RunContext {
       );
       this.checkCancelled();
     }
-    this.store.setRunState(this.run.id, this.state);
+    if (onComplete)
+      this.store.transaction(() => {
+        onComplete();
+        this.checkpointer.writeState(this.run.id, this.state);
+      }, true);
+    else this.checkpointer.writeState(this.run.id, this.state);
+    const p = this.checkpointer.checkpoint(this.run.id, checkpoint);
+    if (p) await p;
   }
 
   async setPhase(phase: Phase): Promise<void> {
+    if (phase !== this.state.phase) consumeGateExecution(this);
     this.state.phase = phase;
     if (phase === "done") this.state.completedChecks = undefined;
     await this.save();
@@ -494,9 +592,10 @@ export class RunContext {
     round = 0,
     background = false,
     parkOnDrain = true,
+    onComplete?: (value: T, stage: Stage, sha?: string) => void,
   ): Promise<T> {
     return this.stageConfig.run(this.liveDeps.cfg, () =>
-      this.runStage(name, fn, round, background, parkOnDrain),
+      this.runStage(name, fn, round, background, parkOnDrain, onComplete),
     );
   }
 
@@ -506,6 +605,7 @@ export class RunContext {
     round: number,
     background: boolean,
     parkOnDrain: boolean,
+    onComplete?: (value: T, stage: Stage, sha?: string) => void,
   ): Promise<T> {
     this.checkCancelled();
     const cacheable =
@@ -519,7 +619,7 @@ export class RunContext {
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
     if (!background)
-      this.run = this.store.updateRun(this.run.id, {
+      this.run = this.checkpointer.writeRun(this.run.id, {
         stage: this.parallelChecks && name === "verify" ? "review" : name,
       });
     const stage = this.store.startStage(this.run.id, name, round);
@@ -537,7 +637,11 @@ export class RunContext {
           if (this.state.completedChecks?.round !== round || this.state.completedChecks.sha !== checkSha)
             this.state.completedChecks = { round, sha: checkSha, values: {} };
           this.state.completedChecks.values[name] = output.value;
-          await this.save();
+          if (name === "gates") consumeGateExecution(this);
+          await this.save(
+            undefined,
+            onComplete ? () => onComplete(output.value, stage, checkSha) : undefined,
+          );
         }
         return output;
       });
@@ -822,7 +926,7 @@ export class RunContext {
           )
         ) {
           this.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
-          store.setRunState(this.run.id, this.state);
+          this.checkpointer.writeState(this.run.id, this.state);
         }
         dispatched = true;
       };
@@ -989,7 +1093,7 @@ export class RunContext {
       } finally {
         if (!dispatched && revision.aborted && opts.role === "implement") {
           this.state.implementer = previousImplementer;
-          store.setRunState(this.run.id, this.state);
+          this.checkpointer.writeState(this.run.id, this.state);
         }
         release();
         if (privateDir) rmSync(privateDir, { recursive: true, force: true });

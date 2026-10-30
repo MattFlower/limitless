@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import type { Role } from "../core/types.ts";
+import { availableParallelism, loadavg } from "node:os";
+import type { AuditAllowance, Role } from "../core/types.ts";
 import type { ExecutionEvent, GateRequest } from "../gates/executor.ts";
 import { redactGateData } from "../gates/output.ts";
 import type { GateRun } from "../gates/run.ts";
@@ -27,6 +28,7 @@ import {
 import { attemptBudget, credentialBearing, credentialInText } from "../workers/validation.ts";
 import type { Store } from "./store.ts";
 
+export const hostLoadPerCore = () => (loadavg()[0] ?? 0) / availableParallelism();
 export const tokenHash = (s: string) => createHash("sha256").update(s).digest("hex");
 export class PairingLimitError extends Error {}
 export function canonicalGateCwd(cwd: string): string {
@@ -54,6 +56,7 @@ export interface WorkerRow {
   pairing_expires_at: number;
   last_heartbeat_at: number | null;
   capabilities: string | null;
+  capabilities_ext: string | null;
   agent_capabilities: string | null;
   setup_warning: string | null;
 }
@@ -65,6 +68,7 @@ export interface JobRow {
   request: string;
   state: "queued" | "leased" | "done" | "failed" | "cancelled";
   worker: string | null;
+  worker_os: string | null;
   attempt: number;
   lease_expires_at: number | null;
   attempt_deadline_at: number | null;
@@ -113,11 +117,12 @@ export interface AgentJobRequest
   repoUrl?: string;
   expectedRemoteSha?: string | null;
   privateStringsDigest?: string;
+  allow?: AuditAllowance[];
   discreet?: boolean;
   uiUrl?: string;
 }
 export interface AgentJobRow
-  extends Omit<JobRow, "setup_fallback" | "setup_order" | "events" | "in_place" | "stopped"> {
+  extends Omit<JobRow, "setup_fallback" | "setup_order" | "events" | "in_place" | "stopped" | "worker_os"> {
   invocation_id: number;
   parent_sha: string;
   result_sha: string | null;
@@ -218,8 +223,13 @@ export class WorkerStore {
       .query("UPDATE workers SET state='revoked',token_hash=NULL,revoked_at=? WHERE name=?")
       .run(this.now(), name);
   }
+  /** A Linux worker's capabilities, which the previous release can't parse, are in `capabilities_ext`. */
+  private capabilities(w: WorkerRow): string | null {
+    return w.capabilities ?? w.capabilities_ext;
+  }
   available(w: WorkerRow, agent = false) {
-    const c = w.capabilities ? Heartbeat.parse(JSON.parse(w.capabilities)) : null;
+    const raw = this.capabilities(w);
+    const c = raw ? Heartbeat.parse(JSON.parse(raw)) : null;
     return (
       w.state === "approved" &&
       w.last_heartbeat_at !== null &&
@@ -227,7 +237,8 @@ export class WorkerStore {
       !!this.releaseSha &&
       c?.releaseSha === this.releaseSha &&
       c.bunVersion === Bun.version &&
-      (agent || c.freeSlots > 0)
+      // Agent rounds stay on macOS workers until Linux editors are confined (#839).
+      (agent ? c.os === "darwin" : c.freeSlots > 0)
     );
   }
   private agentCapabilities(w: WorkerRow) {
@@ -244,7 +255,8 @@ export class WorkerStore {
       )
       .all(this.now())
       .map((w) => {
-        const c: Capabilities | null = w.capabilities ? JSON.parse(w.capabilities) : null;
+        const raw = this.capabilities(w);
+        const c: Capabilities | null = raw ? JSON.parse(raw) : null;
         const { agents, privateStrings } = this.agentCapabilities(w);
         const result = this.sanitize({
           name: w.name,
@@ -300,11 +312,20 @@ export class WorkerStore {
     this.sweep();
     this.sweepAgentJobs();
     if (c.updateWarning !== undefined) c = { ...c, updateWarning: this.sanitize(c.updateWarning) };
+    // The previous release reads `capabilities` with a strict schema that knows only darwin and no
+    // confinement field: a Linux worker's row goes to `capabilities_ext` and leaves it null.
+    const { confinement: _confinement, ...darwin } = c;
     this.store.db
       .query(
-        "UPDATE workers SET last_heartbeat_at=?,capabilities=?,agent_capabilities=? WHERE name=? AND state='approved'",
+        "UPDATE workers SET last_heartbeat_at=?,capabilities=?,capabilities_ext=?,agent_capabilities=? WHERE name=? AND state='approved'",
       )
-      .run(this.now(), JSON.stringify(c), JSON.stringify({ agents, privateStrings }), w.name);
+      .run(
+        this.now(),
+        c.os === "darwin" ? JSON.stringify(darwin) : null,
+        c.os === "darwin" ? null : JSON.stringify(c),
+        JSON.stringify({ agents, privateStrings }),
+        w.name,
+      );
     const cancelled: string[] = [];
     for (const id of c.jobs) {
       const gate = this.job(id);
@@ -341,7 +362,7 @@ export class WorkerStore {
       if (sweep) this.sweep();
       const w = this.worker(name);
       if (!w || !this.available(w)) return null;
-      const c: Capabilities = JSON.parse(w.capabilities ?? "{}");
+      const c: Capabilities = JSON.parse(this.capabilities(w) ?? "{}");
       const unreported = this.jobs("state='leased' AND worker=?", name).filter((j) => !c.jobs.includes(j.id));
       if (unreported.length >= c.freeSlots) return null;
       const j = this.jobs("state='queued' AND in_place=0").find(
@@ -351,9 +372,17 @@ export class WorkerStore {
       const deadline = this.now() + attemptBudget(JSON.parse(j.request));
       const changed = this.store.db
         .query(
-          "UPDATE gate_jobs SET state='leased',worker=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=?,setup_order=(SELECT setup_order+1 FROM workers WHERE name=?) WHERE id=? AND state='queued'",
+          "UPDATE gate_jobs SET state='leased',worker=?,worker_os=?,lease_expires_at=?,attempt_deadline_at=?,updated_at=?,setup_order=(SELECT setup_order+1 FROM workers WHERE name=?) WHERE id=? AND state='queued'",
         )
-        .run(name, Math.min(this.now() + this.times.lease, deadline), deadline, this.now(), name, j.id);
+        .run(
+          name,
+          c.os ?? null,
+          Math.min(this.now() + this.times.lease, deadline),
+          deadline,
+          this.now(),
+          name,
+          j.id,
+        );
       if (changed.changes === 1)
         this.store.db.query("UPDATE workers SET setup_order=setup_order+1 WHERE name=?").run(name);
       return changed.changes === 1 ? this.job(j.id) : null;

@@ -13,6 +13,8 @@ export const lifecycleManaged = (cfg: Partial<Pick<Config, "githubQueue">>, repo
   cfg.githubQueue.repos.some((r) => r.toLowerCase() === repo.toLowerCase());
 const labels = ["limitless:in-progress", "limitless:needs-you", "limitless:failed"] as const;
 const eventOrder = ["started", "pr", "needs_human", "failed", "cancelled"] as const;
+export const lifecycleMarker = (runId: string, event: string) =>
+  `<!-- limitless-lifecycle:${runId}:${event} -->`;
 export const ISSUE_LIFECYCLE_CALL_CAP = 50;
 export type IssueLifecycleOptions = { identity?: typeof githubIdentity; maxCalls?: number };
 const cursors = new WeakMap<Store, { key: string; deferred: boolean }>();
@@ -94,10 +96,7 @@ export async function reconcileIssueLifecycle(
         continue;
       }
       try {
-        const body = checkBody(
-          run,
-          `<!-- limitless-lifecycle:${run.id}:${event} -->\nLimitless run ${run.id} ${text}`,
-        );
+        const body = checkBody(run, `${lifecycleMarker(run.id, event)}\nLimitless run ${run.id} ${text}`);
         save(effect, "pending", { body });
       } catch (error) {
         save(effect, "done");
@@ -110,13 +109,13 @@ export async function reconcileIssueLifecycle(
   // Persist every observation before any delivery, even when the call budget is exhausted.
   for (const run of runs) {
     store.transaction(() => {
-      for (const { repo, number } of linkedIssues(run))
+      for (const { repo, number } of linkedIssues(run, store))
         if (lifecycleManaged(cfg, repo)) observe(run, repo, number);
       store.observeIssueLifecycle(run);
     });
   }
   const work = runs.flatMap((snapshot) =>
-    linkedIssues(snapshot)
+    linkedIssues(snapshot, store)
       .filter(({ repo }) => lifecycleManaged(cfg, repo))
       .flatMap((issue) =>
         ["labels", ...eventOrder].map((effect) => ({
@@ -150,7 +149,13 @@ export async function reconcileIssueLifecycle(
         save("labels", target);
       });
     let run = store.getRun(snapshot.id);
-    if (!run) continue;
+    if (
+      !run ||
+      !linkedIssues(run, store).some(
+        (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
+      )
+    )
+      continue;
     if (task !== "labels") observe(run, repo, number);
     const effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
     if (task === "labels") {

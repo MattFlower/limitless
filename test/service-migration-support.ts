@@ -12,9 +12,10 @@ import {
 import * as os from "node:os";
 import { join } from "node:path";
 import type { DeployClient, DeployClock } from "../src/cli/deploy-wait.ts";
-import { DrainUnsupportedError } from "../src/cli/deploy-wait.ts";
+import { DaemonTimeoutError, DrainUnsupportedError } from "../src/cli/deploy-wait.ts";
 import type { sh } from "../src/util/proc.ts";
 import * as proc from "../src/util/proc.ts";
+import { inspectionResult } from "./service-inspection-support.ts";
 
 const home = process.env.SERVICE_TEST_HOME;
 if (!home) throw new Error("missing isolated test home");
@@ -22,9 +23,11 @@ const nativeOs = { ...os };
 mock.module("node:os", () => ({ ...nativeOs, homedir: () => home }));
 const requestedScenario = process.argv[2] ?? "migration";
 const sequential = requestedScenario.startsWith("sequence");
-let scenario = sequential ? "bootstrap" : requestedScenario;
+const executorRecovery = requestedScenario.startsWith("executor-recovery");
+let scenario = sequential || executorRecovery ? "bootstrap" : requestedScenario;
 const kind = process.argv[3] ?? "daemon";
 const packaged = requestedScenario.startsWith("packaged-");
+const destinationPreflight = requestedScenario.endsWith("-inspection-collision");
 const programCase = requestedScenario.split("-program-")[1];
 const agents = packaged ? join(home, "isolated-agents") : join(home, "Library", "LaunchAgents");
 const realApp = join(home, "app & release");
@@ -48,6 +51,8 @@ writeFileSync(join(home, ".cloudflared", "limitless.yml"), "");
 writeFileSync(join(home, ".cloudflared", "12345678-1234-1234-1234-123456789abc.json"), "{}");
 const calls: string[] = [];
 const loaded = new Set<string>();
+const disabled = new Set<string>();
+const recoveries: { error: string; phase: string; retained: boolean }[] = [];
 const oldLabel = scenario.startsWith("marked") ? `dev.limitless.${kind}` : `arbitrary.installed.${kind}`;
 const oldPath = join(agents, `${kind}-original.plist`);
 const neutral = `dev.limitless.${kind}`;
@@ -76,12 +81,12 @@ function parse(content: string) {
   };
 }
 const args =
-  kind === "daemon"
+  kind === "daemon" || kind === "executor"
     ? [
         "/different/bin/bun",
         ...(scenario === "bun-run" ? ["run"] : []),
         join(plistApp, "src", "cli", "main.ts"),
-        "serve",
+        kind === "executor" ? "executor" : "serve",
       ]
     : kind === "mtplx"
       ? [join(home, ".mtplx", "bin", "mtplx"), "serve", "--model", "old-model"]
@@ -165,6 +170,12 @@ async function compete() {
   lockHeld = existsSync(lock) && readFileSync(lock, "utf8").trim() === String(process.pid);
 }
 const commands: string[][] = [];
+let inspectionInjected = false;
+let replacementFailed = false;
+let drainCompleted = false;
+let recoveryFailure = false;
+const recoveryInspection = scenario.startsWith("failed-recovery-inspection-");
+const recoveryRestore = scenario.startsWith("failed-recovery-restore");
 const command: typeof sh = async (argv) => {
   commands.push([...argv]);
   const ok = (stdout = "", exitCode = 0, stderr = "") => ({ stdout, exitCode, stderr });
@@ -173,20 +184,51 @@ const command: typeof sh = async (argv) => {
     return content.startsWith("<") ? ok(JSON.stringify(parse(content))) : ok("", 1, "invalid plist");
   }
   if (argv[0] !== "launchctl") {
+    if (scenario === "stop-after-recovery" && argv[1] === "fetch") throw new Error("stopped after recovery");
     if (argv[0] === "bun" && argv[1] === "install") recoveryCleaned = !journals()?.length;
     return ok(argv[1] === "rev-parse" ? "current" : "");
   }
   const label = argv.at(-1)?.split("/").at(-1) ?? "";
   if (argv[1] === "print") {
+    const inspectionCase = process.env.SERVICE_TEST_INSPECTION;
+    if (
+      inspectionCase &&
+      (((scenario === "inspection-collision" || destinationPreflight) &&
+        label === neutral &&
+        !calls.includes(`bootout ${oldLabel}`)) ||
+        (scenario.startsWith("inspection-post-drain") && label === oldLabel && drainCompleted) ||
+        (["inspection-status", "inspection-uninstall"].includes(scenario) && label === oldLabel) ||
+        (scenario === "inspection-old" && label === oldLabel && !inspectionInjected) ||
+        (recoveryInspection && recoveryFailure && label === oldLabel && !inspectionInjected) ||
+        (scenario === "inspection-reconcile" && label === neutral && !existsSync(oldPath)) ||
+        (scenario === "inspection-restore" && label === neutral && replacementFailed && !inspectionInjected))
+    ) {
+      inspectionInjected = true;
+      if (inspectionCase === "absent") loaded.delete(label);
+      return inspectionResult(inspectionCase, label);
+    }
     if (stopping && time > stoppedAt && scenario !== "stuck") {
       loaded.delete(stopping);
       stopping = "";
     }
-    return ok("", loaded.has(label) ? 0 : 1);
+    return loaded.has(label)
+      ? ok()
+      : ok("", 113, `Could not find service "${label}" in domain for user gui: ${os.userInfo().uid}`);
+  }
+  if (argv[1] === "enable" || argv[1] === "disable") {
+    calls.push(`${argv[1]} ${label}`);
+    if (argv[1] === "disable") disabled.add(label);
+    else disabled.delete(label);
+    return ok();
   }
   if (argv[1] === "bootout") {
     calls.push(`bootout ${label}`);
     if (label === oldLabel) backupBeforeStop = record()?.backup === Buffer.from(old).toString("base64");
+    if (label === oldLabel && (scenario === "failed-recovery-inspection-stop" || recoveryRestore)) {
+      recoveryFailure = true;
+      if (recoveryRestore) loaded.delete(label);
+      return ok("", 1, "stop failed");
+    }
     if (label === oldLabel && scenario === "signal-stopping") {
       console.log("READY");
       await new Promise(() => {});
@@ -210,6 +252,12 @@ const command: typeof sh = async (argv) => {
     const unitOld = unitKind === kind ? oldLabel : `arbitrary.installed.${unitKind}`;
     const unitOldPath = join(agents, `${unitKind}-original.plist`);
     calls.push(`bootstrap ${data.Label}`);
+    if (data.Label === oldLabel && recoveryRestore) {
+      // The old daemon restarts, but launchctl still reports a restoration failure.
+      loaded.add(oldLabel);
+      return ok("", 1, "old bootstrap failed");
+    }
+    if (disabled.has(data.Label ?? "")) return ok("", 1, "label disabled");
     if (packaged && data.Label === neutral) {
       packagedHealthReads = 0;
       if (failBootstrap) {
@@ -236,7 +284,11 @@ const command: typeof sh = async (argv) => {
       writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
       process.exit(0);
     }
-    if (data.Label === neutral && ["bootstrap", "restore", "partial"].includes(scenario)) {
+    if (
+      data.Label === neutral &&
+      ["bootstrap", "restore", "partial", "inspection-restore"].includes(scenario)
+    ) {
+      replacementFailed = true;
       if (scenario === "partial") loaded.add(neutral);
       return ok("", 1, "replacement bootstrap failed");
     }
@@ -271,7 +323,15 @@ let failHealth = false;
 const client: DeployClient = {
   async admin(action) {
     calls.push(action);
-    if (action === "resume" && scenario === "resume-failure") throw new Error("resume failed");
+    if (
+      action === "resume" &&
+      [
+        "resume-failure",
+        "inspection-post-drain-resume-failure",
+        "failed-recovery-restore-resume-failure",
+      ].includes(scenario)
+    )
+      throw new Error("resume failed");
     if (action === "drain" && (scenario.endsWith("signal-drain") || scenario === "signal-journal")) {
       writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
       const interrupted = new Promise<void>((resolve) => {
@@ -295,12 +355,17 @@ const client: DeployClient = {
     return { draining, active: [] };
   },
   async health() {
+    if (draining && time >= 5000) drainCompleted = true;
     if (packaged) {
       const sha = !draining && (failHealth || packagedHealthReads++ === 0) ? "b".repeat(40) : "a".repeat(40);
       calls.push(`health ${draining ? "draining" : sha}`);
       return { ok: true, uptimeMs: 1, sha, draining, active: [] };
     }
     calls.push(`health ${draining ? "draining" : "fresh"}`);
+    if (draining && scenario === "failed-recovery-inspection-drain-timeout") {
+      recoveryFailure = true;
+      throw new DaemonTimeoutError();
+    }
     if (scenario === "deploy-install") await compete();
     if (draining && scenario === "drain-health") throw new Error("drain health failed");
     if (scenario === "recover-unhealthy-deploy") throw new Error("daemon health failed");
@@ -338,15 +403,26 @@ let tunnelJournal = "";
 let daemonOld = "";
 let firstCalls: string[] = [];
 let discovered: string[] = [];
+let discoveredUnits: { label: string; path: string; kind: string }[] = [];
 let original = "";
 let stable = "";
 let executable = "";
+let errorKind = "";
+let errorCause = "";
+let filesBefore: Record<string, string> = {};
+let loadedBefore: string[] = [];
+let disabledBefore: string[] = [];
+const agentFiles = () =>
+  Object.fromEntries(readdirSync(agents).map((name) => [name, readFileSync(join(agents, name), "utf8")]));
 try {
   if (programCase) {
     executable = join(home, "bin", kind === "tunnel" ? "cloudflared" : packaged ? "limitless" : "bun");
     mkdirSync(join(executable, ".."), { recursive: true });
     writeFileSync(executable, "executable");
-    const unitArgs = packaged && kind === "daemon" ? [executable, "serve"] : [...args];
+    const unitArgs =
+      packaged && ["daemon", "executor"].includes(kind)
+        ? [executable, kind === "executor" ? "executor" : "serve"]
+        : [...args];
     if (kind !== "mtplx") unitArgs[0] = executable;
     const first = unitArgs[0];
     if (!first) throw new Error("missing executable argument");
@@ -354,25 +430,26 @@ try {
     symlinkSync(first, alias);
     const other = join(home, "other-executable");
     writeFileSync(other, "unrelated executable");
-    const program =
-      programCase === "absent"
-        ? ""
-        : programCase === "invalid"
-          ? "<key>Program</key><false/>"
-          : `<key>Program</key><string>${xmlEscape(
-              programCase === "equal"
-                ? first
-                : programCase === "symlink"
-                  ? alias
-                  : programCase === "unresolvable"
-                    ? join(home, "missing-executable")
-                    : other,
-            )}</string>`;
+    const program = ["absent", "marker", "duplicate"].includes(programCase)
+      ? ""
+      : programCase === "invalid"
+        ? "<key>Program</key><false/>"
+        : `<key>Program</key><string>${xmlEscape(
+            programCase === "equal"
+              ? first
+              : programCase === "symlink"
+                ? alias
+                : programCase === "unresolvable"
+                  ? join(home, "missing-executable")
+                  : other,
+          )}</string>`;
     const directory = packaged ? join(home, ".limitless") : app;
     mkdirSync(directory, { recursive: true });
-    original = `<plist><dict><key>Label</key><string>${oldLabel}</string>${program}<key>WorkingDirectory</key><string>${xmlEscape(directory)}</string><key>ProgramArguments</key><array>${unitArgs.map((arg) => `<string>${xmlEscape(arg)}</string>`).join("")}</array></dict></plist>`;
+    original = `<plist><dict>${programCase === "marker" ? "<key>LimitlessService</key><string>daemon</string>" : ""}<key>Label</key><string>${oldLabel}</string>${program}<key>WorkingDirectory</key><string>${xmlEscape(directory)}</string><key>ProgramArguments</key><array>${unitArgs.map((arg) => `<string>${xmlEscape(arg)}</string>`).join("")}</array></dict></plist>`;
     const path = join(agents, programCase === "collision" ? `${neutral}.plist` : `${kind}-original.plist`);
     writeFileSync(path, original);
+    if (programCase === "duplicate")
+      writeFileSync(join(agents, "duplicate.plist"), original.replace(oldLabel, "other.executor"));
     loaded.add(oldLabel);
     const options = {
       command,
@@ -384,8 +461,36 @@ try {
         ? { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version }
         : { kind: "source" as const, root: app, version: "1.0", bun: Bun.version },
     };
-    discovered = (await service.installedUnits(options)).map((unit) => unit.kind);
+    discoveredUnits = await service.installedUnits(options);
+    discovered = discoveredUnits.map((unit) => unit.kind);
     if (programCase === "collision") await service.install(0, options);
+  } else if (destinationPreflight) {
+    executable = join(home, "bin", "limitless");
+    const options = {
+      command,
+      client,
+      clock,
+      agentsDir: agents,
+      executor: true,
+      execPath: executable,
+      release: packaged
+        ? { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version }
+        : { kind: "source" as const, root: app, version: "1.0", bun: Bun.version },
+    };
+    for (const [label, content] of service.installationUnits(options)) {
+      const unitKind = label.split(".").at(-1);
+      const oldLabel = `arbitrary.installed.${unitKind}`;
+      writeFileSync(join(agents, `${unitKind}-original.plist`), content.replaceAll(label, oldLabel));
+      loaded.add(oldLabel);
+    }
+    disabled.add(oldLabel);
+    const inspectionCase = process.env.SERVICE_TEST_INSPECTION;
+    if (inspectionCase === "path") writeFileSync(join(agents, `${neutral}.plist`), unrelated);
+    if (inspectionCase === "loaded") loaded.add(neutral);
+    filesBefore = agentFiles();
+    loadedBefore = [...loaded];
+    disabledBefore = [...disabled];
+    await service.install(0, options);
   } else if (packaged) {
     const prefix = join(home, "brew");
     const version = join(prefix, "Cellar", "limitless", "1.0");
@@ -402,6 +507,7 @@ try {
       agentsDir: agents,
       release: { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version },
       execPath: executable,
+      executor: kind === "executor",
       mtplx: true,
       tunnel: true,
       publicUrl: "https://hooks.example.test",
@@ -441,14 +547,47 @@ try {
       clock,
       leaseClient: async () => ({ id: "lease", acquired: true }),
     });
-  else if (scenario === "status") await service.status(0);
-  else if (scenario === "uninstall") await service.uninstall();
+  else if (requestedScenario === "intent-install") {
+    const intentPath = join(home, ".limitless", "executor-intent.json");
+    mkdirSync(join(intentPath, ".."), { recursive: true });
+    writeFileSync(
+      intentPath,
+      JSON.stringify({
+        phase: "deploying",
+        label: oldLabel,
+        path: oldPath,
+        previous: "previous",
+        target: "current",
+      }),
+    );
+    await service.install(0, { command, client, clock, executor: true });
+  } else if (executorRecovery) {
+    disabled.add(oldLabel);
+    await service.install(0, { command, client, clock, executor: true }).catch((e) => {
+      firstError = String(e);
+    });
+    firstCalls = calls.splice(0);
+    for (let i = 0; i < 2; i++) {
+      scenario = requestedScenario.endsWith("stuck") ? "stuck" : "stop-after-recovery";
+      if (scenario === "stuck") loaded.add(oldLabel);
+      const error = String(
+        await service.deploy(0, undefined, false, { command, client, clock, executor: true }).catch((e) => e),
+      );
+      recoveries.push({ error, phase: record()?.phase, retained: existsSync(journal) });
+    }
+    if (!requestedScenario.endsWith("stuck")) {
+      scenario = "migration";
+      await service.deploy(0, undefined, false, { command, client, clock, executor: true });
+    }
+  } else if (["status", "inspection-status"].includes(scenario)) await service.status(0, { command });
+  else if (["uninstall", "inspection-uninstall"].includes(scenario)) await service.uninstall({ command });
   else {
     await service
       .install(0, {
         command,
         client,
         clock,
+        executor: kind === "executor" && scenario !== "unselected",
         mtplx: kind === "mtplx" && scenario !== "unselected",
         tunnel: kind === "tunnel" && scenario !== "unselected",
         publicUrl: "https://hooks.example.test",
@@ -475,14 +614,23 @@ try {
   }
 } catch (caught) {
   error = String(caught);
+  errorKind = caught instanceof Error ? caught.constructor.name : "";
+  errorCause = caught instanceof Error && caught.cause ? String(caught.cause) : "";
 }
 clearTimeout(signalTimer);
 writeFileSync(join(home, "loaded.json"), JSON.stringify([...loaded]));
 console.log(
   JSON.stringify({
     error,
+    errorKind,
+    errorCause,
+    filesBefore,
+    loadedBefore,
+    disabledBefore,
     firstCalls,
+    recoveries,
     discovered,
+    discoveredUnits,
     original,
     stable,
     executable,
@@ -507,12 +655,12 @@ console.log(
     lock: existsSync(lock),
     calls,
     loaded: [...loaded],
+    disabled: [...disabled],
+    intent: existsSync(join(home, ".limitless", "executor-intent.json")),
     draining,
     old,
     time,
-    files: Object.fromEntries(
-      readdirSync(agents).map((name) => [name, readFileSync(join(agents, name), "utf8")]),
-    ),
+    files: agentFiles(),
     unrelated,
   }),
 );
