@@ -7,6 +7,7 @@ import { ciDecision, ciSignature } from "../src/integrations/ci-classifier.ts";
 import { normalizePr } from "../src/integrations/github-poller.ts";
 import * as proc from "../src/util/proc.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { assertionLog, ciEvidence, junit, reportZip } from "./ci-evidence-support.ts";
 import { pollerHarness, respond, SHA, url } from "./github-poller-support.ts";
 
 let h: ReturnType<typeof pollerHarness>;
@@ -128,6 +129,320 @@ function failure(n = 1, name = "test", conclusion = "timed_out") {
   };
   return { node, check, job, state, observe, rerun };
 }
+
+function unrelatedFailure() {
+  const f = failure(1, "test", "failure");
+  f.state.log = assertionLog;
+  f.job.steps = [{ name: "Test", status: "completed", conclusion: "failure" }];
+  const evidence = ciEvidence(h.gh, "o/r", 1, SHA, f.job);
+  return { ...f, evidence };
+}
+
+test.each(["success", "failure"])(
+  "unrelated assertion reruns once across restart, then %s",
+  async (result) => {
+    h = pollerHarness();
+    const f = unrelatedFailure();
+    h.start(15);
+    await h.advance(0);
+    expect(reruns().map((c) => c.path)).toEqual(["repos/o/r/actions/jobs/21/rerun"]);
+    expect(items("ci.needs_fix")).toHaveLength(0);
+    expect(fixEvidence()).toBeNull();
+    const observations = h.store.failureObservations({ class: "flaky" });
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({
+      sha: SHA,
+      exit_code: 1,
+      history: "no_retry",
+      handle_kind: "github-actions",
+      handle_id: '["o/r",1,1,21]',
+      failed_files: '["test/example.test.ts"]',
+    });
+    expect(JSON.parse(observations[0]?.reason ?? "{}")).toMatchObject({
+      tests: [
+        { file: "test/example.test.ts", identity: '["test/example.test.ts",["suite"],"outer","asserts"]' },
+      ],
+      main: { sha: mainSha, run: 90, attempt: 1, job: 91 },
+      artifacts: [81],
+      mainArtifacts: [82],
+    });
+    h.reopen();
+    h.start(15);
+    await h.advance(0);
+    f.observe("FAILURE", "polled-again");
+    await h.advance(15000);
+    expect(reruns()).toHaveLength(1);
+    expect(h.store.failureObservations({ class: "flaky" })).toEqual(observations);
+    f.rerun(result);
+    f.evidence.run.run_attempt = 2;
+    f.observe(result === "success" ? "SUCCESS" : "FAILURE", "rerun");
+    await h.advance(15000);
+    expect(reruns()).toHaveLength(1);
+    expect(items("ci.needs_fix")).toHaveLength(result === "success" ? 0 : 1);
+    expect(fixEvidence() !== null).toBe(result === "failure");
+    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe(
+      result === "success" ? "failed_then_passed" : "failed_again",
+    );
+    expect(h.store.failureObservations({ class: "flaky" })).toEqual(observations);
+  },
+);
+
+test("an earlier transient claim also consumes the unrelated-test allowance", async () => {
+  h = pollerHarness();
+  const f = unrelatedFailure();
+  const earlier = {
+    ...ciSignature("other", "timeout", "failure"),
+    prUrl: f.node.url,
+    sha: SHA,
+    outcome: "failed" as const,
+    rerunMarker: null,
+  };
+  h.store.recordCiFailure(earlier);
+  expect(h.store.claimCiRerun(earlier, "earlier", { id: 500, runId: 100, attempt: 1, name: "other" })).toBe(
+    true,
+  );
+  h.store.finishCiFailure(earlier, "failed_again");
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(0);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  expect(fixEvidence()).not.toBeNull();
+  expect(h.store.failureObservations({ class: "flaky" })).toHaveLength(0);
+});
+
+test.each(["changed", "renamed-from", "renamed-to", "mixed"])(
+  "%s testcase files follow the fix path",
+  async (kind) => {
+    h = pollerHarness();
+    const f = unrelatedFailure();
+    f.evidence.files =
+      kind === "changed" || kind === "mixed"
+        ? [{ filename: "./test/example.test.ts", status: "modified" }]
+        : [
+            {
+              filename: kind === "renamed-from" ? "test/new.test.ts" : "test/example.test.ts",
+              status: "renamed",
+              previous_filename: kind === "renamed-from" ? "test/example.test.ts" : "test/old.test.ts",
+            },
+          ];
+    if (kind === "mixed") {
+      f.evidence.prXml = `<testsuites tests="2" failures="2" errors="0">${junit()}${junit("failure", "test/unrelated.test.ts")}</testsuites>`;
+      f.evidence.mainXml = `<testsuites tests="2" failures="0" errors="0">${junit("pass")}${junit("pass", "test/unrelated.test.ts")}</testsuites>`;
+      f.state.log = "(fail) asserts\n0 pass\n2 fail\nRan 2 tests across 2 files.";
+    }
+    h.start(15);
+    await h.advance(0);
+    expect(reruns()).toHaveLength(0);
+    expect(items("ci.needs_fix")).toHaveLength(1);
+    expect(fixEvidence()).not.toBeNull();
+  },
+);
+
+test.each([
+  "missing-pr",
+  "missing-main",
+  "malformed",
+  "incomplete",
+  "unmatched",
+  "main-failed",
+  "main-skipped",
+  "conflicting",
+  "expired",
+  "wrong-commit",
+  "wrong-repo",
+  "old-attempt",
+  "latest-has-no-report",
+  "files-missing",
+  "files-incomplete",
+  "rename-incomplete",
+  "ambiguous-job",
+  "non-test-error",
+  "multiple-failed-steps",
+  "runner-summary-missing",
+  "unknown-outcome",
+  "suite-error",
+  "absolute-path",
+  "traversal",
+  "class-context",
+  "suite-context",
+  "corrupt-zip",
+])("unusable evidence (%s) retains needs-fix", async (kind) => {
+  h = pollerHarness();
+  const f = unrelatedFailure();
+  const e = f.evidence;
+  if (kind === "missing-pr") e.prArtifacts = [];
+  if (kind === "missing-main") e.mainArtifacts = [];
+  if (kind === "malformed") e.mainXml = "<testsuite";
+  if (kind === "incomplete") e.prXml = e.prXml.replace('tests="1"', 'tests="2"');
+  if (kind === "unmatched") e.mainXml = junit("pass", "test/example.test.ts", "different");
+  if (kind === "main-failed") e.mainXml = junit();
+  if (kind === "main-skipped") e.mainXml = junit("skipped");
+  if (kind === "conflicting")
+    e.mainXml = `<testsuites tests="2" failures="1" errors="0">${junit("pass")}${junit()}</testsuites>`;
+  if (kind === "expired" && e.mainArtifacts[0]) e.mainArtifacts[0].expired = true;
+  if (kind === "wrong-commit" && e.prArtifacts[0]) e.prArtifacts[0].workflow_run.head_sha = mainSha;
+  if (kind === "wrong-repo") e.mainRun.repository = { full_name: "o/elsewhere" };
+  if (kind === "old-attempt") e.run.run_attempt = 2;
+  if (kind === "latest-has-no-report") e.mainRuns = [{ ...e.mainRun, id: 100 }, e.mainRun];
+  if (kind === "files-missing") h.gh.responses.delete("repos/o/r/pulls/1/files?per_page=100&page=1");
+  if (kind === "files-incomplete")
+    h.gh.responses.set("repos/o/r/pulls/1", () =>
+      respond(200, { node_id: "PR_o/r_1", head: { sha: SHA }, state: "open", changed_files: 2 }),
+    );
+  if (kind === "rename-incomplete") e.files = [{ filename: "test/new.ts", status: "renamed" }];
+  if (kind === "ambiguous-job")
+    h.gh.responses.set("repos/o/r/actions/runs/90/attempts/1/jobs?per_page=100&page=1", () =>
+      respond(200, { total_count: 2, jobs: [e.mainJob, { ...e.mainJob, id: 92 }] }),
+    );
+  if (kind === "non-test-error") f.state.log += "\n1 error";
+  if (kind === "multiple-failed-steps")
+    f.job.steps.push({ name: "Build", status: "completed", conclusion: "failure" });
+  if (kind === "runner-summary-missing") f.state.log = "(fail) asserts";
+  if (kind === "unknown-outcome") e.prXml = e.prXml.replace("<failure/>", "<unknown/>");
+  if (kind === "suite-error") e.prXml = e.prXml.replace("</testsuite>", "<error/></testsuite>");
+  if (kind === "absolute-path") e.prXml = junit("failure", "/tmp/example.test.ts");
+  if (kind === "traversal") e.prXml = junit("failure", "test/../example.test.ts");
+  if (kind === "class-context") e.mainXml = e.mainXml.replace('classname="outer"', 'classname="other"');
+  if (kind === "suite-context") e.mainXml = e.mainXml.replace('name="suite"', 'name="other"');
+  if (kind === "corrupt-zip")
+    h.gh.responses.set("repos/o/r/actions/artifacts/82/zip", () => {
+      const zip = reportZip(e.mainXml);
+      zip[40] = (zip[40] ?? 0) ^ 255;
+      return respond(200, zip);
+    });
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(0);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  expect(fixEvidence()).not.toBeNull();
+});
+
+test("JUnit entities and relative paths share the changed-file normalization", async () => {
+  h = pollerHarness();
+  const f = unrelatedFailure();
+  f.evidence.prXml = junit("failure", "./test/a&amp;b.test.ts", "a&amp;b");
+  f.evidence.mainXml = junit("pass", "test/a&amp;b.test.ts", "a&#38;b");
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(1);
+  expect(h.store.failureObservations({ class: "flaky" })[0]?.failed_files).toBe('["test/a&b.test.ts"]');
+});
+
+test.each(["head", "claim", "default-tip", "main-attempt"])(
+  "an overtaking %s prevents a JUnit rerun",
+  async (change) => {
+    h = pollerHarness();
+    const f = unrelatedFailure();
+    let active = true;
+    h.gh.responses.set("repos/o/r/actions/artifacts/82/zip", () => {
+      if (change === "head") active = false;
+      if (change === "claim") active = false;
+      if (change === "default-tip")
+        h.gh.responses.set("repos/o/r/commits/main", () => respond(200, { sha: "c".repeat(40) }));
+      if (change === "main-attempt") f.evidence.mainRun.run_attempt = 2;
+      return respond(200, reportZip(f.evidence.mainXml));
+    });
+    const snap = normalizePr(f.node);
+    const pr = h.store.githubTracked()[0];
+    if (!snap || !pr) throw new Error("missing fixture");
+    const result = await ciDecision(
+      h.store,
+      pr,
+      snap,
+      (_repo, path, body) => h.gh.client(path, body),
+      true,
+      () => true,
+      () => (change === "head" ? active : true),
+      "land",
+      undefined,
+      () => (change === "claim" ? active : true),
+    );
+    expect(result.state).toBe(change === "head" || change === "claim" ? "pending" : "failed");
+    expect(reruns()).toHaveLength(0);
+    expect(h.store.failureObservations({ class: "flaky" })).toHaveLength(0);
+  },
+);
+
+test.each(["moved", "approved-lag"])("the JUnit PR-files read respects a %s head", async (kind) => {
+  h = pollerHarness();
+  const f = unrelatedFailure();
+  const snap = normalizePr(f.node);
+  const pr = h.store.githubTracked()[0];
+  if (!snap || !pr) throw new Error("missing fixture");
+  const remote = "c".repeat(40);
+  h.gh.responses.set("repos/o/r/pulls/1", () => respond(200, { head: { sha: remote }, changed_files: 1 }));
+  const result = await ciDecision(
+    h.store,
+    pr,
+    snap,
+    (_repo, path, body) => h.gh.client(path, body),
+    true,
+    () => true,
+    () => true,
+    "land",
+    kind === "approved-lag" ? remote : undefined,
+  );
+  expect(result.state).toBe(kind === "approved-lag" ? "pending" : "head_moved");
+  expect(reruns()).toHaveLength(0);
+  expect(fixEvidence()).toBeNull();
+});
+
+test.each([403, 429])("JUnit access/rate denial (%s) leaves the inspection pending", async (status) => {
+  h = pollerHarness();
+  const f = unrelatedFailure();
+  const snap = normalizePr(f.node);
+  const pr = h.store.githubTracked()[0];
+  if (!snap || !pr) throw new Error("missing fixture");
+  h.gh.responses.set("repos/o/r/actions/artifacts/82/zip", () => respond(status, {}));
+  await expect(
+    ciDecision(
+      h.store,
+      pr,
+      snap,
+      (_repo, path, body) => h.gh.client(path, body),
+      true,
+      () => true,
+      () => true,
+      "land",
+    ),
+  ).rejects.toThrow("CI inspection paused");
+  expect(reruns()).toHaveLength(0);
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(fixEvidence()).toBeNull();
+});
+
+test.each(["success", "failure"])(
+  "shared land classification keeps a JUnit rerun pending until %s",
+  async (result) => {
+    h = pollerHarness();
+    const f = unrelatedFailure();
+    const pr = h.store.githubTracked()[0];
+    if (!pr) throw new Error("missing fixture");
+    const decide = () => {
+      const snap = normalizePr(f.node);
+      if (!snap) throw new Error("missing snapshot");
+      return ciDecision(
+        h.store,
+        pr,
+        snap,
+        (_repo, path, body) => h.gh.client(path, body),
+        true,
+        () => true,
+        () => true,
+        "land",
+      );
+    };
+    expect((await decide()).state).toBe("pending");
+    h.reopen();
+    f.observe("SUCCESS", "premature-green");
+    expect((await decide()).state).toBe("pending");
+    f.rerun(result);
+    f.evidence.run.run_attempt = 2;
+    f.observe(result === "success" ? "SUCCESS" : "FAILURE", "confirmed");
+    expect((await decide()).state).toBe(result === "success" ? "green" : "failed");
+    expect(reruns()).toHaveLength(1);
+  },
+);
 
 test("a timed-out job reruns once and a pass at its SHA is flake evidence", async () => {
   h = pollerHarness();
@@ -1500,32 +1815,36 @@ test.each(["accepted", "lost", "security"])(
   },
 );
 
-test("independent Store connections share the atomic head claim without a false needs-fix", async () => {
-  h = pollerHarness();
-  const f = failure();
-  const snap = normalizePr(f.node);
-  const pr = h.store.githubTracked()[0];
-  if (!snap || !pr) throw new Error("missing PR fixture");
-  const other = new Store(join(h.dir, "db.sqlite"));
-  try {
-    const decide = (store: Store) =>
-      ciDecision(
-        store,
-        pr,
-        snap,
-        (_repo, path, body) => h.gh.client(path, body),
-        true,
-        () => true,
-        () => true,
-      );
-    const decisions = await Promise.all([decide(h.store), decide(other)]);
-    expect(decisions.map((d) => d.state)).toEqual(["pending", "pending"]);
-    expect(reruns()).toHaveLength(1);
-    expect(items("ci.needs_fix")).toHaveLength(0);
-  } finally {
-    other.close();
-  }
-});
+test.each(["transient", "unrelated"])(
+  "independent Stores share the %s head claim without a false needs-fix",
+  async (kind) => {
+    h = pollerHarness();
+    const f = kind === "unrelated" ? unrelatedFailure() : failure();
+    const snap = normalizePr(f.node);
+    const pr = h.store.githubTracked()[0];
+    if (!snap || !pr) throw new Error("missing PR fixture");
+    const other = new Store(join(h.dir, "db.sqlite"));
+    try {
+      const decide = (store: Store) =>
+        ciDecision(
+          store,
+          pr,
+          snap,
+          (_repo, path, body) => h.gh.client(path, body),
+          true,
+          () => true,
+          () => true,
+        );
+      const decisions = await Promise.all([decide(h.store), decide(other)]);
+      expect(decisions.map((d) => d.state)).toEqual(["pending", "pending"]);
+      expect(reruns()).toHaveLength(1);
+      expect(items("ci.needs_fix")).toHaveLength(0);
+      expect(h.store.failureObservations({ class: "flaky" })).toHaveLength(kind === "unrelated" ? 1 : 0);
+    } finally {
+      other.close();
+    }
+  },
+);
 
 test("REST-confirmed success waits for the old failed rollup without a false failure", async () => {
   h = pollerHarness();

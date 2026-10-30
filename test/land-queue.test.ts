@@ -38,6 +38,7 @@ import * as proc from "../src/util/proc.ts";
 import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
 import { GateRunSchema } from "../src/workers/protocol.ts";
 import { validRun } from "../src/workers/validation.ts";
+import { assertionLog, ciEvidence } from "./ci-evidence-support.ts";
 import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
@@ -2841,7 +2842,7 @@ test("a CI feed item lands the entry without the clock moving", async () => {
   expect(ghCalls("pr merge")).toHaveLength(1);
 });
 
-function workflow(head: string, attempt: number, conclusion: string, status = "completed"): void {
+function workflow(head: string, attempt: number, conclusion: string, status = "completed", ordinary = false) {
   const job = {
     id: 20 + attempt,
     run_id: 42,
@@ -2849,9 +2850,9 @@ function workflow(head: string, attempt: number, conclusion: string, status = "c
     name: "network",
     head_sha: head,
     status,
-    conclusion: conclusion === "failure" ? "timed_out" : conclusion,
+    conclusion: conclusion === "failure" && !ordinary ? "timed_out" : conclusion,
     check_run_url: `https://api.github.com/repos/${SLUG}/check-runs/${10 + attempt}`,
-    steps: [],
+    steps: [{ name: "Test", status, conclusion }],
   };
   const check = {
     id: 10 + attempt,
@@ -2872,7 +2873,9 @@ function workflow(head: string, attempt: number, conclusion: string, status = "c
     respond(200, { total_count: 1, jobs: [job] }),
   );
   github.responses.set(`repos/${SLUG}/actions/jobs/${job.id}`, () => respond(200, job));
-  github.responses.set(`repos/${SLUG}/actions/jobs/${job.id}/logs`, () => respond(200, "runner timed out"));
+  github.responses.set(`repos/${SLUG}/actions/jobs/${job.id}/logs`, () =>
+    respond(200, ordinary ? assertionLog : "runner timed out"),
+  );
   github.responses.set(`repos/${SLUG}/check-runs/${check.id}/annotations?per_page=100&page=1`, () =>
     respond(200, []),
   );
@@ -2881,7 +2884,42 @@ function workflow(head: string, attempt: number, conclusion: string, status = "c
     join(root, "gh.runs"),
     JSON.stringify([{ databaseId: 42, headSha: head, attempt, conclusion, status }]),
   );
+  return job;
 }
+
+test.each(["success", "failure"])(
+  "unrelated JUnit rerun holds landing until confirmed %s",
+  async (result) => {
+    const pr = delivered(1, "pr-1");
+    const head = await pushBranch("pr-1", "one.txt", "one\n", 1);
+    observe(1, head);
+    approve(1, head);
+    ci = () => null;
+    const q = queue();
+    const entry = await q.request({ target: pr.run.id });
+    await waitFor(() => !!store.getLandEntry(entry.id)?.pushedSha);
+    const pinned = store.getLandEntry(entry.id)?.pushedSha ?? "";
+    const job = workflow(pinned, 1, "failure", "completed", true);
+    ciEvidence(github, SLUG, 1, pinned, job);
+    observers.get(url(1))?.(pinned, "FAILURE", ["network"]);
+    await waitFor(() => github.rest().some((c) => c.path.endsWith("/rerun")));
+    await tick();
+    expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(store.failureObservations({ class: "flaky" })).toHaveLength(1);
+    workflow(pinned, 2, "", "in_progress", true);
+    observers.get(url(1))?.(pinned, "SUCCESS");
+    await tick();
+    expect(store.getLandEntry(entry.id)?.state).toBe("waiting_ci");
+    expect(ghCalls("pr merge")).toEqual([]);
+    workflow(pinned, 2, result, "completed", true);
+    observers.get(url(1))?.(pinned, result === "success" ? "SUCCESS" : "FAILURE", ["network"]);
+    await settle();
+    expect(store.getLandEntry(entry.id)?.state).toBe(result === "success" ? "landed" : "blocked");
+    expect(ghCalls("pr merge")).toHaveLength(result === "success" ? 1 : 0);
+    expect(github.rest().filter((c) => c.path.endsWith("/rerun"))).toHaveLength(1);
+  },
+);
 
 test("a transient CI failure is re-run once and lands", async () => {
   const flaky = delivered(1, "pr-1");
