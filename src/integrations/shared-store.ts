@@ -91,7 +91,7 @@ async function abortable<T>(signals: (AbortSignal | undefined)[], work: () => Pr
   }
 }
 /** Internal companion transport and authenticated envelope IO; construction is inert. */
-export function createCompanionIO(deps: SharedStoreDeps) {
+export function createCompanionIO(deps: SharedStoreDeps, maxResponseBytes?: number) {
   const repo = guard(() => canonicalRepo(deps.repo), "configuration");
   if (typeof deps.token !== "string" || !deps.token.trim()) fail("configuration");
   if (!(deps.dataKey instanceof Uint8Array) || deps.dataKey.length !== 32) fail("configuration");
@@ -127,6 +127,25 @@ export function createCompanionIO(deps: SharedStoreDeps) {
       return fail("unavailable");
     }
   }
+  async function boundedText(res: Response, max: number): Promise<string> {
+    if (Number(res.headers.get("content-length")) > max) fail("invalid");
+    const reader = res.body?.getReader();
+    if (!reader) return "";
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await transport(() => reader.read());
+        if (done) return Buffer.concat(chunks, size).toString("utf8");
+        size += value.byteLength;
+        if (size > max) fail("invalid");
+        chunks.push(value);
+      }
+    } finally {
+      void reader.cancel().catch(() => undefined);
+      reader.releaseLock();
+    }
+  }
   // One request with a fresh deadline covering dispatch, headers and the complete body.
   async function call(path: string | null, body?: unknown, signal?: AbortSignal): Promise<unknown> {
     const controller = new AbortController();
@@ -143,11 +162,11 @@ export function createCompanionIO(deps: SharedStoreDeps) {
             ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           }),
         );
+        const text = maxResponseBytes === undefined ? undefined : await boundedText(res, maxResponseBytes);
         if (!res.ok || res.redirected)
           fail(res.status === 404 && !body && !res.redirected ? "missing" : "unavailable");
-        const json: unknown = await transport(() => res.text()).then((text) =>
-          guard(() => JSON.parse(text), path === null ? "unavailable" : "corrupt"),
-        );
+        const raw = text ?? (await transport(() => res.text()));
+        const json: unknown = guard(() => JSON.parse(raw), path === null ? "unavailable" : "corrupt");
         if (path === null && (!(json instanceof Object) || "errors" in json)) fail("unavailable");
         return json;
       });

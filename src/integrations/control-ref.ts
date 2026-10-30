@@ -2,6 +2,8 @@ import { z } from "zod";
 import { rethrowClaimControl } from "./claim-errors.ts";
 import { createCompanionIO, type SharedStoreDeps, SharedStoreError } from "./shared-store.ts";
 
+export const CONTROL_REF_RESPONSE_LIMIT = 1_048_576;
+
 export type ControlKind = "receipt" | "boundary" | "run-index" | "member" | "land-authority";
 export type ControlKey = Readonly<{ kind: ControlKind; id: string }>;
 export type ControlRefTip = { sha: string; bytes: Uint8Array };
@@ -40,7 +42,7 @@ function parse<T>(schema: z.ZodType<T>, input: unknown): T {
 }
 
 export function createControlRefReader(deps: SharedStoreDeps): ControlRefReader {
-  const io = createCompanionIO(deps);
+  const io = createCompanionIO(deps, CONTROL_REF_RESPONSE_LIMIT);
   return {
     async read(key, signal) {
       const captured = keySchema.safeParse(key);

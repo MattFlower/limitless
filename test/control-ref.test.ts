@@ -1,7 +1,11 @@
 import { expect, test } from "bun:test";
 import { createCipheriv, createDecipheriv } from "node:crypto";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
-import { type ControlKey, createControlRefReader } from "../src/integrations/control-ref.ts";
+import {
+  CONTROL_REF_RESPONSE_LIMIT,
+  type ControlKey,
+  createControlRefReader,
+} from "../src/integrations/control-ref.ts";
 import {
   createCompanionIO,
   createSharedStore,
@@ -59,6 +63,130 @@ async function rejects(pending: Promise<unknown>, code: SharedStoreErrorCode) {
   expect(error).toMatchObject({ code, message: `Shared store error: ${code}` });
   expect(error).not.toHaveProperty("cause");
 }
+
+const responsePaths = ["metadata", "ref/", "commits/", "trees/", "blobs/"];
+const matches = (path: string, call: Parameters<typeof isMeta>[0]) =>
+  path === "metadata" ? isMeta(call) : isRead(`git/${path}`)(call);
+function streamed(chunks: Uint8Array[], headers = {}, status = 200, remainder?: Promise<void>) {
+  const tail = deferred<void>();
+  const state = { pulls: 0, cancelled: false, complete: false };
+  const response = new Response(
+    new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          const chunk = chunks[state.pulls++];
+          if (chunk) return controller.enqueue(chunk);
+          tail.resolve();
+          if (remainder) await remainder;
+          state.complete = true;
+          controller.close();
+        },
+        cancel() {
+          state.cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    ),
+    { headers, status },
+  );
+  return { response, state, tail: tail.promise };
+}
+
+test("control response limit is 1 MiB; declared overflow refuses before any body read", async () => {
+  expect(CONTROL_REF_RESPONSE_LIMIT).toBe(1_048_576);
+  for (const path of responsePaths) {
+    const remote = new Remote();
+    seed(remote);
+    const wire = streamed([Buffer.from("private-server-text")], {
+      "Content-Length": String(CONTROL_REF_RESPONSE_LIMIT + 1),
+    });
+    remote.hook = async (call, next) => (matches(path, call) ? wire.response : next());
+    await rejects(reader(remote).read(key), "invalid");
+    expect(wire.state.pulls).toBe(0);
+  }
+});
+
+for (const header of [undefined, "1"])
+  test(`streamed overflow with ${header ? "understated" : "missing"} length stops before deferred remainder`, async () => {
+    for (const path of responsePaths) {
+      const remote = new Remote();
+      seed(remote);
+      const caller = new AbortController();
+      const remainder = deferred<void>();
+      const wire = streamed(
+        [Buffer.alloc(CONTROL_REF_RESPONSE_LIMIT - 1, 32), Buffer.from("é")],
+        header ? { "Content-Length": header } : {},
+        200,
+        remainder.promise,
+      );
+      remote.hook = async (call, next) => (matches(path, call) ? wire.response : next());
+      const pending = reader(remote).read(key, caller.signal);
+      try {
+        await rejects(Promise.race([pending, wire.tail.then(() => "drained remainder")]), "invalid");
+        expect(wire.state).toMatchObject({ pulls: 2, cancelled: true, complete: false });
+      } finally {
+        caller.abort();
+        remainder.resolve();
+        await pending.catch(() => undefined);
+      }
+    }
+  });
+
+test("authenticated control responses exactly at the byte limit succeed at every request", async () => {
+  const remote = new Remote();
+  const { sha } = seed(remote);
+  const bodies: ReturnType<typeof streamed>[] = [];
+  remote.hook = async (_call, next) => {
+    const response = await next();
+    const bytes = Buffer.from(await response.text());
+    const wire = streamed([bytes, Buffer.alloc(CONTROL_REF_RESPONSE_LIMIT - bytes.length, 32)], {
+      "Content-Length": String(CONTROL_REF_RESPONSE_LIMIT),
+    });
+    bodies.push(wire);
+    return wire.response;
+  };
+  expect(await reader(remote).read(key)).toEqual({ kind: "tip", tip: { sha, bytes: payload } });
+  expect(bodies).toHaveLength(5);
+  for (const wire of bodies) expect(wire.state.complete).toBe(true);
+  const blob = [...remote.blobs.keys()][0] ?? "";
+  const frame = Buffer.from(encrypted(), "base64");
+  frame[frame.length - 1] = (frame[frame.length - 1] ?? 0) ^ 1;
+  remote.blobs.set(blob, frame.toString("base64"));
+  await rejects(reader(remote).read(key), "corrupt");
+});
+
+for (const outcome of ["absence", "valid blob", "invalid blob"])
+  test(`cancellation during deadline disposal after ${outcome} rejects aborted`, async () => {
+    const remote = new Remote();
+    seed(remote);
+    if (outcome === "absence") remote.refs.clear();
+    const caller = new AbortController();
+    let body: ReturnType<typeof streamed> | undefined;
+    let disposed = false;
+    remote.hook = async (call, next) => {
+      if (!isRead(outcome === "absence" ? "git/ref/" : "git/blobs/")(call)) return next();
+      const response = await next();
+      // Malformed blob metadata throws inside content(), before the reader's post-content abort check.
+      const bytes = outcome === "invalid blob" ? Buffer.from("{}") : Buffer.from(await response.text());
+      body = streamed([bytes], {}, response.status);
+      return body.response;
+    };
+    await rejects(
+      reader(remote, {
+        deadline: () => ({
+          signal: new AbortController().signal,
+          dispose() {
+            if (!body) return;
+            expect(body.state.complete).toBe(true);
+            disposed = true;
+            caller.abort();
+          },
+        }),
+      }).read(key, caller.signal),
+      "aborted",
+    );
+    expect(disposed).toBe(true);
+  });
 
 test("independent control envelopes bind both identities; IO seals fresh authenticated frames", async () => {
   const remote = new Remote();
@@ -267,12 +395,17 @@ for (const phase of ["headers", "body"] as const)
             reached.resolve();
             return never();
           }
-          const response = json({});
-          response.text = () => {
-            reached.resolve();
-            return new Promise(() => undefined);
-          };
-          return response;
+          return new Response(
+            new ReadableStream(
+              {
+                pull() {
+                  reached.resolve();
+                  return new Promise(() => undefined);
+                },
+              },
+              { highWaterMark: 0 },
+            ),
+          );
         };
         const pending = reader(remote, {
           deadline: (ms) => {
@@ -321,11 +454,13 @@ test("redirects, GraphQL errors and exceptions use fixed diagnostics; claim erro
     for (const body of [false, true]) {
       remote.hook = async () => {
         if (!body) throw claim;
-        const response = json({});
-        response.text = async () => {
-          throw claim;
-        };
-        return response;
+        return new Response(
+          new ReadableStream({
+            pull() {
+              throw claim;
+            },
+          }),
+        );
       };
       expect(
         await reader(remote)
@@ -357,11 +492,13 @@ test("transport exceptions cannot impersonate HTTP absence; claim exceptions sur
     remote.hook = async (call, next) => {
       if (!isRead("git/ref/")(call)) return next();
       if (!body) throw new SharedStoreError("missing");
-      const response = json({});
-      response.text = async () => {
-        throw new SharedStoreError("missing");
-      };
-      return response;
+      return new Response(
+        new ReadableStream({
+          pull() {
+            throw new SharedStoreError("missing");
+          },
+        }),
+      );
     };
     expect(await reader(remote).read(key)).toEqual({ kind: "unconfirmed" });
   }

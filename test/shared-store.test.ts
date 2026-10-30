@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { createDecipheriv } from "node:crypto";
 import { getEventListeners } from "node:events";
 import { formatRecord, parseRecord } from "../src/integrations/claim-ref.ts";
+import { CONTROL_REF_RESPONSE_LIMIT } from "../src/integrations/control-ref.ts";
 import {
   type RetentionOutcome,
   SharedStoreError,
@@ -128,6 +129,26 @@ class Deadlines {
 }
 
 describe("envelope and authentication", () => {
+  test("C02 put/get retain authenticated blob responses larger than the control limit", async () => {
+    const remote = new Remote();
+    const payload = Buffer.alloc(CONTROL_REF_RESPONSE_LIMIT, 7);
+    let largeReads = 0;
+    remote.hook = async (call, next) => {
+      const response = await next();
+      if (!isRead("git/blobs/")(call)) return response;
+      const body = await response.text();
+      expect(Buffer.byteLength(body)).toBeGreaterThan(CONTROL_REF_RESPONSE_LIMIT);
+      largeReads++;
+      return new Response(body, { headers: { "Content-Length": String(Buffer.byteLength(body)) } });
+    };
+    const client = remote.client();
+    const stored = await client.put(runId, role, keyA, payload);
+    expect(stored.kind).toBe("applied");
+    expect(await client.put(runId, role, keyA, payload)).toEqual(stored);
+    expect(Buffer.from(await client.get(runId, role, stored.blob))).toEqual(payload);
+    expect(largeReads).toBe(2);
+  });
+
   test("envelope: empty and binary payloads round-trip with injected fresh nonces", async () => {
     const remote = new Remote();
     const nonces: Buffer[] = [];
