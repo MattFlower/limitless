@@ -45,6 +45,21 @@ missing or unresolved blockers prevent work.
 
 ## Acceptance intent
 
+The `acceptance` label marks a ticket that must never start a build, including through a
+`limitless` label or a `/limitless` or `@bot` comment command. The queue keeps its usual
+eligibility rules and routes eligible tickets to acceptance runs only when the most recent
+application of `acceptance` was by an account in `[github.queue] trusted` (case-insensitive).
+A missing or untrusted application refuses the ticket; an earlier trusted application does
+not approve a later untrusted one. The ticket needs a parent, and both bodies must pass the
+trusted-author and last-editor checks. Acceptance runs retain the lifecycle labels and fixed
+started, needs-you, failed and cancelled comments above; they make no other GitHub writes.
+
+Operators can run `limitless accept <owner/name>#<n>` without queue eligibility or the label.
+It uses the same configured trusted accounts and ticket/parent checks, and refuses a ticket
+already claimed by a run. Use `limitless accept <owner/name>#<n> --check` to resolve the units
+against the current default-branch head SHA, or print the refusal reason, without creating a
+run, a worktree or invoking a model. An empty trusted list refuses acceptance.
+
 Acceptance runs resolve a stable manifest from trusted ticket and parent snapshots before any
 model call. The ticket's `## The original intent` section names sections of the parent with
 lines of the form `#123's "Goal" section`, optionally followed by ` (docs)`; #123 must be the

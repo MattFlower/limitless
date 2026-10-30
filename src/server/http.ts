@@ -579,11 +579,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
           const ticket = issueTextSchema
             .extend({ title: z.string(), parent: issueTextSchema.nullable() })
             .parse(result.data?.repository?.issue);
-          const snapshot = acceptanceRunRequest({
-            ticket,
-            parent: ticket.parent,
-            trusted: factory.cfg.githubQueue?.trusted ?? [],
-          });
+          const trusted = factory.cfg.githubQueue?.trusted ?? [];
+          const snapshot = acceptanceRunRequest({ ticket, parent: ticket.parent, trusted });
           if (check) {
             const resolved = await resolveRepo(store, repo, factory.cfg.githubMerge);
             await ensureCache(factory.cfg.paths, resolved, req.signal);

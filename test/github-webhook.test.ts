@@ -377,6 +377,25 @@ test("maps issue and comment with quoted attacker text", async () => {
   expect(requests[1]?.prompt?.match(/<\/github-data-json>/g)).toHaveLength(1);
 });
 
+test.each([
+  ["issues", "github-issue.json"],
+  ["issue_comment", "github-comment.json"],
+] as const)("acceptance tickets refuse the %s build webhook", async (event, file) => {
+  const payload = JSON.parse(fixture(file));
+  payload.issue.labels = [{ name: "acceptance" }];
+  // This repository is outside the queue, so comments reach the webhook mapper.
+  expect(cfg.githubQueue?.repos ?? []).not.toContain(payload.repository.full_name);
+  const response = await handler()(request(JSON.stringify(payload), event, true, event));
+  expect(response.status).toBe(200);
+  expect(store.db.query("SELECT status, note, run_id FROM inbox WHERE id = ?").get(event)).toEqual({
+    status: "ignored",
+    note: "acceptance ticket: build runs refused",
+    run_id: null,
+  });
+  expect(requests).toEqual([]);
+  expect(store.listRuns()).toEqual([]);
+});
+
 test("unset owner trusts neither the former default nor another login for labels or comments", async () => {
   cfg = loadConfig({ home: dir, configDir: dir });
   cfg.secrets.GITHUB_WEBHOOK_SECRET = "test-secret";
