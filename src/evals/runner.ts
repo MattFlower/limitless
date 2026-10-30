@@ -354,7 +354,9 @@ export class EvalRunner {
     if (targets[0]?.vendor === targets[1]?.vendor) throw new Error("judges must be from different vendors");
     const judges = targets.map(recordedTarget);
     const cases = loadRoleCases("review", this.casePath).cases.flatMap((c) => ("defects" in c ? [c] : []));
-    const job: JudgeJob = { judges, status: "running" };
+    const previous = this.deps.store.evalJudges(id);
+    const spent = previous?.spendUsd ?? previous?.result?.spendUsd ?? 0;
+    const job: JudgeJob = { judges, status: "running", spendUsd: spent };
     this.deps.store.saveEvalJudges(id, job);
     const controller = new AbortController();
     this.executing.set(id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
@@ -364,16 +366,20 @@ export class EvalRunner {
       run,
       cases,
       targets,
-      request.maxUsd ?? run.maxUsd,
+      (request.maxUsd ?? run.maxUsd) - spent,
       controller.signal,
       (provider) => this.evalSlot(provider).acquire(controller.signal),
       (provider) => this.evalLimit(provider, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY),
+      (spendUsd) => {
+        job.spendUsd = spent + spendUsd;
+        this.deps.store.saveEvalJudges(id, job);
+      },
     )
       .then(
-        (result) => this.deps.store.saveEvalJudges(id, { judges, status: "completed", result }),
+        (result) => this.deps.store.saveEvalJudges(id, { ...job, status: "completed", result }),
         (error: unknown) =>
           this.deps.store.saveEvalJudges(id, {
-            judges,
+            ...job,
             status: "failed",
             error: redactCredentials(String(error)),
           }),

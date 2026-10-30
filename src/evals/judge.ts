@@ -51,6 +51,8 @@ export interface JudgeResult {
 export interface JudgeJob {
   judges: string[];
   status: "running" | "completed" | "failed";
+  /** Cumulative spend for this eval, including requests without cached judgments. */
+  spendUsd?: number;
   result?: JudgeResult;
   error?: string;
 }
@@ -119,6 +121,7 @@ export function judgedMetrics(
   judges: string[],
 ) {
   let total = 0,
+    agreed = 0,
     caught = 0,
     contested = 0,
     underRated = 0,
@@ -136,6 +139,7 @@ export function judgedMetrics(
       if (!gold.required) continue;
       total++;
       const mapped = matches.map((m) => m?.find((m) => m.gold === `G${i + 1}`)?.finding);
+      if (mapped.every(Boolean) || mapped.every((id) => !id)) agreed++;
       const decisions = mapped.map((id) =>
         Boolean(id && blocking.some((f) => f === output.findings[Number(id.slice(1)) - 1])),
       );
@@ -160,7 +164,7 @@ export function judgedMetrics(
     contested,
     underRated,
     unjudged,
-    agreement: { rate: total ? 1 - contested / total : null },
+    agreement: { rate: total ? agreed / total : null },
   };
 }
 export type JudgedMetrics = ReturnType<typeof judgedMetrics>;
@@ -174,6 +178,7 @@ export async function judgeTrials(
   signal: AbortSignal,
   slot: (provider: string) => Promise<() => void>,
   limit: (provider: string) => number,
+  onSpend: (spendUsd: number) => void,
 ): Promise<JudgeResult> {
   const { store, router, tracker } = deps;
   const judges = targets.map(recordedTarget);
@@ -229,6 +234,7 @@ export async function judgeTrials(
           },
         });
         result.spendUsd += response.costUsd;
+        onSpend(result.spendUsd);
         cost += response.costUsd;
         if (response.quota) tracker.observeWindows(target.provider, response.quota.windows);
         tracker.record(target.provider, response.status, {
