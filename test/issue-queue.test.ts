@@ -1,6 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -1571,6 +1571,538 @@ async function linkedRun(h: ReturnType<typeof harness>, number = 7) {
   );
 }
 
+async function lifecycleFixture() {
+  const h = harness();
+  const path = join(h.cfg.paths.home, "lifecycle.db");
+  let store = new Store(path);
+  const repo = h.store.getRepoBySlug("owner/repo");
+  if (!repo) throw new Error("missing repo");
+  const run = store.createRun(
+    store.upsertRepo(repo),
+    issueRunRequest({ repo: repo.slug, number: 7, title: "work", body: "", author: "owner" }, "owner"),
+  );
+  store.setIssueLifecycleEffect(run.id, repo.slug, 7, "comment:started", "done");
+  cleanups.unshift(async () => store.close());
+  return {
+    h,
+    run,
+    get store() {
+      return store;
+    },
+    reopen() {
+      store.close();
+      store = new Store(path);
+    },
+    poll: (maxCalls?: number) =>
+      reconcileIssueLifecycle(store, h.cfg, h.gh, new AbortController().signal, (s) => h.logs.push(s), {
+        identity: (r) => h.identity(r),
+        maxCalls,
+      }),
+    effect: (ids: number[]) =>
+      store
+        .issueLifecycleEffects(run.id, repo.slug, 7)
+        .find((e) => e.effect === `comment:questions:${ids.join(",")}`),
+  };
+}
+
+test("Q4: open question sets keep IDs and dedupe across database reopening", async () => {
+  const f = await lifecycleFixture();
+  const a = f.store.askQuestion(f.run.id, "Which color?");
+  const b = f.store.askQuestion(f.run.id, "Which size?");
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  await f.poll();
+  expect(f.h.comments.get(7)).toEqual([
+    `<!-- limitless-lifecycle:${f.run.id}:questions:owner/repo#7:${a.id},${b.id} -->\nLimitless run ${f.run.id} has questions. Answer in the UI: ${f.h.cfg.uiUrl}/runs/${f.run.id}\nQuestion ${a.id}: Which color?\nQuestion ${b.id}: Which size?`,
+  ]);
+  expect(f.effect([a.id, b.id])).toMatchObject({ state: "done", commentId: 7001 });
+  await f.poll();
+  f.reopen();
+  await f.poll();
+  expect(f.h.comments.get(7)).toHaveLength(1);
+  f.store.answerQuestion(a.id, "blue", "ui");
+  await f.poll();
+  expect(f.h.comments.get(7)).toHaveLength(2);
+  expect(f.h.comments.get(7)?.[1]).toContain(`Question ${b.id}: Which size?`);
+  expect(f.h.comments.get(7)?.[1]).not.toContain(`Question ${a.id}:`);
+  f.store.answerQuestion(b.id, "large", "ui");
+  await f.poll();
+  expect(f.h.comments.get(7)).toHaveLength(2);
+});
+
+const privateForms = ["literal", "json", "percent", "html", "base64", "decode failure"];
+test.each(
+  privateForms.flatMap((form) =>
+    ["question", "reason"].flatMap((kind) =>
+      ["credential", "private"].map((protection) => ({ form, kind, protection })),
+    ),
+  ),
+)("Q4: complete $kind field withholding for $form $protection text", async ({ form, kind, protection }) => {
+  const f = await lifecycleFixture();
+  const credential = ["q4", "credential", form].join("-");
+  const privateText = ["q4", "private", form].join("-");
+  registerCredential(`Q4_${form}`, credential);
+  writeFileSync(join(f.h.cfg.paths.configDir, "private-strings.txt"), privateText);
+  const encode = (value: string) =>
+    form === "json"
+      ? [...value].map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`).join("")
+      : form === "percent"
+        ? [...value].map((c) => `%${c.charCodeAt(0).toString(16)}`).join("")
+        : form === "html"
+          ? [...value].map((c) => `&#${c.charCodeAt(0)};`).join("")
+          : form === "base64"
+            ? Buffer.from(value).toString("base64")
+            : value;
+  const original =
+    form === "decode failure"
+      ? `%${"25".repeat(8)}41`
+      : `distinctive-prefix ${encode(protection === "credential" ? credential : privateText)} distinctive-suffix`;
+  if (kind === "question") {
+    f.store.askQuestion(f.run.id, original);
+    f.store.updateRun(f.run.id, { status: "waiting_input" });
+  } else {
+    f.store.setRunState(f.run.id, { needsHumanReason: original, terminalReason: "lower-priority" });
+    f.store.updateRun(f.run.id, { status: "needs_human" });
+  }
+  await f.poll();
+  expect(f.h.comments.get(7)).toHaveLength(1);
+  const body = f.h.comments.get(7)?.[0] ?? "";
+  expect(body).toContain("[withheld; see the UI]");
+  expect(body).not.toContain("lower-priority");
+  for (const text of [
+    credential,
+    privateText,
+    encode(credential),
+    encode(privateText),
+    "distinctive-prefix",
+    "distinctive-suffix",
+  ])
+    expect(`${JSON.stringify(f.h.calls)}\n${f.h.logs.join("\n")}`).not.toContain(text);
+  expect(f.h.logs.every((line) => line.endsWith("field-withheld"))).toBe(true);
+});
+
+test.each(["config failure", "UI private", "UI encoded credential", "marker transformed", "delivery check"])(
+  "Q4: final body suppression is durable for %s",
+  async (mode) => {
+    const f = await lifecycleFixture();
+    const q = f.store.askQuestion(f.run.id, "safe question");
+    f.store.updateRun(f.run.id, { status: "waiting_input" });
+    const privateText = ["q4", "private", "url"].join("-");
+    if (mode === "config failure") {
+      // A directory cannot be read as a regular private-strings file.
+      mkdirSync(join(f.h.cfg.paths.configDir, "private-strings.txt"));
+    } else if (mode === "marker transformed") registerCredential("Q4_MARKER", f.run.id);
+    else if (mode === "UI encoded credential") {
+      registerCredential("Q4_UI", privateText);
+      f.h.cfg.uiUrl = `https://example.com/${[...privateText].map((c) => `%${c.charCodeAt(0).toString(16)}`).join("")}`;
+    } else if (mode === "UI private") {
+      writeFileSync(join(f.h.cfg.paths.configDir, "private-strings.txt"), privateText);
+      f.h.cfg.uiUrl = `https://example.com/${privateText}`;
+    } else {
+      await f.poll(0);
+      expect(f.effect([q.id])?.state).toBe("pending");
+      writeFileSync(join(f.h.cfg.paths.configDir, "private-strings.txt"), "safe question");
+    }
+    await f.poll();
+    expect(f.h.comments.size).toBe(0);
+    expect(f.effect([q.id])?.state).toBe("done");
+    f.reopen();
+    await f.poll();
+    expect(f.h.comments.size).toBe(0);
+    expect(f.h.logs.join("\n")).toContain("body-suppressed");
+    expect(f.h.logs.join("\n")).not.toContain(privateText);
+    expect(f.h.labels.get(7)).toEqual(new Set(["limitless:needs-you"]));
+  },
+);
+
+test("Q4: safe fields sanitize local paths and discreet waiting runs keep only labels", async () => {
+  const f = await lifecycleFixture();
+  const worktree = join(f.h.cfg.paths.work, "checkout");
+  f.store.setRunState(f.run.id, { worktreePath: worktree });
+  f.store.askQuestion(f.run.id, `Inspect ${worktree}/src/main.ts and ${f.h.cfg.paths.home}/state.db`);
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  await f.poll();
+  expect(f.h.comments.get(7)?.[0]).toContain("Inspect src/main.ts and <data>/state.db");
+  f.h.cfg.repos = { "owner/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false } };
+  const q = f.store.askQuestion(f.run.id, "another question");
+  await f.poll();
+  expect(f.effect([1, q.id])?.state).toBe("done");
+  f.store.updateRun(f.run.id, { status: "needs_human", error: "reason" });
+  await f.poll();
+  expect(f.h.comments.get(7)).toHaveLength(1);
+  expect(f.h.labels.get(7)).toEqual(new Set(["limitless:needs-you"]));
+});
+
+test.each(["question", "reason"])("Q4: inspect the original %s before path sanitization", async (kind) => {
+  const f = await lifecycleFixture();
+  const worktree = join(f.h.cfg.paths.work, "private-checkout");
+  writeFileSync(join(f.h.cfg.paths.configDir, "private-strings.txt"), worktree);
+  f.store.setRunState(f.run.id, {
+    worktreePath: worktree,
+    needsHumanReason: `original-prefix ${worktree}/src/main.ts`,
+  });
+  if (kind === "question") f.store.askQuestion(f.run.id, `original-prefix ${worktree}/src/main.ts`);
+  f.store.updateRun(f.run.id, { status: kind === "question" ? "waiting_input" : "needs_human" });
+  await f.poll();
+  expect(f.h.comments.get(7)?.[0]).toContain("[withheld; see the UI]");
+  expect(f.h.comments.get(7)?.[0]).not.toContain("original-prefix");
+  expect(f.h.logs.join("\n")).not.toContain(worktree);
+});
+
+test.each([
+  ["first", "second", "third", "first"],
+  ["", "second", "third", "second"],
+  ["  ", "", "third", "third"],
+  ["", "", "", "See the UI for details."],
+])("Q4: needs-human reason precedence %j", async (first, second, third, expected) => {
+  const f = await lifecycleFixture();
+  f.store.setRunState(f.run.id, { needsHumanReason: first, terminalReason: second });
+  f.store.updateRun(f.run.id, { status: "needs_human", error: third });
+  await f.poll();
+  expect(f.h.comments.get(7)?.[0]).toEndWith(`\n${expected}`);
+  f.reopen();
+  await f.poll();
+  expect(f.h.comments.get(7)).toHaveLength(1);
+});
+
+test("Q4: historical done and legacy pending needs-human bodies retain their text", async () => {
+  const f = await lifecycleFixture();
+  f.store.updateRun(f.run.id, { status: "needs_human", error: "new reason" });
+  f.store.setIssueLifecycleEffect(f.run.id, "owner/repo", 7, "comment:needs_human", "done");
+  await f.poll();
+  expect(f.h.comments.size).toBe(0);
+  const body = `<!-- limitless-lifecycle:${f.run.id}:needs_human -->\nlegacy fixed text`;
+  f.store.setIssueLifecycleEffect(f.run.id, "owner/repo", 7, "comment:needs_human", "pending", { body });
+  f.reopen();
+  await f.poll();
+  expect(f.h.comments.get(7)).toEqual([body]);
+});
+
+test("Q4: upgrading publishes old waiting questions and preserves seeded needs-human history", async () => {
+  const h = harness();
+  const migrations = join(h.cfg.paths.home, "before-q4");
+  cpSync(MIGRATION_DIR, migrations, { recursive: true, filter: beforeLifecycle });
+  const path = join(h.cfg.paths.home, "upgrade.db");
+  let store = new Store(path, migrations);
+  try {
+    const repo = h.store.getRepoBySlug("owner/repo");
+    if (!repo) throw new Error("missing repo");
+    const waiting = store.createRun(store.upsertRepo(repo), { repo: repo.slug, prompt: "Closes #7" });
+    const human = store.createRun(repo, { repo: repo.slug, prompt: "Closes #8" });
+    const q = store.askQuestion(waiting.id, "pre-upgrade question");
+    store.updateRun(waiting.id, { status: "waiting_input" });
+    store.updateRun(human.id, { status: "needs_human", error: "historical reason" });
+    store.close();
+    store = new Store(path);
+    const poll = () =>
+      reconcileIssueLifecycle(store, h.cfg, h.gh, new AbortController().signal, (s) => h.logs.push(s), {
+        identity: h.identity,
+      });
+    await poll();
+    expect(h.comments.get(7)).toEqual([expect.stringContaining(`Question ${q.id}: pre-upgrade question`)]);
+    expect(h.comments.get(8)).toBeUndefined();
+    expect(store.issueLifecycleEffect(human.id, "owner/repo", 8, "comment:needs_human")).toBeNull();
+    expect(store.issueLifecycleEffects(human.id, "owner/repo", 8)).toContainEqual(
+      expect.objectContaining({ effect: "comment:needs_human", state: "done" }),
+    );
+    store.close();
+    store = new Store(path);
+    await poll();
+    expect(h.comments.get(7)).toHaveLength(1);
+  } finally {
+    store.close();
+  }
+});
+
+test("Q4: private configuration changes during identity lookup suppress delivery", async () => {
+  const f = await lifecycleFixture();
+  const q = f.store.askQuestion(f.run.id, "newly-private-question");
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.h.identity = async () => {
+    started.resolve();
+    await release.promise;
+    return { kind: "owner" };
+  };
+  const pending = f.poll();
+  await started.promise;
+  writeFileSync(join(f.h.cfg.paths.configDir, "private-strings.txt"), "newly-private-question");
+  release.resolve();
+  await pending;
+  expect(f.effect([q.id])?.state).toBe("done");
+  expect(f.h.comments.size).toBe(0);
+  expect(f.h.logs.join("\n")).not.toContain("newly-private-question");
+});
+
+test("Q4: accepted question POST recovers its first-line marker after reopening", async () => {
+  const f = await lifecycleFixture();
+  const q = f.store.askQuestion(f.run.id, "question");
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  f.h.afterWrite = (args) => {
+    if (args[1]?.endsWith("/comments")) throw new Error("lost response");
+  };
+  await f.poll();
+  expect(f.effect([q.id])).toMatchObject({ state: "pending", page: 1, login: "owner" });
+  f.reopen();
+  f.h.afterWrite = undefined;
+  await f.poll();
+  expect(f.effect([q.id])).toMatchObject({ state: "done", commentId: 7001 });
+  expect(f.h.calls.filter((a) => a[1]?.endsWith("/comments") && a.includes("POST"))).toHaveLength(1);
+});
+
+test("Q4: question recovery keeps its page and author through the shared call budget", async () => {
+  const f = await lifecycleFixture();
+  const q = f.store.askQuestion(f.run.id, "question");
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  f.h.comments.set(
+    7,
+    Array.from({ length: 100 }, (_, i) => `discussion ${i}`),
+  );
+  f.h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+  f.h.login = "factory[bot]";
+  f.h.afterWrite = (args) => {
+    if (args[1]?.endsWith("/comments")) throw new Error("lost response");
+  };
+  await f.poll();
+  expect(f.effect([q.id])).toMatchObject({ state: "pending", page: 1, login: "factory[bot]" });
+  f.h.afterWrite = undefined;
+  f.h.calls.length = 0;
+  await f.poll(1);
+  expect(f.h.calls).toHaveLength(1);
+  expect(f.effect([q.id])).toMatchObject({ state: "pending", page: 2, login: "factory[bot]" });
+  f.reopen();
+  f.h.calls.length = 0;
+  await f.poll(1);
+  expect(f.h.calls).toHaveLength(1);
+  expect(f.effect([q.id])).toMatchObject({ state: "done", commentId: 7101 });
+  expect(f.h.comments.get(7)).toHaveLength(101);
+});
+
+test.each([false, true])(
+  "Q4: supersession survives a recovery pause even if waiting resumes, accepted=%s",
+  async (accepted) => {
+    const f = await lifecycleFixture();
+    const q = f.store.askQuestion(f.run.id, "question");
+    f.store.updateRun(f.run.id, { status: "waiting_input" });
+    f.h.comments.set(
+      7,
+      Array.from({ length: 100 }, (_, i) => `discussion ${i}`),
+    );
+    const reject = (args: string[]) => {
+      if (args[1]?.endsWith("/comments")) throw new Error("lost response");
+    };
+    if (accepted) f.h.afterWrite = reject;
+    else f.h.intercept = reject;
+    await f.poll();
+    f.h.afterWrite = undefined;
+    f.h.intercept = undefined;
+    f.store.updateRun(f.run.id, { status: "running" });
+    // Keep labels settled so the one call is available for recovery.
+    f.store.setIssueLifecycleEffect(f.run.id, "owner/repo", 7, "labels", "limitless:in-progress");
+    await f.poll(1);
+    expect(f.effect([q.id])).toMatchObject({ state: "recovering", page: 2 });
+    f.reopen();
+    f.store.updateRun(f.run.id, { status: "waiting_input" });
+    await f.poll();
+    expect(f.effect([q.id])).toMatchObject({ state: "done", commentId: accepted ? 7101 : null });
+    expect(f.h.comments.get(7)).toHaveLength(accepted ? 101 : 100);
+  },
+);
+
+test.each(["identity", "recovery"])("Q4: stale work stays superseded when %s rejects", async (step) => {
+  const f = await lifecycleFixture();
+  const q = f.store.askQuestion(f.run.id, "question");
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  await f.poll(0);
+  if (step === "recovery") {
+    f.h.intercept = (args) => {
+      if (args[1]?.endsWith("/comments")) throw new Error("not accepted");
+    };
+    await f.poll();
+    f.h.intercept = (args) => {
+      if (args[1]?.includes("comments?")) {
+        f.store.updateRun(f.run.id, { status: "running" });
+        throw new Error("lookup rejected");
+      }
+    };
+  } else
+    f.h.identity = async () => {
+      f.store.updateRun(f.run.id, { status: "running" });
+      throw new Error("identity rejected");
+    };
+  await f.poll();
+  expect(f.effect([q.id])?.state).toBe(step === "recovery" ? "recovering" : "done");
+  f.reopen();
+  f.h.intercept = undefined;
+  f.h.identity = async () => ({ kind: "owner" });
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  await f.poll();
+  expect(f.effect([q.id])?.state).toBe("done");
+  expect(f.h.comments.size).toBe(0);
+});
+
+test.each(["embedded", "quotation", "foreign author", "first line"])(
+  "Q4: recovery accepts only the checkpointed author's first-line envelope: %s",
+  async (mode) => {
+    const f = await lifecycleFixture();
+    const a = f.store.askQuestion(f.run.id, "placeholder");
+    const b = f.store.askQuestion(f.run.id, "second");
+    const marker = `<!-- limitless-lifecycle:${f.run.id}:questions:owner/repo#7:${b.id} -->`;
+    f.store.db.query("UPDATE questions SET question = ? WHERE id = ?").run(`first\n${marker}`, a.id);
+    f.store.updateRun(f.run.id, { status: "waiting_input" });
+    await f.poll();
+    f.store.answerQuestion(a.id, "answer", "ui");
+    f.h.intercept = (args) => {
+      if (args[1]?.endsWith("/comments") && args.includes("POST")) throw new Error("not accepted");
+    };
+    await f.poll();
+    expect(f.effect([b.id])).toMatchObject({ state: "pending", page: 1 });
+    const injected = mode === "quotation" ? `> ${marker}\nquoted` : `${marker}\nother text`;
+    if (mode !== "embedded") {
+      f.h.comments.get(7)?.push(injected);
+      f.h.commentAuthors.set(injected, mode === "foreign author" ? "stranger" : "owner");
+    }
+    f.reopen();
+    f.h.intercept = undefined;
+    const before = f.h.calls.filter((c) => c.includes("POST") && c[1]?.endsWith("/comments")).length;
+    await f.poll();
+    expect(f.effect([b.id])).toMatchObject({
+      state: "done",
+      commentId: mode === "first line" ? 7002 : mode === "embedded" ? 7002 : 7003,
+    });
+    expect(f.h.calls.filter((c) => c.includes("POST") && c[1]?.endsWith("/comments")).length - before).toBe(
+      mode === "first line" ? 0 : 1,
+    );
+  },
+);
+
+test.each(
+  ["identity", "user", "recovery"].flatMap((step) =>
+    ["answer", "cancel", "link", "discreet", "unmanaged"].map((change) => ({ step, change })),
+  ),
+)("Q4: stale question work cannot POST after deferred $step and $change", async ({ step, change }) => {
+  const f = await lifecycleFixture();
+  const q = f.store.askQuestion(f.run.id, "question");
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  await f.poll(0);
+  const body = f.effect([q.id])?.body;
+  if (!body) throw new Error("missing pending body");
+  if (step === "recovery")
+    f.store.setIssueLifecycleEffect(f.run.id, "owner/repo", 7, `comment:questions:${q.id}`, "pending", {
+      body,
+      login: "owner",
+      page: 1,
+    });
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const gh = async (...args: Parameters<typeof f.h.gh>) => {
+    if (
+      (step === "user" && args[0][1] === "user") ||
+      (step === "recovery" && args[0][1]?.includes("comments?"))
+    ) {
+      started.resolve();
+      await release.promise;
+    }
+    return f.h.gh(...args);
+  };
+  f.h.identity = async () => {
+    if (step === "identity") {
+      started.resolve();
+      await release.promise;
+    }
+    return { kind: "owner" };
+  };
+  const pending = reconcileIssueLifecycle(
+    f.store,
+    f.h.cfg,
+    gh,
+    new AbortController().signal,
+    (s) => f.h.logs.push(s),
+    { identity: f.h.identity },
+  );
+  await started.promise;
+  if (change === "answer") {
+    f.store.answerQuestion(q.id, "yes", "ui");
+    f.store.updateRun(f.run.id, { status: "running" });
+  }
+  if (change === "cancel") f.store.updateRun(f.run.id, { status: "cancelled" });
+  if (change === "link") f.store.db.query("UPDATE runs SET source_ref = NULL WHERE id = ?").run(f.run.id);
+  if (change === "discreet")
+    f.h.cfg.repos = {
+      "owner/repo": { discreet: true, branchPrefix: "change/", landRequiresApproval: false },
+    };
+  if (change === "unmanaged" && f.h.cfg.githubQueue) f.h.cfg.githubQueue.repos = [];
+  release.resolve();
+  await pending;
+  expect(f.effect([q.id])).toMatchObject({ state: "done", commentId: null });
+  expect(f.h.calls.some((a) => a.includes("POST") && a[1]?.endsWith("/comments"))).toBe(false);
+  await f.poll();
+  if (change === "answer") expect(f.h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+  if (change === "cancel") expect(f.h.labels.get(7)).toEqual(new Set());
+});
+
+test.each([false, true])("Q4: superseded sets close after recovery, accepted=%s", async (accepted) => {
+  const f = await lifecycleFixture();
+  const a = f.store.askQuestion(f.run.id, "first");
+  const b = f.store.askQuestion(f.run.id, "second");
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  const reject = (args: string[]) => {
+    if (args[1]?.endsWith("/comments")) throw new Error("lost response");
+  };
+  if (accepted) f.h.afterWrite = reject;
+  else f.h.intercept = reject;
+  await f.poll();
+  f.store.answerQuestion(a.id, "yes", "ui");
+  f.reopen();
+  f.h.afterWrite = undefined;
+  f.h.intercept = undefined;
+  await f.poll();
+  expect(f.effect([a.id, b.id])).toMatchObject({ state: "done", commentId: accepted ? 7001 : null });
+  expect(f.h.comments.get(7)).toHaveLength(accepted ? 2 : 1);
+  expect(f.h.comments.get(7)?.at(-1)).not.toContain(`Question ${a.id}:`);
+});
+
+test.each(
+  ["unsent", "uncertain"].flatMap((kind) => ["link", "status", "set"].map((change) => ({ kind, change }))),
+)("Q4: reopening retires $kind work after a $change change", async ({ kind, change }) => {
+  const f = await lifecycleFixture();
+  const q = f.store.askQuestion(f.run.id, "old question");
+  f.store.updateRun(f.run.id, { status: "waiting_input" });
+  if (kind === "unsent") await f.poll(0);
+  else {
+    f.h.intercept = (args) => {
+      if (args[1]?.endsWith("/comments")) throw new Error("not accepted");
+    };
+    await f.poll();
+    f.h.intercept = undefined;
+  }
+  if (change === "link") f.store.db.query("UPDATE runs SET source_ref = NULL WHERE id = ?").run(f.run.id);
+  if (change === "status") f.store.updateRun(f.run.id, { status: "running" });
+  if (change === "set") f.store.answerQuestion(q.id, "yes", "ui");
+  f.reopen();
+  f.h.calls.length = 0;
+  await f.poll();
+  expect(f.effect([q.id])).toMatchObject({ state: "done", commentId: null });
+  expect(f.h.calls.some((a) => a[1]?.includes("comments?"))).toBe(kind === "uncertain");
+  expect(f.h.calls.some((a) => a[1]?.endsWith("/comments") && a.includes("POST"))).toBe(false);
+});
+
+test("Q4: waiting labels and store work selection agree before and after resumption", async () => {
+  const h = harness();
+  const run = await linkedRun(h);
+  h.store.updateRun(run.id, { status: "waiting_input" });
+  h.store.setIssueLifecycleEffect(run.id, "owner/repo", 7, "labels", "limitless:in-progress");
+  h.store.observeIssueLifecycle(h.store.updateRun(run.id, { status: "waiting_input" }));
+  expect(h.store.issueLifecycleRuns().map((r) => r.id)).toContain(run.id);
+  h.start();
+  await h.advance();
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:needs-you"]));
+  h.store.updateRun(run.id, { status: "running" });
+  expect(h.store.issueLifecycleRuns().map((r) => r.id)).toContain(run.id);
+  await h.advance(180_000);
+  expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
+});
+
 test.each([
   ["needs_human", "limitless:needs-you", "needs you: see"],
   ["failed", "limitless:failed", "failed: see"],
@@ -1730,7 +2262,8 @@ test.each([
   expect(h.comments.get(7)?.[1]).toContain(
     `${status === "needs_human" ? "needs you" : "failed"}: see ${h.cfg.uiUrl}/runs/${run.id}.`,
   );
-  expect(h.comments.get(7)?.[1]).not.toContain("original reason");
+  if (status === "needs_human") expect(h.comments.get(7)?.[1]).toContain("original reason");
+  else expect(h.comments.get(7)?.[1]).not.toContain("original reason");
   expect(h.comments.get(7)?.[1]).not.toContain("changed reason");
   await h.advance(180_000);
   expect(h.comments.get(7)).toHaveLength(2);
@@ -1873,29 +2406,26 @@ test("poll requires trusted re-approval later than the failure label", async () 
   expect(h.runs()).toHaveLength(1);
 });
 
-test.each(["failed", "needs_human"] as const)(
-  "%s comments contain only fixed public text",
-  async (status) => {
-    const h = harness();
-    const token = ["lifecycle", "test", "credential"].join("-");
-    const privateText = ["lifecycle", "private", "location"].join("-");
-    registerCredential("ISSUE_LIFECYCLE_TEST", token);
-    writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), privateText);
-    const run = await linkedRun(h);
-    const worktree = join(h.cfg.paths.work, run.id);
-    h.store.setRunState(run.id, { worktreePath: worktree });
-    const homePath = join(h.cfg.paths.home, "internal.db");
-    h.store.updateRun(run.id, { status, error: `${worktree} ${homePath} ${token} ${privateText}` });
-    h.start();
-    await h.advance();
-    expect(h.comments.get(7)).toHaveLength(2);
-    expect(h.comments.get(7)?.[1]).toBe(
-      `<!-- limitless-lifecycle:${run.id}:${status} -->\nLimitless run ${run.id} ${status === "failed" ? "failed" : "needs you"}: see ${h.cfg.uiUrl}/runs/${run.id}.`,
-    );
-    for (const value of [worktree, homePath, token, privateText])
-      expect(h.comments.get(7)?.[1]).not.toContain(value);
-  },
-);
+test.each(["failed", "needs_human"] as const)("%s comments withhold protected run text", async (status) => {
+  const h = harness();
+  const token = ["lifecycle", "test", "credential"].join("-");
+  const privateText = ["lifecycle", "private", "location"].join("-");
+  registerCredential("ISSUE_LIFECYCLE_TEST", token);
+  writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), privateText);
+  const run = await linkedRun(h);
+  const worktree = join(h.cfg.paths.work, run.id);
+  h.store.setRunState(run.id, { worktreePath: worktree });
+  const homePath = join(h.cfg.paths.home, "internal.db");
+  h.store.updateRun(run.id, { status, error: `${worktree} ${homePath} ${token} ${privateText}` });
+  h.start();
+  await h.advance();
+  expect(h.comments.get(7)).toHaveLength(2);
+  expect(h.comments.get(7)?.[1]).toBe(
+    `<!-- limitless-lifecycle:${run.id}:${status} -->\nLimitless run ${run.id} ${status === "failed" ? "failed" : "needs you"}: see ${h.cfg.uiUrl}/runs/${run.id}.${status === "needs_human" ? "\n[withheld; see the UI]" : ""}`,
+  );
+  for (const value of [worktree, homePath, token, privateText])
+    expect(h.comments.get(7)?.[1]).not.toContain(value);
+});
 
 test("private lifecycle bodies are suppressed durably while labels still reconcile", async () => {
   const h = harness();
@@ -1907,7 +2437,7 @@ test("private lifecycle bodies are suppressed durably while labels still reconci
   expect(h.calls.some((args) => args[1]?.endsWith("/comments") && args.includes("POST"))).toBe(false);
   expect(h.store.issueLifecycleEffect(run.id, "owner/repo", 7, "comment:started")).toBe("done");
   expect(h.logs.join("\n")).toContain(`owner/repo#7 run ${run.id}`);
-  expect(h.logs.join("\n")).toContain("Issue lifecycle comment");
+  expect(h.logs.join("\n")).toContain("body-suppressed");
   expect(h.labels.get(7)).toEqual(new Set(["limitless:in-progress"]));
 });
 
@@ -2450,16 +2980,18 @@ test("unavailable posting identity keeps comments pending until a later poll", a
 test("the exact posted body includes redaction and publication path sanitization", async () => {
   const h = harness();
   const run = await linkedRun(h);
-  h.cfg.uiUrl = `${h.cfg.paths.home}/ui`;
-  registerCredential("ISSUE_MARKER_TEST", run.id);
+  const secret = ["ui", "test", "credential"].join("-");
+  h.cfg.uiUrl = `${h.cfg.paths.home}/ui/${secret}`;
+  registerCredential("ISSUE_UI_TEST", secret);
   writeFileSync(join(h.cfg.paths.configDir, "private-strings.txt"), h.cfg.paths.home);
   h.start();
   await h.advance();
   const body = h.comments.get(7)?.[0];
-  expect(body).toContain("<data>/ui/runs/");
+  expect(body).toContain("<data>/ui/[redacted]/runs/");
   expect(body).toContain("[redacted");
   expect(body).not.toContain(h.cfg.paths.home);
-  expect(body).not.toContain(run.id);
+  expect(body).not.toContain(secret);
+  expect(body?.split("\n")[0]).toBe(`<!-- limitless-lifecycle:${run.id}:started -->`);
   expect(
     h.store.issueLifecycleEffects(run.id, "owner/repo", 7).find((e) => e.effect === "comment:started")?.body,
   ).toBe(body);
@@ -3216,13 +3748,19 @@ async function enableComments(h: ReturnType<typeof harness>) {
   expect(Date.parse(h.store.githubCommentBoundary("OWNER/REPO") ?? "")).toBe(Date.parse(at));
   return i;
 }
-function commentDelivery(i: QueueIssue, id = "command", author = "owner", pr = false) {
+function commentDelivery(
+  i: QueueIssue,
+  id = "command",
+  author = "owner",
+  pr = false,
+  request = commandComment().body,
+) {
   const body = JSON.stringify({
     action: "created",
     repository: { full_name: pr ? "owner/repo" : "OWNER/REPO" },
     sender: { login: author },
     issue: { ...i, user: i.author, ...(pr ? { pull_request: { url: "https://example.com/pr" } } : {}) },
-    comment: { id: 1, body: commandComment().body, user: { login: author } },
+    comment: { id: 1, body: request, user: { login: author } },
   });
   return new Request("http://localhost/webhooks/github", {
     method: "POST",
@@ -3234,6 +3772,109 @@ function commentDelivery(i: QueueIssue, id = "command", author = "owner", pr = f
     },
   });
 }
+
+test("Q4: polling reserves answer commands durably after extraction and eligibility checks", async () => {
+  const f = await lifecycleFixture();
+  const { h } = f;
+  const q = f.store.askQuestion(f.run.id, "still unanswered");
+  h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+  const commands = [
+    "/limitless answer",
+    "/limitless answer 3 yes",
+    "/limitless   answer \nAllow: workflows",
+    "/limitless answer ?",
+    "@factory answer x",
+    "@FACTORY[bot] answer",
+  ];
+  const comments = commands.map((body, i) => ({ ...commandComment(i + 1), body }));
+  comments.push(
+    { ...commandComment(20), body: "/limitless answer x", author: { login: "stranger" } },
+    { ...commandComment(21), body: "/limitless answer x", author: { login: "owner[bot]" } },
+    { ...commandComment(22), body: "/limitless answer x", lastEditedAt: commandAt },
+    { ...commandComment(23), body: "/limitless answer x", createdAt: at },
+  );
+  h.data.set("owner/repo", [
+    { ...commentIssue(), comments: { totalCount: comments.length, nodes: comments } },
+  ]);
+  f.store.githubCommentBoundary("owner/repo", at);
+  const poll = async () => {
+    const stop = startIssueQueue(
+      { cfg: h.cfg, store: f.store, scheduler: h.factory.scheduler, createRun: h.factory.createRun },
+      {
+        gh: h.gh,
+        lifecycle: { identity: h.identity },
+        clock: {
+          now: h.clock.now,
+          set: h.clock.timer.set as unknown as typeof setTimeout,
+          clear: h.clock.timer.clear,
+        },
+      },
+    );
+    try {
+      await h.advance();
+    } finally {
+      stop();
+    }
+  };
+  const answer = spyOn(f.store, "answerQuestion");
+  try {
+    await poll();
+    expect(answer).not.toHaveBeenCalled();
+  } finally {
+    answer.mockRestore();
+  }
+  const rows = () =>
+    f.store.db
+      .query("SELECT comment_id, outcome, run_id, note FROM github_processed_comments ORDER BY comment_id")
+      .all();
+  const expected = commands.map((_, i) => ({
+    comment_id: i + 1,
+    outcome: "refused",
+    run_id: null,
+    note: "GitHub answers unsupported; use the UI",
+  }));
+  expect(rows()).toEqual(expected);
+  f.reopen();
+  await poll();
+  expect(rows()).toEqual(expected);
+  expect(h.requests).toHaveLength(0);
+  expect(f.store.listQuestions(f.run.id)).toMatchObject([{ id: q.id, answer: null }]);
+  expect(h.calls.some((c) => c.includes("POST") && c[1]?.endsWith("/comments"))).toBe(false);
+});
+
+test.each(["/limitless answer:", "/limitless Answer", "/limitless fix the docs"])(
+  "Q4: exact word reservation preserves ordinary requests: %s",
+  async (body) => {
+    const h = harness();
+    const i = await enableComments(h);
+    i.comments = { totalCount: 1, nodes: [{ ...commandComment(), body }] };
+    await pollComments(h);
+    expect(h.runs()).toHaveLength(1);
+    expect(records(h)).toMatchObject([{ outcome: "run" }]);
+  },
+);
+
+test.each(
+  ["/limitless answer", "/limitless answer 2 text", "/limitless  answer ?", "@factory answer x"].flatMap(
+    (body) => ["PR", "closed", "unmanaged"].map((kind) => ({ body, kind })),
+  ),
+)("Q4: webhook reservation ignores $body on $kind", async ({ body, kind }) => {
+  const h = harness();
+  if (kind === "unmanaged" && h.cfg.githubQueue) h.cfg.githubQueue.repos = [];
+  const i = commentIssue();
+  if (kind === "closed") i.state = "CLOSED";
+  const req = commentDelivery(i, "reserved", "owner", kind === "PR", body);
+  const payload: unknown = await req.clone().json();
+  expect(mapGitHubEvent("issue_comment", payload, "owner").request).toBeUndefined();
+  const response = await githubWebhook(h.factory, async () => null)(req);
+  expect(response.status).toBe(200);
+  expect(h.runs()).toEqual([]);
+  expect(h.store.db.query("SELECT status FROM inbox WHERE id = 'reserved'").get()).toEqual({
+    status: "ignored",
+  });
+  expect(h.calls).toHaveLength(0);
+  expect(records(h)).toHaveLength(0);
+});
 
 test.each(["owner", "collaborator", "mention"])(
   "polled %s command uses the shared builder and bypasses label admission",
