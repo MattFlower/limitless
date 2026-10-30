@@ -77,6 +77,9 @@ export function unquoteGitHub(
   }
 }
 
+export const reservedAnswer = (request: string) => /^answer(?:\s|$)/.test(request.trimStart());
+export const ANSWER_UNSUPPORTED = "GitHub answers unsupported; use the UI";
+
 type Mapped = { request?: CreateRunRequest; note: string; error?: boolean };
 
 export function commentRunRequest(
@@ -155,6 +158,7 @@ export function mapGitHubEvent(event: string, payload: unknown, owner: string | 
     if (!id || title === null || body === null || (issue?.body !== null && string(issue?.body) === null))
       return { note: "malformed comment or issue", error: true };
     if (!body.startsWith("/limitless ") || !body.slice(11).trim()) return { note: "other comment" };
+    if (reservedAnswer(body.slice(11))) return { note: ANSWER_UNSUPPORTED };
     return {
       note: "owner command",
       request: commentRunRequest(
