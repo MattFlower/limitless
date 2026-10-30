@@ -649,6 +649,30 @@ test("review split and adjudication fields are optional, enumerated and strict",
   }
 });
 
+test.each([undefined, false, true])("eval specs preserve browser marker presence: %s", (browser) => {
+  const item = ReviewCaseFileSchema.parse(loadRoleCases("review")).cases.find((c) => c.input.spec);
+  if (!item?.input.spec) throw new Error("missing spec case");
+  const criteria = item.input.spec.acceptance_criteria.map(({ browser: _browser, ...c }) =>
+    browser === undefined ? c : { ...c, browser },
+  );
+  const input = {
+    ...item,
+    input: { ...item.input, spec: { ...item.input.spec, acceptance_criteria: criteria } },
+  };
+  const parsed = ReviewCaseSchema.parse(input);
+  expect(parsed.input.spec?.acceptance_criteria).toEqual(criteria);
+  expect(ReviewCaseSchema.parse(parsed)).toEqual(parsed);
+  expect(
+    ReviewCaseSchema.safeParse({
+      ...input,
+      input: {
+        ...input.input,
+        spec: { ...input.input.spec, acceptance_criteria: [{ ...criteria[0], browser: "true" }] },
+      },
+    }).success,
+  ).toBe(false);
+});
+
 test("M5.2 cases preserve previous cases and load with pins, adjudicated labels and private text checks", () => {
   const file = ReviewCaseFileSchema.parse(loadRoleCases("review"));
   // Fingerprints of the pre-M5.2 parsed cases (with local paths sanitized) and notes.
@@ -716,8 +740,9 @@ test("M5.2 cases preserve previous cases and load with pins, adjudicated labels 
     heads.add(identity);
     expect(item.input).toMatchObject({ spec: null, implementerReport: "", gates: [] });
     for (const entry of item.labelHistory ?? []) {
-      // The 2026-10-14 clean-case audit only relabels clean controls as real.
-      if (entry.on === "2026-10-14") expect(entry).toMatchObject({ from: "clean", to: "real" });
+      // The 2026-10-14 and 2026-10-30 clean-case audits only relabel clean controls as real.
+      if (entry.on === "2026-10-14" || entry.on === "2026-10-30")
+        expect(entry).toMatchObject({ from: "clean", to: "real" });
       else expect(entry.on).toBe("2026-10-08");
       expect(entry.by).toContain("codex/sol-6.1");
     }

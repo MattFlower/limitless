@@ -100,6 +100,12 @@ export const GateComparisonSchema = z.strictObject({
 });
 /** `snapshot: true` gives the candidate neutral commits of the pinned trees without `evals/`. */
 const repositoryCase = { id: nonempty, repo: repoId, base: pin, head: pin, snapshot: z.boolean().optional() };
+// Keep pinned eval inputs stable: historical specs must not acquire new authoring defaults.
+const EvalSpecSchema = SpecSchema.extend({
+  acceptance_criteria: z.array(
+    SpecSchema.shape.acceptance_criteria.element.extend({ browser: z.boolean().optional() }),
+  ),
+});
 const reviewKind = z.enum(["real", "clean", "seeded"]);
 export const ReviewCaseSchema = z
   .strictObject({
@@ -122,7 +128,7 @@ export const ReviewCaseSchema = z
     source: z.string(),
     input: z.strictObject({
       prompt: z.string().refine((s) => s.trim().length > 0, "prompt must not be blank"),
-      spec: SpecSchema.nullable(),
+      spec: EvalSpecSchema.nullable(),
       implementerReport: z.string(),
       gates: z.array(GateComparisonSchema),
     }),
@@ -182,7 +188,7 @@ export const VerifyCaseSchema = z
     ...repositoryCase,
     input: z.strictObject({
       prompt: nonempty,
-      spec: SpecSchema,
+      spec: EvalSpecSchema,
       gates: z.array(GateComparisonSchema),
       holdout: HoldoutSchema.optional(),
     }),
@@ -237,7 +243,7 @@ export const ImplementCaseSchema = z.strictObject({
   id: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]*$/),
   complexity: z.enum(["trivial", "small", "medium"]),
   prompt: z.string().refine((s) => s.trim().length > 0, "prompt must not be blank"),
-  spec: SpecSchema.nullable(),
+  spec: EvalSpecSchema.nullable(),
   hidden: z.strictObject({
     files: z.array(safePath).refine((paths) => new Set(paths).size === paths.length, "duplicate hidden path"),
     command: nonempty,

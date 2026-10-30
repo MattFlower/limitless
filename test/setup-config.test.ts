@@ -1,5 +1,69 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { patchSetupConfig } from "../src/cli/setup-config.ts";
+import { loadConfig, repoSettings } from "../src/config.ts";
+import { Store } from "../src/db/store.ts";
+import { WorkerStore } from "../src/db/workers.ts";
+import { gateExecutorFor } from "../src/gates/executor.ts";
+
+function operatorConfig(toml: string) {
+  const root = mkdtempSync(join(tmpdir(), "actions-authorization-"));
+  try {
+    writeFileSync(join(root, "config.toml"), toml);
+    return loadConfig({ home: join(root, "data"), configDir: root });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test.each([
+  ["", false, false],
+  ["github_actions = true", true, false],
+  ["github_actions_paid_minutes = true", false, true],
+  ["github_actions = true\ngithub_actions_paid_minutes = true", true, true],
+])("Actions repository authorization parses without warnings: %s", (settings, enabled, paid) => {
+  const warning = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const cfg = operatorConfig(`[repos."Owner/Repo"]\n${settings}`);
+    expect(repoSettings(cfg, "OWNER/REPO")).toMatchObject({
+      githubActions: enabled,
+      githubActionsPaidMinutes: paid,
+    });
+    expect(repoSettings(cfg, "other/repo")).toMatchObject({
+      githubActions: false,
+      githubActionsPaidMinutes: false,
+    });
+    expect(warning).not.toHaveBeenCalled();
+  } finally {
+    warning.mockRestore();
+  }
+});
+
+for (const key of ["github_actions", "github_actions_paid_minutes"])
+  test.each(['"true"', "1"])(`${key} rejects non-boolean %s`, (value) => {
+    expect(() => operatorConfig(`[repos."owner/repo"]\n${key} = ${value}`)).toThrow(
+      `repos.${key} must be a boolean`,
+    );
+  });
+
+test("Actions permissions preserve repository normalization and executor routing", () => {
+  const settings = '[repos."Owner/Repo"]\ngithub_actions = true\ngithub_actions_paid_minutes = true';
+  expect(() => operatorConfig(`${settings}\n[repos."owner/repo"]`)).toThrow("Duplicate repository keys");
+  expect(() => operatorConfig(`${settings}\n[gates]\nexecutor = "github-actions"`)).toThrow("gates.executor");
+  const store = new Store(":memory:");
+  try {
+    for (const kind of ["local", "lan"] as const) {
+      const cfg = operatorConfig(`${settings}\n[gates]\nexecutor = "${kind}"`);
+      expect(gateExecutorFor(cfg.gateExecutor, new WorkerStore(store, undefined), ["owner/repo"]).kind).toBe(
+        kind,
+      );
+    }
+  } finally {
+    store.close();
+  }
+});
 
 for (const original of [
   '[repos."acme/app"]\nland_requires_approval = true\ndiscreet = false\n',

@@ -143,6 +143,39 @@ test("HTTP run input cannot set persisted acceptance state or its flow", async (
   }
 });
 
+test("failed acceptance runs refuse factory and HTTP retry without creating a build", async () => {
+  const f = await fixture();
+  try {
+    const reader = mock(() => ({}));
+    f.factory.deps.harnesses = { fake: fakeHarness(reader) };
+    const store = f.factory.store;
+    const run = store.createAcceptanceRun(store.upsertRepo(repoInput), request(), { ticket, parent });
+    store.updateRun(run.id, { status: "failed", error: "Check failed", finishedAt: Date.now() });
+    const original = store.getRun(run.id);
+    const state = store.getRunState<RunState>(run.id);
+    if (!original || !state) throw new Error("missing acceptance run or state");
+    const reason = "acceptance runs are restarted from the ticket, not retried";
+    await expect(f.factory.retryRun(run.id)).rejects.toThrow(reason);
+    const retry = (createHttpRoutes(f.factory)["/api/runs/:id/retry"] as { POST: Route }).POST;
+    const response = await retry(
+      requestWithParams(
+        `http://localhost/api/runs/${run.id}/retry`,
+        { method: "POST", headers: { "content-type": "application/json" }, body: "{}" },
+        { id: run.id },
+      ),
+      localServer,
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: reason });
+    expect(store.listRuns()).toEqual([original]);
+    expect(store.getRunState<RunState>(run.id)).toEqual(state);
+    expect(store.listStages(run.id)).toEqual([]);
+    expect(reader).not.toHaveBeenCalled();
+  } finally {
+    await f.close();
+  }
+});
+
 test("persisted acceptance guards block an engine without acceptance handling at all checkpoints", async () => {
   const f = await fixture();
   try {
