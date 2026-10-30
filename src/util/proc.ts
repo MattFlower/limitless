@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { sep } from "node:path";
-import { credentialMatcher, registerCredentialVariant } from "./credential-matcher.ts";
+import { credentialMatcher, credentialRegistry } from "./credential-matcher.ts";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 import { activity } from "./stall.ts";
 import { terminalRedactor } from "./terminal-redaction.ts";
@@ -1222,22 +1222,12 @@ export async function sh(
 
 // Retain registrations across config reloads while older invocations may still be running.
 const credentialNames = new Set<string>();
-const credentialValues = new Set<string>();
-export const registeredCredentials = (): readonly string[] => [...credentialValues];
+export const registeredCredentials = (): readonly string[] => credentialRegistry.values();
 export const credentialRedactionPadding = (): number => Math.max(0, credentialMatcher().maxLength - 1);
 export function registerCredential(name: string, value?: string): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
-    if (typeof secret === "string" && secret && !credentialValues.has(secret)) {
-      credentialValues.add(secret);
-      // Log normalization removes CRLF line endings before publication-window redaction.
-      const values = [secret, secret.replace(/\r\n/g, "\n")];
-      const variants = values.flatMap((s) => {
-        const json = JSON.stringify(s).slice(1, -1);
-        return s.includes("/") ? [s, json, json.replaceAll("/", "\\/")] : [s, json];
-      });
-      for (const variant of new Set(variants)) registerCredentialVariant(variant, secret.length >= 8);
-    }
+    if (typeof secret === "string") credentialRegistry.add(secret);
 }
 export function redactCredentials(text: string): string;
 export function redactCredentials(text: string, window?: { start: number; end: number }): string;
@@ -1265,8 +1255,8 @@ const redactData = <T>(value: T): T =>
   );
 const isCredential = ([k, v]: [string, string]) =>
   credentialNames.has(k) ||
-  credentialValues.has(v) ||
-  [...credentialValues].some((secret) => secret.length >= 8 && v.includes(secret));
+  credentialRegistry.has(v) ||
+  registeredCredentials().some((secret) => secret.length >= 8 && v.includes(secret));
 
 /** Environment for agent child processes: inherit PATH etc. but never leak factory secrets. */
 export function agentEnv(extra: Record<string, string> = {}): Record<string, string> {

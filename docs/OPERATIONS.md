@@ -190,6 +190,10 @@ to an older release fails at startup until they are removed.
 Rolling back past the release introducing worker report `failureClass` (#869) can reject an in-flight
 worker job's authentication-failure report; cancelling the run's worker job before rollback avoids this.
 
+Apply the `acceptance` label to tickets only after the release supporting acceptance routing is
+deployed. Before rolling back to an older release, remove `acceptance` from every open ticket:
+older releases ignore the label and can build those tickets as code changes.
+
 Changing the launchd units themselves (PATH, LANG, arguments) needs `limitless service install`.
 The units set `LANG=C.UTF-8`: launchd sets no locale, and without one every git start asks macOS for
 the preferred language. Agents and gates inherit it, so each repository's cached gate baseline misses

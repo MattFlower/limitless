@@ -30,6 +30,7 @@ Usage:
         [--allow submodules|gitattributes|binary|workflows]  Allow that blocked audit change (repeatable)
           Older daemons reject --allow workflows submitted by a newer CLI.
         [--model role=model[@effort][,fallback]]  Pin a role's chain (repeatable; | joins alternatives)
+  limitless accept <owner/name>#<n> [--check]  Start acceptance, or resolve its units without a run
   limitless retry <run> [--model role=chain]  Retry, inheriting or replacing model chains
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
@@ -359,6 +360,7 @@ async function main(): Promise<void> {
       sha: { type: "string" },
       all: { type: "boolean" },
       changes: { type: "string" },
+      check: { type: "boolean" },
       approve: { type: "boolean" },
     },
   });
@@ -512,6 +514,21 @@ async function main(): Promise<void> {
         )
       )
         process.exitCode = 1;
+      return;
+    }
+    case "accept": {
+      const ref = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#([1-9][0-9]*)$/.exec(rest[0] ?? "");
+      if (rest.length !== 1 || !ref || !Number.isSafeInteger(Number(ref[2])))
+        throw new Error("usage: limitless accept <owner/name>#<n> [--check]");
+      const result = await api<Run | { ok: boolean; reason?: string; sha?: string; units?: unknown[] }>(
+        "/api/acceptance",
+        {
+          method: "POST",
+          body: JSON.stringify({ repo: ref[1], number: Number(ref[2]), check: values.check ?? false }),
+        },
+      );
+      if ("ok" in result && !result.ok) throw new Error(result.reason);
+      console.log("id" in result ? result.id : JSON.stringify(result, null, 2));
       return;
     }
     case "run": {

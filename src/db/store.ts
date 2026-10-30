@@ -1270,10 +1270,15 @@ export class Store {
     return this.createClaimedRun(repo, req, verifiedGitHubWebhook, admission, comment);
   }
 
-  createAcceptanceRun(repo: Repo, req: CreateRunRequest, snapshot: AcceptanceSnapshot): Run {
+  createAcceptanceRun(
+    repo: Repo,
+    req: CreateRunRequest,
+    snapshot: AcceptanceSnapshot,
+    admission?: () => string | null,
+  ): Run {
     if (req.sourceRef?.kind !== "issue" || req.sourceRef.number !== snapshot.ticket.number)
       throw new Error("acceptance run requires its ticket issue sourceRef");
-    return this.createClaimedRun(repo, req, false, undefined, undefined, snapshot);
+    return this.createClaimedRun(repo, req, false, admission, undefined, snapshot);
   }
 
   private createClaimedRun(
@@ -1359,6 +1364,7 @@ export class Store {
     repo: string,
     observations: ReadonlyMap<number, EpicAttention | null | undefined>,
   ): void {
+    const configuredRepo = repo;
     repo = repo.toLowerCase();
     this.transaction(() => {
       const saved = this.db
@@ -1377,7 +1383,7 @@ export class Store {
           .query("INSERT OR REPLACE INTO queue_epic_attention VALUES (?, ?, ?)")
           .run(repo, epic, attention.state);
         const data = {
-          repo: redactCredentials(repo),
+          repo: redactCredentials(configuredRepo),
           epic,
           state: attention.state,
           items: attention.items.map(redactCredentials),
