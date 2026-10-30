@@ -16,7 +16,7 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "typecheck": "tsc --noEmit -p .",
-    "test": "bun test --parallel=$(bun scripts/test-workers.ts)",
+    "test": "bun test --parallel=$(bun scripts/test-workers.ts) ${LIMITLESS_CI_JUNIT:+--reporter=junit --reporter-outfile=$LIMITLESS_CI_JUNIT}",
     "smoke": "bun scripts/smoke.ts",
     "check": "bun run lint && bun run typecheck && bun run test"
   },
