@@ -716,8 +716,9 @@ test("M5.2 cases preserve previous cases and load with pins, adjudicated labels 
     heads.add(identity);
     expect(item.input).toMatchObject({ spec: null, implementerReport: "", gates: [] });
     for (const entry of item.labelHistory ?? []) {
-      // The 2026-10-14 clean-case audit only relabels clean controls as real.
-      if (entry.on === "2026-10-14") expect(entry).toMatchObject({ from: "clean", to: "real" });
+      // The 2026-10-14 and 2026-10-30 clean-case audits only relabel clean controls as real.
+      if (entry.on === "2026-10-14" || entry.on === "2026-10-30")
+        expect(entry).toMatchObject({ from: "clean", to: "real" });
       else expect(entry.on).toBe("2026-10-08");
       expect(entry.by).toContain("codex/sol-6.1");
     }

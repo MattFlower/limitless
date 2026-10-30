@@ -421,3 +421,50 @@ Split assignment is fixed by PR-number parity: even PRs go to **escapes-dev**;
 odd PRs go to **escapes-heldout**. All rounds of a PR share its split. Existing
 cases never move into or out of a split. These splits form a new family, independent
 of the existing `dev`/`heldout` assignment and seed.
+
+## Held-out clean-case audit — 2026-10-30
+
+Every M5.2 held-out system blocked review-068, review-092 and review-108, so held-out clean blocks were
+saturated. Each blocking claim from the stored held-out evals was adjudicated blind (system identity
+withheld) by codex/sol-6.1 at high effort and by claude/opus, under the 2026-10-08 rule. The orchestrator
+then re-ran the evidence in a checkout of each case's head. Claims the two adjudicators rated differently
+were settled by consequence: medium needs a realistic input in normal operation.
+
+| Case | PR | Split | Gold | Optional | Downgraded | Rejected | Outcome |
+|---|---|---|---|---|---|---|---|
+| review-068 | #393 | heldout | 2 | 0 | 1 | 0 | relabelled real |
+| review-092 | #406 | heldout | 1 | 0 | 2 | 1 | relabelled real |
+| review-108 | #424 | heldout | 1 | 0 | 1 | 1 | relabelled real |
+
+Downgraded claims stay as optional (minor) defects, as in the M5.2 procedure.
+
+- **review-068.**
+  - *Major:* any skipped file in a candidate gate disables gate substitution. The repository's confined
+    suite intentionally skips real-Seatbelt tests, so the loopback failure the request targets remains.
+    #647 later fixed this on main; its issue reports about 20 of 49 needs_human runs caused by it.
+  - *Blocker:* the coverage parser takes a test-printed `test/missing.test.ts:` line as a file header.
+    Output from the change under test can therefore mark a file that never ran as passed, and that
+    becomes factory evidence. Reproduced with a real `bun test`.
+  - *Minor, not gold:* a crash between the gate checkpoint and stage completion rejects cached gates on
+    resume. This needs a hard kill between two synchronous writes, and the run ends needs_human as
+    before the change.
+- **review-092.**
+  - *Major:* a changed result resets the loop count but keeps earlier same-key entries, which the
+    request says must be dropped. Twelve identical failing commands between progressing polls are never
+    stopped.
+  - *Minor, not gold:* forgetting an evicted baseline stops a genuine repeat loop at most one call
+    early. A poll that never returns defers the stop.
+  - *Not gold:* pending identical calls finalised by an unrelated call. Base behaves the same.
+- **review-108.**
+  - *Major:* the change's gate command `bun test --parallel=$(bun scripts/test-workers.ts)` is
+    rejected by gate-evidence's command recogniser. Gate evidence can then no longer satisfy
+    sandbox-blocked criteria on this repository.
+  - *Minor, not gold:* the worker count is missing from the baseline cache key. The only effect is on
+    flake classification.
+  - *Process, not gold:* measurements missing from the PR description.
+
+After the audit, the held-out clean set is the ten clean cases from the 2026-10-16 fresh set.
+review-114 is the only held-out case blocked by both production and D, and both of its claims were
+rejected. review-133's Unicode claim was already confirmed minor (sandbox PR #14 above). Decisions
+measured before this audit keep their recorded verdicts. #551 (D) recorded 10/26 clean blocks against
+7/26. On true clean cases it is 4/20 against 2/20.
