@@ -1,14 +1,15 @@
-import { createHash } from "node:crypto";
 import type { StageName } from "../core/types.ts";
 import type { FailureObservation } from "../db/failure-observations.ts";
 import type { Store } from "../db/store.ts";
 import { hostLoadPerCore, WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import {
+  blockInterrupted,
   cancelGateExecution,
   type ExecutionHandle,
   executeGate,
   type GateRequest,
+  gateDigest,
   gateShutdown,
 } from "../gates/executor.ts";
 import { lanExecutor } from "../gates/lan.ts";
@@ -161,6 +162,8 @@ export async function resumeGateExecution(
     const job = pending.handle.kind === "inplace" ? workers.job(pending.handle.id) : null;
     const scratch = job ? (JSON.parse(job.request) as GateRequest).scratch : undefined;
     try {
+      if (pending.handle.githubActions && !pending.handle.githubActions.completed)
+        await blockInterrupted(pending.handle, executor, async () => {});
       await cancelGateExecution(
         pending.handle,
         pending.handle.kind === "inplace" ? lanExecutor(workers, [], true) : executor,
@@ -197,7 +200,7 @@ export async function runGateExecution(
   const round = ctx.state.round;
   const pending = ctx.state.gateExecution;
   const sameIdentity = pending?.stage === stage && pending.round === round && pending.sha === sha;
-  const gateKey = createHash("sha256").update(JSON.stringify(gates)).digest("hex");
+  const gateKey = gateDigest(gates);
   const previous = sameIdentity ? [...(pending.previous ?? [])] : [];
   const replay = previous.find((attempt) => attempt.purpose === purpose && attempt.gateKey === gateKey);
   if (replay) {
@@ -293,15 +296,14 @@ export async function runGateExecution(
     return result;
   } finally {
     // A termination before attach leaves the durable identity available for resume; so does
-    // failed remote cleanup, so a later resume or discard retries it.
+    // any Actions handle until consumed: a failed one stays blocked and retries pending cleanup.
     if (
       settled &&
       !(
         ["lan", "inplace", "github-actions"].includes(ctx.state.gateExecution?.handle.kind ?? "") &&
         gateShutdown(ctx.signal)
       ) &&
-      !ctx.state.gateExecution?.handle.githubActions?.cleanupFailed &&
-      !ctx.state.gateExecution?.handle.githubActions?.completed
+      !ctx.state.gateExecution?.handle.githubActions
     ) {
       ctx.state.gateExecution = undefined;
       await ctx.save("gate-result");

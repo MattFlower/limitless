@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
@@ -102,6 +102,38 @@ export async function gateProvenance(cwd: string, signal: AbortSignal, checkedSh
     // A completed gate still returns its result when Git inspection is unavailable.
   }
   return { trackedClean: false, provenanceError: "execution provenance could not be confirmed" };
+}
+
+export const gateDigest = (gates: GateConfig) =>
+  createHash("sha256").update(JSON.stringify(gates)).digest("hex");
+
+/** Operational failure: never a gate result, a local substitute or implementation feedback. */
+export class GateBlockedError extends Error {
+  readonly classification: string;
+  constructor(classification: string, message: string) {
+    super(redactGateOutput(`GitHub Actions gate blocked (${classification}): ${message}`));
+    this.classification = classification;
+  }
+}
+
+/** Interrupted Actions work is cleaned up, then stays blocked: never replaced, redispatched or replayed. */
+export async function blockInterrupted(
+  handle: ExecutionHandle,
+  executor: GateExecutor | undefined,
+  persist: () => Promise<unknown>,
+): Promise<never> {
+  const p = handle.githubActions;
+  try {
+    // Recorded only once cleanup succeeds, so a failed or unavailable cleanup is retried.
+    if (!p?.interrupted || p.cleanupFailed) await cancelGateExecution(handle, executor);
+    if (p?.cleanupFailed) throw new Error("cleanup remains pending");
+    if (p) p.interrupted ??= "interrupted";
+  } catch (error) {
+    throw error instanceof GateBlockedError ? error : new GateBlockedError("cleanup", String(error));
+  } finally {
+    await persist();
+  }
+  throw new GateBlockedError(p?.interrupted ?? "interrupted", "interrupted execution is not replaced");
 }
 
 /** Shutdown detaches durable jobs; owner cancellation discards them. */
@@ -242,7 +274,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
 
 /**
  * Start, checkpoint, attach and cancel through the same path for all daemon gates.
- * Interrupted Actions handles are discarded before replacement; completed results are reused.
+ * Interrupted Actions handles stay blocked; completed results bound to this request are reused.
  */
 export async function executeGate(
   req: GateRequest,
@@ -258,16 +290,11 @@ export async function executeGate(
       ? localExecutor(hooks)
       : (injected ?? localExecutor(hooks));
   if (stored && stored.kind !== executor.kind) throw new Error(`Unavailable gate executor: ${stored.kind}`);
-  if (stored?.kind === "github-actions" && !stored.githubActions?.completed) {
-    try {
-      await cancelGateExecution(stored, executor);
-      if (stored.githubActions?.cleanupFailed) throw new Error("GitHub Actions gate cleanup remains pending");
-    } catch (error) {
-      await persist(stored);
-      throw error;
-    }
-    stored = undefined;
-  }
+  const p = stored?.githubActions;
+  const bound =
+    p?.completed && !p.interrupted && p.headSha === req.headSha && p.gateKey === gateDigest(req.gates);
+  if (stored?.kind === "github-actions" && !bound)
+    await blockInterrupted(stored, executor, () => persist(stored));
   const handle = stored ?? (await executor.start(req, signal));
   if (!stored) await persist(handle);
   let execution: Execution<GateRun>;

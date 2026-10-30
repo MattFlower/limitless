@@ -139,15 +139,7 @@ function parseRepos(value: unknown): Record<string, RepoSettings> {
     spellings.set(normalized, slug);
     if (!table(entry)) throw new Error("repos entries must be tables");
     for (const key of Object.keys(entry))
-      if (
-        ![
-          "discreet",
-          "branch_prefix",
-          "land_requires_approval",
-          "github_actions",
-          "github_actions_paid_minutes",
-        ].includes(key)
-      )
+      if (!/^(?:discreet|branch_prefix|land_requires_approval|github_actions(?:_paid_minutes)?)$/.test(key))
         console.warn(`Ignoring unknown repository setting for ${slug}: ${key}`);
     const { discreet = false, branch_prefix = "change/", land_requires_approval = false } = entry;
     const { github_actions = false, github_actions_paid_minutes = false } = entry;

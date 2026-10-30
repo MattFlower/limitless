@@ -580,17 +580,9 @@ export function compareGates(baseline: GateRun | null, after: GateRun): GateComp
   return out;
 }
 
-function actionsEvidence(result?: GateResult): boolean {
-  return (
-    !!result &&
-    !!(
-      result.executor ||
-      actionsEvidence(result.firstAttempt) ||
-      actionsEvidence(result.retryAttempt) ||
-      actionsEvidence(result.targetedRetry)
-    )
-  );
-}
+/** Actions execution identity is not established as equivalent to any baseline's. */
+const actionsEvidence = (r?: GateResult): boolean =>
+  !!r && (!!r.executor || [r.firstAttempt, r.retryAttempt, r.targetedRetry].some(actionsEvidence));
 
 /** Whether the output names a location (`file:12`, `file(12,`) in one of the changed files. */
 function pointsAt(output: string, changed: string[]): boolean {
