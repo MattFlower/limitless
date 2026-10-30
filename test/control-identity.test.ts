@@ -2,7 +2,14 @@ import { expect, test } from "bun:test";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import type { ControlKind } from "../src/integrations/control-ref.ts";
 import { canonicalRepo } from "../src/integrations/lease-store.ts";
-import { fixedFailure, withoutIO } from "./control-purity-support.ts";
+import { expectPureModule, fixedFailure, withoutIO } from "./control-purity-support.ts";
+
+test("identity module imports only pure dependencies and references no IO globals", () => {
+  expectPureModule(new URL("../src/integrations/control-identity.ts", import.meta.url), [
+    "node:crypto",
+    "./control-json.ts",
+  ]);
+});
 
 const dataKey = Uint8Array.from({ length: 32 }, (_, i) => i);
 const hmac = (key: Uint8Array, text: string | Uint8Array) => createHmac("sha256", key).update(text).digest();
@@ -50,6 +57,7 @@ test("loading and construction do no IO and all failures hide keys and identity 
     const namer = createControlNamer(key);
     expect(namer.derive("member", [sentinel]).id).toMatch(/^[0-9a-f]{64}$/);
     expect(Object.keys(namer)).toEqual(["derive"]);
+    const spoofed = Object.defineProperty(new Uint8Array(31), "byteLength", { value: 32 });
     for (const invalid of [
       null,
       undefined,
@@ -60,6 +68,7 @@ test("loading and construction do no IO and all failures hide keys and identity 
       new Uint8Array(0),
       new Uint8Array(31),
       new Uint8Array(33),
+      spoofed,
     ])
       fixedFailure(() => createControlNamer(invalid as Uint8Array), "Invalid control naming key", [
         sentinel,
@@ -119,6 +128,11 @@ test("namers capture owned key bytes including Buffer subarray views", async () 
   const caller = backing.subarray(16, 48);
   const namer = createControlNamer(caller);
   const before = fixtures.map(({ kind, components }) => namer.derive(kind, components));
+  const extracted = hmac(Buffer.from("limitless-control-naming", "utf8"), Buffer.alloc(32, 7));
+  const expectedKey = hmac(extracted, Buffer.concat([Buffer.from("v1", "utf8"), Buffer.of(1)]));
+  expect(before).toEqual(
+    fixtures.map(({ kind, tuple }) => ({ kind, id: hmac(expectedKey, tuple).toString("hex") })),
+  );
   backing.fill(0);
   expect(fixtures.map(({ kind, components }) => namer.derive(kind, components))).toEqual(before);
 });

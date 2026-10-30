@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { types } from "node:util";
+
+// Plain objects, including null-prototype objects, have unambiguous JSON encodings.
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
@@ -9,10 +12,10 @@ function encode(value: unknown, ancestors: Set<object>): string {
     case "boolean":
       return JSON.stringify(value);
     case "number":
-      if (!Number.isFinite(value)) break;
+      if (!Number.isFinite(value) || Object.is(value, -0)) break;
       return JSON.stringify(value);
     case "object": {
-      if (ancestors.has(value)) break;
+      if (types.isProxy(value) || ancestors.has(value)) break;
       const array = Array.isArray(value);
       const proto = Object.getPrototypeOf(value);
       if (array ? proto !== Array.prototype : proto !== Object.prototype && proto !== null) break;

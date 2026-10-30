@@ -6,6 +6,14 @@ import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 
+export function expectPureModule(url: URL, imports: string[]) {
+  const source = fs.readFileSync(url, "utf8");
+  expect(new Bun.Transpiler({ loader: "ts" }).scanImports(source)).toEqual(
+    imports.map((path) => ({ path, kind: "import-statement" })),
+  );
+  expect(source).not.toMatch(/\b(?:Bun|process|fetch|globalThis|console)\b/u);
+}
+
 export async function withoutIO(run: () => Promise<void>) {
   const spies: { mockRestore(): void }[] = [];
   const calls: string[] = [];

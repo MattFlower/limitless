@@ -9,8 +9,9 @@ export interface ControlNamer {
 export function createControlNamer(dataKey: Uint8Array): ControlNamer {
   let namingKey: Buffer;
   try {
-    if (!(dataKey instanceof Uint8Array) || dataKey.byteLength !== 32) throw new Error();
+    if (!(dataKey instanceof Uint8Array)) throw new Error();
     const owned = Buffer.from(dataKey);
+    if (owned.byteLength !== 32) throw new Error();
     namingKey = Buffer.from(hkdfSync("sha256", owned, "limitless-control-naming", "v1", 32));
   } catch {
     throw new Error("Invalid control naming key");
