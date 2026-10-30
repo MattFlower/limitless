@@ -30,9 +30,8 @@ test("agent result reports accept only terminal statuses and strict fields", () 
   };
   for (const status of ["ok", "error", "cancelled", "timeout", "stuck", "quota", "unavailable", "declined"])
     expect(AgentResultReport.safeParse({ ...report, status }).success).toBe(true);
-  expect(AgentResultReport.parse({ ...report, failureClass: "authentication" }).failureClass).toBe(
-    "authentication",
-  );
+  for (const failureClass of ["authentication", "malformed"] as const)
+    expect(AgentResultReport.parse({ ...report, failureClass }).failureClass).toBe(failureClass);
   expect(
     AgentResultReport.parse({ ...report, status: "error", error: "Failed to authenticate" }).failureClass,
   ).toBeUndefined();

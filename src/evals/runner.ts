@@ -61,6 +61,7 @@ import {
   nextImplementTarget,
   RETRY_FEEDBACK_GRADE,
 } from "./implement.ts";
+import { type JudgeJob, JudgeRequestSchema, judgedMetrics, judgeTrials } from "./judge.ts";
 import {
   gradeCase,
   prepareCase,
@@ -72,7 +73,7 @@ import {
   storedSchemaFor,
 } from "./prepare.ts";
 import { replayFinders, validateReplay } from "./replay.ts";
-import { type EvalReport, type StatsOptions, summarize } from "./stats.ts";
+import { candidateOf, type EvalReport, type StatsOptions, summarize } from "./stats.ts";
 
 /** The abort reason of `eval cancel`; any other abort is a daemon shutdown. */
 const CANCELLED = "cancelled";
@@ -315,7 +316,81 @@ export class EvalRunner {
         ? loadRoleCases("review", this.casePath).cases.flatMap((item) => ("defects" in item ? [item] : []))
         : [];
     const labels = { reviewCases, reviewGrader: gradeReview };
-    return { run, summaries: summarize(run, trials, { cascadeFallback, ...labels, ...options }), trials };
+    const summaries = summarize(run, trials, { cascadeFallback, ...labels, ...options });
+    const judges = this.deps.store.evalJudges(id)?.judges;
+    if (judges)
+      for (const summary of summaries)
+        if (summary.review)
+          summary.review.judged = judgedMetrics(
+            this.deps.store,
+            run,
+            trials.filter((t) => candidateOf(t) === summary.candidate),
+            reviewCases,
+            judges,
+          );
+    return { run, summaries, trials };
+  }
+
+  judgeStatus(id: string): JudgeJob | null {
+    const job = this.deps.store.evalJudges(id);
+    return job?.status === "running" && !this.active.has(id)
+      ? { ...job, status: "failed", error: "judging interrupted by daemon restart; run eval judge again" }
+      : job;
+  }
+
+  judge(id: string, input: unknown): JudgeJob | null {
+    if (this.stopping) throw new Error("daemon is stopping");
+    const run = this.deps.store.getEvalRun(id);
+    if (!run) return null;
+    if (run.role !== "review") throw new Error("only review evals can be judged");
+    if (run.status === "queued" || run.status === "running")
+      throw new Error(`eval ${id} is still ${run.status}`);
+    if (this.active.has(id)) throw new Error(`judge job already running for eval ${id}`);
+    const request = JudgeRequestSchema.parse(input);
+    const targets = request.judges.map((j) => {
+      const { model, effort } = this.deps.router.resolveFor("summarize", j);
+      return this.deps.router.toTarget(model, effort ?? null);
+    });
+    if (targets[0]?.vendor === targets[1]?.vendor) throw new Error("judges must be from different vendors");
+    const judges = targets.map(recordedTarget);
+    const cases = loadRoleCases("review", this.casePath).cases.flatMap((c) => ("defects" in c ? [c] : []));
+    const previous = this.deps.store.evalJudges(id);
+    const spent = previous?.spendUsd ?? previous?.result?.spendUsd ?? 0;
+    const job: JudgeJob = { judges, status: "running", spendUsd: spent };
+    this.deps.store.saveEvalJudges(id, job);
+    const controller = new AbortController();
+    this.executing.set(id, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY);
+    this.resizeEvalSlots();
+    const done = judgeTrials(
+      this.deps,
+      run,
+      cases,
+      targets,
+      (request.maxUsd ?? run.maxUsd) - spent,
+      controller.signal,
+      (provider) => this.evalSlot(provider).acquire(controller.signal),
+      (provider) => this.evalLimit(provider, run.concurrency ?? DEFAULT_EVAL_CONCURRENCY),
+      (spendUsd) => {
+        job.spendUsd = spent + spendUsd;
+        this.deps.store.saveEvalJudges(id, job);
+      },
+    )
+      .then(
+        (result) => this.deps.store.saveEvalJudges(id, { ...job, status: "completed", result }),
+        (error: unknown) =>
+          this.deps.store.saveEvalJudges(id, {
+            ...job,
+            status: "failed",
+            error: redactCredentials(String(error)),
+          }),
+      )
+      .finally(() => {
+        this.executing.delete(id);
+        this.resizeEvalSlots();
+        this.active.delete(id);
+      });
+    this.active.set(id, { controller, done });
+    return job;
   }
 
   /**

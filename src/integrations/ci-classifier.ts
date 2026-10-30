@@ -3,6 +3,7 @@ import type { CiFailure, GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { credentialRedactionPadding, redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
+import { CiEvidenceHeadMoved, unrelatedCiTests } from "./ci-test-evidence.ts";
 import type { GitHubResponse, PrSnapshot } from "./github-poller.ts";
 
 const bad = new Set(["failure", "error", "timed_out", "startup_failure", "action_required", "cancelled"]);
@@ -67,6 +68,7 @@ const securityFailure = (log: string) =>
 const timeoutDiagnostic =
   /^(?:\s*\^\s*this test timed out after \d+(?:\.\d+)?\s*ms\.?|(?:Error: )?Test timeout of \d+ms exceeded\.|##\[error\]The job running on runner .+ has exceeded the maximum execution time of \d+ minutes\.)$/;
 class CiWriteDenied extends Error {}
+class CiReadDeferred extends Error {}
 const pending = (f: CiFailure) => f.outcome === "rerunning" || f.outcome === "rerun_requested";
 /** The approved head can lag a factory push; any other head supersedes the pinned commit. */
 export const headMoved = (head: string, sha: string, approvedSha?: string): boolean =>
@@ -156,6 +158,8 @@ async function inspectCiInner(
     allowed();
     const res = await call(pr.repo, `${root}/${path}`, undefined, optionalLog);
     allowed();
+    if (!res || [401, 403, 429].includes(res.status))
+      throw new CiReadDeferred(`CI inspection paused: ${path} (${res?.status ?? "unavailable"})`);
     // A verified job may have no uploaded log after its workflow times out.
     if (optionalLog && res?.status === 404)
       return ["error: Job log unavailable (HTTP 404)", fallback].join("\n");
@@ -511,7 +515,28 @@ async function inspectCiInner(
         paused = true;
         continue;
       }
-      if (!unsafe && !prior.length && job && transient && reruns) {
+      let unrelated: Awaited<ReturnType<typeof unrelatedCiTests>> | undefined;
+      if (!unsafe && !prior.length && job && !transient && reruns && !state.get(c.name)?.red) {
+        try {
+          unrelated = await unrelatedCiTests(
+            (path) => read(path, true),
+            pr.repo,
+            pr.url.split("/").at(-1) ?? "",
+            snap.headRefOid,
+            branch,
+            mainSha,
+            job,
+            log,
+          );
+        } catch (error) {
+          if (error instanceof CiWriteDenied || error instanceof CiReadDeferred) throw error;
+          if (error instanceof CiEvidenceHeadMoved)
+            return headMoved(error.head, snap.headRefOid, approvedSha) ? "head_moved" : false;
+          // Missing/incomplete reports preserve the ordinary fix path; cooldowns remain pending.
+          if (!ready()) return false;
+        }
+      }
+      if (!unsafe && !prior.length && job && (transient || unrelated) && reruns) {
         const siblings = (await jobs(job.run_id, job.run_attempt)).filter((j) => j.name === job.name);
         if (siblings.length !== 1 || siblings[0]?.id !== job.id)
           throw new Error("Ambiguous originating CI job");
@@ -524,14 +549,17 @@ async function inspectCiInner(
         if (remote.state !== "open" || !current()) continue;
         if (!ready()) return false;
         if (
-          write(() =>
-            store.claimCiRerun(f, marker, {
+          write(() => {
+            const claimed = store.claimCiRerun(f, marker, {
               id: job.id,
               runId: job.run_id,
               attempt: job.run_attempt,
               name: job.name,
-            }),
-          )
+            });
+            if (claimed && unrelated)
+              store.observations.ciFlaky(pr.repo, pr.runId, f, job, unrelated, excerpt);
+            return claimed;
+          })
         ) {
           await requestRerun(f, job.id, excerpt);
           continue;
