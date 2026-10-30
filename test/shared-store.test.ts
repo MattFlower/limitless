@@ -509,16 +509,20 @@ describe("validation and absence", () => {
         throw new Error("connection reset");
       },
     ];
-    for (const match of [isMeta, isRead("git/ref/"), isRead("git/trees/"), isRead("git/blobs/")])
+    const reads = [isMeta, isRead("git/ref/"), isRead("git/trees/"), isRead("git/blobs/")];
+    for (const [i, match] of reads.entries())
       for (const failure of failures) {
         remote.hook = async (call, next) => (match(call) ? failure() : next());
         await rejects(client.get(runId, role, expected), "unavailable");
         const count = remote.calls.length;
-        // The idempotent retry of a retained key reads every object a get reads.
-        expect(await client.put(runId, role, keyA, payload)).toEqual({
-          kind: "unconfirmed",
-          blob: blobOf(keyA, payload),
-        });
+        // The idempotent retry of a retained key reads every object a get reads; a blob-read
+        // failure follows the observed state, so it is unchanged rather than unconfirmed.
+        const observed = i === reads.length - 1;
+        expect(await client.put(runId, role, keyA, payload)).toEqual(
+          observed
+            ? { kind: "unchanged", tip: remote.refs.get(ref(runId)) ?? null, blob: blobOf(keyA, payload) }
+            : { kind: "unconfirmed", blob: blobOf(keyA, payload) },
+        );
         expect(writes(remote.calls.slice(count))).toEqual([]);
       }
     remote.hook = undefined;
@@ -1174,6 +1178,27 @@ describe("cancellation and deadlines", () => {
         expect(writes(after)).toEqual([]);
         deadlines.expectDisposed();
       });
+
+  for (const failure of ["HTTP 503", "headers", "body"] as const)
+    test(`deadline: a retained-object read failing by ${failure} after observed state is unchanged`, async () => {
+      const remote = new Remote();
+      const payload = bytesOf("retained");
+      await remote.client().put(runId, role, keyA, payload);
+      const tip = remote.refs.get(ref(runId)) ?? null;
+      const deadlines = new Deadlines();
+      const body = stalledBody();
+      const reached = intercept(remote, isRead("git/blobs/"), async () => {
+        if (failure === "HTTP 503") return json({ message: "unavailable" }, 503);
+        return failure === "headers" ? never() : body.response;
+      });
+      const pending = remote.client({ deadline: deadlines.deadline }).put(runId, role, keyA, payload);
+      const stalled = await reached;
+      if (failure === "body") await body.reading;
+      if (failure !== "HTTP 503") deadlines.expire();
+      expect(await pending).toEqual({ kind: "unchanged", tip, blob: blobOf(keyA, payload) });
+      expect(remote.calls.slice(remote.calls.indexOf(stalled) + 1)).toEqual([]);
+      deadlines.expectDisposed();
+    });
 
   test("deadline: failed reconciliation after a CAS timeout is unconfirmed; timed-out get is unavailable", async () => {
     const remote = new Remote();

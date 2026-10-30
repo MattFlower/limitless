@@ -203,13 +203,13 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
         try {
           const id = await repository(signal);
           before = await state(c.runId, signal);
+          stage = 1;
           const existing = before?.entries.get(c.key);
           if (before && existing !== undefined) {
             const retained = await content(existing, signal);
             if (!guard(() => open(c, retained).equals(bytes), "conflict")) fail("conflict");
             return finish({ kind: "applied", tip: before.sha });
           }
-          stage = 1;
           const upload = { content: seal(c, bytes), encoding: "base64" };
           const sha = parse(created, await call("git/blobs", upload, signal)).sha;
           const entry = { path: `objects/${c.key}`, mode: "100644", type: "blob", sha };
