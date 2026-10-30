@@ -173,6 +173,43 @@ export function ciArtifactXml(value: unknown): string[] {
   return xml;
 }
 
+/** Summary agreement covers tests, not a shell script's other commands or failures. */
+function testExecution(log: string): string[] {
+  const lines = Bun.stripANSI(log)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, "").trim())
+    .filter(Boolean);
+  const exits = lines.flatMap((line, index) => (line.startsWith("##[error]") ? [index] : []));
+  const exit = exits[0];
+  if (
+    exits.length !== 1 ||
+    exit === undefined ||
+    lines[exit] !== "##[error]Process completed with exit code 1."
+  )
+    throw new Error("Unattributed execution failure");
+  const start = lines.findLastIndex((line, index) => index < exit && line.startsWith("##[group]Run "));
+  const command = lines[start]?.slice("##[group]Run ".length);
+  if (
+    !command ||
+    !/^bun test(?: [\w./=:-]+)*$/.test(command) ||
+    lines[start + 1] !== command ||
+    !/^shell: \/(?:usr\/bin|bin)\/bash (?:--noprofile --norc -e -o pipefail|-e) \{0\}$/.test(
+      lines[start + 2] ?? "",
+    ) ||
+    lines[start + 3] !== "##[endgroup]"
+  )
+    throw new Error("Missing direct test execution");
+  const output = lines.slice(start + 4, exit);
+  if (
+    !/^bun test v\d+\./.test(output[0] ?? "") ||
+    !/^Ran \d+ tests? across \d+ files?\.(?: \[[\d.]+(?:ms|s)\])?$/.test(output.at(-1) ?? "") ||
+    output.some((line) => line.startsWith("##[")) ||
+    lines.some((line) => /\berror TS\d+:|^error: script .* exited with code \d+/i.test(line))
+  )
+    throw new Error("Non-test or incomplete execution evidence");
+  return lines;
+}
+
 /** Unavailable evidence is handled by the caller as ordinary needs-fix, never as green CI. */
 export async function unrelatedCiTests(
   read: Read,
@@ -301,7 +338,7 @@ export async function unrelatedCiTests(
   const failed = await reports(run, origin.id);
   // JUnit counters alone can omit runner/load failures. Corroborate the entire failing execution.
   const runner = new RunnerFailureEvidence();
-  for (const line of log.split(/\r?\n/)) runner.observe(line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, ""));
+  for (const line of testExecution(log)) runner.observe(line);
   const outcomes = [...failed.tests.values()];
   if (
     !runner.agrees({

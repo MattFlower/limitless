@@ -210,6 +210,62 @@ test("an earlier transient claim also consumes the unrelated-test allowance", as
   expect(h.store.failureObservations({ class: "flaky" })).toHaveLength(0);
 });
 
+test("a timestamped direct Bun invocation retains assertion diagnostics and reruns", async () => {
+  h = pollerHarness();
+  const f = unrelatedFailure();
+  f.state.log = assertionLog
+    .replaceAll("bun test\n", "bun test --reporter=junit\n")
+    .replace("--noprofile --norc -e -o pipefail", "-e")
+    .replace("(fail) asserts", "error: expect(received).toBe(expected)\n(fail) asserts")
+    .split("\n")
+    .map((line) => `2026-10-29T00:00:30.000Z \u001b[31m${line}\u001b[0m`)
+    .join("\n");
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(1);
+  expect(items("ci.needs_fix")).toHaveLength(0);
+  expect(fixEvidence()).toBeNull();
+  expect(h.store.failureObservations({ class: "flaky" })).toHaveLength(1);
+});
+
+test.each([
+  "compiler-after-summary",
+  "compiler-before-summary",
+  "script-exit",
+  "composite-command",
+  "multiline-script",
+  "opaque-script",
+  "missing-command",
+  "missing-exit",
+  "wrong-exit",
+  "additional-failure",
+  "unknown-output-after-summary",
+])("unrelated testcase plus unattributed execution (%s) starts a fix round", async (kind) => {
+  h = pollerHarness();
+  const f = unrelatedFailure();
+  const compiler = "src/changed.ts(1,1): error TS2322: Type string is not assignable to type number.";
+  if (kind === "compiler-after-summary")
+    f.state.log = f.state.log.replace("\n##[error]", `\n${compiler}\n##[error]`);
+  if (kind === "compiler-before-summary") f.state.log = f.state.log.replace("0 pass", `${compiler}\n0 pass`);
+  if (kind === "script-exit") f.state.log += '\nerror: script "build" exited with code 2';
+  if (kind === "composite-command")
+    f.state.log = f.state.log.replaceAll("Run bun test", "Run bun test; bun run build");
+  if (kind === "multiline-script") f.state.log = f.state.log.replace("\nshell:", "\nbun run build\nshell:");
+  if (kind === "opaque-script") f.state.log = f.state.log.replaceAll("bun test", "bun run check");
+  if (kind === "missing-command") f.state.log = f.state.log.slice(f.state.log.indexOf("(fail)"));
+  if (kind === "missing-exit") f.state.log = f.state.log.replace(/\n##\[error\].*/, "");
+  if (kind === "wrong-exit") f.state.log = f.state.log.replace("exit code 1.", "exit code 2.");
+  if (kind === "additional-failure") f.state.log += "\n##[error]build failed";
+  if (kind === "unknown-output-after-summary")
+    f.state.log = f.state.log.replace("\n##[error]", "\nBuild failed\n##[error]");
+  h.start(15);
+  await h.advance(0);
+  expect(reruns()).toHaveLength(0);
+  expect(items("ci.needs_fix")).toHaveLength(1);
+  expect(fixEvidence()).not.toBeNull();
+  expect(h.store.failureObservations({ class: "flaky" })).toHaveLength(0);
+});
+
 test.each(["changed", "renamed-from", "renamed-to", "mixed"])(
   "%s testcase files follow the fix path",
   async (kind) => {
@@ -228,7 +284,9 @@ test.each(["changed", "renamed-from", "renamed-to", "mixed"])(
     if (kind === "mixed") {
       f.evidence.prXml = `<testsuites tests="2" failures="2" errors="0">${junit()}${junit("failure", "test/unrelated.test.ts")}</testsuites>`;
       f.evidence.mainXml = `<testsuites tests="2" failures="0" errors="0">${junit("pass")}${junit("pass", "test/unrelated.test.ts")}</testsuites>`;
-      f.state.log = "(fail) asserts\n0 pass\n2 fail\nRan 2 tests across 2 files.";
+      f.state.log = assertionLog
+        .replace("1 fail", "2 fail")
+        .replace("1 test across 1 file", "2 tests across 2 files");
     }
     h.start(15);
     await h.advance(0);

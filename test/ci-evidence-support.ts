@@ -35,7 +35,16 @@ export const junit = (outcome = "failure", file = "test/example.test.ts", name =
   `<testsuite name="suite" tests="1" failures="${Number(outcome === "failure")}" errors="0" skipped="${Number(outcome === "skipped")}">
     <testcase file="${file}" classname="outer" name="${name}">${outcome === "pass" ? "" : `<${outcome}/>`}</testcase>
   </testsuite>`;
-export const assertionLog = "(fail) asserts\n0 pass\n1 fail\nRan 1 test across 1 file.";
+export const assertionLog = `##[group]Run bun test
+bun test
+shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+##[endgroup]
+bun test v1.3.0 (example)
+(fail) asserts
+0 pass
+1 fail
+Ran 1 test across 1 file.
+##[error]Process completed with exit code 1.`;
 
 export function ciEvidence(
   github: ReturnType<typeof fakeGitHub>,
