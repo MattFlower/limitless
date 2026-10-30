@@ -2,6 +2,37 @@ import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { promptJson, redactHoldoutText } from "./prompts.ts";
 import { type Holdout, requirementCitationIssue, rowKind, type Spec, type Verify } from "./schemas.ts";
 
+export type BrowserContext = "available" | "unavailable" | "no_preview";
+export const BROWSER_INCOMPLETE =
+  "Factory: a ready preview and browser were available for this attempt, but browser verification was not completed.";
+
+export function applyBrowserContext(
+  verify: Verify,
+  spec: Spec,
+  holdout: Holdout,
+  context?: BrowserContext,
+): Verify {
+  if (context !== "available") return verify;
+  const marked = new Set(
+    [...spec.acceptance_criteria, ...holdout.scenarios].filter((c) => c.browser === true).map((c) => c.id),
+  );
+  return {
+    ...verify,
+    criteria: verify.criteria.map((c) => {
+      if (c.status !== "blocked" || !marked.has(c.id)) return c;
+      const { gateEvidence: _gate, ...row } = c;
+      return {
+        ...row,
+        status: "unclear",
+        blockedReason: null,
+        covering_tests: [],
+        evidence: `${BROWSER_INCOMPLETE}\n${redactGateOutput(c.evidence)}`,
+        publicSummary: rowKind(c.id, spec, holdout) === "holdout" ? BROWSER_INCOMPLETE : c.publicSummary,
+      };
+    }),
+  };
+}
+
 export function preDeliveryVerifyArtifact(
   verify: Verify & { modelId: string; round: number; attempt: number; sha?: string; modelOutput?: Verify },
   spec: Spec,

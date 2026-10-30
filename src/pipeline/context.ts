@@ -55,6 +55,7 @@ import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 import type { SizeReport } from "./size.ts";
+import type { BrowserContext } from "./verification.ts";
 
 export interface Checkpointer {
   writeState(runId: string, state: RunState): void;
@@ -213,7 +214,14 @@ export interface RunState {
   lastGates?: GateComparison[];
   gateEvidence?: GateEvidence;
   coveringTestRuns?: CoveringTestRun[];
-  pendingVerify?: { round: number; attempt: number; sha: string; modelOutput: Verify; modelId: string };
+  pendingVerify?: {
+    round: number;
+    attempt: number;
+    sha: string;
+    modelOutput: Verify;
+    modelId: string;
+    browserContext?: BrowserContext;
+  };
   gateTimeoutReruns?: number;
   lastAudit?: AuditFinding[];
   lastReview?: Review & { modelId: string };
@@ -238,6 +246,7 @@ export interface RunState {
     sha?: string;
     /** Parsed verifier output, before engine substitution; retained privately for restart. */
     modelOutput?: Verify;
+    browserContext?: BrowserContext;
   })[];
   /** Round whose retry is reserved; a restart resumes it, and a recorded attempt 1 ends retrying. */
   environmentRetryRound?: number;
