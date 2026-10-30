@@ -78,8 +78,8 @@ export const browserSpec = (cwd: string, scratchDir: string, cacheDir: string): 
   },
 });
 
-/** A minimal 64-bit Mach-O image whose load commands name these dylibs and run paths. */
-export function machO(dylibs: string[] = [], rpaths: string[] = []): Buffer {
+/** A minimal 64-bit Mach-O image whose load commands name these dylibs, run paths and weak dylibs. */
+export function machO(dylibs: string[] = [], rpaths: string[] = [], weak: string[] = []): Buffer {
   const command = (cmd: number, name: string) => {
     const offset = cmd === 0x8000001c ? 12 : 24;
     const size = Math.ceil((offset + Buffer.byteLength(name) + 1) / 8) * 8;
@@ -93,11 +93,12 @@ export function machO(dylibs: string[] = [], rpaths: string[] = []): Buffer {
   const commands = Buffer.concat([
     ...dylibs.map((name) => command(0xc /* LC_LOAD_DYLIB */, name)),
     ...rpaths.map((name) => command(0x8000001c /* LC_RPATH */, name)),
+    ...weak.map((name) => command(0x80000018 /* LC_LOAD_WEAK_DYLIB */, name)),
   ]);
   const header = Buffer.alloc(32);
   header.writeUInt32LE(0xfeedfacf, 0);
   header.writeUInt32LE(0x0100000c, 4);
-  header.writeUInt32LE(dylibs.length + rpaths.length, 16);
+  header.writeUInt32LE(dylibs.length + rpaths.length + weak.length, 16);
   header.writeUInt32LE(commands.length, 20);
   return Buffer.concat([header, commands]);
 }

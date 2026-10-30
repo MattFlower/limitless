@@ -66,7 +66,7 @@ that remains is needed for Node or Chromium to start, navigate or render. A blan
 | Allowance | Reason |
 |---|---|
 | file-read-data on `/` (literal) | dyld opens the root directory to find its shared cache; Node aborts in `CacheFinder` without it. It exposes only top-level names. |
-| file-read-metadata on each symlink of dyld's lookups (literals) | dyld loads Homebrew libraries through `opt` links, versioned dylib links, `@rpath` and `@loader_path` (for example `libicudata.78.dylib`). `src/harness/dyld-links.ts` reads the recorded runtime's Mach-O load commands and grants only links whose lookup ends at a recorded library (36 for the pinned Node). |
+| file-read-metadata on each symlink of dyld's lookups (literals) | dyld loads Homebrew libraries through `opt` links, versioned dylib links, `@rpath` and `@loader_path` (for example `libicudata.78.dylib`). `src/harness/dyld-links.ts` reads the recorded runtime's Mach-O load commands, refuses malformed ones, and grants the links of each dependency's lookup (36 for the pinned Node). A required non-system dependency that no longer ends at a recorded library refuses setup. |
 | The recorded Node runtime and libraries, the browser directory, the pinned cache | Node, its libraries, the MCP server and Chromium. |
 | `/System/Library`, `/usr/lib` | frameworks, system fonts and libraries |
 | `/usr/share/icu` | CoreFoundation's ICU data |
@@ -113,9 +113,9 @@ and restricted. Crash reporting is off (crashpad cannot check in), which is harm
   only. IOKit user clients (the GPU process needs them), binding and accepting sockets, and sysctl
   reads stay allowed.
 - The allowlist was measured on one macOS release with this Chrome build and Homebrew Node; another
-  coordinator, macOS release or pin needs the probe re-run. If a Homebrew upgrade keeps the old keg,
-  its `opt` link moves to the new one and dyld no longer reaches the recorded libraries; Node then
-  aborts at start and the browser fails closed without a specific diagnostic.
+  coordinator, macOS release or pin needs the probe re-run. A Homebrew upgrade that moves an `opt`
+  link, even with the old keg kept, makes setup refuse with "browser runtime changed: … reprovision
+  the browser cache".
 
 ## Running the probe
 
