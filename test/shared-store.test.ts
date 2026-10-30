@@ -747,6 +747,29 @@ describe("concurrency", () => {
     expect(remote.retained(runId).size).toBe(4);
   });
 
+  test("mutex: a write queued behind a cancelled waiter still waits for the active write", async () => {
+    const remote = new Remote();
+    const client = remote.client();
+    const cas = hold();
+    const started = intercept(remote, isCas, cas.hook);
+    const head = client.put(runId, role, keyA, bytesOf("a"));
+    await started;
+    const count = remote.calls.length;
+    const controller = new AbortController();
+    const cancelled = client.put(runId, role, keyB, bytesOf("b"), controller.signal);
+    controller.abort();
+    await rejects(cancelled, "aborted");
+    const third = client.put(runId, role, keyC, bytesOf("c"));
+    const state = track(third);
+    await flush();
+    expect(remote.calls.length).toBe(count);
+    expect(state.settled).toBe(false);
+    cas.release();
+    expect(await head).toMatchObject({ kind: "applied" });
+    expect(await third).toMatchObject({ kind: "applied" });
+    expect([...remote.retained(runId).keys()].sort()).toEqual([keyA, keyC].sort());
+  });
+
   async function race(remote: Remote, existing: boolean) {
     if (existing) await remote.client().put(runId, role, keyC, bytesOf("base"));
     const cas = hold();
@@ -1082,6 +1105,36 @@ describe("cancellation and deadlines", () => {
       expect(await pending).toEqual({ kind: "unconfirmed", blob: blobOf(keyA, payload) });
       await flush();
       expect(remote.calls.length).toBe(count);
+      const recovered = await remote.client().put(runId, role, keyA, payload, new AbortController().signal);
+      expect(recovered).toMatchObject({ kind: "applied", tip: remote.refs.get(ref(runId)) });
+    });
+
+  for (const boundary of ["validated response", "reconciliation"] as const)
+    test(`cancellation: abort while confirming the ${boundary} is unconfirmed`, async () => {
+      const remote = new Remote();
+      const controller = new AbortController();
+      intercept(remote, isCas, async (_call, next) => {
+        const response = await next();
+        if (boundary === "validated response") return response;
+        throw new Error("connection reset");
+      });
+      // Abort as the request that would confirm the outcome disposes its deadline, after its complete body.
+      const casAt = () => remote.calls.findIndex(isCas);
+      const confirming = () =>
+        casAt() >= 0 &&
+        (boundary === "validated response" ||
+          remote.calls.slice(casAt()).filter(isRead("git/trees/")).length === 2);
+      const deadline = () => ({
+        signal: new AbortController().signal,
+        dispose: () => confirming() && controller.abort(),
+      });
+      const payload = bytesOf("confirming");
+      const pending = remote.client({ deadline }).put(runId, role, keyA, payload, controller.signal);
+      expect(await pending).toEqual({ kind: "unconfirmed", blob: blobOf(keyA, payload) });
+      expect(controller.signal.aborted).toBe(true);
+      const after = remote.calls.slice(casAt() + 1);
+      expect(after).toHaveLength(boundary === "validated response" ? 0 : 4);
+      expect(remote.retained(runId).has(keyA)).toBe(true);
       const recovered = await remote.client().put(runId, role, keyA, payload, new AbortController().signal);
       expect(recovered).toMatchObject({ kind: "applied", tip: remote.refs.get(ref(runId)) });
     });
