@@ -26,11 +26,12 @@ import * as gitMerge from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { confinementScope, observerRoots } from "../src/harness/sandbox.ts";
+import { ClaimLostError } from "../src/integrations/claim-errors.ts";
 import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import { configureGitHubIdentity } from "../src/integrations/github-identity.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type GitHubClient, normalizePr, startGitHubPoller } from "../src/integrations/github-poller.ts";
-import { type LandPrClient, LandQueue } from "../src/land/queue.ts";
+import { LandBlocked, type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import { markReport, reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
@@ -5602,5 +5603,51 @@ test("lost land attempt stays open until the replacement blocks", async () => {
   } finally {
     spy.mockRestore();
     await q.stop();
+  }
+});
+
+test.each([true, false])("disable-auto preserves claim interruption (control: %s)", async (control) => {
+  const pr = delivered(1, "pr-1");
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const q = queue({ start: false });
+  const entry = store.createLandEntry({
+    runId: pr.run.id,
+    repo: SLUG,
+    prUrl: pr.prUrl,
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  const worker = q as unknown as {
+    owner: string;
+    merge: (
+      entry: LandEntry,
+      repo: import("../src/core/types.ts").Repo,
+      cwd: string,
+      sha: string,
+      subject: string,
+      body: string,
+      signal: AbortSignal,
+    ) => Promise<void>;
+  };
+  store.updateLandEntry(entry.id, { state: "queued" });
+  const claimed = store.claimLandEntry(SLUG, 30_000, worker.owner, clock.now());
+  if (!claimed) throw new Error("Missing claim");
+  store.updateLandEntry(entry.id, { state: "waiting_ci" });
+  const repo = store.getRepo(pr.run.repoId);
+  if (!repo) throw new Error("Missing repo");
+  const failure = control ? new ClaimLostError() : new Error("disable failed");
+  const merge = spyOn(repos, "mergePullRequest").mockResolvedValue("failed");
+  const disable = spyOn(repos, "disableAutoMerge").mockRejectedValue(failure);
+  try {
+    const attempt = worker.merge(claimed, repo, seed, head, "Title", "Body", new AbortController().signal);
+    if (control) await expect(attempt).rejects.toBe(failure);
+    else await expect(attempt).rejects.toBeInstanceOf(LandBlocked);
+    expect(disable).toHaveBeenCalledTimes(1);
+  } finally {
+    merge.mockRestore();
+    disable.mockRestore();
   }
 });

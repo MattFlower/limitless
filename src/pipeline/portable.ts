@@ -6,6 +6,7 @@ import { linkedIssues, type Store } from "../db/store.ts";
 import { githubUrlRepo } from "../integrations/github-identity.ts";
 import { lifecycleMarker } from "../integrations/issue-lifecycle.ts";
 import { deliveryMarker } from "./markers.ts";
+import { RunTransferError, rethrowRunTransfer } from "./run-transfer-errors.ts";
 
 const runId = z.string().regex(/^[0-9a-z]{6,40}$/);
 const repo = z.string().regex(/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i);
@@ -128,6 +129,13 @@ const manifestSchema = z.strictObject({
   effects: z.array(effectSchema),
 });
 export type ManifestV1 = z.infer<typeof manifestSchema>;
+const manifestV2Schema = manifestSchema.extend({
+  schema: z.literal(2),
+  phase: z.enum(["prepare", "triage", "clarify", "spec", "loop", "deliver", "accept", "done"]),
+});
+export type ManifestV2 = z.infer<typeof manifestV2Schema>;
+export type PortableManifest = ManifestV1 | ManifestV2;
+const portableManifestSchema = z.discriminatedUnion("schema", [manifestSchema, manifestV2Schema]);
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value !== null && typeof value === "object")
@@ -142,13 +150,20 @@ const hash = (text: string) => createHash("sha256").update(text, "utf8").digest(
 export function effectId(id: string, intent: EffectIntent): string {
   return `fx1-${hash(canonical({ runId: runId.parse(id), intent: intentSchema.parse(intent) })).slice(0, 32)}`;
 }
-export function formatManifest(m: ManifestV1): string {
-  return canonical(manifestSchema.parse(m));
+export function formatManifest(m: PortableManifest): string {
+  if (typeof m.schema === "number" && m.schema !== 1 && m.schema !== 2)
+    throw new RunTransferError("unsupported");
+  if (m.schema === 1) return canonical(manifestSchema.parse(m));
+  try {
+    return canonical(manifestV2Schema.parse(m));
+  } catch (error) {
+    rethrowRunTransfer(error, "invalid");
+  }
 }
-export function manifestDigest(m: ManifestV1): string {
+export function manifestDigest(m: PortableManifest): string {
   return hash(formatManifest(m));
 }
-export function parseManifest(text: string): ManifestV1 | "malformed" | { unsupported: number } {
+export function parseManifest(text: string): PortableManifest | "malformed" | { unsupported: number } {
   try {
     const value: unknown = JSON.parse(text);
     if (
@@ -156,11 +171,14 @@ export function parseManifest(text: string): ManifestV1 | "malformed" | { unsupp
       typeof value === "object" &&
       "schema" in value &&
       typeof value.schema === "number" &&
-      value.schema !== 1
+      value.schema !== 1 &&
+      value.schema !== 2
     )
       return { unsupported: value.schema };
-    const parsed = manifestSchema.safeParse(value);
-    return parsed.success ? parsed.data : "malformed";
+    const parsed = portableManifestSchema.safeParse(value);
+    if (!parsed.success) return "malformed";
+    if (parsed.data.schema === 2 && canonical(parsed.data) !== text) return "malformed";
+    return parsed.data;
   } catch {
     return "malformed";
   }
