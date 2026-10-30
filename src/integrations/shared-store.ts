@@ -3,6 +3,7 @@ import { addAbortListener } from "node:events";
 import { z } from "zod";
 import type { BlobRef } from "../pipeline/portable.ts";
 import { redactCredentials, registerCredential } from "../util/proc.ts";
+import { rethrowClaimControl } from "./claim-errors.ts";
 import { canonicalRepo } from "./lease-store.ts";
 
 // Codes `put` throws instead of classifying them as a retention outcome.
@@ -60,7 +61,8 @@ function fail(code: SharedStoreErrorCode): never {
 function guard<T>(action: () => T, code: SharedStoreErrorCode): T {
   try {
     return action();
-  } catch {
+  } catch (e) {
+    rethrowClaimControl(e);
     return fail(code);
   }
 }
@@ -88,34 +90,42 @@ async function abortable<T>(signals: (AbortSignal | undefined)[], work: () => Pr
     for (const s of subscriptions) s[Symbol.dispose]();
   }
 }
-export function createSharedStore(deps: SharedStoreDeps): SharedStore {
+/** Internal companion transport and authenticated envelope IO; construction is inert. */
+export function createCompanionIO(deps: SharedStoreDeps) {
   const repo = guard(() => canonicalRepo(deps.repo), "configuration");
   if (typeof deps.token !== "string" || !deps.token.trim()) fail("configuration");
   if (!(deps.dataKey instanceof Uint8Array) || deps.dataKey.length !== 32) fail("configuration");
   const dataKey = Buffer.from(deps.dataKey);
   const { token, request = fetch, random = randomBytes, deadline = timer } = deps;
   registerCredential("LIMITLESS_COMPANION_TOKEN", token);
-  const queues = new Map<string, Promise<unknown>>();
   function draw(size: number): Buffer {
     const bytes = guard(() => Buffer.from(random(size)), "configuration");
     return bytes.length === size ? bytes : fail("configuration");
   }
-  function seal(c: Context, bytes: Uint8Array): string {
+  function seal(associatedData: Uint8Array, bytes: Uint8Array): string {
     const nonce = draw(12);
-    const cipher = createCipheriv("aes-256-gcm", dataKey, nonce).setAAD(aad(c));
+    const cipher = createCipheriv("aes-256-gcm", dataKey, nonce).setAAD(associatedData);
     const frame = [Buffer.of(1), nonce, cipher.update(bytes), cipher.final(), cipher.getAuthTag()];
     return Buffer.concat(frame).toString("base64");
   }
-  function open(c: Context, content: string): Buffer {
+  function open(associatedData: Uint8Array, content: string): Buffer {
     // GitHub wraps base64 lines; re-encoding rejects any other noncanonical input.
     const encoded = content.replace(/[\r\n]/g, "");
     const frame = Buffer.from(encoded, "base64");
     if (frame.toString("base64") !== encoded || frame.length < 29) fail("corrupt");
     if (frame[0] !== 1) fail("unsupported");
-    const decipher = createDecipheriv("aes-256-gcm", dataKey, frame.subarray(1, 13)).setAAD(aad(c));
+    const decipher = createDecipheriv("aes-256-gcm", dataKey, frame.subarray(1, 13)).setAAD(associatedData);
     const plaintext = decipher.setAuthTag(frame.subarray(-16)).update(frame.subarray(13, -16));
     // Authentication completes in final(), before any decrypted byte leaves this function.
     return Buffer.concat([plaintext, guard(() => decipher.final(), "corrupt")]);
+  }
+  async function transport<T>(work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (e) {
+      rethrowClaimControl(e);
+      return fail("unavailable");
+    }
   }
   // One request with a fresh deadline covering dispatch, headers and the complete body.
   async function call(path: string | null, body?: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -124,19 +134,25 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
     try {
       const url = `https://api.github.com/${path === null ? "graphql" : `repos/${repo}/${path}`}`;
       return await abortable([limit.signal, signal], async () => {
-        const res = await request(url, {
-          method: body === undefined ? "GET" : "POST",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          redirect: "manual",
-          signal: controller.signal,
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        });
-        if (!res.ok || res.redirected) fail(res.status === 404 && !body ? "missing" : "unavailable");
-        const json: unknown = await res.text().then((text) => guard(() => JSON.parse(text), "corrupt"));
+        const res = await transport(() =>
+          request(url, {
+            method: body === undefined ? "GET" : "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            redirect: "manual",
+            signal: controller.signal,
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          }),
+        );
+        if (!res.ok || res.redirected)
+          fail(res.status === 404 && !body && !res.redirected ? "missing" : "unavailable");
+        const json: unknown = await transport(() => res.text()).then((text) =>
+          guard(() => JSON.parse(text), path === null ? "unavailable" : "corrupt"),
+        );
         if (path === null && (!(json instanceof Object) || "errors" in json)) fail("unavailable");
         return json;
       });
     } catch (e) {
+      rethrowClaimControl(e);
       if (signal?.aborted) fail("aborted");
       return fail(e instanceof SharedStoreError && e.code !== "aborted" ? e.code : "unavailable");
     } finally {
@@ -151,6 +167,15 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
     if (metadata.isPrivate !== true || metadata.nameWithOwner.toLowerCase() !== repo) fail("configuration");
     return metadata.id;
   }
+  async function content(sha: string, signal?: AbortSignal): Promise<string> {
+    const blob = parse(blobSchema, await call(`git/blobs/${sha}`, undefined, signal));
+    return blob.sha === sha ? blob.content : fail("corrupt");
+  }
+  return { draw, seal, open, call, repository, content };
+}
+export function createSharedStore(deps: SharedStoreDeps): SharedStore {
+  const { draw, seal, open, call, repository, content } = createCompanionIO(deps);
+  const queues = new Map<string, Promise<unknown>>();
   async function state(runId: string, signal?: AbortSignal): Promise<Tip | null> {
     const head = await call(`git/ref/${ref(runId).slice(5)}`, undefined, signal).catch((e: unknown) =>
       e instanceof SharedStoreError && e.code === "missing" ? null : Promise.reject(e),
@@ -172,10 +197,6 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
       entries.set(e.path, e.sha);
     }
     return { sha: object.sha, root: commit.tree.sha, entries };
-  }
-  async function content(sha: string, signal?: AbortSignal): Promise<string> {
-    const blob = parse(blobSchema, await call(`git/blobs/${sha}`, undefined, signal));
-    return blob.sha === sha ? blob.content : fail("corrupt");
   }
   // Serializes one run's puts; a caller cancelled while queued never starts its task.
   function exclusive<T>(runId: string, signal: AbortSignal | undefined, task: () => Promise<T>): Promise<T> {
@@ -207,10 +228,10 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
           const existing = before?.entries.get(c.key);
           if (before && existing !== undefined) {
             const retained = await content(existing, signal);
-            if (!guard(() => open(c, retained).equals(bytes), "conflict")) fail("conflict");
+            if (!guard(() => open(aad(c), retained).equals(bytes), "conflict")) fail("conflict");
             return finish({ kind: "applied", tip: before.sha });
           }
-          const upload = { content: seal(c, bytes), encoding: "base64" };
+          const upload = { content: seal(aad(c), bytes), encoding: "base64" };
           const sha = parse(created, await call("git/blobs", upload, signal)).sha;
           const entry = { path: `objects/${c.key}`, mode: "100644", type: "blob", sha };
           const base = before && { base_tree: before.root };
@@ -222,7 +243,10 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
           stage = 2;
           const update = { name: ref(c.runId), beforeOid: before?.sha ?? "0".repeat(40), afterOid: commit };
           const variables = { r: id, u: [{ ...update, force: false }] };
-          const response = await call(null, { query: mutation, variables }, signal).catch(() => null);
+          const response = await call(null, { query: mutation, variables }, signal).catch((e: unknown) => {
+            rethrowClaimControl(e);
+            return null;
+          });
           if (casSchema.safeParse(response).success) return finish({ kind: "applied", tip: commit });
           // Ambiguous CAS: reconcile; any fresh tip (the attempt included) retaining this blob OID applied.
           const after = await state(c.runId, signal);
@@ -230,6 +254,7 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
           if (after?.sha === before?.sha) return unchanged();
           return finish(after ? { kind: "moved", tip: after.sha } : { kind: "unconfirmed" });
         } catch (e) {
+          rethrowClaimControl(e);
           if (stage < 2 && !signal?.aborted && e instanceof SharedStoreError && thrown.has(e.code)) throw e;
           return stage === 1 ? unchanged() : finish({ kind: "unconfirmed" });
         }
@@ -242,7 +267,7 @@ export function createSharedStore(deps: SharedStoreDeps): SharedStore {
       const sha = (await state(c.runId, signal))?.entries.get(c.key) ?? fail("missing");
       const retained = await content(sha, signal);
       if (signal?.aborted) fail("aborted");
-      const bytes = open(c, retained);
+      const bytes = open(aad(c), retained);
       if (sha256(bytes) !== e.digest || (e.size !== undefined && bytes.length !== e.size)) fail("corrupt");
       return signal?.aborted ? fail("aborted") : bytes;
     },
