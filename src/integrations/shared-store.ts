@@ -127,29 +127,23 @@ export function createCompanionIO(deps: SharedStoreDeps, maxResponseBytes?: numb
       return fail("unavailable");
     }
   }
-  async function boundedText(res: Response, max: number): Promise<string> {
-    if (Number(res.headers.get("content-length")) > max) fail("invalid");
-    const reader = res.body?.getReader();
-    if (!reader) return "";
+  // The caller cancels the reader, so a body stalled past a settled deadline is still released.
+  async function boundedText(reader: ReadableStreamDefaultReader<Uint8Array> | undefined, max: number) {
     const chunks: Uint8Array[] = [];
-    let size = 0;
-    try {
-      for (;;) {
-        const { done, value } = await transport(() => reader.read());
-        if (done) return Buffer.concat(chunks, size).toString("utf8");
-        size += value.byteLength;
-        if (size > max) fail("invalid");
-        chunks.push(value);
-      }
-    } finally {
-      void reader.cancel().catch(() => undefined);
-      reader.releaseLock();
+    for (let size = 0; reader; ) {
+      const { done, value } = await transport(() => reader.read());
+      if (done) return Buffer.concat(chunks, size).toString("utf8");
+      size += value.byteLength;
+      if (size > max) fail("invalid");
+      chunks.push(value);
     }
+    return "";
   }
   // One request with a fresh deadline covering dispatch, headers and the complete body.
   async function call(path: string | null, body?: unknown, signal?: AbortSignal): Promise<unknown> {
     const controller = new AbortController();
     const limit = deadline(30_000);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
       const url = `https://api.github.com/${path === null ? "graphql" : `repos/${repo}/${path}`}`;
       return await abortable([limit.signal, signal], async () => {
@@ -162,7 +156,9 @@ export function createCompanionIO(deps: SharedStoreDeps, maxResponseBytes?: numb
             ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           }),
         );
-        const text = maxResponseBytes === undefined ? undefined : await boundedText(res, maxResponseBytes);
+        if (Number(res.headers.get("content-length")) > (maxResponseBytes ?? Infinity)) fail("invalid");
+        if (maxResponseBytes !== undefined) reader = res.body?.getReader();
+        const text = maxResponseBytes === undefined ? undefined : await boundedText(reader, maxResponseBytes);
         if (!res.ok || res.redirected)
           fail(res.status === 404 && !body && !res.redirected ? "missing" : "unavailable");
         const raw = text ?? (await transport(() => res.text()));
@@ -176,6 +172,7 @@ export function createCompanionIO(deps: SharedStoreDeps, maxResponseBytes?: numb
       return fail(e instanceof SharedStoreError && e.code !== "aborted" ? e.code : "unavailable");
     } finally {
       controller.abort();
+      void reader?.cancel().catch(() => undefined);
       limit.dispose();
     }
   }
