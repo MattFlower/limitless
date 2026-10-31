@@ -488,6 +488,7 @@ test("source boundaries permit guarded control IO without production claim bindi
     if (/\bclaimGuard\b/.test(source))
       expect([
         "src/integrations/control-ref.ts",
+        "src/integrations/control-receipt.ts",
         "src/integrations/github-identity.ts",
         "src/git/repos.ts",
         "src/pipeline/context.ts",
