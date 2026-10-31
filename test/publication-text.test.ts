@@ -222,7 +222,8 @@ test("paths after prose colons are sanitized in labels, titles and bare text", (
 });
 
 test("configured and canonical aliases rewrite file URLs with complete directory boundaries", () => {
-  const temp = mkdtempSync(join(tmpdir(), "publication-alias-"));
+  const temp = realpathSync(mkdtempSync(join(tmpdir(), "publication-alias-")));
+  const mockedHome = spyOn(os, "homedir").mockReturnValue(temp);
   try {
     const data = join(temp, "data");
     const work = join(temp, "external-work");
@@ -234,20 +235,22 @@ test("configured and canonical aliases rewrite file URLs with complete directory
     symlinkSync(work, workAlias, "dir");
     for (const root of [workAlias, realpathSync(workAlias)]) {
       const input = `${root}/a.ts file://${root}/a.ts [f](file://${root}/a.ts) ${root}-other/a.ts`;
-      const sibling = root === workAlias ? "<data>/work-other/a.ts" : `${root}-other/a.ts`;
+      const sibling = root === workAlias ? "<data>/work-other/a.ts" : "~/external-work-other/a.ts";
       const expected = `a.ts a.ts [a.ts](a.ts) ${sibling}`;
       expect(sanitizePublication(input, workAlias, alias)).toBe(expected);
       expect(sanitizePublication(expected, workAlias, alias)).toBe(expected);
     }
     for (const root of [alias, realpathSync(alias)]) {
       const input = `${root}/logs/a file://${root}/logs/a [f](file://${root}/logs/a) ${root}-other/a`;
-      const expected = `<data>/logs/a <data>/logs/a <data>/logs/a ${root}-other/a`;
+      const sibling = root === alias ? "~/alias-other/a" : "~/data-other/a";
+      const expected = `<data>/logs/a <data>/logs/a <data>/logs/a ${sibling}`;
       expect(sanitizePublication(input, workAlias, alias)).toBe(expected);
     }
     const missing = join(alias, "removed");
     expect(sanitizePublication(`file://${missing}/a.ts`, missing, alias)).toBe("a.ts");
     expect(sanitizePublication(`${work.toUpperCase()}/a.ts`, work, data)).toBe(`${work.toUpperCase()}/a.ts`);
   } finally {
+    mockedHome.mockRestore();
     rmSync(temp, { recursive: true, force: true });
   }
 });
