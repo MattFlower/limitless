@@ -1010,7 +1010,17 @@ test("poll query reads title evidence and looks up all body blockers", async () 
   expect(h.runs()).toHaveLength(1);
 });
 
-test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval", "body trust"])(
+const repositoryResolutionAdmissionRechecks = [
+  "run limit",
+  "issue run limit",
+  "draining",
+  "stopped",
+  "re-approval",
+  "body trust",
+  "acceptance ticket body trust",
+  "acceptance parent body trust",
+];
+test.each(repositoryResolutionAdmissionRechecks)(
   "admission rechecks %s after repository resolution",
   async (mode) => {
     const h = harness();
@@ -1046,7 +1056,7 @@ test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval",
             ),
           ).id;
           h.store.updateRun(competingId, { status: "cancelled", finishedAt });
-        } else if (mode === "body trust" && h.cfg.githubQueue) {
+        } else if (mode.endsWith("body trust") && h.cfg.githubQueue) {
           h.cfg.githubQueue = { ...h.cfg.githubQueue, trusted: ["owner"] };
         } else if (mode === "draining") h.factory.scheduler.drain();
         else h.stop();
@@ -1059,10 +1069,14 @@ test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval",
       if (msg.kind === "run" && msg.run.sourceRef?.via === "queue") queuePublications.push(msg.run.id);
     });
     try {
-      const candidate = issue();
-      if (mode === "body trust" && h.cfg.githubQueue) {
+      const candidate = mode.startsWith("acceptance") ? acceptanceIssue() : issue();
+      if (mode.endsWith("body trust") && h.cfg.githubQueue) {
         h.cfg.githubQueue.trusted = ["owner", "collaborator"];
-        candidate.userContentEdits.nodes = [
+        const edited = mode === "acceptance parent body trust" ? candidate.parent : candidate;
+        if (!edited) throw new Error("missing edited issue");
+        edited.lastEditedAt = at;
+        edited.editor = { login: "owner" };
+        edited.userContentEdits.nodes = [
           { editor: { login: "owner" } },
           { editor: { login: "collaborator" } },
         ];
@@ -1079,8 +1093,8 @@ test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval",
       expect(h.logs.join("\n")).toContain(
         mode === "re-approval"
           ? "linked run changed during the poll; retrying next poll"
-          : mode === "body trust"
-            ? "untrusted body editor: collaborator"
+          : mode.endsWith("body trust")
+            ? `${mode === "acceptance parent body trust" ? "parent: " : ""}untrusted body editor: collaborator`
             : mode,
       );
       expect(h.clock.pending).toBe(mode === "stopped" ? 0 : 1);
