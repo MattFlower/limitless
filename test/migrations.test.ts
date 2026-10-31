@@ -12,7 +12,9 @@ import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { Store } from "../src/db/store.ts";
 import { mountDefectWindow } from "../src/integrations/defect-land-detector.ts";
 import { createDefectReporter } from "../src/integrations/defect-reporter.ts";
+import { mountIntegrations } from "../src/integrations/index.ts";
 import { customModel } from "./provider-config-support.ts";
+import { waitClock } from "./wait-clock.ts";
 
 const childKeyMigration = "20261016T091806-foreign-key-child-indexes.sql";
 
@@ -190,18 +192,54 @@ test("land detector migration permits prior writes and recovers a pending send a
     store.close();
     store = new Store(path);
     const reporter = createDefectReporter(store, deps);
-    await reporter.reconcile();
-    expect(posts).toBe(0);
-    expect(lists).toBeGreaterThan(0);
-    expect(reporter.read(source.id, "old-send")).toMatchObject({ state: "delivered", object_id: 7 });
-    expect(reporter.read(source.id, "rollback")?.state).toBe("no-report");
-    expect(store.getLandEntry(land.id)?.state).toBe("blocked");
-    expect(store.failureObservations()).toHaveLength(1);
-    expect(store.db.query("SELECT start,end FROM defect_enablement_windows").all()).toEqual([
-      { start: 100, end: null },
-    ]);
-    await reporter.reconcile();
-    expect(posts).toBe(0);
+    const cfg = loadConfig({
+      home: directory,
+      configDir: directory,
+      readOnly: true,
+      raw: { github: { poll: false } },
+    });
+    cfg.githubDefects = { enabled: true, factoryRepo: "example/factory", dailyCap: 10 };
+    cfg.secrets.DISCORD_BOT_TOKEN = "";
+    const clock = waitClock();
+    const mounted = await mountIntegrations(
+      {
+        cfg,
+        store,
+        land: {
+          start: () => {},
+          stop: async () => {},
+          list: () => [],
+        },
+      } as unknown as Factory,
+      {
+        defectGitHub: deps.github,
+        identity: deps.identity,
+        toolVersions: async () => [],
+        prClient: async () => null,
+        gh: async () => {
+          throw new Error("unexpected gh");
+        },
+        issueClock: { now: clock.now, set: clock.timer.set as typeof setTimeout, clear: clock.timer.clear },
+      },
+    );
+    try {
+      await clock.advance(0);
+      await new Promise<void>((r) => setImmediate(r));
+      expect(posts).toBe(0);
+      expect(lists).toBeGreaterThan(0);
+      expect(reporter.read(source.id, "old-send")).toMatchObject({ state: "delivered", object_id: 7 });
+      expect(reporter.read(source.id, "rollback")?.state).toBe("no-report");
+      expect(store.getLandEntry(land.id)?.state).toBe("blocked");
+      expect(store.failureObservations()).toHaveLength(1);
+      expect(store.db.query("SELECT start,end FROM defect_enablement_windows").all()).toEqual([
+        { start: 100, end: null },
+      ]);
+      await clock.advance(60_000);
+      await new Promise<void>((r) => setImmediate(r));
+      expect(posts).toBe(0);
+    } finally {
+      await mounted.stop();
+    }
   } finally {
     store.close();
     rmSync(directory, { recursive: true, force: true });

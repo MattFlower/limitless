@@ -2,12 +2,15 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Factory } from "../src/app.ts";
 import { loadConfig, repoSettings } from "../src/config.ts";
 import type { FailureObservation } from "../src/db/failure-observations.ts";
 import { Store } from "../src/db/store.ts";
 import { detectLandDefects, mountDefectWindow } from "../src/integrations/defect-land-detector.ts";
 import { createDefectReporter, type DefectGitHub } from "../src/integrations/defect-reporter.ts";
+import { type IntegrationDeps, mountIntegrations } from "../src/integrations/index.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { waitClock } from "./wait-clock.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -390,4 +393,241 @@ test("deactivation while preparation awaits leaves the observation available for
   expect(h.outbox()).toEqual([]);
   await h.scan();
   expect(h.outbox()).toHaveLength(1);
+});
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+async function mounted(h: ReturnType<typeof harness>, deps: IntegrationDeps = {}, enabled = true, at = 100) {
+  h.cfg.githubDefects = { enabled, factoryRepo: "example/factory", dailyCap: 10 };
+  h.cfg.githubPoll = false;
+  h.cfg.secrets.DISCORD_BOT_TOKEN = "";
+  h.cfg.secrets.GITHUB_WEBHOOK_SECRET = "";
+  const clock = waitClock();
+  await clock.advance(at - clock.now());
+  const factory = {
+    cfg: h.cfg,
+    store: h.store,
+    land: {
+      start: () => {},
+      stop: async () => {},
+      list: () => [],
+    },
+  } as unknown as Factory;
+  const integrations = await mountIntegrations(factory, {
+    toolVersions: async () => [],
+    gh: async () => {
+      throw new Error("unexpected gh");
+    },
+    prClient: async () => null,
+    defectGitHub: h.github,
+    identity: async () => app,
+    issueClock: { now: clock.now, set: clock.timer.set as typeof setTimeout, clear: clock.timer.clear },
+    ...deps,
+  });
+  return {
+    ...integrations,
+    clock,
+    flush: async (ms = 0) => {
+      await clock.advance(ms);
+      await new Promise<void>((r) => setImmediate(r));
+    },
+  };
+}
+
+test("mounted reporting publishes labelled factory evidence once and survives restart", async () => {
+  const h = harness();
+  h.seed(null, 100, { setup_eligible: 1 });
+  const first = await mounted(h);
+  h.store.observations.finalize(`land:${h.entry.id}`, {
+    round: 0,
+    sha: "a".repeat(40),
+    stageId: 0,
+    comparisons: [],
+    purpose: "land",
+  });
+  await first.flush();
+  await first.stop();
+  expect(h.posts).toHaveLength(1);
+  expect(h.posts[0]).toEqual([
+    "example/factory",
+    null,
+    expect.objectContaining({ labels: ["defect"], title: "Factory defect" }),
+    app.token,
+  ]);
+  const data = JSON.parse(h.posts[0]?.[2].body.split("\n").at(-2) ?? "");
+  expect(data).toMatchObject({
+    detector: "land-check",
+    suspectedCausalStage: "gate environment",
+    machineRole: "unknown",
+  });
+  h.reopen();
+  const second = await mounted(h);
+  await second.flush();
+  await second.stop();
+  expect(h.posts).toHaveLength(1);
+});
+
+test("mounted shutdown coalesces ticks and drops an identity continuation before submission", async () => {
+  const h = harness();
+  h.seed();
+  const entered = deferred<void>();
+  const release = deferred<typeof app>();
+  let calls = 0;
+  const m = await mounted(h, {
+    identity: async () => {
+      calls++;
+      entered.resolve();
+      return release.promise;
+    },
+  });
+  await m.flush();
+  await entered.promise;
+  await m.flush(60_000);
+  await m.flush(60_000);
+  expect(calls).toBe(1);
+  const stopping = m.stop();
+  expect(m.clock.pending).toBe(0);
+  release.resolve(app);
+  await stopping;
+  expect(h.posts).toEqual([]);
+  expect(h.consumed()).toEqual([]);
+  h.reopen();
+  const next = await mounted(h);
+  await next.flush();
+  await next.stop();
+  expect(h.posts).toHaveLength(1);
+});
+
+test("mounted shutdown retains a dispatched send, recovers it before any fresh POST on re-upgrade", async () => {
+  const h = harness();
+  const old = h.seed();
+  const sent = deferred<void>();
+  const release = deferred<unknown>();
+  const post = h.github.post;
+  h.github.post = async (...args) => {
+    await post(...args); // GitHub accepted it; the response is still in flight.
+    sent.resolve();
+    return release.promise;
+  };
+  const m = await mounted(h);
+  await m.flush();
+  await sent.promise;
+  const stopping = m.stop();
+  release.resolve(undefined);
+  await stopping;
+  expect(h.reporter().read(h.source.id, String(old))?.state).toBe("sending");
+  h.reopen();
+  const fresh = h.seed("flaky");
+  const order: string[] = [];
+  const list = h.github.list;
+  h.github.list = async (...args) => {
+    order.push("list");
+    return list(...args);
+  };
+  h.github.post = async (...args) => {
+    order.push("post");
+    return post(...args);
+  };
+  const next = await mounted(h);
+  await next.flush();
+  await next.stop();
+  expect(order[0]).toBe("list");
+  expect(h.posts).toHaveLength(2);
+  expect(h.reporter().read(h.source.id, String(old))?.state).toBe("delivered");
+  expect(h.reporter().read(h.source.id, String(fresh))?.state).toBe("delivered");
+});
+
+test("mounted production policy blocks a discreet source and decoded late credentials across restart", async () => {
+  const h = harness();
+  h.cfg.repos = { [h.source.slug]: { ...repoSettings(h.cfg, h.source.slug), discreet: true } };
+  const discreet = h.seed();
+  let m = await mounted(h);
+  await m.flush();
+  await m.stop();
+  expect(h.reporter().read(h.source.id, String(discreet))).toMatchObject({ state: "blocked", body: null });
+  h.cfg.repos = {};
+  const credential = `mounted\n${crypto.randomUUID()}`;
+  const unsafe = h.seed("setup", 100, { name: credential });
+  const label = h.github.label;
+  h.github.label = async (...args) => {
+    // Preparation has finished; the encoded body now needs a fresh decoded registry check.
+    expect(h.reporter().read(h.source.id, String(unsafe))?.body).toContain("\\n");
+    registerCredential("TEST_MOUNTED_DEFECT_LATE", credential);
+    return label(...args);
+  };
+  m = await mounted(h);
+  await m.flush();
+  await m.stop();
+  expect(h.reporter().read(h.source.id, String(unsafe))?.state).toBe("blocked");
+  h.reopen();
+  m = await mounted(h);
+  await m.flush();
+  await m.stop();
+  expect(h.posts).toEqual([]);
+});
+
+test("startup recovery precedes detection and shutdown prevents dispatch after a paused lookup", async () => {
+  const h = harness();
+  h.enable(true, 100);
+  const old = h.seed();
+  await h.scan();
+  await h.reporter().reconcile();
+  h.store.db.exec("UPDATE defect_outbox SET state='sending'");
+  const fresh = h.seed("flaky");
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const list = h.github.list;
+  h.github.list = async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return list(...args);
+  };
+  const m = await mounted(h);
+  await m.flush();
+  await entered.promise;
+  // Startup has not scanned/accepted the fresh finding while recovery is awaiting GitHub.
+  expect(h.consumed()).toEqual([{ observation_id: old, status: "submitted" }]);
+  expect(h.reporter().read(h.source.id, String(fresh))).toBeNull();
+  const stopping = m.stop();
+  release.resolve();
+  await stopping;
+  expect(h.posts).toHaveLength(1);
+  expect(h.reporter().read(h.source.id, String(old))?.state).toBe("sending");
+  h.github.list = list;
+  h.reopen();
+  const next = await mounted(h);
+  await next.flush();
+  await next.stop();
+  expect(h.posts).toHaveLength(2);
+  expect(h.reporter().read(h.source.id, String(old))?.state).toBe("delivered");
+  expect(h.reporter().read(h.source.id, String(fresh))?.state).toBe("delivered");
+});
+
+test("disabled mounts send nothing and a re-enabled mount resumes accepted and unconsumed backlog", async () => {
+  const h = harness();
+  h.enable(true, 100);
+  const accepted = h.seed();
+  await h.scan();
+  const pending = h.seed("flaky");
+  h.reopen();
+  const disabled = await mounted(h, {}, false, 200);
+  await disabled.flush();
+  expect(disabled.clock.pending).toBe(0);
+  await disabled.stop();
+  expect(h.posts).toEqual([]);
+  const excluded = h.seed("platform", 250);
+  h.reopen();
+  const enabled = await mounted(h, {}, true, 300);
+  await enabled.flush();
+  await enabled.stop();
+  expect(h.posts).toHaveLength(2);
+  expect(h.reporter().read(h.source.id, String(accepted))?.state).toBe("delivered");
+  expect(h.reporter().read(h.source.id, String(pending))?.state).toBe("delivered");
+  expect(h.reporter().read(h.source.id, String(excluded))).toBeNull();
 });

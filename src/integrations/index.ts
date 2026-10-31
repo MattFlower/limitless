@@ -1,6 +1,6 @@
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
-import { mountDefectWindow } from "./defect-land-detector.ts";
+import { type DefectServiceDeps, startDefectService } from "./defect-service.ts";
 import { mountDiscord } from "./discord.ts";
 import { type GhRunner, githubWebhook, runGh } from "./github.ts";
 import { type GitHubPrClient, getGitHubPr, startGitHubNotifier } from "./github-notifier.ts";
@@ -15,7 +15,7 @@ export interface Integrations {
   stop: () => Promise<void>;
 }
 
-export interface IntegrationDeps {
+export interface IntegrationDeps extends DefectServiceDeps {
   toolVersions?: () => Promise<string[]>;
   gh?: GhRunner;
   prClient?: GitHubPrClient;
@@ -29,16 +29,12 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
   let stopping: Promise<void> | undefined;
   const stop = () =>
     (stopping ??= (async () => {
-      const results = await Promise.allSettled(cleanups.map((cleanup) => Promise.resolve().then(cleanup)));
+      const results = await Promise.allSettled(cleanups.map(async (cleanup) => cleanup()));
       const failure = results.find((result) => result.status === "rejected");
       if (failure?.status === "rejected") throw failure.reason;
     })());
   try {
-    mountDefectWindow(
-      factory.store,
-      factory.cfg.githubDefects?.enabled === true,
-      (deps.issueClock?.now ?? Date.now)(),
-    );
+    cleanups.push(startDefectService(factory, deps));
     const mcp = mountMcp(factory);
     cleanups.push(() => mcp.stop());
     const discord = mountDiscord(factory);
