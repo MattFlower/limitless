@@ -25,3 +25,11 @@ export class ClaimLostError extends ClaimControlError {
 export function rethrowClaimControl(error: unknown): void {
   if (error instanceof ClaimControlError) throw error;
 }
+
+/** Preserve the original control object; loss dominates wait, then input order breaks ties. */
+export function selectClaimControl(reasons: readonly unknown[]): ClaimControlError | undefined {
+  return (
+    (reasons.find((error) => error instanceof ClaimLostError) as ClaimLostError | undefined) ??
+    (reasons.find((error) => error instanceof ClaimWaitError) as ClaimWaitError | undefined)
+  );
+}

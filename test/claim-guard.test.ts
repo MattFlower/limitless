@@ -6,8 +6,15 @@ import {
   ClaimLostError,
   ClaimWaitError,
   rethrowClaimControl,
+  selectClaimControl,
 } from "../src/integrations/claim-errors.ts";
-import { bindClaim, claimGuard, claimScope, type ScopedClaim } from "../src/integrations/claim-guard.ts";
+import {
+  bindClaim,
+  claimGuard,
+  claimScope,
+  hasClaimScope,
+  type ScopedClaim,
+} from "../src/integrations/claim-guard.ts";
 import { type ClaimRecord, createClaimClient } from "../src/integrations/claim-ref.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { createLeaseManager, type LeaseHandle } from "../src/integrations/leases.ts";
@@ -58,6 +65,23 @@ function stub(windowOpen: () => unknown = () => true, cancelled: () => unknown =
 function guard(claims: readonly ScopedClaim[]) {
   return () => claimScope.run(claims, claimGuard);
 }
+
+test("scope inspection inherits bindings and respects empty scopes and exits without reading authority", () => {
+  const claim = stub(() => {
+    throw new Error("authority must not be evaluated");
+  });
+  expect(hasClaimScope()).toBe(false);
+  claimScope.run([], () => expect(hasClaimScope()).toBe(false));
+  claimScope.run([claim], () => {
+    expect(hasClaimScope()).toBe(true);
+    claimScope.run([], () => expect(hasClaimScope()).toBe(true));
+    claimScope.exit(() => {
+      expect(hasClaimScope()).toBe(false);
+      claimScope.run([], () => expect(hasClaimScope()).toBe(false));
+    });
+    expect(hasClaimScope()).toBe(true);
+  });
+});
 async function managerFixture() {
   const gh = new GitHub();
   const store = new Store(":memory:");
@@ -461,7 +485,14 @@ test("source boundaries permit guarded control IO without production claim bindi
       continue;
     }
     expect(source).not.toMatch(/\bbindClaim\b|claimScope\.run\b/);
-    if (path !== "src/integrations/control-ref.ts") expect(source).not.toMatch(/\bclaimGuard\b/);
+    if (/\bclaimGuard\b/.test(source))
+      expect([
+        "src/integrations/control-ref.ts",
+        "src/integrations/github-identity.ts",
+        "src/git/repos.ts",
+        "src/pipeline/context.ts",
+      ]).toContain(path);
+    if (/\bhasClaimScope\b/.test(source)) expect(path).toBe("src/pipeline/engine.ts");
     if (/\bclaimScope\b/.test(source)) {
       expect(allowed.has(path)).toBe(true);
       expect(source.replace(/import .*claimScope.*\n/, "").replaceAll("claimScope.exit", "")).not.toMatch(
@@ -471,4 +502,22 @@ test("source boundaries permit guarded control IO without production claim bindi
     }
   }
   expect(references.sort()).toEqual([...allowed].sort());
+});
+
+test("claim rejection selection preserves identity, priority and input-order ties", () => {
+  const ordinary = new Error("ordinary");
+  const wait = new ClaimWaitError("lease");
+  const loss = new ClaimLostError();
+  for (const pair of [
+    [ordinary, wait],
+    [ordinary, loss],
+    [wait, loss],
+  ]) {
+    const selected = pair.includes(loss) ? loss : wait;
+    expect(selectClaimControl(pair)).toBe(selected);
+    expect(selectClaimControl([...pair].reverse())).toBe(selected);
+  }
+  expect(selectClaimControl([ordinary, null, undefined])).toBeUndefined();
+  expect(selectClaimControl([wait, new ClaimWaitError("cancelled")])).toBe(wait);
+  expect(selectClaimControl([loss, new ClaimLostError()])).toBe(loss);
 });
