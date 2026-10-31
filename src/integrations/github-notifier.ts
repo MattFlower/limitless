@@ -4,6 +4,7 @@ import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
+import { ClaimObserverSuppressed, isClaimLossProjection, observerDispatchGuard } from "./claim-projection.ts";
 import { type GhRunner, runGh } from "./github.ts";
 import { githubSh, githubUrlRepo } from "./github-identity.ts";
 import { type Context, rollup, savedSnapshot } from "./github-poller.ts";
@@ -281,6 +282,7 @@ export function startGitHubNotifier(
   const unsubscribe = store.subscribe((msg) => {
     if (msg.kind !== "run") return;
     const run = msg.run;
+    if (isClaimLossProjection(run)) return;
     if (
       run.prUrl &&
       (run.status === "needs_human" || (["succeeded", "resolved"].includes(run.status) && !run.merged))
@@ -331,9 +333,12 @@ export function startGitHubNotifier(
       body,
     ];
     void track(
-      gh(args, abort.signal, undefined, ref.repo).catch((error: unknown) => {
-        if (!abort.signal.aborted) log(`GitHub comment failed for ${run.id}: ${String(error)}`);
-      }),
+      gh(args, abort.signal, undefined, ref.repo, observerDispatchGuard(store, run.id)).catch(
+        (error: unknown) => {
+          if (error instanceof ClaimObserverSuppressed) return;
+          if (!abort.signal.aborted) log(`GitHub comment failed for ${run.id}: ${String(error)}`);
+        },
+      ),
     );
   });
   return async () => {
