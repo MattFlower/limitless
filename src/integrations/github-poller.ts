@@ -450,7 +450,23 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         return res;
       };
       const ready = () => !stopped && now() >= cooldownUntil && now() >= (blocks.get(pr.repo)?.until ?? 0);
-      if ((await ciDecision(store, pr, snap, ciCall, opts.ciReruns !== false, ready, current)).complete) {
+      if (
+        (
+          await ciDecision(
+            store,
+            pr,
+            snap,
+            ciCall,
+            opts.ciReruns !== false,
+            ready,
+            current,
+            "poller",
+            undefined,
+            undefined,
+            now,
+          )
+        ).complete
+      ) {
         ciPending = false;
         if (current()) save(unknown ? (prev?.nudged ?? null) : null, []);
       } else return null;

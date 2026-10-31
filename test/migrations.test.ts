@@ -546,6 +546,59 @@ test("invocations recorded before cache writes were stored read as zero writes",
   });
 });
 
+test("CI claim timestamps upgrade existing rows and preserve previous-release inserts", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-ci-rerun-claimed-at.sql"),
+    });
+    const failure = {
+      prUrl: "https://github.com/o/r/pull/1",
+      sha: "a".repeat(40),
+      signature: "legacy failure",
+      check: "test",
+      line: "timeout",
+      image: null,
+      outcome: "failed" as const,
+      rerunMarker: null,
+    };
+    const job = { id: 21, runId: 1, attempt: 1, name: "test" };
+    const old = new Store(path, before);
+    old.recordCiFailure(failure);
+    old.db
+      .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested',
+      rerun_marker = 'legacy', rerun_job = ?`)
+      .run(JSON.stringify(job));
+    old.close();
+
+    const store = new Store(path);
+    expect(store.ciFailures(failure.prUrl, failure.sha)).toEqual([
+      {
+        ...failure,
+        outcome: "rerun_requested",
+        rerunMarker: "legacy",
+        rerunJob: job,
+        rerunClaimedAt: null,
+        rerunRetryAt: null,
+        rerunRetryUsed: 0,
+      },
+    ]);
+    store.close();
+
+    // The previous release's explicit-column insert still works after migration.
+    const previous = new Store(path, before);
+    previous.recordCiFailure({ ...failure, signature: "rollback failure" });
+    previous.close();
+    const reopened = new Store(path);
+    expect(reopened.ciFailures(failure.prUrl, failure.sha)).toHaveLength(2);
+    expect(reopened.ciFailures(failure.prUrl, failure.sha).every((f) => f.rerunClaimedAt === null)).toBe(
+      true,
+    );
+    reopened.close();
+  });
+});
+
 test("SQL files run in filename order regardless of creation order", () => {
   for (const reverse of [false, true]) {
     temporary((directory, path) => {

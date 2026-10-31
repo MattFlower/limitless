@@ -3609,7 +3609,8 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
         [string, string]
       >(`SELECT pr_url AS prUrl, sha, signature,
       check_name AS "check", error_line AS line, runner_image AS image, outcome, rerun_marker AS rerunMarker,
-      rerun_job AS rerunJob, rerun_retry_at AS rerunRetryAt, rerun_retry_used AS rerunRetryUsed
+      rerun_job AS rerunJob, rerun_claimed_at AS rerunClaimedAt,
+      rerun_retry_at AS rerunRetryAt, rerun_retry_used AS rerunRetryUsed
       FROM ci_failures WHERE pr_url = ? AND sha = ?`)
       .all(prUrl, sha)
       .map((f) => ({ ...f, rerunJob: f.rerunJob ? JSON.parse(f.rerunJob) : null }));
@@ -3623,15 +3624,29 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
   }
 
   /** One claim per PR head, before the POST; refusals and lost responses retain it. */
-  claimCiRerun(f: CiFailure, marker: string, job: NonNullable<CiFailure["rerunJob"]>): boolean {
+  claimCiRerun(
+    f: CiFailure,
+    marker: string,
+    job: NonNullable<CiFailure["rerunJob"]>,
+    now = Date.now(),
+  ): boolean {
     return (
       this.db
-        .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested', rerun_marker = ?, rerun_job = ?
+        .query(`UPDATE ci_failures SET rerun_claimed = 1, outcome = 'rerun_requested', rerun_marker = ?, rerun_job = ?, rerun_claimed_at = ?
       WHERE pr_url = ? AND sha = ? AND signature = ? AND rerun_claimed = 0
       AND NOT EXISTS (SELECT 1 FROM ci_failures WHERE pr_url = ? AND sha = ? AND rerun_claimed = 1)
       AND NOT EXISTS (SELECT 1 FROM land_entries WHERE pr_url = ? AND pushed_sha = ? AND ci_rerun IS NOT NULL)`)
-        .run(marker, JSON.stringify(job), f.prUrl, f.sha, f.signature, f.prUrl, f.sha, f.prUrl, f.sha)
+        .run(marker, JSON.stringify(job), now, f.prUrl, f.sha, f.signature, f.prUrl, f.sha, f.prUrl, f.sha)
         .changes === 1
+    );
+  }
+
+  transitionCiRerun(f: CiFailure, outcome: "rerunning" | "rerun_rejected"): boolean {
+    return (
+      this.db
+        .query(`UPDATE ci_failures SET outcome = ? WHERE pr_url = ? AND sha = ? AND signature = ?
+          AND outcome = 'rerun_requested' AND rerun_marker IS ?`)
+        .run(outcome, f.prUrl, f.sha, f.signature, f.rerunMarker).changes === 1
     );
   }
 
