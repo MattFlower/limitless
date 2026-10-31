@@ -15,8 +15,10 @@ import {
 import { type IssueText, issueTextRefusal } from "../integrations/issue-trust.ts";
 import { CancelledError, NeedsHumanError, type RunContext } from "./context.ts";
 import {
+  acceptanceCoveringPolicy,
   citedFileRefusal,
   coveringTestRefusal,
+  coveringTestUnavailable,
   runCoveringRequests,
   selectCoveringRequests,
   succeededCoveringStages,
@@ -294,11 +296,17 @@ async function assess(
   const claims = manifest.map((unit) => ({ unit, items: output.items.filter((i) => i.unit === unit.id) }));
   const met = claims.flatMap(({ items }) => (items.length === 1 && items[0]?.verdict === "met" ? items : []));
   const requests = met.map((item) => item.tests);
-  await runCoveringRequests(ctx, requests, sha, async () => {
-    if ((await headSha(cwd)) !== sha)
-      throw new Error("Commit changed during acceptance; tests cannot cover it");
-  });
-  const selected = selectCoveringRequests(requests);
+  await runCoveringRequests(
+    ctx,
+    requests,
+    sha,
+    async () => {
+      if ((await headSha(cwd)) !== sha)
+        throw new Error("Commit changed during acceptance; tests cannot cover it");
+    },
+    acceptanceCoveringPolicy,
+  );
+  const selected = selectCoveringRequests(requests, acceptanceCoveringPolicy);
   const succeeded = succeededCoveringStages(ctx);
   const docs = (ctx.state.gatesConfig?.docs ?? []).map(globToRegex);
   const units: NonNullable<AcceptanceState["outcome"]>["units"] = [];
@@ -311,6 +319,7 @@ async function assess(
     }
     const refusals: string[] = [];
     const citations: string[] = [];
+    let rejected = false;
     let docFiles = 0;
     const index = met.indexOf(item);
     for (const test of index < 0 ? [] : item.tests) {
@@ -319,8 +328,10 @@ async function assess(
       );
       const capped = selected[index]?.tests.includes(test) ? undefined : selected[index]?.reason;
       const refusal = capped ?? coveringTestRefusal(record, sha, succeeded);
-      if (refusal || !record) refusals.push(`${test.file} › ${test.name}: ${refusal}`);
-      else citations.push(coveringCitation(record, sha));
+      if (refusal || !record) {
+        refusals.push(`${test.file} › ${test.name}: ${refusal}`);
+        if (!capped && !coveringTestUnavailable(record)) rejected = true;
+      } else citations.push(coveringCitation(record, sha));
     }
     const tests = citations.length;
     for (const { path, lines } of item.files) {
@@ -329,8 +340,10 @@ async function assess(
       const count = text.replace(/\n$/, "").split("\n").length;
       if (!refusal && lines && !(lines.start <= lines.end && lines.end <= count))
         refusal = "line range out of bounds";
-      if (refusal) refusals.push(`${path}: ${refusal}`);
-      else {
+      if (refusal) {
+        refusals.push(`${path}: ${refusal}`);
+        rejected = true;
+      } else {
         citations.push(`${path}@${sha}${lines ? `:${lines.start}-${lines.end}` : ""}`);
         if (docs.some((glob) => glob.test(path.replace(/^\.\//, "")))) docFiles++;
       }
@@ -341,7 +354,12 @@ async function assess(
           ? "behaviour requirement needs a passing covering test"
           : "docs requirement needs a verified file matching [gates] docs",
       );
-    const verdict = item.verdict === "met" && refusals.length ? "unmet" : item.verdict;
+    const verdict =
+      item.verdict === "met" && refusals.length
+        ? rejected || !item.tests.length
+          ? "unmet"
+          : "not_assessed"
+        : item.verdict;
     units.push({ unit: unit.id, verdict, citations, refusals, note: item.note });
   }
   const counts = ["met", "partly_met", "unmet", "regressed", "not_assessed", "manual"].map(

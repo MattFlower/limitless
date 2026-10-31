@@ -45,6 +45,19 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
         }
       : undefined,
     freshCheckoutFor: (repo) => !inplace && repos.includes(repo),
+    cancelBeforeStart(handle) {
+      if (handle.kind === "local" || live.has(handle.id)) return false;
+      // A lease is not a check start, but its absence must be proved atomically: another
+      // executor can lease a queued job between inspection and cancellation.
+      const cancelled = workers.store.db
+        .query(
+          "UPDATE gate_jobs SET state='cancelled',updated_at=? WHERE id=? AND state='queued' AND attempt=1 AND worker IS NULL",
+        )
+        .run(workers.now(), handle.id).changes;
+      const unqueued = inplace && starts.has(handle.id) && !workers.job(handle.id);
+      if (cancelled || unqueued) starts.delete(handle.id);
+      return !!cancelled || unqueued;
+    },
     async discard(handle) {
       workers.cancel(handle.id);
       await live.get(handle.id)?.cancel();
