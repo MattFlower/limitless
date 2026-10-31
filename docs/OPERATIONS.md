@@ -649,11 +649,19 @@ disabled so both the source and the credentials are required.
 
 ## Defect reporter delivery status
 
-The defect reporter (`src/integrations/defect-reporter.ts`) is implemented but inactive: no
-detector, daemon timer or operator configuration mounts it yet. The `[github.defects]` setting
-belongs to D1a.3.
+The defect reporter (`src/integrations/defect-reporter.ts`) remains inactive in production.
+D1a.3's first delivery adds `[github.defects]` configuration, persistent enablement windows and
+the land-check detector. The next delivery must add the App-token client, timer, shutdown wiring
+and narrow human-approved queue admission before production sending is available.
 
-When it is enabled, enable `[github.defects]` on **exactly one coordinator**. A second enabled
+Enable/disable changes take effect only when integrations mount after restart. An enabled mount
+opens a half-open `[start, end)` window; an enabled restart preserves it, including downtime.
+A disabled or invalid mount closes it. Re-enabling opens a new window without backfilling the
+disabled interval or pre-enablement history. Earlier enabled-window backlog and accepted outbox
+work remain pending, subject to current privacy checks. Invalid defect settings produce a fixed
+startup diagnostic and leave unrelated repository execution available.
+
+When production sending is available, **enable on exactly one coordinator**. A second enabled
 coordinator can create duplicate issues and spends its own local daily cap (default ten new
 issues per UTC day). Later occurrences enumerate every legitimate match and comment on the oldest
 issue, so duplicates converge but are not removed. Cross-coordinator serialization, a shared cap
@@ -661,9 +669,10 @@ and ownership transfer belong to #902; the local database is not a fleet-wide gu
 Preserve the database and pinned destination when disabling or rolling back. Moving to a
 different coordinator or database is not a supported ownership-transfer procedure.
 
+The reporter acquires no lease or claim; C05's issue/PR/run-only lease contract is unchanged.
 Submission is composed with the detector's checkpoint: await
-`prepareSubmission(sourceKey, finding)`, then call the returned function inside the checkpoint
-transaction. Only guarded publication bytes and the posting App login are stored.
+`prepareSubmission(sourceKey, finding)`, then call the returned function with a consumption
+callback, which runs inside the reporter's transaction. Only guarded publication bytes and the posting App login are stored.
 `reconcile()` delivers with the GitHub App only and always labels new issues `defect`. Each pass
 reconciles unresolved sends first and makes at most 32 GitHub calls.
 

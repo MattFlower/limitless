@@ -1,5 +1,6 @@
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
+import { mountDefectWindow } from "./defect-land-detector.ts";
 import { mountDiscord } from "./discord.ts";
 import { type GhRunner, githubWebhook, runGh } from "./github.ts";
 import { type GitHubPrClient, getGitHubPr, startGitHubNotifier } from "./github-notifier.ts";
@@ -33,6 +34,11 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
       if (failure?.status === "rejected") throw failure.reason;
     })());
   try {
+    mountDefectWindow(
+      factory.store,
+      factory.cfg.githubDefects?.enabled === true,
+      (deps.issueClock?.now ?? Date.now)(),
+    );
     const mcp = mountMcp(factory);
     cleanups.push(() => mcp.stop());
     const discord = mountDiscord(factory);
@@ -79,6 +85,9 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
         "/webhooks/github": githubWebhook(factory, undefined, issueQueue.pollNow, deps.gh),
       },
       notes: [
+        ...(factory.cfg.githubDefects?.invalid
+          ? ["Defect reporter disabled: invalid [github.defects] settings"]
+          : []),
         ...(await (deps.toolVersions ?? toolVersions)()),
         "MCP: /mcp (loopback only)",
         discord.note,
