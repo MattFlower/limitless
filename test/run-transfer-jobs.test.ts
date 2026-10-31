@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { AgentJobRow } from "../src/db/workers.ts";
 import * as j from "../src/pipeline/run-transfer-jobs.ts";
 import { encodeTransferJson } from "../src/pipeline/run-transfer-json.ts";
+import { AgentResultReport } from "../src/workers/agent-protocol.ts";
 import { rejects } from "./run-transfer-support.ts";
 
 const parent = "a".repeat(40),
@@ -170,4 +171,32 @@ test("strict portable records refuse local resources at every boundary", () => {
   rejects(() => j.encodeTransferAgentResult({ ...result, backend: {} }), "unsupported");
   rejects(() => j.encodeTransferAgentResult({ ...result, structured: { nested: undefined } }));
   rejects(() => j.encodeTransferAgentResult({ ...result, structured: new Date(0) }));
+});
+
+test("persisted AgentResultReport completions export with publication metadata checked against the job", () => {
+  const report = AgentResultReport.parse({
+    ...result,
+    parentSha: parent,
+    sha: resultSha,
+    branch: "run/example",
+    privateStringsDigest: "d".repeat(64),
+  });
+  expect(j.encodeTransferAgentResult(report)).toMatchObject({ parentSha: parent, sha: resultSha });
+  const done = Object.freeze({ ...source("done"), result: JSON.stringify(report) });
+  const value = roundTrip(done);
+  expect(value.result).toMatchObject({
+    status: "ok",
+    usage: result.usage,
+    parentSha: parent,
+    sha: resultSha,
+    branch: "run/example",
+  });
+  expect(Object.hasOwn(value.result ?? {}, "privateStringsDigest")).toBe(false);
+  expect(JSON.stringify(value)).not.toContain("d".repeat(64));
+  expect(j.agentJobCommitDependencies(value)).toEqual([parent, resultSha]);
+  const other = "e".repeat(40);
+  rejects(() => roundTrip({ ...done, result: JSON.stringify({ ...report, sha: other }) }));
+  rejects(() => roundTrip({ ...done, result: JSON.stringify({ ...report, parentSha: other }) }));
+  rejects(() => roundTrip({ ...done, result: JSON.stringify({ ...report, branch: "bad..branch" }) }));
+  rejects(() => j.parseTransferAgentJob({ ...value, result: { ...value.result, sha: other } }, portable));
 });

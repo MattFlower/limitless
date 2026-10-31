@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isBranchName } from "../core/delivery.ts";
 import { RunTransferError } from "./run-transfer-errors.ts";
 import { parseTransferJson } from "./run-transfer-json.ts";
 import * as r from "./run-transfer-rows.ts";
@@ -19,6 +20,9 @@ export const transferAgentResultSchema = object({
   error: text.nullable(),
   decline: object({ reason: text, lastResort: z.boolean() }).optional(),
   ...r.fields("fastModeState fastModeDisabledReason", text.nullable().optional()),
+  // Persisted AgentResultReport publication metadata; commits must match the job's typed fields.
+  ...r.fields("parentSha sha", r.oid.optional()),
+  branch: text.refine(isBranchName).optional(),
 });
 export const transferAgentJobSchema = object({
   id: r.identity,
@@ -45,6 +49,7 @@ export const encodeTransferAgentResult = r.boundary(
       "quota",
       "modelCooldownMs",
       "confinement",
+      "privateStringsDigest",
     ]),
 );
 // No request, worker, lease or dispatch API exists on this historical record.
@@ -54,7 +59,13 @@ export const parseTransferAgentJob = r.boundary(
     const matches = invocations.filter(
       (v) => r.parseRecord(r.ordinal, v.ordinal) === result.invocationOrdinal,
     );
-    if (matches.length !== 1 || (result.run_id !== null && matches[0]?.runId !== result.run_id))
+    const report = result.result;
+    if (
+      matches.length !== 1 ||
+      (result.run_id !== null && matches[0]?.runId !== result.run_id) ||
+      (report?.parentSha !== undefined && report.parentSha !== result.parent_sha) ||
+      (report?.sha !== undefined && report.sha !== result.result_sha)
+    )
       throw new RunTransferError("invalid");
     return result;
   },
