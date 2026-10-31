@@ -33,6 +33,7 @@ export const transferCoveringTestEvidenceSchema = object({
   file: text,
   name: text,
   reason: text.optional(),
+  reportUnavailable: flag,
 });
 const provenance = {
   sha: r.oid.optional(),
@@ -44,6 +45,7 @@ export const transferGateResultSchema: z.ZodType<GateResult> = z.lazy(() =>
     executor: object({ kind: z.literal("github-actions"), workflowSha: r.oid, runsOn: text }).optional(),
     incomplete: text.optional(),
     coveringTest: transferCoveringTestEvidenceSchema.optional(),
+    coveringTests: z.array(transferCoveringTestEvidenceSchema).optional(),
     executedCommand: text.optional(),
     executionProvenance: object(provenance).optional(),
     reused: object({ executionId: r.identity, treeHash: r.oid, createdAt: r.counter }).optional(),

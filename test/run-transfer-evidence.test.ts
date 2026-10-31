@@ -111,37 +111,73 @@ test("completed post-merge results preserve missing workers separately from null
   expect(e.parseTransferEvidence({}, [])).toEqual({});
 });
 
-test("covering-test refusals preserve the no-stage sentinel without allocating a reference", () => {
-  const refused = {
-    file: "a.test.ts",
-    name: "case",
-    verifiedSha: sha,
-    round: 1,
-    stageId: 0,
-    reason: "targeted retries not configured",
-  };
-  const encoded = e.encodeTransferEvidence({ coveringTestRuns: [refused, refused] }, []);
-  const decoded = e.parseTransferEvidence(
-    JSON.parse(new TextDecoder().decode(encodeTransferJson(encoded))),
-    [],
-  );
-  const expected = {
-    file: "a.test.ts",
-    name: "case",
-    verifiedSha: sha,
-    round: 1,
-    stageOrdinal: 0,
-    reason: "targeted retries not configured",
-  };
-  expect(decoded.coveringTestRuns).toEqual([expected, expected]);
-  expect(Object.hasOwn(decoded.coveringTestRuns?.[0] ?? {}, "result")).toBe(false);
-  expect(Object.hasOwn(decoded.coveringTestRuns?.[0] ?? {}, "command")).toBe(false);
-  const mixed = roundTrip({
-    ...input(),
-    coveringTestRuns: [refused, ...input().coveringTestRuns, refused],
-  });
-  expect(mixed.coveringTestRuns?.map((v) => v.stageOrdinal)).toEqual([0, 1, 2, 0]);
-});
+test.each([undefined, false, true])(
+  "covering-test refusals preserve unavailable %s and the no-stage sentinel",
+  (unavailable) => {
+    const refused = {
+      file: "a.test.ts",
+      name: "case",
+      verifiedSha: sha,
+      round: 1,
+      stageId: 0,
+      reason: "targeted retries not configured",
+      ...(unavailable === undefined ? {} : { unavailable }),
+    };
+    const encoded = e.encodeTransferEvidence({ coveringTestRuns: [refused, refused] }, []);
+    const decoded = e.parseTransferEvidence(
+      JSON.parse(new TextDecoder().decode(encodeTransferJson(encoded))),
+      [],
+    );
+    const expected = {
+      file: "a.test.ts",
+      name: "case",
+      verifiedSha: sha,
+      round: 1,
+      stageOrdinal: 0,
+      reason: "targeted retries not configured",
+      ...(unavailable === undefined ? {} : { unavailable }),
+    };
+    expect(decoded.coveringTestRuns).toEqual([expected, expected]);
+    expect(Object.hasOwn(decoded.coveringTestRuns?.[0] ?? {}, "unavailable")).toBe(unavailable !== undefined);
+    expect(decoded.coveringTestRuns?.[0]?.unavailable).toBe(unavailable);
+    expect(Object.hasOwn(decoded.coveringTestRuns?.[0] ?? {}, "result")).toBe(false);
+    expect(Object.hasOwn(decoded.coveringTestRuns?.[0] ?? {}, "command")).toBe(false);
+    const mixed = roundTrip({
+      ...input(),
+      coveringTestRuns: [
+        refused,
+        { ...input().coveringTestRuns[0], unavailable: false },
+        ...input().coveringTestRuns.slice(1),
+        refused,
+      ],
+    });
+    expect(mixed.coveringTestRuns?.map((v) => v.stageOrdinal)).toEqual([0, 1, 2, 0]);
+    expect(mixed.coveringTestRuns?.[1]).toMatchObject({ stageOrdinal: 1, unavailable: false, result });
+  },
+);
+
+test.each([null, "true", 1])(
+  "malformed covering-run availability is rejected locally and portably: %s",
+  (unavailable) => {
+    rejects(() =>
+      e.encodeTransferEvidence(
+        {
+          coveringTestRuns: [{ ...input().coveringTestRuns[0], unavailable }],
+        },
+        stages,
+      ),
+    );
+    const value = e.encodeTransferEvidence(input(), stages);
+    rejects(() =>
+      e.parseTransferEvidence(
+        {
+          coveringTestRuns: [{ ...value.coveringTestRuns?.[0], unavailable }],
+        },
+        portable,
+      ),
+    );
+  },
+);
 
 test("each semantic commit field contributes dependencies through every evidence family", () => {
   const oid = (n: number) => n.toString(16).padStart(40, "0");

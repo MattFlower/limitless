@@ -21,6 +21,7 @@ const coveringRun = object({
   verifiedSha: r.oid,
   round: r.counter,
   stageOrdinal: coveringStage,
+  unavailable: z.boolean().optional(),
   result: g.transferGateResultSchema.optional(),
   ...r.fields("command reason", text.optional()),
 });

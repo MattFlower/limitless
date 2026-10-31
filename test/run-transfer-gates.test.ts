@@ -126,6 +126,24 @@ test("legacy uncertainty, explicit false flags and incomplete evidence never acq
     "reused",
   ])
     expect(Object.hasOwn(result, key)).toBe(false);
+  for (const skippedTestsIncomplete of [undefined, false, true]) {
+    const decoded = g.parseTransferGateResult(
+      json(
+        g.parseTransferGateResult({
+          ...basic(),
+          testCoverage: {
+            passedFiles: [],
+            skippedFiles: [],
+            ...(skippedTestsIncomplete === undefined ? {} : { skippedTestsIncomplete }),
+          },
+        }),
+      ),
+    );
+    expect(Object.hasOwn(decoded.testCoverage ?? {}, "skippedTestsIncomplete")).toBe(
+      skippedTestsIncomplete !== undefined,
+    );
+    expect(decoded.testCoverage?.skippedTestsIncomplete).toBe(skippedTestsIncomplete);
+  }
   const comparison = populated();
   delete comparison.postMergeWorker;
   delete comparison.coordinatorConfirmation?.result;
@@ -145,6 +163,63 @@ test("legacy uncertainty, explicit false flags and incomplete evidence never acq
     setup: [],
     checks: [],
   });
+});
+
+test("grouped covering identities retain order through recursive retries", () => {
+  const coveringTests = [
+    { file: "a.test.ts", name: "second", reason: "test failed" },
+    { file: "a.test.ts", name: "first" },
+  ];
+  const input: GateResult = {
+    ...basic(),
+    coveringTests,
+    firstAttempt: { ...basic(), retryAttempt: { ...basic(), coveringTests } },
+  };
+  const decoded = g.parseTransferGateResult(json(g.parseTransferGateResult(input)));
+  expect(decoded).toEqual(input);
+  expect(decoded.coveringTests?.map((v) => v.name)).toEqual(["second", "first"]);
+  expect(decoded.firstAttempt?.retryAttempt?.coveringTests).toEqual(coveringTests);
+});
+
+test.each([undefined, false, true])("covering report availability preserves %s", (reportUnavailable) => {
+  const evidence = {
+    file: "a.test.ts",
+    name: "case",
+    reason: "JUnit report missing",
+    ...(reportUnavailable === undefined ? {} : { reportUnavailable }),
+  };
+  const decoded = g.parseTransferGateResult(
+    json(
+      g.parseTransferGateResult({
+        ...basic(),
+        coveringTest: evidence,
+        retryAttempt: { ...basic(), coveringTests: [evidence] },
+      }),
+    ),
+  );
+  for (const record of [decoded.coveringTest, decoded.retryAttempt?.coveringTests?.[0]]) {
+    expect(record).toEqual(evidence);
+    expect(Object.hasOwn(record ?? {}, "reportUnavailable")).toBe(reportUnavailable !== undefined);
+    expect(record?.reportUnavailable).toBe(reportUnavailable);
+  }
+});
+
+test.each([
+  { coveringTests: {} },
+  { coveringTests: [{ file: "a.test.ts" }] },
+  { coveringTests: [{ file: "a.test.ts", name: "case", unknown: true }] },
+  ...[null, "true", 1].flatMap((reportUnavailable) => {
+    const evidence = { file: "a.test.ts", name: "case", reportUnavailable };
+    return [{ coveringTest: evidence }, { coveringTests: [evidence] }];
+  }),
+])("malformed covering evidence is sanitized", (evidence) => {
+  expect(() => g.parseTransferGateResult({ ...basic(), ...evidence })).toThrow(
+    expect.objectContaining({
+      name: "RunTransferError",
+      code: "invalid",
+      message: "Run transfer data is invalid",
+    }),
+  );
 });
 
 test.each([
