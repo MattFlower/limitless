@@ -5,7 +5,15 @@ import {
   type RunTransferErrorCode,
   rethrowRunTransfer,
 } from "../src/pipeline/run-transfer-errors.ts";
+import { decodeRunTransfer, encodeRunTransfer } from "../src/pipeline/run-transfer-followups.ts";
 import { encodeTransferJson, parseTransferJson } from "../src/pipeline/run-transfer-json.ts";
+import {
+  decodeRunTransferRows,
+  decodeTransferRun,
+  encodeRunTransferRows,
+  encodeTransferRun,
+} from "../src/pipeline/run-transfer-rows.ts";
+import { fixture, rejects, repo } from "./run-transfer-support.ts";
 
 const messages = {
   missing: "Run transfer data is missing",
@@ -117,4 +125,61 @@ test("transfer boundaries contain exceptions while inspecting caught values", ()
     expect(normalized).not.toHaveProperty("cause");
     expect(String(normalized)).not.toContain(sentinel);
   }
+});
+
+test("all row and follow-up public boundaries contain injected exceptions", () => {
+  const input = fixture();
+  const wire = encodeRunTransfer(input, repo);
+  const actions = [
+    (value: typeof input.run) => encodeTransferRun(value, repo),
+    (value: typeof input.run) => decodeTransferRun(value, repo),
+    (value: typeof input.run) => encodeRunTransferRows({ ...input, run: value }, repo),
+    (value: typeof input.run) => decodeRunTransferRows({ ...wire, run: value }, repo),
+    (value: typeof input.run) => encodeRunTransfer({ ...input, run: value }, repo),
+    (value: typeof input.run) => decodeRunTransfer({ ...wire, run: value }, repo),
+  ];
+  for (const error of [
+    new ClaimLostError(),
+    new ClaimWaitError("lease"),
+    new CustomControl(),
+    new Error("private input"),
+    { name: "ClaimLostError" },
+    "private input",
+  ]) {
+    const hostile = new Proxy(input.run, {
+      get: () => {
+        throw error;
+      },
+    });
+    for (const action of actions) {
+      if (error instanceof ClaimControlError) expect(caught(() => action(hostile))).toBe(error);
+      else {
+        rejects(() => action(hostile));
+        expect(caught(() => action(hostile))).toMatchObject({ message: "Run transfer data is invalid" });
+      }
+    }
+  }
+  for (const code of Object.keys(messages) as RunTransferErrorCode[]) {
+    const error = new RunTransferError(code);
+    const hostile = new Proxy(input.run, {
+      get: () => {
+        throw error;
+      },
+    });
+    for (const action of actions) expect(caught(() => action(hostile))).toBe(error);
+  }
+  const inspectionFailure = new Proxy(
+    {},
+    {
+      getPrototypeOf: () => {
+        throw new Error("private input");
+      },
+    },
+  );
+  const hostile = new Proxy(input.run, {
+    get: () => {
+      throw inspectionFailure;
+    },
+  });
+  for (const action of actions) rejects(() => action(hostile));
 });
