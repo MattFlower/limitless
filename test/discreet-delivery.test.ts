@@ -105,6 +105,45 @@ test.each([true, false])("delivery publishes expected text (discreet: %s)", asyn
   }
 });
 
+test("discreet repairs consolidate with the latest round message and operator identity", async () => {
+  const bare = await githubFixture();
+  mkdirSync(join(state.home, "cfg"));
+  writeFileSync(join(state.home, "cfg", "config.toml"), '[repos."test/repo"]\ndiscreet = true');
+  let implementations = 0;
+  let firstIdentity = "";
+  const f = start(async (s) => {
+    if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (roleOf(s) === "review") return { structured: approve };
+    if (++implementations === 2)
+      firstIdentity = (
+        await sh(["git", "show", "-s", "--format=%an <%ae>%n%cn <%ce>", "HEAD"], { cwd: s.cwd })
+      ).stdout;
+    return { files: { "farewell.txt": implementations === 1 ? "BAD\n" : "goodbye\n" } };
+  });
+  registerGithub(f, bare);
+  const created = await f.createRun({
+    repo: "test/repo",
+    prompt: "Add farewell",
+    title: "Add farewell",
+    profile: "quick",
+  });
+  expect(await waitFor(f, created.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  const run = f.store.getRun(created.id);
+  if (!run?.headSha) throw new Error("Missing discreet head");
+  expect(implementations).toBe(2);
+  expect(
+    (await sh(["git", "rev-list", "--count", `${run.baseSha}..${run.headSha}`], { cwd: bare })).stdout.trim(),
+  ).toBe("1");
+  expect((await sh(["git", "show", "-s", "--format=%B", run.headSha], { cwd: bare })).stdout.trim()).toBe(
+    "Add farewell (round 2)",
+  );
+  const identity = (
+    await sh(["git", "show", "-s", "--format=%an <%ae>%n%cn <%ce>", run.headSha], { cwd: bare })
+  ).stdout;
+  expect(identity).not.toMatch(/limitless/i);
+  expect(identity).toBe(firstIdentity);
+});
+
 test("branch allocation checks stored, local and remote names and resumes a suffixed branch", async () => {
   const bare = await githubFixture();
   const f = start(() => ({ text: "unused" }));

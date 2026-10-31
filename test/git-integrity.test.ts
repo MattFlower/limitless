@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -23,6 +23,7 @@ import { Store } from "../src/db/store.ts";
 import { attributeRules, auditDiff } from "../src/gates/audit.ts";
 import { loadPrivateStrings } from "../src/gates/private.ts";
 import { collectGarbage } from "../src/gc.ts";
+import * as gitCommand from "../src/git/command.ts";
 import { recordWorktree, stageAll, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import { completeMerge, prepareMerge } from "../src/git/merge.ts";
 import {
@@ -38,6 +39,7 @@ import {
   discardChanges,
   ensureCache,
   headSha,
+  iterationRefs,
   publicationDiagnosisLimits,
   pushBranch,
   readFileAt,
@@ -145,6 +147,71 @@ test.each([false, true])(
     expect(JSON.stringify(findings).toLowerCase()).not.toContain("secret-host.example");
   },
 );
+
+test("retention failure refuses replacement and can resume after partial retention", async () => {
+  const history = [];
+  for (let n = 0; n < 2; n++) {
+    writeFileSync(join(work, "iteration.txt"), `legacy ${n}\n`);
+    await commitAll(work, "legacy");
+    history.push(await headSha(work));
+  }
+  const before = await headSha(work);
+  writeFileSync(join(work, "iteration.txt"), "final\n");
+  const originalGit = gitCommand.worktreeGit;
+  let retained = 0;
+  const gitSpy = spyOn(gitCommand, "worktreeGit").mockImplementation(async (args, opts) => {
+    if (args[1] === "update-ref" && args[2]?.startsWith("refs/limitless/iterations/") && ++retained === 2)
+      throw new Error("Synthetic retention failure");
+    return originalGit(args, opts);
+  });
+  try {
+    await expect(commitAll(work, "final", { boundary: base, runId: "owner" })).rejects.toThrow(
+      "Synthetic retention failure",
+    );
+    expect(await headSha(work)).toBe(before);
+    expect(await iterationRefs(work, "owner")).toHaveLength(1);
+  } finally {
+    gitSpy.mockRestore();
+  }
+  await commitAll(work, "final", { boundary: base, runId: "owner" });
+  expect((await iterationRefs(work, "owner")).map((ref) => ref.sha).sort()).toEqual(history.sort());
+});
+
+test("consolidation retains all legacy iterations through cache GC", async () => {
+  const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "config") });
+  const store = new Store(cfg.paths.db);
+  const repo = store.upsertRepo({
+    slug: "test/repo",
+    kind: "github",
+    url: seed,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  store.close();
+  const cache = await ensureCache(cfg.paths, repo);
+  work = (await createWorktree(cfg.paths, repo, "owner", "retention", "main")).path;
+  const old: string[] = [];
+  for (let n = 0; n < 3; n++) {
+    writeFileSync(join(work, "iteration.txt"), `old ${n}\n`);
+    await commitAll(work, `legacy ${n}`);
+    old.push(await headSha(work));
+  }
+  await factory("update-ref", "refs/limitless/iterations/unrelated/keep", base);
+  writeFileSync(join(work, "iteration.txt"), "final\n");
+  const final = await commitAll(work, "final", { boundary: base, runId: "owner" });
+  expect((await iterationRefs(work, "owner")).map((ref) => ref.sha).sort()).toEqual(old.sort());
+  await git(cache, "reflog", "expire", "--expire=now", "--all");
+  await git(cache, "gc", "--prune=now");
+  for (const sha of old) {
+    expect((await git(work, "cat-file", "-e", `${sha}^{commit}`)).exitCode).toBe(0);
+    expect((await git(work, "diff", `${sha}..HEAD`)).stdout).toContain("+final");
+  }
+  expect((await git(work, "rev-list", "--parents", "-n", "1", "HEAD")).stdout.trim()).toBe(
+    `${final} ${base}`,
+  );
+  expect((await iterationRefs(work, "unrelated")).map((ref) => ref.sha)).toEqual([base]);
+});
 
 test("committed -diff attributes cannot hide skipped tests, while 500 KB binaries stay compact", async () => {
   writeFileSync(join(work, ".gitattributes"), "*.ts -diff\n*.png diff\n");
