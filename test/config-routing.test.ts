@@ -1200,6 +1200,11 @@ test("operator approval policy parses booleans and case-insensitive repository s
       return loadConfig({ home: dir, configDir: dir, readOnly: true });
     };
     expect([...load("").landRequiresApproval]).toEqual([]);
+    for (const value of [true, false])
+      expect(load(`[repos."owner/work"]\nshared = ${value}`).repos?.["owner/work"]?.shared).toBe(value);
+    expect(load('[repos."owner/work"]').repos?.["owner/work"]?.shared).toBe(false);
+    for (const value of ['"true"', "1", "[]", "{}"])
+      expect(() => load(`[repos."owner/work"]\nshared = ${value}`)).toThrow("repos.shared must be a boolean");
     expect([
       ...load(
         '[repos."Owner/Work"]\nland_requires_approval = true\n[repos."Owner/Personal"]\nland_requires_approval = false',

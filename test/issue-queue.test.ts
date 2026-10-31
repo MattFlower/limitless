@@ -55,6 +55,7 @@ function issue(number = 1, p = 1): QueueIssue & { repository: { nameWithOwner: s
     author: { login: "owner" },
     editor: null,
     lastEditedAt: null,
+    userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
     parent: null,
     labels: { totalCount: 1, nodes: [{ name: `priority:${p}` }] },
     subIssuesSummary: { total: 0 },
@@ -117,7 +118,7 @@ test("queue routes trusted acceptance tickets without creating a build", async (
   });
   expect(h.store.listStages(run.id)).toEqual([]);
   expect(h.calls.find((a) => a[1] === "graphql")?.join(" ")).toContain(
-    "parent { number body author { login } editor { login } lastEditedAt }",
+    "parent { number body author { login } editor { login } lastEditedAt",
   );
 });
 
@@ -427,10 +428,59 @@ test.each(exclusions)("excludes %s", (reason, change) => {
   });
 });
 
+test("an earlier untrusted body editor survives a trusted final edit", () => {
+  const candidate = issue();
+  candidate.lastEditedAt = at;
+  candidate.editor = { login: "owner" };
+  candidate.userContentEdits.nodes = [{ editor: { login: "owner" } }, { editor: { login: "stranger" } }];
+  expect(issueEligibility(candidate, ["OWNER"])).toEqual({
+    eligible: false,
+    reason: "untrusted body editor: stranger",
+  });
+});
+
+test.each([0, 2, 100])("complete history of %i trusted edits is eligible", (count) => {
+  const candidate = issue();
+  if (count) {
+    candidate.lastEditedAt = at;
+    candidate.editor = { login: "owner" };
+  }
+  candidate.userContentEdits.nodes = Array.from({ length: count }, (_, n) => ({
+    editor: { login: n % 2 ? "COLLABORATOR" : "owner" },
+  }));
+  expect(issueEligibility(candidate, ["OWNER", "collaborator"])).toEqual({ eligible: true, priority: 1 });
+});
+
+test.each([
+  [false, "body edit history unavailable"],
+  [true, "body edit history exceeds 100 edits"],
+] as const)("an edited issue with empty history refuses (hasNextPage: %s)", (hasNextPage, reason) => {
+  const candidate = issue();
+  candidate.lastEditedAt = at;
+  candidate.editor = { login: "owner" };
+  candidate.userContentEdits.pageInfo.hasNextPage = hasNextPage;
+  expect(issueEligibility(candidate, ["owner"])).toEqual({ eligible: false, reason });
+});
+
+test.each([
+  [undefined, "body edit history unavailable"],
+  [null, "body edit history unavailable"],
+  [{ nodes: [], pageInfo: {} }, "body edit history unavailable"],
+  [{ nodes: [null], pageInfo: { hasNextPage: false } }, "body edit history unavailable"],
+  [{ nodes: [{ editor: {} }], pageInfo: { hasNextPage: false } }, "body edit history unavailable"],
+  [{ nodes: [], pageInfo: { hasNextPage: "false" } }, "body edit history unavailable"],
+  [{ nodes: [{ editor: null }], pageInfo: { hasNextPage: false } }, "untrusted body editor: unknown"],
+  [{ nodes: [], pageInfo: { hasNextPage: true } }, "body edit history exceeds 100 edits"],
+] as const)("incomplete or untrusted history refuses eligibility: %j", (history, reason) => {
+  const candidate = Object.assign(issue(), { userContentEdits: history });
+  expect(issueEligibility(candidate, ["owner"])).toEqual({ eligible: false, reason });
+});
+
 test("closed dependencies and merged PRs allow a trusted, edited issue", () => {
   const i = issue();
   i.editor = { login: "OWNER" };
   i.lastEditedAt = at;
+  i.userContentEdits.nodes = [{ editor: { login: "OWNER" } }];
   i.body = "Blocked by #9\r\nBlocked by #10";
   i.blockedBy = {
     totalCount: 1,
@@ -708,12 +758,19 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
               },
             },
           }
-        : Object.fromEntries(
-            [...query.matchAll(/i(\d+):issue/g)].map((m) => [
-              `i${m[1]}`,
-              states.get(Number(m[1])) ? { state: states.get(Number(m[1])) } : null,
-            ]),
-          );
+        : query.includes("issue:") && !/i\d+:issue/.test(query)
+          ? {
+              issue:
+                issues.find(
+                  (i) => i.number === Number(query.match(/(?:issue|pullRequest)\(number:(\d+)/)?.[1]),
+                ) ?? issue(),
+            }
+          : Object.fromEntries(
+              [...query.matchAll(/i(\d+):issue/g)].map((m) => [
+                `i${m[1]}`,
+                states.get(Number(m[1])) ? { state: states.get(Number(m[1])) } : null,
+              ]),
+            );
       return JSON.stringify({ data: { repository, rateLimit: h.rate } });
     },
     start() {
@@ -969,7 +1026,17 @@ test("poll query reads title evidence and looks up all body blockers", async () 
   expect(h.runs()).toHaveLength(1);
 });
 
-test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval"])(
+const repositoryResolutionAdmissionRechecks = [
+  "run limit",
+  "issue run limit",
+  "draining",
+  "stopped",
+  "re-approval",
+  "body trust",
+  "acceptance ticket body trust",
+  "acceptance parent body trust",
+];
+test.each(repositoryResolutionAdmissionRechecks)(
   "admission rechecks %s after repository resolution",
   async (mode) => {
     const h = harness();
@@ -1005,6 +1072,8 @@ test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval"]
             ),
           ).id;
           h.store.updateRun(competingId, { status: "cancelled", finishedAt });
+        } else if (mode.endsWith("body trust") && h.cfg.githubQueue) {
+          h.cfg.githubQueue = { ...h.cfg.githubQueue, trusted: ["owner"] };
         } else if (mode === "draining") h.factory.scheduler.drain();
         else h.stop();
         changed = true;
@@ -1016,7 +1085,18 @@ test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval"]
       if (msg.kind === "run" && msg.run.sourceRef?.via === "queue") queuePublications.push(msg.run.id);
     });
     try {
-      const candidate = issue();
+      const candidate = mode.startsWith("acceptance") ? acceptanceIssue() : issue();
+      if (mode.endsWith("body trust") && h.cfg.githubQueue) {
+        h.cfg.githubQueue.trusted = ["owner", "collaborator"];
+        const edited = mode === "acceptance parent body trust" ? candidate.parent : candidate;
+        if (!edited) throw new Error("missing edited issue");
+        edited.lastEditedAt = at;
+        edited.editor = { login: "owner" };
+        edited.userContentEdits.nodes = [
+          { editor: { login: "owner" } },
+          { editor: { login: "collaborator" } },
+        ];
+      }
       h.data.set(repo.slug, [candidate]);
       h.start();
       await h.advance();
@@ -1027,7 +1107,11 @@ test.each(["run limit", "issue run limit", "draining", "stopped", "re-approval"]
       expect(h.store.db.query("SELECT count(*) AS n FROM events").get()).toEqual({ n: 0 });
       expect(h.logs.join("\n")).toContain("Run admission refused:");
       expect(h.logs.join("\n")).toContain(
-        mode === "re-approval" ? "linked run changed during the poll; retrying next poll" : mode,
+        mode === "re-approval"
+          ? "linked run changed during the poll; retrying next poll"
+          : mode.endsWith("body trust")
+            ? `${mode === "acceptance parent body trust" ? "parent: " : ""}untrusted body editor: collaborator`
+            : mode,
       );
       expect(h.clock.pending).toBe(mode === "stopped" ? 0 : 1);
       if (mode.includes("limit")) {
@@ -1188,7 +1272,12 @@ function webhook(h: ReturnType<typeof harness>, id: string) {
     label: { name: "limitless" },
     issue: { ...i, user: i.author },
   });
-  return githubWebhook(h.factory)(
+  return githubWebhook(
+    h.factory,
+    undefined,
+    undefined,
+    h.gh,
+  )(
     new Request("http://localhost/webhooks/github", {
       method: "POST",
       body,
@@ -4792,9 +4881,14 @@ test("PR comment webhooks in queue repositories retain provenance and comment de
   const h = harness();
   const i = commentIssue();
   let hints = 0;
-  const handle = githubWebhook(h.factory, undefined, () => {
-    hints++;
-  });
+  const handle = githubWebhook(
+    h.factory,
+    undefined,
+    () => {
+      hints++;
+    },
+    h.gh,
+  );
   expect((await handle(commentDelivery(i, "pr-first", "owner", true))).status).toBe(201);
   const run = h.runs()[0];
   if (!run) throw new Error("missing PR command run");
@@ -4931,7 +5025,7 @@ test("non-queue webhook records its comment transactionally before repository jo
         "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
       },
     });
-  const handle = githubWebhook(h.factory);
+  const handle = githubWebhook(h.factory, undefined, undefined, h.gh);
   expect((await handle(send("first"))).status).toBe(201);
   expect(h.requests[0]).toEqual(
     commentRunRequest(
@@ -5712,4 +5806,111 @@ test("attention uses full open-issue labels when the child preview omits priorit
     epicAttention("owner/repo", epic, ["owner"], new Map([["owner/repo#3", open]]), (_repo, n) => n === 2)
       ?.state,
   ).toBe("needs_approval");
+});
+
+test.each(["priority", "comment"])(
+  "polled %s refuses earlier untrusted edits and accepts trusted history",
+  async (mode) => {
+    const h = harness();
+    const candidate = mode === "comment" ? commentIssue() : issue();
+    candidate.lastEditedAt = at;
+    candidate.editor = { login: "owner" };
+    candidate.userContentEdits.nodes = [{ editor: { login: "owner" } }, { editor: { login: "stranger" } }];
+    if (mode === "comment") candidate.comments = { totalCount: 1, nodes: [commandComment()] };
+    h.data.set("owner/repo", [candidate]);
+    h.start();
+    await h.advance();
+    expect(h.runs()).toEqual([]);
+    expect(h.store.issueClaim("owner/repo", candidate.number)).toBeNull();
+    if (mode === "comment") {
+      expect(records(h)).toMatchObject([{ outcome: "refused", note: "untrusted body editor: stranger" }]);
+      candidate.comments.nodes = [commandComment(2)];
+    }
+    candidate.userContentEdits.nodes = [{ editor: { login: "OWNER" } }];
+    await h.advance(180_000);
+    expect(h.runs()).toHaveLength(1);
+  },
+);
+
+test.each(["priority", "comment", "App mention"])(
+  "polled %s refuses edited-but-empty body history before claiming",
+  async (mode) => {
+    const h = harness();
+    const candidate = mode === "priority" ? issue() : commentIssue();
+    candidate.lastEditedAt = at;
+    candidate.editor = { login: "owner" };
+    if (mode !== "priority") {
+      const comment = commandComment();
+      if (mode === "App mention") {
+        h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+        comment.body = "@factory[bot] do it";
+      }
+      candidate.comments = { totalCount: 1, nodes: [comment] };
+    }
+    h.data.set("owner/repo", [candidate]);
+    h.start();
+    await h.advance();
+    expect(h.requests).toEqual([]);
+    expect(h.runs()).toEqual([]);
+    expect(h.store.issueClaim("owner/repo", candidate.number)).toBeNull();
+    expect(h.calls).toHaveLength(1);
+    if (mode !== "priority")
+      expect(records(h)).toMatchObject([{ outcome: "refused", note: "body edit history unavailable" }]);
+  },
+);
+
+test.each(["missing", "null editor", "overflow", "failed read", "GraphQL errors"])(
+  "polling refuses %s body history before runs or comments are claimed",
+  async (mode) => {
+    const h = harness();
+    const candidate = issue();
+    candidate.comments = { totalCount: 1, nodes: [commandComment()] };
+    if (mode === "missing") Reflect.deleteProperty(candidate, "userContentEdits");
+    if (mode === "null editor") candidate.userContentEdits.nodes = [{ editor: null }];
+    if (mode === "overflow") candidate.userContentEdits.pageInfo.hasNextPage = true;
+    if (mode === "failed read")
+      h.intercept = () => {
+        throw new Error("history unavailable");
+      };
+    if (mode === "GraphQL errors")
+      h.response = {
+        errors: [{ message: "history unavailable" }],
+        data: {
+          repository: { issues: { nodes: [candidate], pageInfo: { hasNextPage: false, endCursor: null } } },
+          rateLimit: h.rate,
+        },
+      };
+    h.data.set("owner/repo", [candidate]);
+    h.start();
+    await h.advance();
+    expect(h.runs()).toEqual([]);
+    expect(h.store.issueClaim("owner/repo", candidate.number)).toBeNull();
+    expect(h.calls).toHaveLength(1);
+    if (mode === "overflow") {
+      expect(h.calls[0]?.[3]).toContain("userContentEdits(first:100)");
+      expect(records(h)).toMatchObject([{ outcome: "refused", note: "body edit history exceeds 100 edits" }]);
+    }
+  },
+);
+
+test("polled comment admission rechecks body history against current trust after repository resolution", async () => {
+  const h = harness({ trusted: ["owner", "collaborator"] });
+  const candidate = commentIssue();
+  candidate.userContentEdits.nodes = [{ editor: { login: "owner" } }, { editor: { login: "collaborator" } }];
+  candidate.comments = { totalCount: 1, nodes: [commandComment()] };
+  h.data.set("owner/repo", [candidate]);
+  const getRepo = h.store.getRepoBySlug.bind(h.store);
+  h.store.getRepoBySlug = (slug) => {
+    h.store.getRepoBySlug = getRepo;
+    queueMicrotask(() => {
+      if (h.cfg.githubQueue) h.cfg.githubQueue = { ...h.cfg.githubQueue, trusted: ["owner"] };
+    });
+    return getRepo(slug);
+  };
+  h.start();
+  await h.advance();
+  expect(h.requests).toHaveLength(1);
+  expect(h.runs()).toEqual([]);
+  expect(h.store.issueClaim("owner/repo", candidate.number)).toBeNull();
+  expect(h.logs.join("\n")).toContain("Run admission refused: untrusted body editor: collaborator");
 });

@@ -752,15 +752,26 @@ test.skipIf(realGitSkip !== null)(
 
 test("the private-strings script launched without the test preload refuses unconfined git", async () => {
   const script = resolve("scripts/check-private-strings.ts");
+  writeFileSync(join(root, "config.toml"), "");
+  const env = { ...process.env, LIMITLESS_CONFIG_DIR: root };
   const preloaded = await sh(
-    [process.execPath, `--preload=${resolve("test/git-preload.ts")}`, script, "--record"],
-    { cwd },
+    [process.execPath, `--preload=${resolve("test/git-preload.ts")}`, script, "--record", "test/repo"],
+    { cwd, env },
   );
   expect(preloaded.stdout.split("\n")[0]).toBe(realpathSync(cwd));
   const refused = await sh(
-    [...unavailable, process.execPath, "--config=/dev/null", "--no-env-file", script, "--record"],
+    [
+      ...unavailable,
+      process.execPath,
+      "--config=/dev/null",
+      "--no-env-file",
+      script,
+      "--record",
+      "test/repo",
+    ],
     {
       cwd,
+      env,
       allowFail: true,
     },
   );

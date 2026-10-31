@@ -180,8 +180,18 @@ exit "$status"
   registerGithub(f, bare);
   const repo = await resolveRepo(f.store, "test/repo", cfg.githubMerge);
   const snapshot = acceptanceRunRequest({
-    ticket: { number: 9, body: options.ticket ?? ticket, author: { login: "owner" } },
-    parent: { number: 1, body: options.parent ?? parent, author: { login: "owner" } },
+    ticket: {
+      number: 9,
+      body: options.ticket ?? ticket,
+      author: { login: "owner" },
+      userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
+    },
+    parent: {
+      number: 1,
+      body: options.parent ?? parent,
+      author: { login: "owner" },
+      userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
+    },
     trusted: ["owner"],
   });
   const run = f.store.createAcceptanceRun(
