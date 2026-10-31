@@ -1,7 +1,7 @@
 import { types } from "node:util";
 import { z } from "zod";
 import type { ClaimKey } from "../pipeline/portable.ts";
-import { rethrowClaimControl } from "./claim-errors.ts";
+import { ClaimControlError, rethrowClaimControl } from "./claim-errors.ts";
 import type { ControlNamer } from "./control-identity.ts";
 import { canonicalJson, type JsonValue, snapshotJson } from "./control-json.ts";
 import type { ControlKey } from "./control-ref.ts";
@@ -99,11 +99,17 @@ type ValidationCode = "invalid" | "corrupt";
 function fail(code: ValidationCode | "limit" | "unsupported"): never {
   throw new SharedStoreError(code);
 }
+// Walks only proxy-free ordinary prototypes, so classification runs no caller code and cannot throw.
+function isClaimControl(error: unknown): boolean {
+  for (let p = error; typeof p === "object" && p !== null && !types.isProxy(p); p = Object.getPrototypeOf(p))
+    if (p === ClaimControlError.prototype) return true;
+  return false;
+}
 function checked<T>(action: () => T, code: ValidationCode): T {
   try {
     return action();
   } catch (error) {
-    if (!types.isProxy(error)) rethrowClaimControl(error);
+    if (isClaimControl(error)) rethrowClaimControl(error);
     return fail(code);
   }
 }

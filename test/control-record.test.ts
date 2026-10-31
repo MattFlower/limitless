@@ -499,7 +499,7 @@ test("non-JSON proposals and caller exceptions disclose only fixed errors withou
   });
 });
 
-test("thrown proxy exceptions produce fixed errors without inspecting their prototypes", () => {
+test("thrown proxies and proxy-derived exceptions produce fixed errors without inspecting prototypes", () => {
   const sentinel = randomUUID();
   let inspections = 0;
   const throwing = new Proxy(
@@ -513,7 +513,14 @@ test("thrown proxy exceptions produce fixed errors without inspecting their prot
   );
   const revoked = Proxy.revocable(new ClaimLostError(), {});
   revoked.revoke();
-  for (const error of [throwing, revoked.proxy]) {
+  const disguised = Object.create(new Proxy(new ClaimLostError(), {}));
+  for (const error of [
+    throwing,
+    revoked.proxy,
+    Object.create(throwing),
+    Object.create(revoked.proxy),
+    disguised,
+  ]) {
     const throwingNamer = {
       derive() {
         throw error;
