@@ -415,6 +415,16 @@ export class IssueClaimed extends Error {
   }
 }
 export type GitHubComment = { repo: string; id: number };
+export type AcceptancePass = {
+  repo: string;
+  epic: number;
+  pass: number;
+  ticket: number;
+  runId: string;
+  sha: string;
+  items: { item: string; state: "pending" | "requested" | "filed"; issue?: number }[];
+  state: "filing" | "complete";
+};
 export class CommentProcessed extends Error {}
 
 const RUN_SELECT = "SELECT runs.*, repos.slug AS repo_slug FROM runs JOIN repos ON repos.id = runs.repo_id";
@@ -1554,6 +1564,130 @@ export class Store {
           (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
         ),
       );
+  }
+
+  /** Reuse the run's pass, any at this ticket/SHA, or the latest unsent reservation before counting another. */
+  claimAcceptancePass(claim: Omit<AcceptancePass, "pass" | "state">, limit: number): AcceptancePass | null {
+    const repo = claim.repo.toLowerCase();
+    return this.transaction(() => {
+      const rows = this.db
+        .query<
+          {
+            pass: number;
+            ticket: number;
+            sha: string;
+            run_id: string;
+            items: string;
+            state: AcceptancePass["state"];
+          },
+          [string, number]
+        >(
+          "SELECT pass, ticket, sha, run_id, items, state FROM acceptance_passes WHERE repo = ? AND epic = ? ORDER BY pass",
+        )
+        .all(repo, claim.epic);
+      const own = rows.find((r) => r.run_id === claim.runId);
+      if (own) return { ...claim, ...own, repo, items: JSON.parse(own.items) };
+      const prior = rows.find((r) => r.ticket === claim.ticket && r.sha === claim.sha) ?? rows.at(-1);
+      if (prior) {
+        const items: AcceptancePass["items"] = JSON.parse(prior.items);
+        const same = prior.ticket === claim.ticket && prior.sha === claim.sha;
+        if (same || !items.some((h) => h.state === "requested" || h.state === "filed")) {
+          const record: AcceptancePass = same
+            ? { ...claim, ...prior, repo, items }
+            : { ...claim, repo, pass: prior.pass, state: "filing" };
+          this.db
+            .query(`UPDATE acceptance_passes SET run_id = ?, ticket = ?, sha = ?, items = ?, state = ?
+            WHERE repo = ? AND epic = ? AND pass = ?`)
+            .run(
+              claim.runId,
+              record.ticket,
+              record.sha,
+              JSON.stringify(record.items),
+              record.state,
+              repo,
+              claim.epic,
+              record.pass,
+            );
+          return record;
+        }
+      }
+      if (rows.length >= limit) return null;
+      const record: AcceptancePass = { ...claim, repo, pass: rows.length + 1, state: "filing" };
+      this.db
+        .query("INSERT INTO acceptance_passes VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(
+          repo,
+          claim.epic,
+          record.pass,
+          claim.ticket,
+          claim.runId,
+          claim.sha,
+          JSON.stringify(claim.items),
+          "filing",
+        );
+      return record;
+    }, true);
+  }
+
+  /** Applies `change` atomically; null fences callers of a reassigned ticket/SHA reservation. */
+  changeAcceptancePass(
+    { repo, epic, pass, ticket, sha }: AcceptancePass,
+    change: (record: AcceptancePass) => boolean,
+  ): { changed: boolean; record: AcceptancePass } | null {
+    return this.transaction(() => {
+      const row = this.db
+        .query<
+          { ticket: number; run_id: string; sha: string; items: string; state: AcceptancePass["state"] },
+          [string, number, number]
+        >(
+          "SELECT ticket, run_id, sha, items, state FROM acceptance_passes WHERE repo = ? AND epic = ? AND pass = ?",
+        )
+        .get(repo, epic, pass);
+      if (!row) throw new Error(`acceptance pass ${pass} of ${repo}#${epic} is missing`);
+      if (row.ticket !== ticket || row.sha !== sha) return null;
+      const record: AcceptancePass = {
+        ...row,
+        repo,
+        epic,
+        pass,
+        runId: row.run_id,
+        items: JSON.parse(row.items),
+      };
+      const changed = change(record);
+      if (changed)
+        this.db
+          .query("UPDATE acceptance_passes SET items = ?, state = ? WHERE repo = ? AND epic = ? AND pass = ?")
+          .run(JSON.stringify(record.items), record.state, repo, epic, pass);
+      return { changed, record };
+    }, true);
+  }
+
+  /** Claim the pass-limit comment immediately before posting; uncertain requests are never re-sent. */
+  claimAcceptanceLimit(repo: string, epic: number, runId: string): "claimed" | "requested" | "done" {
+    repo = repo.toLowerCase();
+    return this.transaction(() => {
+      this.db
+        .query("INSERT OR IGNORE INTO acceptance_epic_limits VALUES (?, ?, ?, 'pending', 'pending')")
+        .run(repo, epic, runId);
+      const claimed = this.db
+        .query(
+          "UPDATE acceptance_epic_limits SET comment = 'requested' WHERE repo = ? AND epic = ? AND comment = 'pending'",
+        )
+        .run(repo, epic).changes;
+      if (claimed) return "claimed";
+      return this.db
+        .query<{ comment: "requested" | "done" }, [string, number]>(
+          "SELECT comment FROM acceptance_epic_limits WHERE repo = ? AND epic = ?",
+        )
+        .get(repo, epic)?.comment as "requested" | "done";
+    }, true);
+  }
+
+  finishAcceptanceLimit(repo: string, epic: number, runId: string): void {
+    this.db
+      .query(`INSERT INTO acceptance_epic_limits VALUES (?, ?, ?, 'pending', 'done')
+        ON CONFLICT(repo, epic) DO UPDATE SET comment = 'done'`)
+      .run(repo.toLowerCase(), epic, runId);
   }
 
   latestIssueRun(repo: string, number: number): Run | null {
