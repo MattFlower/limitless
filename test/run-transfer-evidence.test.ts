@@ -111,6 +111,38 @@ test("completed post-merge results preserve missing workers separately from null
   expect(e.parseTransferEvidence({}, [])).toEqual({});
 });
 
+test("covering-test refusals preserve the no-stage sentinel without allocating a reference", () => {
+  const refused = {
+    file: "a.test.ts",
+    name: "case",
+    verifiedSha: sha,
+    round: 1,
+    stageId: 0,
+    reason: "targeted retries not configured",
+  };
+  const encoded = e.encodeTransferEvidence({ coveringTestRuns: [refused, refused] }, []);
+  const decoded = e.parseTransferEvidence(
+    JSON.parse(new TextDecoder().decode(encodeTransferJson(encoded))),
+    [],
+  );
+  const expected = {
+    file: "a.test.ts",
+    name: "case",
+    verifiedSha: sha,
+    round: 1,
+    stageOrdinal: 0,
+    reason: "targeted retries not configured",
+  };
+  expect(decoded.coveringTestRuns).toEqual([expected, expected]);
+  expect(Object.hasOwn(decoded.coveringTestRuns?.[0] ?? {}, "result")).toBe(false);
+  expect(Object.hasOwn(decoded.coveringTestRuns?.[0] ?? {}, "command")).toBe(false);
+  const mixed = roundTrip({
+    ...input(),
+    coveringTestRuns: [refused, ...input().coveringTestRuns, refused],
+  });
+  expect(mixed.coveringTestRuns?.map((v) => v.stageOrdinal)).toEqual([0, 1, 2, 0]);
+});
+
 test("each semantic commit field contributes dependencies through every evidence family", () => {
   const oid = (n: number) => n.toString(16).padStart(40, "0");
   const check = (n: number) => ({
@@ -152,6 +184,8 @@ test.each([
   { gateEvidence: { ...input().gateEvidence, stageOrdinal: 2 } },
   { gateEvidence: { ...input().gateEvidence, checks: [comparison] } },
   { coveringTestRuns: [{ ...input().coveringTestRuns[0], stageId: 404 }] },
+  { coveringTestRuns: [{ ...input().coveringTestRuns[0], stageId: -1 }] },
+  { coveringTestRuns: [{ ...input().coveringTestRuns[0], stageId: null }] },
   { coveringTestRuns: [{ ...input().coveringTestRuns[0], verifiedSha: "bad" }] },
   { postMergeGates: { ...input().postMergeGates, head: "bad" } },
   { postMergeGates: { ...input().postMergeGates, result: { setupOk: true, comparison: [] } } },
@@ -169,12 +203,13 @@ test("portable references must exist in the supplied stage mapping and remain st
     rejects(() =>
       e.parseTransferEvidence({ ...value, gateEvidence: { ...value.gateEvidence, stageOrdinal } }, portable),
     );
-    rejects(() =>
-      e.parseTransferEvidence(
-        { coveringTestRuns: [{ ...value.coveringTestRuns?.[0], stageOrdinal }] },
-        portable,
-      ),
-    );
+    if (stageOrdinal !== 0)
+      rejects(() =>
+        e.parseTransferEvidence(
+          { coveringTestRuns: [{ ...value.coveringTestRuns?.[0], stageOrdinal }] },
+          portable,
+        ),
+      );
   }
   rejects(() => e.parseTransferEvidence(value, [{ ordinal: 1 }]));
   rejects(() => e.encodeTransferEvidence(input(), [{ id: 31 }, { id: 31 }]));

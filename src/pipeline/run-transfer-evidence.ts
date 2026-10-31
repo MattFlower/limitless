@@ -13,12 +13,14 @@ const gateEvidence = object({
   changedFiles: z.array(text).optional(),
   checks: z.array(g.transferGateComparisonSchema.extend({ testCommand: text.nullable() })),
 });
+// Covering requests refused before stage allocation retain the local no-stage sentinel.
+const coveringStage = z.union([z.literal(0), r.ordinal]);
 const coveringRun = object({
   file: text,
   name: text,
   verifiedSha: r.oid,
   round: r.counter,
-  stageOrdinal: r.ordinal,
+  stageOrdinal: coveringStage,
   result: g.transferGateResultSchema.optional(),
   ...r.fields("command reason", text.optional()),
 });
@@ -43,7 +45,7 @@ export type TransferEvidence = z.infer<typeof transferEvidenceSchema>;
 const localSchema = transferEvidenceSchema.extend({
   gateEvidence: gateEvidence.omit({ stageOrdinal: true }).extend({ stageId: r.ordinal }).optional(),
   coveringTestRuns: z
-    .array(coveringRun.omit({ stageOrdinal: true }).extend({ stageId: r.ordinal }))
+    .array(coveringRun.omit({ stageOrdinal: true }).extend({ stageId: coveringStage }))
     .optional(),
 });
 export const parseTransferEvidence = r.boundary(
@@ -51,7 +53,8 @@ export const parseTransferEvidence = r.boundary(
     const result = r.parseRecord(transferEvidenceSchema, value);
     const ordinals = new Set(stages.map((s) => r.parseRecord(r.ordinal, s.ordinal)));
     for (const record of [result.gateEvidence, ...(result.coveringTestRuns ?? [])])
-      if (record && !ordinals.has(record.stageOrdinal)) throw new RunTransferError("invalid");
+      if (record && record.stageOrdinal !== 0 && !ordinals.has(record.stageOrdinal))
+        throw new RunTransferError("invalid");
     return result;
   },
 );
@@ -60,6 +63,7 @@ export const encodeTransferEvidence = r.boundary((value: unknown, stages: readon
   const ids = stages.map((s) => r.parseRecord(r.ordinal, s.id)).sort((a, b) => a - b);
   if (new Set(ids).size !== ids.length) throw new RunTransferError("invalid");
   const reference = <T extends { stageId: number }>({ stageId, ...record }: T) => {
+    if (stageId === 0) return { ...record, stageOrdinal: 0 };
     const ordinal = ids.indexOf(stageId) + 1;
     if (!ordinal) throw new RunTransferError("invalid");
     return { ...record, stageOrdinal: ordinal };
