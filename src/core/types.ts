@@ -669,7 +669,9 @@ export type FinderPrompt =
   | "trace"
   | "adversarial-checklist"
   | "adversarial-thorough"
-  | "adversarial-callers";
+  | "adversarial-callers"
+  | "adversarial-calibrated"
+  | "adversarial-thorough-calibrated";
 /**
  * One review finder; production may omit `target` (routed), evals may not. Production single-mode
  * reviews use the reviewer prompt, named `standard`; evals may add a second `trace` finder.
