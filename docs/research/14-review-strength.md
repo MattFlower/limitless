@@ -784,6 +784,28 @@ are all deferred; this recipe claims no empirical gain.
 **Budget and scope.** About 60 source lines plus tests. Out of scope: lenses, the probe prompt,
 production adoption.
 
+## Appendix C. Lab-prompt additions to the adversarial prompt (2026-10-31)
+
+A comparison of published review prompts (Codex `/review`, OpenAI's completeness guidance, Claude
+Code's review angles, the Anthropic review plugins, Gemini CLI, PR-Agent) found two gaps in the
+adversarial prompt: nothing tells the reviewer not to stop at the first finding, and nothing gives
+it a method for leaving the diff. Two eval-only prompts add one block each to the unchanged
+adversarial framing, so a comparison with stored adversarial trials changes one thing:
+
+- `adversarial-thorough`: do not stop at the first finding; check second-order failures (empty and
+  stale state, retries, restarts, rollback); one more pass over the largest file and removed blocks
+  when findings are fewer than min(changed files, 4); never invent a finding to reach that number.
+  Targets early stopping (about one finding per review). False-block risk: highest of the two.
+- `adversarial-callers`: before the rubric, find callers and alternate entry points of every changed
+  symbol (including files outside the diff), the invariant each deleted line enforced, and the whole
+  enclosing function of each hunk; a claim that other code breaks must name it by file and line.
+  Targets misses that need files outside the diff. Unlike the `trace` finder (B2), it adds to the
+  general review instead of replacing it.
+
+Both are refused by production schemas and rosters and run only in single mode (with or without
+`samples: 2`). Measure on escapes-dev and the dev clean cases at k=2 with the two-judge matcher,
+against the stored adversarial trials for the same model; the decision rule is unchanged.
+
 ## References (new in this note; others in research/08)
 
 - AnyPoC, arXiv 2604.11950 [arXiv]
