@@ -242,6 +242,7 @@ export async function runCoveringRequests(
     await ctx.save();
     const purpose = `covering-test:${stage.id}`;
     let started = false;
+    let preStartFailure = false;
     const saveResult = (_handle: unknown, run: GateRun) => {
       for (const record of group) {
         const result = run.checks[0];
@@ -292,6 +293,9 @@ export async function runCoveringRequests(
               onCheckStart: () => {
                 started = true;
               },
+              onPreStartFailure: () => {
+                preStartFailure = true;
+              },
             },
             undefined,
             saveResult,
@@ -302,14 +306,16 @@ export async function runCoveringRequests(
           error instanceof CancelledError ||
           error instanceof SimulatedTermination ||
           error instanceof InjectedFault;
-        const remote = ctx.state.gateExecution && ctx.state.gateExecution.handle.kind !== "local";
+        const remote = [ctx.deps.gateExecutor?.kind, ctx.state.gateExecution?.handle.kind].some(
+          (kind) => kind && kind !== "local",
+        );
         if (
           !policy.groupFiles ||
           interrupted ||
           ctx.signal.aborted ||
           ctx.termination ||
           started ||
-          remote ||
+          (remote && !preStartFailure) ||
           group.some((r) => r.result)
         )
           throw error;

@@ -73,6 +73,9 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
         .object({ file: z.string(), name: z.string(), reason: z.string().optional() })
         .strict()
         .optional(),
+      coveringTests: z
+        .array(z.object({ file: z.string(), name: z.string(), reason: z.string().optional() }).strict())
+        .optional(),
       ok: z.boolean(),
       exitCode: z.number().int().nullable(),
       durationMs: z.number().finite().nonnegative(),

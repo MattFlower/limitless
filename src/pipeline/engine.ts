@@ -565,7 +565,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
 function gateEvents(
   ctx: RunContext,
   label?: string,
-): Required<Omit<GateHooks, "onLocalSetup" | "onCheckStart" | "env" | "fallbackSetup">> {
+): Required<
+  Omit<GateHooks, "onLocalSetup" | "onCheckStart" | "onPreStartFailure" | "env" | "fallbackSetup">
+> {
   return {
     priority: "finish",
     skipGateSlot: false,

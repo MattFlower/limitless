@@ -125,6 +125,8 @@ export interface GateHooks {
   onResult?: (r: GateResult, phase: "setup" | "check") => void;
   /** Factory notification when the trusted shell starts a local check. */
   onCheckStart?: () => void;
+  /** Factory confirmation that execution failed before a check could start. */
+  onPreStartFailure?: () => void;
   /** Evidence from this process, never from a remote result or cache. */
   onLocalSetup?: () => void;
   /** Fires once when every gate slot is busy and this call has to queue. */

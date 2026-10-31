@@ -4,8 +4,10 @@ import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
+import { WorkerStore } from "../src/db/workers.ts";
 import type { GateCommand } from "../src/gates/detect.ts";
 import { type GateRequest, localExecutor } from "../src/gates/executor.ts";
+import { lanExecutor } from "../src/gates/lan.ts";
 import { resolveRepo } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { type AcceptanceState, acceptanceEngine, acceptanceRunRequest } from "../src/pipeline/acceptance.ts";
@@ -602,7 +604,7 @@ test("acceptance runs all 36 identities once per shared file and reuses duplicat
   expect(t.outcome().units[12]?.citations).toEqual(t.outcome().units[0]?.citations);
 });
 
-test.each(["runner", "slot"] as const)(
+test.each(["runner", "slot", "inplace attachment", "inplace before enqueue", "LAN slot"] as const)(
   "a pre-start %s refusal leaves independent files assessable",
   async (mode) => {
     const t = await setup({
@@ -622,7 +624,7 @@ test.each(["runner", "slot"] as const)(
         if (request.gates.checks[0]?.coveringTest?.file === "x.test.ts") throw new Error(reason);
         return start(request, signal);
       };
-    } else {
+    } else if (mode === "slot") {
       const attach = executor.attach.bind(executor);
       executor.attach = (handle, signal, request, hooks, persist) => {
         if (request?.gates.checks[0]?.coveringTest?.file === "x.test.ts")
@@ -632,6 +634,33 @@ test.each(["runner", "slot"] as const)(
             cancel: async () => {},
           };
         return attach(handle, signal, request, hooks, persist);
+      };
+    } else {
+      const workers = new WorkerStore(t.f.store, t.f.deps.buildSha);
+      const inplace = mode !== "LAN slot";
+      workers.executor = () => ({ id: "executor", pid: process.pid, birth: "1", release_sha: "test-build" });
+      const remote = lanExecutor(workers, ["test/repo"], inplace);
+      t.f.deps.gateExecutor = {
+        ...remote,
+        async start(request, signal) {
+          if (request.gates.checks[0]?.coveringTest?.file !== "x.test.ts")
+            return executor.start(request, signal);
+          if (mode === "inplace before enqueue") return remote.start(request, signal);
+          return {
+            kind: remote.kind,
+            id: workers.enqueue(request, undefined, inplace),
+            startedAt: Date.now(),
+          };
+        },
+        attach(handle, signal, request, hooks, persist) {
+          if (handle.kind === "local") return executor.attach(handle, signal, request, hooks, persist);
+          if (inplace) throw new Error(reason);
+          return {
+            result: Promise.reject(new Error(reason)),
+            events: { async *[Symbol.asyncIterator]() {} },
+            cancel: async () => {},
+          };
+        },
       };
     }
     expect(await t.execute()).toBe("needs_human");
@@ -647,6 +676,57 @@ test.each(["runner", "slot"] as const)(
     expect(JSON.parse(t.f.store.getArtifact(t.run.id, "acceptance.json") ?? "null")).toEqual(t.outcome());
     expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(
       `not_assessed (x.test.ts › passes: ${reason})`,
+    );
+    if (mode === "inplace attachment" || mode === "LAN slot")
+      expect(new WorkerStore(t.f.store, t.f.deps.buildSha).jobs("1=1")).toMatchObject([
+        { state: "cancelled", attempt: 1, worker: null },
+      ]);
+    if (mode === "inplace before enqueue")
+      expect(new WorkerStore(t.f.store, t.f.deps.buildSha).jobs("1=1")).toEqual([]);
+  },
+);
+
+test.each(["leased", "retried", "missing", "resumed"] as const)(
+  "a remote failure with %s execution state is not a confirmed pre-start refusal",
+  async (state) => {
+    const t = await setup();
+    t.reply(() => ({ structured: metAll }));
+    const workers = new WorkerStore(t.f.store, t.f.deps.buildSha);
+    const remote = lanExecutor(workers, ["test/repo"]);
+    t.f.deps.gateExecutor = {
+      ...remote,
+      async start(request) {
+        const id = workers.enqueue(request);
+        if (state === "leased" || state === "resumed")
+          t.f.store.db.query("UPDATE gate_jobs SET state='leased',worker='runner' WHERE id=?").run(id);
+        else if (state === "retried") workers.fail(id, "previous attempt unknown");
+        else t.f.store.db.query("DELETE FROM gate_jobs WHERE id=?").run(id);
+        return { kind: "lan", id, startedAt: Date.now() };
+      },
+      attach() {
+        return {
+          result: Promise.reject(new Error("execution state unknown")),
+          events: { async *[Symbol.asyncIterator]() {} },
+          cancel: async () => {},
+        };
+      },
+    };
+    if (state === "resumed") {
+      t.f.deps.checkpointer = {
+        ...localCheckpointer(t.f.store),
+        checkpoint(_runId, label) {
+          if (label === "gate-started") throw new SimulatedTermination("saved unknown remote job");
+        },
+      };
+      expect(await t.execute()).toBe("running");
+      t.f.deps.checkpointer = undefined;
+      t.f.deps.gateExecutor = localExecutor();
+    }
+    expect(await t.execute()).toBe("failed");
+    expect(t.state()?.acceptance?.outcome).toBeUndefined();
+    expect(t.state()?.coveringTestRuns?.some((r) => r.unavailable)).toBe(false);
+    expect(t.f.store.getRun(t.run.id)?.error).toContain(
+      state === "resumed" ? "Unavailable gate executor: lan" : "execution state unknown",
     );
   },
 );

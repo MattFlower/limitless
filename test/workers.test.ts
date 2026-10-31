@@ -7757,7 +7757,13 @@ test("a worker preserves covering-test requests, fresh JUnit evidence and the ex
   const req = await request();
   writeFileSync(
     join(req.cwd, "x.test.ts"),
-    'import { describe, test } from "bun:test"; describe("outer", () => test("passes", () => {}));',
+    `import { describe, test, expect } from "bun:test";
+describe("outer", () => {
+  test("passes", () => {});
+  test("also passes", () => {});
+  test("fails", () => expect(1).toBe(2));
+  test${".skip"}("skipped", () => {});
+});`,
   );
   await sh(["git", "add", "."], { cwd: req.cwd });
   await sh(["git", "commit", "-qm", "covering worker fixture"], { cwd: req.cwd });
@@ -7769,8 +7775,12 @@ test("a worker preserves covering-test requests, fresh JUnit evidence and the ex
     checks: [
       {
         name: "test",
-        run: `${process.execPath} test -t '^outer passes$' ./x.test.ts`,
+        run: `${process.execPath} test -t '^outer (passes|also passes|fails|skipped|absent)$' ./x.test.ts`,
         coveringTest: { file: "x.test.ts", name: "outer passes" },
+        coveringTests: ["passes", "also passes", "fails", "skipped", "absent"].map((name) => ({
+          file: "x.test.ts",
+          name: `outer ${name}`,
+        })),
       },
     ],
   };
@@ -7786,6 +7796,16 @@ test("a worker preserves covering-test requests, fresh JUnit evidence and the ex
     expect(run.sha).toBe(req.headSha);
     expect(run.trackedClean).toBe(true);
     expect(run.checks[0]?.coveringTest).toEqual({ file: "x.test.ts", name: "outer passes" });
+    const evidence = [
+      { file: "x.test.ts", name: "outer passes" },
+      { file: "x.test.ts", name: "outer also passes" },
+      { file: "x.test.ts", name: "outer fails", reason: "test failed" },
+      { file: "x.test.ts", name: "outer skipped", reason: "named test skipped" },
+      { file: "x.test.ts", name: "outer absent", reason: "name matched no tests" },
+    ];
+    expect(run.checks[0]?.coveringTests).toEqual(evidence);
+    const events = JSON.parse(workers.jobs("1=1")[0]?.events ?? "[]");
+    expect(events).toContainEqual({ type: "check", phase: "check", result: run.checks[0] });
     expect(run.checks[0]?.executedCommand).toContain("--reporter=junit");
     expect(run.checks[0]?.command).toBe(req.gates.checks[0]?.run);
     expect(workers.jobs("1=1")).toMatchObject([

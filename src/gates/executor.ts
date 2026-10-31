@@ -64,6 +64,8 @@ export interface GateRequest {
   skipGateSlot?: boolean;
 }
 export type GateExecutor = Executor<GateRequest, GateRun> & {
+  /** Atomically stop an unleased job; false leaves execution state unknown. */
+  cancelBeforeStart?: (handle: ExecutionHandle) => boolean;
   canResume?: (handle: ExecutionHandle, env?: Record<string, string>, daemonPort?: number) => boolean;
   freshCheckoutFor?: (repo: string) => boolean;
 };
@@ -312,13 +314,29 @@ export async function executeGate(
   )
     await blockInterrupted(stored, executor, () => persist(stored));
   const handle = stored ?? (await executor.start(req, signal));
-  // A dispatched remote command may already be running before attach observes it.
-  if (handle.kind !== "local") hooks.onCheckStart?.();
+  let checkStarted = false;
+  const failedBeforeStart = () => {
+    if (!checkStarted && (handle.kind === "local" || executor.cancelBeforeStart?.(handle)))
+      hooks.onPreStartFailure?.();
+  };
   if (!stored) await persist(handle);
   let execution: Execution<GateRun>;
   try {
-    execution = executor.attach(handle, signal, req, hooks, persist);
+    execution = executor.attach(
+      handle,
+      signal,
+      req,
+      {
+        ...hooks,
+        onCheckStart() {
+          checkStarted = true;
+          hooks.onCheckStart?.();
+        },
+      },
+      persist,
+    );
   } catch (error) {
+    failedBeforeStart();
     onSettled();
     throw error;
   }
@@ -343,6 +361,7 @@ export async function executeGate(
     if (handle.kind === "local") Object.assign(result, await gateProvenance(req.cwd, signal, req.headSha));
     return result;
   } catch (error) {
+    failedBeforeStart();
     abort();
     throw error;
   } finally {
