@@ -1598,23 +1598,62 @@ export class Store {
     }, true);
   }
 
-  saveAcceptancePass({ repo, epic, pass, items, state }: AcceptancePass): void {
-    this.db
-      .query("UPDATE acceptance_passes SET items = ?, state = ? WHERE repo = ? AND epic = ? AND pass = ?")
-      .run(JSON.stringify(items), state, repo, epic, pass);
+  /** Applies `change` to the stored pass in one write transaction; a false return leaves it untouched. */
+  changeAcceptancePass(
+    { repo, epic, pass }: AcceptancePass,
+    change: (record: AcceptancePass) => boolean,
+  ): { changed: boolean; record: AcceptancePass } {
+    return this.transaction(() => {
+      const row = this.db
+        .query<
+          { ticket: number; run_id: string; sha: string; items: string; state: AcceptancePass["state"] },
+          [string, number, number]
+        >(
+          "SELECT ticket, run_id, sha, items, state FROM acceptance_passes WHERE repo = ? AND epic = ? AND pass = ?",
+        )
+        .get(repo, epic, pass);
+      if (!row) throw new Error(`acceptance pass ${pass} of ${repo}#${epic} is missing`);
+      const record: AcceptancePass = {
+        ...row,
+        repo,
+        epic,
+        pass,
+        runId: row.run_id,
+        items: JSON.parse(row.items),
+      };
+      const changed = change(record);
+      if (changed)
+        this.db
+          .query("UPDATE acceptance_passes SET items = ?, state = ? WHERE repo = ? AND epic = ? AND pass = ?")
+          .run(JSON.stringify(record.items), record.state, repo, epic, pass);
+      return { changed, record };
+    }, true);
   }
 
-  /** The epic's pass-limit effects, recorded once per epic by the first run that reaches the limit. */
-  acceptanceLimit(repo: string, epic: number, runId: string): { label: string; comment: string } {
+  /** Claims one pass-limit effect of the epic: only the caller that moves it from pending gets "claimed". */
+  claimAcceptanceLimit(
+    repo: string,
+    epic: number,
+    runId: string,
+    effect: "label" | "comment",
+  ): "claimed" | "requested" | "done" {
     repo = repo.toLowerCase();
-    this.db
-      .query("INSERT OR IGNORE INTO acceptance_epic_limits VALUES (?, ?, ?, 'pending', 'pending')")
-      .run(repo, epic, runId);
-    return this.db
-      .query<{ label: string; comment: string }, [string, number]>(
-        "SELECT label, comment FROM acceptance_epic_limits WHERE repo = ? AND epic = ?",
-      )
-      .get(repo, epic) as { label: string; comment: string };
+    return this.transaction(() => {
+      this.db
+        .query("INSERT OR IGNORE INTO acceptance_epic_limits VALUES (?, ?, ?, 'pending', 'pending')")
+        .run(repo, epic, runId);
+      const claimed = this.db
+        .query(
+          `UPDATE acceptance_epic_limits SET ${effect} = 'requested' WHERE repo = ? AND epic = ? AND ${effect} = 'pending'`,
+        )
+        .run(repo, epic).changes;
+      if (claimed) return "claimed";
+      return this.db
+        .query<Record<string, "requested" | "done">, [string, number]>(
+          `SELECT ${effect} FROM acceptance_epic_limits WHERE repo = ? AND epic = ?`,
+        )
+        .get(repo, epic)?.[effect] as "requested" | "done";
+    }, true);
   }
 
   finishAcceptanceLimit(repo: string, epic: number, effect: "label" | "comment"): void {

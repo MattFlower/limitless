@@ -11,7 +11,8 @@ import { lanExecutor } from "../src/gates/lan.ts";
 import { resolveRepo } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { type AcceptanceState, acceptanceEngine, acceptanceRunRequest } from "../src/pipeline/acceptance.ts";
-import { localCheckpointer, type RunState } from "../src/pipeline/context.ts";
+import { fileFollowUps } from "../src/pipeline/acceptance-follow-ups.ts";
+import { localCheckpointer, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { type Fault, SimulatedTermination } from "../src/pipeline/faults.ts";
 import { AcceptanceSchema } from "../src/pipeline/schemas.ts";
@@ -986,7 +987,7 @@ type FakeIssue = {
   parent?: number;
   blockedBy: number[];
 };
-/** A stateful in-memory GitHub for follow-up filing; `fail` interrupts one creation request. */
+/** A stateful in-memory GitHub for follow-up filing; `fail` and `labelFail` lose one write's response. */
 function fakeGitHub(t: Awaited<ReturnType<typeof setup>>, login = "factory") {
   t.f.cfg.githubQueue = { repos: ["test/repo"], trusted: ["owner"], maxIssueRuns: 1, pollSeconds: 180 };
   const issues: FakeIssue[] = [
@@ -1003,14 +1004,22 @@ function fakeGitHub(t: Awaited<ReturnType<typeof setup>>, login = "factory") {
     comments,
     calls,
     created,
-    fail: undefined as { at: number; landed: boolean } | undefined,
+    labelRequests: 0,
+    fail: undefined as { at: number; landed: boolean; connection?: boolean } | undefined,
+    labelFail: undefined as "termination" | "connection" | undefined,
+    intercept: undefined as ((args: string[]) => void) | undefined,
   };
+  const lost = (connection: boolean | undefined, what: string) =>
+    connection
+      ? new Error(`connection reset after ${what}`)
+      : new SimulatedTermination(`${what} response lost`);
   const issue = (by: (i: FakeIssue) => boolean) => {
     const found = issues.find(by);
     if (!found) throw new Error("HTTP 404");
     return found;
   };
   t.f.deps.gh = async (args) => {
+    fake.intercept?.(args);
     calls.push(args);
     const fields = Object.fromEntries(
       args.flatMap((a, i) =>
@@ -1020,7 +1029,13 @@ function fakeGitHub(t: Awaited<ReturnType<typeof setup>>, login = "factory") {
     const path = args[1] ?? "";
     if (path === "user") return JSON.stringify({ login });
     if (path === "repos/test/repo/issues/1/labels") {
-      labels.push(fields["labels[]"] ?? "");
+      if (!args.includes("POST")) return JSON.stringify(labels.map((name) => ({ name })));
+      fake.labelRequests++;
+      const label = fields["labels[]"] ?? "";
+      if (!labels.includes(label)) labels.push(label);
+      const fail = fake.labelFail;
+      fake.labelFail = undefined;
+      if (fail) throw lost(fail === "connection", "label");
       return "[]";
     }
     if (path.startsWith("repos/test/repo/issues/1/comments")) {
@@ -1042,7 +1057,7 @@ function fakeGitHub(t: Awaited<ReturnType<typeof setup>>, login = "factory") {
           parent: 1,
           blockedBy: [],
         });
-      if (fail) throw new SimulatedTermination("creation response lost");
+      if (fail) throw lost(fail.connection, "creation");
       return JSON.stringify({ data: { createIssue: { issue: { id: `I_${number}`, number } } } });
     }
     if (query.includes("addBlockedBy")) {
@@ -1266,4 +1281,104 @@ test("a model note cannot forge a marker or a requirement, and foreign markers a
   const outside = [...lines.slice(0, open), ...lines.slice(close + 1)];
   expect(outside.some((l) => /Requirement|New requirement|Carriage/.test(l))).toBe(false);
   expect(gh.issues.find((i) => i.number === 9)?.blockedBy).not.toContain(50);
+});
+
+test("a connection error after a creation ends needs-you naming the item, and a resume adopts it", async () => {
+  const t = await setup({ parent: gapParent, ticket: gapTicket });
+  const gh = fakeGitHub(t);
+  gh.fail = { at: 1, landed: true, connection: true };
+  t.reply(() => ({ structured: gapOutput() }));
+  expect(await t.execute()).toBe("needs_human");
+  const error = t.f.store.getRun(t.run.id)?.error ?? "";
+  expect(error).toContain("pass 1 follow-ups none filed");
+  expect(error).toContain("GitHub failed: connection reset after creation");
+  expect(error).toContain("U1's creation request is unconfirmed and is not sent again");
+  expect(error).toContain("U3 is not filed yet");
+  expect(gh.created).toHaveLength(1);
+  expect(JSON.parse(gh.passes()[0]?.items ?? "[]")).toEqual([
+    { item: "U1", state: "requested" },
+    { item: "U3", state: "pending" },
+    { item: "U5", state: "pending" },
+  ]);
+  expect(await t.execute()).toBe("needs_human");
+  expect(gh.created).toHaveLength(3);
+  expect(gh.issues.find((i) => i.number === 9)?.blockedBy).toEqual([100, 101, 102]);
+  expect(gh.passes()[0]?.state).toBe("complete");
+  expect(t.f.store.getRun(t.run.id)?.error).toContain("pass 1 follow-ups: #100, #101, #102");
+});
+
+test("concurrent coordinators of one run send each creation request once", async () => {
+  const t = await setup({ parent: gapParent, ticket: gapTicket });
+  const gh = fakeGitHub(t);
+  gh.intercept = (args) => {
+    if (args.join(" ").includes("subIssues")) throw new SimulatedTermination("stopped before the listing");
+  };
+  t.reply(() => ({ structured: gapOutput() }));
+  expect(await t.execute()).toBe("running");
+  gh.intercept = undefined;
+  const run = t.f.store.getRun(t.run.id);
+  const repo = run && t.f.store.getRepo(run.repoId);
+  if (!run || !repo) throw new Error("missing run");
+  const contexts = [1, 2].map(() => new RunContext(t.f.deps, run, repo, new AbortController().signal));
+  await Promise.allSettled(
+    contexts.map((ctx) => fileFollowUps(ctx, ctx.state.acceptance as AcceptanceState)),
+  );
+  expect(gh.created.map((c) => c.body.split("\n")[0]).sort()).toEqual(
+    ["U1", "U3", "U5"].map((item) => `<!-- limitless-acceptance:9:1:${item} -->`),
+  );
+  // A resume links what the racing coordinators could not and completes the pass.
+  expect(await t.execute()).toBe("needs_human");
+  expect(gh.created).toHaveLength(3);
+  expect(gh.issues.find((i) => i.number === 9)?.blockedBy.sort()).toEqual([100, 101, 102]);
+  expect(gh.passes()[0]?.state).toBe("complete");
+});
+
+/** Runs two counted passes with gaps, leaving the next run of the ticket past the limit. */
+async function exhaustPasses(t: Awaited<ReturnType<typeof setup>>) {
+  t.reply(() => ({ structured: gapOutput() }));
+  expect(await t.execute()).toBe("needs_human");
+  t.next();
+  await t.restart();
+  expect(await t.execute()).toBe("needs_human");
+}
+
+test.each(["termination", "connection"] as const)(
+  "a lost label response (%s) is reconciled on resume, never sent again",
+  async (kind) => {
+    const t = await setup({ parent: gapParent, ticket: gapTicket });
+    const gh = fakeGitHub(t);
+    await exhaustPasses(t);
+    t.next();
+    await t.restart();
+    gh.labelFail = kind;
+    expect(await t.execute()).toBe(kind === "termination" ? "running" : "needs_human");
+    if (kind === "connection")
+      expect(t.f.store.getRun(t.run.id)?.error).toContain("GitHub failed: connection reset after label");
+    expect(gh.comments).toHaveLength(0);
+    await t.restart();
+    expect(await t.execute()).toBe("needs_human");
+    t.next();
+    await t.restart();
+    expect(await t.execute()).toBe("needs_human");
+    expect(gh.labelRequests).toBe(1);
+    expect(gh.labels).toEqual(["limitless:needs-you"]);
+    expect(gh.comments).toHaveLength(1);
+    expect(gh.created).toHaveLength(6);
+  },
+);
+
+test("concurrent runs past the limit label and comment on the epic once", async () => {
+  const t = await setup({ parent: gapParent, ticket: gapTicket });
+  const gh = fakeGitHub(t);
+  await exhaustPasses(t);
+  const acceptance = t.state()?.acceptance as AcceptanceState;
+  const repo = t.f.store.getRepo(t.run.repoId);
+  if (!repo) throw new Error("missing repo");
+  const contexts = [t.next(), t.next()].map(
+    (run) => new RunContext(t.f.deps, run, repo, new AbortController().signal),
+  );
+  await Promise.allSettled(contexts.map((ctx) => fileFollowUps(ctx, acceptance)));
+  expect(gh.labelRequests).toBe(1);
+  expect(gh.comments).toHaveLength(1);
+  expect(gh.created).toHaveLength(6);
 });

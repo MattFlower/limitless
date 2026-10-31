@@ -87,6 +87,8 @@ an existing sub-issue of the epic whose first line is the marker and whose autho
 factory's posting login. A pass record (epic, pass, ticket SHA, filed issues) is written
 before the first GitHub write, and a creation request is sent at most once: after a restart, a
 request that the marker search can't find stops the run for you instead of being re-sent.
+Only the coordinator that durably claims a pending item sends its request, and a GitHub failure
+ends the run needs-you, naming the filed issues and the unconfirmed item.
 Each epic has at most two counted passes. When a later run still finds gaps, it files nothing,
 labels the epic `limitless:needs-you` and posts one comment there naming the ticket and run,
 once per epic. The run ends needs-you, listing the pass and filed issues or the reached limit.
