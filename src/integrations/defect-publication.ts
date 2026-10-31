@@ -45,7 +45,7 @@ type PrivacyDeps = {
 export type DefectPreparationDeps = PrivacyDeps & {
   repos: readonly Repo[];
   factory: string;
-  policy: (repo: Repo | string) => Promise<{ discreet: boolean } | undefined>;
+  policy: (repo: Repo | string) => { discreet: boolean } | undefined;
   identity: (repo: string) => Promise<GitHubIdentity | undefined>;
 };
 
@@ -171,6 +171,7 @@ const item = content.extend({
   pull_request: z.unknown().optional(),
 });
 export type DefectItem = z.infer<typeof item>;
+export const defectItemSchema = item;
 
 /** Shared issue/comment authentication; unavailable provenance requires reconciliation. */
 export function defectRecordStatus(
