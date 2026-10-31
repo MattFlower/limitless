@@ -71,7 +71,17 @@ async function setup(
     setup?: string;
     parent?: string;
     ticket?: string;
-    junit?: "stale" | "missing";
+    junit?:
+      | "stale"
+      | "missing"
+      | "empty"
+      | "whitespace"
+      | "no-match"
+      | "unsafe"
+      | "malformed"
+      | "exit126"
+      | "bun-missing"
+      | "spawn";
     checks?: GateCommand[];
     files?: Record<string, string>;
   } = {},
@@ -101,12 +111,22 @@ test("fails", () => expect(1).toBe(2));
 test${".skip"}("skipped", () => {});
 `,
   );
-  if (options.junit)
+  const reportEdits: Record<string, string> = {
+    stale: 'touch -t 200001010000 "$LIMITLESS_GATE_REPORT"',
+    missing: 'rm -f "$LIMITLESS_GATE_REPORT"',
+    empty: ': > "$LIMITLESS_GATE_REPORT"',
+    whitespace: 'printf " \n\t" > "$LIMITLESS_GATE_REPORT"',
+    "no-match": `printf '%s' '<testsuites><testsuite file="x.test.ts"><testcase name="unrelated"/></testsuite></testsuites>' > "$LIMITLESS_GATE_REPORT"`,
+    unsafe:
+      'mv "$LIMITLESS_GATE_REPORT" "$LIMITLESS_GATE_REPORT.target"; ln -s "$LIMITLESS_GATE_REPORT.target" "$LIMITLESS_GATE_REPORT"',
+    malformed: `printf '%s' '<testsuites><oops>' > "$LIMITLESS_GATE_REPORT"`,
+  };
+  if (options.junit && reportEdits[options.junit])
     writeFileSync(
       join(repoDir, "junit-evidence.sh"),
       `bun test -t '(?:^| )passes$' ./x.test.ts "$@"
 status=$?
-${options.junit === "stale" ? 'touch -t 200001010000 "$LIMITLESS_GATE_REPORT"' : 'rm -f "$LIMITLESS_GATE_REPORT"'}
+${reportEdits[options.junit]}
 exit "$status"
 `,
     );
@@ -129,7 +149,11 @@ exit "$status"
       if (check.run.includes(" -t ")) {
         targeted.push(check.run);
         requests.push(structuredClone(request));
-        if (options.junit) check.run = "bash ./junit-evidence.sh";
+        if (check.coveringTest?.file === "x.test.ts") {
+          if (options.junit === "bun-missing") check.run = `PATH=./absent-bin ${check.run}`;
+          else if (options.junit === "exit126") check.run = "exit 126; :";
+          else if (options.junit && reportEdits[options.junit]) check.run = "bash ./junit-evidence.sh";
+        }
       }
     return start(request, signal);
   };
@@ -144,6 +168,14 @@ exit "$status"
     bootSha: "test-build",
     gateExecutor: executor,
   });
+  if (options.junit === "spawn")
+    f.deps.confinement = {
+      ...fakeConfinement,
+      wrap: (cmd) =>
+        cmd.some((arg) => arg.includes(" -t ") && arg.includes("x.test.ts"))
+          ? [join(repoDir, "absent-runner")]
+          : cmd,
+    };
   factory = f;
   registerGithub(f, bare);
   const repo = await resolveRepo(f.store, "test/repo", cfg.githubMerge);
@@ -247,9 +279,14 @@ test("adjacent section references retain an unassessed requirement and prevent s
   await t.published();
 });
 
-test.each(["stale", "missing"] as const)(
+test.each([
+  ["stale", "JUnit report missing, stale or unsafe"],
+  ["unsafe", "JUnit report missing, stale or unsafe"],
+  ["malformed", "unparseable JUnit report"],
+  ["no-match", "name matched no tests"],
+] as const)(
   "%s JUnit evidence cannot satisfy acceptance despite successful execution",
-  async (junit) => {
+  async (junit, reason) => {
     const t = await setup({
       junit,
       parent: "## Goal\n- Required behaviour.",
@@ -260,19 +297,77 @@ test.each(["stale", "missing"] as const)(
     expect(t.state()?.coveringTestRuns?.[0]?.result).toMatchObject({
       ok: true,
       exitCode: 0,
-      coveringTest: { file: "x.test.ts", name: "passes", reason: "JUnit report missing, stale or unsafe" },
+      coveringTest: { file: "x.test.ts", name: "passes", reason },
     });
     expect(t.outcome().units).toEqual([
       {
         unit: "U1",
         verdict: "unmet",
         citations: [],
-        refusals: ["x.test.ts › passes: JUnit report missing, stale or unsafe"],
+        refusals: [`x.test.ts › passes: ${reason}`],
         note: "",
       },
     ]);
     expect(t.targeted).toHaveLength(1);
     await t.published();
+  },
+);
+
+test.each(["bun-missing", "exit126", "spawn", "missing", "empty", "whitespace"] as const)(
+  "a %s runner refusal is persisted for grouped identities before restart",
+  async (junit) => {
+    const t = await setup({
+      junit,
+      files: { "y.test.ts": 'import { test } from "bun:test"; test("independent", () => {});' },
+    });
+    const value = AcceptanceSchema.parse(metAll);
+    const [first, second] = value.items;
+    if (!first || !second) throw new Error("missing units");
+    first.tests.push({ file: "x.test.ts", name: "also passes" });
+    second.tests = [{ file: "y.test.ts", name: "independent" }];
+    t.reply(() => ({ structured: value }));
+    t.f.deps.checkpointer = {
+      ...localCheckpointer(t.f.store),
+      checkpoint(_runId, label) {
+        if (label === (junit === "spawn" ? "covering-test-recorded" : "gate-result"))
+          throw new SimulatedTermination("saved unavailable covering execution");
+      },
+    };
+    expect(await t.execute()).toBe("running");
+    const saved = t.state()?.coveringTestRuns?.filter((r) => r.file === "x.test.ts") ?? [];
+    expect(saved).toHaveLength(2);
+    const reason =
+      junit === "spawn"
+        ? saved[0]?.reason
+        : junit === "empty" || junit === "whitespace"
+          ? "JUnit report empty"
+          : "JUnit report missing";
+    expect(reason).toBeTruthy();
+    for (const record of saved) {
+      expect(record).toMatchObject({ unavailable: true, reason });
+      if (junit !== "spawn")
+        expect(record.result?.exitCode).toBe(junit === "bun-missing" ? 127 : junit === "exit126" ? 126 : 0);
+    }
+    expect(t.state()?.gateExecution).toBeUndefined();
+    t.f.deps.checkpointer = undefined;
+    expect(await t.execute()).toBe("needs_human");
+    expect(t.targeted).toHaveLength(2);
+    expect(t.calls()).toBe(1);
+    expect(t.outcome()).toMatchObject({
+      passed: false,
+      summary: "2 met, 1 not assessed",
+      units: [
+        {
+          verdict: "not_assessed",
+          citations: [],
+          refusals: [`x.test.ts › passes: ${reason}`, `x.test.ts › also passes: ${reason}`],
+        },
+        { verdict: "met" },
+        { verdict: "met" },
+      ],
+    });
+    expect(JSON.parse(t.f.store.getArtifact(t.run.id, "acceptance.json") ?? "null")).toEqual(t.outcome());
+    expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(`x.test.ts › passes: ${reason}`);
   },
 );
 
@@ -778,4 +873,80 @@ test("a per-unit cap is unavailable, but rejected evidence takes precedence", as
     refusals: ["x.test.ts › also passes: per-criterion limit reached"],
   });
   expect(t.outcome().units[1]?.refusals).toContain("x.test.ts › fails: test failed");
+});
+
+test.each([
+  ["targeted retries not configured", undefined, "not_assessed"],
+  ["per-criterion limit reached", undefined, "not_assessed"],
+  ["per-round limit reached", undefined, "not_assessed"],
+  ["covering tests do not support an option terminator (--) in retry_files", undefined, "not_assessed"],
+  ["expanded command is not a single bun test invocation", undefined, "not_assessed"],
+  ["targeted retries not configured", false, "unmet"],
+  ["unknown refusal: targeted retries not configured", undefined, "unmet"],
+  ["custom infrastructure refusal", true, "not_assessed"],
+] as const)("saved refusal %s with unavailable=%s resumes as %s", async (reason, unavailable, verdict) => {
+  const t = await setup();
+  t.reply(() => ({ structured: metAll }));
+  t.f.deps.checkpointer = {
+    ...localCheckpointer(t.f.store),
+    checkpoint(runId, label) {
+      if (label !== "acceptance-output") return;
+      const state = t.state();
+      if (!state) throw new Error("missing state");
+      state.coveringTestRuns = ["passes", "also passes"].map((name) => ({
+        file: "x.test.ts",
+        name,
+        verifiedSha: t.sha,
+        stageId: 0,
+        round: state.round,
+        reason,
+        ...(unavailable === undefined ? {} : { unavailable }),
+      }));
+      t.f.store.setRunState(runId, state);
+      throw new SimulatedTermination("saved legacy covering refusals");
+    },
+  };
+  expect(await t.execute()).toBe("running");
+  t.f.deps.checkpointer = undefined;
+  expect(await t.execute()).toBe("needs_human");
+  expect(t.targeted).toHaveLength(0);
+  expect(t.calls()).toBe(1);
+  expect(t.outcome()).toMatchObject({
+    passed: false,
+    units: [
+      { verdict, citations: [], refusals: [`x.test.ts › passes: ${reason}`] },
+      { verdict, citations: [], refusals: [`x.test.ts › also passes: ${reason}`] },
+      { verdict: "met" },
+    ],
+  });
+  expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(
+    `${verdict} (x.test.ts › passes: ${reason})`,
+  );
+});
+
+test("failed evidence wins over a missing report in another file", async () => {
+  const t = await setup({
+    junit: "missing",
+    files: {
+      "y.test.ts": 'import { test, expect } from "bun:test"; test("fails", () => expect(1).toBe(2));',
+    },
+  });
+  const value = AcceptanceSchema.parse(metAll);
+  const first = value.items[0];
+  if (!first) throw new Error("missing unit");
+  first.tests.push({ file: "y.test.ts", name: "fails" });
+  t.reply(() => ({ structured: value }));
+  expect(await t.execute()).toBe("needs_human");
+  expect(t.outcome()).toMatchObject({
+    passed: false,
+    units: [
+      {
+        verdict: "unmet",
+        citations: [],
+        refusals: ["x.test.ts › passes: JUnit report missing", "y.test.ts › fails: test failed"],
+      },
+      { verdict: "not_assessed" },
+      { verdict: "met" },
+    ],
+  });
 });

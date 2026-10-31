@@ -1887,7 +1887,10 @@ test.each([
   ["skipped", "named test skipped"],
   ["failed", "test failed"],
   ["errored", "test failed"],
-  ["missing", "JUnit report missing, stale or unsafe"],
+  ["missing", "JUnit report missing"],
+  ["empty", "JUnit report empty"],
+  ["stale-empty", "JUnit report missing, stale or unsafe"],
+  ["pre-existing-empty", "JUnit report existed before execution"],
   ["stale", "JUnit report missing, stale or unsafe"],
   ["symlink", "JUnit report missing, stale or unsafe"],
   ["pre-existing", "JUnit report existed before execution"],
@@ -1923,13 +1926,14 @@ test.each([
       `<testcase name="${title}"/>` +
       (outcome ? `<testcase name="${title}"><${outcome}/></testcase><testcase name="${title}"/>` : "");
     const xml = `<testsuites><testsuite file="${file}">${mode === "nested" ? `<testsuite name="outer"><testsuite name="inner">${cases}</testsuite></testsuite>` : cases}</testsuite></testsuites>`;
-    if (mode !== "missing") writeFileSync(path, mode === "malformed" ? "<testsuites><oops>" : xml);
+    if (mode !== "missing")
+      writeFileSync(path, mode.endsWith("empty") ? "" : mode === "malformed" ? "<testsuites><oops>" : xml);
     if (mode === "equal" || mode === "clock-lag") {
       utimesSync(path, filesystemBaseline / 1000, filesystemBaseline / 1000);
       expect(statSync(path).mtimeMs).toBe(filesystemBaseline);
     }
     if (mode === "clock-lag") expect(statSync(path).mtimeMs).toBeLessThan(Date.now());
-    if (mode === "stale") utimesSync(path, 1, 1);
+    if (mode === "stale" || mode === "stale-empty") utimesSync(path, 1, 1);
     if (mode === "symlink") {
       const target = join(cwd, "target.xml");
       writeFileSync(target, xml);
@@ -1947,9 +1951,10 @@ test.each([
       cwd,
       { file: "./x.test.ts", name },
       filesystemBaseline,
-      mode === "pre-existing",
+      mode === "pre-existing" || mode === "pre-existing-empty",
     );
     expect(junit.reason).toBe(reason);
+    expect(junit.reportUnavailable === true).toBe(mode === "missing" || mode === "empty");
     const run = coveringRun();
     if (!run.result) throw new Error("missing result");
     run.name = name;

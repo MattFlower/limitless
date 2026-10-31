@@ -21,6 +21,18 @@ export interface CoveringTestRun extends Test {
   reason?: string;
   unavailable?: boolean;
 }
+const infrastructureRefusals = new Set([
+  "targeted retries not configured",
+  "per-criterion limit reached",
+  "per-round limit reached",
+  "covering tests do not support an option terminator (--) in retry_files",
+  "expanded command is not a single bun test invocation",
+]);
+
+export function coveringTestUnavailable(run: CoveringTestRun | undefined): boolean {
+  return run?.unavailable ?? infrastructureRefusals.has(run?.reason ?? "");
+}
+
 export const coveringPattern = (name: string): string =>
   `(?:^| )${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
 const controls = (text: string) =>
@@ -200,10 +212,7 @@ export async function runCoveringRequests(
       }
       if (!built.command) {
         record.reason = built.reason;
-        record.unavailable =
-          built.reason === "targeted retries not configured" ||
-          built.reason === "covering tests do not support an option terminator (--) in retry_files" ||
-          built.reason === "expanded command is not a single bun test invocation";
+        record.unavailable = infrastructureRefusals.has(built.reason ?? "");
         await ctx.save();
         continue;
       }
@@ -262,6 +271,14 @@ export async function runCoveringRequests(
               }
             : undefined,
         );
+        if (
+          record.result?.coveringTest?.reportUnavailable &&
+          run.sha === sha &&
+          run.trackedClean === true &&
+          !record.result.incomplete &&
+          !confinementFailed(record.result)
+        )
+          Object.assign(record, { reason: record.result.coveringTest.reason, unavailable: true });
         if (!record.result) Object.assign(record, { reason: "missing check result", unavailable: !started });
       }
       ctx.store.finishStage(stage.id, "succeeded", "covering-test execution recorded");

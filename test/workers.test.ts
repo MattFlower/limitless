@@ -168,6 +168,31 @@ test("strict worker results and check events accept optional bounded skipped-tes
     expect(CheckEvent.safeParse({ type: "check", phase: "check", result }).success).toBe(false);
   }
 });
+test.each([undefined, false, true])(
+  "worker reports preserve covering-report availability: %s",
+  (reportUnavailable) => {
+    const evidence = {
+      file: "x.test.ts",
+      name: "passes",
+      reason: "JUnit report missing",
+      ...(reportUnavailable === undefined ? {} : { reportUnavailable }),
+    };
+    const result = {
+      name: "test",
+      command: "bun test",
+      ok: false,
+      exitCode: 127,
+      durationMs: 1,
+      output: "",
+      coveringTest: evidence,
+      coveringTests: [evidence],
+    };
+    expect(
+      Result.parse({ sha: releaseSha, run: { setupOk: true, setup: [], checks: [result] } }).run.checks,
+    ).toEqual([result]);
+    expect(CheckEvent.parse({ type: "check", phase: "check", result }).result).toEqual(result);
+  },
+);
 const fixture = seeded(async (dir) => {
   await sh(["git", "init", "-q", "--template=", dir], { cwd: dir });
   writeFileSync(join(dir, "tracked"), "gate bytes\n");

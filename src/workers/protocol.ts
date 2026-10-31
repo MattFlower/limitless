@@ -70,11 +70,25 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
       command: z.string(),
       executedCommand: z.string().optional(),
       coveringTest: z
-        .object({ file: z.string(), name: z.string(), reason: z.string().optional() })
+        .object({
+          file: z.string(),
+          name: z.string(),
+          reason: z.string().optional(),
+          reportUnavailable: z.boolean().optional(),
+        })
         .strict()
         .optional(),
       coveringTests: z
-        .array(z.object({ file: z.string(), name: z.string(), reason: z.string().optional() }).strict())
+        .array(
+          z
+            .object({
+              file: z.string(),
+              name: z.string(),
+              reason: z.string().optional(),
+              reportUnavailable: z.boolean().optional(),
+            })
+            .strict(),
+        )
         .optional(),
       ok: z.boolean(),
       exitCode: z.number().int().nullable(),

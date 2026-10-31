@@ -18,6 +18,7 @@ import {
   acceptanceCoveringPolicy,
   citedFileRefusal,
   coveringTestRefusal,
+  coveringTestUnavailable,
   runCoveringRequests,
   selectCoveringRequests,
   succeededCoveringStages,
@@ -329,7 +330,7 @@ async function assess(
       const refusal = capped ?? coveringTestRefusal(record, sha, succeeded);
       if (refusal || !record) {
         refusals.push(`${test.file} › ${test.name}: ${refusal}`);
-        if (!capped && !record?.unavailable) rejected = true;
+        if (!capped && !coveringTestUnavailable(record)) rejected = true;
       } else citations.push(coveringCitation(record, sha));
     }
     const tests = citations.length;
