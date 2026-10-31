@@ -5,8 +5,8 @@ import { type Repo, type Run, TERMINAL_STATUSES } from "./core/types.ts";
 import type { Store } from "./db/store.ts";
 import { FEED_RETENTION_DAYS } from "./feed.ts";
 import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
-import { cacheGit } from "./git/command.ts";
-import { cachePath, removeIterationRefs, withRepoLock, worktreeOwner } from "./git/repos.ts";
+import { cacheGit, worktreeGit } from "./git/command.ts";
+import { cachePath, withRepoLock, worktreeOwner } from "./git/repos.ts";
 import { sh } from "./util/proc.ts";
 
 const DAY = 86_400_000;
@@ -85,14 +85,54 @@ export async function collectGarbage(
   const workRoot = resolve(cfg.paths.work);
   const runRoot = resolve(cfg.paths.runs);
 
-  if (!dryRun)
-    for (const run of store.listRuns({ status: [...TERMINAL_STATUSES], limit: Number.MAX_SAFE_INTEGER })) {
-      const repo = repos.get(run.repoId);
-      if (repo)
-        await removeIterationRefs(cfg.paths, repo, run.id).catch((error: unknown) => {
-          result.errors.push(`${run.id} iterations: ${(error as Error).message}`);
-        });
+  const iterationRepos = new Set<string>();
+  for (const repo of repos.values()) {
+    const cache = cachePath(cfg.paths, repo);
+    try {
+      if (existsSync(cache)) iterationRepos.add(realpathSync(cache));
+    } catch (error) {
+      result.errors.push(`${repo.slug} iterations: ${(error as Error).message}`);
     }
+    if (repo.kind !== "local" || !repo.localPath || !existsSync(repo.localPath)) continue;
+    try {
+      // Registered sources are user-owned and may be linked worktrees without a sidecar.
+      const owner = await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+        cwd: repo.localPath,
+      });
+      iterationRepos.add(realpathSync(owner.stdout.trim()));
+    } catch (error) {
+      result.errors.push(`${repo.slug} iterations: ${(error as Error).message}`);
+    }
+  }
+  for (const cwd of iterationRepos) {
+    try {
+      await withRepoLock(cwd, async () => {
+        const listing = await worktreeGit(
+          ["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/limitless/iterations/"],
+          { cwd },
+        );
+        const byRun = new Map<string, string[]>();
+        for (const line of listing.stdout.trim().split("\n").filter(Boolean)) {
+          const match = /^refs\/limitless\/iterations\/([^/\s]+)\/\S+ ([a-f0-9]+)$/.exec(line);
+          if (!match?.[1] || !match[2]) throw new Error("Invalid iteration ref listing");
+          const [ref = "", sha = ""] = line.split(" ");
+          const deletions = byRun.get(match[1]) ?? [];
+          deletions.push(`delete ${ref} ${sha}\n`);
+          byRun.set(match[1], deletions);
+        }
+        const batch = [...byRun]
+          .flatMap(([id, deletions]) => {
+            const run = store.getRun(id);
+            return !run || TERMINAL_STATUSES.includes(run.status) ? deletions : [];
+          })
+          .join("");
+        if (!dryRun && batch)
+          await worktreeGit(["git", "update-ref", "--no-deref", "--stdin"], { cwd, stdin: batch });
+      });
+    } catch (error) {
+      result.errors.push(`${cwd} iterations: ${(error as Error).message}`);
+    }
+  }
 
   for (const run of finished) {
     const days =

@@ -1,5 +1,13 @@
-import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -17,6 +25,7 @@ import {
   removeWorktree,
 } from "../src/git/repos.ts";
 import { startHttp } from "../src/server/http.ts";
+import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { testWaits } from "./wait-support.ts";
 
@@ -98,7 +107,7 @@ test("cancelling a parked run cleans its iteration refs without waiting for GC",
 });
 
 test.each(["cache", "legacy", "linked"])(
-  "terminal refs in %s are cleaned without a worktree",
+  "terminal and orphan refs in %s are cleaned without a worktree",
   async (owner) => {
     const statuses: RunStatus[] = [...TERMINAL_STATUSES, "queued", "running", "waiting", "waiting_input"];
     const records = [];
@@ -123,30 +132,161 @@ test.each(["cache", "legacy", "linked"])(
       const previous = await headSha(cwd);
       writeFileSync(join(cwd, "iteration.txt"), "second\n");
       await commitAll(cwd, "second", { boundary: base, runId: record.id });
+      writeFileSync(join(cwd, "iteration.txt"), "third\n");
+      await commitAll(cwd, "third", { boundary: base, runId: record.id });
       if (status === "queued") store.setRunState(record.id, { parked: true });
       await removeWorktree(cfg.paths, repo, cwd);
       records.push({ ...record, status, previous });
     }
     const cache = legacy ? repoDir : cachePath(cfg.paths, repo);
-    await worktreeGit(
-      ["git", "update-ref", "refs/limitless/iterations/unrelated/keep", records[0]?.previous ?? ""],
-      { cwd: cache },
+    const orphan = "refs/limitless/iterations/orphan.old/keep";
+    const outside = "refs/limitless/other/keep";
+    for (const ref of [orphan, outside])
+      await worktreeGit(["git", "update-ref", ref, records[0]?.previous ?? ""], { cwd: cache });
+    const refs = async () =>
+      (await sh(["git", "for-each-ref", "--format=%(refname)", "refs/limitless/"], { cwd: cache })).stdout
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .sort();
+    const symbolic = "refs/limitless/iterations/orphan/symbolic";
+    await sh(["git", "symbolic-ref", symbolic, outside], { cwd: cache });
+    const before = await refs();
+    expect((await collectGarbage(store, cfg, { now, dryRun: true })).errors).toEqual([]);
+    expect(await refs()).toEqual(before);
+    const removedIds = records.filter((r) => TERMINAL_STATUSES.includes(r.status)).map((r) => r.id);
+    const remaining = before.filter(
+      (ref) =>
+        ref !== orphan &&
+        ref !== symbolic &&
+        !removedIds.some((id) => ref.startsWith(`refs/limitless/iterations/${id}/`)),
     );
-    await collectGarbage(store, cfg, { now, dryRun: true });
-    for (const record of records) expect(await iterationRefs(cache, record.id)).toHaveLength(1);
     for (let pass = 0; pass < 2; pass++) {
-      expect((await collectGarbage(store, cfg, { now })).errors).toEqual([]);
+      const commands = spyOn(proc, "sh");
+      try {
+        expect((await collectGarbage(store, cfg, { now })).errors).toEqual([]);
+        const listings = commands.mock.calls.filter(([cmd]) => cmd.includes("for-each-ref"));
+        expect(listings).toHaveLength(legacy ? 1 : 2);
+      } finally {
+        commands.mockRestore();
+      }
+      expect(await refs()).toEqual(remaining);
       for (const record of records) {
         expect(await iterationRefs(cache, record.id)).toHaveLength(
-          TERMINAL_STATUSES.includes(record.status) ? 0 : 1,
+          TERMINAL_STATUSES.includes(record.status) ? 0 : 2,
         );
         if (!TERMINAL_STATUSES.includes(record.status))
           expect((await sh(["git", "cat-file", "-e", record.previous], { cwd: cache })).exitCode).toBe(0);
       }
-      expect(await iterationRefs(cache, "unrelated")).toHaveLength(1);
     }
   },
 );
+
+// Model Git at the process boundary, recording hardening/discovery calls as well as ref commands.
+function recordingGit(initial: Map<string, Map<string, string>>, fail?: string) {
+  const calls: { cmd: string[]; cwd: string; stdin?: string }[] = [];
+  const runner = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+    const cwd = realpathSync(opts.cwd);
+    calls.push({ cmd, cwd, stdin: opts.stdin });
+    const common = initial.has(cwd) ? cwd : realpathSync(join(cwd, ".git"));
+    let stdout = "";
+    if (cmd.includes("--version")) stdout = "git version 2.45.0\n";
+    else if (cmd.includes("var")) stdout = "/dev/null\n";
+    else if (cmd.includes("rev-parse"))
+      stdout = cmd.includes("--show-object-format") ? `${common}\n${common}\nsha1\n` : `${common}\n`;
+    else if (cmd.includes("for-each-ref")) {
+      const prefix = cmd.at(-1) ?? "";
+      stdout = [...(initial.get(cwd) ?? [])]
+        .filter(([ref]) => ref.startsWith(prefix))
+        .map(([ref, sha]) => `${ref} ${sha}\n`)
+        .join("");
+    } else if (cmd.includes("update-ref")) {
+      if (cwd === fail) throw new Error("injected ref cleanup failure");
+      if (opts.stdin) {
+        for (const line of opts.stdin.trim().split("\n")) {
+          const [action, ref, sha] = line.split(" ");
+          expect(action).toBe("delete");
+          expect(initial.get(cwd)?.get(ref ?? "")).toBe(sha);
+          initial.get(cwd)?.delete(ref ?? "");
+        }
+      } else if (cmd.includes("-d")) initial.get(cwd)?.delete(cmd.at(-1) ?? "");
+      else throw new Error(`unexpected mutation: ${cmd.join(" ")}`);
+    } else if (!cmd.includes("config")) throw new Error(`unexpected command: ${cmd.join(" ")}`);
+    return { stdout, stderr: "", exitCode: 0 };
+  });
+  return { calls, restore: () => runner.mockRestore() };
+}
+
+test("iteration cleanup Git calls are bounded with 3 and 500 young terminal runs", async () => {
+  const ids = Array.from({ length: 3 }, () => run("succeeded", 0).id);
+  const common = realpathSync(join(repoDir, ".git"));
+  const sha = "a".repeat(40);
+  const refs = ids.flatMap((id) =>
+    ["first", "second"].map((name) => `refs/limitless/iterations/${id}/${name}`),
+  );
+  // Two registrations share a common repository, even without runs on one registration.
+  const { id: _, createdAt: __, ...registration } = repo;
+  store.upsertRepo({ ...registration, slug: "local/alias" });
+  const counts = [];
+  for (const history of [3, 500]) {
+    if (history === 500) for (let i = 3; i < 500; i++) run("succeeded", 0);
+    const current = new Map(refs.map((ref) => [ref, sha]));
+    const fake = recordingGit(new Map([[common, current]]));
+    try {
+      expect((await collectGarbage(store, cfg, { now })).errors).toEqual([]);
+      expect(current.size).toBe(0);
+      const listings = fake.calls.filter(({ cmd }) => cmd.includes("for-each-ref"));
+      expect(listings).toHaveLength(1);
+      expect(listings[0]?.cmd.at(-1)).toBe("refs/limitless/iterations/");
+      const batches = fake.calls.filter(({ cmd }) => cmd.includes("update-ref"));
+      expect(batches).toHaveLength(1);
+      expect(batches[0]?.cmd).toContain("--stdin");
+      expect(batches[0]?.stdin?.trim().split("\n").sort()).toEqual(
+        refs.map((ref) => `delete ${ref} ${sha}`).sort(),
+      );
+      counts.push(fake.calls.length);
+      expect(fake.calls.length).toBeLessThanOrEqual(10);
+      fake.calls.length = 0;
+      expect((await collectGarbage(store, cfg, { now })).errors).toEqual([]);
+      expect(fake.calls.filter(({ cmd }) => cmd.includes("update-ref"))).toEqual([]);
+    } finally {
+      fake.restore();
+    }
+  }
+  expect(counts[1]).toBeLessThanOrEqual(counts[0] ?? 0);
+});
+
+test("iteration cleanup visits repositories without runs and isolates repository failures", async () => {
+  const common = realpathSync(join(repoDir, ".git"));
+  const cache = cachePath(cfg.paths, repo);
+  await sh(["git", "clone", "-q", "--bare", repoDir, cache], { cwd: root });
+  const cacheCommon = realpathSync(cache);
+  const ref = "refs/limitless/iterations/orphan/first";
+  const sha = "a".repeat(40);
+  const sourceRefs = new Map([[ref, sha]]);
+  const cacheRefs = new Map([[ref, sha]]);
+  const fake = recordingGit(
+    new Map([
+      [common, sourceRefs],
+      [cacheCommon, cacheRefs],
+    ]),
+    cacheCommon,
+  );
+  try {
+    expect((await collectGarbage(store, cfg, { now, dryRun: true })).errors).toEqual([]);
+    expect(sourceRefs.size).toBe(1);
+    expect(cacheRefs.size).toBe(1);
+    expect(fake.calls.some(({ cmd }) => cmd.includes("update-ref"))).toBe(false);
+    const result = await collectGarbage(store, cfg, { now });
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain("iterations: injected ref cleanup failure");
+    expect(result.errors[0]).toContain(cacheCommon);
+    expect(sourceRefs.size).toBe(0);
+    expect(cacheRefs.size).toBe(1);
+  } finally {
+    fake.restore();
+  }
+});
 
 test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal worktrees", async () => {
   const cases: [RunStatus, number, boolean][] = [
