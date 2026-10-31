@@ -71,8 +71,25 @@ application of `acceptance` was by an account in `[github.queue] trusted` (case-
 A missing or untrusted application refuses the ticket; an earlier trusted application does
 not approve a later untrusted one. The ticket needs a parent, and both bodies must pass the
 trusted-author and last-editor checks. Acceptance runs retain the lifecycle labels and only
-the fixed started and needs-you comments, carrying the run id and UI link; they make no other
-GitHub writes, including failed or cancelled comments.
+the fixed started and needs-you comments, carrying the run id and UI link, and post no failed or
+cancelled comments. Their only other GitHub writes file follow-ups, as described below.
+
+When the engine judges a unit `partly_met`, `unmet` or `regressed`, the run files one follow-up
+per top-level item with such a gap (the item and its nested sub-items); `met`, `not_assessed`
+and `manual` units file nothing. Each follow-up is created as a sub-issue of the epic (the
+ticket's parent) and added as a native blocker of the acceptance ticket, so the ticket runs
+again only after its follow-ups close. Follow-ups get no labels, in particular no priority
+label: prioritizing them is the owner's or orchestrator's approval. Line 1 of the body is the
+marker `<!-- limitless-acceptance:<ticket>:<pass>:<item> -->`; the body quotes the item and each
+gap unit from the epic, the verdict and the engine's citations and refusals, and puts the
+reader's note under "Reviewer's note (data)" in a quoted, fenced block. Before creating, the run adopts
+an existing sub-issue of the epic whose first line is the marker and whose author is the
+factory's posting login. A pass record (epic, pass, ticket SHA, filed issues) is written
+before the first GitHub write, and a creation request is sent at most once: after a restart, a
+request that the marker search can't find stops the run for you instead of being re-sent.
+Each epic has at most two counted passes. When a later run still finds gaps, it files nothing,
+labels the epic `limitless:needs-you` and posts one comment there naming the ticket and run,
+once per epic. The run ends needs-you, listing the pass and filed issues or the reached limit.
 
 Operators can run `limitless accept <owner/name>#<n>` without queue scheduling eligibility or the label.
 The repository must be listed in `[github.queue] repos` (case-insensitive), with a nonempty

@@ -415,6 +415,16 @@ export class IssueClaimed extends Error {
   }
 }
 export type GitHubComment = { repo: string; id: number };
+export type AcceptancePass = {
+  repo: string;
+  epic: number;
+  pass: number;
+  ticket: number;
+  runId: string;
+  sha: string;
+  items: { item: string; state: "pending" | "requested" | "filed"; issue?: number }[];
+  state: "filing" | "complete";
+};
 export class CommentProcessed extends Error {}
 
 const RUN_SELECT = "SELECT runs.*, repos.slug AS repo_slug FROM runs JOIN repos ON repos.id = runs.repo_id";
@@ -1554,6 +1564,63 @@ export class Store {
           (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
         ),
       );
+  }
+
+  /** The run's own pass for the epic, else the next one claimed; null once `limit` passes exist. */
+  claimAcceptancePass(claim: Omit<AcceptancePass, "pass" | "state">, limit: number): AcceptancePass | null {
+    const repo = claim.repo.toLowerCase();
+    return this.transaction(() => {
+      const rows = this.db
+        .query<
+          { pass: number; run_id: string; items: string; state: AcceptancePass["state"] },
+          [string, number]
+        >(
+          "SELECT pass, run_id, items, state FROM acceptance_passes WHERE repo = ? AND epic = ? ORDER BY pass",
+        )
+        .all(repo, claim.epic);
+      const own = rows.find((r) => r.run_id === claim.runId);
+      if (own) return { ...claim, repo, pass: own.pass, items: JSON.parse(own.items), state: own.state };
+      if (rows.length >= limit) return null;
+      const record: AcceptancePass = { ...claim, repo, pass: rows.length + 1, state: "filing" };
+      this.db
+        .query("INSERT INTO acceptance_passes VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(
+          repo,
+          claim.epic,
+          record.pass,
+          claim.ticket,
+          claim.runId,
+          claim.sha,
+          JSON.stringify(claim.items),
+          "filing",
+        );
+      return record;
+    }, true);
+  }
+
+  saveAcceptancePass({ repo, epic, pass, items, state }: AcceptancePass): void {
+    this.db
+      .query("UPDATE acceptance_passes SET items = ?, state = ? WHERE repo = ? AND epic = ? AND pass = ?")
+      .run(JSON.stringify(items), state, repo, epic, pass);
+  }
+
+  /** The epic's pass-limit effects, recorded once per epic by the first run that reaches the limit. */
+  acceptanceLimit(repo: string, epic: number, runId: string): { label: string; comment: string } {
+    repo = repo.toLowerCase();
+    this.db
+      .query("INSERT OR IGNORE INTO acceptance_epic_limits VALUES (?, ?, ?, 'pending', 'pending')")
+      .run(repo, epic, runId);
+    return this.db
+      .query<{ label: string; comment: string }, [string, number]>(
+        "SELECT label, comment FROM acceptance_epic_limits WHERE repo = ? AND epic = ?",
+      )
+      .get(repo, epic) as { label: string; comment: string };
+  }
+
+  finishAcceptanceLimit(repo: string, epic: number, effect: "label" | "comment"): void {
+    this.db
+      .query(`UPDATE acceptance_epic_limits SET ${effect} = 'done' WHERE repo = ? AND epic = ?`)
+      .run(repo.toLowerCase(), epic);
   }
 
   latestIssueRun(repo: string, number: number): Run | null {

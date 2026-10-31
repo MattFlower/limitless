@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { type AcceptanceSnapshot, groupAcceptanceUnits, resolveIntent } from "../src/pipeline/acceptance.ts";
+import { type AcceptanceSnapshot, resolveIntent } from "../src/pipeline/acceptance.ts";
+import { groupAcceptanceUnits } from "../src/pipeline/acceptance-follow-ups.ts";
 
 const issue = (number: number, body: string) => ({ number, body, author: { login: "owner" } });
 // The ticket's intent lines start at line 4 of its body.

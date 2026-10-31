@@ -180,6 +180,13 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
     blocks.push(
       "## Acceptance",
       `Checked \`${acceptance.sha}\`: ${acceptance.summary}`,
+      ...(acceptance.followUps?.limit
+        ? ["Pass limit reached: the epic was labelled `limitless:needs-you` and nothing more was filed."]
+        : acceptance.followUps
+          ? [
+              `Follow-ups (pass ${acceptance.followUps.pass}): ${acceptance.followUps.issues.map((n) => `#${n}`).join(", ")}`,
+            ]
+          : []),
       ...acceptance.units.map((u) =>
         reportText(
           "verifier",

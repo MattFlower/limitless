@@ -13,6 +13,7 @@ import {
   readFileAt,
 } from "../git/repos.ts";
 import { type IssueText, issueTextRefusal } from "../integrations/issue-trust.ts";
+import { fileFollowUps } from "./acceptance-follow-ups.ts";
 import { CancelledError, NeedsHumanError, type RunContext } from "./context.ts";
 import {
   acceptanceCoveringPolicy,
@@ -61,6 +62,7 @@ export interface AcceptanceState {
     }[];
     summary: string;
     passed: boolean;
+    followUps?: { pass?: number; issues: number[]; limit?: boolean };
   };
 }
 
@@ -208,17 +210,6 @@ export function resolveIntent({ ticket, parent }: AcceptanceSnapshot): Acceptanc
   return units;
 }
 
-export function groupAcceptanceUnits(manifest: AcceptanceUnit[]): Map<string, AcceptanceUnit[]> {
-  const groups = new Map<string, AcceptanceUnit[]>();
-  for (const unit of manifest) {
-    const item = unit.item ?? unit.id;
-    const group = groups.get(item) ?? [];
-    group.push(unit);
-    groups.set(item, group);
-  }
-  return groups;
-}
-
 export async function prepareAcceptance(ctx: RunContext): Promise<void> {
   const acceptance = ctx.state.acceptance as AcceptanceState;
   await ctx.stage("prepare", async () => {
@@ -299,8 +290,23 @@ export async function runAcceptance(ctx: RunContext): Promise<void> {
     saveReport(ctx, buildReportArtifacts(ctx, acceptance.outcome.passed));
     return { summary: acceptance.outcome.summary, value: acceptance.outcome };
   });
-  if (!outcome.passed) throw new NeedsHumanError(`Acceptance: ${outcome.summary}`);
+  if (outcome.passed) return;
+  const filed = await fileFollowUps(ctx, acceptance);
+  if (filed) {
+    outcome.followUps = filed;
+    await ctx.save("acceptance-follow-ups");
+    ctx.artifact("acceptance.json", "acceptance", JSON.stringify(outcome, null, 2));
+    saveReport(ctx, buildReportArtifacts(ctx, false));
+  }
+  throw new NeedsHumanError(`Acceptance: ${outcome.summary}${followUpSummary(filed)}`);
 }
+
+const followUpSummary = (filed: NonNullable<AcceptanceState["outcome"]>["followUps"]) =>
+  !filed
+    ? ""
+    : filed.limit
+      ? "; pass limit reached, so the epic was labelled limitless:needs-you"
+      : `; pass ${filed.pass} follow-ups: ${filed.issues.map((n) => `#${n}`).join(", ")}`;
 
 async function assess(
   ctx: RunContext,
