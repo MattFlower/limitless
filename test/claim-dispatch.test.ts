@@ -1,17 +1,21 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import * as subprocess from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { Store } from "../src/db/store.ts";
 import { cacheGit, worktreeGit, worktreeGitScope } from "../src/git/command.ts";
 import * as hardening from "../src/git/hardening.ts";
 import { githubRetry, pushBranch, remoteBranchSha } from "../src/git/repos.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
-import { bindClaim, claimScope } from "../src/integrations/claim-guard.ts";
+import { bindClaim, claimGuard, claimScope } from "../src/integrations/claim-guard.ts";
 import { runGh } from "../src/integrations/github.ts";
 import * as identity from "../src/integrations/github-identity.ts";
 import type { LeaseHandle } from "../src/integrations/leases.ts";
+import { bindRunClaim, renewRunClaim } from "../src/pipeline/run-claim.ts";
+import { type ClockSample, windowOpen } from "../src/util/claim-clock.ts";
 import {
   CommandError,
   processBootInspection,
@@ -59,6 +63,58 @@ function noSpawn() {
   });
   restores.push(() => spawn.mockRestore());
   return spawn;
+}
+
+function durableAuthority(terminal = false) {
+  const store = new Store(":memory:");
+  restores.push(() => store.close());
+  const repo = store.upsertRepo({
+    slug: handle.repo,
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const run = store.createRun(repo, {
+    repo: repo.slug,
+    prompt: "work",
+    sourceRef: { kind: "issue", repo: repo.slug, number: 1 },
+  });
+  const now = { inclusive: 1_000, exclusive: 1_000 };
+  let anchor: ClockSample | null = null;
+  const binding = bindClaim(
+    { windowOpen: () => windowOpen(anchor, now) },
+    { ...handle, run: run.id },
+    () => false,
+  );
+  const execution = bindRunClaim(run, store, {
+    binding,
+    leases: {
+      update: async () => {
+        anchor = { ...now };
+        return "applied";
+      },
+    },
+  });
+  return {
+    claim: execution.binding,
+    execution,
+    now,
+    store,
+    run,
+    error: new ClaimWaitError("cancelled"),
+    close: () =>
+      store.updateRun(
+        run.id,
+        terminal ? { status: "needs_human", error: "rejected" } : { error: "cancelled by owner" },
+        {
+          postMergeRejection: { reason: "rejected" },
+          terminalReason: "rejected",
+          needsHumanReason: "rejected",
+        },
+      ),
+  };
 }
 
 for (const app of [false, true])
@@ -119,11 +175,18 @@ async function repository() {
   };
 }
 
-test.each(["ls-remote", "push"])(
-  "remote %s rechecks claims after real cacheGit preparation",
-  async (command) => {
+test.each([
+  ["ls-remote", "window"],
+  ["push", "window"],
+  ["ls-remote", "cancelled"],
+  ["push", "terminal"],
+] as const)(
+  "remote %s rechecks the %s execution authority after real cacheGit preparation",
+  async (command, kind) => {
     const { cwd, repo } = await repository();
-    const a = authority();
+    const durable = kind === "window" ? null : durableAuthority(kind === "terminal");
+    if (durable) await renewRunClaim(durable.execution);
+    const a = durable ?? authority();
     const entered = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<void>();
     const harden = hardening.harden;
@@ -155,7 +218,8 @@ test.each(["ls-remote", "push"])(
     await entered.promise;
     a.close();
     resume.resolve();
-    expect(await work).toBe(a.error);
+    if (durable) expect(await work).toEqual(a.error);
+    else expect(await work).toBe(a.error);
     expect(spawn.mock.calls.filter(([, args]) => Array.isArray(args) && args.includes(command))).toHaveLength(
       0,
     );
@@ -197,7 +261,7 @@ test("remote retry checks authority after the injected retry pause", async () =>
   expect(transports).toBe(1);
 });
 
-test.each(["loss", "cancelled", "unguarded"])(
+test.each(["loss", "cancelled", "unguarded", "durable-cancelled", "terminal"])(
   "final dispatch follows recorded recovery: %s",
   async (kind) => {
     const store = new Store(":memory:");
@@ -213,11 +277,16 @@ test.each(["loss", "cancelled", "unguarded"])(
     const entered = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<number[]>();
     const error = kind === "loss" ? new ClaimLostError() : new ClaimWaitError("cancelled");
+    const a =
+      kind === "durable-cancelled" || kind === "terminal" ? durableAuthority(kind === "terminal") : null;
+    if (a) await renewRunClaim(a.execution);
     let closed = false;
     const sleep = spyOn(Bun, "sleep").mockResolvedValue(undefined);
     restores.push(() => sleep.mockRestore());
-    const spawn = spyOn(subprocess, "spawn");
+    const spawn = a ? noSpawn() : spyOn(subprocess, "spawn");
     restores.push(() => spawn.mockRestore());
+    const dispatch = (opts: Parameters<typeof runProcess>[0]) =>
+      claimScope.run(a ? [a.claim] : [], () => runProcess(opts));
     const work = processBootInspection.run(
       () => "test",
       () =>
@@ -241,7 +310,7 @@ test.each(["loss", "cancelled", "unguarded"])(
                 cleanups: store,
               },
               () =>
-                runProcess({
+                dispatch({
                   cmd: ["/bin/echo", "ok"],
                   cwd: process.cwd(),
                   env: process.env as Record<string, string>,
@@ -249,7 +318,8 @@ test.each(["loss", "cancelled", "unguarded"])(
                     kind === "unguarded"
                       ? undefined
                       : () => {
-                          if (closed) throw error;
+                          if (a) claimGuard();
+                          else if (closed) throw error;
                         },
                 }),
             ),
@@ -258,12 +328,14 @@ test.each(["loss", "cancelled", "unguarded"])(
     const outcome = work.catch((e) => e);
     await entered.promise;
     closed = true;
+    a?.close();
     resume.resolve([]);
     if (kind === "unguarded") {
       expect(await outcome).toMatchObject({ exitCode: 0, stdout: "ok\n" });
       expect(spawn).toHaveBeenCalledTimes(1);
     } else {
-      expect(await outcome).toBe(error);
+      if (a) expect(await outcome).toEqual(a.error);
+      else expect(await outcome).toBe(error);
       expect(spawn).not.toHaveBeenCalled();
     }
   },
@@ -356,5 +428,80 @@ test.each(["window", "loss"])(
     expect(await work).toBeInstanceOf(kind === "loss" ? ClaimLostError : ClaimWaitError);
     expect(controller.signal.aborted).toBe(false);
     expect(spawn).not.toHaveBeenCalled();
+  },
+);
+
+test.each(["cancelled", "terminal", "missing", "unreadable", "window", "suspend", "tolerance", "permitted"])(
+  "composed authority rechecks durable state and clocks after identity await: %s",
+  async (kind) => {
+    const a = durableAuthority(kind === "terminal");
+    await renewRunClaim(a.execution);
+    const pending = Promise.withResolvers<identity.GitHubIdentity>();
+    const resolver = spyOn(identity, "githubIdentity").mockImplementation(() => pending.promise);
+    restores.push(() => resolver.mockRestore());
+    const spawn = spyOn(subprocess, "spawn").mockImplementation((() => {
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const stdin = new PassThrough();
+      const child = Object.assign(new EventEmitter(), {
+        stdout,
+        stderr,
+        stdin,
+        stdio: [stdin, stdout, stderr],
+      });
+      setImmediate(() => {
+        stdout.end();
+        stderr.end();
+        child.emit("close", 0, null);
+      });
+      return child as unknown as subprocess.ChildProcess;
+    }) as typeof subprocess.spawn);
+    restores.push(() => spawn.mockRestore());
+    const controller = new AbortController();
+    const dispatch = () =>
+      claimScope.run([a.claim], () =>
+        identity.githubSh(["gh", "api", "repos/owner/project"], {
+          cwd: process.cwd(),
+          signal: controller.signal,
+          allowFail: true,
+        }),
+      );
+    const work = dispatch().catch((e: unknown) => e);
+    if (kind === "cancelled" || kind === "terminal") a.close();
+    if (kind === "missing" || kind === "unreadable") {
+      const read = spyOn(a.store, "getRun");
+      restores.push(() => read.mockRestore());
+      if (kind === "missing") read.mockReturnValue(null);
+      else
+        read.mockImplementation(() => {
+          throw new Error("Unreadable run");
+        });
+    }
+    if (kind === "window") {
+      a.now.inclusive += 420_000;
+      a.now.exclusive += 420_000;
+    }
+    if (kind === "suspend" || kind === "tolerance") a.now.inclusive += kind === "suspend" ? 1_001 : 1_000;
+    pending.resolve({ kind: "owner" });
+    const outcome = await work;
+    if (kind === "tolerance" || kind === "permitted") {
+      expect(outcome).toMatchObject({ exitCode: 0 });
+      expect(spawn).toHaveBeenCalledTimes(1);
+    } else {
+      const reason =
+        kind === "missing" || kind === "unreadable"
+          ? "unavailable"
+          : kind === "window" || kind === "suspend"
+            ? "lease"
+            : "cancelled";
+      expect(outcome).toEqual(new ClaimWaitError(reason));
+      expect(spawn).not.toHaveBeenCalled();
+      if (kind === "window" || kind === "suspend") {
+        await renewRunClaim(a.execution);
+        expect(await dispatch()).toMatchObject({ exitCode: 0 });
+        expect(spawn).toHaveBeenCalledTimes(1);
+      }
+    }
+    expect(controller.signal.aborted).toBe(false);
   },
 );
