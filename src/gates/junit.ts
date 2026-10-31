@@ -134,7 +134,9 @@ export function parseJUnit(xml: string, cwd: string): FailedTestFiles | undefine
   }
 }
 
-function readReport(path: string, filesystemBaseline?: number): string | undefined {
+type JUnitReport = { status: "available"; xml: string } | { status: "missing" | "unsafe" };
+
+function readReport(path: string, filesystemBaseline?: number): JUnitReport {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -144,19 +146,19 @@ function readReport(path: string, filesystemBaseline?: number): string | undefin
       stat.size > MAX_REPORT_BYTES ||
       (filesystemBaseline !== undefined && stat.mtimeMs < filesystemBaseline)
     )
-      return undefined;
+      return { status: "unsafe" };
     const xml = readFileSync(fd, "utf8");
-    return Buffer.byteLength(xml) <= MAX_REPORT_BYTES ? xml : undefined;
-  } catch {
-    return undefined;
+    return Buffer.byteLength(xml) <= MAX_REPORT_BYTES ? { status: "available", xml } : { status: "unsafe" };
+  } catch (error) {
+    return { status: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unsafe" };
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
 }
 
 export function readJUnit(path: string, cwd: string): FailedTestFiles | undefined {
-  const xml = readReport(path);
-  return xml === undefined ? undefined : parseJUnit(xml, cwd);
+  const report = readReport(path);
+  return report.status === "available" ? parseJUnit(report.xml, cwd) : undefined;
 }
 
 /** Canonical checkout-relative identities shared by reports and the factory diff. */
@@ -193,6 +195,8 @@ export interface CoveringTestEvidence {
   name: string;
   /** Absence affirms that every exact matching testcase passed in this execution's fresh report. */
   reason?: string;
+  /** Only absent or empty fresh reports establish that runner evidence was unavailable. */
+  reportUnavailable?: boolean;
 }
 
 export function readCoveringJUnit(
@@ -205,8 +209,13 @@ export function readCoveringJUnit(
   const evidence: CoveringTestEvidence = { file: test.file.replace(/^\.\//, ""), name: test.name };
   if (existed) return { ...evidence, reason: "JUnit report existed before execution" };
   try {
-    const xml = readReport(path, filesystemBaseline);
-    if (xml === undefined) return { ...evidence, reason: "JUnit report missing, stale or unsafe" };
+    const report = readReport(path, filesystemBaseline);
+    if (report.status === "missing")
+      return { ...evidence, reason: "JUnit report missing", reportUnavailable: true };
+    if (report.status !== "available")
+      return { ...evidence, reason: "JUnit report missing, stale or unsafe" };
+    const { xml } = report;
+    if (!xml.trim()) return { ...evidence, reason: "JUnit report empty", reportUnavailable: true };
     if (/<!DOCTYPE/i.test(xml)) throw new Error("Unsafe XML");
     const root = Bun.XML.parse(xml, { compact: false });
     if (root.name !== "testsuites" && root.name !== "testsuite") throw new Error("Invalid root");
@@ -257,8 +266,9 @@ export function readJUnitSkips(
     }
   | undefined {
   try {
-    const xml = readReport(path);
-    if (xml === undefined || /<!DOCTYPE/i.test(xml)) return undefined;
+    const report = readReport(path);
+    if (report.status !== "available" || /<!DOCTYPE/i.test(report.xml)) return undefined;
+    const { xml } = report;
     const root = Bun.XML.parse(xml, { compact: false });
     if (root.name !== "testsuites" && root.name !== "testsuite") return undefined;
     const skippedTests: NonNullable<TestCoverage["skippedTests"]> = [];

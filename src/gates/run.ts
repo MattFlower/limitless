@@ -35,6 +35,7 @@ export interface GateResult {
   /** Infrastructure stopped this command before a complete execution could be observed. */
   incomplete?: string;
   coveringTest?: CoveringTestEvidence;
+  coveringTests?: CoveringTestEvidence[];
   /** Configured command plus factory-supplied arguments, when execution adds any. */
   executedCommand?: string;
   executionProvenance?: Pick<GateRun, "sha" | "trackedClean" | "provenanceError">;
@@ -122,6 +123,10 @@ export interface GateHooks {
   /** Recreate prerequisites if an in-place retry falls back after cleaning its worktree. */
   fallbackSetup?: string[];
   onResult?: (r: GateResult, phase: "setup" | "check") => void;
+  /** Factory notification when the trusted shell starts a local check. */
+  onCheckStart?: () => void;
+  /** Factory confirmation that execution failed before a check could start. */
+  onPreStartFailure?: () => void;
   /** Evidence from this process, never from a remote result or cache. */
   onLocalSetup?: () => void;
   /** Fires once when every gate slot is busy and this call has to queue. */
@@ -150,6 +155,7 @@ async function runOne(
   cwd: string,
   signal: AbortSignal,
   env = gateEnv(),
+  onStarted?: () => void,
 ): Promise<GateResult> {
   const launch = launchFailureScan();
   const coverage = new BunTestCoverage(cwd);
@@ -166,12 +172,13 @@ async function runOne(
   const report = join(scratch, `gate-report-${randomUUID()}.xml`);
   const existed = existsSync(report);
   let reportBaseline = 0;
-  if (cmd.coveringTest) {
+  const covering = cmd.coveringTests ?? (cmd.coveringTest ? [cmd.coveringTest] : []);
+  if (covering.length) {
     const sentinel = `${report}.sentinel`;
     writeFileSync(sentinel, "", { flag: "wx" });
     reportBaseline = statSync(sentinel).mtimeMs;
   }
-  const args = cmd.coveringTest ? ["--reporter=junit", `--reporter-outfile=${report}`] : undefined;
+  const args = covering.length ? ["--reporter=junit", `--reporter-outfile=${report}`] : undefined;
   const res = await runConfined({
     command: cmd.run,
     args,
@@ -181,6 +188,7 @@ async function runOne(
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
     redactOutput: true,
     onRawChunk: launch.observe,
+    onStarted,
     onStdoutLine: observe,
     onStderrLine: observe,
   });
@@ -200,6 +208,13 @@ async function runOne(
       : {}),
     ...(cmd.coveringTest
       ? { coveringTest: readCoveringJUnit(report, cwd, cmd.coveringTest, reportBaseline, existed) }
+      : {}),
+    ...(cmd.coveringTests
+      ? {
+          coveringTests: covering.map((test) =>
+            readCoveringJUnit(report, cwd, test, reportBaseline, existed),
+          ),
+        }
       : {}),
     ok,
     exitCode: res.exitCode,
@@ -241,7 +256,9 @@ export async function runLocalGates(
     hooks.priority,
   );
   try {
-    const result = await withCommandScratch(cwd, () => runAll(cwd, cfg, signal, hooks.onResult, hooks.env));
+    const result = await withCommandScratch(cwd, () =>
+      runAll(cwd, cfg, signal, hooks.onResult, hooks.env, hooks.onCheckStart),
+    );
     if (result.setupOk && !signal.aborted) hooks.onLocalSetup?.();
     return result;
   } finally {
@@ -269,6 +286,7 @@ async function runAll(
   signal: AbortSignal,
   onResult: GateHooks["onResult"],
   env?: Record<string, string>,
+  onCheckStart?: () => void,
 ): Promise<GateRun> {
   const setup: GateResult[] = [];
   for (const [i, run] of cfg.setup.entries()) {
@@ -285,7 +303,7 @@ async function runAll(
   const checks: GateResult[] = [];
   for (const c of cfg.checks) {
     if (signal.aborted) break;
-    const r = await runOne(c, cwd, signal, env);
+    const r = await runOne(c, cwd, signal, env, onCheckStart);
     checks.push(r);
     onResult?.(r, "check");
   }
