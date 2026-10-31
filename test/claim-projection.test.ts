@@ -201,9 +201,17 @@ test.each(["identity", "user", "labels", "failure", "recovery"])(
 );
 
 for (const boundary of ["identity", "recovery"] as const) {
-  test.each(["notifier", "comment", "labels", "user", "search", "failure"])(
-    `real runGh suppresses %s at inner ${boundary} without claim scope or signal abort`,
-    async (observer) => {
+  test.each([
+    ["notifier", true],
+    ["notifier", false],
+    ["comment", true],
+    ["labels", true],
+    ["user", true],
+    ["search", true],
+    ["failure", true],
+  ] as const)(
+    `real runGh checks %s (claim lost: %j) at inner ${boundary} without claim scope or signal abort`,
+    async (observer, claimLost) => {
       const id = fixture();
       settle(id, observer === "labels" || observer === "failure" ? "labels" : "comment");
       if (observer === "search")
@@ -229,10 +237,16 @@ for (const boundary of ["identity", "recovery"] as const) {
         () => spawn.mockRestore(),
       );
       const signal = new AbortController().signal;
+      let request: ReturnType<GhRunner> | undefined;
+      let requestSignal: AbortSignal | undefined;
       let stop: (() => Promise<void>) | undefined;
       const start = async () => {
         if (observer === "notifier") {
-          stop = notifier(runGh);
+          stop = notifier((...args) => {
+            requestSignal = args[1];
+            request = runGh(...args);
+            return request;
+          });
           store.updateRun(id, { status: "queued" });
         } else
           await reconcileIssueLifecycle(store, cfg, runGh, signal, () => {}, {
@@ -280,14 +294,20 @@ for (const boundary of ["identity", "recovery"] as const) {
         );
       } else work = start();
       await entered.promise;
-      store.updateRun(id, { status: "cancelled", error: "superseded: claim lost" });
+      if (claimLost) store.updateRun(id, { status: "cancelled", error: "superseded: claim lost" });
       const before = effects(id);
       resume.resolve();
       await work;
-      if (stop) await stop();
+      if (stop) {
+        // The notifier starts background work; wait for dispatch before stop aborts its signal.
+        expect(request).toBeDefined();
+        await request?.catch(() => {});
+        expect(requestSignal?.aborted).toBe(false);
+      }
       expect(signal.aborted).toBe(false);
-      expect(spawn).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledTimes(claimLost ? 0 : 1);
       expect(effects(id)).toEqual(before);
+      if (stop) await stop();
     },
   );
 }
