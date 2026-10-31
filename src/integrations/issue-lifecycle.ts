@@ -6,6 +6,7 @@ import { loadPrivateStrings } from "../gates/private.ts";
 import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import type { RunState } from "../pipeline/context.ts";
 import { redactCredentials, registeredCredentials } from "../util/proc.ts";
+import { ClaimObserverSuppressed, isClaimLossProjection, observerDispatchGuard } from "./claim-projection.ts";
 import type { GhRunner } from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
 
@@ -55,17 +56,20 @@ export async function reconcileIssueLifecycle(
     freshLabels = new Set();
     sessions.set(signal, freshLabels);
   }
-  const call = (repo: string | undefined, args: string[], before?: () => void) => {
+  const call = (runId: string, repo: string | undefined, args: string[], before?: () => void) => {
+    const guard = observerDispatchGuard(store, runId);
+    guard();
     if (signal.aborted || remaining <= 0) throw exhausted;
     remaining--;
     before?.();
-    return gh(["api", ...args], signal, undefined, repo);
+    return gh(["api", ...args], signal, undefined, repo, guard);
   };
   const logFailure = (
     code: "field-withheld" | "body-suppressed" | "labels-failed" | "publication-failed",
     error?: unknown,
   ) => {
-    if (!signal.aborted && error !== exhausted) log(`Issue lifecycle: ${code}`);
+    if (!signal.aborted && error !== exhausted && !(error instanceof ClaimObserverSuppressed))
+      log(`Issue lifecycle: ${code}`);
   };
   const openQuestions = (run: Run) => store.listQuestions(run.id).filter((q) => q.answer === null);
   const questionSet = (run: Run) =>
@@ -95,6 +99,7 @@ export async function reconcileIssueLifecycle(
     return checked;
   };
   const observe = (run: Run, repo: string, number: number) => {
+    if (isClaimLossProjection(store.getRun(run.id))) return;
     const effects = new Map(store.issueLifecycleEffects(run.id, repo, number).map((e) => [e.effect, e]));
     const save = (effect: string, state: string, details = {}) => {
       store.setIssueLifecycleEffect(run.id, repo, number, effect, state, details);
@@ -158,7 +163,7 @@ export async function reconcileIssueLifecycle(
     }
     if (!effects.has("labels")) save("labels", "pending");
   };
-  const runs = store.issueLifecycleRuns();
+  const runs = store.issueLifecycleRuns().filter((run) => !isClaimLossProjection(run));
   // Persist every observation before any delivery, even when the call budget is exhausted.
   for (const run of runs) {
     store.transaction(() => {
@@ -183,20 +188,25 @@ export async function reconcileIssueLifecycle(
   const cursor = cursors.get(store);
   const start = Math.max(0, work.findIndex((w) => w.key === cursor?.key) + (cursor?.deferred ? 0 : 1));
   const ordered = [...work.slice(start), ...work.slice(0, start)];
-  const postingLogin = async (repo: string, eligible: () => boolean) => {
+  const postingLogin = async (runId: string, repo: string, eligible: () => boolean) => {
     const identity = await (opts.identity ?? githubIdentity)(repo);
     if (!eligible()) return null;
     if (identity.kind === "app") return identity.botLogin;
     // Look up the owner only when the POST can follow in this poll.
     reserve(2);
-    return z.object({ login: z.string() }).parse(JSON.parse(String(await call(undefined, ["user"])))).login;
+    return z.object({ login: z.string() }).parse(JSON.parse(String(await call(runId, undefined, ["user"]))))
+      .login;
   };
   for (const { snapshot, repo, number, effect: task, key } of ordered) {
     if (signal.aborted || remaining <= 0) return;
     cursors.set(store, { key, deferred: false });
     const path = `repos/${repo}/issues/${number}`;
-    const save = (effect: string, state: string, details = {}) =>
+    const guard = observerDispatchGuard(store, snapshot.id);
+    const save = (effect: string, state: string, details = {}, completed = false) => {
+      // A completed request remains evidence even if authority was lost while it was in flight.
+      if (!completed) guard();
       store.setIssueLifecycleEffect(snapshot.id, repo, number, effect, state, details);
+    };
     const finishLabels = (target: string) =>
       store.transaction(() => {
         for (const e of store.issueLifecycleEffects(snapshot.id, repo, number))
@@ -208,6 +218,7 @@ export async function reconcileIssueLifecycle(
       const current = store.getRun(snapshot.id);
       return (
         !!current &&
+        !isClaimLossProjection(current) &&
         (task === "labels" || commentAllowed(current, task)) &&
         lifecycleManaged(cfg, repo) &&
         !repoSettings(cfg, repo).discreet &&
@@ -220,6 +231,7 @@ export async function reconcileIssueLifecycle(
     let run = store.getRun(snapshot.id);
     if (
       !run ||
+      isClaimLossProjection(run) ||
       (!questions &&
         !linkedIssues(run, store).some(
           (issue) => issue.repo.toLowerCase() === repo.toLowerCase() && issue.number === number,
@@ -253,7 +265,9 @@ export async function reconcileIssueLifecycle(
                     }),
                   }),
                 })
-                .parse(JSON.parse(String(await call(repo, ["graphql", "-f", `query=${query}`]))));
+                .parse(
+                  JSON.parse(String(await call(snapshot.id, repo, ["graphql", "-f", `query=${query}`]))),
+                );
               if (evidence.errors?.length) throw new Error("incomplete failure timeline evidence");
               save("failure", "removing", {
                 body: String(evidence.data.repository.issue.timelineItems.totalCount),
@@ -283,7 +297,9 @@ export async function reconcileIssueLifecycle(
               const current = z
                 .array(z.object({ name: z.string() }))
                 .parse(
-                  JSON.parse(String(await call(repo, [`${path}/labels?per_page=100&page=${plan.page}`]))),
+                  JSON.parse(
+                    String(await call(snapshot.id, repo, [`${path}/labels?per_page=100&page=${plan.page}`])),
+                  ),
                 );
               plan.current.push(...current.map((l) => l.name));
               plan.page = current.length === 100 ? plan.page + 1 : 0;
@@ -291,26 +307,40 @@ export async function reconcileIssueLifecycle(
             }
             freshLabels.delete(key);
             run = store.getRun(snapshot.id);
-            if (!run) continue;
+            if (!run || isClaimLossProjection(run)) continue;
             observe(run, repo, number);
             const target = desiredLabel(run);
             if (target === labels[2]) await prepareFailure();
             run = store.getRun(snapshot.id);
-            if (!run || desiredLabel(run) !== target || !store.issueLifecycleOwnsLabels(run, repo, number))
+            if (
+              !run ||
+              isClaimLossProjection(run) ||
+              desiredLabel(run) !== target ||
+              !store.issueLifecycleOwnsLabels(run, repo, number)
+            )
               continue;
             plan.target = target;
             save("labels", "pending", { body: JSON.stringify(plan) });
             if (target === labels[2] && failure?.state === "removing") {
               if (plan.current.includes(labels[2])) {
-                await call(repo, [`${path}/labels/${encodeURIComponent(labels[2])}`, "-X", "DELETE"]);
+                await call(snapshot.id, repo, [
+                  `${path}/labels/${encodeURIComponent(labels[2])}`,
+                  "-X",
+                  "DELETE",
+                ]);
                 plan.current = plan.current.filter((l) => l !== labels[2]);
-              }
-              save("failure", "adding");
+                save("failure", "adding", {}, true);
+              } else save("failure", "adding");
             }
             for (const label of labels) {
               if (signal.aborted) return;
               run = store.getRun(snapshot.id);
-              if (!run || desiredLabel(run) !== target || !store.issueLifecycleOwnsLabels(run, repo, number))
+              if (
+                !run ||
+                isClaimLossProjection(run) ||
+                desiredLabel(run) !== target ||
+                !store.issueLifecycleOwnsLabels(run, repo, number)
+              )
                 break;
               const add = label === target;
               const effect = `label:${label}:${add}`;
@@ -318,6 +348,7 @@ export async function reconcileIssueLifecycle(
               save(effect, "pending");
               try {
                 await call(
+                  snapshot.id,
                   repo,
                   add
                     ? [`${path}/labels`, "-X", "POST", "-f", `labels[]=${label}`]
@@ -329,14 +360,16 @@ export async function reconcileIssueLifecycle(
               plan.current = plan.current.filter((l) => l !== label);
               if (add) plan.current.push(label);
               store.transaction(() => {
-                save(effect, "done");
-                save("labels", "pending", { body: JSON.stringify(plan) });
+                save(effect, "done", {}, true);
+                if (!isClaimLossProjection(store.getRun(snapshot.id)))
+                  save("labels", "pending", { body: JSON.stringify(plan) });
               });
               freshLabels.delete(key);
             }
             run = store.getRun(snapshot.id);
             if (
               run &&
+              !isClaimLossProjection(run) &&
               desiredLabel(run) === target &&
               labels.every((l) => plan.current.includes(l) === (l === target))
             ) {
@@ -380,13 +413,17 @@ export async function reconcileIssueLifecycle(
                 user: z.object({ login: z.string() }).nullable(),
               }),
             )
-            .parse(JSON.parse(String(await call(repo, [`${path}/comments?per_page=100&page=${page}`]))));
+            .parse(
+              JSON.parse(
+                String(await call(snapshot.id, repo, [`${path}/comments?per_page=100&page=${page}`])),
+              ),
+            );
           stale ||= !eligible();
           const found = comments.find(
             (c) => c.user?.login === pending.login && c.body.split("\n")[0] === marker,
           );
           if (found) {
-            save(effect, "done", { commentId: found.id });
+            save(effect, "done", { commentId: found.id }, true);
             break;
           }
           if (stale && comments.length < 100) {
@@ -402,7 +439,7 @@ export async function reconcileIssueLifecycle(
         save(effect, "done");
         continue;
       }
-      const login = await postingLogin(repo, eligible);
+      const login = await postingLogin(snapshot.id, repo, eligible);
       if (!eligible()) {
         save(effect, "done");
         continue;
@@ -425,18 +462,20 @@ export async function reconcileIssueLifecycle(
       const created = z.object({ id: z.number().int().positive() }).parse(
         JSON.parse(
           String(
-            await call(repo, [`${path}/comments`, "-X", "POST", "-f", `body=${body}`], () => {
+            await call(snapshot.id, repo, [`${path}/comments`, "-X", "POST", "-f", `body=${body}`], () => {
               save(effect, "pending", { body, login, page: 1 });
             }),
           ),
         ),
       );
-      save(effect, "done", { commentId: created.id });
+      save(effect, "done", { commentId: created.id }, true);
     } catch (error) {
       if (error === exhausted) {
         cursors.set(store, { key, deferred: true });
         return;
       }
+      if (error instanceof ClaimObserverSuppressed || isClaimLossProjection(store.getRun(snapshot.id)))
+        continue;
       if (questions && !eligible()) {
         const checkpoint = store.issueLifecycleEffects(run.id, repo, number).find((e) => e.effect === effect);
         save(effect, checkpoint?.page ? "recovering" : "done", { page: checkpoint?.page ?? 0 });
