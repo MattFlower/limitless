@@ -139,6 +139,37 @@ test.each([
   });
 });
 test.each([
+  ["outputUnits", '"abcdef"', '"'],
+  ["outputUnits", '{"longkey":true}', "{"],
+  ["outputUnits", "[12345]", "["],
+  ["outputBytes", '"abcdef"', '"'],
+  ["outputBytes", '{"longkey":true}', "{"],
+  ["outputBytes", "[12345]", "["],
+] as const)("final %s cap allows a one-unit selection from %s", (key, json, expected) => {
+  expect(
+    consume(fixture().data(json, { cut: { limit: 1, unit: "U" } }, { limits: { [key]: 1 } })),
+  ).toMatchObject({ text: expected, withheld: false, checkedComplete: true, truncated: true });
+});
+test.each([
+  ["", 2, 3],
+  ["…", 3, 6],
+] as const)("selected text includes marker %j in both output bounds", (marker, units, bytes) => {
+  const f = fixture();
+  const cut = { limit: 2, unit: "U", marker } as const;
+  for (const [key, cap] of [
+    ["outputUnits", units],
+    ["outputBytes", bytes],
+  ] as const) {
+    expect(consume(f.data('"émore"', { cut }, { limits: { [key]: cap } }))).toMatchObject({
+      text: `"é${marker}`,
+      withheld: false,
+      checkedComplete: true,
+      truncated: true,
+    });
+    refused(f.data('"émore"', { cut }, { limits: { [key]: cap - 1 } }), "output-length");
+  }
+});
+test.each([
   ["depth", "[0]", 1, "json-depth"],
   ["nodes", '{"a":1}', 3, "json-nodes"],
   ["nodes", "[0]", 2, "json-nodes"],
@@ -163,7 +194,11 @@ test("root depth zero, default depth and complete candidate bounds survive selec
     truncated: true,
     withheld: false,
   });
-  refused(f.data('"ab"', { cut }, { limits: { inputUnits: 4 } }), "input-length");
+  for (const key of ["inputUnits", "inputBytes"] as const)
+    refused(
+      f.data('"ab"', { cut }, { limits: { [key]: 4, outputUnits: 1, outputBytes: 1 } }),
+      "input-length",
+    );
   refused(f.data('"ab"', {}, { limits: { outputUnits: 4 } }), "output-length");
 });
 test("malformed Unicode and terminal fields refuse or render through the boundary", () => {

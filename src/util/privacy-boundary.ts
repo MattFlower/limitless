@@ -403,12 +403,13 @@ export function protectData(
     state.truncated = provenance.kind === "cut" ? true : provenance.kind === "complete" ? false : undefined;
     return issue(withheld(state, "nonconvergent"));
   }
-  // The original is an internal complete candidate; only the eventual selection uses output caps.
+  // Originals and fields are internal candidates; only the eventual selection uses output caps.
   const limits = context(policy, options).limits;
-  const original = protectText(
-    { text: json, provenance, policy, terminal },
-    { ...options, limits: { ...limits, outputUnits: limits.inputUnits, outputBytes: limits.inputBytes } },
-  );
+  const candidateOptions = {
+    ...options,
+    limits: { ...limits, outputUnits: limits.inputUnits, outputBytes: limits.inputBytes },
+  };
+  const original = protectText({ text: json, provenance, policy, terminal }, candidateOptions);
   const state = read(original);
   if (state.withheld) return original;
   let parsed: unknown;
@@ -426,7 +427,7 @@ export function protectData(
   };
   const marker = "[withheld: private text]";
   const field = (text: string) => {
-    const result = read(protectText({ text, provenance, policy, terminal }, options));
+    const result = read(protectText({ text, provenance, policy, terminal }, candidateOptions));
     if (result.withheld) {
       if (result.reason === "private-match") return marker;
       return fail(result.reason ?? "nonconvergent");
