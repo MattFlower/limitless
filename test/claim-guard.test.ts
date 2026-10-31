@@ -470,7 +470,8 @@ test("client IO clears scope through awaits and ambiguous-result readback", asyn
 });
 
 test("source boundaries permit guarded control IO without production claim bindings", async () => {
-  const allowed = new Set(["src/integrations/claim-ref.ts", "src/integrations/leases.ts"]);
+  const execution = "src/pipeline/run-claim.ts";
+  const allowed = new Set(["src/integrations/claim-ref.ts", "src/integrations/leases.ts", execution]);
   const references: string[] = [];
   for await (const path of new Bun.Glob("src/**/*.ts").scan({
     cwd: new URL("..", import.meta.url).pathname,
@@ -484,7 +485,11 @@ test("source boundaries permit guarded control IO without production claim bindi
       ]);
       continue;
     }
-    expect(source).not.toMatch(/\bbindClaim\b|claimScope\.run\b/);
+    expect(source).not.toMatch(/\bbindClaim\b/);
+    if (path !== execution) {
+      expect(source).not.toMatch(/claimScope\.run\b|\b(?:bindRunClaim|validateRunClaim|renewRunClaim)\b/);
+      expect(source).not.toContain('from "./run-claim.ts"');
+    }
     if (/\bclaimGuard\b/.test(source))
       expect([
         "src/integrations/control-ref.ts",
@@ -492,11 +497,13 @@ test("source boundaries permit guarded control IO without production claim bindi
         "src/integrations/github-identity.ts",
         "src/git/repos.ts",
         "src/pipeline/context.ts",
+        execution,
       ]).toContain(path);
     if (/\bhasClaimScope\b/.test(source)) expect(path).toBe("src/pipeline/engine.ts");
     if (/\bclaimScope\b/.test(source)) {
       expect(allowed.has(path)).toBe(true);
-      expect(source.replace(/import .*claimScope.*\n/, "").replaceAll("claimScope.exit", "")).not.toMatch(
+      const operation = path === execution ? "claimScope.run" : "claimScope.exit";
+      expect(source.replace(/import .*claimScope.*\n/, "").replaceAll(operation, "")).not.toMatch(
         /\bclaimScope\b/,
       );
       references.push(path);
