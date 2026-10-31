@@ -95,6 +95,13 @@ const manifest = z
   .refine((m) => new Set(m.mutations.map((entry) => entry.id)).size === m.mutations.length);
 export type ControlManifestV1 = z.infer<typeof manifest>;
 export type ControlTip = { sha: string; manifest: ControlManifestV1 };
+export {
+  actor as controlActorSchema,
+  checked as checkedControlInput,
+  id as controlMutationIdSchema,
+  key as controlKeySchema,
+};
+
 type ValidationCode = "invalid" | "corrupt";
 function fail(code: ValidationCode | "limit" | "unsupported"): never {
   throw new SharedStoreError(code);
