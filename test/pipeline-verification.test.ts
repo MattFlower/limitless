@@ -1284,7 +1284,7 @@ test.each([
         : "bun test {files}";
   writeFileSync(
     join(repoDir, ".limitless.toml"),
-    `[gates]\n${mode === "fresh" ? 'setup = ["echo ready > dependency"]\n' : ""}retry_files = "${retryTemplate}"\nchecks = [{ name = "test", run = "bun test" }]\n`,
+    `[gates]\n${mode === "fresh" ? 'setup = ["echo ready > dependency"]\n' : ""}retry_files = "${retryTemplate}"\nchecks = [${mode === "pass" ? '{ name = "lint", run = "echo lint" }, { name = "typecheck", run = "echo types" }, ' : ""}{ name = "test", run = "bun test", timeoutSec = 17 }]\n`,
   );
   await sh(["git", "add", "."], { cwd: repoDir });
   await sh(["git", "commit", "-qm", "covering gate fixture"], { cwd: repoDir });
@@ -1304,6 +1304,8 @@ test.each([
     for (const check of request.gates.checks)
       if (check.run.includes(" -t ")) {
         targeted++;
+        expect(request.gates.checks).toHaveLength(1);
+        expect(check).toMatchObject({ name: "test", timeoutSec: 17 });
         expect(request.gates.setup).toEqual(mode === "fresh" ? ["echo ready > dependency"] : []);
         expect(request.env?.CI).toBe("1");
         expect(request.skipGateSlot).not.toBe(true);
