@@ -41,7 +41,7 @@ function deps(overrides: Partial<DefectPreparationDeps> = {}): DefectPreparation
   return {
     factory: "Operator/Factory",
     repos: [repo],
-    policy: async () => ({ discreet: false }),
+    policy: () => ({ discreet: false }),
     identity: async () => app,
     loadPrivateStrings: () => [],
     registeredCredentials: () => [],
@@ -376,11 +376,11 @@ test("full rendered byte budget refuses expansion even though individual values 
 
 test("source and destination policy and App-only identity fail closed", async () => {
   const cases: Partial<DefectPreparationDeps>[] = [
-    { policy: async (value) => ({ discreet: typeof value !== "string" }) },
-    { policy: async (value) => ({ discreet: typeof value === "string" }) },
-    { policy: async (value) => (typeof value === "string" ? { discreet: false } : undefined) },
+    { policy: (value) => ({ discreet: typeof value !== "string" }) },
+    { policy: (value) => ({ discreet: typeof value === "string" }) },
+    { policy: (value) => (typeof value === "string" ? { discreet: false } : undefined) },
     {
-      policy: async () => {
+      policy: () => {
         throw new Error("sensitive policy failure");
       },
     },

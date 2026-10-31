@@ -161,7 +161,7 @@ function harness(remote = new Remote()) {
     repos: [repo],
     coordinator: () => (clock.enabled === undefined ? undefined : { enabled: clock.enabled }),
     identity: async (): Promise<GitHubIdentity> => APP,
-    policy: async () => ({ discreet: false }),
+    policy: () => ({ discreet: false }),
     loadPrivateStrings: () => [],
     registeredCredentials: () => [],
     github: remote.client(),
@@ -224,9 +224,9 @@ test("submission and checkpoint commit together; replay keeps one occurrence; re
   expect(h.count()).toBe(1);
 
   h.deps.identity = async () => APP;
-  h.deps.policy = async () => ({ discreet: true });
+  h.deps.policy = () => ({ discreet: true });
   const discreet = await h.submit("discreet");
-  h.deps.policy = async () => ({ discreet: false });
+  h.deps.policy = () => ({ discreet: false });
   const noReport = await h.submit("regression", { ...finding(), class: "regression" });
   for (const [refused, state] of [
     [discreet, "blocked"],
@@ -236,6 +236,43 @@ test("submission and checkpoint commit together; replay keeps one occurrence; re
     for (const column of ["title", "body", "signature", "occurrence", "destination", "app_login"] as const)
       expect(refused?.[column]).toBeNull();
   }
+});
+
+test("a credential registered before checkpoint submission prevents payload persistence across reopen and replay", async () => {
+  const h = harness();
+  const credentials: string[] = [];
+  h.deps.registeredCredentials = () => credentials;
+  const credential = "checkpoint\ncredential";
+  const submit = await h.reporter.prepareSubmission("event", finding(credential));
+  credentials.push(credential);
+  const row = submit(() => h.store.setSetting("consumed", "yes"));
+  if (!row) throw new Error("expected blocked occurrence");
+  expect(row).toMatchObject({
+    source_ref: repo.id,
+    source_key: "event",
+    state: "blocked",
+    diagnostic: "Defect publication blocked",
+  });
+  for (const column of [
+    "destination",
+    "signature",
+    "occurrence",
+    "title",
+    "body",
+    "comment_body",
+    "app_login",
+  ] as const)
+    expect(row?.[column]).toBeNull();
+  expect(h.count("defect_signatures")).toBe(0);
+  expect(h.store.getSetting("consumed", "no")).toBe("yes");
+  h.reopen();
+  expect(h.row("event")).toEqual(row);
+  expect(h.store.getSetting("consumed", "no")).toBe("yes");
+  credentials.length = 0;
+  expect(await h.submit("event", finding(credential))).toEqual(row);
+  await h.settle();
+  expect(h.count()).toBe(1);
+  expect(h.remote.posts).toHaveLength(0);
 });
 
 test("a prepared record stores approved bytes only and is delivered once after reopen and fresh lookup", async () => {
@@ -349,6 +386,45 @@ test.each([
   });
 });
 
+test("a conflicting recovered creation keeps its durable barrier after remote deletion and reopen", async () => {
+  const h = harness();
+  const row = await h.submit("first");
+  h.remote.mode = { apply: true, labels: true, respond: "throw" };
+  const post = h.deps.github.post;
+  h.deps.github.post = async (...args) => {
+    const response = await post(...args).catch(() => undefined);
+    const created = h.remote.issues[0];
+    if (!created) throw new Error("expected remote creation");
+    created.body += "\nconflicting edit";
+    return response;
+  };
+  await h.reporter.reconcile();
+  const held = h.row("first");
+  expect(held).toMatchObject({
+    state: "held",
+    object_id: null,
+    diagnostic: "Defect object conflicts with outbox",
+  });
+  h.remote.issues = [];
+  h.remote.mode = { apply: true, labels: true, respond: "ok" };
+  h.deps.github.post = post;
+  h.reopen();
+  const next = await h.submit("second");
+  expect(next?.signature).toBe(row?.signature);
+  expect(next?.occurrence).not.toBe(row?.occurrence);
+  await h.settle();
+  expect(h.remote.postsTo(null)).toHaveLength(1);
+  expect(h.row("first")).toEqual(held);
+  expect(h.row("second")).toMatchObject({
+    state: "held",
+    diagnostic: "Defect issue provenance unavailable",
+  });
+  expect(h.store.db.query("SELECT barrier_occurrence, issue_number FROM defect_signatures").get()).toEqual({
+    barrier_occurrence: row?.occurrence,
+    issue_number: null,
+  });
+});
+
 test("a remotely created unlabelled issue with a lost response keeps its ID and stays held", async () => {
   const h = harness();
   await h.submit("event");
@@ -450,13 +526,9 @@ test("cap-deferred creations do not starve a later occurrence that only needs a 
 
 test.each([
   [
-    "identity changes during the awaited policy",
+    "identity changes during the label check",
     (h: ReturnType<typeof harness>) => {
-      h.deps.policy = async () => {
-        await Promise.resolve();
-        h.deps.identity = async () => ({ kind: "owner" });
-        return { discreet: false };
-      };
+      h.deps.identity = async () => ({ kind: "owner" });
     },
     { state: "prepared", diagnostic: "Defect App identity unavailable" },
   ],
@@ -465,7 +537,7 @@ test.each([
     (h: ReturnType<typeof harness>) => {
       h.deps.identity = async () => {
         await Promise.resolve();
-        h.deps.policy = async () => ({ discreet: true });
+        h.deps.policy = () => ({ discreet: true });
         return APP;
       };
     },
@@ -637,9 +709,9 @@ test.each([
 test.each(["source", "destination"])("a %s that becomes discreet is suppressed permanently", async (side) => {
   const h = harness();
   await h.submit("event");
-  h.deps.policy = async (target) => ({ discreet: (typeof target === "string") === (side === "destination") });
+  h.deps.policy = (target) => ({ discreet: (typeof target === "string") === (side === "destination") });
   await h.settle();
-  h.deps.policy = async () => ({ discreet: false });
+  h.deps.policy = () => ({ discreet: false });
   await h.settle();
   expect(h.remote.posts).toHaveLength(0);
   expect(h.row("event")).toMatchObject({ state: "suppressed", title: null, body: null, comment_body: null });
@@ -733,62 +805,90 @@ async function readyToPost(h: ReturnType<typeof harness>, kind: "issue" | "comme
 }
 
 test.each(
-  ["issue", "comment"].flatMap((kind) => [1, 2, 3, 4].map((call) => [kind as "issue" | "comment", call])),
-)("a %s is not posted when identity becomes owner during policy read %i", async (kind, call) => {
+  (["issue", "comment"] as const).flatMap((kind) =>
+    (["source", "destination"] as const).flatMap((side) =>
+      (["missing", "failing"] as const).map((failure) => [kind, side, failure] as const),
+    ),
+  ),
+)("a %s is not posted with %s policy %s", async (kind, side, failure) => {
   const h = harness();
   const before = await readyToPost(h, kind);
-  let calls = 0;
-  h.deps.policy = async () => {
-    await Promise.resolve();
-    if (++calls === call) h.deps.identity = async () => ({ kind: "owner" });
+  h.deps.policy = (target) => {
+    if ((typeof target === "string") === (side === "destination")) {
+      if (failure === "failing") throw new Error("sensitive policy failure");
+      return undefined;
+    }
     return { discreet: false };
   };
   await h.reporter.reconcile();
   expect(h.remote.posts).toHaveLength(before);
-  expect(h.row("event")).toMatchObject({ state: "prepared", diagnostic: "Defect App identity unavailable" });
+  expect(h.row("event")).toMatchObject({
+    state: "prepared",
+    diagnostic: failure === "missing" ? "Defect policy unavailable" : "Defect delivery check failed",
+  });
 });
 
-test.each([
-  ["issue", "source", "destination", 1],
-  ["issue", "source", "destination", 2],
-  ["issue", "destination", "source", 1],
-  ["comment", "source", "destination", 1],
-  ["comment", "source", "destination", 2],
-  ["comment", "destination", "source", 1],
-] as const)(
-  "a %s is suppressed when the %s becomes discreet during %s policy read %i",
-  async (kind, changed, during, nth) => {
-    const h = harness();
-    const before = await readyToPost(h, kind);
-    const discreet = { source: false, destination: false };
-    const sideOf = (target: unknown) => (typeof target === "string" ? "destination" : "source");
-    let seen = 0;
-    h.deps.policy = async (target) => {
-      const side = sideOf(target);
-      const value = discreet[side];
-      await Promise.resolve();
-      // One-shot change during the nth read of `during`; a later read must still observe it.
-      if (side === during && ++seen === nth) discreet[changed] = true;
-      return { discreet: value };
-    };
-    await h.reporter.reconcile();
+test.each(
+  (["issue", "comment"] as const).flatMap((kind) =>
+    (["source", "destination", "identity"] as const).map((change) => [kind, change] as const),
+  ),
+)("a %s rechecks %s after the final identity await", async (kind, change) => {
+  const h = harness();
+  const before = await readyToPost(h, kind);
+  const waiting = deferred();
+  const release = deferred();
+  const resolved = { ...APP };
+  let policyReads = 0;
+  let discreet = false;
+  h.deps.policy = (target) => {
+    policyReads++;
+    if (typeof target !== "string") expect(target).toEqual(repo);
+    else expect(target).toBe("example/factory");
+    return { discreet: discreet && (typeof target === "string") === (change === "destination") };
+  };
+  h.deps.identity = async () => {
+    // Lookup identity resolves normally; pause only after the final GitHub inspection.
+    const last = h.remote.calls.at(-1);
+    if (last !== "label" && last !== "issue:1") return APP;
+    // The previous two-round implementation had an intermediate identity check after two reads.
+    // Let that resolve unchanged so this regression exercises its final await as well.
+    if (policyReads === 2) return APP;
+    waiting.resolve();
+    await release.promise;
+    if (change === "identity") {
+      // Change the shared result after the resolver's check, before its caller resumes.
+      queueMicrotask(() =>
+        queueMicrotask(() => queueMicrotask(() => Object.assign(resolved, { kind: "owner" }))),
+      );
+    }
+    return resolved;
+  };
+  const pass = h.reporter.reconcile();
+  await waiting.promise;
+  discreet = change !== "identity";
+  release.resolve();
+  await pass;
+  expect(h.remote.posts).toHaveLength(before);
+  expect(h.row("event")).toMatchObject(
+    change === "identity"
+      ? { state: "prepared", diagnostic: "Defect App identity unavailable" }
+      : { state: "suppressed", title: null, body: null, comment_body: null },
+  );
+  h.deps.policy = () => ({ discreet: false });
+  h.deps.identity = async () => APP;
+  if (change !== "identity") {
+    await h.settle();
     expect(h.remote.posts).toHaveLength(before);
-    expect(h.row("event")).toMatchObject({
-      state: "suppressed",
-      title: null,
-      body: null,
-      comment_body: null,
-    });
-  },
-);
+    expect(h.row("event")?.state).toBe("suppressed");
+  }
+});
 
 test("a source made discreet during every destination read is suppressed", async () => {
   const h = harness();
   await h.submit("event");
   let source = false;
-  h.deps.policy = async (target) => {
+  h.deps.policy = (target) => {
     const value = typeof target === "string" ? false : source;
-    await Promise.resolve();
     if (typeof target === "string") source = true;
     return { discreet: value };
   };

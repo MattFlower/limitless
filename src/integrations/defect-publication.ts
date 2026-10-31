@@ -45,7 +45,7 @@ type PrivacyDeps = {
 export type DefectPreparationDeps = PrivacyDeps & {
   repos: readonly Repo[];
   factory: string;
-  policy: (repo: Repo | string) => Promise<{ discreet: boolean } | undefined>;
+  policy: (repo: Repo | string) => { discreet: boolean } | undefined;
   identity: (repo: string) => Promise<GitHubIdentity | undefined>;
 };
 

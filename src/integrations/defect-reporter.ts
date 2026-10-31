@@ -178,14 +178,16 @@ export function createDefectReporter(store: Store, deps: DefectReporterDeps) {
     }
     const label = () => gh.label(row.destination, "defect", id.token);
     if (!target && !(await call(label, 1).catch(() => false))) throw new Deferred("Defect label missing");
-    const src = deps.repos.find((repo) => repo.id === row.source_ref) ?? row.source_ref;
-    // Two whole rounds, identity last, then only synchronous checks until the request is dispatched.
-    for (let round = 0; round < 2; round++) {
-      const pols = [await deps.policy(row.destination), await deps.policy(src)];
-      id = await app(row);
-      if (pols.some((p) => p?.discreet === true)) return update(row, { state: "suppressed", ...cleared });
-      if (pols.some((p) => p?.discreet !== false)) throw new Deferred("Defect policy unavailable");
-    }
+    id = await app(row);
+    // Final snapshots, send intent and dispatch must share one synchronous turn.
+    if (id.kind !== "app" || id.botLogin !== row.app_login)
+      throw new Deferred("Defect App identity unavailable");
+    if (!enabled()) throw exhausted;
+    const src = deps.repos.find((repo) => repo.id === row.source_ref);
+    if (!src) throw new Deferred("Defect policy unavailable");
+    const pols = [deps.policy(row.destination), deps.policy(src)];
+    if (pols.some((p) => p?.discreet === true)) return update(row, { state: "suppressed", ...cleared });
+    if (pols.some((p) => p?.discreet !== false)) throw new Deferred("Defect policy unavailable");
     const body = target ? row.body.replace(":v1:issue:", ":v1:comment:") : row.body;
     if (d.guardDefectPublication({ title: row.title, body }, deps).status !== "safe")
       return update(row, { state: "blocked", diagnostic: "Defect publication blocked" });
