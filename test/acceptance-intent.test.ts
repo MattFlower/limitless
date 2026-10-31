@@ -20,12 +20,15 @@ const unsupported = (line: number, where: string, kind: string) =>
   `unsupported Markdown in the intent: line ${line} of ${where}: ${kind}; normalize the ticket`;
 
 test("top-level items own their descendants while paragraphs own themselves", () => {
-  const units = resolve(
+  const source = snapshot(
     goal,
     inGoal("- First.\n  - Child.\n  - Sibling.\n- Second.\n\nParagraph.\nContinued."),
   );
+  const units = resolveIntent(source);
   expect(units.map((u) => u.item)).toEqual(["U1", "U1", "U1", "U4", "U5"]);
-  expect([...groupAcceptanceUnits(units)].map(([item, group]) => [item, group.map((u) => u.id)])).toEqual([
+  expect(
+    [...groupAcceptanceUnits(units, source)].map(([item, group]) => [item, group.map((u) => u.id)]),
+  ).toEqual([
     ["U1", ["U1", "U2", "U3"]],
     ["U4", ["U4"]],
     ["U5", ["U5"]],
@@ -47,16 +50,28 @@ test("deduplicated units keep the item of their first occurrence across sections
   expect(units[1]?.sources).toEqual(['#1 "Goal"', '#1 "Docs"']);
 });
 
-test("legacy persisted manifests group each unit as its own item without re-resolving", () => {
+test("legacy persisted manifests recover top-level items from the snapshot", () => {
   const manifest = [
     { id: "U1", text: "Root.", class: "behaviour" as const, sources: ['#1 "Goal"'] },
     { id: "U2", text: "Root. — Child.", class: "behaviour" as const, sources: ['#1 "Goal"'] },
   ];
-  expect([...groupAcceptanceUnits(manifest)].map(([item, group]) => [item, group.map((u) => u.id)])).toEqual([
-    ["U1", ["U1"]],
-    ["U2", ["U2"]],
-  ]);
+  expect(
+    [...groupAcceptanceUnits(manifest, snapshot(goal, inGoal("- Root.\n  - Child.")))].map(
+      ([item, group]) => [item, group.map((u) => u.id)],
+    ),
+  ).toEqual([["U1", ["U1", "U2"]]]);
   expect(manifest.every((u) => !("item" in u))).toBe(true);
+});
+
+test.each(["count", "id", "order"])("legacy grouping refuses a different unit %s", (mismatch) => {
+  const source = snapshot(goal, inGoal("- Root.\n  - Child.\n- Next."));
+  const manifest = resolveIntent(source).map(({ item: _item, ...unit }) => unit);
+  if (mismatch === "count") manifest.pop();
+  if (mismatch === "id" && manifest[0]) manifest[0].id = "U99";
+  if (mismatch === "order") manifest.reverse();
+  expect(() => groupAcceptanceUnits(manifest, source)).toThrow(
+    "Follow-ups were not filed because the persisted manifest's top-level items could not be confirmed from the snapshot",
+  );
 });
 
 const epic784 = `## Goal

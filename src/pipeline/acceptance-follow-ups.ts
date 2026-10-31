@@ -6,7 +6,12 @@ import { runGh } from "../integrations/github.ts";
 import { githubIdentity } from "../integrations/github-identity.ts";
 import { lifecycleManaged } from "../integrations/issue-lifecycle.ts";
 import { redactCredentials, registeredCredentials } from "../util/proc.ts";
-import type { AcceptanceState, AcceptanceUnit } from "./acceptance.ts";
+import {
+  type AcceptanceSnapshot,
+  type AcceptanceState,
+  type AcceptanceUnit,
+  resolveIntent,
+} from "./acceptance.ts";
 import { CancelledError, NeedsHumanError, type RunContext } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 
@@ -19,11 +24,31 @@ export const followUpMarker = (ticket: number, pass: number, item: string) =>
 const firstLine = (body: string) => body.split(/\r?\n/)[0];
 const issueList = (record: AcceptancePass) => record.items.flatMap((h) => (h.issue ? [h.issue] : []));
 
-/** Units grouped by top-level item; units of manifests without `item` stand alone. */
-export function groupAcceptanceUnits(manifest: AcceptanceUnit[]): Map<string, AcceptanceUnit[]> {
+/** Group by top-level item, confirming legacy ancestry against the persisted snapshot. */
+export function groupAcceptanceUnits(
+  manifest: AcceptanceUnit[],
+  snapshot: AcceptanceSnapshot,
+): Map<string, AcceptanceUnit[]> {
+  if (manifest.some((u) => !u.item)) {
+    try {
+      const resolved = resolveIntent(snapshot);
+      if (
+        resolved.length !== manifest.length ||
+        resolved.some((u, i) => u.id !== manifest[i]?.id || u.text !== manifest[i]?.text)
+      )
+        throw new Error("manifest mismatch");
+      manifest = manifest.map((u, i) => ({ ...u, item: resolved[i]?.item }));
+    } catch {
+      throw new NeedsHumanError(
+        "Follow-ups were not filed because the persisted manifest's top-level items could not be confirmed from the snapshot",
+      );
+    }
+  }
   const groups = new Map<string, AcceptanceUnit[]>();
-  for (const unit of manifest)
-    groups.set(unit.item ?? unit.id, [...(groups.get(unit.item ?? unit.id) ?? []), unit]);
+  for (const unit of manifest) {
+    if (!unit.item) throw new Error("Missing top-level item");
+    groups.set(unit.item, [...(groups.get(unit.item) ?? []), unit]);
+  }
   return groups;
 }
 
@@ -33,7 +58,7 @@ const fenced = (text: string) => {
   return [`${fence}text`, ...text.split(/\r\n?|\n/), fence].map((line) => `> ${line}`).join("\n");
 };
 
-const Author = z.object({ login: z.string() }).nullable();
+const Author = z.object({ __typename: z.string().optional(), login: z.string() }).nullable();
 const Listing = z.object({
   data: z.object({
     repository: z.object({
@@ -110,15 +135,21 @@ export async function fileFollowUps(
     ctx.checkCancelled();
     return JSON.parse(String(await gh(["api", ...args], ctx.signal, undefined, repo))) as unknown;
   };
-  const login = async () => {
+  const login = async (graphql = false) => {
     const identity = await githubIdentity(repo);
     const name =
       identity.kind === "app"
         ? identity.botLogin
         : z.object({ login: z.string() }).parse(await api(["user"])).login;
-    return (author: z.infer<typeof Author>) => author?.login.toLowerCase() === name.toLowerCase();
+    return (author: z.infer<typeof Author>) =>
+      identity.kind === "app" && graphql
+        ? author?.__typename === "Bot" &&
+          author.login.toLowerCase() === name.replace(/\[bot\]$/i, "").toLowerCase()
+        : author?.login.toLowerCase() === name.toLowerCase();
   };
-  const groups = [...groupAcceptanceUnits(manifest)].filter(([, units]) => units.some((u) => gaps.has(u.id)));
+  const groups = [...groupAcceptanceUnits(manifest, acceptance.snapshot)].filter(([, units]) =>
+    units.some((u) => gaps.has(u.id)),
+  );
   const items = groups.map(([item]) => ({ item, state: "pending" as const }));
   const claimed = ctx.store.claimAcceptancePass(
     { repo, epic, ticket, runId: ctx.run.id, sha: outcome.sha, items },
@@ -130,44 +161,34 @@ export async function fileFollowUps(
       ctx,
       (failure) => `${limited}; ${failure}`,
       async () => {
-        const unconfirmed: string[] = [];
-        // Only the caller that claims an effect sends it; a claimed effect is later reconciled, never re-sent.
-        const label = ctx.store.claimAcceptanceLimit(repo, epic, ctx.run.id, "label");
-        if (label === "claimed")
+        const labels = z
+          .array(z.object({ name: z.string() }))
+          .parse(await api([`repos/${repo}/issues/${epic}/labels`]));
+        if (!labels.some((l) => l.name === NEEDS_YOU))
           await api([`repos/${repo}/issues/${epic}/labels`, "-X", "POST", "-f", `labels[]=${NEEDS_YOU}`]);
-        else if (label === "requested") {
-          const labels = z
-            .array(z.object({ name: z.string() }))
-            .parse(await api([`repos/${repo}/issues/${epic}/labels`]));
-          if (!labels.some((l) => l.name === NEEDS_YOU))
-            unconfirmed.push(`the ${NEEDS_YOU} label request is unconfirmed`);
-        }
-        if (label !== "done" && !unconfirmed.length) ctx.store.finishAcceptanceLimit(repo, epic, "label");
         const link = `${ctx.deps.cfg.uiUrl}/runs/${ctx.run.id}`;
         const body = publishable(
           ctx,
           `${LIMIT_MARKER}\nLimitless: acceptance ticket #${ticket} still has gaps after ${MAX_PASSES} follow-up passes, so no more follow-ups are filed. See ${link}.`,
         );
         if (!body) throw new NeedsHumanError(`${limited}; the pass-limit comment was withheld`);
-        const comment = ctx.store.claimAcceptanceLimit(repo, epic, ctx.run.id, "comment");
-        if (comment !== "done") {
-          const factory = await login();
-          let posted = false;
-          for (let page = 1; !posted; page++) {
-            const comments = z
-              .array(z.object({ body: z.string(), user: Author }))
-              .parse(await api([`repos/${repo}/issues/${epic}/comments?per_page=100&page=${page}`]));
-            posted = comments.some((c) => factory(c.user) && firstLine(c.body) === LIMIT_MARKER);
-            if (comments.length < 100) break;
-          }
-          if (!posted && comment === "claimed") {
-            await api([`repos/${repo}/issues/${epic}/comments`, "-X", "POST", "-f", `body=${body}`]);
-            posted = true;
-          }
-          if (posted) ctx.store.finishAcceptanceLimit(repo, epic, "comment");
-          else unconfirmed.push("the pass-limit comment request is unconfirmed");
+        const factory = await login();
+        let posted = false;
+        for (let page = 1; !posted; page++) {
+          const comments = z
+            .array(z.object({ body: z.string(), user: Author }))
+            .parse(await api([`repos/${repo}/issues/${epic}/comments?per_page=100&page=${page}`]));
+          posted = comments.some((c) => factory(c.user) && firstLine(c.body) === LIMIT_MARKER);
+          if (comments.length < 100) break;
         }
-        if (unconfirmed.length) throw new NeedsHumanError(`${limited}; ${unconfirmed.join("; ")}`);
+        const comment = posted ? "done" : ctx.store.claimAcceptanceLimit(repo, epic, ctx.run.id);
+        if (!posted && comment === "claimed") {
+          await api([`repos/${repo}/issues/${epic}/comments`, "-X", "POST", "-f", `body=${body}`]);
+          posted = true;
+        }
+        if (posted) ctx.store.finishAcceptanceLimit(repo, epic, ctx.run.id);
+        else if (comment === "requested")
+          throw new NeedsHumanError(`${limited}; the pass-limit comment request is unconfirmed`);
         return { issues: [], limit: true };
       },
     );
@@ -191,26 +212,32 @@ export async function fileFollowUps(
               : `${h.item} is not filed yet`),
         ),
     ].join("; ")}`;
-  /** Moves one handle durably; false when its stored state is no longer in `from`. */
-  const move = (item: string, from: string[], to: Partial<AcceptancePass["items"][number]>) => {
-    const result = ctx.store.changeAcceptancePass(record, (r) => {
-      const handle = r.items.find((h) => h.item === item);
-      return !!handle && from.includes(handle.state) && !!Object.assign(handle, to);
-    });
+  const update = (change: (r: AcceptancePass) => boolean) => {
+    const result = ctx.store.changeAcceptancePass(record, change);
+    if (!result)
+      throw new NeedsHumanError(
+        "Acceptance follow-ups stopped because the pass reservation was reassigned to another ticket or SHA",
+      );
     record = result.record;
     return result.changed;
   };
+  /** Moves one handle durably; false when its stored state is no longer in `from`. */
+  const move = (item: string, from: string[], to: Partial<AcceptancePass["items"][number]>) =>
+    update((r) => {
+      const handle = r.items.find((h) => h.item === item);
+      return !!handle && from.includes(handle.state) && !!Object.assign(handle, to);
+    });
   if (record.state === "complete") return { pass: record.pass, issues: issueList(record) };
   const failed = (failure: string) => {
-    record = ctx.store.changeAcceptancePass(record, () => false).record;
+    update(() => false);
     return progress([failure]);
   };
   return guarded(ctx, failed, async () => {
-    const factory = await login();
+    const factory = await login(true);
     const [owner, name] = repo.split("/");
     const query = `query($after:String) { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) { id
       epic: issue(number:${epic}) { id subIssues(first:100, after:$after) {
-        nodes { id number body author { login } } pageInfo { hasNextPage endCursor } } }
+        nodes { id number body author { __typename login } } pageInfo { hasNextPage endCursor } } }
       ticket: issue(number:${ticket}) { id blockedBy(first:100) { nodes { number } } } } }`;
     let listing: z.infer<typeof Listing>["data"]["repository"] | undefined;
     const subIssues: z.infer<typeof Listing>["data"]["repository"]["epic"]["subIssues"]["nodes"] = [];
@@ -221,6 +248,7 @@ export async function fileFollowUps(
       ).data.repository;
       subIssues.push(...listing.epic.subIssues.nodes);
     }
+    update(() => false);
     const ids = new Map(subIssues.map((i) => [i.number, i.id]));
     // Reconcile every handle, including requests whose response was lost, before creating anything.
     for (const handle of record.items) {
@@ -264,7 +292,8 @@ export async function fileFollowUps(
           }),
         ].join("\n"),
       );
-      const title = publishable(ctx, `Acceptance #${ticket} pass ${record.pass}: ${text.slice(0, 80)}`);
+      const prefix = `Acceptance #${ticket} pass ${record.pass}: `;
+      const title = publishable(ctx, `${prefix}${text}`)?.slice(0, prefix.length + 80);
       if (!body || !title) {
         why.set(item, `${item}'s follow-up was withheld by the publication check`);
         continue;
@@ -298,7 +327,7 @@ export async function fileFollowUps(
     }
     if (unlinked.length || record.items.some((h) => h.state !== "filed"))
       throw new NeedsHumanError(progress(unlinked));
-    record = ctx.store.changeAcceptancePass(record, (r) => !!Object.assign(r, { state: "complete" })).record;
+    update((r) => !!Object.assign(r, { state: "complete" }));
     return { pass: record.pass, issues: issueList(record) };
   });
 }

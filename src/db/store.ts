@@ -1566,20 +1566,51 @@ export class Store {
       );
   }
 
-  /** The run's own pass for the epic, else the next one claimed; null once `limit` passes exist. */
+  /** Reuse the run's pass, the latest at this ticket/SHA, or an unsent reservation before counting another. */
   claimAcceptancePass(claim: Omit<AcceptancePass, "pass" | "state">, limit: number): AcceptancePass | null {
     const repo = claim.repo.toLowerCase();
     return this.transaction(() => {
       const rows = this.db
         .query<
-          { pass: number; run_id: string; items: string; state: AcceptancePass["state"] },
+          {
+            pass: number;
+            ticket: number;
+            sha: string;
+            run_id: string;
+            items: string;
+            state: AcceptancePass["state"];
+          },
           [string, number]
         >(
-          "SELECT pass, run_id, items, state FROM acceptance_passes WHERE repo = ? AND epic = ? ORDER BY pass",
+          "SELECT pass, ticket, sha, run_id, items, state FROM acceptance_passes WHERE repo = ? AND epic = ? ORDER BY pass",
         )
         .all(repo, claim.epic);
       const own = rows.find((r) => r.run_id === claim.runId);
-      if (own) return { ...claim, repo, pass: own.pass, items: JSON.parse(own.items), state: own.state };
+      if (own) return { ...claim, ...own, repo, items: JSON.parse(own.items) };
+      const latest = rows.at(-1);
+      if (latest) {
+        const items: AcceptancePass["items"] = JSON.parse(latest.items);
+        const same = latest.ticket === claim.ticket && latest.sha === claim.sha;
+        if (same || !items.some((h) => h.state === "requested" || h.state === "filed")) {
+          const record: AcceptancePass = same
+            ? { ...claim, ...latest, repo, items }
+            : { ...claim, repo, pass: latest.pass, state: "filing" };
+          this.db
+            .query(`UPDATE acceptance_passes SET run_id = ?, ticket = ?, sha = ?, items = ?, state = ?
+            WHERE repo = ? AND epic = ? AND pass = ?`)
+            .run(
+              claim.runId,
+              record.ticket,
+              record.sha,
+              JSON.stringify(record.items),
+              record.state,
+              repo,
+              claim.epic,
+              record.pass,
+            );
+          return record;
+        }
+      }
       if (rows.length >= limit) return null;
       const record: AcceptancePass = { ...claim, repo, pass: rows.length + 1, state: "filing" };
       this.db
@@ -1598,11 +1629,11 @@ export class Store {
     }, true);
   }
 
-  /** Applies `change` to the stored pass in one write transaction; a false return leaves it untouched. */
+  /** Applies `change` atomically; null fences callers of a reassigned ticket/SHA reservation. */
   changeAcceptancePass(
-    { repo, epic, pass }: AcceptancePass,
+    { repo, epic, pass, ticket, sha }: AcceptancePass,
     change: (record: AcceptancePass) => boolean,
-  ): { changed: boolean; record: AcceptancePass } {
+  ): { changed: boolean; record: AcceptancePass } | null {
     return this.transaction(() => {
       const row = this.db
         .query<
@@ -1613,6 +1644,7 @@ export class Store {
         )
         .get(repo, epic, pass);
       if (!row) throw new Error(`acceptance pass ${pass} of ${repo}#${epic} is missing`);
+      if (row.ticket !== ticket || row.sha !== sha) return null;
       const record: AcceptancePass = {
         ...row,
         repo,
@@ -1630,13 +1662,8 @@ export class Store {
     }, true);
   }
 
-  /** Claims one pass-limit effect of the epic: only the caller that moves it from pending gets "claimed". */
-  claimAcceptanceLimit(
-    repo: string,
-    epic: number,
-    runId: string,
-    effect: "label" | "comment",
-  ): "claimed" | "requested" | "done" {
+  /** Claim the pass-limit comment immediately before posting; uncertain requests are never re-sent. */
+  claimAcceptanceLimit(repo: string, epic: number, runId: string): "claimed" | "requested" | "done" {
     repo = repo.toLowerCase();
     return this.transaction(() => {
       this.db
@@ -1644,22 +1671,23 @@ export class Store {
         .run(repo, epic, runId);
       const claimed = this.db
         .query(
-          `UPDATE acceptance_epic_limits SET ${effect} = 'requested' WHERE repo = ? AND epic = ? AND ${effect} = 'pending'`,
+          "UPDATE acceptance_epic_limits SET comment = 'requested' WHERE repo = ? AND epic = ? AND comment = 'pending'",
         )
         .run(repo, epic).changes;
       if (claimed) return "claimed";
       return this.db
-        .query<Record<string, "requested" | "done">, [string, number]>(
-          `SELECT ${effect} FROM acceptance_epic_limits WHERE repo = ? AND epic = ?`,
+        .query<{ comment: "requested" | "done" }, [string, number]>(
+          "SELECT comment FROM acceptance_epic_limits WHERE repo = ? AND epic = ?",
         )
-        .get(repo, epic)?.[effect] as "requested" | "done";
+        .get(repo, epic)?.comment as "requested" | "done";
     }, true);
   }
 
-  finishAcceptanceLimit(repo: string, epic: number, effect: "label" | "comment"): void {
+  finishAcceptanceLimit(repo: string, epic: number, runId: string): void {
     this.db
-      .query(`UPDATE acceptance_epic_limits SET ${effect} = 'done' WHERE repo = ? AND epic = ?`)
-      .run(repo.toLowerCase(), epic);
+      .query(`INSERT INTO acceptance_epic_limits VALUES (?, ?, ?, 'pending', 'done')
+        ON CONFLICT(repo, epic) DO UPDATE SET comment = 'done'`)
+      .run(repo.toLowerCase(), epic, runId);
   }
 
   latestIssueRun(repo: string, number: number): Run | null {

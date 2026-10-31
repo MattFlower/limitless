@@ -84,14 +84,22 @@ marker `<!-- limitless-acceptance:<ticket>:<pass>:<item> -->`; the body quotes t
 gap unit from the epic, the verdict and the engine's citations and refusals, and puts the
 reader's note under "Reviewer's note (data)" in a quoted, fenced block. Before creating, the run adopts
 an existing sub-issue of the epic whose first line is the marker and whose author is the
-factory's posting login. A pass record (epic, pass, ticket SHA, filed issues) is written
-before the first GitHub write, and a creation request is sent at most once: after a restart, a
+factory's posting login. Under a GitHub App, only a Bot author matching the App slug
+(without `[bot]`, case-insensitively) is adopted. A pass record (epic, pass, ticket SHA, filed
+issues) is written before the first GitHub write, and a creation request is sent at most once: after a restart, a
 request that the marker search can't find stops the run for you instead of being re-sent.
 Only the coordinator that durably claims a pending item sends its request, and a GitHub failure
 ends the run needs-you, naming the filed issues and the unconfirmed item.
+A fresh run at the same ticket and SHA reuses the epic's latest pass, including its stored
+handles and completion state. A pass that sent no creation request is reused for a new run
+and is not counted; only passes that requested follow-ups spend the allowance. If that reservation
+is reassigned to another ticket or SHA while a caller awaits GitHub, the stale caller stops before
+filing or completing the replacement pass. Callers for the same ticket and SHA still share it.
 Each epic has at most two counted passes. When a later run still finds gaps, it files nothing,
-labels the epic `limitless:needs-you` and posts one comment there naming the ticket and run,
-once per epic. The run ends needs-you, listing the pass and filed issues or the reached limit.
+adds `limitless:needs-you` only if the epic lacks it, and posts one comment there naming the
+ticket and run, once per epic. The comment is reconciled by marker after identity and listing
+reads succeed, and claimed only immediately before posting; uncertain requests are not re-sent.
+The run ends needs-you, listing the pass and filed issues or the reached limit.
 
 Operators can run `limitless accept <owner/name>#<n>` without queue scheduling eligibility or the label.
 The repository must be listed in `[github.queue] repos` (case-insensitive), with a nonempty
@@ -117,7 +125,9 @@ written share one unit.
 The manifest records the top-level unit id as each unit's `item`: a paragraph or top-level
 list item owns itself, and nested sub-items belong to their top-level list item. Deduplicated
 units keep the item of their first occurrence. Persisted manifests without `item` remain
-valid; grouping treats each of their units as its own item without resolving the intent again.
+valid; grouping re-resolves the persisted snapshot and uses its items only when the unit ids
+and texts match in the same order. If ancestry cannot be confirmed, the run ends needs-you
+with a reason, filing nothing and claiming no pass.
 
 Quoting parent or file text (a `From #123:` or `From docs/PLAN.md:` line followed by `>` quotes)
 is not supported: it was cut from #981's scope, and a lead-in or a quote refuses the run. Put the
