@@ -19,6 +19,7 @@ import * as proc from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { holdout, models, pipelineSetup, policy, providers, spec } from "./pipeline-support.ts";
 import { test } from "./read-policy-support.ts";
+import { waitClock } from "./wait-clock.ts";
 
 let home: string;
 let repoDir: string;
@@ -75,6 +76,14 @@ async function context() {
     implementedRound: 0,
   });
   return ctx;
+}
+function scoped<T>(ctx: RunContext, fn: () => T): T {
+  const claim = bindClaim(
+    { windowOpen: () => true },
+    { repo: ctx.repo.slug, ref: "refs/limitless/claims/1", run: ctx.run.id, member: "m", generation: 1 },
+    () => false,
+  );
+  return claimScope.run([claim], fn);
 }
 const failure = (kind: string) =>
   kind === "loss"
@@ -134,7 +143,8 @@ function workers(ctx: RunContext, run: (name: StageName) => Promise<unknown>) {
       fn: (stage: Stage) => Promise<{ summary: string; value: T }>,
       ...rest: [number?, boolean?, boolean?, ((value: T, row: Stage, sha?: string) => void)?]
     ) => {
-      if (["gates", "audit", "review", "verify", "holdout"].includes(name)) return (await run(name)) as T;
+      if (["implement", "gates", "audit", "review", "verify", "holdout"].includes(name))
+        return (await run(name)) as T;
       return original(name, fn, ...rest);
     },
   );
@@ -194,69 +204,149 @@ test.each(pairs)("concurrent readers settle before selecting claim control and c
   }
 });
 
-test.each(["failed+wait", "failed+loss", "ordinary+wait", "ordinary+loss", "wait+loss", "passed+loss"])(
-  "foreground/holdout arbitration precedes round accounting and delivery: %s",
-  async (pair) => {
-    const ctx = await context();
-    ctx.state.holdoutStatus = undefined;
-    const [foreground, background = "loss"] = pair.split("+");
-    const fgError = failure(foreground ?? "ordinary");
-    const bgError = failure(background);
-    const entered = Promise.withResolvers<void>();
-    const resume = Promise.withResolvers<void>();
-    const foregroundDone = Promise.withResolvers<void>();
-    const stage = workers(ctx, async (name) => {
-      if (name === "holdout") {
-        entered.resolve();
-        await resume.promise;
-        throw bgError;
-      }
-      if (name === "audit") return [];
-      if (name === "gates") {
-        await entered.promise;
-        foregroundDone.resolve();
-        if (foreground === "ordinary" || foreground === "wait") throw fgError;
-        return foreground === "failed"
-          ? [
-              {
-                name: "check",
-                blocking: true,
-                verdict: "regressed",
-                result: {
-                  name: "check",
-                  ok: false,
-                  command: "false",
-                  output: "check failed",
-                  durationMs: 0,
-                  exitCode: 1,
-                },
-              } satisfies GateComparison,
-            ]
-          : [];
-      }
-      if (name === "review") return { verdict: "approve", summary: "ok", findings: [] };
-      return { overall: "pass", criteria: [], notes: "" };
-    });
-    const delivery = spyOn(ctx, "setPhase");
-    const work = buildLoop(ctx).catch((e) => e);
-    try {
-      await foregroundDone.promise;
-      // Let the foreground reach its return/throw while the background is still pending.
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(ctx.state).toMatchObject({ phase: "loop", round: 0, roundsOnImplementer: 0 });
-      resume.resolve();
-      expect(await work).toBe(bgError);
-      if (foreground === "failed") expect(ctx.state.feedback).toContain("Check `check` now FAILS");
-      expect(ctx.state).toMatchObject({ phase: "loop", round: 0, roundsOnImplementer: 0 });
-      expect(delivery).not.toHaveBeenCalled();
-    } finally {
-      resume.resolve();
-      await work;
-      stage.mockRestore();
-      delivery.mockRestore();
+test.each([
+  "failed+wait",
+  "failed+loss",
+  "ordinary+wait",
+  "ordinary+loss",
+  "wait+loss",
+  "passed+loss",
+  "unscoped:wait+loss",
+])("foreground/holdout arbitration precedes round accounting and delivery: %s", async (pair) => {
+  const ctx = await context();
+  ctx.state.holdoutStatus = undefined;
+  const [foreground, background = "loss"] = pair.replace("unscoped:", "").split("+");
+  const fgError = failure(foreground ?? "ordinary");
+  const bgError = failure(background);
+  const entered = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const foregroundDone = Promise.withResolvers<void>();
+  const stage = workers(ctx, async (name) => {
+    if (name === "holdout") {
+      entered.resolve();
+      await resume.promise;
+      throw bgError;
     }
-  },
-);
+    if (name === "audit") return [];
+    if (name === "gates") {
+      await entered.promise;
+      foregroundDone.resolve();
+      if (foreground === "ordinary" || foreground === "wait") throw fgError;
+      return foreground === "failed"
+        ? [
+            {
+              name: "check",
+              blocking: true,
+              verdict: "regressed",
+              result: {
+                name: "check",
+                ok: false,
+                command: "false",
+                output: "check failed",
+                durationMs: 0,
+                exitCode: 1,
+              },
+            } satisfies GateComparison,
+          ]
+        : [];
+    }
+    if (name === "review") return { verdict: "approve", summary: "ok", findings: [] };
+    return { overall: "pass", criteria: [], notes: "" };
+  });
+  const delivery = spyOn(ctx, "setPhase");
+  const work = (pair.startsWith("unscoped:") ? buildLoop(ctx) : scoped(ctx, () => buildLoop(ctx))).catch(
+    (e) => e,
+  );
+  try {
+    await foregroundDone.promise;
+    // Let the foreground reach its return/throw while the background is still pending.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(ctx.state).toMatchObject({ phase: "loop", round: 0, roundsOnImplementer: 0 });
+    resume.resolve();
+    expect(await work).toBe(bgError);
+    if (foreground === "failed") expect(ctx.state.feedback).toContain("Check `check` now FAILS");
+    expect(ctx.state).toMatchObject({ phase: "loop", round: 0, roundsOnImplementer: 0 });
+    expect(delivery).not.toHaveBeenCalled();
+  } finally {
+    resume.resolve();
+    await work;
+    stage.mockRestore();
+    delivery.mockRestore();
+  }
+});
+
+test.each(["unscoped", "scoped", "settled"])("failed-round holdout overlap: %s", async (mode) => {
+  const bound = mode === "scoped";
+  const overlap = mode === "unscoped";
+  const ctx = await context();
+  ctx.state.holdoutStatus = undefined;
+  const clock = waitClock();
+  const entered = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const failed = Promise.withResolvers<void>();
+  const loss = new ClaimLostError();
+  let secondRound = false;
+  const stage = workers(ctx, async (name) => {
+    if (name === "holdout") {
+      entered.resolve();
+      await resume.promise;
+      throw loss;
+    }
+    if (name === "implement") {
+      secondRound = true;
+      throw new ClaimWaitError("lease");
+    }
+    if (name === "gates") {
+      await entered.promise;
+      if (mode === "settled") {
+        await clock.advance(200);
+        await clock.flush();
+      }
+      return [
+        {
+          name: "check",
+          blocking: true,
+          verdict: "regressed",
+          result: {
+            name: "check",
+            ok: false,
+            command: "false",
+            output: "check failed",
+            durationMs: 0,
+            exitCode: 1,
+          },
+        } satisfies GateComparison,
+      ];
+    }
+    return [];
+  });
+  const log = ctx.log.bind(ctx);
+  const notice = spyOn(ctx, "log").mockImplementation((...args) => {
+    log(...args);
+    if (args[0].startsWith("Deterministic checks failed")) failed.resolve();
+  });
+  const delivery = spyOn(ctx, "setPhase");
+  const timer = clock.timer.set(() => resume.resolve(), 200);
+  const work = (bound ? scoped(ctx, () => buildLoop(ctx)) : buildLoop(ctx)).catch((e) => e);
+  try {
+    await failed.promise;
+    await clock.flush();
+    expect(secondRound).toBe(overlap);
+    expect(ctx.state.round).toBe(overlap ? 1 : 0);
+    expect(ctx.state.roundsOnImplementer).toBe(overlap ? 1 : 0);
+    await clock.advance(200);
+    expect(await work).toBe(loss);
+    expect(ctx.state.round).toBe(overlap ? 1 : 0);
+    expect(delivery).not.toHaveBeenCalled();
+  } finally {
+    resume.resolve();
+    await work;
+    clock.timer.clear(timer);
+    stage.mockRestore();
+    notice.mockRestore();
+    delivery.mockRestore();
+  }
+});
 
 test("holdout interruption survives failure of snapshot cleanup", async () => {
   const ctx = await context();
@@ -297,7 +387,7 @@ test("holdout interruption survives failure of snapshot cleanup", async () => {
     },
   );
   try {
-    expect(await buildLoop(ctx).catch((e) => e)).toBe(error);
+    expect(await scoped(ctx, () => buildLoop(ctx)).catch((e) => e)).toBe(error);
     expect(ctx.store.listEvents(ctx.run.id).some((e) => e.message.includes("snapshot cleanup refused"))).toBe(
       true,
     );

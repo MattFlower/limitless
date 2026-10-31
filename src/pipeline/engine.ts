@@ -85,6 +85,7 @@ import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, platformConfinement } from "../harness/sandbox.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
 import { ClaimControlError, rethrowClaimControl, selectClaimControl } from "../integrations/claim-errors.ts";
+import { hasClaimScope } from "../integrations/claim-guard.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -1152,19 +1153,21 @@ export async function buildLoop(ctx: RunContext): Promise<void> {
       : Math.max(1, ctx.deps.cfg.maxRounds) +
         ROUNDS_PER_IMPLEMENTER +
         (ctx.state.reviewResolution?.sha ? 2 : 0);
+  let holdoutError: Error | null = null;
   const holdout =
     ctx.state.flow === "verify-change" || profile(ctx) === "quick" || ctx.state.holdoutStatus === "complete"
       ? null
       : authorHoldout(ctx).then(
           () => null,
-          (error: unknown) => error as Error,
+          (error: unknown) => (holdoutError = error as Error),
         );
   try {
     while (ctx.state.round < maxRounds) {
       ctx.checkCancelled();
       const round = ctx.state.round;
       const passed = await oneRound(ctx, round, holdout);
-      const interruption = selectClaimControl([await holdout]);
+      if (hasClaimScope()) await holdout;
+      const interruption = selectClaimControl([holdoutError]);
       if (interruption) throw interruption;
       if (passed) {
         await ctx.setPhase("deliver");
@@ -1178,7 +1181,8 @@ export async function buildLoop(ctx: RunContext): Promise<void> {
       `Still failing after ${ctx.state.round} implementation rounds. Last feedback:\n${ctx.state.feedback ?? ""}`,
     );
   } catch (error) {
-    throw selectClaimControl([error, await holdout]) ?? error;
+    if (hasClaimScope() || error instanceof ClaimControlError) await holdout;
+    throw selectClaimControl([error, holdoutError]) ?? error;
   } finally {
     if (holdout) await holdout;
   }

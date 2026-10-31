@@ -108,63 +108,126 @@ describe("routing bounded slot waits", () => {
     return { clock, cfg, tracker, router, calls, controller, context, run, invoke, events };
   }
 
-  test.each(["claim", "rejected", "unavailable"])(
-    "admission cleanup owns the slot during preflight: %s",
-    async (kind) => {
-      const f = fixture();
-      const entered = deferred<void>();
-      const resume = Promise.withResolvers<boolean>();
-      const error = kind === "claim" ? new ClaimWaitError("lease") : new Error("preflight rejected");
-      let closed = false;
-      const claim = bindClaim(
-        {
-          windowOpen: () => {
-            if (closed) throw error;
-            return true;
-          },
+  test.each([
+    "claim",
+    "loss+release",
+    "wait+release",
+    "persist+loss+release",
+    "persist+wait+release",
+    "rejected",
+    "unavailable",
+  ])("admission cleanup owns the slot through preflight and handoff: %s", async (kind) => {
+    const f = fixture();
+    const entered = deferred<void>();
+    const resume = Promise.withResolvers<boolean>();
+    const interrupted = kind === "claim" || kind.endsWith("+release");
+    const error = kind.includes("loss")
+      ? new ClaimLostError()
+      : interrupted
+        ? new ClaimWaitError("lease")
+        : new Error("preflight rejected");
+    let closed = false;
+    const claim = bindClaim(
+      {
+        windowOpen: () => {
+          if (closed) throw error;
+          return true;
         },
-        { repo: "wait/repo", ref: "refs/limitless/claims/1", run: f.run.id, member: "m", generation: 1 },
-        () => false,
-      );
-      const preflight = spyOn(f.tracker, "preflight").mockImplementation(() => {
-        entered.resolve();
-        return resume.promise;
-      });
-      const acquire = f.tracker.acquireFirst.bind(f.tracker);
-      let releases = 0;
-      const admission = spyOn(f.tracker, "acquireFirst").mockImplementation(async (...args) => {
-        const slot = await acquire(...args);
-        if (!slot) return slot;
-        return {
-          ...slot,
-          release: () => {
-            releases++;
-            slot.release();
-          },
-        };
-      });
-      try {
-        const work = claimScope.run([claim], () => f.invoke()).catch((e) => e);
-        await entered.promise;
-        expect(f.tracker.status("alpha")?.inFlight).toBe(1);
-        if (kind === "rejected") resume.reject(error);
-        else {
-          closed = kind === "claim";
-          resume.resolve(kind !== "unavailable");
-        }
-        if (kind === "unavailable") f.controller.abort();
-        const outcome = await work;
-        if (kind !== "unavailable") expect(outcome).toBe(error);
-        expect(releases).toBe(1);
-        expect(f.tracker.status("alpha")?.inFlight).toBe(0);
-        expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
-        expect(f.calls).toHaveLength(0);
-      } finally {
-        preflight.mockRestore();
-        admission.mockRestore();
+      },
+      { repo: "wait/repo", ref: "refs/limitless/claims/1", run: f.run.id, member: "m", generation: 1 },
+      () => false,
+    );
+    const preflight = spyOn(f.tracker, "preflight").mockImplementation(() => {
+      if (kind.startsWith("persist")) return Promise.resolve(true);
+      entered.resolve();
+      return resume.promise;
+    });
+    const persistence = kind.startsWith("persist")
+      ? spyOn(f.context, "save").mockImplementation(async () => {
+          entered.resolve();
+          await resume.promise;
+          throw error;
+        })
+      : undefined;
+    const acquire = f.tracker.acquireFirst.bind(f.tracker);
+    let releases = 0;
+    const admission = spyOn(f.tracker, "acquireFirst").mockImplementation(async (...args) => {
+      const slot = await acquire(...args);
+      if (!slot) return slot;
+      return {
+        ...slot,
+        release: () => {
+          releases++;
+          slot.release();
+          if (kind.endsWith("+release")) throw new Error("slot cleanup refused");
+        },
+      };
+    });
+    try {
+      const work = claimScope
+        .run([claim], () =>
+          f.context.stage("triage", async () => ({
+            value: await f.invoke(undefined, kind.startsWith("persist") ? "implement" : "triage"),
+            summary: "unreachable",
+          })),
+        )
+        .catch((e) => e);
+      await entered.promise;
+      expect(f.tracker.status("alpha")?.inFlight).toBe(1);
+      if (kind === "rejected") resume.reject(error);
+      else {
+        closed = interrupted;
+        resume.resolve(kind !== "unavailable");
       }
-    },
-  );
+      if (kind === "unavailable") f.controller.abort();
+      const outcome = await work;
+      if (kind !== "unavailable") expect(outcome).toBe(error);
+      expect(releases).toBe(1);
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+      expect(f.context.store.listInvocations(f.run.id)).toHaveLength(0);
+      expect(f.calls).toHaveLength(0);
+      if (interrupted) {
+        expect(f.controller.signal.aborted).toBe(false);
+        expect(f.context.store.listStages(f.run.id).at(-1)?.status).toBe("cancelled");
+      }
+      if (kind.endsWith("+release"))
+        expect(
+          f.context.store
+            .listEvents(f.run.id)
+            .some((e) => e.level === "warn" && e.message.includes("slot cleanup refused")),
+        ).toBe(true);
+    } finally {
+      preflight.mockRestore();
+      persistence?.mockRestore();
+      admission.mockRestore();
+    }
+  });
+
+  test("synchronous invocation cleanup stores ok before cancellation queued at release", async () => {
+    const f = fixture();
+    const acquire = f.tracker.acquireFirst.bind(f.tracker);
+    let releases = 0;
+    const admission = spyOn(f.tracker, "acquireFirst").mockImplementation(async (...args) => {
+      const slot = await acquire(...args);
+      if (!slot) return slot;
+      return {
+        ...slot,
+        release: () => {
+          releases++;
+          slot.release();
+          queueMicrotask(() => f.controller.abort());
+        },
+      };
+    });
+    try {
+      expect((await f.invoke()).result.status).toBe("ok");
+      expect(f.context.store.listInvocations(f.run.id).map((i) => i.status)).toEqual(["ok"]);
+      expect(releases).toBe(1);
+      expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+    } finally {
+      admission.mockRestore();
+    }
+  });
 
   test.each([false, true])(
     "invoke and stage preserve claim control with signal aborted=%s",
@@ -192,9 +255,9 @@ describe("routing bounded slot waits", () => {
     },
   );
 
-  test.each([false, true])(
-    "executor interruption survives reader cleanup with signal aborted=%s",
-    async (abort) => {
+  test.each(["open", "aborted", "throwing release"])(
+    "executor interruption survives reader cleanup: %s",
+    async (kind) => {
       const f = fixture();
       const error = new ClaimLostError();
       let executions = 0;
@@ -203,10 +266,24 @@ describe("routing bounded slot waits", () => {
         kind: "fake",
         run: async () => {
           executions++;
-          if (abort) f.controller.abort();
+          if (kind === "aborted") f.controller.abort();
           throw error;
         },
       };
+      const acquire = f.tracker.acquireFirst.bind(f.tracker);
+      let releases = 0;
+      const admission = spyOn(f.tracker, "acquireFirst").mockImplementation(async (...args) => {
+        const slot = await acquire(...args);
+        if (!slot) return slot;
+        return {
+          ...slot,
+          release: () => {
+            releases++;
+            slot.release();
+            if (kind === "throwing release") throw new Error("reader slot cleanup failed");
+          },
+        };
+      });
       const cleanup = spyOn(repos, "discardChanges").mockRejectedValue(new Error("reader cleanup failed"));
       try {
         const work = f.context.stage("review", async (stage) => ({
@@ -226,11 +303,19 @@ describe("routing bounded slot waits", () => {
         expect(cleanup).toHaveBeenCalledTimes(1);
         expect(f.context.store.listStages(f.run.id).at(-1)?.status).toBe("cancelled");
         expect(f.tracker.status("alpha")?.inFlight).toBe(0);
+        expect(releases).toBe(1);
         expect(
           f.context.store.listEvents(f.run.id).some((e) => e.message.includes("reader cleanup failed")),
         ).toBe(true);
+        if (kind === "throwing release")
+          expect(
+            f.context.store
+              .listEvents(f.run.id)
+              .some((e) => e.message.includes("reader slot cleanup failed")),
+          ).toBe(true);
       } finally {
         cleanup.mockRestore();
+        admission.mockRestore();
       }
     },
   );

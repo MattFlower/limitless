@@ -8,7 +8,13 @@ import {
   rethrowClaimControl,
   selectClaimControl,
 } from "../src/integrations/claim-errors.ts";
-import { bindClaim, claimGuard, claimScope, type ScopedClaim } from "../src/integrations/claim-guard.ts";
+import {
+  bindClaim,
+  claimGuard,
+  claimScope,
+  hasClaimScope,
+  type ScopedClaim,
+} from "../src/integrations/claim-guard.ts";
 import { type ClaimRecord, createClaimClient } from "../src/integrations/claim-ref.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { createLeaseManager, type LeaseHandle } from "../src/integrations/leases.ts";
@@ -59,6 +65,23 @@ function stub(windowOpen: () => unknown = () => true, cancelled: () => unknown =
 function guard(claims: readonly ScopedClaim[]) {
   return () => claimScope.run(claims, claimGuard);
 }
+
+test("scope inspection inherits bindings and respects empty scopes and exits without reading authority", () => {
+  const claim = stub(() => {
+    throw new Error("authority must not be evaluated");
+  });
+  expect(hasClaimScope()).toBe(false);
+  claimScope.run([], () => expect(hasClaimScope()).toBe(false));
+  claimScope.run([claim], () => {
+    expect(hasClaimScope()).toBe(true);
+    claimScope.run([], () => expect(hasClaimScope()).toBe(true));
+    claimScope.exit(() => {
+      expect(hasClaimScope()).toBe(false);
+      claimScope.run([], () => expect(hasClaimScope()).toBe(false));
+    });
+    expect(hasClaimScope()).toBe(true);
+  });
+});
 async function managerFixture() {
   const gh = new GitHub();
   const store = new Store(":memory:");
@@ -469,6 +492,7 @@ test("source boundaries permit guarded control IO without production claim bindi
         "src/git/repos.ts",
         "src/pipeline/context.ts",
       ]).toContain(path);
+    if (/\bhasClaimScope\b/.test(source)) expect(path).toBe("src/pipeline/engine.ts");
     if (/\bclaimScope\b/.test(source)) {
       expect(allowed.has(path)).toBe(true);
       expect(source.replace(/import .*claimScope.*\n/, "").replaceAll("claimScope.exit", "")).not.toMatch(

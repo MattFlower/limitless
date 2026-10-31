@@ -702,7 +702,17 @@ export class RunContext {
    * Route a role to a model and run it, falling back across candidates when a provider is out of
    * quota or unavailable. Task-level failures are returned to the caller, not retried here.
    */
-  async invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
+  invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
+    return this.invokeWithAdmission(opts).catch((error: unknown) => {
+      if (error instanceof SuppressedError && error.suppressed instanceof ClaimControlError) {
+        this.log(redactCredentials(`Invocation cleanup failed: ${String(error.error)}`), "warn");
+        throw error.suppressed;
+      }
+      throw error;
+    });
+  }
+
+  private async invokeWithAdmission(opts: InvokeOptions): Promise<InvokeOutcome> {
     const agentExecutor = this.deps.agentExecutor ?? localAgentExecutor;
     const { router, tracker, store, harnesses } = this.deps;
     const { shadow } = opts;
@@ -844,6 +854,7 @@ export class RunContext {
       if (admission) target = candidates.find((t) => t.provider === admission.provider) ?? target;
       waitMs += waitingAt === null ? 0 : Math.max(0, tracker.now() - waitingAt);
       if (this.signal.aborted || left() <= 0) {
+        claimGuard();
         release?.();
         this.checkCancelled();
         if (chain) exhaustPinned(decision, true);
@@ -880,7 +891,10 @@ export class RunContext {
         );
         continue;
       }
-      if (this.signal.aborted) release();
+      if (this.signal.aborted) {
+        claimGuard();
+        release();
+      }
       this.checkCancelled();
       const guard = shadow;
       const stopped = guard?.stop(target.provider);
@@ -911,7 +925,7 @@ export class RunContext {
           await this.save();
         } catch (error) {
           this.state.implementer = previousImplementer;
-          release();
+          if (!(error instanceof ClaimControlError)) release();
           throw error;
         }
       }
@@ -971,6 +985,10 @@ export class RunContext {
           ? holdoutRedactor(this.state.holdout, publicSources)
           : undefined;
       let interruption: ClaimControlError | undefined;
+      const cleanupFailure = (error: unknown) => {
+        if (!interruption) throw error;
+        this.log(redactCredentials(`Invocation cleanup failed: ${String(error)}`), "warn");
+      };
       try {
         const spec: AgentSpec = {
           fast: invocation.fast,
@@ -1128,12 +1146,16 @@ export class RunContext {
           quota: null,
         };
       } finally {
-        await (async () => {
+        try {
           if (!dispatched && revision.aborted && opts.role === "implement") {
             this.state.implementer = previousImplementer;
             this.checkpointer.writeState(this.run.id, this.state);
           }
-          release();
+          try {
+            release();
+          } catch (error) {
+            cleanupFailure(error);
+          }
           if (privateDir) rmSync(privateDir, { recursive: true, force: true });
           const checkout = shadow?.cwd ?? this.state.worktreePath;
           if (
@@ -1142,10 +1164,9 @@ export class RunContext {
             (!this.parallelChecks || shadow)
           )
             await discardChanges(checkout);
-        })().catch((error: unknown) => {
-          if (!interruption) throw error;
-          this.log(redactCredentials(`Invocation cleanup failed: ${String(error)}`), "warn");
-        });
+        } catch (error) {
+          cleanupFailure(error);
+        }
       }
       if (needsHuman) {
         store.updateInvocation(invocation.id, {
