@@ -422,6 +422,77 @@ odd PRs go to **escapes-heldout**. All rounds of a PR share its split. Existing
 cases never move into or out of a split. These splits form a new family, independent
 of the existing `dev`/`heldout` assignment and seed.
 
+## Escape-case labelling — 2026-10-30
+
+The owner approved this rubric on 2026-10-30. It decides which escape findings become gold.
+
+**Gold** requires all of the following:
+- The finding is real at the reviewed commit, shown by a reproduction or by quoted code contrasted
+  with the base.
+- It is about code, not process.
+- It is introduced or newly exposed by the change, or it is a requirement the request explicitly
+  states (even when main already had the gap).
+- It is major or blocker.
+- It is not a duplicate of another finding in the same round.
+
+Confirmed minors and nits are not written.
+
+**Severity = consequence × trigger.** The test is "would this plausibly happen in the next month of
+normal factory operation?" Deploys restart the daemon daily, so restart-window bugs count unless the
+window is milliseconds.
+- **Blocker:** a realistic trigger, plus a consequence that loses or corrupts persisted state, leaks a
+  secret, breaks a trust or confinement boundary, or stops the factory or deploys.
+- **Major:** a realistic trigger, plus real harm:
+  - a wrong result or a silent failure that someone acts on;
+  - lost or repeated work;
+  - a bypassable check the change claims to add;
+  - a rollback or older-daemon compatibility break;
+  - a new test that fails on the platform the factory deploys from.
+- **Minor:** a contrived trigger, meaning an input, environment or timing the request doesn't ask to
+  handle, or a cost that is cosmetic, diagnostic, test-only, or corrects itself on the next step.
+  - Exception: a secret leak is at least major even with an unusual trigger.
+- **Untrusted triggers count as realistic.** When an untrusted party (the agent, the code under test,
+  a PR author, a LAN peer, an untrusted collaborator) controls the trigger, and the effect crosses a
+  boundary the change enforces, the trigger is realistic.
+- **Bugs from an earlier round's fix count.** A bug introduced by the factory's own fix in an earlier
+  round counts in the later round's case.
+
+**Procedure.**
+1. Two adjudicators judged each finding blind, in a checkout of the reviewed head: Codex
+   GPT-6.1 Sol and Claude Opus, both at high effort. They did not see the original severity, the
+   reviewer, or each other. Each reproduced the finding where it could and said whether the next
+   round's commit fixes it.
+2. Two raters, Claude Sonnet and GPT-6.1 Terra, then classified the consequence and the trigger, and
+   code mapped those to a severity. On a blind validation set of 20, these ratings matched the
+   orchestrator 18 times.
+3. The orchestrator ruled on every finding where:
+   - the adjudicators disagreed on whether it was real;
+   - the raters disagreed on whether it blocks;
+   - a rater gave no rating.
+
+   Each of those rulings records a reason.
+
+**Outcome.**
+
+| Measure | Count |
+|---|---|
+| Findings in the 181 candidate rounds (no `--since`) | 448 |
+| Not real, both adjudicators | 25 |
+| Not real, orchestrator ruling | 1 |
+| Severities set by agreeing raters | 255 |
+| Severities set by orchestrator rulings | 167 |
+| Gold defects (159 major, 24 blocker) | 183 |
+| Cases written | 108 |
+
+The 108 cases are 51 escapes-dev and 57 escapes-heldout. Their 183 defects are 80 dev and 103
+held-out. The remaining rounds had no eligible defect or already had a case.
+
+Two cases quoted placeholder home paths from the review text; those were rewritten home-relative
+(`~/…`) to satisfy the path test.
+
+The escape gold holds only what the orchestrator's review found. A real defect it missed is not in
+the gold, so precision on these cases is judged only through the judged matcher.
+
 ## Held-out clean-case audit — 2026-10-30
 
 Every M5.2 held-out system blocked review-068, review-092 and review-108, so held-out clean blocks were
