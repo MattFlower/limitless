@@ -1590,12 +1590,133 @@ function claimWithoutPost(f: ReturnType<typeof failure>) {
   };
   const job = { id: f.job.id, runId: f.job.run_id, attempt: f.job.run_attempt, name: f.job.name };
   h.store.recordCiFailure(record);
-  expect(h.store.claimCiRerun(record, "before-post", job)).toBe(true);
+  expect(h.store.claimCiRerun(record, "before-post", job, h.clock.now())).toBe(true);
   return { record, job };
 }
 
 const setClaimedAt = (at: number | null) =>
   h.store.db.query("UPDATE ci_failures SET rerun_claimed_at = ?").run(at);
+
+function inspectFailure(f: ReturnType<typeof failure>, store = h.store) {
+  const pr = store.githubTracked()[0];
+  const snap = normalizePr(f.node);
+  if (!pr || !snap) throw new Error("missing PR fixture");
+  return ciDecision(
+    store,
+    pr,
+    snap,
+    (_repo, path, body) => h.gh.client(path, body),
+    true,
+    () => true,
+    () => true,
+    "poller",
+    undefined,
+    undefined,
+    h.clock.now,
+  );
+}
+
+test.each(["competing", "rerunning", "replacement"])(
+  "expiry only rejects the observed pending claim (%s)",
+  async (intervening) => {
+    h = pollerHarness();
+    const f = failure();
+    makeFixEligible(f.node.url);
+    const { record, job } = claimWithoutPost(f);
+    await h.clock.advance(660_000);
+    const other = new Store(join(h.dir, "db.sqlite"));
+    const first = spyOn(h.store, "transitionCiRerun");
+    const second = spyOn(other, "transitionCiRerun");
+    const observed = Promise.withResolvers<void>();
+    const releases = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let reads = 0;
+    h.gh.responses.set("repos/o/r/actions/runs/1", async () => {
+      const release = releases[reads++];
+      if (!release) throw new Error("unexpected run observation");
+      if (reads === 2) observed.resolve();
+      await release.promise;
+      return respond(200, { head_sha: SHA, run_attempt: 1 });
+    });
+    try {
+      const a = inspectFailure(f);
+      const b = inspectFailure(f, other);
+      await observed.promise;
+      if (intervening === "rerunning") other.finishCiFailure(record, "rerunning");
+      if (intervening === "replacement")
+        other.db.query("UPDATE ci_failures SET rerun_marker = ?").run("replacement");
+      releases[0]?.resolve();
+      const winner = await a;
+      releases[1]?.resolve();
+      const loser = await b;
+      const won = intervening === "competing";
+      expect(first.mock.results.map((r) => r.value)).toEqual([won]);
+      expect(second.mock.results.map((r) => r.value)).toEqual([false]);
+      expect(winner.state).toBe(won ? "failed" : "pending");
+      expect(loser.state).toBe("pending");
+      expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
+        outcome: won ? "rerun_rejected" : intervening === "rerunning" ? "rerunning" : "rerun_requested",
+        rerunMarker: intervening === "replacement" ? "replacement" : "before-post",
+        rerunJob: job,
+      });
+      expect(items("ci.needs_fix")).toHaveLength(won ? 1 : 0);
+      expect(fixTriggers()).toHaveLength(won ? 1 : 0);
+      expect(reruns()).toHaveLength(0);
+    } finally {
+      for (const release of releases) release.resolve();
+      first.mockRestore();
+      second.mockRestore();
+      other.close();
+    }
+  },
+);
+
+test.each(
+  [201, 403].flatMap((status) =>
+    ["rejection", "replacement", "unchanged"].map((intervening) => [status, intervening] as const),
+  ),
+)("a delayed POST %s only transitions its matching pending claim (%s)", async (status, intervening) => {
+  h = pollerHarness();
+  const f = failure();
+  makeFixEligible(f.node.url);
+  const other = new Store(join(h.dir, "db.sqlite"));
+  const posted = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, async () => {
+    posted.resolve();
+    await release.promise;
+    return respond(status, {});
+  });
+  const transition = spyOn(h.store, "transitionCiRerun");
+  try {
+    const decision = inspectFailure(f);
+    await posted.promise;
+    const claimed = other.ciFailures(f.node.url, SHA)[0];
+    if (!claimed?.rerunMarker) throw new Error("missing claim marker");
+    expect(claimed.rerunClaimedAt).toBe(h.clock.now());
+    if (intervening === "rejection") {
+      await h.clock.advance(660_000);
+      expect((await inspectFailure(f, other)).state).toBe("failed");
+    }
+    if (intervening === "replacement")
+      other.db.query("UPDATE ci_failures SET rerun_marker = ?").run("replacement");
+    release.resolve();
+    const result = await decision;
+    const rejected = intervening === "rejection" || (intervening === "unchanged" && status === 403);
+    expect(transition.mock.results.map((r) => r.value)).toEqual([intervening === "unchanged"]);
+    expect(result.state).toBe(intervening === "unchanged" && status === 403 ? "failed" : "pending");
+    expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
+      outcome: rejected ? "rerun_rejected" : intervening === "replacement" ? "rerun_requested" : "rerunning",
+      rerunMarker: intervening === "replacement" ? "replacement" : claimed.rerunMarker,
+    });
+    expect(items("ci.needs_fix")).toHaveLength(rejected ? 1 : 0);
+    expect(fixTriggers()).toHaveLength(rejected ? 1 : 0);
+    expect(reruns()).toHaveLength(1);
+  } finally {
+    release.resolve();
+    transition.mockRestore();
+    other.close();
+  }
+});
 
 test.each([false, true])(
   "a claim interrupted before POST expires after restart (legacy=%s)",
@@ -1610,7 +1731,8 @@ test.each([false, true])(
     expect(h.store.ciFailures(f.node.url, SHA)[0]?.rerunClaimedAt).toBe(claimedAt);
     expect(h.store.claimCiRerun(record, "second-claim", job)).toBe(false);
     expect(h.store.ciFailures(f.node.url, SHA)[0]?.rerunClaimedAt).toBe(claimedAt);
-    setClaimedAt(legacy ? null : Date.now() - 600_001);
+    if (legacy) setClaimedAt(null);
+    await h.clock.advance(660_000);
     h.start(15);
     await h.advance(0);
     expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
@@ -1641,6 +1763,7 @@ test.each([
   "an unconfirmed %s rerun (%s) expires once",
   async (kind, response) => {
     h = pollerHarness();
+    await h.clock.advance(2_000_000);
     const f = kind === "unrelated" ? unrelatedFailure() : failure();
     makeFixEligible(f.node.url);
     h.gh.responses.set(`repos/o/r/actions/jobs/${f.job.id}/rerun`, () => {
@@ -1649,11 +1772,13 @@ test.each([
     });
     h.start(15);
     await h.advance(0);
-    expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
+    expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
+      outcome: "rerun_requested",
+      rerunClaimedAt: h.clock.now(),
+    });
     expect(items("ci.needs_fix")).toHaveLength(0);
     expect(h.store.pendingCiFixTriggers()).toHaveLength(0);
-    setClaimedAt(Date.now() - 600_001);
-    await h.advance(15000);
+    await h.advance(660_000);
     expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_rejected");
     expect(items("ci.needs_fix")).toHaveLength(1);
     expect(h.store.pendingCiFixTriggers()).toHaveLength(1);
@@ -1675,36 +1800,19 @@ test.each(["rerun_requested", "rerunning"] as const)("%s respects the claim dead
   const f = failure();
   const { record, job } = claimWithoutPost(f);
   h.store.finishCiFailure(record, outcome);
-  const claimedAt = 1_000_000;
-  setClaimedAt(claimedAt);
-  const now = spyOn(Date, "now");
-  try {
-    for (const elapsed of [599_999, 600_000, 600_001]) {
-      now.mockReturnValue(claimedAt + elapsed);
-      expect(h.store.claimCiRerun(record, "second-claim", job)).toBe(false);
-      const pr = h.store.githubTracked()[0];
-      const snap = normalizePr(f.node);
-      if (!pr || !snap) throw new Error("missing PR fixture");
-      await ciDecision(
-        h.store,
-        pr,
-        snap,
-        (_repo, path, body) => h.gh.client(path, body),
-        true,
-        () => true,
-        () => true,
-      );
-      const expired = outcome === "rerun_requested" && elapsed > 600_000;
-      expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
-        outcome: expired ? "rerun_rejected" : outcome,
-        rerunClaimedAt: claimedAt,
-      });
-      expect(items("ci.needs_fix")).toHaveLength(expired ? 1 : 0);
-      expect(h.store.pendingCiFixTriggers()).toHaveLength(expired ? 1 : 0);
-      expect(reruns()).toHaveLength(0);
-    }
-  } finally {
-    now.mockRestore();
+  const claimedAt = h.clock.now();
+  for (const elapsed of [599_999, 600_000, 600_001]) {
+    await h.clock.advance(claimedAt + elapsed - h.clock.now());
+    expect(h.store.claimCiRerun(record, "second-claim", job)).toBe(false);
+    await inspectFailure(f);
+    const expired = outcome === "rerun_requested" && elapsed > 600_000;
+    expect(h.store.ciFailures(f.node.url, SHA)[0]).toMatchObject({
+      outcome: expired ? "rerun_rejected" : outcome,
+      rerunClaimedAt: claimedAt,
+    });
+    expect(items("ci.needs_fix")).toHaveLength(expired ? 1 : 0);
+    expect(h.store.pendingCiFixTriggers()).toHaveLength(expired ? 1 : 0);
+    expect(reruns()).toHaveLength(0);
   }
 });
 
@@ -1714,7 +1822,7 @@ test.each(["sha", "unavailable", "current", "write-guard"])(
     h = pollerHarness();
     const f = failure();
     claimWithoutPost(f);
-    setClaimedAt(Date.now() - 600_001);
+    await h.clock.advance(660_000);
     let current = true;
     let allowed = true;
     h.gh.responses.set("repos/o/r/actions/runs/1", () => {
@@ -1738,6 +1846,7 @@ test.each(["sha", "unavailable", "current", "write-guard"])(
       "poller",
       undefined,
       () => allowed,
+      h.clock.now,
     );
     if (condition === "sha" || condition === "unavailable")
       await expect(decision).rejects.toThrow(
@@ -1766,11 +1875,10 @@ async function reconcileLostRerunResponse(result: string) {
   expect(reruns()).toHaveLength(1);
   expect(items("ci.needs_fix")).toHaveLength(0);
   expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe("rerun_requested");
-  setClaimedAt(Date.now() - 600_001);
   f.rerun(result, result === "unfinished" ? "in_progress" : "completed");
   if (result === "unfinished") f.observe("PENDING", "unfinished");
   // An unchanged GraphQL key must not prevent reconciliation of the ambiguous claim.
-  await h.advance(15000);
+  await h.advance(660_000);
   expect(h.store.ciFailures(f.node.url, SHA)[0]?.outcome).toBe(
     result === "unfinished"
       ? "rerun_requested"

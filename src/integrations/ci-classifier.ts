@@ -144,6 +144,7 @@ async function inspectCiInner(
   consumer: "poller" | "land",
   approvedSha?: string,
   writeGuard: () => boolean = () => true,
+  now: () => number = Date.now,
 ): Promise<boolean | "head_moved"> {
   const allowed = () => {
     if (!writeGuard()) throw new CiWriteDenied();
@@ -280,10 +281,11 @@ async function inspectCiInner(
     });
     if (kind === "ci.needs_fix") onFailure();
   };
-  const reject = (f: CiFailure, excerpt = f.line, unsafe = false, evidence = f) => {
-    write(() => store.finishCiFailure(f, "rerun_rejected"));
-    emit("ci.needs_fix", evidence, `${pr.url}:${f.sha}:${evidence.signature}`, false, excerpt, unsafe);
-  };
+  const reject = (f: CiFailure, excerpt = f.line, unsafe = false, evidence = f) =>
+    write(() => {
+      if (store.transitionCiRerun(f, "rerun_rejected"))
+        emit("ci.needs_fix", evidence, `${pr.url}:${f.sha}:${evidence.signature}`, false, excerpt, unsafe);
+    });
   const requestRerun = async (f: CiFailure, job: number, excerpt: string) => {
     allowed();
     const res = await call(pr.repo, `${root}/actions/jobs/${job}/rerun`, {});
@@ -297,7 +299,7 @@ async function inspectCiInner(
       return;
     }
     if (res?.status !== 201) throw new Error("CI job rerun was not confirmed");
-    write(() => store.finishCiFailure(f, "rerunning"));
+    write(() => store.transitionCiRerun(f, "rerunning"));
   };
   const branch = store.getRepoBySlug(pr.repo)?.defaultBranch ?? "main";
   const mainSha = z
@@ -347,9 +349,11 @@ async function inspectCiInner(
     if (run.run_attempt <= origin.attempt) {
       if (
         f.outcome === "rerun_requested" &&
-        (f.rerunClaimedAt == null || Date.now() - f.rerunClaimedAt > 10 * 60_000)
-      )
+        (f.rerunClaimedAt == null || now() - f.rerunClaimedAt > 10 * 60_000)
+      ) {
         reject(f);
+        resolved.add(origin.id);
+      }
       continue;
     }
     const matches = (await jobs(origin.runId, run.run_attempt)).filter((j) => j.name === origin.name);
@@ -558,18 +562,23 @@ async function inspectCiInner(
         if (!ready()) return false;
         if (
           write(() => {
-            const claimed = store.claimCiRerun(f, marker, {
-              id: job.id,
-              runId: job.run_id,
-              attempt: job.run_attempt,
-              name: job.name,
-            });
+            const claimed = store.claimCiRerun(
+              f,
+              marker,
+              {
+                id: job.id,
+                runId: job.run_id,
+                attempt: job.run_attempt,
+                name: job.name,
+              },
+              now(),
+            );
             if (claimed && unrelated)
               store.observations.ciFlaky(pr.repo, pr.runId, f, job, unrelated, excerpt);
             return claimed;
           })
         ) {
-          await requestRerun(f, job.id, excerpt);
+          await requestRerun({ ...f, rerunMarker: marker }, job.id, excerpt);
           continue;
         }
         // Another Store/daemon may win the atomic claim while this inspection awaits the head read.
@@ -602,6 +611,7 @@ export function ciDecision(
   consumer: "poller" | "land" = "poller",
   approvedSha?: string,
   writeGuard: () => boolean = () => true,
+  now: () => number = Date.now,
 ): Promise<CiDecision> {
   let active = inspections.get(store);
   if (!active) {
@@ -629,6 +639,7 @@ export function ciDecision(
       consumer,
       approvedSha,
       writeGuard,
+      now,
     ).catch((error: unknown) => {
       if (error instanceof CiWriteDenied || !writeGuard()) {
         denied = true;
