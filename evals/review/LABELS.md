@@ -490,6 +490,11 @@ held-out. The remaining rounds had no eligible defect or already had a case.
 Two cases quoted placeholder home paths from the review text; those were rewritten home-relative
 (`~/…`) to satisfy the path test.
 
+**Running the held-out split is deliberate.** `eval run review` without `--cases` runs every case,
+including escapes-heldout. Routine, tuning and comparison runs therefore pass `--cases` with dev IDs.
+Escapes-heldout runs only to confirm a decision already made on dev, so it doesn't wear out the way
+the M5.2 clean held-out set did (#541, #542).
+
 The escape gold holds only what the orchestrator's review found. A real defect it missed is not in
 the gold, so precision on these cases is judged only through the judged matcher.
 
