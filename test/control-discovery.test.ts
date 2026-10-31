@@ -188,6 +188,7 @@ const malformed: [string, unknown][] = [
     ],
   ),
   ["empty nonterminal", envelope(connection([], true, "next"))],
+  ["oversized continuation cursor", envelope(connection([node()], true, "a".repeat(1025)))],
   ["invalid terminal cursor", envelope(connection([], false, 3))],
   ["mixed valid and malformed", envelope(connection([node(), node("bad")]))],
 ];
@@ -224,7 +225,7 @@ test("construction is inert; invalid cursors and pre-abort perform no requests",
   expect([request.mock.calls.length, random.mock.calls.length, deadline.mock.calls.length]).toEqual([
     0, 0, 0,
   ]);
-  for (const after of ["", " ", "bad\ncursor", "cursor\n", 3, null])
+  for (const after of ["", " ", "bad\ncursor", "cursor\n", "a".repeat(1025), 3, null])
     await rejects(directory.listReceiptCandidates(after as string), "invalid");
   const caller = new AbortController();
   caller.abort();
@@ -232,6 +233,18 @@ test("construction is inert; invalid cursors and pre-abort perform no requests",
   expect([request.mock.calls.length, random.mock.calls.length, deadline.mock.calls.length]).toEqual([
     0, 0, 0,
   ]);
+});
+
+test("input and continuation cursors accept the 1024-character boundary", async () => {
+  const remote = new DirectoryRemote();
+  const after = "a".repeat(1024);
+  const next = "b".repeat(1024);
+  remote.listingResponse = () => json(envelope(connection([node()], true, next)));
+  expect(await createControlDirectory(remote.deps()).listReceiptCandidates(after)).toEqual({
+    keys: [{ kind: "receipt", id: id(1) }],
+    next,
+  });
+  expect(remote.listings.map((call) => call.after)).toEqual([after]);
 });
 
 test("every continuation freshly checks private repository metadata before listing", async () => {

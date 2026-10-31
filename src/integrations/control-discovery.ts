@@ -18,6 +18,7 @@ const prefix = "refs/control/receipt/";
 const cursor = z
   .string()
   .min(1)
+  .max(1024)
   .refine((value) => !/[\s\p{Cc}]/u.test(value));
 const pageSchema = z.object({
   data: z.object({
