@@ -21,10 +21,15 @@ const issue = object({
   }).optional(),
 });
 const acceptance = object({
-  snapshot: object({ ticket: issue, parent: issue }),
+  snapshot: object({
+    ticket: issue.extend({ title: text.optional(), parent: issue.nullable().optional() }),
+    parent: issue,
+  }),
   sha: r.oid.optional(),
   manifest: z
-    .array(object({ id: text, text, class: r.oneOf("behaviour docs"), sources: strings }))
+    .array(
+      object({ id: text, text, class: r.oneOf("behaviour docs"), sources: strings, item: text.optional() }),
+    )
     .optional(),
   setupDone: z.boolean().optional(),
   output: storedInput(AcceptanceSchema).optional(),
@@ -40,6 +45,11 @@ const acceptance = object({
     ),
     summary: text,
     passed: z.boolean(),
+    followUps: object({
+      pass: z.number().optional(),
+      issues: z.array(z.number()),
+      limit: z.boolean().optional(),
+    }).optional(),
   }).optional(),
 });
 export const transferAcceptanceSchema = object({ acceptance: acceptance.optional() });

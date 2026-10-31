@@ -14,9 +14,13 @@ const finding = s.StoredReviewSchema.shape.findings.element.extend({
   prior: text.optional(),
 });
 export const transferReviewSchema = storedInput(
-  object({ ...s.StoredReviewSchema.shape, findings: z.array(finding), modelId: text.optional() }).refine(
-    (v) => v.findings.length > 0 || v.summary.trim().length >= s.MIN_LATER_REVIEW_SUMMARY,
-  ),
+  // StoredReview's shape includes historical absences; approval refinements are not transfer rules.
+  object({
+    ...s.StoredReviewSchema.shape,
+    verdict: s.ReviewSchema.shape.verdict,
+    findings: z.array(finding),
+    modelId: text.optional(),
+  }),
 );
 export const transferAuditSchema = z.array(
   object({ rule: text, severity: r.oneOf("block warn"), file: text.optional(), detail: text }),
@@ -40,13 +44,18 @@ const history = z.array(
 );
 const binding = object({ stageOrdinal: r.ordinal, sha: r.oid, check: text, command: text });
 function outcomesSchema(reference: z.ZodType<z.infer<typeof binding>>) {
-  const criterion = storedInput(
-    s.VerifySchema.shape.criteria.element.extend({ gateEvidence: z.unknown().optional() }),
-  ).transform(({ gateEvidence, ...v }) => ({
-    ...v,
-    ...(gateEvidence === undefined ? {} : { gateEvidence: r.parseRecord(reference, gateEvidence) }),
-  }));
-  const model = object({ ...s.VerifySchema.shape, criteria: z.array(criterion) });
+  // Persisted Verify criteria predate publicSummary and model defaults; evidence is verbatim.
+  const criterion = object({
+    id: text,
+    status: r.oneOf("met unmet unclear blocked"),
+    evidence: text,
+    ...r.fields("publicSummary requirementCitation", text.optional()),
+    covering_tests: z.array(object({ file: text, name: text })).optional(),
+    blockedReason: r.oneOf("sandbox environment").nullable().optional(),
+    requirement: text.nullable().optional(),
+    gateEvidence: reference.optional(),
+  });
+  const model = object({ criteria: z.array(criterion), overall: r.oneOf("pass fail"), notes: text });
   const verify = model.extend({
     modelId: text,
     ...r.fields("round attempt", r.counter.optional()),

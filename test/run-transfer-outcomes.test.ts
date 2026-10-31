@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { ClaimLostError } from "../src/integrations/claim-errors.ts";
 import { encodeTransferJson } from "../src/pipeline/run-transfer-json.ts";
 import * as o from "../src/pipeline/run-transfer-outcomes.ts";
+import { LaterReviewSchema, ReviewSchema } from "../src/pipeline/schemas.ts";
 import { fixture, head, rejects, sha } from "./run-transfer-support.ts";
 
 const stages = fixture().stages,
@@ -117,6 +118,90 @@ test("stored model bodies retain optional absence, whitespace, catches and uncla
   expect<unknown>(roundTrip({})).toEqual({});
 });
 
+test("legacy verifier criteria survive every outcome path without adding public summaries", () => {
+  const legacy = { id: "H-1", status: "blocked", evidence: `  stageId 900 ${head}  ` };
+  const model = {
+    criteria: [legacy, { ...legacy, gateEvidence: { ...binding, stageId: 31 } }],
+    overall: "pass",
+    notes: `stageId 31 ${head}`,
+  };
+  const expectedModel = {
+    ...model,
+    criteria: [legacy, { ...legacy, gateEvidence: { ...binding, stageOrdinal: 1 } }],
+  };
+  const outcome = {
+    ...model,
+    criteria: [{ ...legacy, status: "met", gateEvidence: { ...binding, stageId: 900 } }],
+    modelOutput: model,
+    modelId: "fake/model",
+  };
+  const expectedOutcome = {
+    ...outcome,
+    criteria: [{ ...legacy, status: "met", gateEvidence: { ...binding, stageOrdinal: 2 } }],
+    modelOutput: expectedModel,
+  };
+  const pending = { round: 1, attempt: 0, sha, modelId: "fake/model", modelOutput: model };
+  const input = {
+    lastVerify: outcome,
+    pendingVerify: pending,
+    verifyResults: [{ ...outcome, round: 1 }],
+    lastVerifiedEvidence: { lastVerify: outcome },
+  };
+  const expected = {
+    lastVerify: expectedOutcome,
+    pendingVerify: { ...pending, modelOutput: expectedModel },
+    verifyResults: [{ ...expectedOutcome, round: 1 }],
+    lastVerifiedEvidence: { lastVerify: expectedOutcome },
+  };
+  const value = roundTrip(input);
+  expect<unknown>(encodeTransferJson(value)).toEqual(encodeTransferJson(expected));
+  for (const verify of [value.lastVerify, value.verifyResults?.[0], value.lastVerifiedEvidence?.lastVerify]) {
+    expect<unknown>(Object.hasOwn(verify?.criteria[0] ?? {}, "publicSummary")).toBe(false);
+    expect<unknown>(Object.hasOwn(verify?.modelOutput?.criteria[0] ?? {}, "publicSummary")).toBe(false);
+  }
+  expect<unknown>(Object.hasOwn(value.pendingVerify?.modelOutput.criteria[0] ?? {}, "publicSummary")).toBe(
+    false,
+  );
+  expect<unknown>(o.parseTransferOutcomes(jsonValue(value), portable)).toEqual(expected);
+  expect<unknown>(new Set(o.outcomesCommitDependencies(value))).toEqual(new Set([sha]));
+  for (const publicSummary of [null, 1, [], {}])
+    rejects(() => roundTrip({ lastVerify: { ...outcome, criteria: [{ ...legacy, publicSummary }] } }));
+});
+
+function jsonValue(value: unknown) {
+  return JSON.parse(new TextDecoder().decode(encodeTransferJson(value)));
+}
+
+test("stored verifier fields validate structure without production evidence minimums", () => {
+  for (const evidence of ["", " "]) {
+    const input = { lastVerify: { ...raw, criteria: [{ ...criterion, evidence }], modelId: "fake/model" } };
+    expect<unknown>(encodeTransferJson(roundTrip(input))).toEqual(encodeTransferJson(input));
+  }
+  for (const fields of [
+    { evidence: null },
+    { status: "approved" },
+    { covering_tests: [{ file: "a.ts", name: 1 }] },
+    { blockedReason: "other" },
+    { requirement: {} },
+    { requirementCitation: 1 },
+    { extra: true },
+  ])
+    rejects(() =>
+      roundTrip({ lastVerify: { ...raw, criteria: [{ ...criterion, ...fields }], modelId: "fake/model" } }),
+    );
+});
+
+test.each(["test", ""])(
+  "stored review summary %j remains history across current and saved reviews",
+  (summary) => {
+    const review = { verdict: "approve", summary, findings: [], modelId: "fake/review" };
+    const input = { lastReview: review, lastVerifiedEvidence: { lastReview: review } };
+    expect<unknown>(encodeTransferJson(roundTrip(input))).toEqual(encodeTransferJson(input));
+    expect<unknown>(ReviewSchema.safeParse(review).success).toBe(false);
+    expect<unknown>(LaterReviewSchema.safeParse(review).success).toBe(false);
+  },
+);
+
 test("historical later-round and panel reviews preserve findings, scopes and saved evidence", () => {
   const finding = {
     severity: "minor",
@@ -192,7 +277,9 @@ test("historical later-round and panel reviews preserve findings, scopes and sav
     rejects(() => roundTrip({ reviewHistory: [{ ...history[0], scope: { kind: "fix", range } }] }));
   rejects(() => roundTrip({ reviewHistory: [{ ...history[0], extra: true }] }));
   rejects(() => roundTrip({ reviewFollowUps: [{ ...finding, label: "invalid" }] }));
-  rejects(() => roundTrip({ lastReview: { ...later, summary: "too short" } }));
+  expect<unknown>(roundTrip({ lastReview: { ...later, summary: "too short" } })).toEqual({
+    lastReview: { ...later, summary: "too short" },
+  });
 });
 
 test("commit dependencies follow every typed binding and nested gate provenance, never prose", () => {

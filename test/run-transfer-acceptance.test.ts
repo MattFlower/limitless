@@ -41,6 +41,99 @@ const complete = {
   },
 };
 const json = (value: unknown) => JSON.parse(new TextDecoder().decode(encodeTransferJson(value)));
+const preservesAcceptance = (acceptance: unknown) => {
+  const input = { acceptance };
+  const parsed = a.parseTransferAcceptance(input);
+  expect<unknown>(encodeTransferJson(parsed)).toEqual(encodeTransferJson(input));
+  expect<unknown>(encodeTransferJson(a.parseTransferAcceptance(json(parsed)))).toEqual(
+    encodeTransferJson(input),
+  );
+};
+
+test("acceptance tickets preserve HTTP extensions and nested IssueText metadata", () => {
+  for (const extensions of [
+    {},
+    { title: " acceptance ticket ", parent: snapshot.parent },
+    { title: "", parent: null },
+    { title: "title" },
+    { parent: issue },
+  ]) {
+    const ticket = { ...snapshot.parent, ...extensions };
+    preservesAcceptance({ snapshot: { ...snapshot, ticket } });
+  }
+  for (const extensions of [
+    { title: null },
+    { title: 1 },
+    { parent: "#1" },
+    { parent: [] },
+    { parent: {} },
+    { parent: { ...issue, editor: "editor" } },
+    { parent: { ...issue, userContentEdits: { nodes: [], pageInfo: { hasNextPage: "false" } } } },
+    { parent: { ...issue, extra: true } },
+    { parent: { ...issue, parent: null } },
+    { extra: true },
+  ])
+    rejects(() =>
+      a.parseTransferAcceptance({
+        acceptance: { snapshot: { ...snapshot, ticket: { ...issue, ...extensions } } },
+      }),
+    );
+});
+
+test("acceptance manifest item preserves optional text", () => {
+  preservesAcceptance(complete);
+  for (const item of ["", "original item"]) {
+    preservesAcceptance({ ...progress, manifest: [{ ...progress.manifest[0], item }] });
+  }
+  for (const item of [null, 1, [], {}])
+    rejects(() =>
+      a.parseTransferAcceptance({
+        acceptance: { ...progress, manifest: [{ ...progress.manifest[0], item }] },
+      }),
+    );
+});
+
+test("acceptance follow-ups preserve absent members, empty issues, zero and false", () => {
+  preservesAcceptance(complete);
+  for (const followUps of [
+    { issues: [] },
+    { issues: [123], pass: 0 },
+    { issues: [], limit: false },
+    { issues: [123, 124], pass: 1, limit: true },
+    { issues: [], pass: 0, limit: false },
+  ])
+    preservesAcceptance({ ...complete, outcome: { ...complete.outcome, followUps } });
+  for (const followUps of [
+    null,
+    [],
+    {},
+    { pass: 0, limit: false },
+    { issues: null },
+    { issues: ["123"] },
+    { issues: [], pass: "0" },
+    { issues: [], pass: null },
+    { issues: [], limit: 0 },
+    { issues: [], limit: null },
+    { issues: [], extra: true },
+  ])
+    rejects(() =>
+      a.parseTransferAcceptance({ acceptance: { ...complete, outcome: { ...complete.outcome, followUps } } }),
+    );
+});
+
+test.each(["test", ""])(
+  "completed checks retain stored review summary %j without approval rules",
+  (summary) => {
+    const input = {
+      completedChecks: { round: 1, values: { review: { verdict: "approve", summary, findings: [] } } },
+    };
+    const parsed = a.parseTransferCompletedChecks(input);
+    expect<unknown>(encodeTransferJson(parsed)).toEqual(encodeTransferJson(input));
+    expect<unknown>(encodeTransferJson(a.parseTransferCompletedChecks(json(parsed)))).toEqual(
+      encodeTransferJson(input),
+    );
+  },
+);
 
 test("acceptance preserves snapshot, setup progress and complete historical outcomes", () => {
   for (const acceptance of [{ snapshot }, progress, complete]) {
