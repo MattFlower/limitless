@@ -441,10 +441,25 @@ test("an earlier untrusted body editor survives a trusted final edit", () => {
 
 test.each([0, 2, 100])("complete history of %i trusted edits is eligible", (count) => {
   const candidate = issue();
+  if (count) {
+    candidate.lastEditedAt = at;
+    candidate.editor = { login: "owner" };
+  }
   candidate.userContentEdits.nodes = Array.from({ length: count }, (_, n) => ({
     editor: { login: n % 2 ? "COLLABORATOR" : "owner" },
   }));
   expect(issueEligibility(candidate, ["OWNER", "collaborator"])).toEqual({ eligible: true, priority: 1 });
+});
+
+test.each([
+  [false, "body edit history unavailable"],
+  [true, "body edit history exceeds 100 edits"],
+] as const)("an edited issue with empty history refuses (hasNextPage: %s)", (hasNextPage, reason) => {
+  const candidate = issue();
+  candidate.lastEditedAt = at;
+  candidate.editor = { login: "owner" };
+  candidate.userContentEdits.pageInfo.hasNextPage = hasNextPage;
+  expect(issueEligibility(candidate, ["owner"])).toEqual({ eligible: false, reason });
 });
 
 test.each([
@@ -465,6 +480,7 @@ test("closed dependencies and merged PRs allow a trusted, edited issue", () => {
   const i = issue();
   i.editor = { login: "OWNER" };
   i.lastEditedAt = at;
+  i.userContentEdits.nodes = [{ editor: { login: "OWNER" } }];
   i.body = "Blocked by #9\r\nBlocked by #10";
   i.blockedBy = {
     totalCount: 1,
@@ -5813,6 +5829,33 @@ test.each(["priority", "comment"])(
     candidate.userContentEdits.nodes = [{ editor: { login: "OWNER" } }];
     await h.advance(180_000);
     expect(h.runs()).toHaveLength(1);
+  },
+);
+
+test.each(["priority", "comment", "App mention"])(
+  "polled %s refuses edited-but-empty body history before claiming",
+  async (mode) => {
+    const h = harness();
+    const candidate = mode === "priority" ? issue() : commentIssue();
+    candidate.lastEditedAt = at;
+    candidate.editor = { login: "owner" };
+    if (mode !== "priority") {
+      const comment = commandComment();
+      if (mode === "App mention") {
+        h.identity = async () => ({ kind: "app", token: "fake", botLogin: "factory[bot]" });
+        comment.body = "@factory[bot] do it";
+      }
+      candidate.comments = { totalCount: 1, nodes: [comment] };
+    }
+    h.data.set("owner/repo", [candidate]);
+    h.start();
+    await h.advance();
+    expect(h.requests).toEqual([]);
+    expect(h.runs()).toEqual([]);
+    expect(h.store.issueClaim("owner/repo", candidate.number)).toBeNull();
+    expect(h.calls).toHaveLength(1);
+    if (mode !== "priority")
+      expect(records(h)).toMatchObject([{ outcome: "refused", note: "body edit history unavailable" }]);
   },
 );
 

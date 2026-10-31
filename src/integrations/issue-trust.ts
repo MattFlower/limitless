@@ -30,6 +30,7 @@ export function issueTextRefusal(issue: IssueText, trusted: string[]): string | 
   const history = issueTextSchema.shape.userContentEdits.safeParse(issue.userContentEdits);
   if (!history.success) return "body edit history unavailable";
   if (history.data.pageInfo.hasNextPage) return "body edit history exceeds 100 edits";
+  if (issue.lastEditedAt && !history.data.nodes.length) return "body edit history unavailable";
   for (const edit of history.data.nodes)
     if (!trusts(edit.editor?.login)) return `untrusted body editor: ${edit.editor?.login ?? "unknown"}`;
 }

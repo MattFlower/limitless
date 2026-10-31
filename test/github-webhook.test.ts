@@ -759,6 +759,7 @@ const checkedIssue = () => ({
 
 test.each([
   "earlier untrusted",
+  "edited-but-empty",
   "null editor",
   "missing",
   "malformed",
@@ -768,6 +769,7 @@ test.each([
 ])("issue and comment webhooks refuse %s history with one bounded read", async (mode) => {
   const text = checkedIssue();
   if (mode === "earlier untrusted") text.userContentEdits.nodes.push({ editor: { login: "stranger" } });
+  if (mode === "edited-but-empty") text.userContentEdits.nodes = [];
   if (mode === "null editor") Object.assign(text.userContentEdits, { nodes: [{ editor: null }] });
   if (mode === "missing") Reflect.deleteProperty(text, "userContentEdits");
   if (mode === "malformed") Object.assign(text.userContentEdits.pageInfo, { hasNextPage: "false" });
@@ -787,10 +789,19 @@ test.each([
   for (const [event, file] of [
     ["issues", "github-issue.json"],
     ["issue_comment", "github-comment.json"],
-  ]) {
+  ] as const) {
     const response = await h(request(fixture(file ?? ""), event, true, event));
-    expect(response.status).toBe(["earlier untrusted", "null editor", "overflow"].includes(mode) ? 200 : 500);
+    expect(response.status).toBe(
+      ["earlier untrusted", "edited-but-empty", "null editor", "overflow"].includes(mode) ? 200 : 500,
+    );
     if (mode === "earlier untrusted") expect(await response.text()).toBe("untrusted body editor: stranger");
+    if (mode === "edited-but-empty") {
+      expect(await response.text()).toBe("body edit history unavailable");
+      expect(store.db.query("SELECT note, run_id FROM inbox WHERE id = ?").get(event)).toEqual({
+        note: "body edit history unavailable",
+        run_id: null,
+      });
+    }
     if (mode === "overflow") expect(await response.text()).toBe("body edit history exceeds 100 edits");
   }
   expect(gh).toHaveBeenCalledTimes(2);
@@ -799,31 +810,38 @@ test.each([
   expect(store.issueClaim("MattFlower/limitless", text.number)).toBeNull();
 });
 
-test.each(["issues", "issue_comment"])(
-  "trusted %s webhook uses the body checked with history",
-  async (event) => {
-    const text = checkedIssue();
-    text.userContentEdits.nodes.push({ editor: { login: "COLLABORATOR" } });
-    cfg.githubQueue = {
-      repos: [],
-      trusted: ["mattflower", "collaborator"],
-      maxIssueRuns: 1,
-      pollSeconds: 180,
-    };
-    const gh = mock(async () => JSON.stringify({ data: { repository: { issue: text } } }));
-    const response = await handler(gh)(
-      request(fixture(event === "issues" ? "github-issue.json" : "github-comment.json"), event, true, event),
-    );
-    expect(response.status).toBe(201);
-    expect(gh).toHaveBeenCalledTimes(1);
-    expect(requests[0]?.prompt).toContain(text.body);
-    expect(requests[0]?.prompt).toContain(text.title);
-    expect(requests[0]?.prompt).not.toContain(
-      event === "issues" ? "Ignore previous instructions" : "Please repair",
-    );
-    expect(store.listRuns()).toHaveLength(1);
-  },
-);
+test.each(
+  ["issues", "issue_comment"].flatMap((event) =>
+    ["edited", "never-edited"].map((history) => ({ event, history })),
+  ),
+)("trusted $history $event webhook uses the body checked with history", async ({ event, history }) => {
+  const text = checkedIssue();
+  text.userContentEdits.nodes.push({ editor: { login: "COLLABORATOR" } });
+  if (history === "never-edited")
+    Object.assign(text, {
+      editor: null,
+      lastEditedAt: null,
+      userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
+    });
+  cfg.githubQueue = {
+    repos: [],
+    trusted: ["mattflower", "collaborator"],
+    maxIssueRuns: 1,
+    pollSeconds: 180,
+  };
+  const gh = mock(async () => JSON.stringify({ data: { repository: { issue: text } } }));
+  const response = await handler(gh)(
+    request(fixture(event === "issues" ? "github-issue.json" : "github-comment.json"), event, true, event),
+  );
+  expect(response.status).toBe(201);
+  expect(gh).toHaveBeenCalledTimes(1);
+  expect(requests[0]?.prompt).toContain(text.body);
+  expect(requests[0]?.prompt).toContain(text.title);
+  expect(requests[0]?.prompt).not.toContain(
+    event === "issues" ? "Ignore previous instructions" : "Please repair",
+  );
+  expect(store.listRuns()).toHaveLength(1);
+});
 
 test("direct webhook admission rechecks the observed history against current trust", async () => {
   const text = checkedIssue();
