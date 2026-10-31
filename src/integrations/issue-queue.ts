@@ -31,6 +31,7 @@ const issueReference = z.object({
   repository: z.object({ nameWithOwner: z.string() }),
 });
 const issueSchema = z.object({
+  ...issueTextSchema.shape,
   number: z.number().int().positive(),
   title: z.string(),
   body: z.string(),
@@ -254,7 +255,7 @@ export function issueEligibility(
     : { eligible: true, priority: Math.min(...approved.map((l) => Number(l.name.slice(9)))) };
 }
 
-const ISSUE_FIELDS = `number title body createdAt updatedAt state author { login } editor { login } lastEditedAt
+const ISSUE_FIELDS = `${ISSUE_TEXT_FIELDS} title createdAt updatedAt state
   parent { ${ISSUE_TEXT_FIELDS} }
   comments(last: 20) { totalCount nodes { databaseId body createdAt lastEditedAt author { login } } }
   labels(first:100) { totalCount nodes { name } } subIssuesSummary { total }
@@ -478,6 +479,11 @@ export function startIssueQueue(
                 continue;
               }
               try {
+                const refusal = issueTextRefusal(issue, q.trusted);
+                if (refusal) {
+                  factory.store.recordGitHubComment(comment, null, redactCredentials(refusal));
+                  throw new Error(refusal);
+                }
                 if (issue.labels.nodes.some((l) => l.name === "acceptance")) {
                   const reason = "acceptance ticket: build runs refused";
                   factory.store.recordGitHubComment(comment, null, reason);
@@ -500,7 +506,10 @@ export function startIssueQueue(
                   false,
                   undefined,
                   true,
-                  () => (stopped ? "queue stopped" : null),
+                  () =>
+                    stopped
+                      ? "queue stopped"
+                      : (issueTextRefusal(issue, factory.cfg.githubQueue?.trusted ?? []) ?? null),
                   comment,
                 );
               } catch (error) {
@@ -547,7 +556,7 @@ export function startIssueQueue(
           if (factory.scheduler.draining) return "scheduler draining";
           const deferred = changedDuringPoll(repo, issue.number);
           if (deferred) return deferred;
-          const eligibility = issueEligibility(issue, q.trusted, {
+          const eligibility = issueEligibility(issue, factory.cfg.githubQueue?.trusted ?? [], {
             blockers: states,
             ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
           });

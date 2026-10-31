@@ -8,7 +8,7 @@ import type { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { CreateRunRequest, Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
-import { githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
+import { type GhRunner, githubWebhook, mapGitHubEvent } from "../src/integrations/github.ts";
 import type { GitHubClient } from "../src/integrations/github-poller.ts";
 import { type IntegrationDeps, type Integrations, mountIntegrations } from "../src/integrations/index.ts";
 import { LandQueue } from "../src/land/queue.ts";
@@ -61,18 +61,43 @@ function mount(deps: IntegrationDeps = {}): Promise<Integrations> {
   });
 }
 
-function handler(): ReturnType<typeof githubWebhook> {
+function handler(gh?: GhRunner): ReturnType<typeof githubWebhook> {
   const factory = {
     cfg,
     store,
-    createRun: async (req: CreateRunRequest, verifiedGitHubWebhook = false): Promise<Run> => {
+    createRun: async (
+      ...[req, verifiedGitHubWebhook = false, , , admission, comment]: Parameters<Factory["createRun"]>
+    ): Promise<Run> => {
       requests.push(req);
       const repo = store.getRepoBySlug(req.repo);
       if (!repo) throw new Error("missing repo");
-      return store.createRun(repo, req, verifiedGitHubWebhook);
+      return store.createRun(repo, req, verifiedGitHubWebhook, admission, comment);
     },
   } as Factory;
-  return githubWebhook(factory);
+  return (req) => {
+    const copy = req.clone();
+    const reader: GhRunner =
+      gh ??
+      (async () => {
+        const { issue } = await copy.json();
+        return JSON.stringify({
+          data: {
+            repository: {
+              issue: {
+                number: issue.number,
+                title: issue.title,
+                body: issue.body ?? "",
+                author: issue.user,
+                editor: null,
+                lastEditedAt: null,
+                userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
+              },
+            },
+          },
+        });
+      });
+    return githubWebhook(factory, undefined, undefined, reader)(req);
+  };
 }
 
 function request(body: string, id = "delivery-1", signature = true, event = "issues"): Request {
@@ -327,13 +352,33 @@ test("default version probe yields while tools run and preserves startup notes",
 });
 
 test("processing failure is audited as error", async () => {
-  const failing = githubWebhook({
-    cfg,
-    store,
-    createRun: async () => {
-      throw new Error("queue unavailable");
-    },
-  } as unknown as Factory);
+  const failing = githubWebhook(
+    {
+      cfg,
+      store,
+      createRun: async () => {
+        throw new Error("queue unavailable");
+      },
+    } as unknown as Factory,
+    undefined,
+    undefined,
+    async () =>
+      JSON.stringify({
+        data: {
+          repository: {
+            issue: {
+              number: 42,
+              title: "Issue",
+              body: "Checked body",
+              author: { login: "MattFlower" },
+              editor: null,
+              lastEditedAt: null,
+              userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
+            },
+          },
+        },
+      }),
+  );
   expect((await failing(request(fixture("github-issue.json")))).status).toBe(500);
   const row = store.db.query("SELECT status, note FROM inbox WHERE id = ?").get("delivery-1") as Record<
     string,
@@ -700,4 +745,100 @@ test("only owner-authored request text allows audit exemptions, and it persists 
   } finally {
     reopened.close();
   }
+});
+
+const checkedIssue = () => ({
+  number: 42,
+  title: "Fresh title",
+  body: "Body read with history",
+  author: { login: "MattFlower" },
+  editor: { login: "MattFlower" },
+  lastEditedAt: "2026-01-01T00:00:00Z",
+  userContentEdits: { nodes: [{ editor: { login: "MattFlower" } }], pageInfo: { hasNextPage: false } },
+});
+
+test.each([
+  "earlier untrusted",
+  "null editor",
+  "missing",
+  "malformed",
+  "overflow",
+  "read failure",
+  "GraphQL errors",
+])("issue and comment webhooks refuse %s history with one bounded read", async (mode) => {
+  const text = checkedIssue();
+  if (mode === "earlier untrusted") text.userContentEdits.nodes.push({ editor: { login: "stranger" } });
+  if (mode === "null editor") Object.assign(text.userContentEdits, { nodes: [{ editor: null }] });
+  if (mode === "missing") Reflect.deleteProperty(text, "userContentEdits");
+  if (mode === "malformed") Object.assign(text.userContentEdits.pageInfo, { hasNextPage: "false" });
+  if (mode === "overflow") text.userContentEdits.pageInfo.hasNextPage = true;
+  const gh: GhRunner = mock(async (args, _signal, _stdin, repo) => {
+    expect(repo).toBe("MattFlower/limitless");
+    expect(args[3]).toContain(
+      "userContentEdits(first:100) { nodes { editor { login } } pageInfo { hasNextPage } }",
+    );
+    if (mode === "read failure") throw new Error("history read failed");
+    return JSON.stringify({
+      data: { repository: { issue: text } },
+      ...(mode === "GraphQL errors" ? { errors: [{ message: "history failed" }] } : {}),
+    });
+  });
+  const h = handler(gh);
+  for (const [event, file] of [
+    ["issues", "github-issue.json"],
+    ["issue_comment", "github-comment.json"],
+  ]) {
+    const response = await h(request(fixture(file ?? ""), event, true, event));
+    expect(response.status).toBe(["earlier untrusted", "null editor", "overflow"].includes(mode) ? 200 : 500);
+    if (mode === "earlier untrusted") expect(await response.text()).toBe("untrusted body editor: stranger");
+    if (mode === "overflow") expect(await response.text()).toBe("body edit history exceeds 100 edits");
+  }
+  expect(gh).toHaveBeenCalledTimes(2);
+  expect(requests).toEqual([]);
+  expect(store.listRuns()).toEqual([]);
+  expect(store.issueClaim("MattFlower/limitless", text.number)).toBeNull();
+});
+
+test.each(["issues", "issue_comment"])(
+  "trusted %s webhook uses the body checked with history",
+  async (event) => {
+    const text = checkedIssue();
+    text.userContentEdits.nodes.push({ editor: { login: "COLLABORATOR" } });
+    cfg.githubQueue = {
+      repos: [],
+      trusted: ["mattflower", "collaborator"],
+      maxIssueRuns: 1,
+      pollSeconds: 180,
+    };
+    const gh = mock(async () => JSON.stringify({ data: { repository: { issue: text } } }));
+    const response = await handler(gh)(
+      request(fixture(event === "issues" ? "github-issue.json" : "github-comment.json"), event, true, event),
+    );
+    expect(response.status).toBe(201);
+    expect(gh).toHaveBeenCalledTimes(1);
+    expect(requests[0]?.prompt).toContain(text.body);
+    expect(requests[0]?.prompt).toContain(text.title);
+    expect(requests[0]?.prompt).not.toContain(
+      event === "issues" ? "Ignore previous instructions" : "Please repair",
+    );
+    expect(store.listRuns()).toHaveLength(1);
+  },
+);
+
+test("direct webhook admission rechecks the observed history against current trust", async () => {
+  const text = checkedIssue();
+  text.userContentEdits.nodes.push({ editor: { login: "collaborator" } });
+  cfg.githubQueue = { repos: [], trusted: ["MattFlower", "collaborator"], maxIssueRuns: 1, pollSeconds: 180 };
+  const create = store.createRun.bind(store);
+  spyOn(store, "createRun").mockImplementation((...args) => {
+    if (cfg.githubQueue) cfg.githubQueue = { ...cfg.githubQueue, trusted: ["MattFlower"] };
+    return create(...args);
+  });
+  const gh = mock(async () => JSON.stringify({ data: { repository: { issue: text } } }));
+  const response = await handler(gh)(request(fixture("github-issue.json")));
+  expect(response.status).toBe(500);
+  expect(store.listRuns()).toEqual([]);
+  expect(store.db.query("SELECT note FROM inbox").get()).toEqual({
+    note: "Run admission refused: untrusted body editor: collaborator",
+  });
 });

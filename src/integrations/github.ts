@@ -1,4 +1,5 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { z } from "zod";
 import type { Factory } from "../app.ts";
 import { parseAllow } from "../core/allow.ts";
 import { isBranchName } from "../core/delivery.ts";
@@ -7,6 +8,7 @@ import { CommentProcessed, IssueClaimed } from "../db/store.ts";
 import { inAnyCidr } from "../util/cidr.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import { githubSh } from "./github-identity.ts";
+import { ISSUE_TEXT_FIELDS, issueTextRefusal, issueTextSchema } from "./issue-trust.ts";
 
 type GitHubFactory = Pick<Factory, "cfg" | "store" | "createRun">;
 export type GhRunner = (
@@ -255,6 +257,7 @@ export function githubWebhook(
   factory: GitHubFactory,
   ranges: HookRanges = defaultRanges,
   pollNow?: () => void,
+  gh: GhRunner = runGh,
 ): (req: Request) => Promise<Response> {
   return async (req) => {
     if (req.method !== "POST")
@@ -353,7 +356,37 @@ export function githubWebhook(
         string(object(object(pr.base)?.repo)?.full_name) === repo
       )
         factory.store.reopenGithubPr(`https://github.com/${repo}/pull/${prNumber}`);
-      const mapped = mapGitHubEvent(event, payload, factory.cfg.githubOwner);
+      let mapped = mapGitHubEvent(event, payload, factory.cfg.githubOwner);
+      let admission: (() => string | null) | undefined;
+      const ref = mapped.request?.sourceRef;
+      if (ref?.kind === "issue" && typeof ref.repo === "string") {
+        const [owner, name] = ref.repo.split("/");
+        const field = object(p?.issue)?.pull_request ? "pullRequest" : "issue";
+        const query = `query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) {
+          issue:${field}(number:${ref.number}) { title ${ISSUE_TEXT_FIELDS} } } }`;
+        const raw = await gh(["api", "graphql", "-f", `query=${query}`], req.signal, undefined, ref.repo);
+        const result = z
+          .object({
+            errors: z.array(z.unknown()).optional(),
+            data: z.object({
+              repository: z.object({ issue: issueTextSchema.extend({ title: z.string() }) }),
+            }),
+          })
+          .parse(JSON.parse(String(raw)));
+        if (result.errors?.length) throw new Error("GraphQL issue query returned errors");
+        const text = result.data.repository.issue;
+        if (text.number !== ref.number) throw new Error("GitHub issue number mismatch");
+        admission = () =>
+          issueTextRefusal(text, factory.cfg.githubQueue?.trusted ?? [factory.cfg.githubOwner ?? ""]) ?? null;
+        const refusal = admission();
+        mapped = refusal
+          ? { note: redactCredentials(refusal) }
+          : mapGitHubEvent(
+              event,
+              { ...p, issue: { ...object(p?.issue), title: text.title, body: text.body } },
+              factory.cfg.githubOwner,
+            );
+      }
       if (!mapped.request) {
         factory.store.finishInbox(id, mapped.error ? "error" : "ignored", mapped.note);
         return new Response(mapped.note, { status: mapped.error ? 400 : 200 });
@@ -364,7 +397,7 @@ export function githubWebhook(
         true,
         undefined,
         true,
-        undefined,
+        admission,
         repo && commentId ? { repo, id: commentId } : undefined,
       );
       factory.store.finishInbox(id, "run_created", mapped.note, run.id);
