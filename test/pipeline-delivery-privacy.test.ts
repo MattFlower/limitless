@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { Repo } from "../src/core/types.ts";
@@ -20,7 +21,7 @@ import { reportStructure } from "../src/pipeline/report-privacy.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
-import { approve, pipelineSetup, roleOf, triage, waitFor } from "./pipeline-support.ts";
+import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
 import { expectProcessStopped } from "./process-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
@@ -49,6 +50,79 @@ const { start, githubFixture, registerGithub } = pipelineSetup({
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["PR", "verified draft", "prose", "URL"])(
+    "home paths in verifier evidence are sanitized before publication: %s",
+    async (mode) => {
+      const bare = await githubFixture();
+      const username = ["synthetic", "publication", "owner"].join("-");
+      const userHome = join(home, username);
+      mkdirSync(userHome);
+      const mockedHome = spyOn(os, "homedir").mockReturnValue(userHome);
+      const evidence = `Observed EPERM under \`${userHome}\``;
+      const extra =
+        mode === "prose" ? ` by ${username}` : mode === "URL" ? ` https://example.com/${username}` : "";
+      let fetch: ReturnType<typeof spyOn<typeof repos, "fetchBase">> | undefined;
+      const f = start((s) => {
+        switch (roleOf(s)) {
+          case "triage":
+            return { structured: triage() };
+          case "spec":
+            return { structured: spec };
+          case "holdout":
+            return { structured: holdout };
+          case "review":
+            return { structured: approve };
+          case "verify":
+            if (mode === "verified draft") {
+              fetch = spyOn(repos, "fetchBase").mockImplementationOnce(async () => {
+                fetch?.mockRestore();
+                throw new Error("Synthetic delivery failure after verification");
+              });
+            }
+            return {
+              structured: {
+                ...pass,
+                criteria: pass.criteria.map((criterion) =>
+                  criterion.id === "AC-1" ? { ...criterion, evidence: evidence + extra } : criterion,
+                ),
+              },
+            };
+          default:
+            return { files: { "farewell.txt": "goodbye\n" } };
+        }
+      });
+      try {
+        mkdirSync(f.cfg.paths.configDir, { recursive: true });
+        writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), username);
+        registerGithub(f, bare);
+        const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "standard" });
+        const status = await waitFor(f, run.id, ["succeeded", "failed", "needs_human"]);
+        expect(status, f.store.getRun(run.id)?.error ?? "").toBe(mode === "PR" ? "succeeded" : "needs_human");
+        const report = f.store.getArtifact(run.id, "report.md") ?? "";
+        expect(report).toContain("Observed EPERM under `~`");
+        expect(reportStructure(report)).toBeTruthy();
+        expect(f.store.getArtifact(run.id, "verify-0.json")).toContain(evidence);
+        if (mode === "prose" || mode === "URL") {
+          expect(f.store.getRun(run.id)?.error).toContain("PR body contains a private string (entry 1");
+          expect(existsSync(join(home, "gh-body"))).toBe(false);
+          expect(f.store.getRun(run.id)?.prUrl).toBeNull();
+          return;
+        }
+        const body = readFileSync(join(home, "gh-body"), "utf8");
+        expect(body).toContain("Observed EPERM under `~`");
+        expect(body).not.toContain(username);
+        if (mode === "verified draft") {
+          expect(body).toContain("Failed after verification");
+          expect(readFileSync(join(home, "gh-calls"), "utf8")).toContain("--draft");
+        }
+      } finally {
+        await f.stop();
+        fetch?.mockRestore();
+        mockedHome.mockRestore();
+      }
+    },
+  );
+
   test.each([false, true])("iteration privacy follows the final tree (retained=%s)", async (retained) => {
     const bare = await githubFixture();
     const secret = `private-${crypto.randomUUID()}.example`;
