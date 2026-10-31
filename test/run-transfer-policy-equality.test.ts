@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { RunTransferError } from "../src/pipeline/run-transfer-errors.ts";
+import { encodeTransferJson, parseTransferJson } from "../src/pipeline/run-transfer-json.ts";
 import {
   encodeTransferPolicy,
   executableFieldsFromPolicy,
@@ -9,6 +10,64 @@ import { parseTransferPolicyHistory } from "../src/pipeline/run-transfer-policy-
 import { policyFixture, seal, source } from "./run-transfer-policy-support.ts";
 
 const boundaries = [encodeTransferPolicy, parseTransferPolicy];
+const historicallyOptional = [
+  "agentFullSuite",
+  "slottedCommands",
+  "previewConfig",
+  "baselineScripts",
+] as const;
+test.each([
+  ...historicallyOptional.map((key) => [[key]]),
+  [historicallyOptional.slice(0, 2)],
+  [historicallyOptional.slice(0, 3)],
+  [[...historicallyOptional]],
+])("historical prepared omissions survive transfer: %j", (omitted) => {
+  const f = policyFixture();
+  const fields = { ...f.prepared.fields };
+  for (const key of omitted) Reflect.deleteProperty(fields, key);
+  const prepared = seal({ ...f.prepared, fields });
+  const reviewed = seal({
+    ...f.reviewed,
+    fields,
+    parent: { recordId: prepared.recordId, version: 2 },
+  });
+  const state = { ...fields, reviewMode: "single", round: 1, adopter: f.prepared.fields };
+  const roundTrip = (value: unknown) => {
+    const decoded = parseTransferJson(JSON.parse(new TextDecoder().decode(encodeTransferJson(value))));
+    if (!decoded || typeof decoded !== "object") throw new Error("Expected portable object");
+    return decoded;
+  };
+  const preparedHistory = roundTrip([f.provisional, prepared]);
+  for (const boundary of boundaries)
+    expect(boundary(preparedHistory, f.identity, roundTrip(fields))).toEqual(prepared);
+  expect(
+    executableFieldsFromPolicy(preparedHistory, f.identity, { ...fields, adopter: f.prepared.fields }),
+  ).toEqual(fields);
+  const history = roundTrip([f.provisional, prepared, reviewed]);
+  const portableState = roundTrip(state);
+  const executable = executableFieldsFromPolicy(history, f.identity, portableState);
+  expect(executable).toEqual({ ...fields, reviewMode: "single" });
+  for (const boundary of boundaries) {
+    const pin = boundary(history, f.identity, portableState);
+    expect(pin).toEqual(reviewed);
+    if (pin.kind === "provisional") throw new Error("Expected established policy");
+    for (const key of omitted) {
+      for (const value of [
+        pin.fields,
+        roundTrip(pin.fields),
+        portableState,
+        executable,
+        roundTrip(executable),
+      ])
+        expect(Object.hasOwn(value, key)).toBe(false);
+      expect(() => boundary(history, f.identity, { ...state, [key]: f.prepared.fields[key] })).toThrow(
+        "conflict",
+      );
+    }
+  }
+  expect(parseTransferPolicyHistory(history)).toEqual([f.provisional, prepared, reviewed]);
+});
+
 test.each([
   ["gatesConfig", { setup: [], checks: [], source: "none", protectedPaths: [] }],
   ["previewConfig", { paths: ["ui/"], build: "build", serve: "serve", ready: "ready", env: {} }],

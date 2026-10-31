@@ -1,9 +1,12 @@
 import { expect, test } from "bun:test";
 import { RunTransferError } from "../src/pipeline/run-transfer-errors.ts";
+import { encodeTransferJson } from "../src/pipeline/run-transfer-json.ts";
+import { executableFieldsFromPolicy } from "../src/pipeline/run-transfer-policy-equality.ts";
 import {
   parseTransferPolicyHistory,
   parseTransferPolicyRecord,
   policyCommitDependencies,
+  transferAdmissionPolicySchema,
 } from "../src/pipeline/run-transfer-policy-schema.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { base, policyFixture, seal, source } from "./run-transfer-policy-support.ts";
@@ -104,6 +107,26 @@ test("portable profiles stay inert and admission policy never supplies defaults"
     expect(() => parseTransferPolicyRecord(seal({ ...f.provisional, engine }))).toThrow(RunTransferError);
 });
 
+test("shadow grace preserves finite non-negative fractions without coercion", () => {
+  const { provisional } = policyFixture();
+  const record = seal({
+    ...provisional,
+    engine: { ...provisional.engine, reviewShadowGraceSeconds: 0.5 },
+  });
+  const decoded = JSON.parse(new TextDecoder().decode(encodeTransferJson(record)));
+  expect(parseTransferPolicyRecord(decoded).engine.reviewShadowGraceSeconds).toBe(0.5);
+  for (const value of [0, 0.5])
+    expect(
+      transferAdmissionPolicySchema.parse({ ...provisional.engine, reviewShadowGraceSeconds: value })
+        .reviewShadowGraceSeconds,
+    ).toBe(value);
+  for (const value of [-0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, "0.5"])
+    expect(
+      transferAdmissionPolicySchema.safeParse({ ...provisional.engine, reviewShadowGraceSeconds: value })
+        .success,
+    ).toBe(false);
+});
+
 test("credential-bearing commands and identities reject unchanged with fixed diagnostics", () => {
   const credential = ["synthetic", "policy", "credential", "12345678"].join("-");
   registerCredential("TEST_PORTABLE_POLICY", credential);
@@ -136,13 +159,41 @@ test.each([["s3", "cr3t!"].join(""), ["s3", '"c\\t!'].join("")])(
   "short credentials in decoded policy strings and keys reject unchanged",
   (credential) => {
     registerCredential("TEST_SHORT_PORTABLE_POLICY", credential);
-    const { prepared } = policyFixture();
+    const { provisional: admission, prepared } = policyFixture();
+    expect(parseTransferPolicyRecord(prepared)).toEqual(prepared);
+    expect(
+      executableFieldsFromPolicy(
+        [admission, prepared],
+        {
+          policyId: prepared.policyId,
+          repository: prepared.repository,
+        },
+        prepared.fields,
+      ).baselineScripts,
+    ).toEqual({ test: "bun test", lint: "biome check ." });
     for (const record of [
       { ...prepared, policyId: credential },
       { ...prepared, repository: { ...prepared.repository, slug: credential } },
       { ...prepared, fields: { ...prepared.fields, slottedCommands: [[credential]] } },
       { ...prepared, fields: { ...prepared.fields, baselineScripts: { test: credential } } },
       { ...prepared, fields: { ...prepared.fields, baselineScripts: { [credential]: "bun test" } } },
+      { ...prepared, repository: { ...prepared.repository, slug: `example/${credential}/project` } },
+      { ...prepared, fields: { ...prepared.fields, slottedCommands: [["sh", "-c", `echo ${credential}`]] } },
+      { ...prepared, fields: { ...prepared.fields, baselineScripts: { test: `echo ${credential}` } } },
+      {
+        ...prepared,
+        fields: { ...prepared.fields, baselineScripts: { [`test-${credential}`]: "bun test" } },
+      },
+      {
+        ...prepared,
+        fields: {
+          ...prepared.fields,
+          gatesConfig: {
+            ...prepared.fields.gatesConfig,
+            checks: [{ name: "test", run: `echo ${credential}` }],
+          },
+        },
+      },
       {
         ...prepared,
         fields: {
@@ -155,14 +206,24 @@ test.each([["s3", "cr3t!"].join(""), ["s3", '"c\\t!'].join("")])(
         repository: { ...prepared.repository, profile: { nested: { [credential]: true } } },
       },
     ]) {
-      const input = seal(record),
-        original = JSON.stringify(input);
-      expect(() => parseTransferPolicyRecord(input)).toThrow("Run transfer data is invalid");
-      expect(JSON.stringify(input)).toBe(original);
-      try {
-        parseTransferPolicyRecord(input);
-      } catch (error) {
-        expect(String(error)).not.toContain(credential);
+      const provisional = seal({ ...admission, policyId: record.policyId, repository: record.repository });
+      const input = seal({ ...record, parent: { recordId: provisional.recordId, version: 1 } });
+      const history = [provisional, input];
+      const identity = { policyId: input.policyId, repository: input.repository };
+      const state = { ...input.fields };
+      const original = JSON.stringify({ history, identity, state });
+      for (const check of [
+        () => parseTransferPolicyRecord(input),
+        () => executableFieldsFromPolicy(history, identity, state),
+      ]) {
+        expect(check).toThrow("Run transfer data is invalid");
+        expect(JSON.stringify({ history, identity, state })).toBe(original);
+        try {
+          check();
+        } catch (error) {
+          expect(String(error)).toBe("RunTransferError: Run transfer data is invalid");
+          expect(String(error)).not.toContain(credential);
+        }
       }
     }
   },

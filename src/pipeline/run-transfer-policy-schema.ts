@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { redactCredentials } from "../util/proc.ts";
+import { registeredCredentials } from "../util/proc.ts";
 import { RunTransferError } from "./run-transfer-errors.ts";
 import { transferDictionary } from "./run-transfer-gates.ts";
 import { encodeTransferJson, parseTransferJson } from "./run-transfer-json.ts";
@@ -35,7 +35,7 @@ export const transferAdmissionPolicySchema = object({
   triageDecisionConfidence: z.number().min(0).max(1),
   reviewMode: mode,
   reviewShadow: r.oneOf("off panel"),
-  reviewShadowGraceSeconds: r.counter,
+  reviewShadowGraceSeconds: z.number().finite().nonnegative(),
   reviewImplementerReport: r.oneOf("include omit"),
   reviewAvoidImplementerVendor: z.boolean(),
   reviewRosters: object(r.fields("quick standard deep", z.array(finder))),
@@ -80,10 +80,12 @@ export const transferPreparedPolicySchema = object({
     seed: text.optional(),
     ready: text,
     env: transferDictionary(text),
-  }).nullable(),
-  slottedCommands: z.array(strings),
-  agentFullSuite: r.oneOf("slot refuse gate"),
-  baselineScripts: transferDictionary(text),
+  })
+    .nullable()
+    .optional(),
+  slottedCommands: z.array(strings).optional(),
+  agentFullSuite: r.oneOf("slot refuse gate").optional(),
+  baselineScripts: transferDictionary(text).optional(),
   reviewLenses: lenses.optional(),
   shadowLenses: z.union([lenses, object({ error: text })]).optional(),
 });
@@ -111,9 +113,10 @@ export const transferPolicyRecordSchema = z.union([
 ]);
 export type TransferPolicyRecord = z.infer<typeof transferPolicyRecordSchema>;
 export const policyCanonical = (v: unknown): string => new TextDecoder().decode(encodeTransferJson(v));
-// Short registered credentials match only whole decoded strings, not serialized JSON.
+// Policy rejects literal credentials of every length, including inside decoded strings and keys.
 function rejectPolicyCredentials(value: unknown): void {
-  if (typeof value === "string" && redactCredentials(value) !== value) throw new RunTransferError("invalid");
+  if (typeof value === "string" && registeredCredentials().some((credential) => value.includes(credential)))
+    throw new RunTransferError("invalid");
   if (Array.isArray(value)) value.forEach(rejectPolicyCredentials);
   else if (value && typeof value === "object")
     for (const [key, member] of Object.entries(value)) {
