@@ -266,9 +266,16 @@ test.each(["prepare", "triage", "deliver"] as const)(
     try {
       expect(reopened.nextQueuedRuns(10, now - 1)).toHaveLength(0);
       expect(reopened.nextQueuedRuns(10, now).map((r) => r.id)).toEqual([run.id]);
-      claim.open();
       const clock = spyOn(Date, "now").mockReturnValue(now);
       try {
+        expect(await executeRun({ ...deps, store: reopened }, run.id, signal())).toBe("queued");
+        expect(reopened.getRunState<RunState>(run.id)).toEqual({
+          ...state,
+          githubWait: { ...state.githubWait, nextAttemptAt: now + githubWait.intervalMs },
+        });
+        expect(reopened.listInvocations(run.id)).toEqual(attempts);
+        clock.mockReturnValue(now + githubWait.intervalMs);
+        claim.open();
         expect(await executeRun({ ...deps, store: reopened, faults: undefined }, run.id, signal())).toBe(
           "succeeded",
         );
@@ -276,7 +283,7 @@ test.each(["prepare", "triage", "deliver"] as const)(
         clock.mockRestore();
       }
       expect(reopened.getRunState<RunState>(run.id)?.githubWait).toBeUndefined();
-      expect(claim.update).toHaveBeenCalledTimes(2);
+      expect(claim.update).toHaveBeenCalledTimes(3);
       expect(reopened.listInvocations(run.id).slice(0, attempts.length)).toEqual(attempts);
       if (phase === "deliver")
         expect(reopened.getRunState<RunState>(run.id)?.gateEvidence).toEqual(state.gateEvidence);
@@ -527,9 +534,11 @@ test("engine loss suppresses attached and reopened consumers, including inner id
   restores.push(() => resolver.mockRestore());
   const spawn = noSpawn();
   let request: ReturnType<GhRunner> | undefined;
+  let notifications = 0;
   const stop = startGitHubNotifier(
     f.store,
     (...args) => {
+      notifications++;
       request = runGh(...args);
       return request;
     },
@@ -544,6 +553,7 @@ test("engine loss suppresses attached and reopened consumers, including inner id
   try {
     expect(await executeRun({ ...f.deps, runClaim: claim }, run.id, signal())).toBe("cancelled");
     expect(f.store.getRun(run.id)).toMatchObject({ status: "cancelled", error: "superseded: claim lost" });
+    expect(notifications).toBe(1);
     const receipts = f.store.issueLifecycleEffects(run.id, repo.slug, 7);
     resume.resolve();
     await request?.catch(() => {});
