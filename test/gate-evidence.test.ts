@@ -1887,7 +1887,10 @@ test.each([
   ["skipped", "named test skipped"],
   ["failed", "test failed"],
   ["errored", "test failed"],
-  ["missing", "JUnit report missing, stale or unsafe"],
+  ["missing", "JUnit report missing"],
+  ["empty", "JUnit report empty"],
+  ["stale-empty", "JUnit report missing, stale or unsafe"],
+  ["pre-existing-empty", "JUnit report existed before execution"],
   ["stale", "JUnit report missing, stale or unsafe"],
   ["symlink", "JUnit report missing, stale or unsafe"],
   ["pre-existing", "JUnit report existed before execution"],
@@ -1923,13 +1926,14 @@ test.each([
       `<testcase name="${title}"/>` +
       (outcome ? `<testcase name="${title}"><${outcome}/></testcase><testcase name="${title}"/>` : "");
     const xml = `<testsuites><testsuite file="${file}">${mode === "nested" ? `<testsuite name="outer"><testsuite name="inner">${cases}</testsuite></testsuite>` : cases}</testsuite></testsuites>`;
-    if (mode !== "missing") writeFileSync(path, mode === "malformed" ? "<testsuites><oops>" : xml);
+    if (mode !== "missing")
+      writeFileSync(path, mode.endsWith("empty") ? "" : mode === "malformed" ? "<testsuites><oops>" : xml);
     if (mode === "equal" || mode === "clock-lag") {
       utimesSync(path, filesystemBaseline / 1000, filesystemBaseline / 1000);
       expect(statSync(path).mtimeMs).toBe(filesystemBaseline);
     }
     if (mode === "clock-lag") expect(statSync(path).mtimeMs).toBeLessThan(Date.now());
-    if (mode === "stale") utimesSync(path, 1, 1);
+    if (mode === "stale" || mode === "stale-empty") utimesSync(path, 1, 1);
     if (mode === "symlink") {
       const target = join(cwd, "target.xml");
       writeFileSync(target, xml);
@@ -1947,9 +1951,10 @@ test.each([
       cwd,
       { file: "./x.test.ts", name },
       filesystemBaseline,
-      mode === "pre-existing",
+      mode === "pre-existing" || mode === "pre-existing-empty",
     );
     expect(junit.reason).toBe(reason);
+    expect(junit.reportUnavailable === true).toBe(mode === "missing" || mode === "empty");
     const run = coveringRun();
     if (!run.result) throw new Error("missing result");
     run.name = name;
@@ -2020,6 +2025,98 @@ test.each([
       result: { ...result, executionProvenance: { sha: head, trackedClean: true } },
     };
     expect(coveringTestRefusal(record, head, [13])).toBeDefined();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("literal parameter placeholders select no expanded Bun cases and repeated JUnit names use the worst outcome", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-parameterized-"));
+  try {
+    const { value: sha } = await coveringSeed(cwd);
+    writeFileSync(
+      join(cwd, "each.test.ts"),
+      `import { test, expect } from "bun:test";
+test.each(["one", "two"])("value %s", (value) => expect(value).toBeTruthy());
+test.each(["%s", "%s"])("literal %s", () => {});
+test.each([["%s", true], ["%s", false]])("failure %s", (_name, pass) => expect(pass).toBe(true));
+test.each(["%s"])("skipped %s", () => {});
+test.skip.each(["%s"])("skipped %s", () => {});
+`,
+    );
+    await sh(["git", "add", "."], { cwd });
+    await sh(["git", "commit", "-qm", "parameterized fixture"], { cwd });
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    expect(head).not.toBe(sha);
+    const identity = { file: "each.test.ts", name: "value %s" };
+    const built = await coveringTestCommand(identity, coveringConfig, cwd, head);
+    if (!built.command) throw new Error(built.reason);
+    expect(built.command).toContain(" -t '(?:^| )value %s$'");
+    const gate = await confinementScope.run(fakeConfinement, () =>
+      runLocalGates(
+        cwd,
+        {
+          ...coveringConfig,
+          checks: [
+            {
+              name: "test",
+              run: built.command.replace(/^bun /, `${process.execPath} `),
+              coveringTest: identity,
+            },
+          ],
+        },
+        new AbortController().signal,
+      ),
+    );
+    expect(gate.checks[0]?.coveringTest?.reason).toBe("name matched no tests");
+    expect(gate.checks[0]?.output).toContain("matched 0 tests");
+    // Bun 1.4.3 expands these names in JUnit as well as in the filter.
+    const report = join(cwd, "each.xml");
+    const unfiltered = await sh(
+      [process.execPath, "test", "./each.test.ts", "--reporter=junit", `--reporter-outfile=${report}`],
+      { cwd, allowFail: true },
+    );
+    expect(unfiltered.exitCode).toBe(1);
+    expect(readCoveringJUnit(report, cwd, identity, 0, false).reason).toBe("name matched no tests");
+    expect(
+      readCoveringJUnit(report, cwd, { file: identity.file, name: "value one" }, 0, false).reason,
+    ).toBeUndefined();
+    // Literal placeholders can also be actual expanded names. Every repeated occurrence must pass.
+    for (const [name, reason] of [
+      ["literal %s", undefined],
+      ["skipped %s", "named test skipped"],
+      ["failure %s", "test failed"],
+    ] as const) {
+      const test = { file: identity.file, name };
+      expect(readCoveringJUnit(report, cwd, test, 0, false).reason).toBe(reason);
+      const command = await coveringTestCommand(test, coveringConfig, cwd, head);
+      if (!command.command) throw new Error(command.reason);
+      const executed = await confinementScope.run(fakeConfinement, () =>
+        runLocalGates(
+          cwd,
+          {
+            ...coveringConfig,
+            checks: [
+              {
+                name: "test",
+                run: command.command.replace(/^bun /, `${process.execPath} `),
+                coveringTest: test,
+              },
+            ],
+          },
+          new AbortController().signal,
+        ),
+      );
+      const result = executed.checks[0];
+      expect(result?.coveringTest?.reason).toBe(reason);
+      const record = {
+        ...coveringRun(),
+        ...test,
+        verifiedSha: head,
+        result: result ? { ...result, executionProvenance: { sha: head, trackedClean: true } } : undefined,
+      };
+      expect(coveringTestRefusal(record, head, [record.stageId])).toBe(reason);
+    }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

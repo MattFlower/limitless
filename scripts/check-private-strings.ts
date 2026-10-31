@@ -1,6 +1,7 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { readRepoSettingsReadOnly } from "../src/config.ts";
 import * as privacy from "../src/gates/private.ts";
 import { checkPublicationText } from "../src/gates/publication.ts";
 import { recordWorktree, worktreeGit } from "../src/git/command.ts";
@@ -12,11 +13,18 @@ import {
 } from "../src/git/repos.ts";
 import { processScope, redactCredentials, sh } from "../src/util/proc.ts";
 
+function assertLocalMode(repo: string): void {
+  if (readRepoSettingsReadOnly(repo).shared) throw new Error("Manual landing requires local repository mode");
+}
+
 const controller = new AbortController();
 for (const event of ["SIGTERM", "SIGINT"] as const) process.on(event, () => controller.abort());
 const signal = controller.signal;
 processScope.enterWith({ signal, killGraceMs: 100, children: new Map(), scratchDirs: new Set() });
 try {
+  const repo = process.argv[3] ?? "";
+  assertLocalMode(repo);
+  if (process.argv[2] === "--local-only") process.exit(0);
   if (process.argv[2] === "--record") {
     // Land runs this before any PR code: the hardened git calls below trust only these paths.
     if (lstatSync(join(process.cwd(), ".git"), { throwIfNoEntry: false })?.isFile())
@@ -58,7 +66,10 @@ try {
       squash: { base: data.baseRefOid, head: sha, title, body: data.body },
     });
     const merge = ["gh", "pr", "merge", pr, "-R", repo, "--squash", "--delete-branch"];
-    await sh([...merge, "--subject", title, "--body", data.body, "--match-head-commit", sha], opts);
+    await sh([...merge, "--subject", title, "--body", data.body, "--match-head-commit", sha], {
+      ...opts,
+      dispatchGuard: () => assertLocalMode(repo),
+    });
   } else {
     const [pr = "", repo = "", subject = ""] = process.argv.slice(2);
     const opts = { cwd: process.cwd() };

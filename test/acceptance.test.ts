@@ -4,7 +4,10 @@ import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { RunStatus } from "../src/core/types.ts";
-import { localExecutor } from "../src/gates/executor.ts";
+import { WorkerStore } from "../src/db/workers.ts";
+import type { GateCommand } from "../src/gates/detect.ts";
+import { type GateRequest, localExecutor } from "../src/gates/executor.ts";
+import { lanExecutor } from "../src/gates/lan.ts";
 import { resolveRepo } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { type AcceptanceState, acceptanceEngine, acceptanceRunRequest } from "../src/pipeline/acceptance.ts";
@@ -64,12 +67,40 @@ const output = (items: Item[]) => ({
 });
 
 async function setup(
-  options: { setup?: string; parent?: string; ticket?: string; junit?: "stale" | "missing" } = {},
+  options: {
+    setup?: string;
+    parent?: string;
+    ticket?: string;
+    junit?:
+      | "stale"
+      | "missing"
+      | "empty"
+      | "whitespace"
+      | "no-match"
+      | "unsafe"
+      | "malformed"
+      | "exit126"
+      | "bun-missing"
+      | "spawn";
+    checks?: GateCommand[];
+    files?: Record<string, string>;
+  } = {},
 ) {
   writeFileSync(join(repoDir, ".gitignore"), "local.env\n");
   writeFileSync(
     join(repoDir, ".limitless.toml"),
-    `[gates]\nsetup = [${JSON.stringify(options.setup ?? "echo local > local.env")}]\nretry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]\ndocs = ["README.md", "docs/**"]\n`,
+    `[gates]\nsetup = [${JSON.stringify(options.setup ?? "echo local > local.env")}]\nretry_files = "bun test {files}"\nchecks = [${(
+      options.checks ?? [
+        { name: "lint", run: "echo lint" },
+        { name: "typecheck", run: "echo types" },
+        { name: "test", run: "bun test", timeoutSec: 37 },
+      ]
+    )
+      .map(
+        (c) =>
+          `{ name = ${JSON.stringify(c.name)}, run = ${JSON.stringify(c.run)}${c.timeoutSec ? `, timeoutSec = ${c.timeoutSec}` : ""} }`,
+      )
+      .join(", ")}]\ndocs = ["README.md", "docs/**"]\n`,
   );
   writeFileSync(
     join(repoDir, "x.test.ts"),
@@ -80,15 +111,27 @@ test("fails", () => expect(1).toBe(2));
 test${".skip"}("skipped", () => {});
 `,
   );
-  if (options.junit)
+  const reportEdits: Record<string, string> = {
+    stale: 'touch -t 200001010000 "$LIMITLESS_GATE_REPORT"',
+    missing: 'rm -f "$LIMITLESS_GATE_REPORT"',
+    empty: ': > "$LIMITLESS_GATE_REPORT"',
+    whitespace: 'printf " \n\t" > "$LIMITLESS_GATE_REPORT"',
+    "no-match": `printf '%s' '<testsuites><testsuite file="x.test.ts"><testcase name="unrelated"/></testsuite></testsuites>' > "$LIMITLESS_GATE_REPORT"`,
+    unsafe:
+      'mv "$LIMITLESS_GATE_REPORT" "$LIMITLESS_GATE_REPORT.target"; ln -s "$LIMITLESS_GATE_REPORT.target" "$LIMITLESS_GATE_REPORT"',
+    malformed: `printf '%s' '<testsuites><oops>' > "$LIMITLESS_GATE_REPORT"`,
+  };
+  if (options.junit && reportEdits[options.junit])
     writeFileSync(
       join(repoDir, "junit-evidence.sh"),
       `bun test -t '(?:^| )passes$' ./x.test.ts "$@"
 status=$?
-${options.junit === "stale" ? 'touch -t 200001010000 "$LIMITLESS_GATE_REPORT"' : 'rm -f "$LIMITLESS_GATE_REPORT"'}
+${reportEdits[options.junit]}
 exit "$status"
 `,
     );
+  for (const [file, contents] of Object.entries(options.files ?? {}))
+    writeFileSync(join(repoDir, file), contents);
   writeFileSync(join(repoDir, "notes.txt"), "a\nb\n");
   await sh(["git", "add", "."], { cwd: repoDir });
   await sh(["git", "commit", "-qm", "acceptance fixture"], { cwd: repoDir });
@@ -98,13 +141,19 @@ exit "$status"
   let calls = 0;
   let reply: (calls: number) => FakeReply | Promise<FakeReply> = () => ({ structured: output([]) });
   const targeted: string[] = [];
+  const requests: GateRequest[] = [];
   const executor = localExecutor();
   const start = executor.start.bind(executor);
   executor.start = (request, signal) => {
     for (const check of request.gates.checks)
       if (check.run.includes(" -t ")) {
         targeted.push(check.run);
-        if (options.junit) check.run = "bash ./junit-evidence.sh";
+        requests.push(structuredClone(request));
+        if (check.coveringTest?.file === "x.test.ts") {
+          if (options.junit === "bun-missing") check.run = `PATH=./absent-bin ${check.run}`;
+          else if (options.junit === "exit126") check.run = "exit 126; :";
+          else if (options.junit && reportEdits[options.junit]) check.run = "bash ./junit-evidence.sh";
+        }
       }
     return start(request, signal);
   };
@@ -119,12 +168,30 @@ exit "$status"
     bootSha: "test-build",
     gateExecutor: executor,
   });
+  if (options.junit === "spawn")
+    f.deps.confinement = {
+      ...fakeConfinement,
+      wrap: (cmd) =>
+        cmd.some((arg) => arg.includes(" -t ") && arg.includes("x.test.ts"))
+          ? [join(repoDir, "absent-runner")]
+          : cmd,
+    };
   factory = f;
   registerGithub(f, bare);
   const repo = await resolveRepo(f.store, "test/repo", cfg.githubMerge);
   const snapshot = acceptanceRunRequest({
-    ticket: { number: 9, body: options.ticket ?? ticket, author: { login: "owner" } },
-    parent: { number: 1, body: options.parent ?? parent, author: { login: "owner" } },
+    ticket: {
+      number: 9,
+      body: options.ticket ?? ticket,
+      author: { login: "owner" },
+      userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
+    },
+    parent: {
+      number: 1,
+      body: options.parent ?? parent,
+      author: { login: "owner" },
+      userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
+    },
     trusted: ["owner"],
   });
   const run = f.store.createAcceptanceRun(
@@ -144,6 +211,7 @@ exit "$status"
     sha,
     run,
     targeted,
+    requests,
     calls: () => calls,
     reply: (next: typeof reply) => {
       reply = next;
@@ -178,6 +246,12 @@ test("all units verified met succeed without publishing, at the pinned SHA", asy
     };
   });
   expect(await t.execute()).toBe("succeeded");
+  expect(t.requests).toHaveLength(1);
+  expect(t.requests[0]).toMatchObject({
+    headSha: t.sha,
+    gates: { checks: [{ name: "test", timeoutSec: 37 }] },
+  });
+  expect(t.requests[0]?.gates.checks).toHaveLength(1);
   const outcome = t.outcome();
   expect(outcome).toMatchObject({ sha: t.sha, passed: true, summary: "3 met" });
   const records = t.state()?.coveringTestRuns ?? [];
@@ -215,9 +289,14 @@ test("adjacent section references retain an unassessed requirement and prevent s
   await t.published();
 });
 
-test.each(["stale", "missing"] as const)(
+test.each([
+  ["stale", "JUnit report missing, stale or unsafe"],
+  ["unsafe", "JUnit report missing, stale or unsafe"],
+  ["malformed", "unparseable JUnit report"],
+  ["no-match", "name matched no tests"],
+] as const)(
   "%s JUnit evidence cannot satisfy acceptance despite successful execution",
-  async (junit) => {
+  async (junit, reason) => {
     const t = await setup({
       junit,
       parent: "## Goal\n- Required behaviour.",
@@ -228,19 +307,77 @@ test.each(["stale", "missing"] as const)(
     expect(t.state()?.coveringTestRuns?.[0]?.result).toMatchObject({
       ok: true,
       exitCode: 0,
-      coveringTest: { file: "x.test.ts", name: "passes", reason: "JUnit report missing, stale or unsafe" },
+      coveringTest: { file: "x.test.ts", name: "passes", reason },
     });
     expect(t.outcome().units).toEqual([
       {
         unit: "U1",
         verdict: "unmet",
         citations: [],
-        refusals: ["x.test.ts › passes: JUnit report missing, stale or unsafe"],
+        refusals: [`x.test.ts › passes: ${reason}`],
         note: "",
       },
     ]);
     expect(t.targeted).toHaveLength(1);
     await t.published();
+  },
+);
+
+test.each(["bun-missing", "exit126", "spawn", "missing", "empty", "whitespace"] as const)(
+  "a %s runner refusal is persisted for grouped identities before restart",
+  async (junit) => {
+    const t = await setup({
+      junit,
+      files: { "y.test.ts": 'import { test } from "bun:test"; test("independent", () => {});' },
+    });
+    const value = AcceptanceSchema.parse(metAll);
+    const [first, second] = value.items;
+    if (!first || !second) throw new Error("missing units");
+    first.tests.push({ file: "x.test.ts", name: "also passes" });
+    second.tests = [{ file: "y.test.ts", name: "independent" }];
+    t.reply(() => ({ structured: value }));
+    t.f.deps.checkpointer = {
+      ...localCheckpointer(t.f.store),
+      checkpoint(_runId, label) {
+        if (label === (junit === "spawn" ? "covering-test-recorded" : "gate-result"))
+          throw new SimulatedTermination("saved unavailable covering execution");
+      },
+    };
+    expect(await t.execute()).toBe("running");
+    const saved = t.state()?.coveringTestRuns?.filter((r) => r.file === "x.test.ts") ?? [];
+    expect(saved).toHaveLength(2);
+    const reason =
+      junit === "spawn"
+        ? saved[0]?.reason
+        : junit === "empty" || junit === "whitespace"
+          ? "JUnit report empty"
+          : "JUnit report missing";
+    expect(reason).toBeTruthy();
+    for (const record of saved) {
+      expect(record).toMatchObject({ unavailable: true, reason });
+      if (junit !== "spawn")
+        expect(record.result?.exitCode).toBe(junit === "bun-missing" ? 127 : junit === "exit126" ? 126 : 0);
+    }
+    expect(t.state()?.gateExecution).toBeUndefined();
+    t.f.deps.checkpointer = undefined;
+    expect(await t.execute()).toBe("needs_human");
+    expect(t.targeted).toHaveLength(2);
+    expect(t.calls()).toBe(1);
+    expect(t.outcome()).toMatchObject({
+      passed: false,
+      summary: "2 met, 1 not assessed",
+      units: [
+        {
+          verdict: "not_assessed",
+          citations: [],
+          refusals: [`x.test.ts › passes: ${reason}`, `x.test.ts › also passes: ${reason}`],
+        },
+        { verdict: "met" },
+        { verdict: "met" },
+      ],
+    });
+    expect(JSON.parse(t.f.store.getArtifact(t.run.id, "acceptance.json") ?? "null")).toEqual(t.outcome());
+    expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(`x.test.ts › passes: ${reason}`);
   },
 );
 
@@ -311,7 +448,7 @@ test("claimed met verdicts are downgraded unless the engine verifies them", asyn
   expect(outcome.summary).toBe("1 met, 12 unmet, 1 not assessed, 1 manual");
   expect(t.f.store.getRun(t.run.id)?.error).toBe("Acceptance: 1 met, 12 unmet, 1 not assessed, 1 manual");
   // Only the three tests cited by single met items ran; the unknown unit's test did not.
-  expect(t.targeted).toHaveLength(3);
+  expect(t.targeted).toHaveLength(1);
   await t.published();
 });
 
@@ -399,9 +536,15 @@ test.each([
 test.each(["manifest", "output", "covering-test", "outcome"] as const)(
   "a restart after the %s checkpoint resumes without repeating it",
   async (boundary) => {
-    const t = await setup();
+    const t = await setup({
+      files: { "y.test.ts": 'import { test } from "bun:test"; test("pending", () => {});' },
+    });
+    const restartOutput = AcceptanceSchema.parse(metAll);
+    const third = restartOutput.items[2];
+    if (!third) throw new Error("missing unit");
+    third.tests = [{ file: "y.test.ts", name: "pending" }];
     const shutdown = new AbortController();
-    t.reply(() => ({ structured: metAll }));
+    t.reply(() => ({ structured: restartOutput }));
     const faults: Record<Exclude<typeof boundary, "output">, [string, Fault]> = {
       manifest: ["harness:invoke", { action: "hang", onHit: () => shutdown.abort(new Error("shutdown")) }],
       "covering-test": [
@@ -424,20 +567,23 @@ test.each(["manifest", "output", "covering-test", "outcome"] as const)(
     expect(["queued", "running"]).toContain(await t.execute(shutdown.signal));
     const before = t.state();
     expect(before?.acceptance?.manifest).toHaveLength(3);
-    if (boundary !== "manifest") expect(before?.acceptance?.output).toEqual(parsedMetAll);
+    if (boundary !== "manifest") expect(before?.acceptance?.output).toEqual(restartOutput);
     if (boundary === "output") {
       expect(t.calls()).toBe(1);
       expect(t.targeted).toHaveLength(0);
       expect(before?.coveringTestRuns).toBeUndefined();
     }
-    if (boundary === "covering-test") expect(before?.coveringTestRuns?.[0]?.result).toBeDefined();
+    if (boundary === "covering-test") {
+      expect(before?.coveringTestRuns?.slice(0, 2).every((r) => !!r.result)).toBe(true);
+      expect(before?.coveringTestRuns?.[2]?.result).toBeUndefined();
+    }
     const ran = t.targeted.length;
     t.f.deps.faults = undefined;
     t.f.deps.checkpointer = undefined;
     expect(await t.execute()).toBe("succeeded");
     const after = t.state();
     expect(t.calls()).toBe(1);
-    expect(after?.coveringTestRuns?.map((r) => r.name)).toEqual(["passes", "also passes"]);
+    expect(after?.coveringTestRuns?.map((r) => r.name)).toEqual(["passes", "also passes", "pending"]);
     expect(after?.acceptance?.manifest).toEqual(before?.acceptance?.manifest);
     if (boundary === "outcome") {
       expect(after?.acceptance?.outcome).toEqual(before?.acceptance?.outcome);
@@ -496,3 +642,321 @@ test.each(["created", "prepared", "output"] as const)(
     await t.published();
   },
 );
+
+test("two Bun checks refuse assessment without counting an unmet unit", async () => {
+  const t = await setup({
+    checks: [
+      { name: "test", run: "bun test" },
+      { name: "other", run: "bun test ./other.test.ts" },
+    ],
+  });
+  t.reply(() => ({ structured: metAll }));
+  expect(await t.execute()).toBe("needs_human");
+  expect(t.targeted).toEqual([]);
+  expect(t.outcome()).toMatchObject({
+    passed: false,
+    summary: "1 met, 2 not assessed",
+    units: [
+      { verdict: "not_assessed", refusals: ["x.test.ts › passes: targeted retries not configured"] },
+      { verdict: "not_assessed" },
+      { verdict: "met" },
+    ],
+  });
+  expect(JSON.parse(t.f.store.getArtifact(t.run.id, "acceptance.json") ?? "null")).toEqual(t.outcome());
+  expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(
+    "not_assessed (x.test.ts › passes: targeted retries not configured)",
+  );
+});
+
+test("acceptance runs all 36 identities once per shared file and reuses duplicate citations", async () => {
+  const files = Object.fromEntries(
+    ["x", "y", "z"].map((f) => [
+      `${f}.test.ts`,
+      'import { test } from "bun:test";\n' +
+        Array.from({ length: 12 }, (_, i) => `test("case ${i}", () => {});`).join("\n"),
+    ]),
+  );
+  const t = await setup({
+    files,
+    parent: `## Goal\n${Array.from({ length: 13 }, (_, i) => `- Unit ${i}.`).join("\n")}`,
+    ticket: `## The original intent\n#1's "Goal" section`,
+  });
+  const items = Array.from({ length: 13 }, (_, i) => ({
+    unit: `U${i + 1}`,
+    verdict: "met",
+    files: [],
+    note: "",
+    tests: ["x", "y", "z"].map((f) => ({ file: `${f}.test.ts`, name: `case ${i % 12}` })),
+  }));
+  t.reply(() => ({ structured: { items } }));
+  expect(await t.execute()).toBe("succeeded");
+  expect(t.outcome().summary).toBe("13 met");
+  expect(t.targeted).toHaveLength(3);
+  const records = t.state()?.coveringTestRuns ?? [];
+  expect(records).toHaveLength(36);
+  expect(
+    records.every(
+      (r) => r.result?.coveringTest?.reason === undefined && r.result?.coveringTest?.name === r.name,
+    ),
+  ).toBe(true);
+  expect(
+    t
+      .outcome()
+      .units.every(
+        (u) => u.citations.length === 3 && u.citations.every((c) => c.startsWith("Factory covering test")),
+      ),
+  ).toBe(true);
+  expect(t.outcome().units[12]?.citations).toEqual(t.outcome().units[0]?.citations);
+});
+
+test.each(["runner", "slot", "inplace attachment", "inplace before enqueue", "LAN slot"] as const)(
+  "a pre-start %s refusal leaves independent files assessable",
+  async (mode) => {
+    const t = await setup({
+      files: { "y.test.ts": 'import { test } from "bun:test"; test("independent", () => {});' },
+    });
+    const value = AcceptanceSchema.parse(metAll);
+    const second = value.items[1];
+    if (!second) throw new Error("missing unit");
+    second.tests = [{ file: "y.test.ts", name: "independent" }];
+    t.reply(() => ({ structured: value }));
+    const executor = t.f.deps.gateExecutor;
+    if (!executor) throw new Error("missing executor");
+    const reason = `${mode} unavailable before start`;
+    if (mode === "runner") {
+      const start = executor.start.bind(executor);
+      executor.start = async (request, signal) => {
+        if (request.gates.checks[0]?.coveringTest?.file === "x.test.ts") throw new Error(reason);
+        return start(request, signal);
+      };
+    } else if (mode === "slot") {
+      const attach = executor.attach.bind(executor);
+      executor.attach = (handle, signal, request, hooks, persist) => {
+        if (request?.gates.checks[0]?.coveringTest?.file === "x.test.ts")
+          return {
+            result: Promise.reject(new Error(reason)),
+            events: { async *[Symbol.asyncIterator]() {} },
+            cancel: async () => {},
+          };
+        return attach(handle, signal, request, hooks, persist);
+      };
+    } else {
+      const workers = new WorkerStore(t.f.store, t.f.deps.buildSha);
+      const inplace = mode !== "LAN slot";
+      workers.executor = () => ({ id: "executor", pid: process.pid, birth: "1", release_sha: "test-build" });
+      const remote = lanExecutor(workers, ["test/repo"], inplace);
+      t.f.deps.gateExecutor = {
+        ...remote,
+        async start(request, signal) {
+          if (request.gates.checks[0]?.coveringTest?.file !== "x.test.ts")
+            return executor.start(request, signal);
+          if (mode === "inplace before enqueue") return remote.start(request, signal);
+          return {
+            kind: remote.kind,
+            id: workers.enqueue(request, undefined, inplace),
+            startedAt: Date.now(),
+          };
+        },
+        attach(handle, signal, request, hooks, persist) {
+          if (handle.kind === "local") return executor.attach(handle, signal, request, hooks, persist);
+          if (inplace) throw new Error(reason);
+          return {
+            result: Promise.reject(new Error(reason)),
+            events: { async *[Symbol.asyncIterator]() {} },
+            cancel: async () => {},
+          };
+        },
+      };
+    }
+    expect(await t.execute()).toBe("needs_human");
+    expect(t.outcome()).toMatchObject({
+      passed: false,
+      summary: "2 met, 1 not assessed",
+      units: [
+        { verdict: "not_assessed", refusals: [`x.test.ts › passes: ${reason}`] },
+        { verdict: "met" },
+        { verdict: "met" },
+      ],
+    });
+    expect(JSON.parse(t.f.store.getArtifact(t.run.id, "acceptance.json") ?? "null")).toEqual(t.outcome());
+    expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(
+      `not_assessed (x.test.ts › passes: ${reason})`,
+    );
+    if (mode === "inplace attachment" || mode === "LAN slot")
+      expect(new WorkerStore(t.f.store, t.f.deps.buildSha).jobs("1=1")).toMatchObject([
+        { state: "cancelled", attempt: 1, worker: null },
+      ]);
+    if (mode === "inplace before enqueue")
+      expect(new WorkerStore(t.f.store, t.f.deps.buildSha).jobs("1=1")).toEqual([]);
+  },
+);
+
+test.each(["leased", "retried", "missing", "resumed"] as const)(
+  "a remote failure with %s execution state is not a confirmed pre-start refusal",
+  async (state) => {
+    const t = await setup();
+    t.reply(() => ({ structured: metAll }));
+    const workers = new WorkerStore(t.f.store, t.f.deps.buildSha);
+    const remote = lanExecutor(workers, ["test/repo"]);
+    t.f.deps.gateExecutor = {
+      ...remote,
+      async start(request) {
+        const id = workers.enqueue(request);
+        if (state === "leased" || state === "resumed")
+          t.f.store.db.query("UPDATE gate_jobs SET state='leased',worker='runner' WHERE id=?").run(id);
+        else if (state === "retried") workers.fail(id, "previous attempt unknown");
+        else t.f.store.db.query("DELETE FROM gate_jobs WHERE id=?").run(id);
+        return { kind: "lan", id, startedAt: Date.now() };
+      },
+      attach() {
+        return {
+          result: Promise.reject(new Error("execution state unknown")),
+          events: { async *[Symbol.asyncIterator]() {} },
+          cancel: async () => {},
+        };
+      },
+    };
+    if (state === "resumed") {
+      t.f.deps.checkpointer = {
+        ...localCheckpointer(t.f.store),
+        checkpoint(_runId, label) {
+          if (label === "gate-started") throw new SimulatedTermination("saved unknown remote job");
+        },
+      };
+      expect(await t.execute()).toBe("running");
+      t.f.deps.checkpointer = undefined;
+      t.f.deps.gateExecutor = localExecutor();
+    }
+    expect(await t.execute()).toBe("failed");
+    expect(t.state()?.acceptance?.outcome).toBeUndefined();
+    expect(t.state()?.coveringTestRuns?.some((r) => r.unavailable)).toBe(false);
+    expect(t.f.store.getRun(t.run.id)?.error).toContain(
+      state === "resumed" ? "Unavailable gate executor: lan" : "execution state unknown",
+    );
+  },
+);
+
+test.each(["sha", "dirty"] as const)("grouped evidence refuses %s provenance", async (mode) => {
+  const t = await setup();
+  t.reply(() => ({ structured: metAll }));
+  const checkpoint = localCheckpointer(t.f.store);
+  t.f.deps.checkpointer = {
+    ...checkpoint,
+    checkpoint(runId, label) {
+      if (label === "covering-test-recorded") {
+        const state = t.f.store.getRunState<RunState>(runId);
+        for (const r of state?.coveringTestRuns ?? []) {
+          if (r.result?.executionProvenance)
+            Object.assign(
+              r.result.executionProvenance,
+              mode === "sha" ? { sha: "b".repeat(40) } : { trackedClean: false },
+            );
+        }
+        if (state) t.f.store.setRunState(runId, state);
+        throw new SimulatedTermination("saved rejected provenance");
+      }
+    },
+  };
+  expect(await t.execute()).toBe("running");
+  t.f.deps.checkpointer = undefined;
+  expect(await t.execute()).toBe("needs_human");
+  expect(t.outcome().summary).toBe("1 met, 2 unmet");
+  expect(t.outcome().units[0]?.refusals[0]).toContain(
+    mode === "sha" ? "different SHA" : "changed tracked files",
+  );
+  expect(t.targeted).toHaveLength(1);
+});
+
+test("a per-unit cap is unavailable, but rejected evidence takes precedence", async () => {
+  const t = await setup();
+  t.reply(() => ({
+    structured: output([
+      { unit: "U1", verdict: "met", tests: ["passes", "also passes", "passes", "also passes"] },
+      { unit: "U2", verdict: "met", tests: ["passes", "fails", "passes", "also passes"] },
+      { unit: "U3", verdict: "met", files: [{ path: "README.md" }] },
+    ]),
+  }));
+  expect(await t.execute()).toBe("needs_human");
+  expect(t.outcome().summary).toBe("1 met, 1 unmet, 1 not assessed");
+  expect(t.outcome().units[0]).toMatchObject({
+    verdict: "not_assessed",
+    refusals: ["x.test.ts › also passes: per-criterion limit reached"],
+  });
+  expect(t.outcome().units[1]?.refusals).toContain("x.test.ts › fails: test failed");
+});
+
+test.each([
+  ["targeted retries not configured", undefined, "not_assessed"],
+  ["per-criterion limit reached", undefined, "not_assessed"],
+  ["per-round limit reached", undefined, "not_assessed"],
+  ["covering tests do not support an option terminator (--) in retry_files", undefined, "not_assessed"],
+  ["expanded command is not a single bun test invocation", undefined, "not_assessed"],
+  ["targeted retries not configured", false, "unmet"],
+  ["unknown refusal: targeted retries not configured", undefined, "unmet"],
+  ["custom infrastructure refusal", true, "not_assessed"],
+] as const)("saved refusal %s with unavailable=%s resumes as %s", async (reason, unavailable, verdict) => {
+  const t = await setup();
+  t.reply(() => ({ structured: metAll }));
+  t.f.deps.checkpointer = {
+    ...localCheckpointer(t.f.store),
+    checkpoint(runId, label) {
+      if (label !== "acceptance-output") return;
+      const state = t.state();
+      if (!state) throw new Error("missing state");
+      state.coveringTestRuns = ["passes", "also passes"].map((name) => ({
+        file: "x.test.ts",
+        name,
+        verifiedSha: t.sha,
+        stageId: 0,
+        round: state.round,
+        reason,
+        ...(unavailable === undefined ? {} : { unavailable }),
+      }));
+      t.f.store.setRunState(runId, state);
+      throw new SimulatedTermination("saved legacy covering refusals");
+    },
+  };
+  expect(await t.execute()).toBe("running");
+  t.f.deps.checkpointer = undefined;
+  expect(await t.execute()).toBe("needs_human");
+  expect(t.targeted).toHaveLength(0);
+  expect(t.calls()).toBe(1);
+  expect(t.outcome()).toMatchObject({
+    passed: false,
+    units: [
+      { verdict, citations: [], refusals: [`x.test.ts › passes: ${reason}`] },
+      { verdict, citations: [], refusals: [`x.test.ts › also passes: ${reason}`] },
+      { verdict: "met" },
+    ],
+  });
+  expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(
+    `${verdict} (x.test.ts › passes: ${reason})`,
+  );
+});
+
+test("failed evidence wins over a missing report in another file", async () => {
+  const t = await setup({
+    junit: "missing",
+    files: {
+      "y.test.ts": 'import { test, expect } from "bun:test"; test("fails", () => expect(1).toBe(2));',
+    },
+  });
+  const value = AcceptanceSchema.parse(metAll);
+  const first = value.items[0];
+  if (!first) throw new Error("missing unit");
+  first.tests.push({ file: "y.test.ts", name: "fails" });
+  t.reply(() => ({ structured: value }));
+  expect(await t.execute()).toBe("needs_human");
+  expect(t.outcome()).toMatchObject({
+    passed: false,
+    units: [
+      {
+        verdict: "unmet",
+        citations: [],
+        refusals: ["x.test.ts › passes: JUnit report missing", "y.test.ts › fails: test failed"],
+      },
+      { verdict: "not_assessed" },
+      { verdict: "met" },
+    ],
+  });
+});

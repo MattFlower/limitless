@@ -117,6 +117,7 @@ const WireRequest = z.object({
         run: z.string(),
         timeoutSec: z.number().positive().optional(),
         coveringTest: z.object({ file: z.string(), name: z.string() }).strict().optional(),
+        coveringTests: z.array(z.object({ file: z.string(), name: z.string() }).strict()).optional(),
       }),
     ),
     source: z.enum([".limitless.toml", "detected", "none"]),
