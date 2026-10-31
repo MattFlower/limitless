@@ -29,7 +29,7 @@ function fixture(entries: string[] = [], credentials: string[] = [], limits = {}
   };
   registry.replacePolicy(entries.map((value, entry) => ({ value, entry })));
   for (const credential of credentials) registry.addCredential(credential);
-  const policy = preparePrivacyPolicy(capturePrivacySnapshot(registry), { limits });
+  const policy = preparePrivacyPolicy(capturePrivacySnapshot(registry));
   const options = { registry, limits };
   const protect = (
     text: string,
@@ -197,6 +197,8 @@ test("limits refuse wholly with fixed reasons at equality and cap plus one", () 
     ["inputBytes", "é😀", 6, "input-length"],
     ["outputUnits", "é😀", 3, "output-length"],
     ["outputBytes", "é😀", 6, "output-length"],
+    ["formLength", "abcd", 4, "form-length"],
+    ["formsTotal", "abcd", 32, "forms-total"],
   ] as const) {
     expect(consume(fixture([], [], { [key]: cap }).protect(text)).withheld).toBe(false);
     refused(fixture([], [], { [key]: cap - 1 }).protect(text), code);
@@ -222,4 +224,30 @@ test("limits refuse wholly with fixed reasons at equality and cap plus one", () 
   refused(concat([f.protect("a"), f.protect("b")], { separator: String.fromCharCode(0xd800) }), "ill-formed");
   const cut: BoundaryCut = { limit: 0, unit: "U", marker: String.fromCharCode(0xd800) };
   expect(refused(f.protect("clean", { cut }), "ill-formed").truncated).toBe(true);
+});
+test("injected decoder and cache limits persist through trusted operations", () => {
+  for (const [limits, reason] of [
+    [{ formLength: 3 }, "form-length"],
+    [{ formsTotal: 24 }, "forms-total"],
+  ] as const) {
+    const f = fixture([], [], limits);
+    refused(concat([f.protect("ab"), f.protect("cd")]), reason);
+    const result = refused(f.protect("ab", { cut: { limit: 1, unit: "U", marker: "bcd" } }), reason);
+    expect(result.truncated).toBe(true);
+  }
+  const registry = createPrivacyRegistry();
+  registry.replacePolicy([{ value: host, entry: 1 }]);
+  for (const key of ["memoEntries", "memoUnits"] as const) {
+    const counters = { registrations: 0, inputs: 0, memoAdmissions: 0, memoPeakEntries: 0, memoPeakUnits: 0 };
+    const policy = preparePrivacyPolicy(capturePrivacySnapshot(registry), { counters });
+    const text = Buffer.from("ordinary clean field").toString("base64");
+    const value = protectText(
+      { text, policy, provenance: { kind: "complete" } },
+      { registry, limits: { [key]: 0 } },
+    );
+    expect(consume(concat([cutPrefix(value, text.length), cutTail(value, text.length)]))).toMatchObject({
+      withheld: false,
+    });
+    expect(counters.memoAdmissions).toBe(0);
+  }
 });

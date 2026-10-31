@@ -253,17 +253,18 @@ const withheld = (state: Evidence, reason: Reason): Evidence => ({
 function context(policy: Prepared, options: Options): Evidence {
   const registry = options.registry ?? privacyRegistry;
   const generation = "refused" in policy ? currentPrivacyGeneration(registry) : policy.generation;
+  const limits = { ...privacyLimits, ...("refused" in policy ? {} : policy.limits), ...options.limits };
   return {
     text: "",
     truncated: false,
     checkedComplete: false,
     withheld: false,
     policyDigest: `privacy/${generation.policy}/${generation.credentials}/${generation.checker}`,
-    policy,
+    policy: "refused" in policy ? policy : { ...policy, limits },
     registry,
     generation,
     beforeIssue: options.beforeIssue,
-    limits: { ...privacyLimits, ...("refused" in policy ? {} : policy.limits), ...options.limits },
+    limits,
   };
 }
 function current(state: Evidence): boolean {
