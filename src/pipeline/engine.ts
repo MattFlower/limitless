@@ -69,6 +69,7 @@ import {
   githubWait,
   headSha,
   isAncestor,
+  iterationBoundary,
   mergeBase,
   mergePullRequest,
   type PullRequestIdentity,
@@ -76,6 +77,7 @@ import {
   pushExistingBranch,
   readFileAt,
   remoteBranchSha,
+  removeIterationRefs,
   removeWorktree,
   resetTo,
   verifyWorkerCommit,
@@ -223,7 +225,7 @@ export async function executeRun(
   }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
   const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
-  return processScope.run(
+  const status = await processScope.run(
     {
       signal: ctx.signal,
       killGraceMs: 100,
@@ -240,6 +242,11 @@ export async function executeRun(
         ),
       ),
   );
+  if (TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued"))
+    await removeIterationRefs(deps.cfg.paths, repo, runId).catch((error: unknown) =>
+      ctx.log(`Iteration cleanup deferred to GC: ${(error as Error).message}`, "warn"),
+    );
+  return status;
 }
 
 const REVIEW_RESOLUTION_BLOCK = "Review-base resolution requires a compatible engine to implement findings";
@@ -855,6 +862,20 @@ function commitIdentity(ctx: RunContext) {
   return repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet ? "operator" : "factory";
 }
 
+/**
+ * The newest commit the factory may not replace: published, reviewed or external history, or
+ * commits an implementer made itself. Factory iteration commits above it are replaceable.
+ */
+async function iterationPublicationBase(ctx: RunContext): Promise<string> {
+  const base =
+    ctx.state.publishedSha ??
+    reviewRound(ctx)?.reviewedSha ??
+    ctx.state.verification?.headSha ??
+    (ctx.run.baseSha as string);
+  const floor = ctx.state.iterationBase;
+  return floor && (await isAncestor(ctx.state.worktreePath as string, base, floor)) ? floor : base;
+}
+
 function draftTitle(ctx: RunContext) {
   return repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet
     ? ctx.run.title
@@ -1326,6 +1347,10 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
         ctx.state.publishedSha = parentSha;
         await ctx.save();
       }
+      // The worker protocol preserves parentSha. Keep unpublished repairs local so they can
+      // replace that parent before verification rather than publish its superseded history.
+      if ((await iterationBoundary(cwd, await iterationPublicationBase(ctx), ctx.signal)) !== parentSha)
+        return null;
       const identity = async (variable: string) => {
         const result = await worktreeGit(["git", "var", variable], { cwd, allowFail: true });
         return result.exitCode === 0 ? /^(.+) <([^<>]+)> -?\d+ [+-]\d{4}\n?$/.exec(result.stdout) : null;
@@ -1496,6 +1521,11 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             ? null
             : `${result.status}${result.error ? `: ${result.error}` : ""}`.slice(0, 500);
         if (result.status !== "ok") ctx.log(`Implementer ended with ${result.status}`, "warn");
+        // An implementer that committed itself keeps that history; only factory commits are replaced.
+        const at = await headSha(cwd);
+        const expected =
+          ctx.state.workerCommitRound === round ? ctx.state.publishedSha : (ctx.run.headSha ?? baseSha);
+        if (!merge && at !== expected) ctx.state.iterationBase = at;
         ctx.state.implementationReadyRound = round;
         delete ctx.state.agentJob;
         await ctx.save("implementation-ready");
@@ -1515,7 +1545,10 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
       const sha =
         merge && previousHead
           ? await completeMerge(cwd, previousHead, baseSha, mergeMessage(ctx, baseSha), commitIdentity(ctx))
-          : await commitAll(cwd, commitMessage(ctx, round));
+          : await commitAll(cwd, commitMessage(ctx, round), {
+              boundary: await iterationPublicationBase(ctx),
+              runId: ctx.run.id,
+            });
       ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
       ctx.state.implementedRound = round;
       await ctx.save("implementation-committed");
@@ -3386,7 +3419,6 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
     ctx.state.publishingSha = head;
     await ctx.save("delivery-publishing");
     if (
-      !ctx.state.githubWait ||
       ctx.state.publishedSha !== head ||
       (await remoteBranchSha(ctx.repo, cwd, ctx.run.branch as string, ctx.signal, budget)) !== head
     )
