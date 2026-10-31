@@ -31,6 +31,7 @@ try {
     author: { login: "maintainer" },
     editor: null,
     lastEditedAt: null,
+    userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
     parent: null,
     createdAt: new Date(1).toISOString(),
     updatedAt: new Date(1).toISOString(),
