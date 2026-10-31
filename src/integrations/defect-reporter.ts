@@ -14,10 +14,10 @@ export type DefectGitHub = {
   label(repo: string, name: "defect", token: string): Promise<boolean>;
   post(repo: string, issue: number | null, input: Post, token: string): Promise<unknown>;
 };
+type Bindings = SQLQueryBindings[];
 type Context = { coordinator: () => { enabled: boolean } | undefined; now: () => number; dailyCap?: number };
 export type DefectReporterDeps = d.DefectPreparationDeps & Context & { github: DefectGitHub };
 type App = Extract<GitHubIdentity, { kind: "app" }>;
-type Bindings = SQLQueryBindings[];
 type Text = "source_ref" | "source_key" | "destination" | "signature" | "occurrence" | "title" | "body";
 type Pending = Record<Text | "app_login" | "state" | "scan", string> &
   Record<"comment_body" | "diagnostic" | "reservation_day", string | null> &
@@ -63,6 +63,7 @@ export function createDefectReporter(store: Store, deps: DefectReporterDeps) {
   const bind = (row: Pending, column: "barrier_occurrence" | "issue_number", value: string | number) =>
     run(`UPDATE defect_signatures SET ${column}=? ${where}`, value, row.destination, row.signature);
   const update = (row: Pending, set: Partial<DefectOutboxRow>) => {
+    if (!enabled()) throw exhausted;
     Object.assign(row, set);
     const keys = Object.keys(set) as (keyof Pending)[];
     const sql = `UPDATE defect_outbox SET ${keys.map((k) => `${k}=?`)} WHERE source_ref=? AND source_key=?`;
@@ -98,7 +99,7 @@ export function createDefectReporter(store: Store, deps: DefectReporterDeps) {
         return read(source, key);
       });
   }
-  let [left, cursor] = [0, 0];
+  let [left, cursor, flight] = [0, 0, undefined as Promise<void> | undefined];
   const call = <T>(request: () => Promise<T>, reserve = 0) => {
     if (!enabled() || left <= reserve) throw exhausted;
     left--;
@@ -165,26 +166,26 @@ export function createDefectReporter(store: Store, deps: DefectReporterDeps) {
     if (found.edited || found.own || lost || (!target && found.sig?.barrier_occurrence))
       return update(row, { state: "held", diagnostic: "Defect issue provenance unavailable" });
     const kind: Kind = target ? "comment" : "issue";
-    const reader = await app(row);
-    const day = new Date(deps.now()).toISOString().slice(0, 10);
-    const full = () => (get<{ n: number }>(used, day)?.n ?? cap) >= cap;
+    let id = await app(row);
+    const today = () => new Date(deps.now()).toISOString().slice(0, 10);
+    const full = (day = today()) => (get<{ n: number }>(used, day)?.n ?? cap) >= cap;
     if (!target && full()) throw new Deferred("Defect daily cap reached");
     // Matches saved by earlier passes are inspected again: their provenance must still be current.
     for (const n of new Set([target, bound])) {
-      const raw = n ? item.parse(await call(() => gh.issue(row.destination, n, reader.token), 1)) : undefined;
-      if (raw && (raw.number !== n || inspect(row, raw, "issue", reader).status !== "match"))
+      const raw = n ? item.parse(await call(() => gh.issue(row.destination, n, id.token), 1)) : undefined;
+      if (raw && (raw.number !== n || inspect(row, raw, "issue", id).status !== "match"))
         return update(row, { state: "held", diagnostic: "Defect issue provenance unavailable" });
     }
-    const label = () => gh.label(row.destination, "defect", reader.token);
+    const label = () => gh.label(row.destination, "defect", id.token);
     if (!target && !(await call(label, 1).catch(() => false))) throw new Deferred("Defect label missing");
     const src = deps.repos.find((repo) => repo.id === row.source_ref) ?? row.source_ref;
-    // Each check repeats after the other's await, so a change during either await is still seen.
-    const policies = async () => [await deps.policy(src), await deps.policy(row.destination)];
-    const [early, id] = [await policies(), await app(row)];
-    const pols = [...early, ...(await policies())];
-    // Final synchronous checks: nothing below awaits before the request is dispatched.
-    if (pols.some((p) => p?.discreet === true)) return update(row, { state: "suppressed", ...cleared });
-    if (pols.some((p) => p?.discreet !== false)) throw new Deferred("Defect policy unavailable");
+    // Two whole rounds, identity last, then only synchronous checks until the request is dispatched.
+    for (let round = 0; round < 2; round++) {
+      const pols = [await deps.policy(row.destination), await deps.policy(src)];
+      id = await app(row);
+      if (pols.some((p) => p?.discreet === true)) return update(row, { state: "suppressed", ...cleared });
+      if (pols.some((p) => p?.discreet !== false)) throw new Deferred("Defect policy unavailable");
+    }
     const body = target ? row.body.replace(":v1:issue:", ":v1:comment:") : row.body;
     if (d.guardDefectPublication({ title: row.title, body }, deps).status !== "safe")
       return update(row, { state: "blocked", diagnostic: "Defect publication blocked" });
@@ -193,14 +194,14 @@ export function createDefectReporter(store: Store, deps: DefectReporterDeps) {
       const stale = JSON.stringify(binding(row)) !== JSON.stringify(found.sig);
       if (stale || read(row.source_ref, row.source_key)?.state !== row.state) return false;
       if (!enabled() || left < 1) throw exhausted;
-      if (!target && full()) throw new Deferred("Defect daily cap reached");
+      const day = target ? null : today();
+      if (day && full(day)) throw new Deferred("Defect daily cap reached");
       bind(row, target ? "issue_number" : "barrier_occurrence", target ?? row.occurrence);
       update(row, { operation: kind, target_issue: target ?? null, comment_body: target ? body : null });
-      update(row, { state: "sending", diagnostic: null, reservation_day: target ? null : day, scan: FRESH });
-      return true;
+      update(row, { state: "sending", diagnostic: null, reservation_day: day, scan: FRESH });
+      return left-- > 0; // spends this POST's call budget
     });
     if (!ready) return;
-    left--;
     const input: Post = target ? { body } : { title: row.title, body, labels: ["defect"] };
     // An unknown outcome leaves the row `sending`, so recovery decides before any further POST.
     const response = await gh.post(row.destination, target ?? null, input, id.token).catch(() => undefined);
@@ -228,7 +229,6 @@ export function createDefectReporter(store: Store, deps: DefectReporterDeps) {
       if (!(await settle())) return;
     }
   }
-  let flight: Promise<void> | undefined;
   const land = () => (flight = undefined);
   const reconcile = () => (flight ??= pass().catch(swallow).finally(land));
   return { prepareSubmission, reconcile, read };

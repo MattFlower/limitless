@@ -703,3 +703,116 @@ test("a saved negative scan resumed after reopen still cannot create a second is
   expect(h.remote.postsTo(created)).toHaveLength(1);
   expect(h.row("b")).toMatchObject({ state: "delivered", target_issue: created });
 });
+
+test("a creation whose awaited checks cross UTC midnight reserves the new day", async () => {
+  const h = harness();
+  h.deps.dailyCap = 1;
+  h.reopen();
+  h.clock.now = Date.UTC(2026, 9, 31, 23, 59, 59);
+  await h.submit("a", finding("a"));
+  h.remote.onLabel = () => {
+    h.clock.now = Date.UTC(2026, 10, 1, 0, 0, 1);
+  };
+  await h.reporter.reconcile();
+  h.remote.onLabel = undefined;
+  expect(h.row("a")).toMatchObject({ state: "delivered", reservation_day: "2026-11-01" });
+  await h.submit("b", finding("b"));
+  await h.settle();
+  expect(h.remote.postsTo(null)).toHaveLength(1);
+  expect(h.row("b")).toMatchObject({ state: "prepared", diagnostic: "Defect daily cap reached" });
+});
+
+async function readyToPost(h: ReturnType<typeof harness>, kind: "issue" | "comment") {
+  if (kind === "comment") {
+    await h.submit("first");
+    await h.reporter.reconcile();
+    expect(h.remote.posts).toHaveLength(1);
+  }
+  await h.submit("event");
+  return h.remote.posts.length;
+}
+
+test.each(
+  ["issue", "comment"].flatMap((kind) => [1, 2, 3, 4].map((call) => [kind as "issue" | "comment", call])),
+)("a %s is not posted when identity becomes owner during policy read %i", async (kind, call) => {
+  const h = harness();
+  const before = await readyToPost(h, kind);
+  let calls = 0;
+  h.deps.policy = async () => {
+    await Promise.resolve();
+    if (++calls === call) h.deps.identity = async () => ({ kind: "owner" });
+    return { discreet: false };
+  };
+  await h.reporter.reconcile();
+  expect(h.remote.posts).toHaveLength(before);
+  expect(h.row("event")).toMatchObject({ state: "prepared", diagnostic: "Defect App identity unavailable" });
+});
+
+test.each([
+  ["issue", "source", "destination", 1],
+  ["issue", "source", "destination", 2],
+  ["issue", "destination", "source", 1],
+  ["comment", "source", "destination", 1],
+  ["comment", "source", "destination", 2],
+  ["comment", "destination", "source", 1],
+] as const)(
+  "a %s is suppressed when the %s becomes discreet during %s policy read %i",
+  async (kind, changed, during, nth) => {
+    const h = harness();
+    const before = await readyToPost(h, kind);
+    const discreet = { source: false, destination: false };
+    const sideOf = (target: unknown) => (typeof target === "string" ? "destination" : "source");
+    let seen = 0;
+    h.deps.policy = async (target) => {
+      const side = sideOf(target);
+      const value = discreet[side];
+      await Promise.resolve();
+      // One-shot change during the nth read of `during`; a later read must still observe it.
+      if (side === during && ++seen === nth) discreet[changed] = true;
+      return { discreet: value };
+    };
+    await h.reporter.reconcile();
+    expect(h.remote.posts).toHaveLength(before);
+    expect(h.row("event")).toMatchObject({
+      state: "suppressed",
+      title: null,
+      body: null,
+      comment_body: null,
+    });
+  },
+);
+
+test("a source made discreet during every destination read is suppressed", async () => {
+  const h = harness();
+  await h.submit("event");
+  let source = false;
+  h.deps.policy = async (target) => {
+    const value = typeof target === "string" ? false : source;
+    await Promise.resolve();
+    if (typeof target === "string") source = true;
+    return { discreet: value };
+  };
+  await h.reporter.reconcile();
+  expect(h.remote.posts).toHaveLength(0);
+  expect(h.row("event")?.state).toBe("suppressed");
+});
+
+test("disabling the coordinator during recovery mutates no row", async () => {
+  const h = harness();
+  const row = await h.submit("event");
+  h.remote.mode = { apply: false, labels: true, respond: "throw" };
+  await h.reporter.reconcile();
+  const uncertain = h.row("event");
+  expect(uncertain?.state).toBe("uncertain");
+  h.remote.issues.push(h.remote.object(row?.body ?? "", { labels: [{ name: "defect" }] }));
+  h.remote.listGate = async () => {
+    h.clock.enabled = false;
+  };
+  await h.reporter.reconcile();
+  expect(h.row("event")).toEqual(uncertain);
+  h.remote.listGate = undefined;
+  h.clock.enabled = true;
+  await h.reporter.reconcile();
+  expect(h.row("event")).toMatchObject({ state: "delivered" });
+  expect(h.remote.posts).toHaveLength(1);
+});
