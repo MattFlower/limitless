@@ -70,7 +70,9 @@ test("acceptance check resolves fresh trusted intent at the default branch head 
     expect(await response.json()).toEqual({
       ok: true,
       sha,
-      units: [{ id: "U1", text: "The feature works.", class: "behaviour", sources: ['#1 "Goal"'] }],
+      units: [
+        { id: "U1", item: "U1", text: "The feature works.", class: "behaviour", sources: ['#1 "Goal"'] },
+      ],
     });
     expect(f.factory.store.listRuns()).toEqual([]);
     expect(f.reader).not.toHaveBeenCalled();

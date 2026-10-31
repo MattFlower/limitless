@@ -13,6 +13,7 @@ import {
   readFileAt,
 } from "../git/repos.ts";
 import { type IssueText, issueTextRefusal } from "../integrations/issue-trust.ts";
+import { fileFollowUps } from "./acceptance-follow-ups.ts";
 import { CancelledError, NeedsHumanError, type RunContext } from "./context.ts";
 import {
   acceptanceCoveringPolicy,
@@ -38,6 +39,8 @@ export interface AcceptanceSnapshot {
 }
 export interface AcceptanceUnit {
   id: string;
+  /** Top-level unit id; absent in manifests persisted by older releases. */
+  item?: string;
   text: string;
   class: "behaviour" | "docs";
   sources: string[];
@@ -59,6 +62,7 @@ export interface AcceptanceState {
     }[];
     summary: string;
     passed: boolean;
+    followUps?: { pass?: number; issues: number[]; limit?: boolean };
   };
 }
 
@@ -119,7 +123,7 @@ function scanSection(md: string, heading: string, where: string, intent = false)
   if (fence >= 0)
     throw new Error(`unresolvable source: line ${fence + 1} of ${where}: fence before the section`);
   const level = atx(lines[start] ?? "")?.level ?? 0;
-  const out: { text: string; reference?: RegExpExecArray }[] = [];
+  const out: { text: string; reference?: RegExpExecArray; child?: boolean }[] = [];
   let previous: "item" | "para" | "other" = "other";
   let ancestors: string[] = [];
   for (let i = start + 1; i < lines.length; i++) {
@@ -145,7 +149,7 @@ function scanSection(md: string, heading: string, where: string, intent = false)
         if (previous !== "item" || indent / 2 > ancestors.length) refuse("orphan sub-item");
         ancestors.length = indent / 2;
         ancestors.push(child[1] ?? "");
-        out.push({ text: ancestors.join(" — ") });
+        out.push({ text: ancestors.join(" — "), child: true });
       }
       // In the ticket only references produce units, so a requirement written as a list item would vanish.
       else if (item && intent) refuse("list item; only section references produce units");
@@ -181,8 +185,10 @@ export function resolveIntent({ ticket, parent }: AcceptanceSnapshot): Acceptanc
     const evidence = docs ? "docs" : "behaviour";
     const section = scanSection(parent.body, heading, `#${number}`);
     if (!section) throw new Error(`section "${heading}" does not name exactly one heading of #${number}`);
+    let item = "";
     for (const unit of section) {
       const found = written.get(unit.text);
+      if (!unit.child) item = found?.id ?? `U${units.length + 1}`;
       if (found) {
         if (!found.sources.includes(source)) found.sources.push(source);
         // Behaviour dominates, so referencing a section with (docs) first can't weaken its units.
@@ -191,6 +197,7 @@ export function resolveIntent({ ticket, parent }: AcceptanceSnapshot): Acceptanc
       }
       const added: AcceptanceUnit = {
         id: `U${units.length + 1}`,
+        item,
         text: norm(unit.text),
         class: evidence,
         sources: [source],
@@ -283,8 +290,23 @@ export async function runAcceptance(ctx: RunContext): Promise<void> {
     saveReport(ctx, buildReportArtifacts(ctx, acceptance.outcome.passed));
     return { summary: acceptance.outcome.summary, value: acceptance.outcome };
   });
-  if (!outcome.passed) throw new NeedsHumanError(`Acceptance: ${outcome.summary}`);
+  if (outcome.passed) return;
+  const filed = await fileFollowUps(ctx, acceptance);
+  if (filed) {
+    outcome.followUps = filed;
+    await ctx.save("acceptance-follow-ups");
+    ctx.artifact("acceptance.json", "acceptance", JSON.stringify(outcome, null, 2));
+    saveReport(ctx, buildReportArtifacts(ctx, false));
+  }
+  throw new NeedsHumanError(`Acceptance: ${outcome.summary}${followUpSummary(filed)}`);
 }
+
+const followUpSummary = (filed: NonNullable<AcceptanceState["outcome"]>["followUps"]) =>
+  !filed
+    ? ""
+    : filed.limit
+      ? "; pass limit reached, so the epic was labelled limitless:needs-you"
+      : `; pass ${filed.pass} follow-ups: ${filed.issues.map((n) => `#${n}`).join(", ")}`;
 
 async function assess(
   ctx: RunContext,
