@@ -118,6 +118,28 @@ export function parseRecord<T>(schema: z.ZodType<T>, value: unknown): T {
   if (!result.success) throw new RunTransferError("invalid");
   return result.data;
 }
+// Source-only classification: portable parsers never strip resources or unknown members.
+export function transferSource<T>(schema: z.ZodType<T>, value: unknown, excluded: string[] = []): T {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new RunTransferError("invalid");
+  const result = schema.safeParse(
+    Object.fromEntries(Object.entries(value).filter(([key]) => !excluded.includes(key))),
+  );
+  if (!result.success)
+    throw new RunTransferError(
+      result.error.issues.some((issue) => issue.code === "unrecognized_keys") ? "unsupported" : "invalid",
+    );
+  const defined = (v: unknown): unknown =>
+    Array.isArray(v)
+      ? v.map(defined)
+      : v && typeof v === "object"
+        ? Object.fromEntries(
+            Object.entries(v)
+              .filter(([, item]) => item !== undefined)
+              .map(([k, item]) => [k, defined(item)]),
+          )
+        : v;
+  return parseRecord(schema, defined(result.data));
+}
 export const decodeTransferRun = boundary(
   (value: unknown, repo: Repo, code: "invalid" | "incomplete" = "invalid") => {
     preflight({ run: value });
