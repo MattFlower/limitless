@@ -249,6 +249,7 @@ export function localExecutor(hooks: GateHooks = {}): GateExecutor {
           priority: req.priority,
           env: req.env,
           onLocalSetup: slotHooks.onLocalSetup,
+          onCheckStart: slotHooks.onCheckStart,
           onResult(r, phase) {
             results.push({ type: "check", phase, result: r });
             notify();
@@ -311,6 +312,8 @@ export async function executeGate(
   )
     await blockInterrupted(stored, executor, () => persist(stored));
   const handle = stored ?? (await executor.start(req, signal));
+  // A dispatched remote command may already be running before attach observes it.
+  if (handle.kind !== "local") hooks.onCheckStart?.();
   if (!stored) await persist(handle);
   let execution: Execution<GateRun>;
   try {
