@@ -73,10 +73,28 @@ describe("pipeline (fake agents, real git + gates)", () => {
     mkdirSync(f.cfg.paths.configDir, { recursive: true });
     writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), secret);
     registerGithub(f, bare);
+    const originalPush = repos.pushBranch;
+    const publish = spyOn(repos, "pushBranch").mockImplementation(async (...args) => {
+      const cwd = args[1];
+      const active = f.store.listRuns({ status: ["running"] })[0];
+      if (!active) throw new Error("Missing publishing run");
+      expect((await repos.iterationRefs(cwd, active.id)).map((ref) => ref.sha)).toContain(superseded);
+      await checkPrivateRange(cwd, `${active.baseSha}..${await repos.headSha(cwd)}`, [
+        { value: secret, entry: 1 },
+      ]);
+      await expect(
+        checkPrivateRange(cwd, `${active.baseSha}..${superseded}`, [{ value: secret, entry: 1 }]),
+      ).rejects.toThrow("private string");
+      return originalPush(...args);
+    });
     const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
-      retained ? "needs_human" : "succeeded",
-    );
+    try {
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe(
+        retained ? "needs_human" : "succeeded",
+      );
+    } finally {
+      publish.mockRestore();
+    }
     const done = f.store.getRun(run.id);
     const state = f.store.getRunState<RunState>(run.id);
     if (!done?.headSha || !state?.worktreePath) throw new Error("Missing iteration state");
@@ -102,6 +120,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         "goodbye\n",
       );
     }
+    expect((await sh(["git", "for-each-ref", "refs/limitless/"], { cwd: bare })).stdout).toBe("");
     for (const object of [superseded, blob]) {
       expect(object).toMatch(/^[a-f0-9]{40,64}$/);
       expect((await sh(["git", "cat-file", "-e", object], { cwd: bare, allowFail: true })).exitCode).not.toBe(

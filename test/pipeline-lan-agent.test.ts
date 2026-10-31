@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Stage, StageName } from "../src/core/types.ts";
@@ -40,6 +40,7 @@ import {
   expectReaderDependency,
   readerDependencyFixture,
 } from "./reader-dependencies-support.ts";
+import { findingEvidence } from "./review-support.ts";
 import { workerStartupFailures } from "./worker-startup-support.ts";
 
 let home = "",
@@ -1476,6 +1477,103 @@ async function reviewWorker(f: Factory, handler: (s: AgentSpec) => Promise<FakeR
     await listener.stop();
   };
 }
+
+test("second LAN review resolves its previous SHA from a private bundle after coordinator and worker GC", async () => {
+  const bare = await githubFixture();
+  let previous = "";
+  let unrelated = "";
+  let reviews = 0;
+  let implementations = 0;
+  let f: Factory;
+  ({ f } = boot({
+    implementReply: async () => ({ files: { "farewell.txt": `goodbye ${++implementations}\n` } }),
+    executor: {
+      kind: "test",
+      async run(call, local) {
+        if (call.role === "implement") return local();
+        if (previous) {
+          const repo = f.store.getRepo(f.store.getRun(call.runId)?.repoId ?? "");
+          if (!repo) throw new Error("Missing repository");
+          const cwd = repos.cachePath(f.cfg.paths, repo);
+          await sh(["git", "reflog", "expire", "--expire=now", "--all"], { cwd });
+          await sh(["git", "gc", "--prune=now"], { cwd });
+        }
+        return lanAgentExecutor(f.workers, f.cfg).run(call, local);
+      },
+    },
+  }));
+  f.cfg.workers.agents = ["review"];
+  registerGithub(f, bare);
+  const checkouts: string[] = [];
+  const stop = await reviewWorker(f, async (s) => {
+    checkouts.push(s.cwd);
+    if (++reviews === 1) {
+      previous = await headSha(s.cwd);
+      const job = jobs(f)[0];
+      const repo = f.store.getRepo(f.store.getRun(job?.run_id ?? "")?.repoId ?? "");
+      if (!repo) throw new Error("Missing review repo");
+      const cwd = repos.cachePath(f.cfg.paths, repo);
+      const tree = (await sh(["git", "rev-parse", `${previous}^{tree}`], { cwd })).stdout.trim();
+      unrelated = (
+        await worktreeGit(["git", "commit-tree", tree, "-m", "unrelated run"], { cwd })
+      ).stdout.trim();
+      await worktreeGit(
+        ["git", "update-ref", `refs/limitless/iterations/unrelated/${unrelated}`, unrelated],
+        { cwd },
+      );
+      return {
+        structured: {
+          ...approve,
+          verdict: "request_changes",
+          findings: [
+            {
+              severity: "blocker",
+              security: false,
+              ...findingEvidence,
+              file: "farewell.txt",
+              line: 1,
+              title: "Wrong text",
+              detail: "Use the second farewell",
+              suggestion: "Change the farewell",
+            },
+          ],
+        },
+      };
+    }
+    expect(s.prompt).toContain(`git diff ${previous}..`);
+    // Each agent job has an independent cache. Its private refs must survive GC too.
+    const cache = join(dirname(s.cwd), "repo.git");
+    await sh(["git", "reflog", "expire", "--expire=now", "--all"], { cwd: cache });
+    await sh(["git", "gc", "--prune=now"], { cwd: cache });
+    const diff = await sh(["git", "diff", `${previous}..HEAD`], { cwd: s.cwd });
+    expect(diff.exitCode).toBe(0);
+    expect(diff.stdout).toContain("-goodbye 1");
+    expect(diff.stdout).toContain("+goodbye 2");
+    expect(
+      (await sh(["git", "cat-file", "-e", unrelated], { cwd: s.cwd, allowFail: true })).exitCode,
+    ).not.toBe(0);
+    expect(
+      (await sh(["git", "for-each-ref", "refs/limitless/iterations/unrelated/"], { cwd: s.cwd })).stdout,
+    ).toBe("");
+    return { structured: approve };
+  });
+  try {
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(reviews).toBe(2);
+    expect(new Set(checkouts).size).toBe(2);
+    expect(jobs(f)).toHaveLength(2);
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("Missing final repo");
+    const cache = repos.cachePath(f.cfg.paths, repo);
+    await wait(() => repos.iterationRefs(cache, run.id).then((refs) => refs.length === 0), {
+      timeoutMs: 10_000,
+    });
+    expect(await repos.iterationRefs(cache, "unrelated")).toHaveLength(1);
+  } finally {
+    await stop();
+  }
+}, 60_000);
 
 test.each(["worker only", "local fallback"] as const)(
   "quick LAN review prepares dependencies on the executing host: %s",

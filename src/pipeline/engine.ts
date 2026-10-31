@@ -77,6 +77,7 @@ import {
   pushExistingBranch,
   readFileAt,
   remoteBranchSha,
+  removeIterationRefs,
   removeWorktree,
   resetTo,
   verifyWorkerCommit,
@@ -223,7 +224,7 @@ export async function executeRun(
   }
   // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
   const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
-  return processScope.run(
+  const status = await processScope.run(
     {
       signal: ctx.signal,
       killGraceMs: 100,
@@ -240,6 +241,11 @@ export async function executeRun(
         ),
       ),
   );
+  if (TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued"))
+    await removeIterationRefs(deps.cfg.paths, repo, runId).catch((error: unknown) =>
+      ctx.log(`Iteration cleanup deferred to GC: ${(error as Error).message}`, "warn"),
+    );
+  return status;
 }
 
 const REVIEW_RESOLUTION_BLOCK = "Review-base resolution requires a compatible engine to implement findings";
@@ -1519,6 +1525,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           ? await completeMerge(cwd, previousHead, baseSha, mergeMessage(ctx, baseSha), commitIdentity(ctx))
           : await commitAll(cwd, commitMessage(ctx, round), {
               boundary: await iterationPublicationBase(ctx),
+              runId: ctx.run.id,
             });
       ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { headSha: sha ?? (await headSha(cwd)) });
       ctx.state.implementedRound = round;

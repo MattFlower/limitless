@@ -661,11 +661,44 @@ export async function iterationBoundary(
   return (await worktreeGit(args, { cwd, signal })).stdout.trim() || boundary;
 }
 
+function iterationPrefix(runId: string): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error("Invalid iteration run id");
+  return `refs/limitless/iterations/${runId}/`;
+}
+
+export async function iterationRefs(cwd: string, runId: string) {
+  const result = await worktreeGit(
+    ["git", "for-each-ref", "--format=%(refname) %(objectname)", iterationPrefix(runId)],
+    { cwd },
+  );
+  return result.stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [ref = "", sha = ""] = line.split(" ");
+      return { ref, sha };
+    });
+}
+
+export async function removeIterationRefs(paths: Paths, repo: Repo, runId: string): Promise<void> {
+  const cwd = cachePath(paths, repo);
+  if (!existsSync(cwd)) return;
+  for (const { ref } of await iterationRefs(cwd, runId))
+    await worktreeGit(["git", "update-ref", "-d", ref], { cwd });
+}
+
 /** Commit everything. With a boundary, replace the iteration history above it with one commit. */
 export async function commitAll(
   cwd: string,
   message: string,
-  options: { env?: Record<string, string>; signal?: AbortSignal; verbatim?: boolean; boundary?: string } = {},
+  options: {
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+    verbatim?: boolean;
+    boundary?: string;
+    runId?: string;
+  } = {},
 ): Promise<string | null> {
   const opts = { cwd, env: options.env, signal: options.signal };
   if (worktreeGitScope.getStore() !== false) {
@@ -681,6 +714,12 @@ export async function commitAll(
     const parents = await worktreeGit(["git", "rev-list", "--parents", "-n", "1", head], opts);
     // An unchanged iteration, or a restart after the update below, reuses the existing commit.
     if (!status.stdout.trim() && parents.stdout.trim() === `${head} ${parent}`) return null;
+    if (!options.runId) throw new Error("Missing iteration run id");
+    const prefix = iterationPrefix(options.runId);
+    const history = await worktreeGit(["git", "rev-list", `${parent}..${head}`], opts);
+    // Keep every replaced SHA before HEAD moves, including legacy intermediate iterations.
+    for (const sha of history.stdout.trim().split("\n").filter(Boolean))
+      await worktreeGit(["git", "update-ref", `${prefix}${sha}`, sha], opts);
     const tree = (await worktreeGit(["git", "write-tree"], opts)).stdout.trim();
     const sha = (
       await worktreeGit(["git", "commit-tree", tree, "-p", parent, "-m", message], opts)

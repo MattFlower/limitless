@@ -4,13 +4,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { type Config, loadConfig } from "../src/config.ts";
-import type { RunStatus } from "../src/core/types.ts";
+import { type RunStatus, TERMINAL_STATUSES } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { collectGarbage, type GcResult } from "../src/gc.ts";
-import { recordWorktree } from "../src/git/command.ts";
-import { cachePath, createWorktree } from "../src/git/repos.ts";
+import { recordWorktree, worktreeGit } from "../src/git/command.ts";
+import {
+  cachePath,
+  commitAll,
+  createWorktree,
+  headSha,
+  iterationRefs,
+  removeWorktree,
+} from "../src/git/repos.ts";
 import { startHttp } from "../src/server/http.ts";
 import { sh } from "../src/util/proc.ts";
+import { testWaits } from "./wait-support.ts";
+
+const waits = testWaits();
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
@@ -66,6 +76,62 @@ async function worktree(id: string): Promise<string> {
 async function listed(): Promise<string> {
   return (await sh(["git", "worktree", "list", "--porcelain"], { cwd: cachePath(cfg.paths, repo) })).stdout;
 }
+
+test("cancelling a parked run cleans its iteration refs without waiting for GC", async () => {
+  const record = run("queued", 0, false);
+  const cwd = await worktree(record.id);
+  const base = await headSha(cwd);
+  writeFileSync(join(cwd, "iteration.txt"), "first\n");
+  await commitAll(cwd, "first");
+  writeFileSync(join(cwd, "iteration.txt"), "second\n");
+  await commitAll(cwd, "second", { boundary: base, runId: record.id });
+  store.setRunState(record.id, { parked: true });
+  const factory = new Factory(cfg, { store, providers: [] });
+  try {
+    expect(factory.cancelRun(record.id)).toBe(true);
+    expect(store.getRun(record.id)?.status).toBe("cancelled");
+    await waits.until(async () => (await iterationRefs(cwd, record.id)).length === 0, { timeoutMs: 10_000 });
+    expect(factory.cancelRun(record.id)).toBe(false);
+  } finally {
+    await factory.stop();
+  }
+});
+
+test("terminal iteration refs are removed without a worktree; parked and interrupted history survives", async () => {
+  const statuses: RunStatus[] = [...TERMINAL_STATUSES, "queued", "running", "waiting", "waiting_input"];
+  const records = [];
+  for (const status of statuses) {
+    const record = run(status, 0, status !== "failed");
+    const cwd = await worktree(record.id);
+    const base = await headSha(cwd);
+    writeFileSync(join(cwd, "iteration.txt"), "first\n");
+    await commitAll(cwd, "first");
+    const previous = await headSha(cwd);
+    writeFileSync(join(cwd, "iteration.txt"), "second\n");
+    await commitAll(cwd, "second", { boundary: base, runId: record.id });
+    if (status === "queued") store.setRunState(record.id, { parked: true });
+    await removeWorktree(cfg.paths, repo, cwd);
+    records.push({ ...record, status, previous });
+  }
+  const cache = cachePath(cfg.paths, repo);
+  await worktreeGit(
+    ["git", "update-ref", "refs/limitless/iterations/unrelated/keep", records[0]?.previous ?? ""],
+    { cwd: cache },
+  );
+  await collectGarbage(store, cfg, { now, dryRun: true });
+  for (const record of records) expect(await iterationRefs(cache, record.id)).toHaveLength(1);
+  for (let pass = 0; pass < 2; pass++) {
+    expect((await collectGarbage(store, cfg, { now })).errors).toEqual([]);
+    for (const record of records) {
+      expect(await iterationRefs(cache, record.id)).toHaveLength(
+        TERMINAL_STATUSES.includes(record.status) ? 0 : 1,
+      );
+      if (!TERMINAL_STATUSES.includes(record.status))
+        expect((await sh(["git", "cat-file", "-e", record.previous], { cwd: cache })).exitCode).toBe(0);
+    }
+    expect(await iterationRefs(cache, "unrelated")).toHaveLength(1);
+  }
+});
 
 test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal worktrees", async () => {
   const cases: [RunStatus, number, boolean][] = [

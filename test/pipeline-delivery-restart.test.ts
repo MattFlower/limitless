@@ -62,6 +62,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
     "between iterations",
     "commit checkpoint",
     "git mutation",
+    "retention",
+    "shutdown",
     "verified",
     "pushed",
     "legacy",
@@ -70,6 +72,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const bare = await githubFixture();
     let implementations = 0;
     let firstIteration = "";
+    const controller = new AbortController();
     const f = start(async (s) => {
       if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (roleOf(s) === "review") return { structured: approve };
@@ -79,24 +82,36 @@ describe("pipeline (fake agents, real git + gates)", () => {
     await f.stop();
     registerGithub(f, bare);
     f.deps.faults =
-      boundary === "verified"
-        ? { "stage:deliver:before": { action: "kill" } }
-        : boundary === "between iterations"
-          ? { "stage:implement:before": { action: "kill", when: (c) => c.round === 1 } }
-          : boundary === "pushed" || boundary === "git mutation"
-            ? undefined
-            : {
-                "store:save": {
-                  action: "kill",
-                  when: (c) => c.round === 1 && c.checkpoint === "implementation-committed",
-                },
-              };
+      boundary === "shutdown"
+        ? {
+            "stage:review:before": {
+              action: "continue",
+              onHit: () => controller.abort(new Error("shutdown")),
+            },
+          }
+        : boundary === "verified"
+          ? { "stage:deliver:before": { action: "kill" } }
+          : boundary === "between iterations"
+            ? { "stage:implement:before": { action: "kill", when: (c) => c.round === 1 } }
+            : boundary === "pushed" || boundary === "git mutation" || boundary === "retention"
+              ? undefined
+              : {
+                  "store:save": {
+                    action: "kill",
+                    when: (c) => c.round === 1 && c.checkpoint === "implementation-committed",
+                  },
+                };
     const realPush = repos.pushBranch;
     const realGit = gitCommand.worktreeGit;
     let interrupted = false;
     const mutation = spyOn(gitCommand, "worktreeGit").mockImplementation(async (args, ...rest) => {
       const result = await realGit(args, ...rest);
-      if (boundary === "git mutation" && !interrupted && args[1] === "update-ref" && args[2] === "HEAD") {
+      if (
+        !interrupted &&
+        args[1] === "update-ref" &&
+        ((boundary === "git mutation" && args[2] === "HEAD") ||
+          (boundary === "retention" && args[2]?.startsWith("refs/limitless/iterations/")))
+      ) {
         interrupted = true;
         throw new SimulatedTermination("Git ref updated before run checkpoint");
       }
@@ -105,6 +120,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
     let pushes = 0;
     const push = spyOn(repos, "pushBranch").mockImplementation(async (...args) => {
       pushes++;
+      expect(
+        (
+          await repos.iterationRefs(args[1], f.store.listRuns({ status: ["running"] })[0]?.id ?? "missing")
+        ).map((ref) => ref.sha),
+      ).toContain(firstIteration);
+      expect((await sh(["git", "diff", `${firstIteration}..HEAD`], { cwd: args[1] })).stdout).toContain(
+        "+goodbye",
+      );
       await realPush(...args);
       if (boundary === "pushed" && pushes === 1)
         throw new SimulatedTermination("push completed before acknowledgement");
@@ -112,10 +135,21 @@ describe("pipeline (fake agents, real git + gates)", () => {
     let reopened: Store | undefined;
     try {
       const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-      expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
+      expect(await executeRun(f.deps, run.id, controller.signal)).toBe(
+        boundary === "shutdown" ? "queued" : "running",
+      );
       const state = f.store.getRunState<RunState>(run.id);
       if (!state?.worktreePath) throw new Error("Missing interrupted iteration");
       const cwd = state.worktreePath;
+      if (["retention", "git mutation", "shutdown"].includes(boundary)) {
+        expect((await repos.iterationRefs(cwd, run.id)).map((ref) => ref.sha)).toContain(firstIteration);
+        const repo = f.store.getRepo(run.repoId);
+        if (!repo) throw new Error("Missing restart repository");
+        const cache = repos.cachePath(f.cfg.paths, repo);
+        await sh(["git", "reflog", "expire", "--expire=now", "--all"], { cwd: cache });
+        await sh(["git", "gc", "--prune=now"], { cwd: cache });
+        expect((await sh(["git", "cat-file", "-e", firstIteration], { cwd: cache })).exitCode).toBe(0);
+      }
       const checked = state.gateEvidence?.sha;
       let before = await repos.headSha(cwd);
       if (boundary === "legacy") {

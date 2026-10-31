@@ -147,9 +147,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
       await completeMerge(cwd, before, base);
       const merge = await headSha(cwd);
       writeFileSync(join(cwd, "repair.txt"), "first repair\n");
-      await commitAll(cwd, "repair one", { boundary: before });
+      await commitAll(cwd, "repair one", { boundary: before, runId: "merge-test" });
       writeFileSync(join(cwd, "repair.txt"), "final repair\n");
-      const repaired = await commitAll(cwd, "repair two", { boundary: before });
+      const repaired = await commitAll(cwd, "repair two", { boundary: before, runId: "merge-test" });
       expect((await mergeGit(cwd, ["rev-list", "--parents", "-n", "1", "HEAD"])).stdout.trim()).toBe(
         `${repaired} ${merge}`,
       );

@@ -1660,8 +1660,10 @@ exec '${path}-delegate' "$@"
       expect(next.store.listStages(id)).toEqual(stages);
       expect(next.store.listInvocations(id)).toEqual(invocations);
       expect(existsSync(cwd)).toBe(true);
-      // In particular, a cancelled list/merge must not fall through to create/auto-merge.
-      expect(readFileSync(calls, "utf8")).toBe(beforeCancel);
+      // Only private-ref cleanup may follow cancellation; publication must never resume.
+      expect(readFileSync(calls, "utf8")).toBe(
+        `${beforeCancel}git for-each-ref --format=%(refname) %(objectname) refs/limitless/iterations/${id}/\n`,
+      );
       history(next, id);
     } finally {
       await killRetainedPids(pids);

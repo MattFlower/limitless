@@ -1,12 +1,12 @@
 import { existsSync, lstatSync, readdirSync, realpathSync, rmSync, unlinkSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { Config } from "./config.ts";
-import type { Repo, Run } from "./core/types.ts";
+import { type Repo, type Run, TERMINAL_STATUSES } from "./core/types.ts";
 import type { Store } from "./db/store.ts";
 import { FEED_RETENTION_DAYS } from "./feed.ts";
 import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
 import { cacheGit } from "./git/command.ts";
-import { cachePath, withRepoLock, worktreeOwner } from "./git/repos.ts";
+import { cachePath, removeIterationRefs, withRepoLock, worktreeOwner } from "./git/repos.ts";
 import { sh } from "./util/proc.ts";
 
 const DAY = 86_400_000;
@@ -84,6 +84,15 @@ export async function collectGarbage(
   const repos = new Map(store.listRepos().map((repo) => [repo.id, repo]));
   const workRoot = resolve(cfg.paths.work);
   const runRoot = resolve(cfg.paths.runs);
+
+  if (!dryRun)
+    for (const run of store.listRuns({ status: [...TERMINAL_STATUSES], limit: Number.MAX_SAFE_INTEGER })) {
+      const repo = repos.get(run.repoId);
+      if (repo)
+        await removeIterationRefs(cfg.paths, repo, run.id).catch((error: unknown) => {
+          result.errors.push(`${run.id} iterations: ${(error as Error).message}`);
+        });
+    }
 
   for (const run of finished) {
     const days =
