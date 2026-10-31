@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GateConfig } from "../src/gates/detect.ts";
 import {
+  acceptanceCoveringPolicy,
   citedFileRefusal,
   coveringTestCommand,
   selectCoveringRequests,
@@ -68,4 +69,46 @@ test("shared requests retain the per-item and per-round caps and their reasons",
     undefined,
     "per-round limit reached",
   ]);
+});
+
+test("one Bun check is eligible alongside unrelated checks; ambiguous or invalid configuration refuses", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-config-"));
+  try {
+    const { value: sha } = await seed(cwd);
+    const other = [
+      { name: "lint", run: "echo lint" },
+      { name: "typecheck", run: "tsc --noEmit" },
+    ];
+    const test = { file: "tracked.test.ts", name: "passes" };
+    expect(
+      (await coveringTestCommand(test, { ...config, checks: [...other, ...config.checks] }, cwd, sha))
+        .command,
+    ).toBe("bun test -t '(?:^| )passes$' './tracked.test.ts'");
+    for (const cfg of [
+      { ...config, checks: other },
+      { ...config, checks: [...other, ...config.checks, ...config.checks] },
+      { ...config, retryFiles: undefined },
+      { ...config, retryFiles: "bun test '{files}'" },
+      { ...config, retryFiles: "bun test {files} {files}" },
+      { ...config, retryFiles: "echo {files}" },
+    ])
+      expect(await coveringTestCommand(test, cfg, cwd, sha)).toEqual({
+        reason: "targeted retries not configured",
+      });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("acceptance selects every unit while keeping three tests per unit", () => {
+  const items = Array.from({ length: 12 }, (_, i) =>
+    Array.from({ length: 3 }, (_, j) => ({ file: "x.test.ts", name: `${i}-${j}` })),
+  );
+  expect(selectCoveringRequests(items, acceptanceCoveringPolicy).flatMap((s) => s.tests)).toHaveLength(36);
+  expect(
+    selectCoveringRequests(
+      [items[0]?.concat({ file: "x.test.ts", name: "fourth" }) ?? []],
+      acceptanceCoveringPolicy,
+    )[0],
+  ).toMatchObject({ tests: items[0], reason: "per-criterion limit reached" });
 });

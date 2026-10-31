@@ -35,6 +35,7 @@ trap '[ -z "$push_repo" ] || rm -rf -- "$push_repo"' EXIT
 trap '[ -z "$checker" ] || { kill -TERM "$checker" 2>/dev/null || :; wait "$checker" || :; }; exit 1' TERM INT
 # The worktree's bunfig.toml (preload) and .env must not reach the checker.
 check_private() { (cd "${check_dir:-$PWD}"; exec bun --config=/dev/null --no-env-file "$private_check" "$@") & checker=$!; wait "$checker"; checker=""; }
+check_private --local-only "$repo"
 # Factory git after PR code has run: no hooks (files or config), filters, fsmonitor, forged commit-graph or bitmaps.
 export LIMITLESS_GIT_EMPTY_HOOK=""
 git_exec() { bun --config=/dev/null --no-env-file "$confined_git" "$@"; }
@@ -54,7 +55,7 @@ if ! admin="$(git rev-parse --absolute-git-dir 2>/dev/null)" || ! admin="$(cd "$
   echo "Cannot read repository git paths; refusing to land" >&2
   exit 1
 fi
-paths="$(check_private --record)"
+paths="$(check_private --record "$repo")"
 { IFS= read -r GIT_WORK_TREE; IFS= read -r GIT_DIR; IFS= read -r GIT_COMMON_DIR; ! IFS= read -r extra; } <<< "$paths" || exit 1
 [[ "$GIT_WORK_TREE" = "$(pwd -P)" && "$GIT_DIR" = "$admin" && "$GIT_COMMON_DIR" = "$common" ]] || exit 1
 # A planted graft or shallow file could hide ancestry from the scan and still be pushed.
@@ -145,6 +146,7 @@ fi
 keys="$(safe_git config --name-only --get-regexp '^(hook|filter)\.' 2>/dev/null)" || [ $? = 1 ] || exit 1
 flags=()
 while IFS= read -r key; do [ -z "$key" ] || flags+=("--config-env=$key=LIMITLESS_GIT_EMPTY_HOOK"); done <<< "$keys"
+check_private --local-only "$repo"
 git --no-pager -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.commitGraph=false -c pack.useBitmaps=false \
   ${flags[@]+"${flags[@]}"} -C "$push_repo" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always \
   push --no-verify -q --no-follow-tags "$url" "$sha:refs/heads/$head_ref"

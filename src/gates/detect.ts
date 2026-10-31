@@ -8,6 +8,7 @@ export interface GateCommand {
   timeoutSec?: number;
   /** Factory request for exact testcase evidence, captured before execution scratch is removed. */
   coveringTest?: { file: string; name: string };
+  coveringTests?: { file: string; name: string }[];
 }
 
 export interface GateConfig {

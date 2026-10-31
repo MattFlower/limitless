@@ -1,5 +1,6 @@
 import { availableParallelism, loadavg } from "node:os";
 import { TERMINAL_STATUSES } from "./core/types.ts";
+import { removeIterationRefs } from "./git/repos.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./pipeline/cancellation.ts";
 import { type Checkpointer, type EngineDeps, localCheckpointer, type RunState } from "./pipeline/context.ts";
 import { executeRun } from "./pipeline/engine.ts";
@@ -175,6 +176,11 @@ export class Scheduler {
       active.controller.abort();
     } else {
       finalizeRecordedCancellation(this.deps.store, runId, this.checkpointer);
+      const repo = this.deps.store.getRepo(run.repoId);
+      if (repo)
+        void removeIterationRefs(this.deps.cfg.paths, repo, runId).catch((error: unknown) =>
+          console.warn(`Iteration cleanup deferred to GC: ${(error as Error).message}`),
+        );
     }
     this.deps.store.addEvent({ runId, type: "log", level: "warn", message: `Cancel requested by ${by}` });
     return true;

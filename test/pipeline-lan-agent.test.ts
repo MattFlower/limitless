@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import type { Stage, StageName } from "../src/core/types.ts";
@@ -40,6 +40,7 @@ import {
   expectReaderDependency,
   readerDependencyFixture,
 } from "./reader-dependencies-support.ts";
+import { findingEvidence } from "./review-support.ts";
 import { workerStartupFailures } from "./worker-startup-support.ts";
 
 let home = "",
@@ -88,6 +89,7 @@ function boot(
     executor?: AgentExecutor;
     review?: (s: AgentSpec) => Promise<void>;
     reviewReply?: (s: AgentSpec) => Promise<FakeReply>;
+    implementReply?: (s: AgentSpec) => Promise<FakeReply>;
     faults?: FaultPlan;
     deferStart?: boolean;
     localImplement?: boolean;
@@ -114,7 +116,7 @@ function boot(
           return (await options.reviewReply?.(s)) ?? { structured: approve };
         }
         locals++;
-        return { files: { "farewell.txt": "local goodbye\n" } };
+        return (await options.implementReply?.(s)) ?? { files: { "farewell.txt": "local goodbye\n" } };
       }),
     },
     agentExecutor:
@@ -378,10 +380,10 @@ async function report(f: Factory, job: AgentJobRow, req: AgentJobRequest, sha: s
     sha,
   );
 }
-async function publish(bare: string, req: AgentJobRequest, wrong = false) {
+async function publish(bare: string, req: AgentJobRequest, wrong = false, contents?: string) {
   await sh(["git", "fetch", bare, req.parentSha], { cwd: repoDir });
   await sh(["git", "reset", "--hard", req.parentSha], { cwd: repoDir });
-  writeFileSync(join(repoDir, "farewell.txt"), `worker goodbye ${req.parentSha}\n`);
+  writeFileSync(join(repoDir, "farewell.txt"), contents ?? `worker goodbye ${req.parentSha}\n`);
   const commit = req.commit;
   if (!commit) throw new Error("Missing publication");
   await sh(["git", "add", "."], { cwd: repoDir });
@@ -498,6 +500,105 @@ test("a quota result is adopted before invoke dispatches the next candidate", as
     await finish();
   }
 });
+
+test.each([false, true])(
+  "adopted worker ancestry survives restart and local privacy repairs (retained=%s)",
+  async (retained) => {
+    const bare = await githubFixture();
+    const secret = `private-${crypto.randomUUID()}.example`;
+    let f: Factory;
+    let localCalls = 0;
+    let superseded = "";
+    let blob = "";
+    const executor: AgentExecutor = {
+      kind: "test",
+      run: (call, local) =>
+        call.role === "implement" && call.round === 1
+          ? local()
+          : lanAgentExecutor(f.workers, f.cfg).run(call, local),
+    };
+    const implementReply = async (s: AgentSpec): Promise<FakeReply> => {
+      if (++localCalls === 2) {
+        superseded = await headSha(s.cwd);
+        blob = (await sh(["git", "rev-parse", "HEAD:config.txt"], { cwd: s.cwd })).stdout.trim();
+      }
+      return {
+        files: {
+          "farewell.txt": localCalls === 1 ? "BAD\n" : "goodbye\n",
+          "config.txt": localCalls === 1 || retained ? `${secret}\n` : "public.example\n",
+        },
+      };
+    };
+    ({ f } = boot({
+      executor,
+      implementReply,
+      faults: { "store:save": { action: "kill", when: (c) => c.checkpoint === "worker-commit-adopted" } },
+    }));
+    writeFileSync(join(f.cfg.paths.configDir, "private-strings.txt"), secret);
+    registerGithub(f, bare);
+    const adopt = spyOn(repos, "adoptWorkerCommit");
+    const push = spyOn(repos, "pushBranch");
+    const finish = simulated(f, async (job, req) =>
+      report(f, job, req, await publish(bare, req, false, "BAD\n")),
+    );
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      await wait(
+        () => f.store.listStages(run.id).some((s) => s.name === "implement" && s.status === "cancelled"),
+        {
+          timeoutMs: 10_000,
+          pollMs: null,
+          subscribe: (wake) => f.store.subscribe(wake),
+        },
+      );
+      await finish();
+      await f.stop();
+      const adopted = jobs(f)[0]?.result_sha;
+      if (!adopted) throw new Error("Missing worker publication");
+      expect(adopt).toHaveBeenCalledTimes(1);
+      f.store.close();
+      ({ f } = boot({ executor, implementReply, deferStart: true }));
+      f.cfg.maxRounds = 1;
+      f.start();
+      expect(await waitFor(f, run.id, ["succeeded", "needs_human", "failed"])).toBe(
+        retained ? "needs_human" : "succeeded",
+      );
+      const done = f.store.getRun(run.id);
+      const state = f.store.getRunState<RunState>(run.id);
+      if (!done?.headSha || !state?.worktreePath) throw new Error("Missing repaired worker state");
+      expect(jobs(f)).toHaveLength(1);
+      expect(adopt).toHaveBeenCalledTimes(1);
+      expect(localCalls).toBe(2);
+      const cwd = retained ? state.worktreePath : bare;
+      expect(
+        (await sh(["git", "rev-list", "--parents", "-n", "1", done.headSha], { cwd })).stdout.trim(),
+      ).toBe(`${done.headSha} ${adopted}`);
+      const remoteHead = (
+        await sh(["git", "rev-parse", `refs/heads/${done.branch}`], { cwd: bare })
+      ).stdout.trim();
+      if (retained) {
+        expect(done.error).toContain("private string");
+        expect(push).not.toHaveBeenCalled();
+        expect(remoteHead).toBe(adopted);
+      } else {
+        expect(push).toHaveBeenCalledTimes(1);
+        expect(remoteHead).toBe(state.gateEvidence?.sha as string);
+        expect(remoteHead).toBe(done.headSha);
+        await repos.checkPrivateRange(bare, `${adopted}..${remoteHead}`, [{ value: secret, entry: 1 }]);
+      }
+      for (const object of [superseded, blob]) {
+        expect(object).toMatch(/^[a-f0-9]{40,64}$/);
+        expect(
+          (await sh(["git", "cat-file", "-e", object], { cwd: bare, allowFail: true })).exitCode,
+        ).not.toBe(0);
+      }
+    } finally {
+      await finish();
+      adopt.mockRestore();
+      push.mockRestore();
+    }
+  },
+);
 
 test.each(["worker-commit-adopted", "implementation-ready", "different target"])(
   "restart reuses the done result at %s",
@@ -1376,6 +1477,103 @@ async function reviewWorker(f: Factory, handler: (s: AgentSpec) => Promise<FakeR
     await listener.stop();
   };
 }
+
+test("second LAN review resolves its previous SHA from a private bundle after coordinator and worker GC", async () => {
+  const bare = await githubFixture();
+  let previous = "";
+  let unrelated = "";
+  let reviews = 0;
+  let implementations = 0;
+  let f: Factory;
+  ({ f } = boot({
+    implementReply: async () => ({ files: { "farewell.txt": `goodbye ${++implementations}\n` } }),
+    executor: {
+      kind: "test",
+      async run(call, local) {
+        if (call.role === "implement") return local();
+        if (previous) {
+          const repo = f.store.getRepo(f.store.getRun(call.runId)?.repoId ?? "");
+          if (!repo) throw new Error("Missing repository");
+          const cwd = repos.cachePath(f.cfg.paths, repo);
+          await sh(["git", "reflog", "expire", "--expire=now", "--all"], { cwd });
+          await sh(["git", "gc", "--prune=now"], { cwd });
+        }
+        return lanAgentExecutor(f.workers, f.cfg).run(call, local);
+      },
+    },
+  }));
+  f.cfg.workers.agents = ["review"];
+  registerGithub(f, bare);
+  const checkouts: string[] = [];
+  const stop = await reviewWorker(f, async (s) => {
+    checkouts.push(s.cwd);
+    if (++reviews === 1) {
+      previous = await headSha(s.cwd);
+      const job = jobs(f)[0];
+      const repo = f.store.getRepo(f.store.getRun(job?.run_id ?? "")?.repoId ?? "");
+      if (!repo) throw new Error("Missing review repo");
+      const cwd = repos.cachePath(f.cfg.paths, repo);
+      const tree = (await sh(["git", "rev-parse", `${previous}^{tree}`], { cwd })).stdout.trim();
+      unrelated = (
+        await worktreeGit(["git", "commit-tree", tree, "-m", "unrelated run"], { cwd })
+      ).stdout.trim();
+      await worktreeGit(
+        ["git", "update-ref", `refs/limitless/iterations/unrelated/${unrelated}`, unrelated],
+        { cwd },
+      );
+      return {
+        structured: {
+          ...approve,
+          verdict: "request_changes",
+          findings: [
+            {
+              severity: "blocker",
+              security: false,
+              ...findingEvidence,
+              file: "farewell.txt",
+              line: 1,
+              title: "Wrong text",
+              detail: "Use the second farewell",
+              suggestion: "Change the farewell",
+            },
+          ],
+        },
+      };
+    }
+    expect(s.prompt).toContain(`git diff ${previous}..`);
+    // Each agent job has an independent cache. Its private refs must survive GC too.
+    const cache = join(dirname(s.cwd), "repo.git");
+    await sh(["git", "reflog", "expire", "--expire=now", "--all"], { cwd: cache });
+    await sh(["git", "gc", "--prune=now"], { cwd: cache });
+    const diff = await sh(["git", "diff", `${previous}..HEAD`], { cwd: s.cwd });
+    expect(diff.exitCode).toBe(0);
+    expect(diff.stdout).toContain("-goodbye 1");
+    expect(diff.stdout).toContain("+goodbye 2");
+    expect(
+      (await sh(["git", "cat-file", "-e", unrelated], { cwd: s.cwd, allowFail: true })).exitCode,
+    ).not.toBe(0);
+    expect(
+      (await sh(["git", "for-each-ref", "refs/limitless/iterations/unrelated/"], { cwd: s.cwd })).stdout,
+    ).toBe("");
+    return { structured: approve };
+  });
+  try {
+    const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+    expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    expect(reviews).toBe(2);
+    expect(new Set(checkouts).size).toBe(2);
+    expect(jobs(f)).toHaveLength(2);
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("Missing final repo");
+    const cache = repos.cachePath(f.cfg.paths, repo);
+    await wait(() => repos.iterationRefs(cache, run.id).then((refs) => refs.length === 0), {
+      timeoutMs: 10_000,
+    });
+    expect(await repos.iterationRefs(cache, "unrelated")).toHaveLength(1);
+  } finally {
+    await stop();
+  }
+}, 60_000);
 
 test.each(["worker only", "local fallback"] as const)(
   "quick LAN review prepares dependencies on the executing host: %s",

@@ -648,11 +648,69 @@ export async function clearInterruptedRebase(cwd: string, expected: boolean): Pr
     throw new Error("interrupted rebase could not be aborted");
 }
 
-/** Commit everything in the worktree. Returns the new sha, or null when there was nothing to commit. */
+/**
+ * The commit unpublished iteration history builds on: the newest first-parent merge above the
+ * published boundary, else the boundary. HEAD when the boundary is not its ancestor, so nothing
+ * is replaced.
+ */
+export async function iterationBoundary(
+  cwd: string,
+  boundary: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const head = await headSha(cwd);
+  if (!(await isAncestor(cwd, boundary, head))) return head;
+  const args = ["git", "rev-list", "--first-parent", "--merges", "-n", "1", `${boundary}..HEAD`];
+  return (await worktreeGit(args, { cwd, signal })).stdout.trim() || boundary;
+}
+
+function iterationPrefix(runId: string): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error("Invalid iteration run id");
+  return `refs/limitless/iterations/${runId}/`;
+}
+
+export async function iterationRefs(cwd: string, runId: string) {
+  const result = await worktreeGit(
+    ["git", "for-each-ref", "--format=%(refname) %(objectname)", iterationPrefix(runId)],
+    { cwd },
+  );
+  return result.stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [ref = "", sha = ""] = line.split(" ");
+      return { ref, sha };
+    });
+}
+
+export async function removeIterationRefs(paths: Paths, repo: Repo, runId: string): Promise<void> {
+  const source =
+    repo.kind === "local" && repo.localPath && existsSync(repo.localPath) ? repo.localPath : null;
+  // The user owns the registered source, which may itself be a linked worktree without a sidecar.
+  const owner =
+    source &&
+    (
+      await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: source })
+    ).stdout.trim();
+  for (const cwd of [cachePath(paths, repo), owner]) {
+    if (!cwd || !existsSync(cwd)) continue;
+    for (const { ref } of await iterationRefs(cwd, runId))
+      await worktreeGit(["git", "update-ref", "-d", ref], { cwd });
+  }
+}
+
+/** Commit everything. With a boundary, replace the iteration history above it with one commit. */
 export async function commitAll(
   cwd: string,
   message: string,
-  options: { env?: Record<string, string>; signal?: AbortSignal; verbatim?: boolean } = {},
+  options: {
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+    verbatim?: boolean;
+    boundary?: string;
+    runId?: string;
+  } = {},
 ): Promise<string | null> {
   const opts = { cwd, env: options.env, signal: options.signal };
   if (worktreeGitScope.getStore() !== false) {
@@ -662,6 +720,26 @@ export async function commitAll(
   }
   await stageAll(opts);
   const status = await worktreeGit(["git", "status", "--porcelain"], opts);
+  const head = options.boundary ? await headSha(cwd) : "";
+  const parent = options.boundary ? await iterationBoundary(cwd, options.boundary, options.signal) : head;
+  if (head !== parent) {
+    const parents = await worktreeGit(["git", "rev-list", "--parents", "-n", "1", head], opts);
+    // An unchanged iteration, or a restart after the update below, reuses the existing commit.
+    if (!status.stdout.trim() && parents.stdout.trim() === `${head} ${parent}`) return null;
+    if (!options.runId) throw new Error("Missing iteration run id");
+    const prefix = iterationPrefix(options.runId);
+    const history = await worktreeGit(["git", "rev-list", `${parent}..${head}`], opts);
+    // Keep every replaced SHA before HEAD moves, including legacy intermediate iterations.
+    for (const sha of history.stdout.trim().split("\n").filter(Boolean))
+      await worktreeGit(["git", "update-ref", `${prefix}${sha}`, sha], opts);
+    const tree = (await worktreeGit(["git", "write-tree"], opts)).stdout.trim();
+    const sha = (
+      await worktreeGit(["git", "commit-tree", tree, "-p", parent, "-m", message], opts)
+    ).stdout.trim();
+    // One atomic ref update, so a restart sees either the old history or the replacement.
+    await worktreeGit(["git", "update-ref", "HEAD", sha, head], opts);
+    return sha;
+  }
   if (!status.stdout.trim()) return null;
   await worktreeGit(
     [
