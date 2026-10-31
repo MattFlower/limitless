@@ -34,6 +34,8 @@ import { selectHarness } from "../harness/select.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
+import { ClaimControlError } from "../integrations/claim-errors.ts";
+import { claimGuard } from "../integrations/claim-guard.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
@@ -599,6 +601,7 @@ export class RunContext {
   }
 
   checkCancelled(): void {
+    claimGuard();
     if (this.termination) throw this.termination;
     if (this.signal.aborted) throw new CancelledError();
   }
@@ -676,7 +679,10 @@ export class RunContext {
         this.interruption.abort();
       }
       const cancelled =
-        e instanceof CancelledError || e instanceof SimulatedTermination || this.signal.aborted;
+        e instanceof ClaimControlError ||
+        e instanceof CancelledError ||
+        e instanceof SimulatedTermination ||
+        this.signal.aborted;
       const chain = this.pinnedStages.get(stage.id);
       this.store.finishStage(
         stage.id,
@@ -686,7 +692,9 @@ export class RunContext {
           500,
         ),
       );
-      throw cancelled && !(e instanceof SimulatedTermination) ? new CancelledError() : e;
+      throw cancelled && !(e instanceof ClaimControlError || e instanceof SimulatedTermination)
+        ? new CancelledError()
+        : e;
     } finally {
       if (!background) this.foregroundStageDepth--;
     }
@@ -696,7 +704,17 @@ export class RunContext {
    * Route a role to a model and run it, falling back across candidates when a provider is out of
    * quota or unavailable. Task-level failures are returned to the caller, not retried here.
    */
-  async invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
+  invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
+    return this.invokeWithAdmission(opts).catch((error: unknown) => {
+      if (error instanceof SuppressedError && error.suppressed instanceof ClaimControlError) {
+        this.log(redactCredentials(`Invocation cleanup failed: ${String(error.error)}`), "warn");
+        throw error.suppressed;
+      }
+      throw error;
+    });
+  }
+
+  private async invokeWithAdmission(opts: InvokeOptions): Promise<InvokeOutcome> {
     const agentExecutor = this.deps.agentExecutor ?? localAgentExecutor;
     const { router, tracker, store, harnesses } = this.deps;
     const { shadow } = opts;
@@ -826,10 +844,19 @@ export class RunContext {
             throw error;
           });
       }
-      const release = admission?.release;
+      let admittedRelease = admission?.release;
+      const release = admittedRelease
+        ? () => {
+            const free = admittedRelease;
+            admittedRelease = undefined;
+            free?.();
+          }
+        : undefined;
+      using _slot = { [Symbol.dispose]: () => release?.() };
       if (admission) target = candidates.find((t) => t.provider === admission.provider) ?? target;
       waitMs += waitingAt === null ? 0 : Math.max(0, tracker.now() - waitingAt);
       if (this.signal.aborted || left() <= 0) {
+        claimGuard();
         release?.();
         this.checkCancelled();
         if (chain) exhaustPinned(decision, true);
@@ -866,7 +893,10 @@ export class RunContext {
         );
         continue;
       }
-      if (this.signal.aborted) release();
+      if (this.signal.aborted) {
+        claimGuard();
+        release();
+      }
       this.checkCancelled();
       const guard = shadow;
       const stopped = guard?.stop(target.provider);
@@ -897,7 +927,7 @@ export class RunContext {
           await this.save();
         } catch (error) {
           this.state.implementer = previousImplementer;
-          release();
+          if (!(error instanceof ClaimControlError)) release();
           throw error;
         }
       }
@@ -956,6 +986,11 @@ export class RunContext {
         opts.redactHoldout && this.state.holdout
           ? holdoutRedactor(this.state.holdout, publicSources)
           : undefined;
+      let interruption: ClaimControlError | undefined;
+      const cleanupFailure = (error: unknown) => {
+        if (!interruption) throw error;
+        this.log(redactCredentials(`Invocation cleanup failed: ${String(error)}`), "warn");
+      };
       try {
         const spec: AgentSpec = {
           fast: invocation.fast,
@@ -1091,6 +1126,10 @@ export class RunContext {
           result = await harness(spec);
         }
       } catch (e) {
+        if (e instanceof ClaimControlError) {
+          interruption = e;
+          throw e;
+        }
         if (e instanceof NeedsHumanError) needsHuman = e;
         if (e instanceof SimulatedTermination) {
           this.termination = e;
@@ -1109,19 +1148,27 @@ export class RunContext {
           quota: null,
         };
       } finally {
-        if (!dispatched && revision.aborted && opts.role === "implement") {
-          this.state.implementer = previousImplementer;
-          this.checkpointer.writeState(this.run.id, this.state);
+        try {
+          if (!dispatched && revision.aborted && opts.role === "implement") {
+            this.state.implementer = previousImplementer;
+            this.checkpointer.writeState(this.run.id, this.state);
+          }
+          try {
+            release();
+          } catch (error) {
+            cleanupFailure(error);
+          }
+          if (privateDir) rmSync(privateDir, { recursive: true, force: true });
+          const checkout = shadow?.cwd ?? this.state.worktreePath;
+          if (
+            (opts.role === "review" || opts.role === "verify") &&
+            checkout &&
+            (!this.parallelChecks || shadow)
+          )
+            await discardChanges(checkout);
+        } catch (error) {
+          cleanupFailure(error);
         }
-        release();
-        if (privateDir) rmSync(privateDir, { recursive: true, force: true });
-        const checkout = shadow?.cwd ?? this.state.worktreePath;
-        if (
-          (opts.role === "review" || opts.role === "verify") &&
-          checkout &&
-          (!this.parallelChecks || shadow)
-        )
-          await discardChanges(checkout);
       }
       if (needsHuman) {
         store.updateInvocation(invocation.id, {

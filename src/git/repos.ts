@@ -24,6 +24,7 @@ import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { rethrowClaimControl } from "../integrations/claim-errors.ts";
+import { claimGuard } from "../integrations/claim-guard.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import { GitHubIdentityError, githubSh, githubUrlRepo } from "../integrations/github-identity.ts";
 import { checkDiscreetBranch, DiscreetError } from "../pipeline/markers.ts";
@@ -137,23 +138,25 @@ type RemoteOpts = {
   timeoutMs?: number;
   budget?: GitHubBudget;
 };
-const remoteSh = (cmd: string[], opts: RemoteOpts, guard?: () => void, repo?: string) =>
-  withGitHubRetry(
+const remoteSh = (cmd: string[], opts: RemoteOpts, guard?: () => void, repo?: string) => {
+  const dispatchGuard = () => {
+    claimGuard();
+    try {
+      guard?.();
+    } catch (cause) {
+      rethrowClaimControl(cause);
+      throw new GitHubGuardError("Push guard refused", { cause });
+    }
+  };
+  return withGitHubRetry(
     () =>
-      cmd[0] === "git"
-        ? cacheGit(cmd, opts, () => {
-            try {
-              guard?.();
-            } catch (cause) {
-              throw new GitHubGuardError("Push guard refused", { cause });
-            }
-          })
-        : githubSh(cmd, opts, repo),
+      cmd[0] === "git" ? cacheGit(cmd, opts, dispatchGuard) : githubSh(cmd, { ...opts, dispatchGuard }, repo),
     opts,
   ).catch((error) => {
     if (error instanceof GitHubGuardError) throw error.cause;
     throw error;
   });
+};
 
 export function slugify(text: string, max = 40): string {
   return (
