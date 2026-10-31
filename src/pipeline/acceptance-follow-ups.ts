@@ -249,6 +249,7 @@ export async function fileFollowUps(
       subIssues.push(...listing.epic.subIssues.nodes);
     }
     update(() => false);
+    if (record.state === "complete") return { pass: record.pass, issues: issueList(record) };
     const ids = new Map(subIssues.map((i) => [i.number, i.id]));
     // Reconcile every handle, including requests whose response was lost, before creating anything.
     for (const handle of record.items) {

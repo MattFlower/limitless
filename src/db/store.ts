@@ -1566,7 +1566,7 @@ export class Store {
       );
   }
 
-  /** Reuse the run's pass, the latest at this ticket/SHA, or an unsent reservation before counting another. */
+  /** Reuse the run's pass, any at this ticket/SHA, or the latest unsent reservation before counting another. */
   claimAcceptancePass(claim: Omit<AcceptancePass, "pass" | "state">, limit: number): AcceptancePass | null {
     const repo = claim.repo.toLowerCase();
     return this.transaction(() => {
@@ -1587,14 +1587,14 @@ export class Store {
         .all(repo, claim.epic);
       const own = rows.find((r) => r.run_id === claim.runId);
       if (own) return { ...claim, ...own, repo, items: JSON.parse(own.items) };
-      const latest = rows.at(-1);
-      if (latest) {
-        const items: AcceptancePass["items"] = JSON.parse(latest.items);
-        const same = latest.ticket === claim.ticket && latest.sha === claim.sha;
+      const prior = rows.find((r) => r.ticket === claim.ticket && r.sha === claim.sha) ?? rows.at(-1);
+      if (prior) {
+        const items: AcceptancePass["items"] = JSON.parse(prior.items);
+        const same = prior.ticket === claim.ticket && prior.sha === claim.sha;
         if (same || !items.some((h) => h.state === "requested" || h.state === "filed")) {
           const record: AcceptancePass = same
-            ? { ...claim, ...latest, repo, items }
-            : { ...claim, repo, pass: latest.pass, state: "filing" };
+            ? { ...claim, ...prior, repo, items }
+            : { ...claim, repo, pass: prior.pass, state: "filing" };
           this.db
             .query(`UPDATE acceptance_passes SET run_id = ?, ticket = ?, sha = ?, items = ?, state = ?
             WHERE repo = ? AND epic = ? AND pass = ?`)

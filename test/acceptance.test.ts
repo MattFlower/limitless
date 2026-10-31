@@ -1297,6 +1297,55 @@ test("a credential crossing the title cutoff withholds the item before truncatio
   expect(t.f.store.getRun(t.run.id)?.error).toContain("U1's follow-up was withheld by the publication check");
 });
 
+test.each(["unsent", "complete"])(
+  "an older run reuses its ticket/SHA pass while the newer pass is %s",
+  async (state) => {
+    const t = await setup({ parent: gapParent, ticket: gapTicket });
+    const gh = fakeGitHub(t);
+    t.reply(() => ({ structured: gapOutput() }));
+    expect(await t.execute()).toBe("needs_human");
+    const originalRun = t.run;
+    const acceptance = structuredClone(t.state()?.acceptance);
+    const repo = t.f.store.getRepo(originalRun.repoId);
+    if (!acceptance?.outcome || !repo) throw new Error("missing acceptance context");
+    const original = new RunContext(t.f.deps, originalRun, repo, new AbortController().signal);
+    const nextRun = t.next();
+    const next = new RunContext(t.f.deps, nextRun, repo, new AbortController().signal);
+    expect(await fileFollowUps(next, acceptance)).toEqual({ pass: 1, issues: [100, 101, 102] });
+    expect(t.f.store.db.query("SELECT run_id FROM acceptance_passes WHERE pass = 1").get()).toEqual({
+      run_id: nextRun.id,
+    });
+    const newer = structuredClone(acceptance);
+    if (!newer.outcome) throw new Error("missing outcome");
+    newer.outcome.sha = "sha-B";
+    const current = new RunContext(t.f.deps, t.next(), repo, new AbortController().signal);
+    if (state === "unsent") {
+      gh.intercept = (args) => {
+        if (args.join(" ").includes("subIssues")) throw new SimulatedTermination("before listing");
+      };
+      await expect(fileFollowUps(current, newer)).rejects.toBeInstanceOf(SimulatedTermination);
+      gh.intercept = undefined;
+    } else {
+      expect(await fileFollowUps(current, newer)).toEqual({ pass: 2, issues: [103, 104, 105] });
+    }
+    const pass2 = () => t.f.store.db.query("SELECT * FROM acceptance_passes WHERE pass = 2").get();
+    const reserved = pass2();
+    expect(reserved).toMatchObject({
+      ticket: 9,
+      sha: "sha-B",
+      state: state === "unsent" ? "filing" : "complete",
+    });
+    expect(gh.created).toHaveLength(state === "unsent" ? 3 : 6);
+    const calls = gh.calls.length;
+    expect(await fileFollowUps(original, acceptance)).toEqual({ pass: 1, issues: [100, 101, 102] });
+    expect(gh.calls).toHaveLength(calls);
+    expect(gh.created).toHaveLength(state === "unsent" ? 3 : 6);
+    expect(gh.labels).toEqual([]);
+    expect(gh.comments).toEqual([]);
+    expect(pass2()).toEqual(reserved);
+  },
+);
+
 test("gaps in three top-level items file three unlabelled sub-issues blocking the ticket", async () => {
   const t = await setup({ parent: gapParent, ticket: gapTicket });
   const gh = fakeGitHub(t);
@@ -1580,6 +1629,62 @@ test.each([false, true])(
     }
   },
 );
+
+test("a coordinator returns the pass completed while its sub-issue listing was in flight", async () => {
+  const t = await setup({ parent: gapParent, ticket: gapTicket });
+  const gh = fakeGitHub(t);
+  gh.intercept = (args) => {
+    if (args.join(" ").includes("subIssues")) throw new SimulatedTermination("before listing");
+  };
+  t.reply(() => ({ structured: gapOutput() }));
+  expect(await t.execute()).toBe("running");
+  gh.intercept = undefined;
+  const acceptance = t.state()?.acceptance;
+  const repo = t.f.store.getRepo(t.run.repoId);
+  const runner = t.f.deps.gh;
+  if (!acceptance || !repo || !runner) throw new Error("missing acceptance context");
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let captured = false;
+  t.f.deps.gh = async (...args) => {
+    const response = await runner(...args);
+    if (args[0].join(" ").includes("subIssues") && !captured) {
+      captured = true;
+      entered.resolve();
+      await release.promise;
+    }
+    return String(response);
+  };
+  const otherStore = new Store(t.f.cfg.paths.db);
+  const pending: Promise<unknown>[] = [];
+  try {
+    const first = fileFollowUps(
+      new RunContext(t.f.deps, t.run, repo, new AbortController().signal),
+      acceptance,
+    ).catch((err: unknown) => err);
+    pending.push(first);
+    await entered.promise;
+    const second = fileFollowUps(
+      new RunContext({ ...t.f.deps, store: otherStore }, t.run, repo, new AbortController().signal),
+      acceptance,
+    );
+    pending.push(second);
+    expect(await second).toEqual({ pass: 1, issues: [100, 101, 102] });
+    expect(gh.passes()[0]?.state).toBe("complete");
+    release.resolve();
+    expect(await first).toEqual({ pass: 1, issues: [100, 101, 102] });
+    expect(gh.created).toHaveLength(3);
+    expect(gh.issues.filter((i) => i.number >= 100 && i.parent === 1).map((i) => i.number)).toEqual([
+      100, 101, 102,
+    ]);
+    expect(gh.issues.find((i) => i.number === 9)?.blockedBy).toEqual([100, 101, 102]);
+    expect(gh.passes()[0]?.state).toBe("complete");
+  } finally {
+    release.resolve();
+    await Promise.allSettled(pending);
+    otherStore.close();
+  }
+});
 
 test("concurrent coordinators of one run send each creation request once", async () => {
   const t = await setup({ parent: gapParent, ticket: gapTicket });
