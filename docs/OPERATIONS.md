@@ -649,44 +649,28 @@ disabled so both the source and the credentials are required.
 
 ## Defect reporter delivery status
 
-The defect reporter is inactive. The outbox migration and submission storage are implemented;
-there is no reconciler, detector, daemon timer or operator configuration yet. The future
-`[github.defects]` setting belongs to D1a.3 and cannot currently be enabled.
+The defect reporter (`src/integrations/defect-reporter.ts`) is implemented but inactive: no
+detector, daemon timer or operator configuration mounts it yet. The `[github.defects]` setting
+belongs to D1a.3.
 
-When enabled in that later delivery, enable `[github.defects]` on **exactly one coordinator**.
-A second enabled coordinator can create duplicate issues and independently consume its local
-daily cap. Later occurrences must enumerate all legitimate matches and converge on the oldest
-issue. Cross-coordinator serialization, a shared cap and ownership transfer belong to #902;
-the local database is not a fleet-wide guarantee. Preserve the database and pinned destination
-when disabling or rolling back. Moving to a different coordinator/database is not a supported
-ownership-transfer procedure.
+When it is enabled, enable `[github.defects]` on **exactly one coordinator**. A second enabled
+coordinator can create duplicate issues and spends its own local daily cap (default ten new
+issues per UTC day). Later occurrences enumerate every legitimate match and comment on the oldest
+issue, so duplicates converge but are not removed. Cross-coordinator serialization, a shared cap
+and ownership transfer belong to #902; the local database is not a fleet-wide guarantee.
+Preserve the database and pinned destination when disabling or rolling back. Moving to a
+different coordinator or database is not a supported ownership-transfer procedure.
 
-### D1a.2 source-budget split
+Submission is composed with the detector's checkpoint: await
+`prepareSubmission(sourceKey, finding)`, then call the returned function inside the checkpoint
+transaction. Only guarded publication bytes and the posting App login are stored.
+`reconcile()` delivers with the GitHub App only and always labels new issues `defect`. Each pass
+reconciles unresolved sends first and makes at most 32 GitHub calls.
 
-The 250-line source ceiling requires separate deliveries for the remaining state machine.
-The current delivery adds only the durable submission boundary. Await
-`createDefectOutbox(store, deps).prepareSubmission(sourceKey, finding)`, then invoke its returned
-synchronous function inside the detector's checkpoint transaction. Alternatively, pass the
-synchronous checkpoint callback to that function; its own transaction commits both together.
-Replaying an existing source key skips preparation and keeps its occurrence ID. Disabling the
-injected coordinator context prevents preparation calls and commits. Suppressed and rejected
-submissions have no payload; only guarded bytes and the posting App login enter prepared rows.
-
-Proposed follow-up deliveries, each subject to its own 250-line source ceiling:
-
-1. Add resumable App-authenticated issue enumeration and occurrence-specific issue/comment
-   recovery, sharing D1a.1's parsing and provenance checks. Persist only validated match IDs and
-   creation times. Exercise the 32-call budget, pagination reopen, exact bodies, edited/conflicting
-   objects, lost responses and recovered unlabelled issues with fake clients.
-2. Add the single reporter service and guarded dispatch. Use the signature table for atomic
-   creation barriers/bindings, reserve the UTC cap with the send intent, coalesce reconciliation,
-   reconcile unresolved sends first, and enforce App identity, discreet policy, current privacy
-   guards and the `defect` label. Exercise concurrency, late requests, cap rollover, closed issues
-   and two-database duplicate convergence. No production mounting belongs in this delivery.
-
-Both follow-ups are required before D1a.2 satisfies its delivery acceptance criteria. In
-particular, the schema's send-state, scan-progress and reservation columns alone do not implement
-recovery, delivery or a cap.
+A record whose request may have reached GitHub but cannot be found stays `uncertain` and pauses
+every reporter POST. A record whose GitHub object is edited, conflicting or unlabelled stays
+`held`. Neither is retried automatically, not even after a restart or a later day. The owner
+reconciles them on GitHub; an older daemon leaves the outbox untouched.
 
 ## Website
 
