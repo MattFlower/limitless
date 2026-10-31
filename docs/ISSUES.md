@@ -95,6 +95,11 @@ evidence, and a unit referenced both ways requires tests. Other prose in the int
 a list item there refuses, since only references produce units. Units whose text is identical as
 written share one unit.
 
+The manifest records the top-level unit id as each unit's `item`: a paragraph or top-level
+list item owns itself, and nested sub-items belong to their top-level list item. Deduplicated
+units keep the item of their first occurrence. Persisted manifests without `item` remain
+valid; grouping treats each of their units as its own item without resolving the intent again.
+
 Quoting parent or file text (a `From #123:` or `From docs/PLAN.md:` line followed by `>` quotes)
 is not supported: it was cut from #981's scope, and a lead-in or a quote refuses the run. Put the
 requirements in a section of the parent and reference it.

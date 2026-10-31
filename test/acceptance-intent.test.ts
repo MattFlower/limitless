@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { type AcceptanceSnapshot, resolveIntent } from "../src/pipeline/acceptance.ts";
+import { type AcceptanceSnapshot, groupAcceptanceUnits, resolveIntent } from "../src/pipeline/acceptance.ts";
 
 const issue = (number: number, body: string) => ({ number, body, author: { login: "owner" } });
 // The ticket's intent lines start at line 4 of its body.
@@ -17,6 +17,46 @@ const goal = `#1's "Goal" section`;
 const inGoal = (body: string) => `## Goal\n${body}\n\n## End\n- Outside.`;
 const unsupported = (line: number, where: string, kind: string) =>
   `unsupported Markdown in the intent: line ${line} of ${where}: ${kind}; normalize the ticket`;
+
+test("top-level items own their descendants while paragraphs own themselves", () => {
+  const units = resolve(
+    goal,
+    inGoal("- First.\n  - Child.\n  - Sibling.\n- Second.\n\nParagraph.\nContinued."),
+  );
+  expect(units.map((u) => u.item)).toEqual(["U1", "U1", "U1", "U4", "U5"]);
+  expect([...groupAcceptanceUnits(units)].map(([item, group]) => [item, group.map((u) => u.id)])).toEqual([
+    ["U1", ["U1", "U2", "U3"]],
+    ["U4", ["U4"]],
+    ["U5", ["U5"]],
+  ]);
+  const deep = resolve(goal, inGoal("- Root.\n  - Child.\n    - Grandchild.\n- Next.\n  - Child."));
+  expect(deep.map((u) => u.item)).toEqual(["U1", "U1", "U1", "U4", "U4"]);
+});
+
+test("deduplicated units keep the item of their first occurrence across sections", () => {
+  const units = resolve(
+    `${goal}\n#1's "Docs" section (docs)`,
+    "## Goal\n- Root.\n  - Child.\n## Docs\n- Root.\n  - Child.\n  - New child.\n- Root. — Child.",
+  );
+  expect(units.map((u) => [u.id, u.item, u.text])).toEqual([
+    ["U1", "U1", "Root."],
+    ["U2", "U1", "Root. — Child."],
+    ["U3", "U1", "Root. — New child."],
+  ]);
+  expect(units[1]?.sources).toEqual(['#1 "Goal"', '#1 "Docs"']);
+});
+
+test("legacy persisted manifests group each unit as its own item without re-resolving", () => {
+  const manifest = [
+    { id: "U1", text: "Root.", class: "behaviour" as const, sources: ['#1 "Goal"'] },
+    { id: "U2", text: "Root. — Child.", class: "behaviour" as const, sources: ['#1 "Goal"'] },
+  ];
+  expect([...groupAcceptanceUnits(manifest)].map(([item, group]) => [item, group.map((u) => u.id)])).toEqual([
+    ["U1", ["U1"]],
+    ["U2", ["U2"]],
+  ]);
+  expect(manifest.every((u) => !("item" in u))).toBe(true);
+});
 
 const epic784 = `## Goal
 Every acceptance ticket can be run by the factory.
