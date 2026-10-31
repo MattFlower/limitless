@@ -50,11 +50,10 @@ const EVAL_ONLY_PROMPTS: readonly FinderPrompt[] = [
   "adversarial-callers",
 ];
 const isEvalOnly = (finder: { prompt: FinderPrompt }) => EVAL_ONLY_PROMPTS.includes(finder.prompt);
-const quoted = (names: readonly string[], joiner: "or" | "and") =>
-  `${names
-    .slice(0, -1)
-    .map((n) => `"${n}"`)
-    .join(", ")} ${joiner} "${names.at(-1)}"`;
+const quoted = (names: readonly string[], joiner: "or" | "and") => {
+  const all = names.map((n) => `"${n}"`);
+  return all.length > 1 ? `${all.slice(0, -1).join(", ")} ${joiner} ${all.at(-1)}` : (all[0] ?? "");
+};
 const FinderSchema = z
   .strictObject({
     target: TargetSchema.optional(),

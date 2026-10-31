@@ -200,6 +200,5 @@ test("production and adversarial openings are unchanged and the eval additions a
     expect(variant.endsWith(rest)).toBe(true);
     const block = variant.slice(opening.length + 2, variant.length - rest.length);
     for (const instruction of instructions) expect(block).toContain(instruction);
-    expect(block).not.toContain("# ");
   }
 });

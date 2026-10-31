@@ -660,10 +660,7 @@ export type ChatStreamMessage = { kind: "chat"; message: ChatMessage };
 /** `interrupted`: stopped by a restart, a cancel or a resume; its partial results never feed policy. */
 export type EvalStatus = "queued" | "running" | "completed" | "budget_exhausted" | "failed" | "interrupted";
 export type EvalStrategy = "retry" | "effort" | "switch";
-/**
- * Finder prompts include eval-only `probe`, `trace`, `adversarial-checklist`, `adversarial-thorough`
- * and `adversarial-callers`.
- */
+/** Finder prompts; production refuses the eval-only ones (`EVAL_ONLY_PROMPTS` in review-system.ts). */
 export type FinderPrompt =
   | "standard"
   | "adversarial"
