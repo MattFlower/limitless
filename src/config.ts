@@ -106,6 +106,7 @@ export interface Config {
 }
 
 export interface RepoSettings {
+  shared?: boolean;
   githubActions?: boolean;
   githubActionsPaidMinutes?: boolean;
   discreet: boolean;
@@ -116,6 +117,7 @@ export interface RepoSettings {
 export function repoSettings(cfg: Pick<Config, "repos">, slug: string): RepoSettings {
   return (
     cfg.repos?.[slug.toLowerCase()] ?? {
+      shared: false,
       githubActions: false,
       githubActionsPaidMinutes: false,
       discreet: false,
@@ -125,24 +127,31 @@ export function repoSettings(cfg: Pick<Config, "repos">, slug: string): RepoSett
   );
 }
 
-function parseRepos(value: unknown): Record<string, RepoSettings> {
+function parseRepos(value: unknown, silent = false): Record<string, RepoSettings> {
   const table = (v: unknown): v is Record<string, unknown> =>
     Object.prototype.toString.call(v) === "[object Object]";
   if (!table(value)) throw new Error("repos must be a table");
   const out: Record<string, RepoSettings> = Object.create(null);
   const spellings = new Map<string, string>();
   for (const [slug, entry] of Object.entries(value)) {
-    if (!repoName.test(slug)) throw new Error("repos keys must be owner/name slugs");
+    if (!repoName.test(slug) || slug !== slug.trim()) throw new Error("repos keys must be owner/name slugs");
     const normalized = slug.toLowerCase();
     const previous = spellings.get(normalized);
     if (previous !== undefined) throw new Error(`Duplicate repository keys "${previous}" and "${slug}"`);
     spellings.set(normalized, slug);
     if (!table(entry)) throw new Error("repos entries must be tables");
     for (const key of Object.keys(entry))
-      if (!/^(?:discreet|branch_prefix|land_requires_approval|github_actions(?:_paid_minutes)?)$/.test(key))
+      if (
+        !silent &&
+        !/^(?:shared|discreet|branch_prefix|land_requires_approval|github_actions(?:_paid_minutes)?)$/.test(
+          key,
+        )
+      )
         console.warn(`Ignoring unknown repository setting for ${slug}: ${key}`);
+    const { shared = false } = entry;
     const { discreet = false, branch_prefix = "change/", land_requires_approval = false } = entry;
     const { github_actions = false, github_actions_paid_minutes = false } = entry;
+    if (typeof shared !== "boolean") throw new Error("repos.shared must be a boolean");
     if (typeof github_actions !== "boolean") throw new Error("repos.github_actions must be a boolean");
     if (typeof github_actions_paid_minutes !== "boolean")
       throw new Error("repos.github_actions_paid_minutes must be a boolean");
@@ -152,6 +161,7 @@ function parseRepos(value: unknown): Record<string, RepoSettings> {
     if (typeof branch_prefix !== "string" || !branch_prefix || !isBranchName(`${branch_prefix}x`))
       throw new Error("repos.branch_prefix must be a nonempty valid branch prefix");
     out[normalized] = {
+      shared,
       githubActions: github_actions,
       githubActionsPaidMinutes: github_actions_paid_minutes,
       discreet,
@@ -160,6 +170,30 @@ function parseRepos(value: unknown): Record<string, RepoSettings> {
     };
   }
   return out;
+}
+
+/** Safety-only read: no defaults for absent files, warnings, secrets or runtime configuration. */
+export function readRepoSettingsReadOnly(slug: string, configDir?: string): RepoSettings {
+  if (typeof slug !== "string" || !repoName.test(slug) || slug !== slug.trim())
+    throw new Error("REPO_CONFIG_SLUG: Invalid repository slug");
+  const directory = configDir ?? process.env.LIMITLESS_CONFIG_DIR ?? join(homedir(), ".config", "limitless");
+  let source: string;
+  try {
+    source = readFileSync(join(directory, "config.toml"), "utf8");
+  } catch {
+    throw new Error("REPO_CONFIG_READ: Cannot read repository configuration");
+  }
+  let raw: Record<string, unknown>;
+  try {
+    raw = Bun.TOML.parse(source) as Record<string, unknown>;
+  } catch {
+    throw new Error("REPO_CONFIG_TOML: Invalid repository configuration syntax");
+  }
+  try {
+    return repoSettings({ repos: raw.repos === undefined ? undefined : parseRepos(raw.repos, true) }, slug);
+  } catch {
+    throw new Error("REPO_CONFIG_SETTINGS: Invalid repository settings");
+  }
 }
 
 function parseEnvFile(path: string): Record<string, string> {
