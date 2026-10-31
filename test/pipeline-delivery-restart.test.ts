@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } fro
 import { join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
+import * as gitCommand from "../src/git/command.ts";
 import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { NeedsHumanError, type RunState } from "../src/pipeline/context.ts";
@@ -57,6 +58,154 @@ const {
 });
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each([
+    "between iterations",
+    "commit checkpoint",
+    "git mutation",
+    "retention",
+    "shutdown",
+    "verified",
+    "pushed",
+    "legacy",
+    "unchanged",
+  ])("consolidated iteration restart at %s reuses completed work", async (boundary) => {
+    const bare = await githubFixture();
+    let implementations = 0;
+    let firstIteration = "";
+    const controller = new AbortController();
+    const f = start(async (s) => {
+      if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (roleOf(s) === "review") return { structured: approve };
+      if (++implementations === 2) firstIteration = await repos.headSha(s.cwd);
+      return { files: { "farewell.txt": implementations === 1 ? "BAD\n" : "goodbye\n" } };
+    });
+    await f.stop();
+    registerGithub(f, bare);
+    f.deps.faults =
+      boundary === "shutdown"
+        ? {
+            "stage:review:before": {
+              action: "continue",
+              onHit: () => controller.abort(new Error("shutdown")),
+            },
+          }
+        : boundary === "verified"
+          ? { "stage:deliver:before": { action: "kill" } }
+          : boundary === "between iterations"
+            ? { "stage:implement:before": { action: "kill", when: (c) => c.round === 1 } }
+            : boundary === "pushed" || boundary === "git mutation" || boundary === "retention"
+              ? undefined
+              : {
+                  "store:save": {
+                    action: "kill",
+                    when: (c) => c.round === 1 && c.checkpoint === "implementation-committed",
+                  },
+                };
+    const realPush = repos.pushBranch;
+    const realGit = gitCommand.worktreeGit;
+    let interrupted = false;
+    const mutation = spyOn(gitCommand, "worktreeGit").mockImplementation(async (args, ...rest) => {
+      const result = await realGit(args, ...rest);
+      if (
+        !interrupted &&
+        args[1] === "update-ref" &&
+        ((boundary === "git mutation" && args[2] === "HEAD") ||
+          (boundary === "retention" && args[2]?.startsWith("refs/limitless/iterations/")))
+      ) {
+        interrupted = true;
+        throw new SimulatedTermination("Git ref updated before run checkpoint");
+      }
+      return result;
+    });
+    let pushes = 0;
+    const push = spyOn(repos, "pushBranch").mockImplementation(async (...args) => {
+      pushes++;
+      expect(
+        (
+          await repos.iterationRefs(args[1], f.store.listRuns({ status: ["running"] })[0]?.id ?? "missing")
+        ).map((ref) => ref.sha),
+      ).toContain(firstIteration);
+      expect((await sh(["git", "diff", `${firstIteration}..HEAD`], { cwd: args[1] })).stdout).toContain(
+        "+goodbye",
+      );
+      await realPush(...args);
+      if (boundary === "pushed" && pushes === 1)
+        throw new SimulatedTermination("push completed before acknowledgement");
+    });
+    let reopened: Store | undefined;
+    try {
+      const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
+      expect(await executeRun(f.deps, run.id, controller.signal)).toBe(
+        boundary === "shutdown" ? "queued" : "running",
+      );
+      const state = f.store.getRunState<RunState>(run.id);
+      if (!state?.worktreePath) throw new Error("Missing interrupted iteration");
+      const cwd = state.worktreePath;
+      if (["retention", "git mutation", "shutdown"].includes(boundary)) {
+        expect((await repos.iterationRefs(cwd, run.id)).map((ref) => ref.sha)).toContain(firstIteration);
+        const repo = f.store.getRepo(run.repoId);
+        if (!repo) throw new Error("Missing restart repository");
+        const cache = repos.cachePath(f.cfg.paths, repo);
+        await sh(["git", "reflog", "expire", "--expire=now", "--all"], { cwd: cache });
+        await sh(["git", "gc", "--prune=now"], { cwd: cache });
+        expect((await sh(["git", "cat-file", "-e", firstIteration], { cwd: cache })).exitCode).toBe(0);
+      }
+      const checked = state.gateEvidence?.sha;
+      let before = await repos.headSha(cwd);
+      if (boundary === "legacy") {
+        // A pre-change run interrupted before committing its second iteration has ordinary iteration commits.
+        await sh(["git", "update-ref", "HEAD", firstIteration, before], { cwd });
+        await repos.commitAll(cwd, "old second iteration");
+        before = await repos.headSha(cwd);
+        expect(
+          (
+            await sh(["git", "rev-list", "--count", `${f.store.getRun(run.id)?.baseSha}..HEAD`], { cwd })
+          ).stdout.trim(),
+        ).toBe("2");
+        f.store.updateRun(run.id, { headSha: before }, state);
+      }
+      if (boundary === "unchanged") {
+        state.implementedRound = undefined;
+        f.store.setRunState(run.id, state);
+      }
+      reopened = new Store(f.cfg.paths.db);
+      expect(
+        await executeRun(
+          { ...f.deps, store: reopened, faults: undefined },
+          run.id,
+          new AbortController().signal,
+        ),
+      ).toBe("succeeded");
+      const done = reopened.getRun(run.id);
+      if (!done?.headSha) throw new Error("Missing delivered head");
+      const final = reopened.getRunState<RunState>(run.id);
+      expect(implementations).toBe(2);
+      expect(pushes).toBe(1);
+      expect(
+        (
+          await sh(["git", "rev-list", "--count", `${done.baseSha}..${done.headSha}`], { cwd: bare })
+        ).stdout.trim(),
+      ).toBe("1");
+      expect((await sh(["git", "show", `${done.headSha}:farewell.txt`], { cwd: bare })).stdout).toBe(
+        "goodbye\n",
+      );
+      expect((await sh(["git", "show", `${done.headSha}:greeting.txt`], { cwd: bare })).stdout).toBe(
+        "hello\n",
+      );
+      expect(final?.gateEvidence?.sha).toBe(done?.headSha);
+      expect(
+        (await sh(["git", "rev-parse", `refs/heads/${done?.branch}`], { cwd: bare })).stdout.trim(),
+      ).toBe(done?.headSha);
+      if (boundary === "verified" || boundary === "pushed") expect(done.headSha).toBe(checked ?? "missing");
+      if (["commit checkpoint", "git mutation", "unchanged", "verified", "pushed"].includes(boundary))
+        expect(done?.headSha).toBe(before);
+    } finally {
+      push.mockRestore();
+      mutation.mockRestore();
+      reopened?.close();
+    }
+  });
+
   test.each(["missing audit", "stale audit", "verified fallback", "skipped audit"])(
     "workflow publication refuses %s before any push",
     async (scenario) => {

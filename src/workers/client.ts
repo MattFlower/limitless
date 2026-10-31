@@ -733,6 +733,18 @@ export async function runWorker(
                   signal: jobSignal,
                 });
                 await addDetachedWorktree(cache, expectedSha, cwd, jobSignal);
+                if (path.startsWith("/worker/agent-jobs/")) {
+                  const history = await worktreeGit(
+                    ["git", "for-each-ref", "--format=%(objectname)", prefix],
+                    { cwd: cache, signal: jobSignal },
+                  );
+                  // Agent caches are private to the job and removed with its checkout.
+                  for (const sha of history.stdout.trim().split("\n").filter(Boolean))
+                    await worktreeGit(["git", "update-ref", `refs/limitless/iterations/${id}/${sha}`, sha], {
+                      cwd: cache,
+                      signal: jobSignal,
+                    });
+                }
               } finally {
                 const scope = processScope.getStore();
                 if (scope) scope.signal = new AbortController().signal;
