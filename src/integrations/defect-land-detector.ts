@@ -20,6 +20,7 @@ type Observation = Pick<
   FailureObservation,
   | "id"
   | "run_id"
+  | "round"
   | "handle_kind"
   | "handle_id"
   | "repo"
@@ -33,7 +34,7 @@ type Observation = Pick<
 >;
 type Reporter = Pick<ReturnType<typeof createDefectReporter>, "prepareSubmission" | "read">;
 const pending = `SELECT o.id,o.run_id,o.handle_kind,o.handle_id,o.repo,o.class,o.phase,o.history,
-  o.name,o.sha,o.observed_at,o.finalized_at
+  o.name,o.sha,o.observed_at,o.finalized_at,o.round
   FROM failure_observations o INDEXED BY failure_observations_defect_pending
   LEFT JOIN defect_observation_consumption c ON c.observation_id=o.id
   WHERE o.purpose='land' AND o.interim=0 AND o.class IS NOT NULL AND o.finalized_at IS NOT NULL
@@ -59,6 +60,8 @@ export async function detectLandDefects(
     const entry = Number.isSafeInteger(id) ? store.getLandEntry(id) : null;
     const repos = store.listRepos().filter((r) => r.slug.toLowerCase() === o.repo.toLowerCase());
     const source = repos[0];
+    const pr = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/iu.exec(entry?.prUrl ?? "");
+    const checked = pr?.[1]?.toLowerCase() === source?.slug.toLowerCase() ? Number(pr?.[2]) : NaN;
     if (
       !entry ||
       !source ||
@@ -66,6 +69,9 @@ export async function detectLandDefects(
       o.handle_kind !== "land" ||
       o.run_id !== `land:${entry.id}` ||
       entry.repo !== o.repo ||
+      o.round !== Number(handle?.[2]) ||
+      (entry.runId && store.getRun(entry.runId)?.repoId !== source.id) ||
+      !Number.isSafeInteger(checked) ||
       !Number.isSafeInteger(Number(handle?.[2])) ||
       Number(handle?.[2]) > entry.attempts
     ) {
@@ -73,8 +79,6 @@ export async function detectLandDefects(
       diagnostic("Defect observation identity unresolved");
       continue;
     }
-    const pr = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9]\d*)$/iu.exec(entry.prUrl);
-    const checked = pr?.[1]?.toLowerCase() === source.slug.toLowerCase() ? Number(pr?.[2]) : NaN;
     const commit = await reporter.prepareSubmission(String(o.id), {
       sourceId: source.id,
       detector: "land-check",

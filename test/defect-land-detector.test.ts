@@ -87,7 +87,7 @@ function harness(kind: "local" | "github" = "github") {
       run_id: `land:${entry.id}`,
       repo: source.slug,
       stage_id: 0,
-      round: 0,
+      round: 1,
       sha: "a".repeat(40),
       handle_kind: "land",
       handle_id: `${entry.id}:1`,
@@ -193,7 +193,7 @@ test("late finalization is observed and a checkpoint crash rolls back outbox and
   expect(h.consumed()).toEqual([]);
   h.store.observations.finalize(`land:${h.entry.id}`, {
     stageId: 0,
-    round: 0,
+    round: 1,
     sha: "a".repeat(40),
     purpose: "land",
     comparisons: [],
@@ -209,6 +209,87 @@ test("late finalization is observed and a checkpoint crash rolls back outbox and
   await h.scan();
   expect(h.outbox()).toHaveLength(1);
   expect(h.consumed()).toEqual([{ observation_id: id, status: "submitted" }]);
+});
+
+test("outbox insert crash leaves the observation pending across restart", async () => {
+  const h = harness();
+  h.enable(true, 100);
+  const id = h.seed();
+  h.store.db.exec(`CREATE TRIGGER crash BEFORE INSERT ON defect_outbox
+    BEGIN SELECT RAISE(ABORT, 'outbox crash'); END`);
+  await expect(h.scan()).rejects.toThrow("outbox crash");
+  expect(h.outbox()).toEqual([]);
+  expect(h.consumed()).toEqual([]);
+  h.store.db.exec("DROP TRIGGER crash");
+  h.reopen();
+  await h.scan();
+  await h.scan();
+  expect(h.outbox()).toHaveLength(1);
+  expect(h.consumed()).toEqual([{ observation_id: id, status: "submitted" }]);
+});
+
+test.each(["round", "foreign run", "missing run", "foreign PR", "malformed PR"])(
+  "identity conflict: %s is terminally unresolved before preparation",
+  async (conflict) => {
+    const h = harness();
+    h.enable(true, 100);
+    if (conflict === "foreign run") {
+      const foreign = h.store.upsertRepo({ ...h.source, id: "foreign", slug: "example/other" });
+      const run = h.store.createRun(foreign, { repo: foreign.slug, prompt: "context" });
+      h.store.db.query("UPDATE land_entries SET run_id=? WHERE id=?").run(run.id, h.entry.id);
+    }
+    if (conflict === "missing run")
+      h.store.db.query("UPDATE land_entries SET run_id='missing' WHERE id=?").run(h.entry.id);
+    if (conflict === "foreign PR" || conflict === "malformed PR")
+      h.store.db
+        .query("UPDATE land_entries SET pr_url=? WHERE id=?")
+        .run(
+          conflict === "foreign PR" ? "https://github.com/example/other/pull/7" : "invalid PR",
+          h.entry.id,
+        );
+    const id = h.seed("setup", 100, conflict === "round" ? { round: 2 } : {});
+    let preparations = 0;
+    const reporter = h.reporter();
+    const prepare = reporter.prepareSubmission;
+    reporter.prepareSubmission = (...args) => {
+      preparations++;
+      return prepare(...args);
+    };
+    const scan = () =>
+      detectLandDefects(
+        h.store,
+        reporter,
+        () => true,
+        (d) => h.diagnostics.push(d),
+      );
+    await scan();
+    expect(h.consumed()).toEqual([{ observation_id: id, status: "unresolved" }]);
+    expect(h.diagnostics).toEqual(["Defect observation identity unresolved"]);
+    expect(preparations).toBe(0);
+    expect(h.outbox()).toEqual([]);
+    await reporter.reconcile();
+    expect(h.posts).toEqual([]);
+    h.reopen();
+    await h.scan();
+    await h.reporter().reconcile();
+    expect(h.consumed()).toEqual([{ observation_id: id, status: "unresolved" }]);
+    expect(h.diagnostics).toEqual(["Defect observation identity unresolved"]);
+    expect(h.outbox()).toEqual([]);
+    expect(h.posts).toEqual([]);
+  },
+);
+
+test("matching PR repository casing and an entry without a run remain reportable", async () => {
+  const h = harness();
+  h.enable(true, 100);
+  h.store.db
+    .query("UPDATE land_entries SET run_id='', pr_url=? WHERE id=?")
+    .run("https://github.com/EXAMPLE/PRODUCT/pull/7", h.entry.id);
+  const id = h.seed();
+  await h.scan();
+  await h.reporter().reconcile();
+  expect(h.consumed()).toEqual([{ observation_id: id, status: "submitted" }]);
+  expect(h.posts).toHaveLength(1);
 });
 
 test("half-open windows survive enabled downtime and exclude disabled finalizations while retaining backlog", async () => {
@@ -445,7 +526,7 @@ test("mounted reporting publishes labelled factory evidence once and survives re
   h.seed(null, 100, { setup_eligible: 1 });
   const first = await mounted(h);
   h.store.observations.finalize(`land:${h.entry.id}`, {
-    round: 0,
+    round: 1,
     sha: "a".repeat(40),
     stageId: 0,
     comparisons: [],

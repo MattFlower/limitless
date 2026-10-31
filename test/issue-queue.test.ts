@@ -94,7 +94,7 @@ function acceptanceIssue(): QueueIssue {
 const defectApp = { kind: "app", botLogin: "factory[bot]", token: "fake-app-token" } as const;
 function defectIssue(): QueueIssue {
   const i = issue();
-  i.author = { login: defectApp.botLogin, __typename: "Bot" };
+  i.author = { login: "factory", __typename: "Bot" };
   i.body = `<!-- limitless-defect:v1:issue:${"a".repeat(64)}:${"b".repeat(32)} -->\nFactory evidence`;
   i.includesCreatedEdit = false;
   i.labels.nodes.push({ name: "defect" });
@@ -104,6 +104,7 @@ function defectIssue(): QueueIssue {
 
 test.each([
   ["trusted priority", null],
+  ["case-insensitive bot", null],
   ["no priority", "no priority label"],
   ["app priority", "priority application is untrusted or missing"],
   ["missing actor", "priority application is untrusted or missing"],
@@ -117,6 +118,7 @@ test.each([
   ["incomplete", "incomplete issue evidence"],
   ["unrelated bot", "untrusted author"],
   ["human masquerading", "untrusted author"],
+  ["human slug", "untrusted author"],
   ["unknown provenance", "untrusted author"],
 ] as const)("authenticated App defect queue admission: %s", (mode, reason) => {
   const i = defectIssue();
@@ -150,7 +152,9 @@ test.each([
     i.timelineItems.totalCount++;
   }
   if (mode === "incomplete") i.timelineItems.totalCount++;
-  if (mode === "unrelated bot") i.author = { login: "unrelated[bot]", __typename: "Bot" };
+  if (mode === "unrelated bot") i.author = { login: "unrelated", __typename: "Bot" };
+  if (mode === "case-insensitive bot") i.author = { login: "FaCtOrY", __typename: "Bot" };
+  if (mode === "human slug") i.author = { login: "factory", __typename: "User" };
   if (mode === "human masquerading") i.author = { login: defectApp.botLogin, __typename: "User" };
   if (mode === "unknown provenance") delete i.includesCreatedEdit;
   const trusted = ["owner"];
@@ -175,9 +179,7 @@ test("poll and final admission retain trusted-human approval for authenticated f
   e.actor = { login: "owner" };
   await h.advance(180_000);
   expect(h.requests).toHaveLength(1);
-  expect(h.runs()).toMatchObject([
-    { requestedBy: defectApp.botLogin, sourceRef: { kind: "issue", number: 1 } },
-  ]);
+  expect(h.runs()).toMatchObject([{ requestedBy: "factory", sourceRef: { kind: "issue", number: 1 } }]);
   expect(h.cfg.githubQueue?.trusted).toEqual(["owner"]);
 });
 

@@ -186,7 +186,11 @@ export function defectRecordStatus(
   const value = parsed.data;
   if (
     !value.author ||
-    value.author.login.toLowerCase() !== app.botLogin.toLowerCase() ||
+    value.author.login.toLowerCase() !==
+      (value.author.__typename === undefined
+        ? app.botLogin
+        : app.botLogin.replace(/\[bot\]$/iu, "")
+      ).toLowerCase() ||
     (value.author.type !== undefined && value.author.type !== "Bot") ||
     (value.author.__typename !== undefined && value.author.__typename !== "Bot") ||
     parseDefectEnvelope(value.body, kind)?.signature !== signature
