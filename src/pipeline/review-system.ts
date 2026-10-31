@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import type {
+  FinderPrompt,
   RepoReviewLens,
   ResolvedProfile,
   ReviewFinder,
@@ -30,13 +31,34 @@ const lensShape = {
     .max(2000, "lens focus is at most 2000 characters"),
 };
 const LensSchema = z.strictObject(lensShape);
+const FINDER_PROMPTS = [
+  "standard",
+  "adversarial",
+  "careful",
+  "probe",
+  "trace",
+  "adversarial-checklist",
+  "adversarial-thorough",
+  "adversarial-callers",
+] as const satisfies readonly FinderPrompt[];
+/** Prompts only evals may use; production schemas and rosters refuse them, and evals run them single. */
+const EVAL_ONLY_PROMPTS: readonly FinderPrompt[] = [
+  "probe",
+  "trace",
+  "adversarial-checklist",
+  "adversarial-thorough",
+  "adversarial-callers",
+];
+const isEvalOnly = (finder: { prompt: FinderPrompt }) => EVAL_ONLY_PROMPTS.includes(finder.prompt);
+const quoted = (names: readonly string[], joiner: "or" | "and") =>
+  `${names
+    .slice(0, -1)
+    .map((n) => `"${n}"`)
+    .join(", ")} ${joiner} "${names.at(-1)}"`;
 const FinderSchema = z
   .strictObject({
     target: TargetSchema.optional(),
-    prompt: z.enum(["standard", "adversarial", "careful", "probe", "trace", "adversarial-checklist"], {
-      error:
-        'finder prompt must be "standard", "adversarial", "careful", "probe", "trace" or "adversarial-checklist"',
-    }),
+    prompt: z.enum(FINDER_PROMPTS, { error: `finder prompt must be ${quoted(FINDER_PROMPTS, "or")}` }),
     lens: LensSchema.optional(),
     family: z.enum(["cross", "implementer"]).optional(),
     local: z.boolean().optional(),
@@ -107,13 +129,10 @@ const ReviewSystemBaseSchema = z
 export const ReviewSystemSchema = ReviewSystemBaseSchema.safeExtend({
   samples: z.never({ error: "samples is eval-only until adopted" }).optional(),
 })
-  .refine(
-    (system) => system.finders.every((f) => !["probe", "trace", "adversarial-checklist"].includes(f.prompt)),
-    {
-      path: ["finders"],
-      message: 'the "probe", "trace" or "adversarial-checklist" prompt is eval-only',
-    },
-  )
+  .refine((system) => !system.finders.some(isEvalOnly), {
+    path: ["finders"],
+    message: `the ${quoted(EVAL_ONLY_PROMPTS, "or")} prompt is eval-only`,
+  })
   .refine(
     (system) =>
       system.mode !== "single" ||
@@ -167,15 +186,10 @@ export const EvalSystemSchema = ReviewSystemBaseSchema.safeExtend({
     path: ["finders"],
     message: 'mode "single" takes no local finder option',
   })
-  .refine(
-    (system) =>
-      system.mode === "single" ||
-      system.finders.every((f) => !["probe", "trace", "adversarial-checklist"].includes(f.prompt)),
-    {
-      path: ["finders"],
-      message: 'the "probe", "trace" and "adversarial-checklist" prompts require mode "single"',
-    },
-  );
+  .refine((system) => system.mode === "single" || !system.finders.some(isEvalOnly), {
+    path: ["finders"],
+    message: `the ${quoted(EVAL_ONLY_PROMPTS, "and")} prompts require mode "single"`,
+  });
 
 /** Eval candidates: uniquely named, and every finder pinned so results never depend on live routing. */
 export const EvalReviewSystemsSchema = z
@@ -284,10 +298,7 @@ export const DEFAULT_ROSTERS: Record<ResolvedProfile, ReviewFinder[]> = {
 };
 const RosterSchema = z
   .array(FinderSchema)
-  .refine(
-    (roster) => roster.every((f) => !["probe", "trace", "adversarial-checklist"].includes(f.prompt)),
-    'the "probe", "trace" or "adversarial-checklist" prompt is eval-only',
-  )
+  .refine((roster) => !roster.some(isEvalOnly), `the ${quoted(EVAL_ONLY_PROMPTS, "or")} prompt is eval-only`)
   .refine((roster) => roster.some((f) => !f.local), "a roster needs at least one finder that is not local");
 const RostersSchema = z.strictObject({
   quick: RosterSchema.default(DEFAULT_ROSTERS.quick),
