@@ -40,6 +40,10 @@ export function bindClaim(
 }
 
 const scope = new AsyncLocalStorage<readonly ScopedClaim[]>();
+export function hasClaimScope(): boolean {
+  return !!scope.getStore()?.length;
+}
+
 export const claimScope = {
   run<T>(claims: readonly ScopedClaim[], fn: () => T): T {
     return scope.run(Object.freeze([...(scope.getStore() ?? []), ...claims]), fn);

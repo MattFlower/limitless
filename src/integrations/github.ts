@@ -16,11 +16,17 @@ export type GhRunner = (
   signal?: AbortSignal,
   stdin?: string,
   repo?: string,
+  dispatchGuard?: () => void,
 ) => Promise<string> | Promise<void>;
 
-export const runGh: GhRunner = async (args, signal, stdin, repo) => {
-  return (await githubSh(["gh", ...args], { cwd: process.cwd(), timeoutMs: 30_000, signal, stdin }, repo))
-    .stdout;
+export const runGh: GhRunner = async (args, signal, stdin, repo, dispatchGuard) => {
+  return (
+    await githubSh(
+      ["gh", ...args],
+      { cwd: process.cwd(), timeoutMs: 30_000, signal, stdin, dispatchGuard },
+      repo,
+    )
+  ).stdout;
 };
 
 const object = (value: unknown): Record<string, unknown> | null =>
