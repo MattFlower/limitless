@@ -194,6 +194,20 @@ test("production and adversarial openings are unchanged and the eval additions a
         "name that code by file and line",
       ],
     ],
+    [
+      "adversarial-calibrated",
+      [
+        "where this differs from the severity scale below, this decides",
+        "next month of normal factory operation",
+        "a missing or weak test on its own",
+        "stored or shown unredacted",
+        "Lower a finding to minor rather than dropping it",
+      ],
+    ],
+    [
+      "adversarial-thorough-calibrated",
+      ["Do not stop at the first finding", "next month of normal factory operation"],
+    ],
   ] as const) {
     const variant = reviewPrompt({ ...input, finder });
     expect(variant.startsWith(`${opening}\n\n`)).toBe(true);

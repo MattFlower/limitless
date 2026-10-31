@@ -806,6 +806,26 @@ Both are refused by production schemas and rosters and run only in single mode (
 `samples: 2`). Measure on escapes-dev and the dev clean cases at k=2 with the two-judge matcher,
 against the stored adversarial trials for the same model; the decision rule is unchanged.
 
+Result on GPT-6.1 Terra (escapes-dev, 80 defects, and 16 dev clean cases, k=2): judged recall rose
+from 28.7% (adversarial) to 33.8% (thorough) and 30.6% (callers), against 16.9% for production, but
+clean false blocks were 6–8 of 32 against production's 2. A blind two-vendor audit of every
+clean-case block found nearly all of them pointed at real issues that both auditors could confirm,
+which the reviewer had rated major although their triggers were contrived or their cost was only
+diagnostic or in tests. The gap is severity, not detection.
+
+## Appendix D. Severity calibration for the adversarial prompt (2026-10-31)
+
+The base prompt's severity line ("major = should fix before merge") has no trigger bar, and the
+adversarial framing assumes failure. `adversarial-calibrated` and `adversarial-thorough-calibrated`
+append the owner's labelling rubric (consequence × trigger: "would this plausibly happen in the next
+month of normal factory operation?") to the adversarial and thorough prompts, and say it overrides
+the base scale where they differ. The block keeps the rubric's exceptions (an unredacted secret and
+an unmet explicit requirement stay at least major) and asks the reviewer to lower a finding rather
+than drop it, so minor findings are still recorded. It is general on purpose: it names none of the
+dev clean cases' blocks, so the held-out clean set gives the verdict. Watch the under-rated count
+(detected, not blocking) for recall lost to calibration; the `samples: 2` union keeps the higher
+severity of duplicates, so a calibrated union is the most sensitive arm.
+
 ## References (new in this note; others in research/08)
 
 - AnyPoC, arXiv 2604.11950 [arXiv]

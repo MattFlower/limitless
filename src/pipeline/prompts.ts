@@ -450,14 +450,21 @@ function gateTable(cmp: GateComparison[]): string {
 
 const PATCH_LIMIT = 40_000;
 
+const THOROUGH =
+  "Do not stop at the first finding. After each plausible issue, check its second-order failures (empty state, stale state, retries, restarts, rollback to the previous release), then continue through every changed file until each has been checked against every rubric item. If you have fewer findings than the number of changed files or four, whichever is smaller, make one more pass over the largest changed file and over every removed or replaced block. Never invent a finding to reach that number: an empty pass is a valid result.";
+/** The owner's labelling rubric (consequence x trigger), so blocking severity matches what gold counts. */
+const CALIBRATION =
+  'Set severity by consequence and trigger; where this differs from the severity scale below, this decides. For each finding ask: "would this plausibly happen in the next month of normal factory operation?" Deploys restart the daemon daily, so restart windows count unless they last milliseconds. Blocker: a realistic trigger that loses or corrupts persisted state, leaks a secret or private data, breaks a trust or confinement boundary, or stops the factory or deploys. Major: a realistic trigger with real harm: a wrong result, a silent failure, lost or repeated work, a check the change claims to add that a realistic input bypasses, or a compatibility break with the previous release. Minor: a contrived trigger (an unusual input, configuration, environment or timing the request does not ask to handle), or a cost that is only cosmetic, diagnostic or in tests, such as a missing or weak test on its own. Two cases are at least major whatever the trigger: a secret or credential stored or shown unredacted, and a requirement the request states explicitly that the change does not deliver. Behaviour the repository\'s own rules adopt is not a defect. Lower a finding to minor rather than dropping it; minor findings are still recorded.';
+
 /**
  * Eval-only additions appended to the adversarial framing, from the lab review-prompt comparison:
  * Codex `/review` and OpenAI's completeness guidance (thorough), Claude Code's caller and
- * removed-behaviour angles (callers).
+ * removed-behaviour angles (callers); calibrated ones add the labelling rubric's severity line.
  */
 const ADVERSARIAL_ADDITIONS = {
-  "adversarial-thorough":
-    "Do not stop at the first finding. After each plausible issue, check its second-order failures (empty state, stale state, retries, restarts, rollback to the previous release), then continue through every changed file until each has been checked against every rubric item. If you have fewer findings than the number of changed files or four, whichever is smaller, make one more pass over the largest changed file and over every removed or replaced block. Never invent a finding to reach that number: an empty pass is a valid result.",
+  "adversarial-thorough": THOROUGH,
+  "adversarial-calibrated": CALIBRATION,
+  "adversarial-thorough-calibrated": `${THOROUGH}\n\n${CALIBRATION}`,
   "adversarial-callers": `Before applying the rubric, trace the change beyond the diff:
 1. For every function, method or exported symbol the diff changes, find its callers and alternate entry points with rg, including files outside the diff, and check each against the new behaviour: a new precondition, a changed return shape, a new error or a new ordering.
 2. For every line the diff deletes or replaces, name the invariant it enforced and find where the new code re-establishes it.
