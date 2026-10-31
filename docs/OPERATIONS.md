@@ -647,6 +647,31 @@ proxied browsers also sign in to Limitless over an HTTPS public origin. Keep bas
 authentication on the Access List, with NPM's “Satisfy Any”
 disabled so both the source and the credentials are required.
 
+## Defect reporter delivery status
+
+The defect reporter (`src/integrations/defect-reporter.ts`) is implemented but inactive: no
+detector, daemon timer or operator configuration mounts it yet. The `[github.defects]` setting
+belongs to D1a.3.
+
+When it is enabled, enable `[github.defects]` on **exactly one coordinator**. A second enabled
+coordinator can create duplicate issues and spends its own local daily cap (default ten new
+issues per UTC day). Later occurrences enumerate every legitimate match and comment on the oldest
+issue, so duplicates converge but are not removed. Cross-coordinator serialization, a shared cap
+and ownership transfer belong to #902; the local database is not a fleet-wide guarantee.
+Preserve the database and pinned destination when disabling or rolling back. Moving to a
+different coordinator or database is not a supported ownership-transfer procedure.
+
+Submission is composed with the detector's checkpoint: await
+`prepareSubmission(sourceKey, finding)`, then call the returned function inside the checkpoint
+transaction. Only guarded publication bytes and the posting App login are stored.
+`reconcile()` delivers with the GitHub App only and always labels new issues `defect`. Each pass
+reconciles unresolved sends first and makes at most 32 GitHub calls.
+
+A record whose request may have reached GitHub but cannot be found stays `uncertain` and pauses
+every reporter POST. A record whose GitHub object is edited, conflicting or unlabelled stays
+`held`. Neither is retried automatically, not even after a restart or a later day. The owner
+reconciles them on GitHub; an older daemon leaves the outbox untouched.
+
 ## Website
 
 Build the static website with `bun scripts/build-site.ts`, then serve `site-dist/` with
