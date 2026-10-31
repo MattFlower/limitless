@@ -13,11 +13,18 @@ export function mapClaimInterruption(
   now = Date.now(),
 ): void {
   store.transaction(() => {
+    const lost = error instanceof ClaimLostError;
+    for (const invocation of store.listInvocations(runId))
+      if (invocation.status === "running")
+        store.updateInvocation(invocation.id, {
+          status: "cancelled",
+          error: lost ? "interrupted: claim lost" : "interrupted: claim wait",
+          finishedAt: now,
+        });
     if (finalizeRecordedCancellation(store, runId, localCheckpointer(store))) return;
     const run = store.getRun(runId);
     if (!run || TERMINAL_STATUSES.includes(run.status)) return;
     const state = store.getRunState<Partial<RunState>>(runId) ?? {};
-    const lost = error instanceof ClaimLostError;
     state.githubWait = lost
       ? undefined
       : {
@@ -35,12 +42,5 @@ export function mapClaimInterruption(
       },
       state,
     );
-    for (const invocation of store.listInvocations(runId))
-      if (invocation.status === "running")
-        store.updateInvocation(invocation.id, {
-          status: "cancelled",
-          error: lost ? "interrupted: claim lost" : "interrupted: claim wait",
-          finishedAt: now,
-        });
   });
 }

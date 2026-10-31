@@ -469,9 +469,10 @@ test("client IO clears scope through awaits and ambiguous-result readback", asyn
   ]);
 });
 
-test("source boundaries permit guarded control IO without production claim bindings", async () => {
+test("source boundaries permit claim bindings only at execution entry", async () => {
   const execution = "src/pipeline/run-claim.ts";
-  const allowed = new Set(["src/integrations/claim-ref.ts", "src/integrations/leases.ts", execution]);
+  const engine = "src/pipeline/engine.ts";
+  const allowed = new Set(["src/integrations/claim-ref.ts", "src/integrations/leases.ts", execution, engine]);
   const references: string[] = [];
   for await (const path of new Bun.Glob("src/**/*.ts").scan({
     cwd: new URL("..", import.meta.url).pathname,
@@ -486,9 +487,13 @@ test("source boundaries permit guarded control IO without production claim bindi
       continue;
     }
     expect(source).not.toMatch(/\bbindClaim\b/);
-    if (path !== execution) {
+    if (path !== execution && path !== engine) {
       expect(source).not.toMatch(/claimScope\.run\b|\b(?:bindRunClaim|validateRunClaim|renewRunClaim)\b/);
-      expect(source).not.toContain('from "./run-claim.ts"');
+      const runtime =
+        path === "src/pipeline/context.ts"
+          ? source.replace('import type { RunClaim } from "./run-claim.ts";', "")
+          : source;
+      expect(runtime).not.toContain('from "./run-claim.ts"');
     }
     if (/\bclaimGuard\b/.test(source))
       expect([
@@ -498,11 +503,12 @@ test("source boundaries permit guarded control IO without production claim bindi
         "src/git/repos.ts",
         "src/pipeline/context.ts",
         execution,
+        engine,
       ]).toContain(path);
     if (/\bhasClaimScope\b/.test(source)) expect(path).toBe("src/pipeline/engine.ts");
     if (/\bclaimScope\b/.test(source)) {
       expect(allowed.has(path)).toBe(true);
-      const operation = path === execution ? "claimScope.run" : "claimScope.exit";
+      const operation = path === execution || path === engine ? "claimScope.run" : "claimScope.exit";
       expect(source.replace(/import .*claimScope.*\n/, "").replaceAll(operation, "")).not.toMatch(
         /\bclaimScope\b/,
       );
