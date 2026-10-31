@@ -7,7 +7,7 @@ import { type AgentJobRequest, PairingLimitError, type WorkerStore } from "../db
 import type { GateRequest } from "../gates/executor.ts";
 import { loadPrivateStrings, privateStringsDigest } from "../gates/private.ts";
 import { worktreeGit } from "../git/command.ts";
-import { cachePath, withRepoLock } from "../git/repos.ts";
+import { cachePath, iterationRefs, withRepoLock } from "../git/repos.ts";
 import { AgentEvents, AgentFailure, AgentResultReport } from "../workers/agent-protocol.ts";
 import { CheckEvent, Claim, Heartbeat, LeaseRequest, Pair, Result } from "../workers/protocol.ts";
 import { certificate } from "../workers/tls.ts";
@@ -234,6 +234,7 @@ export async function startWorkerListener(
               job.parent_sha,
               ...(request.baseSha ? [request.baseSha] : []),
               ...(request.expectedRemoteSha ? [request.expectedRemoteSha] : []),
+              ...(run ? (await iterationRefs(cachePath(paths, repo), run.id)).map((ref) => ref.sha) : []),
             ],
             AbortSignal.any([req.signal, closing.signal]),
           );
