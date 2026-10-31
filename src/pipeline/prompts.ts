@@ -450,8 +450,25 @@ function gateTable(cmp: GateComparison[]): string {
 
 const PATCH_LIMIT = 40_000;
 
+/**
+ * Eval-only additions appended to the adversarial framing, from the lab review-prompt comparison:
+ * Codex `/review` and OpenAI's completeness guidance (thorough), Claude Code's caller and
+ * removed-behaviour angles (callers).
+ */
+const ADVERSARIAL_ADDITIONS = {
+  "adversarial-thorough":
+    "Do not stop at the first finding. After each plausible issue, check its second-order failures (empty state, stale state, retries, restarts, rollback to the previous release), then continue through every changed file until each has been checked against every rubric item. If you have fewer findings than the number of changed files or four, whichever is smaller, make one more pass over the largest changed file and over every removed or replaced block. Never invent a finding to reach that number: an empty pass is a valid result.",
+  "adversarial-callers": `Before applying the rubric, trace the change beyond the diff:
+1. For every function, method or exported symbol the diff changes, find its callers and alternate entry points with rg, including files outside the diff, and check each against the new behaviour: a new precondition, a changed return shape, a new error or a new ordering.
+2. For every line the diff deletes or replaces, name the invariant it enforced and find where the new code re-establishes it.
+3. Read the whole enclosing function of each hunk; defects in its unchanged lines are in scope when the change exposes them.
+4. A claim that other code breaks must name that code by file and line.`,
+} as const;
+type AdversarialAddition = keyof typeof ADVERSARIAL_ADDITIONS;
+const isAddition = (finder: FinderPrompt): finder is AdversarialAddition => finder in ADVERSARIAL_ADDITIONS;
+
 /** How each panel finder prompt frames the review; a separate verifier checks every finding. */
-const FINDER_FRAMING: Record<Exclude<FinderPrompt, "adversarial-checklist">, string> = {
+const FINDER_FRAMING: Record<Exclude<FinderPrompt, "adversarial-checklist" | AdversarialAddition>, string> = {
   standard:
     "Report every issue you believe is real, with your confidence and a severity estimate. Do not filter by importance or certainty: a separate step verifies each finding against the code before anything is acted on.",
   adversarial:
@@ -463,6 +480,12 @@ const FINDER_FRAMING: Record<Exclude<FinderPrompt, "adversarial-checklist">, str
   probe:
     "For each proposed blocker or major finding, reproduce the defect with a probe: a throwaway test or command, with temporary files under TMPDIR. Run only the affected test files; never run the full suite. Put the attempted command and its observed result in the finding's detail. If a completed probe does not reproduce the defect, lower the finding to minor or omit it. If sandbox or environment limits prevent the probe from running (for example nested Seatbelt, loopback servers, or a Linux-only path), retain its severity and name the attempted command and the error in detail.",
 };
+const finderFraming = (finder: FinderPrompt) =>
+  finder === "adversarial-checklist"
+    ? FINDER_FRAMING.adversarial
+    : isAddition(finder)
+      ? `${FINDER_FRAMING.adversarial}\n\n${ADVERSARIAL_ADDITIONS[finder]}`
+      : FINDER_FRAMING[finder];
 
 export function reviewPrompt(input: {
   prompt: string;
@@ -527,7 +550,7 @@ export function reviewPrompt(input: {
     : "A different AI model implemented the change below.";
   return `${
     input.finder
-      ? `You are ${input.finder.startsWith("adversarial") ? "an adversarial" : "a"} code reviewer. ${author} ${FINDER_FRAMING[input.finder === "adversarial-checklist" ? "adversarial" : input.finder]}`
+      ? `You are ${input.finder.startsWith("adversarial") ? "an adversarial" : "a"} code reviewer. ${author} ${finderFraming(input.finder)}`
       : `You are an adversarial code reviewer. ${author} Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.`
   }
 ${
