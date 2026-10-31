@@ -2109,7 +2109,8 @@ test.each(["remoteSha", "resume", "adopt"])(
     registerGithub(f, bare);
     try {
       const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
-      await waitFor(f, run.id, ["failed", "needs_human", "succeeded"]);
+      expect(await waitFor(f, run.id, ["cancelled", "failed", "needs_human", "succeeded"])).toBe("cancelled");
+      expect(f.store.getRun(run.id)?.error).toBe("superseded: claim lost");
       expect(reached).toBe(true);
       expect(observed).toBe(sentinel);
       expect(locals()).toBe(0);

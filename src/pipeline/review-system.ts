@@ -40,6 +40,8 @@ const FINDER_PROMPTS = [
   "adversarial-checklist",
   "adversarial-thorough",
   "adversarial-callers",
+  "adversarial-calibrated",
+  "adversarial-thorough-calibrated",
 ] as const satisfies readonly FinderPrompt[];
 /** Prompts only evals may use; production schemas and rosters refuse them, and evals run them single. */
 const EVAL_ONLY_PROMPTS: readonly FinderPrompt[] = [
@@ -48,6 +50,8 @@ const EVAL_ONLY_PROMPTS: readonly FinderPrompt[] = [
   "adversarial-checklist",
   "adversarial-thorough",
   "adversarial-callers",
+  "adversarial-calibrated",
+  "adversarial-thorough-calibrated",
 ];
 const isEvalOnly = (finder: { prompt: FinderPrompt }) => EVAL_ONLY_PROMPTS.includes(finder.prompt);
 const quoted = (names: readonly string[], joiner: "or" | "and") => {

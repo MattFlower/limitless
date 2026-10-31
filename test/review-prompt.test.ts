@@ -175,6 +175,7 @@ test("production and adversarial openings are unchanged and the eval additions a
     "You are an adversarial code reviewer. A different AI model implemented the change below. Assume the change can fail, and find out how. Trace bad and boundary inputs, retries, partial failure, ordering, restarts, and version skew between old and new code or data. Give no credit for intent: judge what the code does, not what its comments, names or commit messages say. Report every issue you believe is real, with your confidence; a separate step verifies each finding.",
   );
   const rest = adversarial.slice(opening.length);
+  const blocks = new Map<string, string>();
   for (const [finder, instructions] of [
     [
       "adversarial-thorough",
@@ -194,11 +195,30 @@ test("production and adversarial openings are unchanged and the eval additions a
         "name that code by file and line",
       ],
     ],
+    [
+      "adversarial-calibrated",
+      [
+        "Severity alone decides whether a finding blocks",
+        "next month of normal factory operation",
+        "a new test that fails in normal runs stops deploys",
+        "stored or shown unredacted",
+        "Process asks (a report, measurements, PR text) are not code defects",
+        "Lower a finding to minor rather than dropping it",
+      ],
+    ],
+    [
+      "adversarial-thorough-calibrated",
+      ["Do not stop at the first finding", "next month of normal factory operation"],
+    ],
   ] as const) {
     const variant = reviewPrompt({ ...input, finder });
     expect(variant.startsWith(`${opening}\n\n`)).toBe(true);
     expect(variant.endsWith(rest)).toBe(true);
     const block = variant.slice(opening.length + 2, variant.length - rest.length);
     for (const instruction of instructions) expect(block).toContain(instruction);
+    blocks.set(finder, block);
   }
+  expect(blocks.get("adversarial-thorough-calibrated")).toBe(
+    `${blocks.get("adversarial-thorough")}\n\n${blocks.get("adversarial-calibrated")}`,
+  );
 });

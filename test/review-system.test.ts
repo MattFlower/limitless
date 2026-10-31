@@ -69,7 +69,7 @@ const invalid: [string, string][] = [
   [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
-    'finder prompt must be "standard", "adversarial", "careful", "probe", "trace", "adversarial-checklist", "adversarial-thorough" or "adversarial-callers"',
+    'finder prompt must be "standard", "adversarial", "careful", "probe", "trace", "adversarial-checklist", "adversarial-thorough", "adversarial-callers", "adversarial-calibrated" or "adversarial-thorough-calibrated"',
   ],
   [file(system({ finders: [] })), "exactly one finder"],
   [file(system({ finders: [system().finders[0], system().finders[0]] })), "exactly one finder"],
@@ -111,8 +111,10 @@ test("single prompt variants are eval-only and retain the single-mode restrictio
     "adversarial-checklist",
     "adversarial-thorough",
     "adversarial-callers",
+    "adversarial-calibrated",
+    "adversarial-thorough-calibrated",
   ] as const) {
-    if (prompt === "adversarial-thorough" || prompt === "adversarial-callers") {
+    if (prompt.startsWith("adversarial-") && prompt !== "adversarial-checklist") {
       // Production and rosters refuse them; evals run them single, with or without samples.
       for (const profile of ["quick", "standard", "deep"])
         expect(() => parseReviewRosters({ [profile]: [{ prompt }] })).toThrow("eval-only");
