@@ -315,7 +315,9 @@ repositories not enabled. One repository has one admission mode, never two compe
 Do not adopt older local-only runs without an explicit validated export of all required state;
 let them finish locally before cutover. An incompatible binary cannot claim shared work.
 Rollback drains shared work and disables shared admission before restoring the local release;
-the old daemon cannot safely resume portable runs from partial SQLite projections. Additive
+the old daemon cannot safely resume portable runs from partial SQLite projections. Older
+observers also lack claim-loss suppression: restarting one against stale shared projections is
+not a supported rollback. C13 owns reconciliation/adoption of the surviving logical run. Additive
 schemas preserve old local runs; shared mode configuration must not be passed to older binaries
 that reject new keys. No fleet-wide simultaneous upgrade is required before opting in.
 
