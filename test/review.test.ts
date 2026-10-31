@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import { type AgentResult, emptyUsage } from "../src/harness/types.ts";
+import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { MERGE_RULES } from "../src/pipeline/panel-merge.ts";
 import * as prompts from "../src/pipeline/prompts.ts";
 import { formatReviewFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
@@ -2293,3 +2294,54 @@ describe("two-sample single review", () => {
     },
   );
 });
+
+for (const mode of ["samples", "panel"] as const) {
+  test.each(
+    ["ordinary+wait", "ordinary+loss", "wait+loss"].flatMap((pair) => [
+      pair,
+      pair.split("+").reverse().join("+"),
+    ]),
+  )(`${mode} preserves original claim precedence: %s`, async (pair) => {
+    const errors = pair
+      .split("+")
+      .map((kind) =>
+        kind === "loss"
+          ? new ClaimLostError()
+          : kind === "wait"
+            ? new ClaimWaitError("lease")
+            : new Error("ordinary"),
+      );
+    const expected =
+      errors.find((e) => e instanceof ClaimLostError) ?? errors.find((e) => e instanceof ClaimWaitError);
+    const waits = [Promise.withResolvers<never>(), Promise.withResolvers<never>()];
+    const samples: unknown[] = [];
+    const work = runReview(
+      {
+        invoke: async (_request, finder, sample) =>
+          waits[mode === "samples" ? (sample ?? 0) : finder]?.promise ??
+          Promise.reject(new Error("unexpected invocation")),
+        onSample: (sample) => samples.push(sample),
+      },
+      {
+        prompt,
+        timeoutMs: 1234,
+        system:
+          mode === "samples"
+            ? { mode: "single", samples: 2, finders: [{ prompt: "adversarial" }] }
+            : { mode: "panel", finders: [{ prompt: "adversarial" }, { prompt: "adversarial", local: true }] },
+      },
+    ).catch((e) => e);
+    waits[1]?.reject(errors[1]);
+    waits[0]?.reject(errors[0]);
+    expect(await work).toBe(expected);
+    expect(
+      samples.filter(
+        (s) =>
+          typeof s === "object" &&
+          s !== null &&
+          "result" in s &&
+          (s.result as AgentResult).error?.includes("Claim"),
+      ),
+    ).toEqual([]);
+  });
+}

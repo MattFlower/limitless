@@ -3,6 +3,7 @@ import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import { redactCredentials, registerCredential, sh } from "../util/proc.ts";
+import { claimGuard } from "./claim-guard.ts";
 
 export type GitHubIdentity = { kind: "owner" } | { kind: "app"; token: string; botLogin: string };
 export class GitHubIdentityError extends Error {}
@@ -170,6 +171,14 @@ export async function githubSh(cmd: string[], opts: Parameters<typeof sh>[1], re
   const references = githubRepos(cmd.slice(1));
   if (repo && references.some((ref) => ref.toLowerCase() !== repo.toLowerCase()))
     throw new GitHubIdentityError(`GitHub repository arguments disagree with explicit repository ${repo}`);
+  const suppliedGuard = opts.dispatchGuard;
+  opts = {
+    ...opts,
+    dispatchGuard: () => {
+      suppliedGuard?.();
+      claimGuard();
+    },
+  };
   const identity = await githubIdentity(repo ?? references[0]);
   return sh(
     cmd,

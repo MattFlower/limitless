@@ -750,6 +750,7 @@ async function stopMarkedProcesses(
 }
 
 export interface ProcOptions {
+  dispatchGuard?: () => void;
   cmd: string[];
   cwd: string;
   env: Record<string, string>;
@@ -884,6 +885,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         ? [opts.cwd, ...(scratch ? [scratch] : [])].map((directory) => realpathSync(directory))
         : [];
     const spawnedAt = darwin?.darwinClock() ?? 0n;
+    opts.dispatchGuard?.();
     scope?.beforeSpawn?.(marker);
     const recordDiscovery = (group: number, leader: DarwinInvocationLeader | null) => {
       const cleanups = scope?.cleanups ?? processCleanupStore.getStore();
@@ -1181,6 +1183,7 @@ export async function sh(
     signal?: AbortSignal;
     encoding?: BufferEncoding;
     redactOutput?: boolean;
+    dispatchGuard?: () => void;
   },
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; timedOut?: boolean }> {
   opts.signal?.throwIfAborted();
@@ -1195,6 +1198,7 @@ export async function sh(
     tailLimit: SH_OUTPUT_LIMIT,
     encoding: opts.encoding,
     redactOutput: opts.redactOutput,
+    dispatchGuard: opts.dispatchGuard,
     ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
   });
   // Cancellation must stop command sequences even when a nonzero exit is allowed.

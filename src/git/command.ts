@@ -104,8 +104,15 @@ async function runGit(
   guard?: () => void,
 ) {
   const run = async (cmd: string[], opts: Parameters<typeof sh>[1]) => {
-    // All asynchronous Git preparation is complete; no await may precede execution here.
-    guard?.();
+    const suppliedGuard = opts.dispatchGuard;
+    if (guard)
+      opts = {
+        ...opts,
+        dispatchGuard: () => {
+          suppliedGuard?.();
+          guard();
+        },
+      };
     try {
       return await execute(cmd, opts);
     } catch (error) {
