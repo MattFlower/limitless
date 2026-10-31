@@ -97,12 +97,16 @@ test("cancelling a parked run cleans its iteration refs without waiting for GC",
   }
 });
 
-test("terminal iteration refs are removed without a worktree; parked and interrupted history survives", async () => {
+test.each(["cache", "legacy"])("terminal refs in %s are cleaned without a worktree", async (owner) => {
   const statuses: RunStatus[] = [...TERMINAL_STATUSES, "queued", "running", "waiting", "waiting_input"];
   const records = [];
   for (const status of statuses) {
     const record = run(status, 0, status !== "failed");
-    const cwd = await worktree(record.id);
+    const cwd = owner === "legacy" ? join(cfg.paths.work, record.id) : await worktree(record.id);
+    if (owner === "legacy") {
+      await sh(["git", "worktree", "add", "-b", record.id, cwd], { cwd: repoDir });
+      await recordWorktree(cwd);
+    }
     const base = await headSha(cwd);
     writeFileSync(join(cwd, "iteration.txt"), "first\n");
     await commitAll(cwd, "first");
@@ -113,7 +117,7 @@ test("terminal iteration refs are removed without a worktree; parked and interru
     await removeWorktree(cfg.paths, repo, cwd);
     records.push({ ...record, status, previous });
   }
-  const cache = cachePath(cfg.paths, repo);
+  const cache = owner === "legacy" ? repoDir : cachePath(cfg.paths, repo);
   await worktreeGit(
     ["git", "update-ref", "refs/limitless/iterations/unrelated/keep", records[0]?.previous ?? ""],
     { cwd: cache },

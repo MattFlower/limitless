@@ -682,10 +682,11 @@ export async function iterationRefs(cwd: string, runId: string) {
 }
 
 export async function removeIterationRefs(paths: Paths, repo: Repo, runId: string): Promise<void> {
-  const cwd = cachePath(paths, repo);
-  if (!existsSync(cwd)) return;
-  for (const { ref } of await iterationRefs(cwd, runId))
-    await worktreeGit(["git", "update-ref", "-d", ref], { cwd });
+  for (const cwd of [cachePath(paths, repo), ...(repo.kind === "local" ? [repo.localPath] : [])]) {
+    if (!cwd || !existsSync(cwd)) continue;
+    for (const { ref } of await iterationRefs(cwd, runId))
+      await worktreeGit(["git", "update-ref", "-d", ref], { cwd });
+  }
 }
 
 /** Commit everything. With a boundary, replace the iteration history above it with one commit. */
