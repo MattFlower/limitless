@@ -143,6 +143,7 @@ export async function prepareDefectPublication(
       sourceIdentity,
       machineRole: ["coordinator", "worker"].includes(machineRole) ? machineRole : "unknown",
       introducingPr: "unknown",
+      suspectedCausalStage: kind === "defect" ? "gate environment" : "unknown",
     });
     const longest = Math.max(2, ...[...encoded.matchAll(/`+/gu)].map(([run]) => run.length));
     const fence = "`".repeat(longest + 1);
