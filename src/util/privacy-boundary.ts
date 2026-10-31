@@ -239,7 +239,7 @@ type Options = {
 type Evidence = Projection & {
   policy: Prepared;
   registry: typeof privacyRegistry;
-  generation: ReturnType<typeof currentPrivacyGeneration>;
+  generation: ReturnType<typeof currentPrivacyGeneration> | undefined;
   limits: typeof privacyLimits;
   beforeIssue?: () => void;
 };
@@ -252,14 +252,21 @@ const withheld = (state: Evidence, reason: Reason): Evidence => ({
 });
 function context(policy: Prepared, options: Options): Evidence {
   const registry = options.registry ?? privacyRegistry;
-  const generation = "refused" in policy ? currentPrivacyGeneration(registry) : policy.generation;
+  let generation: Evidence["generation"];
+  try {
+    generation = "refused" in policy ? currentPrivacyGeneration(registry) : policy.generation;
+  } catch {
+    // A refusal remains possible without generation authority.
+  }
   const limits = { ...privacyLimits, ...("refused" in policy ? {} : policy.limits), ...options.limits };
   return {
     text: "",
     truncated: false,
     checkedComplete: false,
     withheld: false,
-    policyDigest: `privacy/${generation.policy}/${generation.credentials}/${generation.checker}`,
+    policyDigest: generation
+      ? `privacy/${generation.policy}/${generation.credentials}/${generation.checker}`
+      : "privacy/unavailable",
     policy: "refused" in policy ? policy : { ...policy, limits },
     registry,
     generation,
@@ -268,10 +275,11 @@ function context(policy: Prepared, options: Options): Evidence {
   };
 }
 function current(state: Evidence): boolean {
+  if (!state.generation) return false;
   try {
     const generation = currentPrivacyGeneration(state.registry);
     return (Object.keys(generation) as (keyof typeof generation)[]).every(
-      (key) => state.generation[key] === generation[key],
+      (key) => state.generation?.[key] === generation[key],
     );
   } catch {
     return false;
@@ -418,10 +426,10 @@ export function concat(
     if (
       components.some(
         (item) =>
-          item.generation.identity !== state.generation.identity ||
-          item.generation.policy !== state.generation.policy ||
-          item.generation.credentials !== state.generation.credentials ||
-          item.generation.checker !== state.generation.checker,
+          item.generation?.identity !== state.generation?.identity ||
+          item.generation?.policy !== state.generation?.policy ||
+          item.generation?.credentials !== state.generation?.credentials ||
+          item.generation?.checker !== state.generation?.checker,
       )
     )
       return issue(withheld(state, "stale-generation"));

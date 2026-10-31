@@ -191,6 +191,40 @@ test("policy, credential and checker generations guard issuance and every reuse"
   const repeated = f.protect("clean");
   expect(consume(value).policyDigest).toBe(consume(repeated).policyDigest);
 });
+test.each([
+  [{ kind: "complete" }, false],
+  [{ kind: "cut", truncated: true }, true],
+  [{ kind: "legacy-unknown" }, undefined],
+] as const)("refused policies contain generation lookup failures for %j", (provenance, truncated) => {
+  const source = "synthetic-sensitive-source";
+  const exception = "synthetic-sensitive-policy-error";
+  let failing = false;
+  const registry = createPrivacyRegistry(undefined, () => {
+    if (failing) throw new Error(exception);
+    return "v1";
+  });
+  registry.replacePolicy([{ value: "synthetic-policy-entry", entry: 0 }]);
+  const policy = preparePrivacyPolicy(capturePrivacySnapshot(registry), { limits: { entries: 0 } });
+  expect(policy).toEqual({ refused: "entries-count" });
+  failing = true;
+  const value = protectText({ text: source, provenance, policy }, { registry });
+  expect(Object.isFrozen(value)).toBe(true);
+  expect(Object.keys(value)).toEqual([]);
+  const result = consume(value);
+  expect(result).toEqual({
+    text: marker,
+    truncated,
+    checkedComplete: false,
+    withheld: true,
+    policyDigest: "privacy/unavailable",
+    reason: "stale-generation",
+  });
+  for (const sentinel of [source, exception, "synthetic-policy-entry"])
+    expect(JSON.stringify([value, result])).not.toContain(sentinel);
+  expect(consume(cutPrefix(value, 0))).toEqual(result);
+  failing = false;
+  expect(consume(value)).toEqual(result);
+});
 test("limits refuse wholly with fixed reasons at equality and cap plus one", () => {
   for (const [key, text, cap, code] of [
     ["inputUnits", "é😀", 3, "input-length"],
