@@ -1132,10 +1132,13 @@ for (const writable of [true, false]) {
       const command = `python3 '${join(spec.cwd, "verify-probe.py")}'`;
       const scratch = spec.scratchDir as string;
       // An agent may run the exact command from anywhere; only the OS keeps the worktree unwritable.
+      // Not from "/": process cleanup claims new orphans whose cwd is under the invocation's cwd, and
+      // every launchd agent's is "/", so one starting meanwhile was claimed and signalled.
+      const elsewhere = mkdtempSync(join(tmpdir(), "limitless-verify-elsewhere-"));
       if (!writable) chmodSync(spec.cwd, 0o555);
       try {
         const run = await sh(["/bin/sh", "-c", command], {
-          cwd: "/",
+          cwd: elsewhere,
           env: { ...process.env, TMPDIR: scratch, TMP: scratch, TEMP: scratch } as Record<string, string>,
           allowFail: true,
         });
@@ -1148,6 +1151,7 @@ for (const writable of [true, false]) {
         });
       } finally {
         if (!writable) chmodSync(spec.cwd, 0o755);
+        rmSync(elsewhere, { recursive: true, force: true });
       }
       return { ...result, finalText: "done" };
     }, target);
