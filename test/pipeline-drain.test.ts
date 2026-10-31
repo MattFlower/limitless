@@ -19,7 +19,7 @@ import {
 let home: string;
 let repoDir: string;
 let factory: Factory | null = null;
-const { start } = pipelineSetup({
+const { start, wait } = pipelineSetup({
   get home() {
     return home;
   },
@@ -113,6 +113,8 @@ for (const phase of ["clarify", "spec"] as const) {
         expect(await waitFor(f, run.id, ["queued", "cancelled"], 500)).toBe(
           when === "cancelled" ? "cancelled" : "queued",
         );
+        // Terminal status is recorded before Git cleanup and scheduler completion.
+        await wait(() => !f.scheduler.activeRunIds.includes(run.id), { timeoutMs: 10_000 });
         expect(f.scheduler.activeRunIds).toEqual([]);
         if (when === "cancelled") {
           expect(f.scheduler.parkedRunIds).toEqual([]);

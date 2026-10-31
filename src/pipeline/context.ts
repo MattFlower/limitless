@@ -119,6 +119,8 @@ export interface RunState {
   worktreePath?: string;
   /** The commit the coordinator last confirmed on the run's own branch on GitHub; absent means never published. */
   publishedSha?: string;
+  /** HEAD after the latest implementer session that committed itself; that history is never replaced. */
+  iterationBase?: string;
   workerCommitRound?: number;
   /** Exact intended delivery commit saved before a push whose outcome may need reconciliation. */
   publishingSha?: string;
