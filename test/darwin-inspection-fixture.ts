@@ -1,4 +1,24 @@
 // Synthetic libproc snapshots: a visible member carries no invocation marker.
+import { realpathSync as systemRealpathSync } from "node:fs";
+import { homedir as systemHomedir } from "node:os";
+
+export { lstatSync } from "node:fs";
+
+let home = systemHomedir();
+let realpathFailure: { path: string; code: string } | null = null;
+export const homedir = () => home;
+export function setHome(value: string): void {
+  home = value;
+}
+export function setRealpathFailure(value: typeof realpathFailure): void {
+  realpathFailure = value;
+}
+export function realpathSync(path: string): string {
+  if (path === realpathFailure?.path)
+    throw Object.assign(new Error("Synthetic canonicalization failure"), { code: realpathFailure.code });
+  return systemRealpathSync(path);
+}
+
 export const leaderPid = 424242;
 export const memberPid = 424243;
 export const unreadablePid = 424244;

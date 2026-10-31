@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, parse } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
@@ -75,7 +75,7 @@ async function loadNativeInspection(directory: string) {
           // Bun keeps built-in modules external; redirect the native import before bundling.
           builder.onLoad({ filter: /processes-darwin\.ts$/ }, async (args) => ({
             contents: (await Bun.file(args.path).text()).replace(
-              'from "bun:ffi";',
+              /from "(?:bun:ffi|node:fs|node:os)";/g,
               `from ${JSON.stringify(fixturePath)};`,
             ),
             loader: "ts",
@@ -294,6 +294,129 @@ describe("process handling", () => {
     expect(selected).toThrow(`Process cwd inspection failed for ${native.unreadablePid}`);
     native.setUnreadableProcess({ parent: 1, born: unread, cwd: unread });
     expect(selected).toThrow(`Process birth time inspection failed for ${native.unreadablePid}`);
+  });
+
+  test.each([
+    "filesystem root",
+    "home",
+    "home ancestor",
+    "mixed roots",
+    "root alias",
+    "home alias",
+    "ancestor alias",
+  ])("native cwd discovery refuses %s even for persisted null-leader roots", async (scenario) => {
+    const native = await loadNativeInspection(dir);
+    const home = join(dir, "home");
+    const scratch = join(dir, "scratch");
+    mkdirSync(home);
+    mkdirSync(scratch);
+    native.setHome(home);
+    const homeAlias = join(dir, "home-alias");
+    const ancestorAlias = join(dir, "ancestor-alias");
+    symlinkSync(home, homeAlias);
+    symlinkSync(dir, ancestorAlias);
+    const root = parse(dir).root;
+    const cases: Record<string, { roots: string[]; cwd: string }> = {
+      "filesystem root": { roots: [root], cwd: root },
+      home: { roots: [home], cwd: join(home, "orphan") },
+      "home ancestor": { roots: [dirname(home)], cwd: home },
+      "mixed roots": { roots: [home, scratch], cwd: scratch },
+      "root alias": {
+        roots: [process.platform === "darwin" ? "/private/.." : `${root}..`, scratch],
+        cwd: scratch,
+      },
+      "home alias": { roots: [homeAlias, scratch], cwd: scratch },
+      "ancestor alias": { roots: [ancestorAlias, scratch], cwd: scratch },
+    };
+    const candidate = cases[scenario];
+    if (!candidate) throw new Error("Missing root scenario");
+    native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: candidate.cwd } });
+    expect(
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "unsafe-roots",
+        native.leaderPid,
+        2000,
+        candidate.roots,
+        null,
+      ),
+    ).toEqual([]);
+  });
+
+  test("native cwd discovery preserves eligible checkout and scratch boundaries", async () => {
+    const native = await loadNativeInspection(dir);
+    const home = join(dir, "home");
+    const checkout = join(home, "checkout");
+    const scratch = join(dir, "scratch");
+    mkdirSync(checkout, { recursive: true });
+    mkdirSync(scratch);
+    native.setHome(home);
+    const alias = join(dir, "checkout-alias");
+    symlinkSync(checkout, alias);
+    const selected = (roots = [alias, scratch]) =>
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "safe-roots",
+        native.leaderPid,
+        2000,
+        roots,
+        null,
+      );
+    for (const cwd of [checkout, scratch, join(checkout, "deleted")]) {
+      native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: cwd } });
+      expect(selected()).toEqual([native.unreadablePid]);
+    }
+    for (const candidate of [
+      { parent: 1, born: 1n, cwd: { path: scratch } },
+      { parent: process.pid, born: 2n, cwd: { path: scratch } },
+      { parent: 1, born: 2n, cwd: { path: `${scratch}-sibling` } },
+    ]) {
+      native.setUnreadableProcess(candidate);
+      expect(selected()).toEqual([]);
+    }
+    native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: scratch } });
+    // An unresolved root disables the entire cwd rule, including a readable scratch.
+    expect(selected([join(dir, "missing"), scratch])).toEqual([]);
+    for (const code of ["EACCES", "EPERM", "EIO", "ENOENT"]) {
+      native.setRealpathFailure({ path: home, code });
+      // Permission denial still permits canonical parent + non-symlink home metadata.
+      expect(selected()).toEqual(code === "EACCES" || code === "EPERM" ? [native.unreadablePid] : []);
+    }
+    native.setHome(alias);
+    native.setRealpathFailure({ path: alias, code: "EACCES" });
+    expect(selected()).toEqual([]); // A denied symlink home cannot establish safety.
+    native.setHome(home);
+    native.setRealpathFailure({ path: scratch, code: "EACCES" });
+    expect(selected()).toEqual([]);
+  });
+
+  test("unsafe roots preserve marker, ancestry and validated numeric ownership without cwd inspection", async () => {
+    const native = await loadNativeInspection(dir);
+    const leader = native.captureDarwinInvocationLeader(native.leaderPid);
+    const selected = (savedLeader = leader) =>
+      native.markedDarwinProcesses(
+        process.getuid?.() ?? 0,
+        "independent-proof",
+        native.leaderPid,
+        2000,
+        [parse(dir).root],
+        savedLeader,
+      );
+    const unread = { errno: 22 };
+    native.setUnreadableProcess({ parent: 1, born: unread, cwd: unread });
+    expect(selected(null)).toEqual([]); // Unsafe roots do not even inspect an unproven orphan.
+    native.setMemberMarker("independent-proof");
+    native.setUnreadableProcess({ parent: native.memberPid, born: unread, cwd: unread });
+    expect(selected(null)).toContain(native.unreadablePid);
+    expect(selected(null)).toContain(native.memberPid);
+    native.setMemberMarker("other-invocation");
+    for (const membership of ["session", "group"] as const) {
+      native.setMembership(membership);
+      native.setUnreadableProcess({ parent: native.memberPid, born: unread, cwd: unread });
+      expect(selected()).toContain(native.unreadablePid);
+      native.setUnreadableProcess({ parent: 1, born: unread, cwd: unread, inGroup: true });
+      expect(selected()).toContain(native.unreadablePid);
+    }
   });
 
   test("native discovery skips marked processes that started before the spawn unless the start is unreadable", async () => {

@@ -1,6 +1,7 @@
 import { dlopen, FFIType, ptr, toArrayBuffer } from "bun:ffi";
-import { realpathSync } from "node:fs";
-import { sep } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
 
 // libproc and KERN_PROCARGS2 are also what macOS ps uses. Unlike ps, these calls
 // don't require launching a setuid executable (which worker sandboxes deny).
@@ -91,7 +92,40 @@ function darwinDescendant(
   return false;
 }
 
-/** Roots are canonicalized at invocation start; only orphans need birth time and cwd inspection. */
+/** Revalidate persisted roots too, once per scan rather than for every candidate. */
+function cwdOwnershipRoots(directories: readonly string[]): string[] {
+  if (!directories.length) return [];
+  try {
+    const home = homedir();
+    if (!isAbsolute(home)) return [];
+    let canonicalHome: string;
+    try {
+      canonicalHome = realpathSync(home);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // Gates deny reading home itself. A non-symlink directory under a canonical
+      // parent still establishes its identity without reading its contents.
+      const path = resolve(home);
+      if (code !== "EPERM" && code !== "EACCES") return [];
+      const entry = lstatSync(path);
+      if (!entry.isDirectory() || entry.isSymbolicLink()) return [];
+      canonicalHome = resolve(realpathSync(dirname(path)), basename(path));
+    }
+    const roots = directories.map((directory) => realpathSync(directory));
+    if (
+      roots.some(
+        (root) => root === sep || canonicalHome === root || canonicalHome.startsWith(`${root}${sep}`),
+      )
+    )
+      return [];
+    return roots;
+  } catch {
+    // Unresolved roots or home cannot grant cwd ownership; other evidence remains usable.
+    return [];
+  }
+}
+
+/** Roots must be canonical and eligible; only orphans need birth time and cwd inspection. */
 export function hiddenDarwinProcessMember(
   pid: number,
   parents: ReadonlyMap<number, number>,
@@ -101,7 +135,7 @@ export function hiddenDarwinProcessMember(
   readBorn: () => number | { errno: number },
   readCwd: () => { path: string } | { errno: number },
 ): boolean {
-  if (darwinDescendant(pid, parents, members)) return true;
+  if (members.has(pid) || darwinDescendant(pid, parents, members)) return true;
   // Hidden descendants of proven members are ours. Otherwise cwd can identify only
   // orphans (ppid 1) born during this invocation, never a live non-member's children.
   // Measured on macOS with `bun scripts/probe-process-recovery.ts` (#740): setsid,
@@ -111,7 +145,7 @@ export function hiddenDarwinProcessMember(
   // session controls were excluded. Linux env -i remains unmeasured here and marker-only.
   // Two empty scans prove quiescence only within these rules' coverage (ARCHITECTURE §6).
   // A hidden process with a live but unproven parent is also unrecognized.
-  if (parents.get(pid) !== 1) return false;
+  if (!directories.length || parents.get(pid) !== 1) return false;
   const born = readBorn();
   if (typeof born !== "number") {
     if (born.errno === 3 /* ESRCH */) return false;
@@ -223,6 +257,7 @@ export function markedDarwinProcesses(
   /** `darwinClock()` before the invocation spawned; 0n inspects every process. */
   spawnedAt = 0n,
 ): number[] {
+  const cwdDirectories = cwdOwnershipRoots(directories);
   const bytes = symbols.proc_listpids(4 /* PROC_UID_ONLY */, uid, null, 0);
   if (bytes <= 0) throw new Error("Process enumeration failed");
   const processes = new Int32Array(Math.ceil(bytes / 4) + 256);
@@ -342,7 +377,7 @@ export function markedDarwinProcesses(
       parents,
       marked,
       started,
-      directories,
+      cwdDirectories,
       () => {
         if (
           symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(bsd), bsd.byteLength) !== bsd.byteLength
