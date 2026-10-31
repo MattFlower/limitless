@@ -393,7 +393,7 @@ test.each([false, true].flatMap((verified) => [false, true].map((lost) => ({ ver
 );
 
 // Mutations: write provisional terminal rejection, allow stale writes after a terminal decision,
-// or leave failed or shut-down cleanup running after the execution exits.
+// finalize failed cleanup, or leave failed or shut-down cleanup running after the execution exits.
 test.each(
   ["rollback", "report"].flatMap((boundary) =>
     ([undefined, "shutdown", "error", "needs_human", "cancelled", "resolved"] as const).map((decision) => ({
@@ -460,23 +460,22 @@ test.each(
     () => rollback.mockRestore(),
     () => report.mockRestore(),
   );
-  const pending = !decision || decision === "shutdown";
+  const pending = !decision || decision === "shutdown" || decision === "error";
+  const before = Date.now();
   expect(await executeRun({ ...f.deps, runClaim: claim }, run.id, controller.signal)).toBe(
-    pending ? "queued" : decision === "error" ? "needs_human" : decision,
+    pending ? "queued" : decision,
   );
   const state = f.store.getRunState<RunState>(run.id);
   expect(state?.postMergeRejection?.reason).toContain("post-merge gates regressed");
   if (pending) {
-    expect(state?.githubWait?.reason).toBe(decision ? undefined : "claim:lease");
-    expect(f.store.getRun(run.id)).toMatchObject({ stage: null, finishedAt: null });
-  } else if (decision === "error") {
-    // The failed cleanup stays recorded for a human instead of a stranded running run.
-    recorded = f.store.getRun(run.id);
-    recordedState = state;
-    expect(recorded).toMatchObject({
-      error: state?.postMergeRejection?.reason.slice(0, 2000),
-      finishedAt: expect.any(Number),
-    });
+    // Failed cleanup stays owed, with a delayed retry instead of a terminal or stranded run.
+    expect(state?.githubWait?.reason).toBe(
+      { shutdown: undefined, error: "rejected merge cleanup pending" }[decision ?? "shutdown"] ??
+        (decision ? undefined : "claim:lease"),
+    );
+    if (state?.githubWait) expect(state.githubWait.nextAttemptAt).toBeGreaterThan(before);
+    expect(f.store.getRun(run.id)).toMatchObject({ status: "queued", stage: null, finishedAt: null });
+    expect(state?.needsHumanReason).toBe(state?.postMergeRejection?.reason);
   } else {
     expect(f.store.getRun(run.id)).toEqual(recorded);
     expect(state).toEqual(recordedState);
@@ -493,7 +492,7 @@ test.each(
   restores.push(() => observe.mockRestore());
   try {
     expect(await executeRun({ ...f.deps, store: reopened, runClaim: claim }, run.id, signal())).toBe(
-      pending || decision === "error" ? "needs_human" : decision,
+      pending ? "needs_human" : decision,
     );
     expect(resumed[0]).toBe(pending ? "running" : undefined);
     if (!pending) {
@@ -505,6 +504,7 @@ test.each(
     expect(reopened.getRunState<RunState>(run.id)?.postMergeRejection).toEqual(state?.postMergeRejection);
     expect(reopened.getRun(run.id)?.error).toBe(state?.postMergeRejection?.reason.slice(0, 2000));
     expect(reopened.getRunState<RunState>(run.id)?.deliveryComplete).toBe(true);
+    expect(reopened.getRunState<RunState>(run.id)?.githubWait).toBeUndefined();
   } finally {
     reopened.close();
   }

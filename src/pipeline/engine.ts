@@ -432,7 +432,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
     if (ctx.state.postMergeRejection && (signal.aborted || !(e instanceof NeedsHumanError))) {
       ctx.log(`Rejected post-merge rollback interrupted: ${(e as Error).message}`, "warn");
-      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason, true);
     }
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
@@ -442,8 +442,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     const cancelled = (): RunStatus => {
       const rejected = ctx.state.postMergeRejection?.reason;
       if (rejected) {
-        // A recorded rejection is terminal; shutdown during draft reporting must not requeue it.
-        const status = finalizePostMergeRejection(ctx, rejected);
+        // A local rejection is terminal; only claimed runs requeue unfinished draft reporting.
+        const status = finalizePostMergeRejection(ctx, rejected, !ctx.state.deliveryComplete);
         ctx.log(`Draft reporting interrupted; rejected post-merge run stays ${status}`, "warn");
         return status;
       }
@@ -528,6 +528,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       resolvingReview ||
       terminationBlocked;
     let message = redactGateOutput((e as Error).message) + waited;
+    let unreported = false;
     if (resolvingReview && !(e instanceof ReaderSetupError)) {
       message = redactGateOutput(
         `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
@@ -583,6 +584,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         // A failed fallback must retain the delivery fault that made the draft necessary.
         if (err instanceof NeedsHumanError)
           message += `; verified-work draft failed: ${redactGateOutput(err.message)}`;
+        unreported = true;
         ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
       }
     } else if (
@@ -618,6 +620,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         // Cancellation or shutdown during the draft must not be recorded as the original failure.
         if (err instanceof CancelledError || signal.aborted) return cancelled();
         if (err instanceof NeedsHumanError) message = redactGateOutput(err.message);
+        unreported = true;
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
     }
@@ -632,7 +635,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       ctx.checkpointer.writeState(runId, ctx.state);
     }
     if (ctx.state.postMergeRejection)
-      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason, unreported);
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
     ctx.checkpointer.writeRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
     return status;
@@ -3570,7 +3573,7 @@ export type { RunState };
 
 class MergeRegressedError extends Error {}
 
-function finalizePostMergeRejection(ctx: RunContext, reason: string): RunStatus {
+function finalizePostMergeRejection(ctx: RunContext, reason: string, pending = false): RunStatus {
   // Claimed rejection is provisional until reporting completes. Independent terminal decisions win.
   // The read and write must stay synchronous.
   const current = ctx.store.getRun(ctx.run.id);
@@ -3580,10 +3583,23 @@ function finalizePostMergeRejection(ctx: RunContext, reason: string): RunStatus 
     TERMINAL_STATUSES.includes(current.status)
   )
     return current.status;
-  // Shutdown leaves claimed cleanup owed; guarded writes map recorded cancellation and claim changes.
-  if (ctx.execution.shared && !ctx.state.deliveryComplete && ctx.signal.aborted)
-    return ctx.checkpointer.writeRun(ctx.run.id, { status: "queued", stage: null, finishedAt: null }).status;
-  // Ordinary cleanup failures retain the rejection record and, as for local runs, need a human.
+  // Unfinished claimed cleanup stays owed; failures retry later. Guarded writes map recorded
+  // cancellation and claim changes.
+  if (ctx.execution.shared && pending) {
+    const now = Date.now();
+    const state = ctx.store.getRunState<RunState>(ctx.run.id);
+    if (state && !ctx.signal.aborted)
+      state.githubWait = {
+        since: state.githubWait?.since ?? now,
+        nextAttemptAt: now + githubWait.intervalMs,
+        reason: "rejected merge cleanup pending",
+      };
+    return ctx.checkpointer.writeRun(
+      ctx.run.id,
+      { status: "queued", stage: null, finishedAt: null },
+      ctx.signal.aborted ? undefined : (state ?? undefined),
+    ).status;
+  }
   return ctx.checkpointer.writeRun(ctx.run.id, {
     status: "needs_human",
     error: reason.slice(0, 2000),
