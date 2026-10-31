@@ -315,8 +315,9 @@ export async function executeGate(
     await blockInterrupted(stored, executor, () => persist(stored));
   const handle = stored ?? (await executor.start(req, signal));
   let checkStarted = false;
+  // Shutdown detaches and owner cancellation discards; neither is a pre-start refusal.
   const failedBeforeStart = () => {
-    if (!checkStarted && (handle.kind === "local" || executor.cancelBeforeStart?.(handle)))
+    if (!checkStarted && !signal.aborted && (handle.kind === "local" || executor.cancelBeforeStart?.(handle)))
       hooks.onPreStartFailure?.();
   };
   if (!stored) await persist(handle);

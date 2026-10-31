@@ -2206,6 +2206,41 @@ test("daemon shutdown detaches a LAN handle, which reattaches without creating a
   expect(workers.job(handle.id)?.state).toBe("cancelled");
 }, 30_000);
 
+test("daemon shutdown through executeGate keeps a queued LAN job resumable, not a pre-start refusal", async () => {
+  const req: GateRequest = {
+    repo: "test/repo",
+    cwd: home,
+    headSha: releaseSha,
+    baseSha: releaseSha,
+    gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+  };
+  const controller = new AbortController();
+  let handle: ExecutionHandle | undefined;
+  let preStart = false;
+  await expect(
+    executeGate(
+      req,
+      controller.signal,
+      { onPreStartFailure: () => (preStart = true) },
+      gateExecutorFor("lan", workers, [req.repo]),
+      undefined,
+      async (h) => {
+        handle = h;
+        queueMicrotask(() => controller.abort(new Error("shutdown")));
+      },
+    ),
+  ).rejects.toThrow();
+  if (!handle) throw new Error("missing persisted handle");
+  expect(preStart).toBe(false);
+  expect(workers.job(handle.id)?.state).toBe("queued");
+  const resumed = new AbortController();
+  const result = executeGate(req, resumed.signal, {}, gateExecutorFor("lan", workers, [req.repo]), handle);
+  expect(workers.job(handle.id)?.state).toBe("queued");
+  resumed.abort();
+  await expect(result).rejects.toThrow();
+  expect(workers.jobs("1=1")).toHaveLength(1);
+}, 30_000);
+
 const gateTimers = ["fresh", "pickup", "lease"] as const;
 type GateTimer = (typeof gateTimers)[number];
 const gateFailure = {
