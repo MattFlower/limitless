@@ -103,7 +103,7 @@ function checked<T>(action: () => T, code: ValidationCode): T {
   try {
     return action();
   } catch (error) {
-    rethrowClaimControl(error);
+    if (!types.isProxy(error)) rethrowClaimControl(error);
     return fail(code);
   }
 }

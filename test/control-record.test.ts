@@ -499,6 +499,34 @@ test("non-JSON proposals and caller exceptions disclose only fixed errors withou
   });
 });
 
+test("thrown proxy exceptions produce fixed errors without inspecting their prototypes", () => {
+  const sentinel = randomUUID();
+  let inspections = 0;
+  const throwing = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        inspections++;
+        throw new Error(sentinel);
+      },
+    },
+  );
+  const revoked = Proxy.revocable(new ClaimLostError(), {});
+  revoked.revoke();
+  for (const error of [throwing, revoked.proxy]) {
+    const throwingNamer = {
+      derive() {
+        throw error;
+      },
+    };
+    fails(() => controlKey(throwingNamer, reserved), "invalid", sentinel);
+    fails(() => encodeControlManifest(throwingNamer, envelope()), "invalid", sentinel);
+    fails(() => validateControlReplacement(throwingNamer, reserved, committed), "invalid", sentinel);
+    fails(() => decodeControlManifest(throwingNamer, receiptKey, wire(envelope())), "corrupt", sentinel);
+  }
+  expect(inspections).toBe(0);
+});
+
 test.each([
   new ClaimLostError(),
   new ClaimWaitError("cancelled"),
