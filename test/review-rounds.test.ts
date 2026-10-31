@@ -12,7 +12,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { ClaimLostError } from "../src/integrations/claim-errors.ts";
-import { RunContext, type RunState } from "../src/pipeline/context.ts";
+import { invokeGuard, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { type FaultPlan, SimulatedTermination } from "../src/pipeline/faults.ts";
 import { ENVIRONMENT_BLOCKED } from "../src/pipeline/verification.ts";
@@ -148,6 +148,14 @@ const seed = seeded(async (dir) => {
 });
 
 function answer(s: AgentSpec): FakeReply | Promise<FakeReply> {
+  if (invokeGuard.getStore())
+    return {
+      structured: {
+        verdict: "approve",
+        summary: "shadow checked the diff against the request and every finding",
+        findings: [],
+      },
+    };
   if (s.prompt.startsWith("Classify")) return { structured: triage };
   if (s.prompt.startsWith("Write the specification")) return { structured: spec };
   if (s.prompt.startsWith("Write holdout checks")) return { structured: holdout };
@@ -202,7 +210,7 @@ function makeFactory(faults?: FaultPlan): Factory {
     confinement: fakeConfinement,
     healthFetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
     fetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
-    providers,
+    providers: providers.map((provider) => ({ ...provider })),
     models,
     policy,
     harnesses: { fake: fakeHarness(answer) },
@@ -912,6 +920,11 @@ test.each([false, true])(
 );
 
 test("a review resolves its base conflict before findings and pushes only the combined head", async () => {
+  factory.deps.cfg.reviewShadow = "panel";
+  for (const id of ["a", "b"]) {
+    Object.assign(factory.tracker.def(id) ?? {}, { maxConcurrent: 4 });
+    factory.tracker.observeWindows(id, { five_hour: { utilization: 0, resetsAt: null } });
+  }
   const original = await delivered("standard");
   factory.store.updateRun(original.id, { status: "needs_human" });
   const reviewed = await remoteHead();
@@ -943,6 +956,17 @@ test("a review resolves its base conflict before findings and pushes only the co
     (await sh(["git", "diff", "--name-only", merge as string, head], { cwd: remote })).stdout.trim(),
   ).toBe("fix.txt");
   expect(state?.reviewHistory?.map((r) => r.sha)).toEqual([merge, head]);
+  expect(tip).not.toBe(merge);
+  expect(head).not.toBe(merge);
+  expect(reviewPrompts).toHaveLength(2);
+  expect(reviewPrompts[1]).toContain(`${tip}..HEAD`);
+  expect(reviewPrompts[1]).toContain("fix.txt");
+  expect(JSON.parse(factory.store.getArtifact(round.id, "review-2.shadow.json") ?? "null")).toMatchObject({
+    status: "completed",
+    baseSha: tip,
+    reviewedSha: head,
+    range: `${tip}..${head}`,
+  });
   expect(
     factory.store
       .listStages(round.id)
