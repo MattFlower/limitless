@@ -86,8 +86,14 @@ import {
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, platformConfinement } from "../harness/sandbox.ts";
 import { readAgentFullSuite, readSlottedCommands } from "../harness/slotted-config.ts";
-import { ClaimControlError, rethrowClaimControl, selectClaimControl } from "../integrations/claim-errors.ts";
-import { hasClaimScope } from "../integrations/claim-guard.ts";
+import {
+  ClaimControlError,
+  ClaimLostError,
+  ClaimWaitError,
+  rethrowClaimControl,
+  selectClaimControl,
+} from "../integrations/claim-errors.ts";
+import { claimGuard, claimScope, hasClaimScope } from "../integrations/claim-guard.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
@@ -110,6 +116,7 @@ import {
 import { reusableAgentGate } from "./agent-gate.ts";
 import { statedBudget } from "./budget.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./cancellation.ts";
+import { mapClaimInterruption } from "./claim-interruption.ts";
 import {
   CancelledError,
   type EngineDeps,
@@ -172,6 +179,7 @@ import {
 import { readPrHead, roundSection, withPrLock } from "./review-round.ts";
 import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
+import { bindRunClaim, type RunClaim, renewRunClaim } from "./run-claim.ts";
 import {
   type Holdout,
   HoldoutSchema,
@@ -223,24 +231,52 @@ export async function executeRun(
     checkpointer.writeRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  // Local runs work in a factory-owned clone too; legacy source worktrees only gain `-c` flags.
-  const ctx = new RunContext(deps, run, repo, signal, isDraining, drainEvents);
-  const status = await processScope.run(
-    {
-      signal: ctx.signal,
-      killGraceMs: 100,
-      children: new Map(),
-      scratchDirs: new Set(),
-      runId,
-      cleanups: deps.store,
-      checkout: () => ctx.state.worktreePath,
-    },
-    () =>
-      confinementScope.run(deps.confinement ?? platformConfinement(deps.cfg.port), () =>
-        readPolicyScope.run(deps.cfg.readPolicy, () =>
-          worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+  const shared = repo.kind === "github" && repoSettings(deps.cfg, run.repoSlug).shared === true;
+  let claim: RunClaim | undefined;
+  let error: unknown;
+  if (shared) {
+    try {
+      const authority = deps.runClaim;
+      claim = bindRunClaim(run, deps.store, authority);
+    } catch (caught) {
+      error = selectClaimControl([caught]) ?? new ClaimWaitError("unavailable");
+    }
+  }
+  const ctx = new RunContext(
+    deps,
+    run,
+    repo,
+    signal,
+    isDraining,
+    drainEvents,
+    Object.freeze({ shared, claim, error }),
+  );
+  const scoped = () =>
+    processScope.run(
+      {
+        signal: ctx.signal,
+        killGraceMs: 100,
+        children: new Map(),
+        scratchDirs: new Set(),
+        runId,
+        cleanups: deps.store,
+        checkout: () => ctx.state.worktreePath,
+      },
+      () =>
+        confinementScope.run(deps.confinement ?? platformConfinement(deps.cfg.port), () =>
+          readPolicyScope.run(deps.cfg.readPolicy, () =>
+            worktreeGitScope.run(true, () => executeScopedRun(ctx, signal)),
+          ),
         ),
-      ),
+    );
+  const status = await (claim ? claimScope.run([claim.binding], scoped) : scoped()).catch(
+    (error: unknown) => {
+      // Guards can also interrupt a write in failure handling itself.
+      const control = selectClaimControl([error]);
+      if (!(control instanceof ClaimWaitError || control instanceof ClaimLostError)) throw error;
+      mapClaimInterruption(deps.store, runId, control);
+      return deps.store.getRun(runId)?.status ?? "failed";
+    },
   );
   if (TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued"))
     await removeIterationRefs(deps.cfg.paths, repo, runId).catch((error: unknown) =>
@@ -249,20 +285,33 @@ export async function executeRun(
   return status;
 }
 
+function executionInterruption(ctx: RunContext, error: unknown) {
+  let probe: unknown;
+  try {
+    if (ctx.execution.shared) claimGuard();
+  } catch (caught) {
+    probe = caught;
+  }
+  const control = selectClaimControl([error, probe]);
+  return control instanceof ClaimWaitError || control instanceof ClaimLostError ? control : undefined;
+}
+
 const REVIEW_RESOLUTION_BLOCK = "Review-base resolution requires a compatible engine to implement findings";
 
-async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
-  const { deps, run } = ctx;
-  const runId = run.id;
+function startRun(ctx: RunContext): void {
+  const { run } = ctx;
   // Upgrade pending checkpoints from before rollback protection, before any state/run write.
   if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha)
     ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
-  if (ctx.state.phase !== "deliver") ctx.state.githubWait = undefined;
-  // A recorded rejection is already terminal; resume only finishes its rollback.
-  if (!ctx.state.postMergeRejection)
+  if (
+    ctx.state.githubWait?.reason.startsWith("claim:") ? ctx.execution.shared : ctx.state.phase !== "deliver"
+  )
+    ctx.state.githubWait = undefined;
+  // Local rejections are terminal; claimed rejections still owe rollback and reporting.
+  if (!ctx.state.postMergeRejection || ctx.execution.shared)
     ctx.run = ctx.checkpointer.writeRun(
-      runId,
+      run.id,
       {
         status: "running",
         error: null,
@@ -271,9 +320,21 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       ctx.state,
     );
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
+}
 
+async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
+  const { deps, run } = ctx;
+  const runId = run.id;
+  if (!ctx.execution.shared) startRun(ctx);
   try {
-    await recoverScopedProcesses();
+    if (ctx.execution.shared) {
+      await recoverScopedProcesses();
+      if (!ctx.execution.claim) throw ctx.execution.error ?? new ClaimWaitError("unavailable");
+      await renewRunClaim(ctx.execution.claim);
+      claimGuard();
+    }
+    if (ctx.execution.shared) startRun(ctx);
+    if (!ctx.execution.shared) await recoverScopedProcesses();
     if (ctx.state.postMergeRejection) await rollbackRejectedMerge(ctx);
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
@@ -355,6 +416,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log("Run succeeded");
     return "succeeded";
   } catch (e) {
+    const control = executionInterruption(ctx, e);
+    if (control) {
+      mapClaimInterruption(deps.store, runId, control);
+      return deps.store.getRun(runId)?.status ?? "failed";
+    }
     const terminationError = processScope.getStore()?.terminationError;
     if (
       terminationError &&
@@ -372,7 +438,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (!signal.aborted && (e instanceof SimulatedTermination || ctx.termination)) return "running";
     if (ctx.state.postMergeRejection && (signal.aborted || !(e instanceof NeedsHumanError))) {
       ctx.log(`Rejected post-merge rollback interrupted: ${(e as Error).message}`, "warn");
-      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason, true);
     }
     if (e instanceof InjectedFault && !signal.aborted) {
       ctx.log(`Run interrupted: ${e.message}; re-queued to resume`, "warn");
@@ -382,8 +448,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     const cancelled = (): RunStatus => {
       const rejected = ctx.state.postMergeRejection?.reason;
       if (rejected) {
-        // A recorded rejection is terminal; shutdown during draft reporting must not requeue it.
-        const status = finalizePostMergeRejection(ctx, rejected);
+        // A local rejection is terminal; only claimed runs requeue unfinished draft reporting.
+        const status = finalizePostMergeRejection(ctx, rejected, !ctx.state.deliveryComplete);
         ctx.log(`Draft reporting interrupted; rejected post-merge run stays ${status}`, "warn");
         return status;
       }
@@ -468,6 +534,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       resolvingReview ||
       terminationBlocked;
     let message = redactGateOutput((e as Error).message) + waited;
+    let unreported = false;
     if (resolvingReview && !(e instanceof ReaderSetupError)) {
       message = redactGateOutput(
         `The PR branch conflicts with ${reviewRound(ctx)?.owner.baseBranch ?? ctx.repo.defaultBranch} in ${(ctx.state.conflictFiles ?? []).join(", ")}; resolution failed: ${message}`,
@@ -507,7 +574,13 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           false,
           false,
         );
+        if (ctx.execution.shared) claimGuard();
       } catch (err) {
+        const control = executionInterruption(ctx, err);
+        if (control) {
+          mapClaimInterruption(deps.store, runId, control);
+          return deps.store.getRun(runId)?.status ?? "failed";
+        }
         if (err instanceof CancelledError || signal.aborted) return cancelled();
         if (
           !signal.aborted &&
@@ -517,6 +590,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         // A failed fallback must retain the delivery fault that made the draft necessary.
         if (err instanceof NeedsHumanError)
           message += `; verified-work draft failed: ${redactGateOutput(err.message)}`;
+        unreported = true;
         ctx.log(`Could not open verified-work draft PR: ${(err as Error).message}`, "warn");
       }
     } else if (
@@ -537,7 +611,13 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           await ctx.save("needs-human");
         }
         await deliver(ctx, false);
+        if (ctx.execution.shared) claimGuard();
       } catch (err) {
+        const control = executionInterruption(ctx, err);
+        if (control) {
+          mapClaimInterruption(deps.store, runId, control);
+          return deps.store.getRun(runId)?.status ?? "failed";
+        }
         if (
           !signal.aborted &&
           (err instanceof SimulatedTermination || ctx.termination || err instanceof InjectedFault)
@@ -546,6 +626,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         // Cancellation or shutdown during the draft must not be recorded as the original failure.
         if (err instanceof CancelledError || signal.aborted) return cancelled();
         if (err instanceof NeedsHumanError) message = redactGateOutput(err.message);
+        unreported = true;
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
     }
@@ -560,7 +641,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       ctx.checkpointer.writeState(runId, ctx.state);
     }
     if (ctx.state.postMergeRejection)
-      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason);
+      return finalizePostMergeRejection(ctx, ctx.state.postMergeRejection.reason, unreported);
     const status: RunStatus = needsHuman ? "needs_human" : "failed";
     ctx.checkpointer.writeRun(runId, { status, error: message.slice(0, 2000), finishedAt: Date.now() });
     return status;
@@ -3458,7 +3539,7 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
 
     const policy = ctx.state.gatesConfig?.merge ?? ctx.repo.mergePolicy;
     let summary = `PR ${url}`;
-    if (policy === "auto") {
+    if (policy === "auto" && !ctx.execution.shared) {
       ctx.checkCancelled();
       const outcome = await mergePullRequest(
         url,
@@ -3498,12 +3579,33 @@ export type { RunState };
 
 class MergeRegressedError extends Error {}
 
-function finalizePostMergeRejection(ctx: RunContext, reason: string): RunStatus {
-  // Rollback and draft reporting await Git operations after publishing needs_human.
-  // Keep any terminal decision recorded meanwhile; the read and write must stay synchronous.
+function finalizePostMergeRejection(ctx: RunContext, reason: string, pending = false): RunStatus {
+  // Claimed rejection is provisional until reporting completes. Independent terminal decisions win.
+  // The read and write must stay synchronous.
   const current = ctx.store.getRun(ctx.run.id);
-  if (current && current.status !== "needs_human" && TERMINAL_STATUSES.includes(current.status))
+  if (
+    current &&
+    (ctx.execution.shared || current.status !== "needs_human") &&
+    TERMINAL_STATUSES.includes(current.status)
+  )
     return current.status;
+  // Unfinished claimed cleanup stays owed; failures retry later. Guarded writes map recorded
+  // cancellation and claim changes.
+  if (ctx.execution.shared && pending) {
+    const now = Date.now();
+    const state = ctx.store.getRunState<RunState>(ctx.run.id);
+    if (state && !ctx.signal.aborted)
+      state.githubWait = {
+        since: state.githubWait?.since ?? now,
+        nextAttemptAt: now + githubWait.intervalMs,
+        reason: "rejected merge cleanup pending",
+      };
+    return ctx.checkpointer.writeRun(
+      ctx.run.id,
+      { status: "queued", stage: null, finishedAt: null },
+      ctx.signal.aborted ? undefined : (state ?? undefined),
+    ).status;
+  }
   return ctx.checkpointer.writeRun(ctx.run.id, {
     status: "needs_human",
     error: reason.slice(0, 2000),
@@ -3515,8 +3617,11 @@ async function rollbackRejectedMerge(ctx: RunContext): Promise<never> {
   const rejected = ctx.state.postMergeRejection;
   const cwd = ctx.state.worktreePath;
   if (!rejected || !cwd) throw new Error("Missing rejected post-merge rollback details");
+  if (ctx.execution.shared) claimGuard();
   await mergeGit(cwd, ["reset", "--hard", rejected.head]);
+  if (ctx.execution.shared) claimGuard();
   await mergeGit(cwd, ["clean", "-fdq"]);
+  if (ctx.execution.shared) claimGuard();
   ctx.state.lastGates = ctx.state.preRebaseGates ?? ctx.state.lastGates;
   ctx.state.pendingRebaseSha = undefined;
   ctx.state.preRebaseGates = undefined;
@@ -3806,7 +3911,9 @@ async function mergeForDelivery(
     ctx.state.needsHumanReason = ctx.state.postMergeRejection.reason;
     ctx.run = ctx.checkpointer.writeRun(
       ctx.run.id,
-      { status: "needs_human", error: ctx.state.needsHumanReason.slice(0, 2000), finishedAt: Date.now() },
+      ctx.execution.shared
+        ? { finishedAt: null }
+        : { status: "needs_human", error: ctx.state.needsHumanReason.slice(0, 2000), finishedAt: Date.now() },
       ctx.state,
     );
     return rollbackRejectedMerge(ctx);
