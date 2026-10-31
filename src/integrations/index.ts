@@ -76,7 +76,7 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
           server.timeout(req, 90);
           return mcp.handle(req, server.requestIP(req)?.address ?? null);
         },
-        "/webhooks/github": githubWebhook(factory, undefined, issueQueue.pollNow),
+        "/webhooks/github": githubWebhook(factory, undefined, issueQueue.pollNow, deps.gh),
       },
       notes: [
         ...(await (deps.toolVersions ?? toolVersions)()),

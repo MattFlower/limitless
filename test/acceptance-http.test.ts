@@ -25,7 +25,12 @@ async function acceptanceFixture() {
     defaultBranch: "main",
     mergePolicy: "pr",
   });
-  const text = { author: { login: "owner" }, editor: null, lastEditedAt: null };
+  const text = {
+    author: { login: "owner" },
+    editor: null,
+    lastEditedAt: null,
+    userContentEdits: { nodes: [], pageInfo: { hasNextPage: false } },
+  };
   const ticket: IssueText & { title: string; parent: IssueText | null } = {
     ...text,
     number: 2,
@@ -40,7 +45,7 @@ async function acceptanceFixture() {
     expect(args.slice(0, 3)).toEqual(["api", "graphql", "-f"]);
     expect(args[3]).toContain('repository(owner:"example", name:"repo")');
     expect(args[3]).toContain("issue(number:2)");
-    expect(args[3]).toContain("parent { number body author { login } editor { login } lastEditedAt }");
+    expect(args[3]).toContain("parent { number body author { login } editor { login } lastEditedAt");
     return JSON.stringify({ data: { repository: { issue: ticket } } });
   });
   const route = (createHttpRoutes(f.factory, { gh })["/api/acceptance"] as { POST: Route }).POST;
@@ -81,15 +86,30 @@ test.each([
   ["malformed intent", "blockquote"],
   ["untrusted ticket", "ticket: untrusted author"],
   ["missing parent", "acceptance ticket has no parent"],
+  ["ticket history", "ticket: untrusted body editor: stranger"],
+  ["parent history", "parent: untrusted body editor: stranger"],
 ] as const)("acceptance check returns a refusal for %s without a run or model", async (mode, reason) => {
   const f = await acceptanceFixture();
   try {
     if (mode === "malformed intent") f.ticket.body = "## The original intent\n> quoted intent";
     if (mode === "untrusted ticket") f.ticket.author = { login: "stranger" };
     if (mode === "missing parent") f.ticket.parent = null;
+    if (mode === "ticket history" || mode === "parent history") {
+      const text = mode === "ticket history" ? f.ticket : f.ticket.parent;
+      if (!text) throw new Error("missing parent fixture");
+      text.lastEditedAt = "2026-01-01T00:00:00Z";
+      text.editor = { login: "owner" };
+      text.userContentEdits = {
+        nodes: [{ editor: { login: "owner" } }, { editor: { login: "stranger" } }],
+        pageInfo: { hasNextPage: false },
+      };
+    }
     const response = await f.post(true);
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ok: false, reason: expect.stringContaining(reason) });
+    const create = await f.post();
+    expect(create.status).toBe(400);
+    expect(await create.json()).toEqual({ error: expect.stringContaining(reason) });
     expect(f.factory.store.listRuns()).toEqual([]);
     expect(f.reader).not.toHaveBeenCalled();
     expect(readdirSync(f.factory.cfg.paths.work)).toEqual([]);

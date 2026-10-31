@@ -8,8 +8,14 @@ import { executeRun } from "../src/pipeline/engine.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
-const ticket = { number: 2, body: "## The original intent\n> The goal.", author: { login: "owner" } };
-const parent = { number: 1, body: "The goal.", author: { login: "owner" } };
+const userContentEdits = { nodes: [], pageInfo: { hasNextPage: false } };
+const ticket = {
+  userContentEdits,
+  number: 2,
+  body: "## The original intent\n> The goal.",
+  author: { login: "owner" },
+};
+const parent = { userContentEdits, number: 1, body: "The goal.", author: { login: "owner" } };
 const request = (number = 2): CreateRunRequest => ({
   repo: "example/repo",
   source: "github",
@@ -47,6 +53,26 @@ test("untrusted ticket or parent text and missing parents refuse before creation
         { ticket, parent: { ...parent, lastEditedAt: "edited" }, trusted: ["owner"] },
         "parent: untrusted body editor",
       ],
+      ...(["ticket", "parent"] as const).map(
+        (name) =>
+          [
+            {
+              ticket,
+              parent,
+              trusted: ["owner"],
+              [name]: {
+                ...(name === "ticket" ? ticket : parent),
+                lastEditedAt: "edited",
+                editor: { login: "owner" },
+                userContentEdits: {
+                  nodes: [{ editor: { login: "owner" } }, { editor: { login: "stranger" } }],
+                  pageInfo: { hasNextPage: false },
+                },
+              },
+            },
+            `${name}: untrusted body editor: stranger`,
+          ] as const,
+      ),
     ] as const) {
       expect(() =>
         store.createAcceptanceRun(
