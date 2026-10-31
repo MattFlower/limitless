@@ -94,6 +94,7 @@ test.each([
     await git("-C", work, "commit", "-qm", "local repair");
     const candidate = (await git("-C", work, "rev-parse", "HEAD")).stdout.trim();
     for (const path of [bin, config]) mkdirSync(path);
+    writeFileSync(join(config, "config.toml"), "");
     writeFileSync(join(config, "private-strings.txt"), scenario === "granted-private" ? "ungranted.yml" : "");
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
     writeFileSync(
@@ -214,6 +215,7 @@ describe("land-pr private strings", () => {
     if (!gitBin || !bunBin) throw new Error("missing tools");
     try {
       for (const dir of [source, config, bin]) mkdirSync(dir);
+      writeFileSync(join(config, "config.toml"), "");
       const git = (...args: string[]) => sh([gitBin, ...args], { cwd: source });
       await git("init", "-q", "-b", "main");
       await git("remote", "add", "origin", origin);
@@ -321,6 +323,7 @@ describe("land-pr private strings", () => {
         configDir = join(source, "repo-config");
         mkdirSync(configDir);
       }
+      writeFileSync(join(resolve(scenario === "inside" ? work : root, configDir), "config.toml"), "");
       if (scenario === "filename") writeFileSync(join(work, `${entry}.txt`), "safe\n");
       if (scenario === "bunfig-preload") {
         // PR files Bun would load from the worktree: a preload that turns every exit into success.
@@ -459,6 +462,7 @@ test.each([
     const bin = join(root, "bin");
     const config = join(root, "config");
     for (const path of [bin, config]) mkdirSync(path);
+    writeFileSync(join(config, "config.toml"), "");
     const gitBin = Bun.which("git");
     if (!gitBin) throw new Error("missing git");
     const git = (...args: string[]) => sh([gitBin, ...args], { cwd: source });
@@ -508,9 +512,11 @@ test.each([
         `--preload=${resolve("test/git-preload.ts")}`,
         resolve("scripts/check-private-strings.ts"),
         "--record",
+        "MattFlower/limitless",
       ],
       {
         cwd: work,
+        env: { ...process.env, LIMITLESS_CONFIG_DIR: config },
       },
     );
     expect(recorded.stdout.trim().split("\n")).toEqual(paths);
@@ -1028,16 +1034,17 @@ test.each([
     if (scenario === "not-directory") paths[1] = join(source, "file");
     const bin = join(root, "bin");
     mkdirSync(bin);
+    writeFileSync(join(root, "config.toml"), "");
     const marker = join(root, "untrusted-code-or-publication");
     writeFileSync(
       join(bin, "bun"),
-      `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nif (process.argv[5] === "--record") console.log(${JSON.stringify(paths.join("\n"))});\nelse writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+      `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nif (process.argv[5] === "--local-only") process.exit(0);\nif (process.argv[5] === "--record") console.log(${JSON.stringify(paths.join("\n"))});\nelse writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
       { mode: 0o755 },
     );
     writeFileSync(join(bin, "gh"), `#!/bin/sh\ntouch '${marker}'\nexit 1\n`, { mode: 0o755 });
     const result = await sh(["bash", script, "123", "safe", work], {
       cwd: root,
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, LIMITLESS_CONFIG_DIR: root },
       allowFail: true,
     });
     expect(result.exitCode).not.toBe(0);
@@ -1056,20 +1063,21 @@ test.each(["HEAD", "f".repeat(40)])(
     const root = mkdtempSync(join(tmpdir(), "land-bad-sha-"));
     try {
       await repositories(root);
+      writeFileSync(join(root, "config.toml"), "");
       const result = await sh(
         [
           process.execPath,
           `--preload=${resolve("test/git-preload.ts")}`,
           resolve("scripts/check-private-strings.ts"),
           "123",
-          "local",
+          "test/repo",
           "safe",
           "pr",
           head,
         ],
         {
           cwd: join(root, "source"),
-          env: { ...process.env, LIMITLESS_CONFIG_DIR: join(root, "absent") },
+          env: { ...process.env, LIMITLESS_CONFIG_DIR: root },
           allowFail: true,
         },
       );
@@ -1086,10 +1094,11 @@ test("land records the worktree's Git paths before any PR code runs", async () =
   try {
     const bin = join(root, "bin");
     mkdirSync(bin);
+    writeFileSync(join(root, "config.toml"), "");
     const calls = join(root, "calls");
     writeFileSync(
       join(bin, "bun"),
-      `#!/bin/sh\ncase "$*" in *git-confined.ts*) shift; shift; shift; exec git "$@" ;; esac\necho "$*" >> '${calls}'\n[ "$4" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$2" = gate-slot ] && exit 1\nexit 0\n`,
+      `#!/bin/sh\ncase "$*" in *git-confined.ts*) shift; shift; shift; exec git "$@" ;; esac\necho "$*" >> '${calls}'\n[ "$4" = --local-only ] && exit 0\n[ "$4" = --record ] && printf '%s\\n' "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"\n[ "$2" = gate-slot ] && exit 1\nexit 0\n`,
       {
         mode: 0o755,
       },
@@ -1103,12 +1112,13 @@ test("land records the worktree's Git paths before any PR code runs", async () =
     mkdirSync(join(root, "common"));
     await sh(["bash", script, "123", "safe", root], {
       cwd: root,
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: root },
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, LIMITLESS_CONFIG_DIR: root, TMPDIR: root },
       allowFail: true,
     });
     const lines = readFileSync(calls, "utf8").trim().split("\n");
     expect(lines[0]).toStartWith("--config=/dev/null --no-env-file ");
-    expect(lines[0]).toEndWith("check-private-strings.ts --record");
+    expect(lines[0]).toEndWith("check-private-strings.ts --local-only MattFlower/limitless");
+    expect(lines[1]).toEndWith("check-private-strings.ts --record MattFlower/limitless");
     // The check runs through the checkout's own CLI in a named gate slot; `limitless` need not be on PATH.
     const check = lines.findIndex((line) =>
       line.endsWith("/src/cli/main.ts gate-slot --priority ship --name land-pr #123 -- bun run check"),
@@ -1124,10 +1134,11 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
   try {
     const bin = join(root, "bin");
     mkdirSync(bin);
+    writeFileSync(join(root, "config.toml"), "");
     const marker = join(root, "published");
     writeFileSync(
       join(bin, "bun"),
-      '#!/bin/sh\ncase "$*" in *git-confined.ts*) shift; shift; shift; exec git "$@" ;; esac\n[ "$4" = --record ] && { printf "%s\\n" "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
+      '#!/bin/sh\ncase "$*" in *git-confined.ts*) shift; shift; shift; exec git "$@" ;; esac\n[ "$4" = --local-only ] && exit 0\n[ "$4" = --record ] && { printf "%s\\n" "$(pwd -P)" "$(pwd -P)/admin" "$(pwd -P)/common"; exit 0; }\n[ "$1" = install ] && exit 0\necho "failed-check-$$"\nexit 1\n',
       { mode: 0o755 },
     );
     writeFileSync(
@@ -1141,7 +1152,13 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
     const run = (log = "") =>
       sh(["bash", script, "123", "safe", root], {
         cwd: root,
-        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: root, LAND_PR_LOG: log },
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          LIMITLESS_CONFIG_DIR: root,
+          TMPDIR: root,
+          LAND_PR_LOG: log,
+        },
         allowFail: true,
       });
     const results = await Promise.all([run(), run(), run(join(root, "custom log"))]);
@@ -1161,7 +1178,28 @@ test("land logs honor TMPDIR and overrides and are unique for concurrent failure
   }
 });
 
-test.each(["title", "subject", "body", "moved", "lookup-failed", "malformed", "missing", "clean", "cancel"])(
+const finalPublicationAndLocalModeLandingScenarios = [
+  "title",
+  "subject",
+  "body",
+  "moved",
+  "lookup-failed",
+  "malformed",
+  "missing",
+  "clean",
+  "cancel",
+  "push-shared",
+  "push-missing",
+  "push-invalid",
+  "merge-shared",
+  "merge-missing",
+  "merge-invalid",
+  "recovery-shared",
+  "recovery-missing",
+  "recovery-invalid",
+  "recovery-local",
+];
+test.each(finalPublicationAndLocalModeLandingScenarios)(
   "land validates the final PR after CI: %s",
   async (scenario) => {
     const root = mkdtempSync(join(tmpdir(), "land-final-"));
@@ -1174,6 +1212,7 @@ test.each(["title", "subject", "body", "moved", "lookup-failed", "malformed", "m
     let child: ReturnType<typeof Bun.spawn> | undefined;
     try {
       for (const path of [work, config, bin]) mkdirSync(path);
+      writeFileSync(join(config, "config.toml"), "");
       const git = (...args: string[]) => sh([gitBin, ...args], { cwd: work });
       await git("init", "-qb", "main");
       await git("remote", "add", "origin", origin);
@@ -1184,6 +1223,41 @@ test.each(["title", "subject", "body", "moved", "lookup-failed", "malformed", "m
       writeFileSync(join(work, "file"), "safe change");
       await git("commit", "-qam", "safe");
       const sha = (await git("rev-parse", "HEAD")).stdout.trim();
+      const configFile = join(config, "config.toml");
+      const mutation = scenario.endsWith("missing")
+        ? `rmSync(${JSON.stringify(configFile)});`
+        : `writeFileSync(${JSON.stringify(configFile)}, ${JSON.stringify(scenario.endsWith("invalid") ? "[broken" : scenario.endsWith("shared") ? '[repos."MattFlower/limitless"]\nshared = true' : "")});`;
+      const preload = join(root, "recovery.ts");
+      writeFileSync(
+        preload,
+        `
+import { spyOn } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
+import { Store } from ${JSON.stringify(resolve("src/db/store.ts"))};
+import * as proc from ${JSON.stringify(resolve("src/util/proc.ts"))};
+const original = proc.sh;
+spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+  if (cmd[0] !== "gh" || cmd[2] !== "merge") return original(cmd, opts);
+  const store = new Store(":memory:");
+  store.recordProcessDiscovery({ runId: "r", invocation: "prior", directory: process.cwd(),
+    boot: "test", createdAt: 0,
+    discovery: { group: 0, started: 0, directories: [], leader: null, spawnedAt: "0" } });
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const operation = proc.processBootInspection.run(() => "test", () =>
+    proc.processRecoveryInspection.run({ stopped: () => true, timeoutMs: 10000,
+      discover: async () => { entered.resolve(); return resume.promise; } }, () =>
+      proc.processScope.run({ ...proc.processScope.getStore(), runId: "r", cleanups: store },
+        () => original(cmd, opts))));
+  const outcome = operation.finally(() => store.close());
+  await entered.promise;
+  ${mutation}
+  writeFileSync(${JSON.stringify(join(root, "recovered"))}, "ready");
+  resume.resolve([]);
+  return outcome;
+});
+`,
+      );
       const denied = scenario === "subject" ? "Fresh safe title" : entry;
       writeFileSync(join(config, "private-strings.txt"), denied);
       const final = {
@@ -1202,7 +1276,7 @@ test.each(["title", "subject", "body", "moved", "lookup-failed", "malformed", "m
       writeFileSync(
         join(bin, "gh"),
         `#!${process.execPath}\n
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
 if (args[0] === "run" && args[1] === "list") console.log("123");
@@ -1210,6 +1284,7 @@ else if (args[0] === "run" && args[1] === "watch") writeFileSync(${JSON.stringif
 else if (args[1] === "view") {
   if (args.includes("--jq")) console.log("safe-branch");
   else if (existsSync(${JSON.stringify(watched)})) {
+    ${scenario.startsWith("merge-") ? mutation : ""}
     if (${JSON.stringify(scenario)} === "lookup-failed") process.exit(1);
     console.log(${JSON.stringify(scenario === "malformed" ? "not-json" : scenario === "missing" ? "{}" : JSON.stringify(final))});
   } else console.log(${JSON.stringify(JSON.stringify({ baseRefOid: base, headRefOid: base, body: "Initial safe body", headRefName: "safe-branch" }))});
@@ -1219,13 +1294,14 @@ else if (args[1] === "view") {
       );
       writeFileSync(
         join(bin, "bun"),
-        `#!/bin/sh\ncase "$*" in *check-private-strings.ts*|*git-confined.ts*) exec '${process.execPath}' --preload='${resolve("test/git-preload.ts")}' "$@" ;; esac\nexit 0\n`,
+        `#!/bin/sh\ncase "$*" in *check-private-strings.ts*|*git-confined.ts*) exec '${process.execPath}' --preload='${resolve("test/git-preload.ts")}' ${scenario.startsWith("recovery-") ? `--preload='${preload}'` : ""} "$@" ;; esac\nexit 0\n`,
         { mode: 0o755 },
       );
       writeFileSync(
         join(bin, "git"),
         `#!/bin/sh
 ${gitSubcommand}
+${scenario.startsWith("push-") ? `if [ "$sub" = status ]; then '${process.execPath}' -e 'const { rmSync, writeFileSync } = require("node:fs"); eval(JSON.parse(process.argv[1]));' '${JSON.stringify(mutation)}'; fi` : ""}
 if [ "$sub" = push ]; then printf '%s\\n' "$@" > '${pushed}'; exit 0; fi
 ${scenario === "cancel" ? `case "$*" in *cat-file*--batch*) sleep 60 & scan=$!; printf '%s %s' "$$" "$scan" > '${started}'; wait; exit 1 ;; esac` : ""}
 exec '${gitBin}' "$@"
@@ -1272,7 +1348,7 @@ exec '${gitBin}' "$@"
         .split("\n")
         .map((line) => JSON.parse(line));
       const merges = recorded.filter((args) => args[1] === "merge");
-      if (scenario === "clean") {
+      if (["clean", "recovery-local"].includes(scenario)) {
         expect(code).toBe(0);
         expect(merges).toEqual([
           [
@@ -1295,7 +1371,11 @@ exec '${gitBin}' "$@"
         expect(code).not.toBe(0);
         expect(merges).toEqual([]);
       }
-      if (scenario !== "cancel") {
+      if (scenario.startsWith("recovery-")) expect(existsSync(join(root, "recovered"))).toBe(true);
+      if (scenario.startsWith("push-")) {
+        expect(existsSync(watched)).toBe(false);
+        expect(existsSync(pushed)).toBe(false);
+      } else if (scenario !== "cancel") {
         expect(existsSync(watched)).toBe(true);
         const push = readFileSync(pushed, "utf8").trim().split("\n");
         expect(push).toContain("--no-verify");
@@ -1331,6 +1411,7 @@ test.each(["history", "diff", "blob", "title", "body"])(
       const config = join(root, "config");
       mkdirSync(bin);
       mkdirSync(config);
+      writeFileSync(join(config, "config.toml"), "");
       const unsafe = `%${"25".repeat(6)}72`;
       const git = (...args: string[]) => sh(["git", ...args], { cwd: work });
       const commit = async (message: string) => {
@@ -1391,6 +1472,79 @@ test.each(["history", "diff", "blob", "title", "body"])(
       expect(result.exitCode).toBe(scenario === "history" ? 0 : 1);
       expect(existsSync(marker)).toBe(scenario === "history");
       if (scenario !== "history") expect(result.stderr).toContain("decoding limit");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["shared", "missing", "invalid", "unreadable", "local"])(
+  "manual entry proves local mode before tools or private policy: %s",
+  async (kind) => {
+    const root = mkdtempSync(join(tmpdir(), "land-mode-"));
+    try {
+      const bin = join(root, "bin");
+      const config = join(root, "config");
+      const work = join(root, "work");
+      for (const dir of [bin, config, work]) mkdirSync(dir);
+      const file = join(config, "config.toml");
+      if (kind === "unreadable") mkdirSync(file);
+      else if (kind !== "missing")
+        writeFileSync(
+          file,
+          kind === "invalid"
+            ? "[broken"
+            : kind === "shared"
+              ? '[repos."MattFlower/limitless"]\nshared = true'
+              : "",
+        );
+      const marker = join(root, "tools");
+      const policy = join(root, "policy");
+      const preload = join(root, "policy.ts");
+      writeFileSync(
+        preload,
+        `import { spyOn } from "bun:test";
+import * as privacy from ${JSON.stringify(resolve("src/gates/private.ts"))};
+spyOn(privacy, "loadPrivateStrings").mockImplementation(() => { require("node:fs").writeFileSync(${JSON.stringify(policy)}, "read"); throw new Error("policy read"); });`,
+      );
+      for (const tool of ["git", "gh"])
+        writeFileSync(join(bin, tool), `#!/bin/sh\necho '${tool}' >> '${marker}'\nexit 19\n`, {
+          mode: 0o755,
+        });
+      writeFileSync(
+        join(bin, "bun"),
+        `#!/bin/sh\ncase "$*" in *check-private-strings.ts*) exec '${process.execPath}' --preload='${preload}' "$@" ;; esac\necho bun >> '${marker}'\nexit 19\n`,
+        { mode: 0o755 },
+      );
+      const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, LIMITLESS_CONFIG_DIR: "config" };
+      const shell = await sh(["bash", script, "123", "safe", work], { cwd: root, env, allowFail: true });
+      expect(shell.exitCode).not.toBe(0);
+      expect(existsSync(marker)).toBe(kind === "local");
+      expect(existsSync(policy)).toBe(false);
+      // Every helper entry, including path recording, must prove local mode independently.
+      for (const args of [
+        ["--record", "MattFlower/limitless"],
+        ["123", "MattFlower/limitless", "safe"],
+        ["123", "MattFlower/limitless", "--merge"],
+      ]) {
+        const result = await sh(
+          [
+            process.execPath,
+            "--config=/dev/null",
+            "--no-env-file",
+            `--preload=${preload}`,
+            resolve("scripts/check-private-strings.ts"),
+            ...args,
+          ],
+          { cwd: root, env, allowFail: true },
+        );
+        expect(result.exitCode).not.toBe(0);
+        if (kind !== "local") {
+          expect(existsSync(marker)).toBe(false);
+          expect(existsSync(policy)).toBe(false);
+          expect(result.stderr.trim()).toBe("Private check blocked");
+        }
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

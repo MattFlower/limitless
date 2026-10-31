@@ -86,6 +86,18 @@ Only the operator's explicit `--allow workflows` argument grants permission; PR 
 For example: `scripts/land-pr.sh 123 "Update CI" ./merge-worktree --allow workflows`.
 The option bypasses only the workflow guard; privacy, clean-worktree and landing checks still apply.
 
+Manual landing requires a readable, valid `config.toml` proving local repository mode
+(`shared = false`, the default). Configuration is resolved from `LIMITLESS_CONFIG_DIR`,
+or the standard `~/.config/limitless` directory; relative directories resolve before changing
+to the worktree. Missing or unreadable configuration intentionally refuses landing.
+A readable empty configuration is valid local mode, as is a valid repository table without
+an entry for the selected repository. All repository entries must be valid, even unmatched ones.
+Unknown repository settings are ignored silently by the safety reader.
+The script checks before Git inspection or checks, immediately before push, and again at
+final merge dispatch. Configuration becoming shared, missing or invalid stops that dispatch.
+
+Shared PRs remain open until the shared landing path ships; existing local landing paths do not grant shared landing authority.
+
 A few more details:
 
 - **Rounds and escalation.** Any failing gate, audit, review or verify sends structured feedback to
@@ -235,6 +247,7 @@ discovers an owner.
 | `[gates] executor` | `"local"` | `"local"` or `"lan"`. LAN gates require a repository opt-in below; other repos run locally. Older releases reject `"lan"`; reset to `"local"` before rolling back. |
 | `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
 | `[repos."<owner>/<name>"] discreet` | `false` | Omit factory marks from published branches, commits, PR reports and round comments; skip issue-trigger status comments. Slugs match case-insensitively. Older releases ignore this table and publish their usual marks. Existing branches retain their names. |
+| `[repos."<owner>/<name>"] shared` | `false` | Boolean reserving shared-mode safety behavior: manual local landing refuses when true. Does not enable shared admission, approvals or landing authority. Slugs match case-insensitively. |
 | `[repos."<owner>/<name>"] branch_prefix` | `"change/"` | In discreet mode, branches use `<branch_prefix><title-slug>` with `-2` through `-5`, then one random suffix for collisions (six probes maximum). Must form a valid branch when followed by `x`. Ignored unless `discreet = true`. |
 | `[repos."<owner>/<name>"] github_actions` | `false` | Authorizes the GitHub Actions gate executor to publish candidates to this repository. Authorization only: this release does not select Actions, and production keeps its existing routing. Discreet repositories always refuse. |
 | `[repos."<owner>/<name>"] github_actions_paid_minutes` | `false` | Also required when GitHub reports the repository as private; grants nothing without `github_actions`. |
@@ -256,6 +269,13 @@ discovers an owner.
 | `[local] remote_model_path`, `remote_host`, `remote_llama_binary` | — | Used by `limitless local up`; see [OPERATIONS](OPERATIONS.md#local-models) |
 
 Unknown repository settings are ignored with a warning naming the repository and key, so later keys do not prevent rollback.
+The `shared` flag reserves safety behavior; it does not enable shared admission.
+Shared PRs remain open until the shared landing path ships; existing local landing paths do not grant shared landing authority.
+Rollback of local use remains data-compatible. Older parsers ignore `shared` with a warning;
+this provides no shared safety. Before downgrading shared deployments, disable shared admission
+and drain shared work. An older daemon must not resume shared work from local projections.
+See the [coordinator downgrade requirements](coordinators.md) for the planned shared lifecycle.
+
 On rollback, older releases ignore `github_actions` and `github_actions_paid_minutes` with an
 `Ignoring unknown repository setting` warning and continue their existing routing. Neither key
 adds an accepted value to `[gates] executor`, which remains `"local"` or `"lan"`.
