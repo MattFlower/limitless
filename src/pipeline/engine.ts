@@ -298,9 +298,34 @@ function executionInterruption(ctx: RunContext, error: unknown) {
 
 const REVIEW_RESOLUTION_BLOCK = "Review-base resolution requires a compatible engine to implement findings";
 
+function startRun(ctx: RunContext): void {
+  const { run } = ctx;
+  // Upgrade pending checkpoints from before rollback protection, before any state/run write.
+  if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha)
+    ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
+  ctx.state.parked = false;
+  if (
+    ctx.state.githubWait?.reason.startsWith("claim:") ? ctx.execution.shared : ctx.state.phase !== "deliver"
+  )
+    ctx.state.githubWait = undefined;
+  // Local rejections are terminal; claimed rejections still owe rollback and reporting.
+  if (!ctx.state.postMergeRejection || ctx.execution.shared)
+    ctx.run = ctx.checkpointer.writeRun(
+      run.id,
+      {
+        status: "running",
+        error: null,
+        ...(run.startedAt ? {} : { startedAt: Date.now() }),
+      },
+      ctx.state,
+    );
+  if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
+}
+
 async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
   const { deps, run } = ctx;
   const runId = run.id;
+  if (!ctx.execution.shared) startRun(ctx);
   try {
     if (ctx.execution.shared) {
       await recoverScopedProcesses();
@@ -308,26 +333,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       await renewRunClaim(ctx.execution.claim);
       claimGuard();
     }
-    // Upgrade pending checkpoints from before rollback protection, before any state/run write.
-    if (ctx.state.reviewResolution && !ctx.state.reviewResolution.sha)
-      ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
-    ctx.state.parked = false;
-    if (
-      ctx.state.githubWait?.reason.startsWith("claim:") ? ctx.execution.shared : ctx.state.phase !== "deliver"
-    )
-      ctx.state.githubWait = undefined;
-    // Local rejections are terminal; claimed rejections still owe rollback and reporting.
-    if (!ctx.state.postMergeRejection || ctx.execution.shared)
-      ctx.run = ctx.checkpointer.writeRun(
-        runId,
-        {
-          status: "running",
-          error: null,
-          ...(run.startedAt ? {} : { startedAt: Date.now() }),
-        },
-        ctx.state,
-      );
-    if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
+    if (ctx.execution.shared) startRun(ctx);
     if (!ctx.execution.shared) await recoverScopedProcesses();
     if (ctx.state.postMergeRejection) await rollbackRejectedMerge(ctx);
     // Recheck persisted provenance on resume, including runs created before this guard existed.

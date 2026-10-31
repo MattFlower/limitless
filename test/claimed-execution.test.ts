@@ -8,12 +8,12 @@ import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
-import { bindClaim } from "../src/integrations/claim-guard.ts";
+import { bindClaim, claimGuard } from "../src/integrations/claim-guard.ts";
 import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import * as identity from "../src/integrations/github-identity.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
-import { initialRunState, RunContext, type RunState } from "../src/pipeline/context.ts";
+import { initialRunState, localCheckpointer, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import type { RunClaim } from "../src/pipeline/run-claim.ts";
 import * as proc from "../src/util/proc.ts";
@@ -306,7 +306,6 @@ test.each([false, true])(
     const deps = { ...f.deps, faults: { "stage:deliver:before": { action: "kill" as const } } };
     expect(await executeRun(claimed ? { ...deps, runClaim: claim } : deps, run.id, signal())).toBe("running");
     const checkpoints: (string | undefined)[] = [];
-    const { localCheckpointer } = await import("../src/pipeline/context.ts");
     const checkpointer = {
       ...localCheckpointer(f.store),
       checkpoint: (_id: string, label?: string) => {
@@ -650,6 +649,72 @@ test.each([false, true])(
     release?.();
   },
 );
+
+// Mutation: return for a recorded terminal decision before closing running invocations.
+test.each(["cancelled", "needs_human"] as const)(
+  "invocation interruption preserves recorded %s and closes its invocation",
+  async (status) => {
+    const { f, run, claim } = await fixture();
+    f.store.setRunState(run.id, {
+      ...initialRunState(run),
+      phase: "triage",
+      previewConfig: null,
+      slottedCommands: [],
+      agentFullSuite: "slot",
+      lastVerifiedSha: "durable evidence",
+    });
+    let recorded: Run | null = null;
+    let evidence: RunState | null = null;
+    const harness = fakeHarness(async () => {
+      recorded = f.store.updateRun(run.id, {
+        status,
+        error: status === "cancelled" ? "cancelled by owner" : "independent decision",
+        finishedAt: 73,
+      });
+      evidence = f.store.getRunState<RunState>(run.id);
+      claimGuard();
+      throw new Error("claim guard admitted a terminal run");
+    });
+    expect(
+      await executeRun({ ...f.deps, runClaim: claim, harnesses: { fake: harness } }, run.id, signal()),
+    ).toBe(status);
+    expect(recorded).not.toBeNull();
+    expect(f.store.getRun(run.id)).toEqual(recorded);
+    expect(f.store.getRunState<RunState>(run.id)).toEqual(evidence);
+    expect(f.store.listInvocations(run.id)).toMatchObject([
+      {
+        status: "cancelled",
+        error: "interrupted: claim wait",
+        finishedAt: expect.any(Number),
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        numTurns: 0,
+      },
+    ]);
+  },
+);
+
+// Mutation: move local startup back into the main failure handler.
+test.each([false, true])("local startup write failure propagates, aborted=%s", async (aborted) => {
+  const { f, run } = await fixture();
+  shared(f, false);
+  const controller = new AbortController();
+  if (aborted) controller.abort();
+  const failure = new Error("startup write failed");
+  const checkpointer = localCheckpointer(f.store);
+  const write = spyOn(checkpointer, "writeRun").mockImplementationOnce(() => {
+    throw failure;
+  });
+  const recovery = spyOn(proc, "recoverScopedProcesses").mockImplementation(() => {});
+  restores.push(() => recovery.mockRestore());
+  await expect(executeRun({ ...f.deps, checkpointer }, run.id, controller.signal)).rejects.toBe(failure);
+  expect(write).toHaveBeenCalledTimes(1);
+  expect(f.store.getRun(run.id)).toEqual(run);
+  expect(recovery).not.toHaveBeenCalled();
+  expect(f.store.listStages(run.id)).toHaveLength(0);
+  expect(f.store.listInvocations(run.id)).toHaveLength(0);
+});
 
 // Mutation: let claim control from a failure-handling write escape executeRun.
 test("claim change during failure handling returns through the final boundary", async () => {

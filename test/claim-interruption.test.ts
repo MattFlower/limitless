@@ -66,11 +66,10 @@ test.each(["prepare", "loop", "deliver"])(
   },
 );
 
-test.each([false, true])("local interruption closes only running invocations, loss=%s", (loss) => {
-  const { run, state } = fixture();
+function interruptedInvocations(runId: string) {
   const invocation = () =>
     store.createInvocation({
-      runId: run.id,
+      runId,
       stageId: null,
       role: "implement",
       harness: "fake",
@@ -80,7 +79,16 @@ test.each([false, true])("local interruption closes only running invocations, lo
     });
   const running = invocation();
   const finished = invocation();
-  store.updateInvocation(running.id, { costUsd: 1, inputTokens: 17 });
+  store.updateInvocation(running.id, {
+    costUsd: 1,
+    costEquivUsd: 3,
+    inputTokens: 17,
+    outputTokens: 5,
+    cacheReadTokens: 11,
+    cacheWriteTokens: 13,
+    numTurns: 2,
+    sessionId: "partial-session",
+  });
   store.updateInvocation(finished.id, {
     status: "ok",
     finishedAt: 7,
@@ -89,18 +97,29 @@ test.each([false, true])("local interruption closes only running invocations, lo
     numTurns: 4,
   });
   const before = store.getInvocation(finished.id);
-  const costs = store.getRun(run.id);
-  mapClaimInterruption(store, run.id, loss ? new ClaimLostError() : new ClaimWaitError("lease"), 99);
-  expect(store.getInvocation(running.id)).toMatchObject({
-    status: "cancelled",
-    error: loss ? "interrupted: claim lost" : "interrupted: claim wait",
-    finishedAt: 99,
-    costUsd: 1,
-    inputTokens: 17,
-    outputTokens: 0,
-  });
-  expect(store.getInvocation(finished.id)).toEqual(before);
-  expect(store.getRun(run.id)?.costUsd).toBe(costs?.costUsd);
+  store.refreshRunTotals(runId);
+  const partial = store.getInvocation(running.id);
+  if (!partial) throw new Error("Missing running invocation");
+  return (loss: boolean) => {
+    expect(store.getInvocation(running.id)).toEqual({
+      ...partial,
+      status: "cancelled",
+      error: loss ? "interrupted: claim lost" : "interrupted: claim wait",
+      finishedAt: 99,
+    });
+    expect(store.getInvocation(finished.id)).toEqual(before);
+    expect(store.getRun(runId)).toMatchObject({ costUsd: 3, costEquivUsd: 3, tokensIn: 41, tokensOut: 28 });
+  };
+}
+
+test.each([false, true])("local interruption closes only running invocations, loss=%s", (loss) => {
+  const { run, state } = fixture();
+  const assertClosed = interruptedInvocations(run.id);
+  const error = loss ? new ClaimLostError() : new ClaimWaitError("lease");
+  mapClaimInterruption(store, run.id, error, 99);
+  assertClosed(loss);
+  mapClaimInterruption(store, run.id, error, 100);
+  assertClosed(loss);
   if (loss) {
     expect(store.getRun(run.id)).toMatchObject({
       status: "cancelled",
@@ -114,21 +133,29 @@ test.each([false, true])("local interruption closes only running invocations, lo
   }
 });
 
-test.each([...TERMINAL_STATUSES])("independent %s decisions win over both stale callbacks", (status) => {
-  const { run } = fixture();
-  store.updateRun(run.id, { status, error: "independent decision", finishedAt: 73 });
-  const before = store.getRun(run.id);
-  const state = store.getRunState<Record<string, unknown>>(run.id);
-  mapClaimInterruption(store, run.id, new ClaimLostError(), 100);
-  mapClaimInterruption(store, run.id, new ClaimWaitError("lease"), 101);
-  expect(store.getRun(run.id)).toEqual(before);
-  expect(store.getRunState<Record<string, unknown>>(run.id)).toEqual(state);
-});
+test.each(TERMINAL_STATUSES.flatMap((status) => [false, true].map((loss) => ({ status, loss }))))(
+  "independent terminal decision survives cleanup %o",
+  ({ status, loss }) => {
+    const { run } = fixture();
+    const assertClosed = interruptedInvocations(run.id);
+    store.updateRun(run.id, { status, error: "independent decision", finishedAt: 73 });
+    const before = store.getRun(run.id);
+    const state = store.getRunState<Record<string, unknown>>(run.id);
+    mapClaimInterruption(store, run.id, loss ? new ClaimLostError() : new ClaimWaitError("lease"), 99);
+    assertClosed(loss);
+    mapClaimInterruption(store, run.id, loss ? new ClaimWaitError("lease") : new ClaimLostError(), 100);
+    assertClosed(loss);
+    expect(store.getRun(run.id)).toEqual(before);
+    expect(store.getRunState<Record<string, unknown>>(run.id)).toEqual(state);
+  },
+);
 
-test("recorded user cancellation finalizes locally and preserves its evidence", () => {
+test.each([false, true])("recorded user cancellation finalizes with invocation cleanup, loss=%s", (loss) => {
   const { run, state } = fixture();
+  const assertClosed = interruptedInvocations(run.id);
   store.updateRun(run.id, { error: "cancelled by owner", finishedAt: 55 });
-  mapClaimInterruption(store, run.id, new ClaimLostError(), 100);
+  mapClaimInterruption(store, run.id, loss ? new ClaimLostError() : new ClaimWaitError("lease"), 99);
+  assertClosed(loss);
   expect(store.getRun(run.id)).toMatchObject({
     status: "cancelled",
     error: "cancelled by owner",
@@ -137,7 +164,8 @@ test("recorded user cancellation finalizes locally and preserves its evidence", 
   const { githubWait: _wait, ...durable } = state;
   expect(store.getRunState<Record<string, unknown>>(run.id)).toEqual(durable);
   const before = store.getRun(run.id);
-  mapClaimInterruption(store, run.id, new ClaimWaitError("cancelled"), 101);
+  mapClaimInterruption(store, run.id, loss ? new ClaimWaitError("cancelled") : new ClaimLostError(), 100);
+  assertClosed(loss);
   expect(store.getRun(run.id)).toEqual(before);
 });
 
