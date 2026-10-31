@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn } from "bun:test";
+import * as subprocess from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import {
   existsSync,
@@ -3872,16 +3873,18 @@ test("a reclaim during push retry backoff prevents the next push and all publica
   let release: (() => void) | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const set = globalThis.setTimeout;
-  const execute = proc.sh;
-  const transport = spyOn(proc, "sh").mockImplementation((cmd, opts) => {
-    if (cmd.includes("push")) {
+  const execute = subprocess.spawn;
+  const transport = spyOn(subprocess, "spawn").mockImplementation(((
+    bin: string,
+    args: readonly string[],
+    opts: subprocess.SpawnOptions,
+  ) => {
+    if (args.includes("push")) {
       pushes++;
-      return Promise.reject(
-        new CommandError("push unavailable", 1, "", pushes === 1 ? "HTTP 502" : "rejected", false),
-      );
+      throw new CommandError("push unavailable", 1, "", pushes === 1 ? "HTTP 502" : "rejected", false);
     }
-    return execute(cmd, opts);
-  });
+    return execute(bin, args, opts);
+  }) as typeof subprocess.spawn);
   const pause = spyOn(globalThis, "setTimeout").mockImplementation(((
     callback: (...args: unknown[]) => void,
     ms?: number,

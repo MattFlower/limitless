@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { FinderPrompt, ReviewFinder, ReviewSample, ReviewSystem } from "../core/types.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
+import { rethrowClaimControl, selectClaimControl } from "../integrations/claim-errors.ts";
 import { parseTarget } from "../router/targets.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { NoCapacityError } from "./context.ts";
@@ -465,6 +466,7 @@ async function runUnion<T extends Invoked>(
         first ??= invoked;
         result = invoked.result;
       } catch (error) {
+        rethrowClaimControl(error);
         result = {
           status: "error",
           finalText: "",
@@ -492,6 +494,10 @@ async function runUnion<T extends Invoked>(
       return record;
     }),
   );
+  const interruption = selectClaimControl(
+    settled.map((m) => (m.status === "rejected" ? m.reason : undefined)),
+  );
+  if (interruption) throw interruption;
   // Checkpoint failures also wait for both invocations to settle.
   for (const member of settled) if (member.status === "rejected") throw member.reason;
   const samples = settled.flatMap((s) => (s.status === "fulfilled" ? [s.value] : []));
@@ -616,6 +622,10 @@ async function runPanel<T extends Invoked>(
       return { invoked, output };
     }),
   );
+  const interruption = selectClaimControl(
+    settled.map((m) => (m.status === "rejected" ? m.reason : undefined)),
+  );
+  if (interruption) throw interruption;
   const skippable = (member: (typeof settled)[number], finder: number) =>
     input.system?.mode !== "single" &&
     member.status === "rejected" &&
