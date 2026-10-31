@@ -171,6 +171,7 @@ const item = content.extend({
   pull_request: z.unknown().optional(),
 });
 export type DefectItem = z.infer<typeof item>;
+export const defectItemSchema = item;
 
 /** Shared issue/comment authentication; unavailable provenance requires reconciliation. */
 export function defectRecordStatus(

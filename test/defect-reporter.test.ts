@@ -118,6 +118,11 @@ class Remote {
             : (this.comments.get(issue) ?? []);
         return structuredClone(all.slice((page.page - 1) * page.perPage, page.page * page.perPage));
       },
+      issue: async (repo, issue, token) => {
+        this.calls.push(`issue:${issue}`);
+        if (token !== APP.token || repo !== "example/factory") throw new Error("unauthenticated read");
+        return structuredClone(this.issues.find((value) => value.number === issue));
+      },
       label: async (_repo, _name, token) => {
         this.calls.push("label");
         this.onLabel?.();
@@ -320,6 +325,11 @@ test.each([
     (value: Obj) =>
       Object.assign(value, { body: value.body.replace('"lint"', `"lint <!-- ${"b".repeat(32)} -->"`) }),
   ],
+  [
+    "foreign occurrence envelope",
+    (value: Obj) =>
+      Object.assign(value, { body: value.body.replace(/:[a-f0-9]{32} -->/u, `:${"e".repeat(32)} -->`) }),
+  ],
 ])("a recovered App object with a %s is held, not accepted or reposted", async (_name, edit) => {
   const h = harness();
   await h.submit("event");
@@ -384,6 +394,90 @@ test("enumeration is complete, bounded, resumable and comments once on the oldes
   expect(h.remote.posts).toHaveLength(1);
   expect(oldest.state).toBe("closed");
   expect(h.row("event")).toMatchObject({ state: "delivered", target_issue: oldest.number });
+});
+
+test("a match saved by an earlier pass is inspected again and held once edited", async () => {
+  const h = harness();
+  const existing = await prepareDefectPublication(finding(), h.deps);
+  if (existing.status !== "prepared") throw new Error("expected publication");
+  h.remote.noise(150);
+  const match = h.remote.object(existing.body.replace(existing.occurrence, "d".repeat(32)));
+  h.remote.issues.push(match);
+  h.remote.noise(3800);
+  await h.submit("event");
+  await h.reporter.reconcile();
+  expect(JSON.parse(h.row("event")?.scan ?? "").matches).toEqual([[match.number, match.createdAt]]);
+  match.lastEditedAt = "2026-10-31T13:00:00Z";
+  h.reopen();
+  await h.settle();
+  expect(h.remote.calls).toContain(`issue:${match.number}`);
+  expect(h.remote.posts).toHaveLength(0);
+  expect(h.row("event")).toMatchObject({ state: "held", diagnostic: "Defect issue provenance unavailable" });
+});
+
+test.each([
+  ["missing author", (value: Obj) => Reflect.deleteProperty(value, "author")],
+  ["malformed edit provenance", (value: Obj) => Object.assign(value, { lastEditedAt: "yesterday" })],
+])("an App candidate with %s cannot authorize creation", async (_name, corrupt) => {
+  const h = harness();
+  const existing = await prepareDefectPublication(finding(), h.deps);
+  if (existing.status !== "prepared") throw new Error("expected publication");
+  const candidate = h.remote.object(existing.body.replace(existing.occurrence, "d".repeat(32)));
+  corrupt(candidate);
+  h.remote.issues.push(candidate);
+  await h.submit("event");
+  await h.settle();
+  expect(h.remote.posts).toHaveLength(0);
+  expect(h.row("event")).toMatchObject({ state: "prepared", diagnostic: "Defect delivery check failed" });
+});
+
+test("cap-deferred creations do not starve a later occurrence that only needs a comment", async () => {
+  const h = harness();
+  h.deps.dailyCap = 1;
+  h.reopen();
+  await h.submit("first");
+  await h.reporter.reconcile();
+  expect(h.remote.postsTo(null)).toHaveLength(1);
+  for (let i = 0; i < 30; i++) await h.submit(`capped-${i}`, finding(`check-${i}`));
+  await h.submit("again");
+  await h.settle(4);
+  expect(h.remote.postsTo(1)).toHaveLength(1);
+  expect(h.remote.postsTo(null)).toHaveLength(1);
+  expect(h.row("again")).toMatchObject({ state: "delivered", operation: "comment" });
+  expect(h.row("capped-0")).toMatchObject({ state: "prepared", diagnostic: "Defect daily cap reached" });
+  expect(h.remote.calls.filter((call) => call === "label")).toHaveLength(1);
+});
+
+test.each([
+  [
+    "identity changes during the awaited policy",
+    (h: ReturnType<typeof harness>) => {
+      h.deps.policy = async () => {
+        await Promise.resolve();
+        h.deps.identity = async () => ({ kind: "owner" });
+        return { discreet: false };
+      };
+    },
+    { state: "prepared", diagnostic: "Defect App identity unavailable" },
+  ],
+  [
+    "policy becomes discreet during the awaited identity",
+    (h: ReturnType<typeof harness>) => {
+      h.deps.identity = async () => {
+        await Promise.resolve();
+        h.deps.policy = async () => ({ discreet: true });
+        return APP;
+      };
+    },
+    { state: "suppressed", body: null },
+  ],
+])("%s before dispatch prevents the POST", async (_name, change, expected) => {
+  const h = harness();
+  await h.submit("event");
+  h.remote.onLabel = () => change(h);
+  await h.reporter.reconcile();
+  expect(h.remote.posts).toHaveLength(0);
+  expect(h.row("event")).toMatchObject(expected);
 });
 
 test("an ambiguous send without a recoverable object stays uncertain and pauses every POST", async () => {
