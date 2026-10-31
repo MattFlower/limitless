@@ -287,6 +287,9 @@ bounded by the ordinary GitHub outage budget. Renewal and a current guard must s
 before a restart clears the claim wait. Claim loss stops execution locally without
 retrying or publishing a cancellation through attached observers. Guards cannot retract
 requests already dispatched; existing receipts and outcome checks still apply.
+A claimed post-merge rejection stays nonterminal until rollback and draft reporting
+finish. Shutdown re-queues that cleanup; an ordinary cleanup failure records
+`needs_human` with the rejection evidence retained.
 
 Shared PRs remain open until the shared landing path ships; existing local landing paths do not grant shared landing authority.
 Rollback of local use remains data-compatible. Older parsers ignore `shared` with a warning;

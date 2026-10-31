@@ -392,10 +392,11 @@ test.each([false, true].flatMap((verified) => [false, true].map((lost) => ({ ver
   },
 );
 
-// Mutations: write provisional terminal rejection, or allow stale writes after a terminal decision.
+// Mutations: write provisional terminal rejection, allow stale writes after a terminal decision,
+// or leave failed or shut-down cleanup running after the execution exits.
 test.each(
   ["rollback", "report"].flatMap((boundary) =>
-    ([undefined, "needs_human", "cancelled", "resolved"] as const).map((decision) => ({
+    ([undefined, "shutdown", "error", "needs_human", "cancelled", "resolved"] as const).map((decision) => ({
       boundary,
       decision,
     })),
@@ -417,6 +418,7 @@ test.each(
   restores.push(() => workers.processSpy.mockRestore());
   const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
   const claim = authority(run);
+  const controller = new AbortController();
   let recorded: Run | null = null;
   let recordedState: RunState | null = null;
   const interrupted = async () => {
@@ -435,6 +437,8 @@ test.each(
       );
     }
     if (!decision) throw new ClaimWaitError("lease");
+    if (decision === "shutdown") controller.abort(new Error("shutdown"));
+    if (decision === "shutdown" || decision === "error") throw new Error("cleanup failed");
   };
   const reset = merges.mergeGit;
   const rollback = spyOn(merges, "mergeGit").mockImplementation(async (...args) => {
@@ -456,12 +460,23 @@ test.each(
     () => rollback.mockRestore(),
     () => report.mockRestore(),
   );
-  expect(await executeRun({ ...f.deps, runClaim: claim }, run.id, signal())).toBe(decision ?? "queued");
+  const pending = !decision || decision === "shutdown";
+  expect(await executeRun({ ...f.deps, runClaim: claim }, run.id, controller.signal)).toBe(
+    pending ? "queued" : decision === "error" ? "needs_human" : decision,
+  );
   const state = f.store.getRunState<RunState>(run.id);
   expect(state?.postMergeRejection?.reason).toContain("post-merge gates regressed");
-  if (!decision) {
-    expect(state?.githubWait?.reason).toBe("claim:lease");
-    expect(f.store.getRun(run.id)?.finishedAt).toBeNull();
+  if (pending) {
+    expect(state?.githubWait?.reason).toBe(decision ? undefined : "claim:lease");
+    expect(f.store.getRun(run.id)).toMatchObject({ stage: null, finishedAt: null });
+  } else if (decision === "error") {
+    // The failed cleanup stays recorded for a human instead of a stranded running run.
+    recorded = f.store.getRun(run.id);
+    recordedState = state;
+    expect(recorded).toMatchObject({
+      error: state?.postMergeRejection?.reason.slice(0, 2000),
+      finishedAt: expect.any(Number),
+    });
   } else {
     expect(f.store.getRun(run.id)).toEqual(recorded);
     expect(state).toEqual(recordedState);
@@ -469,11 +484,19 @@ test.each(
   rollback.mockRestore();
   report.mockRestore();
   const reopened = new Store(f.cfg.paths.db);
+  // Resumed cleanup is visibly running rather than still queued.
+  const resumed: (string | undefined)[] = [];
+  const observe = spyOn(merges, "mergeGit").mockImplementation(async (...args) => {
+    if (args[1][0] === "reset") resumed.push(reopened.getRun(run.id)?.status);
+    return reset(...args);
+  });
+  restores.push(() => observe.mockRestore());
   try {
     expect(await executeRun({ ...f.deps, store: reopened, runClaim: claim }, run.id, signal())).toBe(
-      decision ?? "needs_human",
+      pending || decision === "error" ? "needs_human" : decision,
     );
-    if (decision) {
+    expect(resumed[0]).toBe(pending ? "running" : undefined);
+    if (!pending) {
       expect(reopened.getRun(run.id)).toEqual(recorded);
       expect(reopened.getRunState<RunState>(run.id)).toEqual(recordedState);
       return;

@@ -317,7 +317,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     )
       ctx.state.githubWait = undefined;
     // Local rejections are terminal; claimed rejections still owe rollback and reporting.
-    if (!ctx.state.postMergeRejection)
+    if (!ctx.state.postMergeRejection || ctx.execution.shared)
       ctx.run = ctx.checkpointer.writeRun(
         runId,
         {
@@ -3580,7 +3580,10 @@ function finalizePostMergeRejection(ctx: RunContext, reason: string): RunStatus 
     TERMINAL_STATUSES.includes(current.status)
   )
     return current.status;
-  if (ctx.execution.shared && !ctx.state.deliveryComplete) return current?.status ?? "failed";
+  // Shutdown leaves claimed cleanup owed; guarded writes map recorded cancellation and claim changes.
+  if (ctx.execution.shared && !ctx.state.deliveryComplete && ctx.signal.aborted)
+    return ctx.checkpointer.writeRun(ctx.run.id, { status: "queued", stage: null, finishedAt: null }).status;
+  // Ordinary cleanup failures retain the rejection record and, as for local runs, need a human.
   return ctx.checkpointer.writeRun(ctx.run.id, {
     status: "needs_human",
     error: reason.slice(0, 2000),
