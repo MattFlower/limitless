@@ -1,5 +1,7 @@
+import { types } from "node:util";
 import { z } from "zod";
 import type { ClaimKey } from "../pipeline/portable.ts";
+import { rethrowClaimControl } from "./claim-errors.ts";
 import type { ControlNamer } from "./control-identity.ts";
 import { canonicalJson, type JsonValue, snapshotJson } from "./control-json.ts";
 import type { ControlKey } from "./control-ref.ts";
@@ -100,7 +102,8 @@ function fail(code: ValidationCode | "limit" | "unsupported"): never {
 function checked<T>(action: () => T, code: ValidationCode): T {
   try {
     return action();
-  } catch {
+  } catch (error) {
+    rethrowClaimControl(error);
     return fail(code);
   }
 }
@@ -139,8 +142,16 @@ export function decodeControlManifest(
   requested: ControlKey,
   bytes: Uint8Array,
 ): ControlManifestV1 {
-  if (!(bytes instanceof Uint8Array)) fail("corrupt");
-  if (bytes.byteLength > CONTROL_MANIFEST_BYTES) fail("limit");
+  const length = checked(() => {
+    if (types.isProxy(bytes) || !types.isUint8Array(bytes)) fail("corrupt");
+    const getter = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(Uint8Array.prototype),
+      "byteLength",
+    )?.get;
+    if (!getter) fail("corrupt");
+    return Reflect.apply(getter, bytes, []) as number;
+  }, "corrupt");
+  if (length > CONTROL_MANIFEST_BYTES) fail("limit");
   const input: unknown = checked(
     () => JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes)),
     "corrupt",

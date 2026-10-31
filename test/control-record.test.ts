@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { createControlNamer } from "../src/integrations/control-identity.ts";
 import {
   type ControlValue,
@@ -318,6 +319,67 @@ test("read byte limits apply before JSON parsing, including exact capacity", () 
   fails(() => decodeControlManifest(namer, receiptKey, Buffer.alloc(262145)), "limit");
 });
 
+test("read limits ignore shadowed byteLength on a valid oversized manifest", () => {
+  const m = envelope({ ...advert, data: "" }, memberKey);
+  m.value = { ...advert, data: "x".repeat(262345 - wire(m).byteLength) };
+  const bytes = Uint8Array.from(wire(m));
+  expect(bytes.byteLength).toBe(262345);
+  Object.defineProperty(bytes, "byteLength", { value: 0 });
+  fails(() => decodeControlManifest(namer, memberKey, bytes), "limit");
+});
+
+test("read limits use the supplied view without invoking byteLength getters", () => {
+  const m = envelope();
+  const base = wire(m);
+  const sentinel = randomUUID();
+  for (const size of [base.byteLength, 262144, 262145]) {
+    const bytes = new Uint8Array(size).fill(32);
+    bytes.set(base);
+    let reads = 0;
+    Object.defineProperty(bytes, "byteLength", {
+      get() {
+        reads++;
+        throw new Error(sentinel);
+      },
+    });
+    if (size <= 262144) expect<unknown>(decodeControlManifest(namer, receiptKey, bytes)).toEqual(m);
+    else fails(() => decodeControlManifest(namer, receiptKey, bytes), "limit", sentinel);
+    expect(reads).toBe(0);
+  }
+  const backing = new Uint8Array(262345);
+  backing.set(base, 17);
+  const view = new Uint8Array(backing.buffer, 17, base.byteLength);
+  expect<unknown>(decodeControlManifest(namer, receiptKey, view)).toEqual(m);
+});
+
+test("invalid byte containers and typed-array proxies produce only fixed corrupt errors", () => {
+  const sentinel = randomUUID();
+  const base = wire(envelope());
+  const revocable = Proxy.revocable(base, {});
+  revocable.revoke();
+  const inputs: unknown[] = [
+    null,
+    undefined,
+    Array.from(base),
+    base.buffer,
+    new DataView(base.buffer),
+    new Uint16Array(1),
+    Object.create(Uint8Array.prototype),
+    new Proxy(Uint8Array.from(base), {}),
+    revocable.proxy,
+    new Proxy(base, {
+      get() {
+        throw new Error(sentinel);
+      },
+      getPrototypeOf() {
+        throw new Error(sentinel);
+      },
+    }),
+  ];
+  for (const input of inputs)
+    fails(() => decodeControlManifest(namer, receiptKey, input as Uint8Array), "corrupt", sentinel);
+});
+
 test("canonical write bytes independently fit exactly, then reject one more UTF-8 byte", () => {
   for (const size of [262144, 262145]) {
     const m = envelope({ ...advert, data: "" }, memberKey);
@@ -427,10 +489,40 @@ test("non-JSON proposals and caller exceptions disclose only fixed errors withou
       },
     };
     fails(() => controlKey(throwingNamer, advert), "invalid", sentinel);
+    fails(() => encodeControlManifest(throwingNamer, envelope()), "invalid", sentinel);
+    fails(() => validateControlReplacement(throwingNamer, reserved, committed), "invalid", sentinel);
     fails(
       () => decodeControlManifest(throwingNamer, memberKey, wire(envelope(advert, memberKey))),
       "corrupt",
       sentinel,
     );
   });
+});
+
+test.each([
+  new ClaimLostError(),
+  new ClaimWaitError("cancelled"),
+  new ClaimWaitError("lease"),
+  new ClaimWaitError("unavailable"),
+])("claim control exceptions retain object identity across all four APIs: %s", (error) => {
+  const throwingNamer = {
+    derive() {
+      throw error;
+    },
+  };
+  const actions = [
+    () => controlKey(throwingNamer, reserved),
+    () => decodeControlManifest(throwingNamer, receiptKey, wire(envelope())),
+    () => encodeControlManifest(throwingNamer, envelope()),
+    () => validateControlReplacement(throwingNamer, reserved, committed),
+  ];
+  for (const action of actions) {
+    let caught: unknown;
+    try {
+      action();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBe(error);
+  }
 });
