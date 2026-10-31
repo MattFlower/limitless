@@ -154,3 +154,51 @@ test("trace finder searches universal clauses and restart entry points with conc
   expect(prompt).not.toContain("Correctness: bugs, edge cases");
   expect(prompt).not.toContain("a separate step verifies");
 });
+
+test("production and adversarial openings are unchanged and the eval additions append one block", () => {
+  const input = {
+    prompt: "Fix the bug",
+    spec: null,
+    baseSha: "base",
+    stat: "src/a.ts | 1 +",
+    gates: [],
+    audit: [],
+    implementerReport: "",
+  };
+  // Stored trials are compared against these exact openings; a resumed eval must keep them.
+  expect(reviewPrompt(input).split("\n")[0]).toBe(
+    "You are an adversarial code reviewer. A different AI model implemented the change below. Your job is to find real problems before it merges — not to be agreeable. Approve only if you would be comfortable merging this into production code you are responsible for.",
+  );
+  const adversarial = reviewPrompt({ ...input, finder: "adversarial" });
+  const opening = adversarial.split("\n")[0] ?? "";
+  expect(opening).toBe(
+    "You are an adversarial code reviewer. A different AI model implemented the change below. Assume the change can fail, and find out how. Trace bad and boundary inputs, retries, partial failure, ordering, restarts, and version skew between old and new code or data. Give no credit for intent: judge what the code does, not what its comments, names or commit messages say. Report every issue you believe is real, with your confidence; a separate step verifies each finding.",
+  );
+  const rest = adversarial.slice(opening.length);
+  for (const [finder, instructions] of [
+    [
+      "adversarial-thorough",
+      [
+        "Do not stop at the first finding",
+        "second-order failures",
+        "every removed or replaced block",
+        "Never invent a finding",
+      ],
+    ],
+    [
+      "adversarial-callers",
+      [
+        "callers and alternate entry points",
+        "files outside the diff",
+        "invariant it enforced",
+        "name that code by file and line",
+      ],
+    ],
+  ] as const) {
+    const variant = reviewPrompt({ ...input, finder });
+    expect(variant.startsWith(`${opening}\n\n`)).toBe(true);
+    expect(variant.endsWith(rest)).toBe(true);
+    const block = variant.slice(opening.length + 2, variant.length - rest.length);
+    for (const instruction of instructions) expect(block).toContain(instruction);
+  }
+});

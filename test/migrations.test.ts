@@ -67,6 +67,37 @@ test("every foreign key has a nonpartial index with its child columns first", ()
   }
 });
 
+test("defect outbox tables survive rollback while the previous release continues writing", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-defect-outbox.sql"),
+    });
+    const old = new Store(path, before);
+    old.setSetting("existing", "preserved");
+    old.close();
+    const current = new Store(path);
+    current.db
+      .query("INSERT INTO defect_outbox (source_ref,source_key,state) VALUES (?,?,?)")
+      .run("source", "event", "blocked");
+    current.close();
+    const rolledBack = new Store(path, before);
+    expect(rolledBack.getSetting("existing", "")).toBe("preserved");
+    rolledBack.setSetting("rollback", "written");
+    rolledBack.close();
+    const upgraded = new Store(path);
+    try {
+      expect(upgraded.getSetting("rollback", "")).toBe("written");
+      expect(upgraded.db.query("SELECT source_key,state FROM defect_outbox").all()).toEqual([
+        { source_key: "event", state: "blocked" },
+      ]);
+    } finally {
+      upgraded.close();
+    }
+  });
+});
+
 test("child-key indexes upgrade populated databases once and permit previous-release writes", () => {
   temporary((directory, path) => {
     const before = join(directory, "before");

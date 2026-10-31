@@ -69,7 +69,7 @@ const invalid: [string, string][] = [
   [file(panel({ verifier: { targets: ["verifier-c", "x@"] } })), "expected model or model@effort"],
   [
     file(system({ finders: [{ target: "candidate-a", prompt: "strict" }] })),
-    'finder prompt must be "standard", "adversarial", "careful", "probe", "trace" or "adversarial-checklist"',
+    'finder prompt must be "standard", "adversarial", "careful", "probe", "trace", "adversarial-checklist", "adversarial-thorough" or "adversarial-callers"',
   ],
   [file(system({ finders: [] })), "exactly one finder"],
   [file(system({ finders: [system().finders[0], system().finders[0]] })), "exactly one finder"],
@@ -104,7 +104,26 @@ test("eval review systems reject unsupported shapes with clear errors", () => {
 });
 
 test("single prompt variants are eval-only and retain the single-mode restrictions", () => {
-  for (const prompt of ["adversarial", "careful", "probe", "adversarial-checklist"] as const) {
+  for (const prompt of [
+    "adversarial",
+    "careful",
+    "probe",
+    "adversarial-checklist",
+    "adversarial-thorough",
+    "adversarial-callers",
+  ] as const) {
+    if (prompt === "adversarial-thorough" || prompt === "adversarial-callers") {
+      // Production and rosters refuse them; evals run them single, with or without samples.
+      for (const profile of ["quick", "standard", "deep"])
+        expect(() => parseReviewRosters({ [profile]: [{ prompt }] })).toThrow("eval-only");
+      const finders = [{ target: "candidate-a", prompt }];
+      expect(ReviewSystemSchema.safeParse(panel({ finders })).success).toBe(false);
+      expect(() => parseEvalReviewSystems(file(panel({ finders })), "s.json")).toThrow(
+        'require mode "single"',
+      );
+      const sampled = system({ samples: 2, finders });
+      expect(parseEvalReviewSystems(file(sampled), "s.json")).toEqual([sampled] as ReviewSystem[]);
+    }
     if (prompt === "adversarial-checklist") {
       expect(() => parseReviewRosters({ quick: [{ prompt }] })).toThrow("eval-only");
       expect(

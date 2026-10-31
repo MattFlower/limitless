@@ -71,8 +71,35 @@ application of `acceptance` was by an account in `[github.queue] trusted` (case-
 A missing or untrusted application refuses the ticket; an earlier trusted application does
 not approve a later untrusted one. The ticket needs a parent, and both bodies must pass the
 trusted-author and last-editor checks. Acceptance runs retain the lifecycle labels and only
-the fixed started and needs-you comments, carrying the run id and UI link; they make no other
-GitHub writes, including failed or cancelled comments.
+the fixed started and needs-you comments, carrying the run id and UI link, and post no failed or
+cancelled comments. Their only other GitHub writes file follow-ups, as described below.
+
+When the engine judges a unit `partly_met`, `unmet` or `regressed`, the run files one follow-up
+per top-level item with such a gap (the item and its nested sub-items); `met`, `not_assessed`
+and `manual` units file nothing. Each follow-up is created as a sub-issue of the epic (the
+ticket's parent) and added as a native blocker of the acceptance ticket, so the ticket runs
+again only after its follow-ups close. Follow-ups get no labels, in particular no priority
+label: prioritizing them is the owner's or orchestrator's approval. Line 1 of the body is the
+marker `<!-- limitless-acceptance:<ticket>:<pass>:<item> -->`; the body quotes the item and each
+gap unit from the epic, the verdict and the engine's citations and refusals, and puts the
+reader's note under "Reviewer's note (data)" in a quoted, fenced block. Before creating, the run adopts
+an existing sub-issue of the epic whose first line is the marker and whose author is the
+factory's posting login. Under a GitHub App, only a Bot author matching the App slug
+(without `[bot]`, case-insensitively) is adopted. A pass record (epic, pass, ticket SHA, filed
+issues) is written before the first GitHub write, and a creation request is sent at most once: after a restart, a
+request that the marker search can't find stops the run for you instead of being re-sent.
+Only the coordinator that durably claims a pending item sends its request, and a GitHub failure
+ends the run needs-you, naming the filed issues and the unconfirmed item.
+A fresh run at the same ticket and SHA reuses the epic's latest pass, including its stored
+handles and completion state. A pass that sent no creation request is reused for a new run
+and is not counted; only passes that requested follow-ups spend the allowance. If that reservation
+is reassigned to another ticket or SHA while a caller awaits GitHub, the stale caller stops before
+filing or completing the replacement pass. Callers for the same ticket and SHA still share it.
+Each epic has at most two counted passes. When a later run still finds gaps, it files nothing,
+adds `limitless:needs-you` only if the epic lacks it, and posts one comment there naming the
+ticket and run, once per epic. The comment is reconciled by marker after identity and listing
+reads succeed, and claimed only immediately before posting; uncertain requests are not re-sent.
+The run ends needs-you, listing the pass and filed issues or the reached limit.
 
 Operators can run `limitless accept <owner/name>#<n>` without queue scheduling eligibility or the label.
 The repository must be listed in `[github.queue] repos` (case-insensitive), with a nonempty
@@ -94,6 +121,13 @@ suffix marks that section's units as documentation requirements; other units req
 evidence, and a unit referenced both ways requires tests. Other prose in the intent section is context;
 a list item there refuses, since only references produce units. Units whose text is identical as
 written share one unit.
+
+The manifest records the top-level unit id as each unit's `item`: a paragraph or top-level
+list item owns itself, and nested sub-items belong to their top-level list item. Deduplicated
+units keep the item of their first occurrence. Persisted manifests without `item` remain
+valid; grouping re-resolves the persisted snapshot and uses its items only when the unit ids
+and texts match in the same order. If ancestry cannot be confirmed, the run ends needs-you
+with a reason, filing nothing and claiming no pass.
 
 Quoting parent or file text (a `From #123:` or `From docs/PLAN.md:` line followed by `>` quotes)
 is not supported: it was cut from #981's scope, and a lead-in or a quote refuses the run. Put the
