@@ -647,6 +647,47 @@ proxied browsers also sign in to Limitless over an HTTPS public origin. Keep bas
 authentication on the Access List, with NPM's “Satisfy Any”
 disabled so both the source and the credentials are required.
 
+## Defect reporter delivery status
+
+The defect reporter is inactive. The outbox migration and submission storage are implemented;
+there is no reconciler, detector, daemon timer or operator configuration yet. The future
+`[github.defects]` setting belongs to D1a.3 and cannot currently be enabled.
+
+When enabled in that later delivery, enable `[github.defects]` on **exactly one coordinator**.
+A second enabled coordinator can create duplicate issues and independently consume its local
+daily cap. Later occurrences must enumerate all legitimate matches and converge on the oldest
+issue. Cross-coordinator serialization, a shared cap and ownership transfer belong to #902;
+the local database is not a fleet-wide guarantee. Preserve the database and pinned destination
+when disabling or rolling back. Moving to a different coordinator/database is not a supported
+ownership-transfer procedure.
+
+### D1a.2 source-budget split
+
+The 250-line source ceiling requires separate deliveries for the remaining state machine.
+The current delivery adds only the durable submission boundary. Await
+`createDefectOutbox(store, deps).prepareSubmission(sourceKey, finding)`, then invoke its returned
+synchronous function inside the detector's checkpoint transaction. Alternatively, pass the
+synchronous checkpoint callback to that function; its own transaction commits both together.
+Replaying an existing source key skips preparation and keeps its occurrence ID. Disabling the
+injected coordinator context prevents preparation calls and commits. Suppressed and rejected
+submissions have no payload; only guarded bytes and the posting App login enter prepared rows.
+
+Proposed follow-up deliveries, each subject to its own 250-line source ceiling:
+
+1. Add resumable App-authenticated issue enumeration and occurrence-specific issue/comment
+   recovery, sharing D1a.1's parsing and provenance checks. Persist only validated match IDs and
+   creation times. Exercise the 32-call budget, pagination reopen, exact bodies, edited/conflicting
+   objects, lost responses and recovered unlabelled issues with fake clients.
+2. Add the single reporter service and guarded dispatch. Use the signature table for atomic
+   creation barriers/bindings, reserve the UTC cap with the send intent, coalesce reconciliation,
+   reconcile unresolved sends first, and enforce App identity, discreet policy, current privacy
+   guards and the `defect` label. Exercise concurrency, late requests, cap rollover, closed issues
+   and two-database duplicate convergence. No production mounting belongs in this delivery.
+
+Both follow-ups are required before D1a.2 satisfies its delivery acceptance criteria. In
+particular, the schema's send-state, scan-progress and reservation columns alone do not implement
+recovery, delivery or a cap.
+
 ## Website
 
 Build the static website with `bun scripts/build-site.ts`, then serve `site-dist/` with
