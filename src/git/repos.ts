@@ -682,7 +682,15 @@ export async function iterationRefs(cwd: string, runId: string) {
 }
 
 export async function removeIterationRefs(paths: Paths, repo: Repo, runId: string): Promise<void> {
-  for (const cwd of [cachePath(paths, repo), ...(repo.kind === "local" ? [repo.localPath] : [])]) {
+  const source =
+    repo.kind === "local" && repo.localPath && existsSync(repo.localPath) ? repo.localPath : null;
+  // The user owns the registered source, which may itself be a linked worktree without a sidecar.
+  const owner =
+    source &&
+    (
+      await sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: source })
+    ).stdout.trim();
+  for (const cwd of [cachePath(paths, repo), owner]) {
     if (!cwd || !existsSync(cwd)) continue;
     for (const { ref } of await iterationRefs(cwd, runId))
       await worktreeGit(["git", "update-ref", "-d", ref], { cwd });

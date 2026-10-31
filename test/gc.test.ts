@@ -97,45 +97,56 @@ test("cancelling a parked run cleans its iteration refs without waiting for GC",
   }
 });
 
-test.each(["cache", "legacy"])("terminal refs in %s are cleaned without a worktree", async (owner) => {
-  const statuses: RunStatus[] = [...TERMINAL_STATUSES, "queued", "running", "waiting", "waiting_input"];
-  const records = [];
-  for (const status of statuses) {
-    const record = run(status, 0, status !== "failed");
-    const cwd = owner === "legacy" ? join(cfg.paths.work, record.id) : await worktree(record.id);
-    if (owner === "legacy") {
-      await sh(["git", "worktree", "add", "-b", record.id, cwd], { cwd: repoDir });
-      await recordWorktree(cwd);
+test.each(["cache", "legacy", "linked"])(
+  "terminal refs in %s are cleaned without a worktree",
+  async (owner) => {
+    const statuses: RunStatus[] = [...TERMINAL_STATUSES, "queued", "running", "waiting", "waiting_input"];
+    const records = [];
+    const legacy = owner !== "cache";
+    if (owner === "linked") {
+      // A registered source that is itself a linked worktree has no factory sidecar.
+      const source = join(root, "linked-source");
+      await sh(["git", "worktree", "add", "-q", "-b", "linked-source", source], { cwd: repoDir });
+      const { id: _, createdAt: __, ...registration } = repo;
+      repo = store.upsertRepo({ ...registration, slug: "local/linked", localPath: source });
     }
-    const base = await headSha(cwd);
-    writeFileSync(join(cwd, "iteration.txt"), "first\n");
-    await commitAll(cwd, "first");
-    const previous = await headSha(cwd);
-    writeFileSync(join(cwd, "iteration.txt"), "second\n");
-    await commitAll(cwd, "second", { boundary: base, runId: record.id });
-    if (status === "queued") store.setRunState(record.id, { parked: true });
-    await removeWorktree(cfg.paths, repo, cwd);
-    records.push({ ...record, status, previous });
-  }
-  const cache = owner === "legacy" ? repoDir : cachePath(cfg.paths, repo);
-  await worktreeGit(
-    ["git", "update-ref", "refs/limitless/iterations/unrelated/keep", records[0]?.previous ?? ""],
-    { cwd: cache },
-  );
-  await collectGarbage(store, cfg, { now, dryRun: true });
-  for (const record of records) expect(await iterationRefs(cache, record.id)).toHaveLength(1);
-  for (let pass = 0; pass < 2; pass++) {
-    expect((await collectGarbage(store, cfg, { now })).errors).toEqual([]);
-    for (const record of records) {
-      expect(await iterationRefs(cache, record.id)).toHaveLength(
-        TERMINAL_STATUSES.includes(record.status) ? 0 : 1,
-      );
-      if (!TERMINAL_STATUSES.includes(record.status))
-        expect((await sh(["git", "cat-file", "-e", record.previous], { cwd: cache })).exitCode).toBe(0);
+    for (const status of statuses) {
+      const record = run(status, 0, status !== "failed");
+      const cwd = legacy ? join(cfg.paths.work, record.id) : await worktree(record.id);
+      if (legacy) {
+        await sh(["git", "worktree", "add", "-b", record.id, cwd], { cwd: repo.localPath ?? repoDir });
+        await recordWorktree(cwd);
+      }
+      const base = await headSha(cwd);
+      writeFileSync(join(cwd, "iteration.txt"), "first\n");
+      await commitAll(cwd, "first");
+      const previous = await headSha(cwd);
+      writeFileSync(join(cwd, "iteration.txt"), "second\n");
+      await commitAll(cwd, "second", { boundary: base, runId: record.id });
+      if (status === "queued") store.setRunState(record.id, { parked: true });
+      await removeWorktree(cfg.paths, repo, cwd);
+      records.push({ ...record, status, previous });
     }
-    expect(await iterationRefs(cache, "unrelated")).toHaveLength(1);
-  }
-});
+    const cache = legacy ? repoDir : cachePath(cfg.paths, repo);
+    await worktreeGit(
+      ["git", "update-ref", "refs/limitless/iterations/unrelated/keep", records[0]?.previous ?? ""],
+      { cwd: cache },
+    );
+    await collectGarbage(store, cfg, { now, dryRun: true });
+    for (const record of records) expect(await iterationRefs(cache, record.id)).toHaveLength(1);
+    for (let pass = 0; pass < 2; pass++) {
+      expect((await collectGarbage(store, cfg, { now })).errors).toEqual([]);
+      for (const record of records) {
+        expect(await iterationRefs(cache, record.id)).toHaveLength(
+          TERMINAL_STATUSES.includes(record.status) ? 0 : 1,
+        );
+        if (!TERMINAL_STATUSES.includes(record.status))
+          expect((await sh(["git", "cat-file", "-e", record.previous], { cwd: cache })).exitCode).toBe(0);
+      }
+      expect(await iterationRefs(cache, "unrelated")).toHaveLength(1);
+    }
+  },
+);
 
 test("terminal worktrees use exact 3/7 day boundaries and preserve nonterminal worktrees", async () => {
   const cases: [RunStatus, number, boolean][] = [
