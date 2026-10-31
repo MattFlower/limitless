@@ -33,6 +33,8 @@ export const privacyLimits = {
   outputUnits: 8388608,
   outputBytes: 33554432,
   assembly: 64,
+  depth: 32,
+  nodes: 10000,
 };
 export function createPrivacyRegistry(secrets = createCredentialRegistry(), checker = () => "privacy/1") {
   let entries: PrivateStrings = [];
@@ -222,7 +224,9 @@ type Reason =
   | "assembly-count"
   | "forged"
   | "unreadable-policy"
-  | "invalid-cut";
+  | "invalid-cut"
+  | "json-depth"
+  | "json-nodes";
 type Projection = {
   text: string;
   truncated: boolean | undefined;
@@ -387,6 +391,83 @@ export function protectText(
     return issue(select(state, cut));
   } catch {
     return issue(withheld(state, "nonconvergent"));
+  }
+}
+type Diagnostic = null | boolean | number | string | Diagnostic[] | { [key: string]: Diagnostic };
+export function protectData(
+  { json, provenance, policy, cut, terminal }: Omit<TextInput, "text"> & { json: unknown },
+  options: Options = {},
+): BoundaryText {
+  if (typeof json !== "string") {
+    const state = context(policy, options);
+    state.truncated = provenance.kind === "cut" ? true : provenance.kind === "complete" ? false : undefined;
+    return issue(withheld(state, "nonconvergent"));
+  }
+  // The original is an internal complete candidate; only the eventual selection uses output caps.
+  const limits = context(policy, options).limits;
+  const original = protectText(
+    { text: json, provenance, policy, terminal },
+    { ...options, limits: { ...limits, outputUnits: limits.inputUnits, outputBytes: limits.inputBytes } },
+  );
+  const state = read(original);
+  if (state.withheld) return original;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch (error) {
+    if (error instanceof SyntaxError)
+      return protectText({ text: json, provenance, policy, cut, terminal }, options);
+    return issue(withheld(state, "nonconvergent"));
+  }
+  let reason: Reason = "nonconvergent";
+  const fail = (code: Reason): never => {
+    reason = code;
+    throw code;
+  };
+  const marker = "[withheld: private text]";
+  const field = (text: string) => {
+    const result = read(protectText({ text, provenance, policy, terminal }, options));
+    if (result.withheld) {
+      if (result.reason === "private-match") return marker;
+      return fail(result.reason ?? "nonconvergent");
+    }
+    return result.text;
+  };
+  let nodes = 0;
+  const count = (depth: number) => {
+    if (depth > limits.depth) fail("json-depth");
+    if (++nodes > limits.nodes) fail("json-nodes");
+  };
+  const visit = (value: unknown, depth: number): Diagnostic => {
+    count(depth);
+    if (typeof value === "string") return field(value);
+    if (typeof value === "number") {
+      const display = String(value);
+      return field(display) === display ? value : marker;
+    }
+    if (value === null || typeof value === "boolean") return value;
+    if (Array.isArray(value)) return value.map((item) => visit(item, depth + 1));
+    if (typeof value !== "object") return fail("nonconvergent");
+    const object: { [key: string]: Diagnostic } = {};
+    let collision = false;
+    for (const [key, item] of Object.entries(value)) {
+      count(depth + 1);
+      const protectedKey = field(key);
+      const protectedValue = visit(item, depth + 1);
+      if (Object.hasOwn(object, protectedKey)) collision = true;
+      else
+        Object.defineProperty(object, protectedKey, {
+          value: protectedValue,
+          enumerable: true,
+        });
+    }
+    return collision ? marker : object;
+  };
+  try {
+    const text = JSON.stringify(visit(parsed, 0));
+    return protectText({ text, provenance, policy, cut }, options);
+  } catch {
+    return issue(withheld(state, reason));
   }
 }
 function derive(value: unknown, operation: (state: Evidence) => Evidence): BoundaryText {
