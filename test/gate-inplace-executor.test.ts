@@ -1417,7 +1417,8 @@ test.each([
       : purpose === "initial"
         ? "test -f farewell.txt && ! test -f base.txt"
         : "test -f base.txt";
-  const command = `if ${condition}; then test "$(cat greeting.txt)" = hello && test ! -f active-build || exit 9; echo run >> '${counter}'; echo gate-output > greeting.txt; touch active-build; echo ready > '${ready}'; while [ ! -f '${proceed}' ]; do sleep 0.05; done; test -f active-build && test "$(cat greeting.txt)" = gate-output; fi`;
+  // Every attempt must publish its completed edits before the test releases it.
+  const command = `if ${condition}; then test ! -f '${proceed}' || exit 8; test "$(cat greeting.txt)" = hello && test ! -f active-build || exit 9; echo run >> '${counter}'; echo gate-output > greeting.txt; touch active-build; cat '${counter}' > '${ready}'; while [ ! -f '${proceed}' ]; do sleep 0.05; done; test -f active-build && test "$(cat greeting.txt)" = gate-output; fi`;
   mkdirSync(join(fixture.repoDir, "test"));
   writeFileSync(
     join(fixture.repoDir, "test/unrelated.test.ts"),
@@ -1456,7 +1457,7 @@ test.each([
         profile: "quick",
       });
       // Counter creation precedes both its contents and the worktree edits we must preserve.
-      await waitForFile(ready, (contents) => contents === "ready\n");
+      await waitForFile(ready, (contents) => contents === "run\n");
       const state = f.store.getRunState<RunContext["state"]>(run.id);
       expect(state?.gateExecution?.purpose).toBe(purpose);
       const job = workers.job(state?.gateExecution?.handle.id ?? "");
@@ -1484,6 +1485,8 @@ test.each([
       } finally {
         attach.mockRestore();
       }
+      // Attach can return while the replacement is still queued, before its worktree edits.
+      await waitForFile(ready, (contents) => contents === (mismatch ? "run\nrun\n" : "run\n"));
       writeFileSync(proceed, "");
       expect(await waitFor(next, run.id, ["succeeded", "failed", "needs_human"])).toBe(
         purpose === "initial" ? "needs_human" : "succeeded",
