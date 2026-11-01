@@ -130,6 +130,7 @@ function verifiedAtLeast(finding: Finding, min: Verification["severity"]): boole
  * R3 — a critical finding (cited prior, regression or new).
  * The panel always sends security findings and prior blocking findings to the verifier, so one without
  * a ruling was left out after a retry: it blocks (fail closed).
+ * Eval `severityRubric` systems also need a verified high or critical finding in round one.
  */
 function panelBlocks(
   finding: Finding,
