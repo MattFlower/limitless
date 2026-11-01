@@ -584,7 +584,7 @@ for (const source of ["cleanup", "discovery", "both-denied"] as const) {
     store.close();
     rmSync(scratch, { recursive: true });
     store = new Store(database);
-    if (source === "both-denied") native.setRealpathFailure({ path: directory, code: "EACCES" });
+    if (source === "both-denied") native.setRealpathFailure({ path: directory, code: "EIO" });
     let alive = true;
     const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
       expect(pid).toBe(native.unreadablePid);
@@ -620,11 +620,11 @@ for (const source of ["cleanup", "discovery", "both-denied"] as const) {
             const cleanups = store.listProcessCleanups();
             const discoveries = store.listProcessDiscoveries();
             await expect(recoverProcessCleanups(store)).rejects.toThrow(
-              "Process cwd root validation failed (EACCES)",
+              "Process cwd root validation failed (EIO)",
             );
             store.close();
             store = new Store(database);
-            await expectRecoveryRefusal("Process cwd root validation failed (EACCES)");
+            await expectRecoveryRefusal("Process cwd root validation failed (EIO)");
             expect(store.listProcessCleanups()).toEqual(cleanups);
             expect(store.listProcessDiscoveries()).toEqual(discoveries);
             expect(kill).not.toHaveBeenCalled();

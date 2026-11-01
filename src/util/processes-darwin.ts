@@ -111,7 +111,7 @@ function darwinCwdDirectories(directories: readonly string[]): string[] {
       root = realpathSync(directory);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") continue;
+      if (code === "ENOENT" || code === "ENOTDIR" || code === "EPERM" || code === "EACCES") continue;
       throw new Error(`Process cwd root validation failed (${code ?? "unknown"})`, { cause: error });
     }
     if (broad(root)) return [];

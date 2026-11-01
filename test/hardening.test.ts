@@ -383,6 +383,56 @@ describe("process handling", () => {
     },
   );
 
+  test.each(["EPERM", "EACCES"])(
+    "Darwin discovery skips %s roots without losing ownership evidence",
+    async (code) => {
+      const native = await loadNativeInspection(dir);
+      const denied = join(dir, "denied");
+      const checkout = join(dir, "checkout");
+      const scratch = join(dir, "scratch");
+      for (const root of [denied, checkout, scratch]) mkdirSync(root);
+      native.setRealpathFailure({ path: denied, code });
+      const selected = (roots: string[]) =>
+        native.markedDarwinProcesses(
+          process.getuid?.() ?? 0,
+          "this-invocation",
+          native.leaderPid,
+          2000,
+          roots,
+          null,
+          new Set([process.pid]),
+        );
+      const hiddenMember = (roots: string[], cwd: string, parent = 1, members = new Set<number>()) =>
+        native.hiddenDarwinProcessMember(
+          native.unreadablePid,
+          new Map([[native.unreadablePid, parent]]),
+          members,
+          2000,
+          roots,
+          () => 2000,
+          () => ({ path: cwd }),
+        );
+      for (const surviving of [checkout, scratch]) {
+        const roots = [denied, surviving];
+        for (const cwd of [denied, surviving]) {
+          native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: cwd } });
+          expect(selected(roots).includes(native.unreadablePid)).toBe(cwd === surviving);
+          expect(hiddenMember(roots, cwd)).toBe(cwd === surviving);
+        }
+      }
+      // Without any readable cwd roots, unrelated orphans stay excluded even when
+      // their birth time and cwd cannot be inspected; markers and ancestry still work.
+      native.setUnreadableProcess({ parent: 1, born: { errno: 1 }, cwd: { errno: 1 } });
+      expect(selected([denied])).toEqual([]);
+      expect(hiddenMember([denied], denied)).toBe(false);
+      native.setMemberMarker("this-invocation");
+      expect(selected([denied])).toEqual([native.memberPid]);
+      native.setUnreadableProcess({ parent: native.memberPid, born: { errno: 1 }, cwd: { errno: 1 } });
+      expect(selected([denied]).sort()).toEqual([native.memberPid, native.unreadablePid]);
+      expect(hiddenMember([denied], denied, native.memberPid, new Set([native.memberPid]))).toBe(true);
+    },
+  );
+
   test("unreadable Darwin home preserves safe roots and refuses its configured spelling", async () => {
     const native = await loadNativeInspection(dir);
     const home = join(dir, "home");
