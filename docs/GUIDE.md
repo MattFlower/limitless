@@ -250,7 +250,7 @@ discovers an owner.
 | `[gates] executor` | `"local"` | `"local"` or `"lan"`. LAN gates require a repository opt-in below; other repos run locally. Older releases reject `"lan"`; reset to `"local"` before rolling back. |
 | `[workers] listen` | unset | Separate TLS worker listener, for example `"0.0.0.0:7443"`. Unset starts no listener. Owner API routes stay on the owner port. |
 | `[repos."<owner>/<name>"] discreet` | `false` | Omit factory marks from published branches, commits, PR reports and round comments; skip issue-trigger status comments. Slugs match case-insensitively. Older releases ignore this table and publish their usual marks. Existing branches retain their names. |
-| `[repos."<owner>/<name>"] shared` | `false` | Boolean reserving shared-mode safety behavior: manual local landing refuses when true. Does not enable shared admission, approvals or landing authority. Slugs match case-insensitively. |
+| `[repos."<owner>/<name>"] shared` | `false` | Shared GitHub execution requires per-execution claim authority; `"auto"` publishes an open PR. Manual local landing refuses when true. Does not enable shared admission, approvals or landing authority. Slugs match case-insensitively. |
 | `[repos."<owner>/<name>"] branch_prefix` | `"change/"` | In discreet mode, branches use `<branch_prefix><title-slug>` with `-2` through `-5`, then one random suffix for collisions (six probes maximum). Must form a valid branch when followed by `x`. Ignored unless `discreet = true`. |
 | `[repos."<owner>/<name>"] github_actions` | `false` | Authorizes the GitHub Actions gate executor to publish candidates to this repository. Authorization only: this release does not select Actions, and production keeps its existing routing. Discreet repositories always refuse. |
 | `[repos."<owner>/<name>"] github_actions_paid_minutes` | `false` | Also required when GitHub reports the repository as private; grants nothing without `github_actions`. |
@@ -273,6 +273,27 @@ discovers an owner.
 
 Unknown repository settings are ignored with a warning naming the repository and key, so later keys do not prevent rollback.
 The `shared` flag reserves safety behavior; it does not enable shared admission.
+For shared GitHub executions, the engine captures this policy when execution starts.
+With merge policy `"auto"`, it publishes the PR, records delivery completion and leaves
+it open. Changing the configuration during execution does not change that decision.
+Local `"auto"` delivery keeps its existing merge behavior.
+
+Claimed execution requires matching per-execution authority and a fresh successful
+renewal on every start or restart, followed by a current claim guard. Persisted held
+state alone never authorizes work. Missing authority queues the run before startup
+bookkeeping or stages begin. No production acquisition or admission is enabled here;
+complete lifecycle fencing and admission remain prerequisites for shared operation.
+
+Claim waits preserve the current phase, rejection evidence and publication checkpoints.
+They queue resumable work with a next-attempt time, even outside delivery, and are not
+bounded by the ordinary GitHub outage budget. Renewal and a current guard must succeed
+before a restart clears the claim wait. Claim loss stops execution locally without
+retrying or publishing a cancellation through attached observers. Guards cannot retract
+requests already dispatched; existing receipts and outcome checks still apply.
+A claimed post-merge rejection stays nonterminal until rollback and draft reporting
+finish. Shutdown re-queues that cleanup; an ordinary cleanup failure re-queues it with
+a delayed retry, retaining the rejection evidence.
+
 Shared PRs remain open until the shared landing path ships; existing local landing paths do not grant shared landing authority.
 Rollback of local use remains data-compatible. Older parsers ignore `shared` with a warning;
 this provides no shared safety. Before downgrading shared deployments, disable shared admission

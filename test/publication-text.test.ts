@@ -1,9 +1,71 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import * as os from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkPublicationText, sanitizePublication } from "../src/gates/publication.ts";
 import { registerCredential, registeredCredentials } from "../src/util/proc.ts";
+
+test("publication rewrites home paths across text forms while preserving siblings and web URLs", () => {
+  const home = `/Users/${["publication", "user"].join("-")}`;
+  const mockedHome = spyOn(os, "homedir").mockReturnValue(home);
+  try {
+    const url = `https://example.com${home}/.agents/x`;
+    const input = [
+      `${home} "${home}" '${home}' \`${home}/.agents/x\` file://${home}`,
+      `[${home}/.agents/x](docs/a) [skill](${home}/.agents/x)`,
+      `[skill](<file://${home}/a file> "See ${home}")`,
+      `[web](${url} 'See ${home}/.agents/x')`,
+      `${home}2/x ${home}-old ${home.toUpperCase()}/x`,
+      `${url} HTTP://example.com?q=${home} https://example.com?q=[x](${home})`,
+    ].join("\n");
+    const expected = [
+      "~ \"~\" '~' `~/.agents/x` ~",
+      "[~/.agents/x](docs/a) [~/.agents/x](~/.agents/x)",
+      '[~/a file](<~/a file> "See ~")',
+      `[web](${url} 'See ~/.agents/x')`,
+      `${home}2/x ${home}-old ${home.toUpperCase()}/x`,
+      `${url} HTTP://example.com?q=${home} https://example.com?q=[x](${home})`,
+    ].join("\n");
+    const clean = sanitizePublication(input, "/factory/work", "/factory/data");
+    expect(clean).toBe(expected);
+    expect(sanitizePublication(clean, "/factory/work", "/factory/data")).toBe(expected);
+  } finally {
+    mockedHome.mockRestore();
+  }
+});
+
+test("home aliases preserve worktree and data priority, including missing roots", () => {
+  const temp = mkdtempSync(join(tmpdir(), "publication-home-"));
+  const canonical = join(realpathSync(temp), "home");
+  const configured = join(temp, "alias");
+  const mockedHome = spyOn(os, "homedir").mockReturnValue(configured);
+  try {
+    mkdirSync(join(canonical, "data", "work"), { recursive: true });
+    symlinkSync(canonical, configured, "dir");
+    const retained = join(configured, "removed-work");
+    const work = [join(configured, "data", "work"), retained];
+    const data = join(configured, "data");
+    for (const root of [configured, canonical]) {
+      const input = `${root}/data/work/a ${root}/data/log ${root}/.agents/x ${root} ${retained}/a`;
+      expect(sanitizePublication(input, work, data)).toBe("a <data>/log ~/.agents/x ~ a");
+    }
+    const missing = join(temp, "missing-home");
+    mockedHome.mockReturnValue(missing);
+    expect(sanitizePublication(`${missing} ${missing}/.agents/x`, work, data)).toBe("~ ~/.agents/x");
+    if (process.platform === "darwin") {
+      for (const root of [`/var/${["missing", "home"].join("-")}`, `/tmp/${["missing", "home"].join("-")}`]) {
+        for (const spelling of [root, `/private${root}`]) {
+          mockedHome.mockReturnValue(spelling);
+          expect(sanitizePublication(`${root} /private${root}/.agents/x`, work, data)).toBe("~ ~/.agents/x");
+        }
+      }
+    }
+  } finally {
+    mockedHome.mockRestore();
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
 
 test("publication rewrites local report links and bare paths without changing ordinary links", () => {
   const data = "/factory/data";
@@ -160,7 +222,8 @@ test("paths after prose colons are sanitized in labels, titles and bare text", (
 });
 
 test("configured and canonical aliases rewrite file URLs with complete directory boundaries", () => {
-  const temp = mkdtempSync(join(tmpdir(), "publication-alias-"));
+  const temp = realpathSync(mkdtempSync(join(tmpdir(), "publication-alias-")));
+  const mockedHome = spyOn(os, "homedir").mockReturnValue(temp);
   try {
     const data = join(temp, "data");
     const work = join(temp, "external-work");
@@ -172,20 +235,22 @@ test("configured and canonical aliases rewrite file URLs with complete directory
     symlinkSync(work, workAlias, "dir");
     for (const root of [workAlias, realpathSync(workAlias)]) {
       const input = `${root}/a.ts file://${root}/a.ts [f](file://${root}/a.ts) ${root}-other/a.ts`;
-      const sibling = root === workAlias ? "<data>/work-other/a.ts" : `${root}-other/a.ts`;
+      const sibling = root === workAlias ? "<data>/work-other/a.ts" : "~/external-work-other/a.ts";
       const expected = `a.ts a.ts [a.ts](a.ts) ${sibling}`;
       expect(sanitizePublication(input, workAlias, alias)).toBe(expected);
       expect(sanitizePublication(expected, workAlias, alias)).toBe(expected);
     }
     for (const root of [alias, realpathSync(alias)]) {
       const input = `${root}/logs/a file://${root}/logs/a [f](file://${root}/logs/a) ${root}-other/a`;
-      const expected = `<data>/logs/a <data>/logs/a <data>/logs/a ${root}-other/a`;
+      const sibling = root === alias ? "~/alias-other/a" : "~/data-other/a";
+      const expected = `<data>/logs/a <data>/logs/a <data>/logs/a ${sibling}`;
       expect(sanitizePublication(input, workAlias, alias)).toBe(expected);
     }
     const missing = join(alias, "removed");
     expect(sanitizePublication(`file://${missing}/a.ts`, missing, alias)).toBe("a.ts");
     expect(sanitizePublication(`${work.toUpperCase()}/a.ts`, work, data)).toBe(`${work.toUpperCase()}/a.ts`);
   } finally {
+    mockedHome.mockRestore();
     rmSync(temp, { recursive: true, force: true });
   }
 });

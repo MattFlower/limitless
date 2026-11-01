@@ -55,6 +55,7 @@ import type { GateEvidence } from "./gate-evidence.ts";
 import { consumeGateExecution } from "./gate-execution.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
+import type { RunClaim } from "./run-claim.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 import type { SizeReport } from "./size.ts";
@@ -78,6 +79,7 @@ export function localCheckpointer(store: Store): Checkpointer {
 }
 
 export interface EngineDeps {
+  runClaim?: RunClaim;
   loadSource?: () => number;
   checkpointer?: Checkpointer;
   gateExecutor?: GateExecutor;
@@ -437,9 +439,24 @@ export class RunContext {
     signal: AbortSignal,
     readonly isDraining: () => boolean = () => false,
     readonly drainEvents?: EventTarget,
+    readonly execution: Readonly<{ shared: boolean; claim?: RunClaim; error?: unknown }> = { shared: false },
   ) {
     const deps = liveDeps;
-    this.checkpointer = deps.checkpointer ?? localCheckpointer(deps.store);
+    const checkpointer = deps.checkpointer ?? localCheckpointer(deps.store);
+    // Reporting and fallback writes must observe durable decisions after every await.
+    this.checkpointer = execution.shared
+      ? {
+          writeState: (...args) => {
+            claimGuard();
+            return checkpointer.writeState(...args);
+          },
+          writeRun: (...args) => {
+            claimGuard();
+            return checkpointer.writeRun(...args);
+          },
+          checkpoint: (...args) => checkpointer.checkpoint(...args),
+        }
+      : checkpointer;
     const thisContext = this;
     this.deps = new Proxy(deps, {
       get(target, key, receiver) {
@@ -561,7 +578,11 @@ export class RunContext {
   }
 
   async save(checkpoint?: string, onComplete?: () => void): Promise<void> {
-    if (this.state.phase !== "deliver" || this.state.deliveryComplete) this.state.githubWait = undefined;
+    if (
+      !this.state.githubWait?.reason.startsWith("claim:") &&
+      (this.state.phase !== "deliver" || this.state.deliveryComplete)
+    )
+      this.state.githubWait = undefined;
     if (this.deps.faults) {
       const stage = this.stageContext.getStore();
       await this.faults.hit(
