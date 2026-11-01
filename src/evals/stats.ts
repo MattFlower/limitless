@@ -108,7 +108,7 @@ function labelTrials(
       ? grader(
           { ...item, kind, defects: kind === "clean" ? [] : item.defects },
           output.data,
-          run.systems?.find((s) => s.name === trial.details.system)?.causalAttribution,
+          run.systems?.find((s) => s.name === trial.details.system),
         )
       : undefined;
     return { ...trial, details: { ...trial.details, grade } };

@@ -133,8 +133,8 @@ export function judgedMetrics(
       unjudged++;
       continue;
     }
-    const causal = run.systems?.find((s) => s.name === trial.details.system)?.causalAttribution;
-    const blocking = blockingReviewFindings(output, undefined, undefined, causal);
+    const rules = run.systems?.find((s) => s.name === trial.details.system);
+    const blocking = blockingReviewFindings(output, undefined, undefined, rules);
     for (const [i, gold] of item.defects.entries()) {
       if (!gold.required) continue;
       total++;

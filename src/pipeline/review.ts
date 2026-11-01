@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { FinderPrompt, ReviewFinder, ReviewSample, ReviewSystem } from "../core/types.ts";
+import type { FinderPrompt, PanelRules, ReviewFinder, ReviewSample, ReviewSystem } from "../core/types.ts";
 import { type AgentResult, emptyUsage, extractJson } from "../harness/types.ts";
 import { rethrowClaimControl, selectClaimControl } from "../integrations/claim-errors.ts";
 import { parseTarget } from "../router/targets.ts";
@@ -135,7 +135,7 @@ function panelBlocks(
   finding: Finding,
   priorBlocking: Review["findings"] | undefined,
   panelReview: PanelReview,
-  causalAttribution: boolean,
+  rules: PanelRules,
 ): boolean {
   const v = finding.verification;
   const cited = !!priorBlocking && citesPriorBlocking(finding, priorBlocking);
@@ -145,14 +145,14 @@ function panelBlocks(
   if (UNVERIFIED_CATEGORIES.includes(v.category)) return false;
   if (!panelVerified(finding)) return false;
   if (
-    causalAttribution &&
+    rules.causalAttribution &&
     !cited &&
     v.attribution &&
     ["preexisting_unchanged", "intended_change", "environment_failure"].includes(v.attribution)
   )
     return false;
   const round = panelReview === "resolution" ? 2 : panelReview;
-  if (!priorBlocking || round <= 1) return true;
+  if (!priorBlocking || round <= 1) return !rules.severityRubric || verifiedAtLeast(finding, "high");
   if (round >= PANEL_REVIEWS) return verifiedAtLeast(finding, "critical");
   if (cited) return true;
   return verifiedAtLeast(finding, finding.label === "regression" ? "medium" : "high");
@@ -171,7 +171,7 @@ export function blockingReviewFindings(
   review: StoredReview,
   priorBlocking?: Review["findings"],
   panelReview?: PanelReview,
-  causalAttribution = false,
+  rules: PanelRules = {},
 ): Review["findings"] {
   const panel = review.mode === "panel";
   if (panel && priorBlocking && panelReview === undefined)
@@ -183,7 +183,7 @@ export function blockingReviewFindings(
   )
     throw new Error(`A panel review number is 1-${PANEL_REVIEWS} or "resolution", not ${panelReview}`);
   return review.findings.filter((finding) => {
-    if (panel) return panelBlocks(finding, priorBlocking, panelReview ?? 1, causalAttribution);
+    if (panel) return panelBlocks(finding, priorBlocking, panelReview ?? 1, rules);
     if (!priorBlocking) return finding.severity === "blocker" || finding.severity === "major";
     if (finding.label === "regression") return true;
     if (citesPriorBlocking(finding, priorBlocking)) return true;
@@ -214,9 +214,9 @@ export function reviewVerdict(
   review: StoredReview,
   priorBlocking?: Review["findings"],
   panelReview?: PanelReview,
-  causalAttribution = false,
+  rules: PanelRules = {},
 ): Review["verdict"] {
-  return blockingReviewFindings(review, priorBlocking, panelReview, causalAttribution).length
+  return blockingReviewFindings(review, priorBlocking, panelReview, rules).length
     ? "request_changes"
     : "approve";
 }
@@ -230,7 +230,7 @@ export interface ReviewInput {
   /** Follow-ups already recorded for this round and commit, when a review is replayed after a restart. */
   replayedFollowUps?: Review["findings"];
   /** Defaults to one finder (`single`). */
-  system?: Pick<ReviewSystem, "mode" | "finders" | "causalAttribution" | "samples">;
+  system?: Pick<ReviewSystem, "mode" | "finders" | "causalAttribution" | "severityRubric" | "samples">;
   /**
    * Panel only: which review this is (1–3, or "resolution"); decides what blocks and is required once
    * there is a previous review. `prompt.fixReview` scopes the diff.
@@ -380,7 +380,7 @@ export function traceIdentity(): string {
  * verifier prompt templates, the verifier schema, and the merge and batching policy. Eval caches key
  * panel trials on it.
  */
-export function panelIdentity(causalAttribution = false): string {
+export function panelIdentity({ causalAttribution, severityRubric }: PanelRules = {}): string {
   return new Bun.CryptoHasher("sha256")
     .update(
       JSON.stringify([
@@ -391,8 +391,8 @@ export function panelIdentity(causalAttribution = false): string {
         reviewPrompt({ ...FINDER_TEMPLATE, finder: "standard", lens: { name: "LENS", focus: "FOCUS" } }),
         LOCAL_FINDER_TIMEOUT_MS,
         MERGE_RULES,
-        verifierPrompt({ ...TEMPLATE_INPUT, causalAttribution }),
-        verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true, causalAttribution }),
+        verifierPrompt({ ...TEMPLATE_INPUT, causalAttribution, severityRubric }),
+        verifierPrompt({ ...TEMPLATE_INPUT, externalChange: true, causalAttribution, severityRubric }),
         toStrictJsonSchema(causalAttribution ? AttributionVerifierSchema : VerifierSchema),
         PANEL_VERIFY_CAP,
         PANEL_BATCH_SIZE,
@@ -542,9 +542,9 @@ function decide(input: ReviewInput, found: Review, modelVerdict: Review["verdict
   const prior = input.prompt.previous?.findings;
   const review: Review = {
     ...found,
-    verdict: reviewVerdict(found, prior, input.panelReview, input.system?.causalAttribution),
+    verdict: reviewVerdict(found, prior, input.panelReview, input.system),
   };
-  const blocking = blockingReviewFindings(review, prior, input.panelReview, input.system?.causalAttribution);
+  const blocking = blockingReviewFindings(review, prior, input.panelReview, input.system);
   // A panel's first round also has a ledger: whatever it does not block.
   const followUps =
     prior || review.mode === "panel"
@@ -822,6 +822,7 @@ async function runPanel<T extends Invoked>(
         {
           prompt: verifierPrompt({
             causalAttribution: input.system?.causalAttribution,
+            severityRubric: input.system?.severityRubric,
             prompt: input.prompt.prompt,
             spec: input.prompt.spec,
             baseSha: input.prompt.baseSha,
