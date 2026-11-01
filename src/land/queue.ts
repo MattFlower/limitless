@@ -61,6 +61,7 @@ import { checkDiscreetCommits, hasFactoryMark } from "../pipeline/markers.ts";
 import { renderReportArtifacts, verifiedFailureState } from "../pipeline/report.ts";
 import { stripReportManifest } from "../pipeline/report-privacy.ts";
 import { redactCredentials } from "../util/proc.ts";
+import { beginActivity } from "../util/stall.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
 export class LandBlocked extends Error {}
@@ -819,6 +820,7 @@ export class LandQueue {
 
   /** The repository's checks, taken from the base commit so the PR cannot weaken them. */
   private async checks(entry: LandEntry, cwd: string, baseSha: string, signal: AbortSignal): Promise<void> {
+    const end = beginActivity("land.check");
     const gateExecutor = this.deps.gateExecutor;
     const log = entry.runId
       ? join(this.deps.paths.runs, entry.runId, `land-${entry.id}.log`)
@@ -966,7 +968,11 @@ export class LandQueue {
         }
       })();
     } finally {
-      rmSync(base, { recursive: true, force: true });
+      try {
+        rmSync(base, { recursive: true, force: true });
+      } finally {
+        end();
+      }
     }
   }
 
@@ -1151,7 +1157,15 @@ export class LandQueue {
     });
   }
 
-  private async merge(
+  private async merge(...args: Parameters<LandQueue["mergeEntry"]>): Promise<void> {
+    const end = beginActivity("land.merge");
+    try {
+      return await this.mergeEntry(...args);
+    } finally {
+      end();
+    }
+  }
+  private async mergeEntry(
     entry: LandEntry,
     repo: Repo,
     cwd: string,

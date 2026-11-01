@@ -8,6 +8,7 @@ import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
 import { cacheGit, worktreeGit } from "./git/command.ts";
 import { cachePath, withRepoLock, worktreeOwner } from "./git/repos.ts";
 import { sh } from "./util/proc.ts";
+import { activity, beginActivity } from "./util/stall.ts";
 
 const DAY = 86_400_000;
 
@@ -68,6 +69,14 @@ export async function collectGarbage(
   cfg: Config,
   opts: { dryRun?: boolean; now?: number } = {},
 ): Promise<GcResult> {
+  const end = beginActivity("gc.collect");
+  try {
+    return await collect(store, cfg, opts);
+  } finally {
+    end();
+  }
+}
+async function collect(...[store, cfg, opts = {}]: Parameters<typeof collectGarbage>): Promise<GcResult> {
   const now = opts.now ?? Date.now();
   const dryRun = opts.dryRun ?? false;
   const result: GcResult = {
@@ -134,21 +143,29 @@ export async function collectGarbage(
     }
   }
 
-  for (const run of finished) {
+  function scanWorktree(run: Run) {
     const days =
       run.status === "failed" || run.status === "needs_human"
         ? cfg.retention.failedWorktreeDays
         : cfg.retention.worktreeDays;
-    if (!due(run, now, days)) continue;
+    if (!due(run, now, days)) return [];
     const repo = repos.get(run.repoId);
     if (!repo) {
       result.errors.push(`${run.id}: registered repository missing`);
-      continue;
+      return [];
     }
     try {
       const path = child(workRoot, run.id);
-      const cache =
-        repo.kind === "local" && existsSync(path) ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
+      return [{ run, repo, path, exists: existsSync(path) }];
+    } catch (error) {
+      result.errors.push(`${run.id} worktree: ${(error as Error).message}`);
+      return [];
+    }
+  }
+  const worktrees = activity("gc.worktrees", () => finished.flatMap(scanWorktree), 50);
+  for (const { run, repo, path, exists } of worktrees) {
+    try {
+      const cache = repo.kind === "local" && exists ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
       // The common repository is factory/user-owned; agents write only the linked checkout.
       const git = repo.kind === "github" ? cacheGit : sh;
       if (repo.kind === "github" && !resolve(cache).startsWith(resolve(cfg.paths.repos) + sep)) {
@@ -240,11 +257,11 @@ export async function collectGarbage(
     }
   }
 
-  for (const run of finished) {
-    if (!due(run, now, cfg.retention.logDays)) continue;
+  function collectLogs(run: Run) {
+    if (!due(run, now, cfg.retention.logDays)) return;
     try {
       const dir = child(runRoot, run.id);
-      if (!existsSync(dir)) continue;
+      if (!existsSync(dir)) return;
       if (lstatSync(dir).isSymbolicLink() || !lstatSync(dir).isDirectory()) {
         throw new Error(`run directory is not a directory: ${dir}`);
       }
@@ -263,6 +280,7 @@ export async function collectGarbage(
       result.errors.push(`${run.id} logs: ${(error as Error).message}`);
     }
   }
+  activity("gc.logs", () => finished.forEach(collectLogs), 50);
 
   try {
     const cutoff = now - cfg.retention.debugEventDays * DAY;

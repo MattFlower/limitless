@@ -16,6 +16,7 @@ import {
   redactCredentialData,
   registerCredential,
 } from "../util/proc.ts";
+import { beginActivity } from "../util/stall.ts";
 import {
   AgentCapabilities,
   type Capabilities,
@@ -563,6 +564,14 @@ export class WorkerStore {
       .immediate();
   }
   sweepAgentJobs() {
+    const end = beginActivity("workers.sweep-agent-jobs");
+    try {
+      return this.sweepAgentJobsWork();
+    } finally {
+      end();
+    }
+  }
+  private sweepAgentJobsWork() {
     this.store.db
       .transaction(() => {
         const now = this.now();
@@ -698,6 +707,14 @@ export class WorkerStore {
       );
   }
   sweep() {
+    const end = beginActivity("workers.sweep");
+    try {
+      return this.sweepWork();
+    } finally {
+      end();
+    }
+  }
+  private sweepWork() {
     const now = this.now();
     const resumedAt = this.resumedAt ?? Number.NEGATIVE_INFINITY;
     for (const j of this.jobs("state IN ('queued','leased')")) {
