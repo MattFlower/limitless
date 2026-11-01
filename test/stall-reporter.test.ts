@@ -149,6 +149,34 @@ test("distinct fast Store query shapes leave capacity for a later slow query", (
   }
 });
 
+test("sample reclaims completed Store query slots while preserving active handles", () => {
+  const fixture = timedStore();
+  const { store, timed, lines } = fixture;
+  const end = stallReporter.beginActivity("pending");
+  try {
+    for (let i = 0; i < 70; i++) {
+      timed(60, () => store.db.query(`SELECT ? AS column_${i}`).get(crypto.randomUUID()));
+      stallReporter.sample(4000);
+      expect(lines[i]).toMatch(/store\.query-[a-f0-9]+: count=1 total=60ms max=60ms/);
+      expect(lines[i]?.match(/store\.query-/g)).toHaveLength(1);
+      expect(lines[i]).toContain("pending: count=0 total=0ms max=0ms active=1");
+    }
+    end();
+    end();
+    timed(5, () => stallReporter.activity("new.activity", () => {}));
+    stallReporter.sample(4000);
+    expect(lines[70]).toContain("pending: count=1");
+    expect(lines[70]).not.toContain("active=");
+    expect(lines[70]).toContain("new.activity: count=1 total=5ms max=5ms");
+    expect(lines[70]).not.toContain("store.query-");
+    stallReporter.sample(4000);
+    expect(lines[71]).not.toMatch(/pending|new\.activity|store\.query-/);
+  } finally {
+    end();
+    fixture.close();
+  }
+});
+
 test("one stall line per late sample, including the threshold boundary", () => {
   let time = 0;
   const lines: string[] = [];

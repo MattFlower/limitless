@@ -68,7 +68,10 @@ export class StallReporter {
         );
       this.log(`Event loop stall: lag=${Math.round(lagMs)}ms; ${names.join("; ")}`);
     }
-    for (const entry of this.entries.values()) entry.count = entry.total = entry.max = 0;
+    for (const [name, entry] of this.entries) {
+      if (entry.active) entry.count = entry.total = entry.max = 0;
+      else this.entries.delete(name);
+    }
   }
 }
 

@@ -1,7 +1,6 @@
 import type { Database, Statement } from "bun:sqlite";
 import { stallReporter } from "../util/stall.ts";
 
-/** Fingerprint query families, never expanded SQL. Literals and comments carry no identity. */
 export function timeStatements(db: Database) {
   const seen = new WeakSet<Statement>();
   for (const method of ["query", "prepare"] as const) {

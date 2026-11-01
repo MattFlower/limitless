@@ -1,4 +1,3 @@
-/** Run on both revisions: bun scripts/benchmark-store-timing.ts */
 import { computeProviderWorkload } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 
