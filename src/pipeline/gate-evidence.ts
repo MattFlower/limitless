@@ -1,7 +1,12 @@
 import { redactGateOutput } from "../gates/output.ts";
 import { confinementFailed, type GateComparison, type GateRun } from "../gates/run.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../gates/test-coverage.ts";
-import { type CoveringTestRun, coveringTestRefusal, selectCoveringTests } from "./covering-tests.ts";
+import {
+  type CoveringTestRun,
+  coveringTestRefusal,
+  selectCoveringTests,
+  testOutcomeOnly,
+} from "./covering-tests.ts";
 import type { Holdout, Spec, Verify } from "./schemas.ts";
 
 /** Factory provenance, saved with the completed candidate gate stage (never baseline checks). */
@@ -244,7 +249,7 @@ function citationRefusal(
     : "gate stage, check or command does not match the factory record";
 }
 
-/** Only structured sandbox blocks qualify; provenance and coverage come from factory records. */
+/** Only structured requests qualify; provenance and coverage come from factory records. */
 export function applyGateEvidence(
   verify: Verify,
   spec: Spec,
@@ -268,7 +273,8 @@ export function applyGateEvidence(
     criteria: verify.criteria.map((row, index) => {
       const sandbox = row.status === "blocked" && row.blockedReason === "sandbox";
       const requested = !!row.covering_tests?.length;
-      if (!row.gateEvidence && !sandbox && !(row.status === "met" && requested)) return row;
+      const outcome = row.test_outcome_only === true && row.status !== "met";
+      if (!outcome && !row.gateEvidence && !sandbox && !(row.status === "met" && requested)) return row;
       const gate = gateBinding(row.id, spec, holdout, sha, gates, baseline);
       const selection = selected[index];
       const runs =
@@ -285,6 +291,23 @@ export function applyGateEvidence(
         selection?.reason ??
         failures.find(Boolean) ??
         (requested && !runs.length ? "no factory record" : undefined);
+      if (outcome) {
+        if (!testOutcomeOnly(row) || !requested || coveringFailure || runs.some((run) => run?.unavailable))
+          return row;
+        const { gateEvidence: _gate, ...original } = row;
+        return {
+          ...original,
+          status: "blocked" as const,
+          blockedReason: "environment" as const,
+          evidence: redactGateOutput(
+            [
+              "Factory execution did not reproduce the verifier's test outcome; acceptance remains unconfirmed.",
+              row.evidence,
+              ...runs.map((run) => (run ? coveringCitation(run, sha) : "")),
+            ].join("\n"),
+          ),
+        };
+      }
       const refuse = (prefix: string, reason: string) => ({
         ...row,
         status: "blocked" as const,

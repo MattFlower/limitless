@@ -48,7 +48,8 @@ export function applyBrowserContext(
         ...row,
         status: "unclear",
         blockedReason: null,
-        covering_tests: [],
+        // Marked observations still need factory reconciliation after browser context is applied.
+        covering_tests: c.test_outcome_only ? c.covering_tests : [],
         evidence: `${BROWSER_INCOMPLETE}\n${redactGateOutput(c.evidence)}`,
         publicSummary: rowKind(c.id, spec, holdout) === "holdout" ? BROWSER_INCOMPLETE : c.publicSummary,
       };
