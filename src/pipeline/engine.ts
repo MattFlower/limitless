@@ -2549,6 +2549,9 @@ async function oneRound(
               browserContext,
             };
             ctx.state.pendingVerify = pending;
+            // Keep the observation durable if the covering-request checkpoint interrupts this attempt.
+            if (pending.modelOutput.criteria.some((c) => c.test_outcome_only && c.covering_tests.length))
+              await ctx.save();
             await ctx.save("covering-test-request");
             return pending;
           };
@@ -2658,9 +2661,12 @@ async function oneRound(
       ).replace("### Checks not met", "### Acceptance criteria not yet met (verify)");
       if (!(await rejectReview(results[0].value, feedback))) return false;
     } else {
-      verify = original
-        ? resolveVerify(VerifySchema.parse(original), recorded?.browserContext)
-        : await verifyAttempt(pending?.attempt ?? 0);
+      if (original) {
+        const output = VerifySchema.parse(original);
+        await executeCovering(output, recorded?.browserContext);
+        await checkVerifiedHead();
+        verify = resolveVerify(output, recorded?.browserContext);
+      } else verify = await verifyAttempt(pending?.attempt ?? 0);
     }
     if (recorded) {
       Object.assign(recorded, verify);
