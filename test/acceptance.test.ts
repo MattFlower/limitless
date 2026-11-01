@@ -1,6 +1,7 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
 import { dirname, join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
@@ -349,58 +350,67 @@ test.each([
 test.each(["bun-missing", "exit126", "spawn", "missing", "empty", "whitespace"] as const)(
   "a %s runner refusal is persisted for grouped identities before restart",
   async (junit) => {
-    const t = await setup({
-      junit,
-      files: { "y.test.ts": 'import { test } from "bun:test"; test("independent", () => {});' },
-    });
-    const value = AcceptanceSchema.parse(metAll);
-    const [first, second] = value.items;
-    if (!first || !second) throw new Error("missing units");
-    first.tests.push({ file: "x.test.ts", name: "also passes" });
-    second.tests = [{ file: "y.test.ts", name: "independent" }];
-    t.reply(() => ({ structured: value }));
-    t.f.deps.checkpointer = {
-      ...localCheckpointer(t.f.store),
-      checkpoint(_runId, label) {
-        if (label === (junit === "spawn" ? "covering-test-recorded" : "gate-result"))
-          throw new SimulatedTermination("saved unavailable covering execution");
-      },
-    };
-    expect(await t.execute()).toBe("running");
-    const saved = t.state()?.coveringTestRuns?.filter((r) => r.file === "x.test.ts") ?? [];
-    expect(saved).toHaveLength(2);
-    const reason =
-      junit === "spawn"
-        ? saved[0]?.reason
-        : junit === "empty" || junit === "whitespace"
-          ? "JUnit report empty"
-          : "JUnit report missing";
-    expect(reason).toBeTruthy();
-    for (const record of saved) {
-      expect(record).toMatchObject({ unavailable: true, reason });
-      if (junit !== "spawn")
-        expect(record.result?.exitCode).toBe(junit === "bun-missing" ? 127 : junit === "exit126" ? 126 : 0);
-    }
-    expect(t.state()?.gateExecution).toBeUndefined();
-    t.f.deps.checkpointer = undefined;
-    expect(await t.execute()).toBe("needs_human");
-    expect(t.targeted).toHaveLength(2);
-    expect(t.calls()).toBe(1);
-    expect(t.outcome()).toMatchObject({
-      passed: false,
-      summary: "2 met, 1 not assessed",
-      units: [
-        {
-          verdict: "not_assessed",
-          citations: [],
-          refusals: [`x.test.ts › passes: ${reason}`, `x.test.ts › also passes: ${reason}`],
+    const mockedHome = spyOn(os, "homedir").mockReturnValue(repoDir);
+    try {
+      const t = await setup({
+        junit,
+        files: { "y.test.ts": 'import { test } from "bun:test"; test("independent", () => {});' },
+      });
+      const value = AcceptanceSchema.parse(metAll);
+      const [first, second] = value.items;
+      if (!first || !second) throw new Error("missing units");
+      first.tests.push({ file: "x.test.ts", name: "also passes" });
+      second.tests = [{ file: "y.test.ts", name: "independent" }];
+      t.reply(() => ({ structured: value }));
+      t.f.deps.checkpointer = {
+        ...localCheckpointer(t.f.store),
+        checkpoint(_runId, label) {
+          if (label === (junit === "spawn" ? "covering-test-recorded" : "gate-result"))
+            throw new SimulatedTermination("saved unavailable covering execution");
         },
-        { verdict: "met" },
-        { verdict: "met" },
-      ],
-    });
-    expect(JSON.parse(t.f.store.getArtifact(t.run.id, "acceptance.json") ?? "null")).toEqual(t.outcome());
-    expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(`x.test.ts › passes: ${reason}`);
+      };
+      expect(await t.execute()).toBe("running");
+      const saved = t.state()?.coveringTestRuns?.filter((r) => r.file === "x.test.ts") ?? [];
+      expect(saved).toHaveLength(2);
+      const reason =
+        junit === "spawn"
+          ? saved[0]?.reason
+          : junit === "empty" || junit === "whitespace"
+            ? "JUnit report empty"
+            : "JUnit report missing";
+      expect(reason).toBeTruthy();
+      if (junit === "spawn") expect(reason).toContain(join(repoDir, "absent-runner"));
+      for (const record of saved) {
+        expect(record).toMatchObject({ unavailable: true, reason });
+        if (junit !== "spawn")
+          expect(record.result?.exitCode).toBe(junit === "bun-missing" ? 127 : junit === "exit126" ? 126 : 0);
+      }
+      expect(t.state()?.gateExecution).toBeUndefined();
+      t.f.deps.checkpointer = undefined;
+      expect(await t.execute()).toBe("needs_human");
+      expect(t.targeted).toHaveLength(2);
+      expect(t.calls()).toBe(1);
+      expect(t.outcome()).toMatchObject({
+        passed: false,
+        summary: "2 met, 1 not assessed",
+        units: [
+          {
+            verdict: "not_assessed",
+            citations: [],
+            refusals: [`x.test.ts › passes: ${reason}`, `x.test.ts › also passes: ${reason}`],
+          },
+          { verdict: "met" },
+          { verdict: "met" },
+        ],
+      });
+      expect(JSON.parse(t.f.store.getArtifact(t.run.id, "acceptance.json") ?? "null")).toEqual(t.outcome());
+      const publishedReason = reason?.replace(repoDir, "~");
+      expect(t.f.store.getArtifact(t.run.id, "report.md")).toContain(
+        `x.test.ts › passes: ${publishedReason}`,
+      );
+    } finally {
+      mockedHome.mockRestore();
+    }
   },
 );
 

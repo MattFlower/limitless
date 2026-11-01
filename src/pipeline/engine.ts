@@ -2272,7 +2272,7 @@ async function oneRound(
         ctx.deps.cfg.reviewShadow === "panel" && system.mode === "single"
           ? shadowReview(
               ctx,
-              { round, baseSha, reviewedSha, profile: profile(ctx), input },
+              { round, baseSha: reviewBaseSha, reviewedSha, profile: profile(ctx), input },
               reviewDeps,
               reviewed,
             ).catch((error) => ctx.log(`Shadow panel: ${error}`, "warn"))
