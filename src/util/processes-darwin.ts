@@ -1,5 +1,6 @@
 import { dlopen, FFIType, ptr, toArrayBuffer } from "bun:ffi";
 import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { sep } from "node:path";
 
 // libproc and KERN_PROCARGS2 are also what macOS ps uses. Unlike ps, these calls
@@ -91,8 +92,29 @@ function darwinDescendant(
   return false;
 }
 
-/** Roots are canonicalized at invocation start; only orphans need birth time and cwd inspection. */
-export function hiddenDarwinProcessMember(
+function darwinCwdDirectories(directories: readonly string[]): string[] {
+  if (!directories.length) return [];
+  try {
+    const home = realpathSync(homedir());
+    const roots = directories.map((directory) => realpathSync(directory));
+    // A broad root invalidates cwd ownership for the whole invocation, including
+    // scratch. Revalidate persisted roots too; older records have no safety check.
+    return roots.some((root) => root === sep || root === home || home.startsWith(`${root}${sep}`))
+      ? []
+      : roots;
+  } catch {
+    // An unchecked home or root must never establish ownership.
+    return [];
+  }
+}
+
+export function hiddenDarwinProcessMember(...args: Parameters<typeof hiddenDarwinMember>): boolean {
+  args[4] = darwinCwdDirectories(args[4]);
+  return hiddenDarwinMember(...args);
+}
+
+/** Only orphans under validated roots need birth time and cwd inspection. */
+function hiddenDarwinMember(
   pid: number,
   parents: ReadonlyMap<number, number>,
   members: ReadonlySet<number>,
@@ -111,7 +133,7 @@ export function hiddenDarwinProcessMember(
   // session controls were excluded. Linux env -i remains unmeasured here and marker-only.
   // Two empty scans prove quiescence only within these rules' coverage (ARCHITECTURE §6).
   // A hidden process with a live but unproven parent is also unrecognized.
-  if (parents.get(pid) !== 1) return false;
+  if (!directories.length || parents.get(pid) !== 1) return false;
   const born = readBorn();
   if (typeof born !== "number") {
     if (born.errno === 3 /* ESRCH */) return false;
@@ -223,6 +245,7 @@ export function markedDarwinProcesses(
   /** `darwinClock()` before the invocation spawned; 0n inspects every process. */
   spawnedAt = 0n,
 ): number[] {
+  const cwdDirectories = darwinCwdDirectories(directories);
   const bytes = symbols.proc_listpids(4 /* PROC_UID_ONLY */, uid, null, 0);
   if (bytes <= 0) throw new Error("Process enumeration failed");
   const processes = new Int32Array(Math.ceil(bytes / 4) + 256);
@@ -337,12 +360,12 @@ export function markedDarwinProcesses(
     if (birth === leader.birth || birth === null) for (const pid of membership) marked.add(pid);
   }
   const isMember = (pid: number) =>
-    hiddenDarwinProcessMember(
+    hiddenDarwinMember(
       pid,
       parents,
       marked,
       started,
-      directories,
+      cwdDirectories,
       () => {
         if (
           symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0, ptr(bsd), bsd.byteLength) !== bsd.byteLength

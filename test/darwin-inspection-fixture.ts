@@ -17,6 +17,12 @@ let memberStart: bigint | { errno: number } = 10n;
 let memberMarker: string | null = null;
 let errno = 3;
 let readAllowlist = false;
+let home = "/";
+
+export const homedir = () => home;
+export function setHome(value: string): void {
+  home = value;
+}
 
 export function setReadAllowlist(value: boolean): void {
   readAllowlist = value;
