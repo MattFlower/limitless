@@ -23,7 +23,6 @@ const tag = <S extends object, T extends string>(
 const policyState = p.transferPreparedPolicySchema
   .partial()
   .extend({ reviewMode: r.oneOf("single panel").optional() });
-// Fragment shapes form the exhaustive state inventory.
 const classification = {
   ...tag(c.transferControlSchema.shape, "control"),
   ...tag(o.transferOutcomesSchema.shape, "outcomes"),
@@ -103,8 +102,7 @@ function readPayload(value: unknown, repo: Repo, manifest: PortableManifest, bui
   const version = z.looseObject({ header: z.looseObject({ version: z.number() }) }).safeParse(value);
   if (version.success && version.data.header.version !== 1) throw new RunTransferError("unsupported");
   const { header: h, state, policy, jobs, commits, ...rows } = r.parseRecord(envelope, value);
-  const slug = r.parseRecord(z.object({ repoSlug: r.identity }), rows.run).repoSlug;
-  const data = f.decodeRunTransfer(rows, { ...repo, slug });
+  const data = f.decodeRunTransfer(rows, repo);
   const ids = data.stages.map((v) => v.ordinal);
   const portable = parseState(state, false, ids);
   parseTransferPolicy(policy.history, policy.identity, portable);
@@ -133,7 +131,7 @@ export const encodeRunPayload = r.boundary(
   (input: RunPayloadInput, repo: Repo, manifest: PortableManifest): RunPayloadV1 => {
     r.preflight(input, input.followUp?.owner);
     const { state, policy, jobs, followUp, ...rows } = input;
-    const data = f.encodeRunTransfer(rows, { ...repo, slug: input.run.repoSlug }, followUp);
+    const data = f.encodeRunTransfer(rows, repo, followUp);
     const ids = input.stages.map((v) => v.id);
     const encoded = {
       ...data,
@@ -149,7 +147,6 @@ export const encodeRunPayload = r.boundary(
       jobs: jobs.map((v) => j.encodeTransferAgentJob(v, input.invocations)),
       commits: [],
     };
-    const result = readPayload(encoded, repo, manifest, true);
-    return decodeRunPayload(result, repo, manifest);
+    return decodeRunPayload(readPayload(encoded, repo, manifest, true), repo, manifest);
   },
 );

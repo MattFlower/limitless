@@ -19,8 +19,7 @@ function controlCommits(value: unknown, path: string[]): string[] {
   return (Array.isArray(member) ? member : [member]).flatMap((v) => controlCommits(v, rest));
 }
 export function payloadCommitDependencies(p: RunPayloadV1): string[] {
-  const f = p.followUp,
-    s = p.state;
+  const { followUp: f, state: s } = p;
   const refs = [p.run, ...(f ? [f.owner] : [])].flatMap(({ sourceRef: ref }) => {
     if (ref?.kind === "pull_request") return [ref.baseSha, ref.headSha];
     return ref?.kind === "review-round" ? [ref.reviewedSha] : [];
@@ -46,9 +45,7 @@ export function validatePayloadReferences(p: RunPayloadV1, repo: Repo, m: Portab
   const invalid = () => {
     throw new RunTransferError("invalid");
   };
-  const stage = (n: number) => {
-    if (!p.stages.some((v) => v.ordinal === n)) invalid();
-  };
+  const stage = (n: number) => p.stages.some((v) => v.ordinal === n) || invalid();
   for (const i of p.invocations) if (i.stageOrdinal !== null) stage(i.stageOrdinal);
   const ids = new Set(p.jobs.map((v) => v.id));
   if (ids.size !== p.jobs.length || (s.agentJob && !ids.has(s.agentJob.id))) invalid();

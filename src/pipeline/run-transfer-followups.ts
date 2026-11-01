@@ -41,7 +41,7 @@ function decodeFollowUp(value: unknown, run: r.PortableRun, repo: Repo): Transfe
     f.runId !== run.id ||
     f.ownerId !== owner.id ||
     owner.id === run.id ||
-    f.repoSlug !== repo.slug ||
+    f.repoSlug.toLowerCase() !== repo.slug.toLowerCase() ||
     f.prUrl !== owner.prUrl ||
     f.prUrl !== run.prUrl ||
     !owner.branch ||

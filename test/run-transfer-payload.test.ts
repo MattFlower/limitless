@@ -351,6 +351,50 @@ test("repository identities compare without case sensitivity", () => {
   const payload = encodeRunPayload(input, { ...repo, slug: repo.slug.toUpperCase() }, manifest);
   expect(decodeRunPayload(payload, repo, manifest)).toEqual(payload);
 });
+test.each(["issue", "pull_request"] as const)(
+  "mixed-case %s source repositories preserve their original spelling on both boundaries",
+  (kind) => {
+    const { input, manifest } = complete();
+    delete input.followUp;
+    input.run.sourceRef = {
+      kind,
+      repo: "Example/PROJECT",
+      number: 17,
+      ...(kind === "pull_request" ? { baseSha: oid(69), headSha: oid(70) } : {}),
+    };
+    manifest.key = { kind: kind === "issue" ? "issue" : "pr", repo: repo.slug, number: 17 };
+    const payload = encodeRunPayload(input, repo, manifest);
+    expect(payload.run.sourceRef).toEqual(input.run.sourceRef);
+    set(payload, "run.sourceRef.repo", "EXAMPLE/Project");
+    const decoded = decodeRunPayload(payload, repo, manifest);
+    expect(decoded).toEqual(payload);
+    expect(decoded.run.sourceRef?.repo).toBe("EXAMPLE/Project");
+    set(payload, "run.sourceRef.repo", "other/project");
+    rejects(() => decodeRunPayload(payload, repo, manifest));
+    input.run.sourceRef.repo = "other/project";
+    rejects(() => encodeRunPayload(input, repo, manifest));
+  },
+);
+test.each(["owner", "round"] as const)(
+  "mixed-case follow-up %s repositories preserve their original spelling on both boundaries",
+  (which) => {
+    const { input, manifest } = complete();
+    const member = input.followUp?.[which];
+    if (!member) throw new Error("fixture dependency missing");
+    member.repoSlug = "Example/PROJECT";
+    const payload = encodeRunPayload(input, repo, manifest);
+    const path = which === "owner" ? "followUp.owner.repoSlug" : "followUp.repoSlug";
+    expect(payload).toHaveProperty(path, "Example/PROJECT");
+    set(payload, path, "EXAMPLE/Project");
+    const decoded = decodeRunPayload(payload, repo, manifest);
+    expect(decoded).toEqual(payload);
+    expect(decoded).toHaveProperty(path, "EXAMPLE/Project");
+    set(payload, path, "other/project");
+    rejects(() => decodeRunPayload(payload, repo, manifest), "incomplete");
+    member.repoSlug = "other/project";
+    rejects(() => encodeRunPayload(input, repo, manifest), "incomplete");
+  },
+);
 test("new payload versions are unsupported", () => {
   const { payload, manifest } = encoded();
   set(payload, "header.version", 2);
