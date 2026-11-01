@@ -22,10 +22,14 @@ export interface IssueText {
   userContentEdits?: z.infer<typeof issueTextSchema>["userContentEdits"];
 }
 
-export function issueTextRefusal(issue: IssueText, trusted: string[]): string | undefined {
+export function issueTextRefusal(
+  issue: IssueText,
+  trusted: string[],
+  approvedOrigin = false,
+): string | undefined {
   const trusts = (login: string | undefined) =>
     !!login && trusted.some((s) => s.toLowerCase() === login.toLowerCase());
-  if (!trusts(issue.author?.login)) return "untrusted author";
+  if (!approvedOrigin && !trusts(issue.author?.login)) return "untrusted author";
   if (issue.lastEditedAt && !trusts(issue.editor?.login)) return "untrusted body editor";
   const history = issueTextSchema.shape.userContentEdits.safeParse(issue.userContentEdits);
   if (!history.success) return "body edit history unavailable";

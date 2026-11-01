@@ -634,3 +634,24 @@ test("comment predicate shares App, exact envelope and complete edit provenance 
     expect(status({ ...comment, ...change })).toBe("ignored");
   expect(status(comment, { kind: "owner" })).toBe("ignored");
 });
+
+test.each([
+  [{ login: "factory", __typename: "Bot" }, "match"],
+  [{ login: "FaCtOrY", __typename: "Bot" }, "match"],
+  [{ login: "factory", __typename: "User" }, "ignored"],
+  [{ login: "factory[bot]", __typename: "User" }, "ignored"],
+  [{ login: "factory[bot]", __typename: "Bot" }, "ignored"],
+  [{ login: "unrelated", __typename: "Bot" }, "ignored"],
+  [{ login: "FaCtOrY[BoT]", type: "Bot" }, "match"],
+  [{ login: "factory[bot]", type: "User" }, "ignored"],
+] as const)("defect author API shape %j authenticates as %s", async (author, expected) => {
+  const publication = await prepared();
+  expect(
+    defectRecordStatus(
+      { body: publication.body, author, lastEditedAt: null, includesCreatedEdit: false },
+      app,
+      publication.signature,
+      "issue",
+    ),
+  ).toBe(expected);
+});

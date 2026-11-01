@@ -10,7 +10,11 @@ import { MIGRATION_DIR, migrationNames, runMigrations } from "../src/db/migratio
 import { MIGRATIONS } from "../src/db/migrations.ts";
 import { ownerDiagnostics } from "../src/db/owner-diagnostics.ts";
 import { Store } from "../src/db/store.ts";
+import { mountDefectWindow } from "../src/integrations/defect-land-detector.ts";
+import { createDefectReporter } from "../src/integrations/defect-reporter.ts";
+import { mountIntegrations } from "../src/integrations/index.ts";
 import { customModel } from "./provider-config-support.ts";
+import { waitClock } from "./wait-clock.ts";
 
 const childKeyMigration = "20261016T091806-foreign-key-child-indexes.sql";
 
@@ -96,6 +100,150 @@ test("defect outbox tables survive rollback while the previous release continues
       upgraded.close();
     }
   });
+});
+
+test("land detector migration permits prior writes and recovers a pending send after re-upgrade", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "defect-upgrade-"));
+  const path = join(directory, "store.db");
+  const before = join(directory, "before");
+  cpSync(MIGRATION_DIR, before, {
+    recursive: true,
+    filter: (src) => !src.endsWith("-defect-land-detection.sql"),
+  });
+  let store = new Store(path, before);
+  const app = { kind: "app", botLogin: "factory[bot]", token: "fake" } as const;
+  const source = store.upsertRepo({
+    id: "source",
+    slug: "example/product",
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  let posts = 0;
+  let lists = 0;
+  let body = "";
+  const deps = {
+    repos: [source],
+    factory: "example/factory",
+    coordinator: () => ({ enabled: true }),
+    now: () => 100,
+    identity: async () => app,
+    policy: () => ({ discreet: false }),
+    loadPrivateStrings: () => [],
+    registeredCredentials: () => [],
+    github: {
+      list: async () => {
+        lists++;
+        return [
+          {
+            number: 7,
+            body,
+            author: { login: app.botLogin, type: "Bot" },
+            createdAt: "2026-10-31T18:00:00Z",
+            lastEditedAt: null,
+            includesCreatedEdit: false,
+            labels: [{ name: "defect" }],
+          },
+        ];
+      },
+      issue: async () => null,
+      label: async () => true,
+      post: async () => {
+        posts++;
+        throw new Error("unexpected replacement POST");
+      },
+    },
+  };
+  try {
+    const commit = await createDefectReporter(store, deps).prepareSubmission("old-send", {
+      sourceId: source.id,
+      detector: "land-check",
+      class: "setup",
+      phase: "setup",
+      checkIdentity: "lint",
+    });
+    body = commit()?.body ?? "";
+    expect(body).not.toBe("");
+    store.db.exec("UPDATE defect_outbox SET state='sending',operation='issue'");
+    store.close();
+    store = new Store(path);
+    mountDefectWindow(store, true, 100);
+    store.close();
+    store = new Store(path, before);
+    const run = store.createRun(source, { repo: source.slug, prompt: "rollback" });
+    const land = store.createLandEntry({
+      runId: run.id,
+      repo: source.slug,
+      prUrl: "https://github.com/example/product/pull/9",
+      baseBranch: "main",
+      headBranch: "change/rollback",
+      approvedSha: "a".repeat(40),
+    });
+    store.db.exec(`INSERT INTO failure_observations (run_id,repo,stage_id,round,sha,handle_kind,handle_id,
+      phase,name,command,observed_at,timed_out,confinement,duration_ms,failed_files,output_tail,signature,setup_eligible)
+      VALUES ('prior','example/product',0,0,'head','land','1:1','setup','check','',100,0,0,1,'[]','','signature',0)`);
+    store.observations.finalize("prior");
+    store.db.exec(
+      "INSERT INTO defect_outbox (source_ref,source_key,state) VALUES ('source','rollback','no-report')",
+    );
+    store.updateLandEntry(land.id, { state: "blocked" });
+    store.close();
+    store = new Store(path);
+    const reporter = createDefectReporter(store, deps);
+    const cfg = loadConfig({
+      home: directory,
+      configDir: directory,
+      readOnly: true,
+      raw: { github: { poll: false } },
+    });
+    cfg.githubDefects = { enabled: true, factoryRepo: "example/factory", dailyCap: 10 };
+    cfg.secrets.DISCORD_BOT_TOKEN = "";
+    const clock = waitClock();
+    const mounted = await mountIntegrations(
+      {
+        cfg,
+        store,
+        land: {
+          start: () => {},
+          stop: async () => {},
+          list: () => [],
+        },
+      } as unknown as Factory,
+      {
+        defectGitHub: deps.github,
+        identity: deps.identity,
+        toolVersions: async () => [],
+        prClient: async () => null,
+        gh: async () => {
+          throw new Error("unexpected gh");
+        },
+        issueClock: { now: clock.now, set: clock.timer.set as typeof setTimeout, clear: clock.timer.clear },
+      },
+    );
+    try {
+      await clock.advance(0);
+      await new Promise<void>((r) => setImmediate(r));
+      expect(posts).toBe(0);
+      expect(lists).toBeGreaterThan(0);
+      expect(reporter.read(source.id, "old-send")).toMatchObject({ state: "delivered", object_id: 7 });
+      expect(reporter.read(source.id, "rollback")?.state).toBe("no-report");
+      expect(store.getLandEntry(land.id)?.state).toBe("blocked");
+      expect(store.failureObservations()).toHaveLength(1);
+      expect(store.db.query("SELECT start,end FROM defect_enablement_windows").all()).toEqual([
+        { start: 100, end: null },
+      ]);
+      await clock.advance(60_000);
+      await new Promise<void>((r) => setImmediate(r));
+      expect(posts).toBe(0);
+    } finally {
+      await mounted.stop();
+    }
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("child-key indexes upgrade populated databases once and permit previous-release writes", () => {
