@@ -2346,7 +2346,7 @@ async function oneRound(
     const reviewFeedback =
       review.verdict === "request_changes"
         ? formatReviewFeedback(
-            blockingReviewFindings(review, previousReview?.findings, panelRules, system.causalAttribution),
+            blockingReviewFindings(review, previousReview?.findings, panelRules, system),
             review.mode === "panel",
           )
         : "";
