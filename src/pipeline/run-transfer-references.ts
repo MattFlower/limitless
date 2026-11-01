@@ -11,6 +11,27 @@ import type { TransferRepository as Repo } from "./run-transfer-rows.ts";
 import type { RunPayloadV1 } from "./run-transfer-schema.ts";
 import { sizeCommitDependencies } from "./run-transfer-size.ts";
 
+// Walk only typed relational references, never open request JSON or model result data.
+export function mapPayloadReferences(
+  payload: RunPayloadV1,
+  stage: (ordinal: number) => number,
+  invocation: (ordinal: number) => number,
+): RunPayloadV1 {
+  const p = structuredClone(payload),
+    s = p.state;
+  for (const i of p.invocations) if (i.stageOrdinal !== null) i.stageOrdinal = stage(i.stageOrdinal);
+  for (const job of p.jobs) job.invocationOrdinal = invocation(job.invocationOrdinal);
+  if (s.gateEvidence) s.gateEvidence.stageOrdinal = stage(s.gateEvidence.stageOrdinal);
+  for (const v of s.coveringTestRuns ?? []) if (v.stageOrdinal !== 0) v.stageOrdinal = stage(v.stageOrdinal);
+  const verify = (v: Partial<NonNullable<TransferOutcomes["lastVerify"]>> | null | undefined) => {
+    for (const c of [...(v?.criteria ?? []), ...(v?.modelOutput?.criteria ?? [])])
+      if (c.gateEvidence) c.gateEvidence.stageOrdinal = stage(c.gateEvidence.stageOrdinal);
+  };
+  [s.lastVerify, s.pendingVerify?.modelOutput, s.lastVerifiedEvidence?.lastVerify].forEach(verify);
+  s.verifyResults?.forEach(verify);
+  return p;
+}
+
 function controlCommits(value: unknown, path: string[]): string[] {
   const [key, ...rest] = path;
   if (!key) return typeof value === "string" ? [value] : [];
