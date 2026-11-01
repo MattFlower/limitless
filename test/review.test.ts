@@ -481,25 +481,29 @@ describe("panel decision", () => {
         ["introduced", "newly_reachable_or_worse", "new_feature_obligation", "unresolved"].includes(
           attribution,
         );
-      expect(blockingReviewFindings(review, undefined, undefined, true).length > 0).toBe(blocks);
+      expect(
+        blockingReviewFindings(review, undefined, undefined, { causalAttribution: true }).length > 0,
+      ).toBe(blocks);
       expect(blockingReviewFindings(review)).toEqual([f]);
       for (const round of [1, 2, 3, "resolution"] as const) {
         const prior = [finding("major")];
-        expect(reviewVerdict(review, prior, round, true)).toBe(
+        expect(reviewVerdict(review, prior, round, { causalAttribution: true })).toBe(
           blocks && round !== 3 ? "request_changes" : "approve",
         );
         const cited = { ...f, label: "unaddressed" as const, prior: "P1" };
         const citedReview = { ...review, findings: [cited] };
-        expect(blockingReviewFindings(citedReview, prior, round, true)).toEqual(
+        expect(blockingReviewFindings(citedReview, prior, round, { causalAttribution: true })).toEqual(
           blockingReviewFindings(citedReview, prior, round),
         );
         for (const special of [
           { ...f, security: true },
           { ...f, verification: { ...f.verification, category: "security" } } as typeof f,
         ]) {
-          expect(blockingReviewFindings({ ...review, findings: [special] }, prior, round, true)).toEqual([
-            special,
-          ]);
+          expect(
+            blockingReviewFindings({ ...review, findings: [special] }, prior, round, {
+              causalAttribution: true,
+            }),
+          ).toEqual([special]);
         }
       }
       for (const [verdict, severity, category] of [
@@ -512,11 +516,49 @@ describe("panel decision", () => {
           verification: { ...f.verification, verdict, severity, category },
         } as typeof f;
         expect(
-          blockingReviewFindings({ ...review, findings: [nonblocking] }, undefined, undefined, true),
+          blockingReviewFindings({ ...review, findings: [nonblocking] }, undefined, undefined, {
+            causalAttribution: true,
+          }),
         ).toEqual([]);
       }
     });
   }
+
+  test("severityRubric blocks round 1 only on verified high or critical, security still unless refuted", () => {
+    const rubric = { severityRubric: true } as const;
+    for (const [verdict, severity, category, blocks] of [
+      ["CONFIRMED", "critical", "correctness", true],
+      ["CONFIRMED", "high", "correctness", true],
+      ["PLAUSIBLE", "high", "correctness", true],
+      ["CONFIRMED", "medium", "correctness", false],
+      ["CONFIRMED", "low", "correctness", false],
+      ["CONFIRMED", "low", "security", true],
+      ["REFUTED", "critical", "security", false],
+    ] as const) {
+      const review: Review = {
+        mode: "panel",
+        verdict: "approve",
+        summary: "s",
+        findings: [verified(verdict, severity, category)],
+      };
+      expect(blockingReviewFindings(review, undefined, undefined, rubric).length > 0).toBe(blocks);
+      expect(reviewVerdict(review, undefined, undefined, rubric)).toBe(
+        blocks ? "request_changes" : "approve",
+      );
+    }
+    // Without the option a confirmed medium finding still blocks, as production does.
+    const medium: Review = {
+      mode: "panel",
+      verdict: "approve",
+      summary: "s",
+      findings: [verified("CONFIRMED", "medium")],
+    };
+    expect(blockingReviewFindings(medium)).toHaveLength(1);
+    const plain = finding("blocker");
+    const security = { ...finding("nit", true), category: "cleanup" as const };
+    const unruled: Review = { mode: "panel", verdict: "approve", summary: "s", findings: [plain, security] };
+    expect(blockingReviewFindings(unruled, undefined, undefined, rubric)).toEqual([security]);
+  });
 
   test("unverified panel findings block only as security findings or prior blocking findings (fail closed)", () => {
     const plain = finding("blocker");
@@ -618,7 +660,7 @@ describe("panel decision", () => {
           const underVariant = { ...review, findings: [attributed] };
           const current = blockingReviewFindings(underVariant, prior, round);
           const exempt = finderSecurity || category === "security" || label === "cited";
-          expect(blockingReviewFindings(underVariant, prior, round, true)).toEqual(
+          expect(blockingReviewFindings(underVariant, prior, round, { causalAttribution: true })).toEqual(
             attribution === "preexisting_unchanged" && !exempt ? [] : current,
           );
         }
@@ -739,6 +781,26 @@ describe("runReview panel", () => {
     trigger: "x -> y",
   } as const;
 
+  test("a severityRubric panel sends the rubric to the verifier and blocks only high or critical", async () => {
+    const system = {
+      mode: "panel",
+      finders: [{ prompt: "standard" as const }],
+      severityRubric: true,
+    } as const;
+    const medium = await panel([[candidate("src/a.ts", 1)]], () => ({ ...confirmed, severity: "medium" }), {
+      system: { ...system, finders: [...system.finders] },
+    });
+    const prompt = medium.verifications[0]?.request.prompt;
+    expect(prompt).toContain("# Severity by consequence and trigger");
+    expect(prompt).not.toContain("# Severity by consequence (");
+    expect(medium.out.decision?.blocking).toEqual([]);
+    expect(medium.out.decision?.followUps).toHaveLength(1);
+    const high = await panel([[candidate("src/a.ts", 1)]], () => ({ ...confirmed, severity: "high" }), {
+      system: { ...system, finders: [...system.finders] },
+    });
+    expect(high.out.decision?.blocking).toHaveLength(1);
+  });
+
   const causalSystem = { mode: "panel", finders: [{ prompt: "standard" }], causalAttribution: true } as const;
   test("causal verifier requests require attribution and comparison evidence; control stays unchanged", async () => {
     const control = await panel([[candidate("src/a.ts", 1)]], () => confirmed);
@@ -838,7 +900,7 @@ describe("runReview panel", () => {
       "base",
       "head",
     ]);
-    expect(panelIdentity(true)).not.toBe(panelIdentity());
+    expect(panelIdentity({ causalAttribution: true })).not.toBe(panelIdentity());
   });
 
   const coercions = [

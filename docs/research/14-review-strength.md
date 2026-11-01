@@ -830,6 +830,29 @@ block on severity alone, so also check the security subset: a security finding w
 trigger now becomes a follow-up. The wording ("normal factory operation", daily restarts) describes
 this repository; production use on other repositories would need it generalised.
 
+Result (Terra 6.1 at medium, 67 dev cases, k=2, two judges): no effect on clean blocks. Calibrated
+adversarial 30.0% judged recall with 6/32 clean blocks (uncalibrated 28.7%, 6); calibrated thorough
+26.3%, 8 (33.8%, 7); calibrated union 38.8%, 9 (36.9%, 8). Under-rated stayed at 0–2 of 160. The text
+reached the model but changed which clean cases block, not how many: the explicit-requirement exception
+turned one case's out-of-scope edits into majors, while contrived configurations (all US-origin models
+excluded) stayed major. Five finder-prompt variants now all land at 6–9 of 32, so finder wording does
+not calibrate this model's severity.
+
+## Appendix E. Rubric severity in the panel verifier (2026-11-01)
+
+Panels block in round one on any CONFIRMED finding (or a high/critical PLAUSIBLE one), whatever its
+severity. Regrading the stored Terra specialist panel (Sol 6.1 verifier) from its stored outputs and
+judgments shows where its 13/32 clean blocks sit: 31 of their 35 blocking findings were rated medium or
+low by the verifier. Blocking only on high or critical would leave 4/32, but the same verifier also
+rates many caught defects medium, so judged recall falls from 41.9% to 24.4% (28.1% when security
+findings keep their own rule). The eval-only `severityRubric` panel option tests whether rating by the
+labelling rubric separates the two: the verifier gets the rubric on its own scale (critical = rubric
+blocker, high = major, medium = a real defect with a contrived trigger or a test-only cost, low =
+cosmetic, process asks and behaviour the repository adopts), and round one blocks only verified high or
+critical findings. Security findings keep the panel's rule (block unless refuted). The run replays the
+stored finders (`--replay-finders`), so only the verifier is new. The rubric also states that edits
+outside the request's scope are not an undelivered requirement, the misreading Appendix D found.
+
 ## References (new in this note; others in research/08)
 
 - AnyPoC, arXiv 2604.11950 [arXiv]
