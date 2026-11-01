@@ -128,6 +128,10 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   `sandbox_apply: Operation not permitted` counts as a confinement failure, not a test result, so
   keep that literal out of test titles and printed strings (a `test.each` title containing it once
   blocked a round as a confinement error).
+  - Process discovery and cleanup (`src/util/proc.ts`, `src/util/processes-*.ts`) is covered by
+    real-Seatbelt tests that your gates skip. Name the ones your change affects in your report so
+    the reviewer runs them unconfined (#1098: two rounds passed their gates while a real-Seatbelt
+    read-policy test still failed).
 - **The home is read-denied for gates.** A gate reads only its checkout, scratch, trusted Git paths
   and toolchains (#492). Inside one, `realpath` on the home fails although `lstat` reports it.
   - A test that runs a confined command must keep everything that command reads inside the
@@ -258,6 +262,14 @@ finish.
 - **Experimental paths stay out of production.** Shadow calls use spare, preemptible provider
   slots and must not update production health, quota telemetry or model blocks; with them off,
   production behavior is unchanged (#263: shadow timeouts opened provider circuits).
+- **Inert by default means no change on production paths.** Code for a feature that is off or
+  unbound (an unset claim scope, a disabled option) adds no await, barrier or ordering change to
+  the paths it guards; compare behavior and timing with the feature off before and after (#1062:
+  an unconditional await in invocation cleanup turned `ok` into `cancelled`).
+- **GitHub spells a bot's login two ways.** GraphQL returns an App's `login` without the `[bot]`
+  suffix that REST and webhook payloads include. Match App authors by `__typename === "Bot"` and
+  the login with `[bot]` removed (as `src/integrations/defect-publication.ts` does), and build test
+  data in the API's real shape (#1080, #1092: App adoption and defect authentication never matched).
 - **Every fix has a test that fails without it.** Several tests asserted the defect they were
   meant to catch, or compared the code with itself (#318, #348, #391). See `test/AGENTS.md`.
 

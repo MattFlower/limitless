@@ -81,7 +81,8 @@ export function preparePrivacyPolicy(
     counters?: Record<
       "registrations" | "inputs" | "memoAdmissions" | "memoPeakEntries" | "memoPeakUnits",
       number
-    >;
+    > &
+      Partial<Record<"forms" | "scans", number>>;
   } = {},
 ) {
   const limits = { ...privacyLimits, ...options.limits };
@@ -141,7 +142,10 @@ export function checkPrepared(
     total += form.length;
     if (total > limits.formsTotal) throw "forms-total";
   };
-  const substring = (form: string) => matcher.scan(form).hits.some(({ node }) => node.output);
+  const substring = (form: string) => {
+    if (counters) counters.scans = (counters.scans ?? 0) + 1;
+    return matcher.scan(form).hits.some(({ node }) => node.output);
+  };
   const credential = (form: string) => matcher.has(form) || substring(form);
   const cache = new Map<string, string>();
   let memoUnits = 0;
@@ -157,7 +161,14 @@ export function checkPrepared(
             for (let offset = 0; offset < 4; offset++) {
               const plain = Buffer.from(run.slice(offset), "base64").toString();
               const found = secrets ? "" : normalize(plain);
-              if (secrets ? secret(plain) : entries.some(({ value }) => found.includes(value))) {
+              if (
+                secrets
+                  ? secret(plain)
+                  : entries.some(({ value }) => {
+                      if (counters) counters.scans = (counters.scans ?? 0) + 1;
+                      return found.includes(value);
+                    })
+              ) {
                 decoded = plain;
                 break;
               }
@@ -180,6 +191,7 @@ export function checkPrepared(
     let hit = false;
     // Credential readings never steer the private decoder's replacements or convergence.
     const inspect = (form: string) => {
+      if (counters) counters.forms = (counters.forms ?? 0) + 1;
       retain(form);
       hit ||= credential(form) || decode(form, true) !== form;
     };
@@ -190,6 +202,7 @@ export function checkPrepared(
     const hits = entries
       .filter(({ value }) =>
         normalized.some((layer) => {
+          if (counters) counters.scans = (counters.scans ?? 0) + 1;
           if (layer.includes(value)) return true;
           if (truncated)
             for (const tail of [layer, stripPartialEscapes(layer)])
