@@ -207,6 +207,29 @@ test.each(["cutPrefix", "cutTail", "trim"] as const)(
     );
   },
 );
+test("an admitted refusal workload over 50 ms triggers the decision; exactly 50 ms does not", async () => {
+  for (const [step, trigger] of [
+    [51, true],
+    [50, false],
+  ] as const) {
+    let clock = 0;
+    const runtime = { platform: [], now: () => clock, memory: () => ({ heap: 0, peakRSS: 0 }), gc: () => {} };
+    const slow = (...args: Parameters<typeof protectText>) => {
+      clock += step;
+      return protectText(...args);
+    };
+    const api = { ...boundary, createCredentialRegistry, protectText: slow };
+    const fixture = () => ({
+      ...workload("sparse", tiny),
+      text: "x",
+      entries: [{ entry: 0, value: "x" }],
+      credentials: [],
+      reason: "private-match",
+    });
+    const report = await measureRevision(api, fixture, { ...runtime, pause: async () => {} });
+    expect(report).toMatchObject({ coverage: "refusal", decision: { trigger } });
+  }
+});
 test("evidence reports decoded forms and matching scans per preparation", async () => {
   const { runtime } = fakeRevision();
   const report = await measureRevision(
