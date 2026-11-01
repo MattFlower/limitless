@@ -33,10 +33,7 @@ const classification = {
   ...tag(policyState.shape, "policy"),
   gateExecution: "execution",
   agentJob: "job",
-  ...tag(
-    r.fields("worktreePath worktreeAliases baseline baselineCached iterationBase", r.counter),
-    "excluded",
-  ),
+  ...tag(r.fields("worktreePath worktreeAliases baseline baselineCached", r.counter), "excluded"),
 } satisfies Record<keyof RunState, string>;
 const jobState = z.strictObject({
   agentJob: z.strictObject({ round: r.counter, id: r.identity }).optional(),

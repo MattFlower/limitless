@@ -178,7 +178,7 @@ function complete() {
     worktreeAliases: ["/local/alias"],
     baseline: null,
     baselineCached: true,
-    iterationBase: prose,
+    iterationBase: oid(71),
   };
   const job = {
     id: "z-done",
@@ -256,6 +256,101 @@ function set(value: unknown, path: string, member: unknown) {
   if (!cursor || typeof cursor !== "object") throw new Error(`fixture path missing: ${path}`);
   Reflect.set(cursor, last, member);
 }
+function withStoredFragments() {
+  const data = complete();
+  const finding = { severity: "major", file: "a.ts", line: 0, confidence: 1.5 };
+  const review = {
+    verdict: "request_changes",
+    summary: " recorded ",
+    findings: [finding, { ...finding, file: "b.ts" }],
+    modelId: "fake/review",
+  };
+  const history = [{ round: 3, sha: oid(37), blocking: [finding], followUps: [finding] }];
+  const stored = {
+    triage: {
+      title: " Task ",
+      task_class: "bugfix",
+      complexity: "small",
+      risk: "low",
+      ambiguity: "low",
+      blocking_questions: ["z", "a"],
+      summary: " recorded ",
+      suggested_profile: "quick",
+    },
+    spec: {
+      summary: " recorded ",
+      assumptions: ["z", "a"],
+      requirements: [],
+      acceptance_criteria: [
+        { id: "AC-2", criterion: " second ", how_to_verify: " inspect " },
+        { id: "AC-1", criterion: " first ", how_to_verify: " run " },
+      ],
+      out_of_scope: [],
+      blocking_questions: [],
+    },
+    holdout: {
+      scenarios: [
+        { id: "H-1", description: " private ", steps: " run ", expected: " result ", edge_case: false },
+      ],
+    },
+    lastReview: review,
+    reviewFollowUps: review.findings,
+    reviewHistory: history,
+    lastVerifiedEvidence: { lastVerify: null, lastReview: review, reviewHistory: history },
+    completedChecks: { round: 3, values: { review } },
+  };
+  for (const [key, value] of Object.entries(stored)) set(data.input.state, key, structuredClone(value));
+  set(data.input.state, "acceptance.output", {
+    items: [
+      {
+        unit: "U1",
+        verdict: "manual",
+        files: [{ path: "a.ts" }, { path: "b.ts", lines: null }],
+        tests: [],
+        note: " recorded ",
+      },
+    ],
+  });
+  return { ...data, stored };
+}
+
+test("complete codecs preserve stored fragments without applying parser changes", () => {
+  const { input, manifest, stored } = withStoredFragments();
+  const payload = encodeRunPayload(input, repo, manifest);
+  const decoded = decodeRunPayload(
+    JSON.parse(new TextDecoder().decode(encodeTransferJson(payload))),
+    repo,
+    manifest,
+  );
+  const fragments = Object.fromEntries(
+    Object.keys(stored).map((key) => [key, Reflect.get(decoded.state, key)]),
+  );
+  expect(encodeTransferJson(fragments)).toEqual(encodeTransferJson(stored));
+  expect(encodeTransferJson(decoded.state.acceptance?.output)).toEqual(
+    encodeTransferJson(input.state.acceptance?.output),
+  );
+});
+test.each([
+  "triage",
+  "spec.acceptance_criteria.0",
+  "holdout.scenarios.0",
+  "lastReview.findings.0",
+  "reviewFollowUps.0",
+  "reviewHistory.0.blocking.0",
+  "reviewHistory.0.followUps.0",
+  "lastVerifiedEvidence.lastReview.findings.0",
+  "lastVerifiedEvidence.reviewHistory.0.blocking.0",
+  "completedChecks.values.review.findings.0",
+  "acceptance.output.items.0",
+  "acceptance.output.items.0.files.0",
+])("both codecs reject unknown stored members inside %s", (path) => {
+  const { input, manifest } = withStoredFragments();
+  const payload = encodeRunPayload(input, repo, manifest);
+  set(input.state, `${path}.unknown`, true);
+  rejects(() => encodeRunPayload(input, repo, manifest));
+  set(payload.state, `${path}.unknown`, true);
+  rejects(() => decodeRunPayload(payload, repo, manifest));
+});
 
 test("complete payload preserves shape, semantic ordering and pending effects", () => {
   const { payload, manifest } = encoded();
@@ -277,9 +372,40 @@ test("complete payload preserves shape, semantic ordering and pending effects", 
   expect(payload.questions.map((v) => v.ordinal)).toEqual([1, 2]);
   expect(payload.jobs.map((v) => v.id)).toEqual(["a-queued", "z-done"]);
   expect(payload.jobs[0]?.result).toBeNull();
-  for (const key of ["worktreePath", "worktreeAliases", "baseline", "baselineCached", "iterationBase"])
+  for (const key of ["worktreePath", "worktreeAliases", "baseline", "baselineCached"])
     expect(payload.state).not.toHaveProperty(key);
 });
+
+test.each([oid(71), oid(1), "Ab".repeat(32), undefined])(
+  "iterationBase checkpoint preserves its spelling and presence (%j)",
+  (checkpoint) => {
+    const { input, manifest } = complete();
+    if (checkpoint === undefined) delete input.state.iterationBase;
+    else input.state.iterationBase = checkpoint;
+    const payload = encodeRunPayload(input, repo, manifest);
+    const decoded = decodeRunPayload(payload, repo, manifest);
+    if (checkpoint === undefined) {
+      expect(payload.state).not.toHaveProperty("iterationBase");
+      expect(decoded.state).not.toHaveProperty("iterationBase");
+      expect(payload.commits).not.toContain(oid(71));
+    } else {
+      expect(payload.state).toHaveProperty("iterationBase", checkpoint);
+      expect(decoded.state).toHaveProperty("iterationBase", checkpoint);
+      expect(payload.commits.filter((v) => v === checkpoint)).toHaveLength(1);
+    }
+  },
+);
+test.each([null, true, "", "main", "a".repeat(39), "g".repeat(40)])(
+  "both codecs reject malformed iterationBase (%j)",
+  (checkpoint) => {
+    const { input, manifest } = complete();
+    set(input.state, "iterationBase", checkpoint);
+    rejects(() => encodeRunPayload(input, repo, manifest));
+    const { payload } = encoded();
+    set(payload.state, "iterationBase", checkpoint);
+    rejects(() => decodeRunPayload(payload, repo, manifest));
+  },
+);
 
 test.each([
   "invocations.0.stageOrdinal",
@@ -300,7 +426,7 @@ test.each([
   rejects(() => decodeRunPayload(payload, repo, manifest));
 });
 
-const expectedCommits = [...Array.from({ length: 68 }, (_, i) => oid(i + 1)), base, source].sort();
+const expectedCommits = [...Array.from({ length: 68 }, (_, i) => oid(i + 1)), oid(71), base, source].sort();
 test("commit closure includes every typed checkpoint and excludes prose and trees", () => {
   const { payload } = encoded();
   expect(payload.commits).toEqual(expectedCommits);
@@ -345,6 +471,28 @@ test("a run claim must name the primary run, even when header agrees", () => {
   payload.header.claim = manifest.key;
   rejects(() => decodeRunPayload(payload, repo, manifest));
 });
+test.each(["issue", "pull_request", "follow-up"] as const)(
+  "both codecs reject self-naming run claims for %s payloads",
+  (kind) => {
+    const { input, manifest } = complete();
+    if (kind !== "follow-up") {
+      delete input.followUp;
+      input.run.sourceRef = {
+        kind,
+        repo: repo.slug,
+        number: 17,
+        ...(kind === "pull_request" ? { baseSha: oid(69), headSha: oid(70) } : {}),
+      };
+      manifest.key = { kind: kind === "issue" ? "issue" : "pr", repo: repo.slug, number: 17 };
+    }
+    const payload = encodeRunPayload(input, repo, manifest);
+    expect(decodeRunPayload(payload, repo, manifest)).toEqual(payload);
+    manifest.key = { kind: "run", repo: repo.slug, runId: input.run.id };
+    payload.header.claim = manifest.key;
+    rejects(() => encodeRunPayload(input, repo, manifest));
+    rejects(() => decodeRunPayload(payload, repo, manifest));
+  },
+);
 test("repository identities compare without case sensitivity", () => {
   const { input, manifest } = complete();
   manifest.key.repo = repo.slug.toUpperCase();
@@ -413,7 +561,7 @@ test.each(["run", "followUp.owner"])("decoding refuses ordinary dependencies on 
   set(payload, `${path}.dependsOn`, ["owner01"]);
   rejects(() => decodeRunPayload(payload, repo, manifest), "unsupported");
 });
-test.each(["worktreePath", "worktreeAliases", "baseline", "baselineCached", "iterationBase", "unclassified"])(
+test.each(["worktreePath", "worktreeAliases", "baseline", "baselineCached", "unclassified"])(
   "portable state refuses %s",
   (key) => {
     const { payload, manifest } = encoded();

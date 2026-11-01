@@ -78,7 +78,7 @@ export function validatePayloadReferences(p: RunPayloadV1, repo: Repo, m: Portab
   const claim = m.key,
     ref = run.sourceRef;
   if (claim.kind === "run") {
-    if (claim.runId !== run.id) invalid();
+    if (claim.runId !== run.id || ref?.kind === "issue" || ref?.kind === "pull_request" || f) invalid();
   } else if (f && claim.kind === "pr") {
     if (Number(f.prUrl.match(/\/pull\/([1-9][0-9]*)$/)?.[1]) !== claim.number) invalid();
   } else if (
