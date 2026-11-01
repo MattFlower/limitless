@@ -157,6 +157,7 @@ const RosterReferenceSchema = z.strictObject({
   samples: z.never({ error: "samples is not supported on roster references" }).optional(),
   roster: z.enum(["quick", "standard", "deep"]),
   causalAttribution: z.literal(true).optional(),
+  severityRubric: z.literal(true).optional(),
   targets: z.array(TargetSchema).min(1),
   lenses: z.array(LensSchema).optional(),
   verifier: VerifierSchema.refine((v) => v.target !== undefined || v.targets !== undefined, {
@@ -170,7 +171,12 @@ export const EvalSystemSchema = ReviewSystemBaseSchema.safeExtend({
   samples: z.literal(2, { error: "samples must be 2" }).optional(),
   setup: z.literal(true).optional(),
   replayFrom: z.string().trim().min(1).optional(),
+  severityRubric: z.literal(true).optional(),
 })
+  .refine((system) => !system.severityRubric || system.mode === "panel", {
+    path: ["severityRubric"],
+    message: 'severityRubric requires mode "panel"',
+  })
   .refine(
     (system) =>
       system.samples === undefined ||
@@ -250,6 +256,7 @@ export function expandRoster(
     setup: system.setup,
     replayFrom: system.replayFrom,
     causalAttribution: system.causalAttribution,
+    severityRubric: system.severityRubric,
     name: system.name,
     mode: "panel",
     finders: finders.map((finder, i) => ({ ...finder, target: system.targets[i] })),

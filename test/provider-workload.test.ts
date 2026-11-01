@@ -375,7 +375,20 @@ test("statistics queries preserve results and report both activity markers on a 
   const store = new Store(":memory:");
   let time = 0;
   const lines: string[] = [];
-  const clock = spyOn(stallReporter, "now").mockImplementation(() => time++);
+  const clock = spyOn(stallReporter, "now").mockImplementation(() => time);
+  const activity = stallReporter.activity.bind(stallReporter);
+  // Advance each whole statistics computation independently of its nested statement timings.
+  const timing = spyOn(stallReporter, "activity").mockImplementation((name, fn, minMs) =>
+    activity(
+      name,
+      () => {
+        const result = fn();
+        if (name.startsWith("stats.")) time++;
+        return result;
+      },
+      minMs,
+    ),
+  );
   const log = spyOn(console, "warn").mockImplementation((line: string) => lines.push(line));
   try {
     setSystemTime(localDay(0, 23));
@@ -417,6 +430,7 @@ test("statistics queries preserve results and report both activity markers on a 
     expect(lines[0]).toContain("stats.computeProviderWorkload: count=1 total=1ms max=1ms");
   } finally {
     stallReporter.sample(0);
+    timing.mockRestore();
     clock.mockRestore();
     log.mockRestore();
     setSystemTime();

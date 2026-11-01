@@ -662,6 +662,19 @@ Explicitly mark security findings with security: true (otherwise false). For eve
 Return your assessment in verdict; the pipeline derives its decision from findings.`;
 }
 
+const CONSEQUENCE_SEVERITY = `# Severity by consequence (the reviewer's severity is not an input you must keep)
+- critical: a security boundary is crossed, data is lost or corrupted, or the production/deploy/rollback path breaks.
+- high: wrong result or crash on a realistic path; a resume, restart or compatibility regression; a safety check silently skipped.
+- medium: wrong result on an edge path; paid work wasted; misleading output or metrics.
+- low: minor inaccuracy or cosmetic.`;
+/** Eval only: the owner's labelling rubric (consequence x trigger) on the verifier's scale. */
+const RUBRIC_SEVERITY = `# Severity by consequence and trigger (the reviewer's severity is not an input you must keep)
+For each candidate ask: "would this plausibly happen in the next month of normal factory operation?" Deploys restart the daemon daily, so restart windows count unless they last milliseconds.
+- critical: a realistic trigger that loses or corrupts persisted state, leaks a secret or private data, breaks a trust or confinement boundary, or stops the factory or deploys.
+- high: a realistic trigger with real harm: a wrong result, a silent failure, lost or repeated work, a check the change claims to add that a realistic input bypasses, or a compatibility break with the previous release. Two cases are at least high whatever the trigger: a secret or credential stored or shown unredacted, and a requirement for the code that the request states explicitly and the change does not deliver. Edits outside the request's scope are not an undelivered requirement.
+- medium: a real defect with a contrived trigger (an unusual input, configuration, environment or timing the request does not ask to handle), or a cost only in tests or diagnostics, such as a missing or weak test on its own. A new test that fails in normal runs stops deploys, so it is at least high.
+- low: cosmetic, a process ask (a report, measurements, PR text), or behaviour the repository's own rules adopt.`;
+
 /** Deliberately without the finders' detail and reasoning or the implementer's report: verify from the code. */
 export function verifierPrompt(input: {
   prompt: string;
@@ -671,6 +684,7 @@ export function verifierPrompt(input: {
   /** PR verification: the base may have moved past the fork point, so diff from the merge base as finders do. */
   externalChange?: boolean;
   causalAttribution?: boolean;
+  severityRubric?: boolean;
   stat: string;
   candidates: {
     id: string;
@@ -723,11 +737,7 @@ ${fence(promptJson(input.candidates, 2))}
 - PLAUSIBLE: realistic but not proven, including rare states (races, rare null paths, boundary off-by-ones, retry storms). Rare is not refuted.
 - REFUTED: only when the code shows the claim is false. Quote the guard or invariant that prevents it in evidence.
 
-# Severity by consequence (the reviewer's severity is not an input you must keep)
-- critical: a security boundary is crossed, data is lost or corrupted, or the production/deploy/rollback path breaks.
-- high: wrong result or crash on a realistic path; a resume, restart or compatibility regression; a safety check silently skipped.
-- medium: wrong result on an edge path; paid work wasted; misleading output or metrics.
-- low: minor inaccuracy or cosmetic.
+${input.severityRubric ? RUBRIC_SEVERITY : CONSEQUENCE_SEVERITY}
 
 Return exactly one result per candidate id. evidence quotes the relevant code with file:line; trigger states the inputs or state and the wrong outcome they produce; category is one of correctness, security, reliability, data, concurrency, compatibility, test-gap, cleanup, conventions.
 Do not modify files. You may run read-only commands and targeted tests; create temporary files only under TMPDIR.${

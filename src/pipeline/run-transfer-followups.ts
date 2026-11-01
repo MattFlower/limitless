@@ -1,6 +1,7 @@
 import { z } from "zod";
-import type { Repo, Run } from "../core/types.ts";
+import type { Run } from "../core/types.ts";
 import { RunTransferError } from "./run-transfer-errors.ts";
+import type { TransferRepository as Repo } from "./run-transfer-rows.ts";
 import * as r from "./run-transfer-rows.ts";
 
 const followUpSchema = z.strictObject({
@@ -41,7 +42,7 @@ function decodeFollowUp(value: unknown, run: r.PortableRun, repo: Repo): Transfe
     f.runId !== run.id ||
     f.ownerId !== owner.id ||
     owner.id === run.id ||
-    f.repoSlug !== repo.slug ||
+    f.repoSlug.toLowerCase() !== repo.slug.toLowerCase() ||
     f.prUrl !== owner.prUrl ||
     f.prUrl !== run.prUrl ||
     !owner.branch ||

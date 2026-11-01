@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Repo, Run, RunDetail } from "../core/types.ts";
+import type { Run, RunDetail, Repo as StoredRepo } from "../core/types.ts";
 import { RunTransferError, rethrowRunTransfer } from "./run-transfer-errors.ts";
 import * as json from "./run-transfer-json.ts";
 export const boundary =
@@ -111,7 +111,11 @@ const rowsSchema = object({
 });
 export type PortableRun = z.infer<typeof runSchema>;
 export type TransferRows = z.infer<typeof rowsSchema>;
-export type TransferRowInput = Pick<RunDetail, "run" | "stages" | "invocations" | "questions">;
+export type TransferRepository = Pick<StoredRepo, "id" | "kind" | "slug">;
+type Repo = TransferRepository;
+export type TransferRowInput = Pick<RunDetail, "run" | "stages" | "questions"> & {
+  invocations: (Omit<RunDetail["invocations"][number], "sessionId"> & { sessionId?: string | null })[];
+};
 export function parseRecord<T>(schema: z.ZodType<T>, value: unknown): T {
   json.parseTransferJson(value);
   const result = schema.safeParse(value);
@@ -154,10 +158,11 @@ export const decodeTransferRun = boundary(
     }
     if (ref?.kind === "review-round" && "reviewedSha" in ref) json.parseTransferOid(ref.reviewedSha);
     if (repo.kind !== "github") throw new RunTransferError("unsupported");
+    const slug = repo.slug.toLowerCase();
     if (
-      run.repoSlug !== repo.slug ||
+      run.repoSlug.toLowerCase() !== slug ||
       ((ref?.kind === "issue" || ref?.kind === "pull_request") &&
-        (ref.repo !== repo.slug || json.parseTransferCounter(ref.number) === 0))
+        (identity.parse(ref.repo).toLowerCase() !== slug || json.parseTransferCounter(ref.number) === 0))
     )
       throw new RunTransferError(code);
     return run;
