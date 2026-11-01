@@ -86,6 +86,17 @@ export function validateCoverage(w: ReturnType<typeof workload>, p: Projection) 
   const success = p.withheld === false && p.checkedComplete === true && p.text === w.expected;
   if (w.reason ? !refused || w.maximum : !success) throw Error(`Invalid coverage: ${w.name}`);
 }
+// These workload fragments contain no protected values. Cuts keep whole code points,
+// but combining marks are independent code points and are not kept with their base.
+function rendering(want: Projection, operation: string, limit: number): Projection {
+  if (want.withheld) return want;
+  const text = want.text ?? "";
+  if (operation === "trim") return { ...want, text: text.trim() };
+  const tail = operation === "cutTail";
+  let fragment = tail ? text.slice(text.length - Math.min(limit, text.length)) : text.slice(0, limit);
+  if (!fragment.isWellFormed()) fragment = tail ? fragment.slice(1) : fragment.slice(0, -1);
+  return { ...want, text: fragment, truncated: text.length > limit || want.truncated };
+}
 export function validateChunkings(parts: Uint8Array[][], want: Projection, run: (s: string) => Projection) {
   for (const p of parts.map((chunks) => run(Buffer.concat(chunks).toString())))
     if (keys.some((k) => p[k] !== want[k])) throw Error("Chunking/provenance mismatch");
@@ -147,7 +158,15 @@ export async function measureRevision(a: API, fixture: () => ReturnType<typeof w
   const availability = Object.fromEntries(operations.split(" ").map(status));
   const groups: Record<string, { status: string; summary: ReturnType<typeof summarizeTrials> }> = {};
   let meter = instrument(r.now, r.pause);
-  let counters = { registrations: 0, inputs: 0, memoAdmissions: 0, memoPeakEntries: 0, memoPeakUnits: 0 };
+  let counters = {
+    registrations: 0,
+    inputs: 0,
+    forms: 0,
+    scans: 0,
+    memoAdmissions: 0,
+    memoPeakEntries: 0,
+    memoPeakUnits: 0,
+  };
   const op = (k: string, ...args: unknown[]) => meter.call(k, () => (a[k] as Fn)(...args));
   const series = async (label: string, enabled: boolean, fn: () => unknown, owned = true) => {
     const raw = [];
@@ -169,7 +188,15 @@ export async function measureRevision(a: API, fixture: () => ReturnType<typeof w
   };
   let registry: Record<"replacePolicy" | "addCredential", Fn>, policy: unknown, receipt: unknown;
   const prepare = () => {
-    counters = { registrations: 0, inputs: 0, memoAdmissions: 0, memoPeakEntries: 0, memoPeakUnits: 0 };
+    counters = {
+      registrations: 0,
+      inputs: 0,
+      forms: 0,
+      scans: 0,
+      memoAdmissions: 0,
+      memoPeakEntries: 0,
+      memoPeakUnits: 0,
+    };
     registry = op("createPrivacyRegistry", op("createCredentialRegistry")) as typeof registry;
     registry.replacePolicy(w.entries);
     w.credentials.forEach(registry.addCredential);
@@ -192,11 +219,27 @@ export async function measureRevision(a: API, fixture: () => ReturnType<typeof w
     receipt = protect(w.text);
     if (count) receipt = op("concat", Array(count).fill(receipt));
     if (w.name === "invalidation") registry.addCredential("synthetic-generation-change");
-    validateCoverage(w, read(receipt));
+    const original = read(receipt);
+    validateCoverage(w, original);
     for (let i = 0; i < (w.name === "repeated" || w.name === "distinct" ? 64 : 1); i++) {
       read(receipt);
-      if (["trim", "cutTail", "cutPrefix"].every(available))
-        op("trim", op("cutTail", op("cutPrefix", receipt, w.name === "distinct" ? i : 4), 4));
+      if (["trim", "cutTail", "cutPrefix"].every(available)) {
+        let derived = receipt;
+        let want: Projection = w.reason
+          ? original
+          : { text: w.expected, truncated: w.name === "combining", checkedComplete: true, withheld: false };
+        for (const [operation, limit] of [
+          ["cutPrefix", w.name === "distinct" ? i : 4],
+          ["cutTail", 4],
+          ["trim", 0],
+        ] as const) {
+          derived = operation === "trim" ? op(operation, derived) : op(operation, derived, limit);
+          want = rendering(want, operation, limit);
+          const got = read(derived);
+          if (keys.some((key) => got[key] !== want[key]))
+            throw Error(`Invalid rendering: ${w.name}/${operation}`);
+        }
+      }
     }
   });
   if (!ready)

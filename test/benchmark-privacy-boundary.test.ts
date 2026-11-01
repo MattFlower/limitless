@@ -14,6 +14,7 @@ import {
   workload,
 } from "../scripts/benchmark-privacy-boundary.ts";
 import { createCredentialRegistry, credentialVariants } from "../src/util/credential-matcher.ts";
+import * as boundary from "../src/util/privacy-boundary.ts";
 import {
   capturePrivacySnapshot,
   consumeBoundaryText,
@@ -177,6 +178,56 @@ function fakeRevision(kind = "b") {
   };
   return { api, runtime, fixture, policies, overlap: () => overlap, preparations: () => preparations };
 }
+test.each(["cutPrefix", "cutTail", "trim"] as const)(
+  "rejects forged or incorrect %s renderings",
+  async (operation) => {
+    const { runtime } = fakeRevision();
+    const fixture = () => ({
+      ...workload("distinct", tiny),
+      text: " \te\u0301😀x ",
+      expected: " \te\u0301😀x ",
+      entries: [],
+      credentials: [],
+    });
+    const api = { ...boundary, createCredentialRegistry };
+    await expect(measureRevision(api, fixture, runtime)).resolves.toMatchObject({ coverage: "successful" });
+    const incorrect = operation === "cutPrefix" ? () => ({}) : (receipt: unknown) => receipt;
+    await expect(measureRevision({ ...api, [operation]: incorrect }, fixture, runtime)).rejects.toThrow(
+      `Invalid rendering: distinct/${operation}`,
+    );
+    const refusal = () => ({
+      ...fixture(),
+      name: "sparse",
+      entries: [{ entry: 0, value: "x" }],
+      reason: "private-match",
+    });
+    await expect(measureRevision(api, refusal, runtime)).resolves.toMatchObject({ coverage: "refusal" });
+    await expect(measureRevision({ ...api, [operation]: () => ({}) }, refusal, runtime)).rejects.toThrow(
+      `Invalid rendering: sparse/${operation}`,
+    );
+  },
+);
+test("evidence reports decoded forms and matching scans per preparation", async () => {
+  const { runtime } = fakeRevision();
+  const report = await measureRevision(
+    { ...boundary, createCredentialRegistry },
+    () => ({
+      ...workload("plain", tiny),
+      text: "%252E",
+      expected: "%252E",
+      entries: [{ entry: 0, value: "synthetic-private" }],
+      credentials: [],
+    }),
+    runtime,
+  );
+  const raw = report.groups.checker?.summary.raw;
+  expect(raw).toHaveLength(7);
+  // Each check visits raw + six forms in each of three rounds (%252E -> %2E -> . -> .).
+  // Nineteen credential passes plus three distinct normalized private forms = 22 scans.
+  // Three full checks; prefix/tail/trim check %252, which settles in two rounds (13 forms, 15 scans).
+  for (const trial of raw ?? [])
+    expect(trial).toMatchObject({ counters: { forms: 3 * 19 + 3 * 13, scans: 3 * 22 + 3 * 15 } });
+});
 test("real worker orchestration excludes fixtures, probes baseline gaps and cleans owned revisions", async () => {
   let pid = 0;
   const cleaned: number[] = [];

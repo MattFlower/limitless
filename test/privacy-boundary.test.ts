@@ -134,6 +134,16 @@ test("normalization work observes registrations once and inputs for each base64 
   }
 });
 
+test("decoded forms and matching passes are optional counters", () => {
+  const counters = { ...work(), forms: 0, scans: 0 };
+  const prepared = preparePrivacyPolicy(snapshot(["synthetic-private"]), { counters });
+  expect(counters).toMatchObject({ forms: 0, scans: 0 });
+  expect(checkPrepared(prepared, "%252E")).toEqual({ clean: true });
+  // Raw, then six decoder readings per round: %252E -> %2E -> . -> . (converged).
+  // Each reading gets a credential scan; three distinct normalized forms get a private pass.
+  expect(counters).toMatchObject({ forms: 19, scans: 22 });
+});
+
 test("preparation is reused and generations remain bound to captured snapshots", () => {
   let version = "v1";
   const registry = createPrivacyRegistry(createCredentialRegistry(), () => version);
