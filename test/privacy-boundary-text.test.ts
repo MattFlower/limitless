@@ -9,7 +9,9 @@ import {
   createPrivacyRegistry,
   cutPrefix,
   cutTail,
+  issuePrivacyWorkerResult,
   preparePrivacyPolicy,
+  privacyLimits,
   protectText,
   trim,
 } from "../src/util/privacy-boundary.ts";
@@ -190,6 +192,51 @@ test("policy, credential and checker generations guard issuance and every reuse"
   expect(consume(value).withheld).toBe(false);
   const repeated = f.protect("clean");
   expect(consume(value).policyDigest).toBe(consume(repeated).policyDigest);
+});
+test.each(["credential", "policy"])("worker bridge keeps internal authority after %s changes", (kind) => {
+  const f = fixture();
+  const generation = f.registry.generation;
+  const impostor = { ...createPrivacyRegistry(), generation };
+  const result = {
+    text: "safe",
+    truncated: false,
+    checkedComplete: true,
+    withheld: false,
+    policyDigest: `privacy/${generation.policy}/${generation.credentials}/${generation.checker}`,
+    registry: impostor,
+    generation: { ...generation, policy: -1 },
+  };
+  const issue = () => issuePrivacyWorkerResult(result, generation, f.registry);
+  const receipt = issue();
+  expect(consume(receipt)).toMatchObject({ text: "safe", withheld: false, truncated: false });
+  if (kind === "credential") f.registry.addCredential("safe");
+  else f.registry.replacePolicy([{ value: "safe", entry: 0 }]);
+  refused(receipt, "stale-generation");
+  refused(issue(), "stale-generation");
+});
+test("worker bridge retains internal limits, policy and issuance hooks", () => {
+  const f = fixture();
+  const generation = f.registry.generation;
+  const result = {
+    text: "safe",
+    truncated: false,
+    checkedComplete: true,
+    withheld: false,
+    policyDigest: `privacy/${generation.policy}/${generation.credentials}/${generation.checker}`,
+    limits: { ...privacyLimits, inputUnits: 100 },
+  };
+  const receipt = issuePrivacyWorkerResult(result, generation, f.registry, { inputUnits: 4 });
+  expect(consume(receipt).text).toBe("safe");
+  refused(concat([receipt, receipt]), "input-length");
+  for (const field of ["policy", "beforeIssue"]) {
+    const supplied = Object.defineProperty({ ...result }, field, {
+      enumerable: true,
+      get: () => {
+        throw new Error("Worker authority must not be read");
+      },
+    });
+    expect(consume(issuePrivacyWorkerResult(supplied, generation, f.registry)).text).toBe("safe");
+  }
 });
 test.each([
   [{ kind: "complete" }, false],
