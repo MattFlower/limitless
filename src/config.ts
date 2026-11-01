@@ -91,6 +91,7 @@ export interface Config {
   triageDecisionConfidence: number;
   landRequiresApproval: ReadonlySet<string>; // operator repository slugs, lower case
   githubApp: { appId: number; installationId: number; privateKeyPath: string; repos: string[] } | null;
+  githubDefects?: { enabled: boolean; factoryRepo: string | null; dailyCap: number; invalid?: true } | null;
   githubOwner: string | null; // allowlisted GitHub login for triggers
   githubMerge?: "auto" | "pr" | "none";
   githubPoll: boolean; // [github] poll: observe factory PRs; off restores the notifier's per-run PR checks
@@ -460,6 +461,32 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
         );
     githubApp = { appId, installationId, privateKeyPath, repos: a.repos.map((r) => r.toLowerCase()) };
   }
+  let githubDefects: Config["githubDefects"] = null;
+  if (github.defects !== undefined) {
+    const d = github.defects;
+    const invalid = { enabled: false, factoryRepo: null, dailyCap: 10, invalid: true } as const;
+    githubDefects = invalid;
+    if (d && typeof d === "object" && !Array.isArray(d)) {
+      const v = d as Record<string, unknown>;
+      const enabled = v.enabled === undefined ? false : v.enabled;
+      const dailyCap = v.daily_cap === undefined ? 10 : v.daily_cap;
+      const factoryRepo = typeof v.factory_repo === "string" ? v.factory_repo.toLowerCase() : null;
+      if (
+        Object.keys(v).every((k) => ["enabled", "factory_repo", "daily_cap"].includes(k)) &&
+        typeof enabled === "boolean" &&
+        typeof dailyCap === "number" &&
+        Number.isSafeInteger(dailyCap) &&
+        dailyCap > 0 &&
+        (v.factory_repo === undefined ||
+          (factoryRepo !== null &&
+            factoryRepo === factoryRepo.trim() &&
+            repoName.test(factoryRepo) &&
+            githubApp?.repos.includes(factoryRepo))) &&
+        (!enabled || factoryRepo !== null)
+      )
+        githubDefects = { enabled, factoryRepo, dailyCap };
+    }
+  }
   let githubQueue: Config["githubQueue"] = null;
   if (github.queue !== undefined) {
     if (!github.queue || typeof github.queue !== "object" || Array.isArray(github.queue))
@@ -650,6 +677,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     githubCiReruns: github.ci_reruns !== false,
     githubQueue,
     githubApp,
+    githubDefects,
     discordOwnerId: str(owners.discord, null),
     discordChannelId: str(discord.channel_id, null),
     discordNotifyAll: discord.notify_all === true,

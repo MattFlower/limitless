@@ -237,6 +237,9 @@ discovers an owner.
 | `[github.queue] trusted` | Configured GitHub owner, or `[]` | Logins trusted to author, edit and approve queued issues; case-insensitive. Empty disables polling. |
 | `[github.queue] max_issue_runs` | `1` | Positive integer cap on active issue-sourced runs; priority 0 may exceed it by one, within the overall run limit. |
 | `[github.queue] poll_seconds` | `180` | Positive polling interval, minimum 15 seconds; low GraphQL budget defers until reset. |
+| `[github.defects] enabled` | `false` | Coordinator opt-in; **enable on exactly one coordinator**. Restart required. Publishes finalized land incidents to the factory repository. See [delivery status](OPERATIONS.md#defect-reporter-delivery-status). Older releases ignore this optional table. |
+| `[github.defects] factory_repo` | unset | Required when enabled: an `owner/name` repository covered by `[github.app].repos`. All defects and unresolved triage go here. |
+| `[github.defects] daily_cap` | `10` | Positive safe integer: new issues per UTC day, accounted separately in each coordinator database. |
 | `[github] repos` | `[]` | Setup repositories, e.g. `["<owner>/<repo>"]`; doctor reads the first to check access and SSO. This is not a run allowlist. |
 | `[github] merge` | `"auto"` when absent; init chooses `"pr"` | Default for newly registered GitHub repos: `"auto"`, `"pr"`, or `"none"`. Existing repo rows stay unchanged; repository `.limitless.toml` policy still wins. |
 | `[routing] prefer` | `[]` | Providers to try first among interchangeable models, for example `["codex"]` |
