@@ -190,7 +190,7 @@ test("setup is eval-only for explicit systems and roster references", () => {
   ).toThrow();
 });
 
-test("severityRubric is an eval-only panel option preserved by roster expansion", () => {
+test("severityRubric (built-in or text) is an eval-only panel option preserved by roster expansion", () => {
   const variant = panel({ severityRubric: true });
   expect(parseEvalReviewSystems(file(variant), "s.json")).toEqual([variant] as ReviewSystem[]);
   expect(ReviewSystemSchema.safeParse(variant).success).toBe(false);
@@ -208,6 +208,23 @@ test("severityRubric is an eval-only panel option preserved by roster expansion"
   if (!parsed) throw new Error("missing system");
   expect(expandRoster(parsed, DEFAULT_ROSTERS)).toMatchObject({ mode: "panel", severityRubric: true });
   expect(reviewSystemHash(variant as ReviewSystem)).not.toBe(reviewSystemHash(panel() as ReviewSystem));
+  // Rubric text: an eval-only variant of the same option.
+  const text = panel({ severityRubric: "# Severity A" });
+  expect(parseEvalReviewSystems(file(text), "s.json")).toEqual([text] as ReviewSystem[]);
+  expect(ReviewSystemSchema.safeParse(text).success).toBe(false);
+  expect(() => parseEvalReviewSystems(file(panel({ severityRubric: "  " })), "s.json")).toThrow("empty");
+  expect(() => parseEvalReviewSystems(file(system({ severityRubric: "# Severity A" })), "s.json")).toThrow(
+    "panel",
+  );
+  const textReference = parseEvalReviewSystems(
+    file({ ...reference, severityRubric: "# Severity A" }),
+    "s.json",
+  )[0];
+  if (!textReference) throw new Error("missing system");
+  expect(expandRoster(textReference, DEFAULT_ROSTERS)).toMatchObject({ severityRubric: "# Severity A" });
+  expect(reviewSystemHash(text as ReviewSystem)).not.toBe(
+    reviewSystemHash(panel({ severityRubric: "# Severity B" }) as ReviewSystem),
+  );
 });
 
 test("causal attribution is an opt-in panel option preserved by parsing and roster expansion", async () => {
