@@ -91,14 +91,17 @@ authorization headers and model authentication are intentional secret transport,
 output; filtering them would break authentication. Repository content publication retains its
 existing refusal checks rather than rewriting source files.
 
-## One shared contract (proposed)
+## One shared contract
 
-Introduce `protectText` and its opaque result `BoundaryText` in `src/util/privacy-boundary.ts`.
-It uses the decoder/matcher in `src/gates/private.ts`, the compiled credential matcher in
-`src/util/credential-matcher.ts` and terminal handling without importing proc.ts back into itself.
-No boundary invents a second private matcher. Existing APIs become adapters to this contract.
-`protectText` is asynchronous; await its result before storage/emission. Synchronous Store
-methods consume already-protected projections rather than running complete checks inline.
+`protectText`, `protectData` and their opaque result `BoundaryText` live in
+`src/util/privacy-boundary.ts` (c2.1a/b). They use the decoder/matcher in `src/gates/private.ts`,
+the compiled credential matcher in `src/util/credential-matcher.ts` and terminal handling without
+importing proc.ts back into itself. No boundary invents a second private matcher. Existing APIs
+become adapters to this contract. c2.1a/b are synchronous. A complete check of an admitted input
+takes far longer than the daemon's 50-ms slice budget (see "Measured cost"), so daemon consumers
+call the asynchronous worker checker (c2.1c) and await its result before storage/emission; the
+synchronous APIs remain its core. Synchronous Store methods consume already-protected
+projections rather than running complete checks inline.
 
 Input: `{text, provenance, policy, cut?, terminal?}`. Provenance is a tagged union:
 `complete`, `cut` with `truncated:true`, or `legacy-unknown`. Only the capture/reader that
@@ -184,80 +187,89 @@ free text can be withheld while typed progress/status still flows. Apply the sam
 cap, discard/withhold overflow and incomplete messages, and never log unchecked raw records.
 This adds conservative withholding, not a second harness execution or a control-flow decision.
 
-## Cost, retained state and c2 benchmark
+## Measured cost, retained state and the worker decision
 
-No performance measurement was made for this documentation change. The issue reports about
-1.3 s for privateMatches on 5 MiB with eight private entries. Review reports newer measurements
-of about 110–260 ms after #921, with #923's decoding/layer caching pending. Plan from that
-measured range, retaining 1.3 s only as the issue's historical figure; remeasure at c2's base.
-Neither figure predicts the additional compiled scan against 600 credentials.
+c2.1b.3 (#999) measured the synchronous c2.1a/b path with `scripts/benchmark-privacy-boundary.ts`
+against main before c2.1a (`33243e96`), completed c2.1a (`03aa8a77`) and completed c2.1b
+(`039d42e1`, c2.1b.1 plus #1100's form and scan counters). Each workload ran two warmups and
+five timed trials in a fresh process per revision, with synthetic policies only (eight entries
+and 600 credentials unless the workload says otherwise). Platforms: macOS arm64, unconfined, with
+other factory work running (load average 2–6); Linux arm64 in an OrbStack VM on the same Mac
+(`oven/bun:1.4.3`), so not independent hardware. Bun 1.4.3 on both.
 
-Run every complete-source and changed-rendering check in a worker thread through protectText,
-including terminal normalization, C and cuts. Use a bounded checker pool, not a worker per
-event: this keeps synchronous decoder/regex work off the daemon without changing its semantics.
-The daemon-thread budget is **no synchronous slice over 50 ms for any input size**, including
-capture, queueing, transfer, result handling and serialization. Transfer bounded byte chunks
-with yields between batches; assemble/decode full text in the worker, not in a giant main-thread
-copy. Apply caps before queueing and bound pending bytes as well as active checkers; overflow
-or worker failure withholds text, never falls back to synchronous checking. Measure transfer
-and output handling too: moving only privateMatches to a worker does not establish this budget.
+c2.1b results (milliseconds; the worst whole slice includes warmups; RSS is the process peak):
 
-Prepare normalized entries, minimum base64 candidate length and literal search structures once
-per policy digest; reuse the credential automaton across all 600 registrations. Decode each
-candidate/form once, matching the prepared private and credential policies against it; avoid
-normalizing every entry again for each base64 token. Preserve current match/refusal semantics.
-Use one traversal of decoder forms, checking and releasing obsolete forms instead of retaining
-normalizedLayers' whole array. This is a performance adaptation, not a new decoding language.
+| Workload (admitted) | Size | Worst whole slice, macOS / Linux | Check call median, macOS / Linux | Peak RSS MiB |
+| --- | --- | ---: | ---: | ---: |
+| 5 MiB ASCII, 8 entries, 600 credentials | 5,242,880 U/B | 612 / 620 | 399 / 413 | 62 / 94 |
+| ASCII at the input cap | 8 Mi U, 8 MiB | 984 / 980 | 632 / 649 | 69 / 99 |
+| BMP text at the input cap | 8 Mi U = CP, 24 MiB | 2,592 / 2,441 | 1,542 / 1,585 | 370 / 506 |
+| Astral text at the input cap | 8 Mi U, 4 Mi CP, 16 MiB | 2,155 / 2,175 | 1,443 / 1,415 | 476 / 550 |
+| One base64 run at the input cap | 8 Mi U/B | 4,218 / 4,252 | 2,794 / 2,807 | 341 / 723 |
+| Recursive input, output at 8 Mi U (`protectData`) | 8 Mi U | 2,389 / 2,332 | 1,990 / 1,958 | 81 / 123 |
+| 10,000 nodes; depth 32 with 10,000 nodes | 20,001 U | 35 / 46; 34 / 39 | 22 / 23; 23 / 23 | 68–72 / 125–130 |
+| Cold preparation, 64 entries, 1,024 credentials, 1 Mi U originals | policy only | 184 / 177 | 109 / 110 | 888 / 999 |
+| Admitted refusal: one decoded form over 32 Mi U | 1.8 Mi U | 478 / 462 | 219 / 224 | 516 / 530 |
+| Admitted refusal: decoded forms over 64 Mi U in total | 8 Mi U | 698 / 658 | 335 / 325 | 131 / 168 |
 
-For 5 MiB mostly ASCII stdout, eight entries and 600 synthetic credentials, budget one complete
-raw check; a second full visible-form check only if terminal stripping changes text; and one
-terminal/credential pass after acceptance. With nonempty stderr the joined view adds a check.
-Each “check” can visit up to 16 forms across five rounds; it is not one byte scan. Base64 can
-try four alignments per relevant run. Reuse complete-source evidence across consumers, but
-check each distinct cut/rendering; reuse exact safe bytes for repeated events/prompt fragments.
-Never scan each growing stream prefix or run a 600-entry regex loop on every output chunk.
+- The whole slice is the benchmark's entry-to-return interval with no yield: cold preparation, a
+  separate `checkPrepared` call, `protectText`/`protectData`, consumption and the cut and trim
+  renderings. The check-call median (`protectText`/`protectData` alone, or preparation alone)
+  is the better estimate of one consumer call. Heartbeat delay matched the slice to within 7 ms in
+  every c2.1b trial; the difference includes the benchmark's own bookkeeping before the heartbeat
+  is observed, so it is not all unrelated scheduler delay.
+- Every other admitted checker workload stayed at or below 37 ms: plain, sparse, SGR/OSC,
+  supported escapes, both streams, combining-mark cuts, 64 repeated and distinct renderings,
+  thousands of small diagnostics, four concurrent consumers, depth 32 and the depth, node and
+  policy-count refusals. The capture simulation, which checks four chunkings (32-KiB chunks and
+  UTF-8/escape splits) in one slice, reached 47 / 49 ms. Steady reuse of a prepared policy stayed
+  at about 1 ms or less.
+- Out of envelope: an 8 Mi + 1 U input and `sh`'s 50,000,000-unit source are refused without a
+  check (the 8 Mi + 1 U slice of about 300 ms is the benchmark's own `checkPrepared` call). They
+  don't count toward the decision.
+- Retained heap after collection was about 56 MiB in the checker phases with the eight-entry,
+  600-credential policy (about 71 MiB including the baseline operations), but a prepared maximum
+  policy retains about 402 MiB. Transient heap growth reached 218 / 212 MiB on base64. Peak RSS
+  includes the baseline operations measured in the same process.
+- Synthetic texts are uniform filler, close to the decoder's best case. Escape-heavy text costs
+  more, as the base64 row shows.
 
-Estimate from the newer range: ~110–260 ms private work with one form source, ~220–520 ms with
-raw plus different visible source, and ~330–780 ms with another joined source, plus roughly
-0.1–0.6 s for normalization/credential/output handling. These are planning estimates only;
-prepared policies may improve them, and escape-heavy output can cost more. Measure the
-combined path, including decoded credential checks, before accepting a c2 performance claim.
-Add work proportional to the sum of distinct rendering lengths, not just captured bytes:
-an 8,000-U excerpt plus a 6,000-U tail adds about 0.3–0.7 ms at the newer ASCII baseline rate
-per validation pass (estimate, not measurement). Line/excerpt selection, final C'd output and
-prompt assemblies add further checks; one extra full 5-MiB rendering adds about 110–260 ms.
-These are worker CPU estimates, not permitted daemon event-loop stalls.
-Cache only exact renderings under policy/credential version; record lengths/scan counts and
-bound cache retention within the checker budget. Check cut candidates serially.
+Baseline on main (separate operations, not the combined contract): on the 5 MiB input,
+`redactCredentials` with 600 registered credentials took 25–27 ms (worst 37–46 ms), the
+credential-only path that #704/#706 optimized, and `privateMatches` with eight entries took
+11–12 ms. On astral text at the input cap they took 89–91 and 47–49 ms. Main has no receipts,
+provenance or recursive checks, so these are comparison points, not parity. Main's
+`redactCredentials` already spends 240–249 ms (worst 261–265 ms) synchronously on `sh`'s
+50,000,000-unit source.
 
-Five MiB ASCII uses ≤10 MiB per UTF-16 text copy; capture, visible/output and several current
-decoder forms suggest ~60–120 MiB peak text storage, plus matcher/object overhead. The capture
-cap bounds raw retention at 16 MiB; decoder expansion needs a separate 32-Mi-U per-form cap
-and refusal before retaining oversized forms. Normalization may transiently expand further;
-measure RSS rather than claiming the capture cap bounds total memory. Stream forms one at a
-time and budget ~250 MiB per active checker including temporary copies, subject to measurement.
-Existing gate concurrency bounds concurrent captures; do not add unbounded checker parallelism.
+**Decision: workers are required.** Implementation-owned synchronous slices exceed 50 ms at
+admitted sizes on both platforms, including admitted refusal paths and maximum-policy cold
+preparation; `protectText` alone exceeds it at 5 MiB. c2.1c.1–c2.1c.3 (#1102–#1104) add the
+asynchronous checker, and daemon consumers adopt it rather than the synchronous APIs. Admission
+caps are unchanged. These finite samples establish a measured envelope, not a latency guarantee.
+With one worker and eight admitted requests, eight maximum base64 checks need about 22.5 s of
+worker time, inside c2.1c's 30-second job deadline on these machines.
 
-Reproduce locally in c2, without network, models or owner configuration:
+The worker runs every complete-source and changed-rendering check, including preparation,
+terminal normalization, C, cuts and recursive serialization. The daemon-thread budget is **no
+implementation-owned synchronous slice over 50 ms at an admitted size**, including capture,
+queueing, transfer, result handling and serialization. Transfer bounded chunks with yields
+between them; assemble and decode full text in the worker, not in a giant main-thread copy.
+Apply caps before queueing and bound pending bytes as well as active work. Overflow or worker
+failure withholds text and never falls back to synchronous checking.
 
-1. Under `mkdtemp(os.tmpdir())`, make a disposable Bun driver importing the checkout by absolute
-   file URL. Pass eight explicit synthetic entries (`host.example` variants) and register 600
-   distinct `<credential>`-based synthetic values. Never load the real private-strings file.
-2. Generate exactly `5*1024*1024` ASCII bytes, with ordinary lines and sparse synthetic matches;
-   repeat with SGR, mixed supported escapes, a long base64 run, both streams and no matches.
-   Feed 32-KiB chunks, then single-byte splits around escapes/UTF-8. Include cap+1 overflow.
-3. In fresh processes for base and c2, use two warmups and five timed trials; report medians,
-   Bun/OS/architecture, total bytes, scan counts, compilation time separately, retained capture,
-   peak RSS and receipts reused. Instrument synthetic consumers for events/excerpts/prompts,
-   counting post-cut checks too; include combining-mark cuts and many distinct excerpts.
-   Report full before/after timings and verify identical safe output across chunkings.
-   Beside medians, report worst daemon event-loop stall across all trials (including warmups),
-   using a short-interval heartbeat plus maximum synchronous-slice instrumentation. Include
-   queue/transfer/result handling, concurrent gates and cap+1 refusal. c2.1's checker and c2.2's
-   whole gate path must meet the 50-ms slice budget; timing assertions stay out of unit tests.
-4. `bun scripts/benchmark-credential-redaction.ts <baseline-proc.ts>` supplies a separate
-   credential-only comparison (see its header for snapshot setup); it does not measure P.
-   Keep all drivers/snapshots/output in scratch and remove them. Tests never assert timings.
+c2.1a.1 prepares normalized entries, the minimum base64 candidate length and literal search
+structures once per policy generation and reuses the credential automaton across registrations.
+Each candidate form is decoded once and checked against both prepared policies. Keep these
+semantics when optimizing; a measured need for decoder optimization gets its own delivery.
+
+Reproduce with `bun scripts/benchmark-privacy-boundary.ts <main> <c2.1a> <c2.1b> [workloads...]`
+from a checkout with installed dependencies. It snapshots each revision's `src` under
+`mkdtemp(os.tmpdir())`, runs each workload in a fresh process and prints JSON. `--worker <root>
+<workload> <sha>` runs one workload against an existing snapshot, which suits containers without
+git. It loads no owner configuration and uses only synthetic data. `bun
+scripts/benchmark-credential-redaction.ts <baseline-proc.ts>` remains the credential-only
+comparison. Keep snapshots and output in scratch; tests never assert timings.
 
 ## c2 adversarial regression matrix
 
@@ -311,16 +323,34 @@ comments just to obtain source text. Completed old results can be withheld diagn
 only genuinely interrupted work uses its existing resume path. Persist proofs with their
 diagnostic value atomically; an interrupted capture has no complete-source proof to recover.
 
-c2 estimate: **about 900 changed lines**, including tests and counting additions/deletions.
-Use these dependency-ordered slices, each reporting its protected classes, rather than one PR:
+The original c2 estimate (about 900 changed lines including tests, with c2.1 at 115 source and
+85 test lines) was far too low: c2.1 alone changed 927 source and 1,239 test lines, about 8×
+and 15× its estimates. Delivered slices (changed lines,
+additions plus deletions; scripts and docs count as source):
 
-| Slice / dependency | Scope and changed-line budget | Verification before claiming coverage |
-| --- | --- | --- |
-| c2.1 / slice (a) | Contract/prepared policy/provenance + bounded worker checker, recursive adapter and post-cut validation, ~115 implementation + 85 tests = 200. | publication-text/credential tests including combining-mark cuts, synthetic scan/memory benchmark with worst daemon stall beside medians; meet the 50-ms synchronous-slice budget. No universal protection claim yet. |
-| c2.2 / c2.1 | Complete bounded gate capture, excerpts/tail and gate metadata, ~100 + 70 = 170. | proc/gates/feedback tests; split/overlap/cap cases and whole gate benchmark reporting worst daemon stall beside medians; meet the 50-ms synchronous-slice budget including concurrent gates and transfers. Other producers remain explicitly unaudited. |
-| c2.3 / c2.2 | Harness logs/results/events, prompts and post-merge/worker persistence, ~110 + 70 = 180. | harness/pipeline/workers restart tests; no unchecked log append, flags survive persistence. |
-| c2.4 / c2.3 | MCP transport/results, REST/SSE, privateOutputData, feed/digest/change/report adapters and optional metadata storage, ~120 + 80 = 200. | MCP/feed/digest/report/HTTP tests plus old-writer/new-reader and rollback migration fixtures. |
-| c2.5 / c2.4 | PR/commit/Discord/deploy/eval/log/script adapters and remaining audit, ~90 + 60 = 150. | Publication/delivery/Discord/deploy/eval tests and repeat inventory search; claim universal coverage only when every row is accounted for. |
+| Slice | PR | Source | Tests |
+| --- | --- | ---: | ---: |
+| c2.1a.1 prepared matching, credential generation and decoder limits | #1045 | 275 | 283 |
+| c2.1a.2 synchronous provenance, receipts and trusted rendering | #1079 | 256 | 287 |
+| c2.1b.1 recursive diagnostics with original and serialized authority | #1087 | 84 | 232 |
+| c2.1b.2 reusable benchmark and reporting hooks | #1100 | 312 | 437 |
+| c2.1b.3 platform evidence and this reconciliation | #999 | 214 | 23 |
+
+Remaining deliveries hard-stop at 250 source lines each, so a larger scope splits before filing.
+The conditional worker slices come from c2.1b.3's trigger. The c2.2–c2.5 figures are judgments
+of roughly 4–6× the original per-slice source estimates, lower than c2.1's ratio because they
+reuse its contract and checker; each is re-estimated in its full spec before labelling. Each production consumer still needs its own provenance path and measured
+envelope through the worker checker.
+
+| Slice / dependency | Scope | Source / test estimate | Verification before claiming coverage |
+| --- | --- | --- | --- |
+| c2.1c.1 / c2.1b.3 (#1102) | Worker checker protocol, generations, lifecycle and reservations. | 170–220 / 100–150 | Fake-port generation, protocol, capacity and lifecycle mutations. |
+| c2.1c.2 / c2.1c.1 (#1103) | Bounded transport, result authority and service integration. | 140–200 / 80–120 | Backpressure and semantic parity through fake ports. |
+| c2.1c.3 / c2.1c.2 (#1104) | Compiled worker entry, real-worker probes, benchmark rerun and design update. | 120–180 / 30–60 | macOS and Linux probes, packaged execution; no daemon slice over 50 ms, warmups included. |
+| c2.2 / c2.1c.3 (#928) | Complete bounded gate capture, excerpts/tail and gate metadata; 2–3 deliveries. | 400–600 / 300–500 | proc/gates/feedback tests; split/overlap/cap cases and whole gate benchmark reporting worst daemon stall beside medians; meet the 50-ms synchronous-slice budget including concurrent gates and transfers. Other producers remain explicitly unaudited. |
+| c2.3 / c2.2 (#929) | Harness logs/results/events, prompts and post-merge/worker persistence; 2–3 deliveries. | 400–600 / 300–500 | harness/pipeline/workers restart tests; no unchecked log append, flags survive persistence. |
+| c2.4 / c2.3 (#930) | MCP transport/results, REST/SSE, privateOutputData, feed/digest/change/report adapters and optional metadata storage; 2–3 deliveries. | 450–650 / 350–550 | MCP/feed/digest/report/HTTP tests plus old-writer/new-reader and rollback migration fixtures. |
+| c2.5 / c2.4 (#931) | PR/commit/Discord/deploy/eval/log/script adapters and remaining audit; 2 deliveries. | 350–500 / 250–400 | Publication/delivery/Discord/deploy/eval tests and repeat inventory search; claim universal coverage only when every row is accounted for. |
 
 Ship adapters only with their source provenance path; unconverted/missing proof is withheld,
 never represented as checked. Each slice runs affected test files, Biome on supported changed
