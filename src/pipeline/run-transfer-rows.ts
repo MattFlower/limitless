@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Repo, Run, RunDetail } from "../core/types.ts";
+import type { Run, RunDetail, Repo as StoredRepo } from "../core/types.ts";
 import { RunTransferError, rethrowRunTransfer } from "./run-transfer-errors.ts";
 import * as json from "./run-transfer-json.ts";
 export const boundary =
@@ -111,7 +111,11 @@ const rowsSchema = object({
 });
 export type PortableRun = z.infer<typeof runSchema>;
 export type TransferRows = z.infer<typeof rowsSchema>;
-export type TransferRowInput = Pick<RunDetail, "run" | "stages" | "invocations" | "questions">;
+export type TransferRepository = Pick<StoredRepo, "id" | "kind" | "slug">;
+type Repo = TransferRepository;
+export type TransferRowInput = Pick<RunDetail, "run" | "stages" | "questions"> & {
+  invocations: (Omit<RunDetail["invocations"][number], "sessionId"> & { sessionId?: string | null })[];
+};
 export function parseRecord<T>(schema: z.ZodType<T>, value: unknown): T {
   json.parseTransferJson(value);
   const result = schema.safeParse(value);

@@ -1,6 +1,7 @@
 import { z } from "zod";
-import type { Repo, Run } from "../core/types.ts";
+import type { Run } from "../core/types.ts";
 import { RunTransferError } from "./run-transfer-errors.ts";
+import type { TransferRepository as Repo } from "./run-transfer-rows.ts";
 import * as r from "./run-transfer-rows.ts";
 
 const followUpSchema = z.strictObject({

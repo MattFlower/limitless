@@ -75,6 +75,22 @@ test("waitForPid waits for a complete PID line after file creation", async () =>
   expect(await pending).toBe(123);
 });
 
+/**
+ * Reaching a gate takes a whole pipeline, which a fixed deadline only fits on an idle machine;
+ * each deadline here bounds a stall in the run's recorded events instead.
+ */
+async function waitWhileProgressing(f: Factory, runId: string, ready: () => boolean) {
+  let seen = -1;
+  const progressed = () => {
+    const latest = f.store.listEvents(runId, { tail: true, limit: 1 })[0]?.id ?? 0;
+    if (latest === seen) return false;
+    seen = latest;
+    return true;
+  };
+  progressed();
+  while (!ready()) await wait(() => ready() || progressed(), { timeoutMs: 10_000 });
+}
+
 async function setup(enabled = true) {
   mkdirSync(join(fixture.home, "cfg"));
   writeFileSync(join(fixture.home, "cfg", "config.toml"), `[executor]\nenabled = ${enabled}\n`);
@@ -1334,12 +1350,24 @@ test.each(["during resume", "before resume"])(
         },
       ],
     };
-    await withExecutor(f, async (workers, crash) => {
+    await withExecutor(f, async (workers, crash, executor) => {
       const first = context(controller.signal);
       const pending = runGateExecution(first, "gates", "initial", req.cwd, long).catch((e) => e);
       try {
         const pid = await waitForPid(pidFile);
         const id = first.state.gateExecution?.handle.id ?? "";
+        // macOS records spawn discovery after spawn returns, so the shell can publish its PID first.
+        await wait(
+          () =>
+            f.store
+              .listProcessDiscoveries(undefined, realpathSync(req.cwd))
+              .some(
+                (row) =>
+                  row.ownerPid === executor.pid &&
+                  (process.platform === "linux" || row.discovery.group === pid),
+              ),
+          { timeoutMs: 10_000 },
+        );
         controller.abort(new Error("shutdown"));
         await pending;
         await crash();
@@ -1384,13 +1412,15 @@ test.each([
   writeFileSync(join(fixture.home, "cfg", "config.toml"), "[executor]\nenabled = true\n");
   const counter = join(fixture.home, "counter");
   const proceed = join(fixture.home, "proceed");
+  const ready = join(fixture.home, "gate-ready");
   const condition =
     purpose === "baseline"
       ? "! test -f farewell.txt"
       : purpose === "initial"
         ? "test -f farewell.txt && ! test -f base.txt"
         : "test -f base.txt";
-  const command = `if ${condition}; then test "$(cat greeting.txt)" = hello && test ! -f active-build || exit 9; echo run >> '${counter}'; echo gate-output > greeting.txt; touch active-build; while [ ! -f '${proceed}' ]; do sleep 0.05; done; test -f active-build && test "$(cat greeting.txt)" = gate-output; fi`;
+  // `>>` creates the counter before writing it; `ready` holds its contents once the edits are done.
+  const command = `if ${condition}; then test "$(cat greeting.txt)" = hello && test ! -f active-build || exit 9; echo run >> '${counter}'; echo gate-output > greeting.txt; touch active-build; cat '${counter}' > '${ready}'; while [ ! -f '${proceed}' ]; do sleep 0.05; done; test -f active-build && test "$(cat greeting.txt)" = gate-output; fi`;
   mkdirSync(join(fixture.repoDir, "test"));
   writeFileSync(
     join(fixture.repoDir, "test/unrelated.test.ts"),
@@ -1428,7 +1458,11 @@ test.each([
         prompt: "Add farewell",
         profile: "quick",
       });
-      await wait(() => existsSync(counter), { timeoutMs: 10_000 });
+      await waitWhileProgressing(
+        f,
+        run.id,
+        () => existsSync(ready) && readFileSync(ready, "utf8") === "run\n",
+      );
       const state = f.store.getRunState<RunContext["state"]>(run.id);
       expect(state?.gateExecution?.purpose).toBe(purpose);
       const job = workers.job(state?.gateExecution?.handle.id ?? "");
@@ -1444,18 +1478,16 @@ test.each([
           .query("UPDATE gate_jobs SET request=? WHERE id=?")
           .run(JSON.stringify({ ...request, env: { ...request.env, CHANGED_ENV: "1" } }), job.id);
       }
-      const next = start(handler);
-      const executor = next.deps.gateExecutor;
-      if (!executor) throw new Error("missing executor");
-      const attach = spyOn(executor, "attach");
-      try {
-        await wait(
-          () => attach.mock.calls.some(([h]) => h.kind === "inplace" && (h.id === job?.id) !== mismatch),
-          { timeoutMs: 10_000 },
-        );
-      } finally {
-        attach.mockRestore();
-      }
+      // Observe attachment from before the new engine exists, so an early resume cannot be missed.
+      const executor = gateExecutorFor("local", workers, [], true);
+      const attach = executor.attach.bind(executor);
+      let attached = false;
+      executor.attach = (h, ...rest) => {
+        attached ||= h.kind === "inplace" && (h.id === job?.id) !== mismatch;
+        return attach(h, ...rest);
+      };
+      const next = start(handler, false, false, { gateExecutor: executor });
+      await waitWhileProgressing(next, run.id, () => attached);
       writeFileSync(proceed, "");
       expect(await waitFor(next, run.id, ["succeeded", "failed", "needs_human"])).toBe(
         purpose === "initial" ? "needs_human" : "succeeded",
