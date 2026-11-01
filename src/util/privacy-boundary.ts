@@ -331,8 +331,19 @@ export function issuePrivacyWorkerResult(
   result: Projection,
   generation: ReturnType<typeof currentPrivacyGeneration> | undefined,
   registry = privacyRegistry,
+  limits: Partial<typeof privacyLimits> = {},
 ): BoundaryText {
-  return issue({ ...context({ refused: "nonconvergent" }, { registry }), ...result, generation });
+  const { text, truncated, checkedComplete, withheld, policyDigest, reason } = result;
+  return issue({
+    ...context({ refused: "nonconvergent" }, { registry, limits }),
+    text,
+    truncated,
+    checkedComplete,
+    withheld,
+    policyDigest,
+    reason,
+    generation,
+  });
 }
 function admit(state: Evidence, text: string, output = false): Reason | undefined {
   if (!text.isWellFormed()) return "ill-formed";

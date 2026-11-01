@@ -37,11 +37,11 @@ const record = (value: unknown): value is Record<string, unknown> =>
 const same = (a: object, b: object) =>
   Object.entries(a).every(([key, value]) => Reflect.get(b, key) === value);
 const digest = (g: Omit<Generation, "identity">) => `privacy/${g.policy}/${g.credentials}/${g.checker}`;
-const failure = (reason: Reason, generation?: Generation): Projection => ({
+const failure = (reason: Reason, generation?: Generation, provenance?: b.Provenance): Projection => ({
   text: "[withheld: private text]",
   withheld: true,
   checkedComplete: false,
-  truncated: false,
+  truncated: provenance?.kind === "cut" ? true : provenance?.kind === "complete" ? false : undefined,
   policyDigest: generation ? digest(generation) : "privacy/unavailable",
   reason,
 });
@@ -54,6 +54,9 @@ const reasons = [
 function projection(value: unknown, generation: Generation): value is Projection {
   if (!record(value)) return false;
   return (
+    Object.keys(value).every((key) =>
+      ["text", "truncated", "checkedComplete", "withheld", "policyDigest", "reason"].includes(key),
+    ) &&
     typeof value.text === "string" &&
     typeof value.checkedComplete === "boolean" &&
     (value.truncated === undefined || typeof value.truncated === "boolean") &&
@@ -84,6 +87,7 @@ export function privacyWorkerHandler(port: Pick<PrivacyWorkerPort, "postMessage"
 }
 export function createPrivacyChecker(options: Options = {}) {
   const registry = options.registry ?? b.privacyRegistry;
+  const limits = { ...b.privacyLimits, ...options.limits };
   const now = options.now ?? Date.now;
   const setTimer = options.setTimeout ?? setTimeout;
   const clearTimer = options.clearTimeout ?? clearTimeout;
@@ -97,7 +101,7 @@ export function createPrivacyChecker(options: Options = {}) {
   let retiring = Promise.resolve();
   let running: Promise<void> | undefined;
   const issue = (result: Projection, generation?: Generation) =>
-    b.issuePrivacyWorkerResult(result, generation, registry);
+    b.issuePrivacyWorkerResult(result, generation, registry, limits);
   const current = (generation: Generation) => {
     try {
       return same(generation, b.currentPrivacyGeneration(registry));
@@ -134,7 +138,8 @@ export function createPrivacyChecker(options: Options = {}) {
   }
   function submit(operation: Operation, input: Input, signal?: AbortSignal): Promise<b.BoundaryText> {
     let generation: Generation | undefined;
-    const refuse = (reason: Reason) => Promise.resolve(issue(failure(reason, generation), generation));
+    const refuse = (reason: Reason) =>
+      Promise.resolve(issue(failure(reason, generation, input.provenance), generation));
     let snapshot: Snapshot;
     try {
       snapshot = b.capturePrivacySnapshot(registry);
@@ -148,12 +153,13 @@ export function createPrivacyChecker(options: Options = {}) {
     const payload = operation === "text" ? input.text : input.json;
     if (typeof payload !== "string") return refuse("nonconvergent");
     const size = Buffer.byteLength(payload);
+    if (payload.length > limits.inputUnits || size > limits.inputBytes) return refuse("input-length");
     if (pending.size >= (options.maxRequests ?? 8) || size > (options.byteLimit ?? Infinity) - bytes)
       return refuse("checker-busy");
     input = { ...input, cut: input.cut && { ...input.cut }, provenance: { ...input.provenance } };
     const authority = generation;
     const deadline = now() + (options.deadlineMs ?? 30000);
-    const request = envelope(++sequence, operation, input, snapshot, options.limits);
+    const request = envelope(++sequence, operation, input, snapshot, limits);
     const result = Promise.withResolvers<b.BoundaryText>();
     let timeout: Parameters<typeof clearTimeout>[0];
     const cancel = () => finish("checker-cancelled", active === finish);
@@ -167,7 +173,9 @@ export function createPrivacyChecker(options: Options = {}) {
         if (terminate) void retire();
         else worker?.unref();
       }
-      result.resolve(issue(typeof value === "string" ? failure(value, authority) : value, authority));
+      result.resolve(
+        issue(typeof value === "string" ? failure(value, authority, input.provenance) : value, authority),
+      );
     };
     pending.set(finish, async () => {
       active = finish;

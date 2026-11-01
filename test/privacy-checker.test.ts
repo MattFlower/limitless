@@ -161,29 +161,40 @@ test.each(["policy", "credentials", "checker", "identity"])(
   },
 );
 
-test.each(["version", "sequence", "generation", "shape", "partial", "missing-id"])(
-  "protocol fault: %s withholds and retires",
-  async (fault) => {
-    const f = fixture({ maxRequests: 1, byteLimit: 4 });
-    const result = f.send();
-    await f.clock.flush();
-    const message: Record<string, unknown> = { ...f.port().response() };
-    if (fault === "version") message.version = 2;
-    if (fault === "sequence") message.sequence = 2;
-    if (fault === "generation") message.generation = { policy: -1, credentials: 0, checker: 0 };
-    if (fault === "shape") message.result = { text: "unvalidated partial" };
-    if (fault === "partial") message.type = "partial";
-    if (fault === "missing-id") delete message.id;
-    f.port().emit(message);
-    await withheld(result, "checker-failed");
-    expect(f.port().terminated).toBe(1);
-    const next = f.send();
-    await f.clock.flush();
-    f.port().reply();
-    expect(read(await next).withheld).toBe(false);
-    await f.dispose();
-  },
-);
+test.each([
+  "version",
+  "sequence",
+  "generation",
+  "shape",
+  "partial",
+  "missing-id",
+  "extra-registry",
+  "extra-generation",
+  "extra-limits",
+  "extra-other",
+])("protocol fault: %s withholds and retires", async (fault) => {
+  const f = fixture({ maxRequests: 1, byteLimit: 4 });
+  const result = f.send();
+  await f.clock.flush();
+  const message: Record<string, unknown> = { ...f.port().response() };
+  if (fault === "version") message.version = 2;
+  if (fault === "sequence") message.sequence = 2;
+  if (fault === "generation") message.generation = { policy: -1, credentials: 0, checker: 0 };
+  if (fault === "shape") message.result = { text: "unvalidated partial" };
+  if (fault === "partial") message.type = "partial";
+  if (fault === "missing-id") delete message.id;
+  if (fault.startsWith("extra-")) message.result = { ...f.port().response().result, [fault.slice(6)]: {} };
+  f.port().emit(message);
+  await withheld(result, "checker-failed");
+  expect(f.port().terminated).toBe(1);
+  expect(f.clock.pending).toBe(0);
+  const next = f.send();
+  await f.clock.flush();
+  expect(f.ports).toHaveLength(2);
+  f.port().reply();
+  expect(read(await next).withheld).toBe(false);
+  await f.dispose();
+});
 
 test("wrong and late IDs do not settle other requests, idle workers are unref'd", async () => {
   const f = fixture();
@@ -362,11 +373,149 @@ test("unreadable authority and core admission failures withhold", async () => {
   expect(f.ports).toHaveLength(0);
   broken = false;
   const result = f.send();
-  await f.clock.flush();
-  f.port().reply();
   await withheld(result, "input-length");
+  expect(f.ports).toHaveLength(0);
   await withheld(f.protectData({ json: {}, provenance: input().provenance }), "nonconvergent");
   await f.dispose();
+});
+
+test.each(["text", "data"] as const)("%s enforces core input caps before admission", async (operation) => {
+  for (const [limits, oversized, exact] of [
+    [{ inputUnits: 3 }, "xxxx", "xxx"],
+    [{ inputBytes: 4 }, "ééé", "éé"],
+  ] as const) {
+    const clock = waitClock();
+    let timers = 0;
+    const f = fixture({
+      limits,
+      maxRequests: 1,
+      byteLimit: Buffer.byteLength(exact),
+      setTimeout: (callback, ms) => {
+        timers++;
+        return clock.timer.set(callback, ms);
+      },
+      clearTimeout: clock.timer.clear,
+    });
+    const send = (text: string) =>
+      operation === "text" ? f.send(text) : f.protectData({ json: text, provenance: input().provenance });
+    await withheld(send(oversized), "input-length");
+    await f.clock.flush();
+    expect(f.ports).toHaveLength(0);
+    expect(timers).toBe(0);
+    const admitted = send(exact);
+    await withheld(send(oversized), "input-length");
+    await withheld(send(exact), "checker-busy");
+    await f.clock.flush();
+    expect(timers).toBe(1);
+    expect(f.port().sent).toHaveLength(1);
+    f.port().reply();
+    const receipt = await admitted;
+    expect(read(receipt).withheld).toBe(false);
+    expect(read(b.concat([receipt, receipt])).reason).toBe("input-length");
+    expect(clock.pending).toBe(0);
+    await f.dispose();
+  }
+});
+
+test.each([
+  [{ kind: "cut", truncated: true }, true],
+  [{ kind: "legacy-unknown" }, undefined],
+  [{ kind: "complete" }, false],
+] as const)("local failures retain provenance %j", async (provenance, truncated) => {
+  for (const [mode, reason] of [
+    ["busy", "checker-busy"],
+    ["pre-aborted", "checker-cancelled"],
+    ["active-cancel", "checker-cancelled"],
+    ["queued-cancel", "checker-cancelled"],
+    ["startup", "checker-failed"],
+    ["error", "checker-failed"],
+    ["exit", "checker-failed"],
+    ["active-timeout", "checker-timeout"],
+    ["queued-timeout", "checker-timeout"],
+    ["protocol", "checker-failed"],
+    ["dispose", "checker-failed"],
+    ["disposed", "checker-failed"],
+    ["input-length", "input-length"],
+    ["non-string", "nonconvergent"],
+    ["unreadable", "stale-generation"],
+    ["stale-admission", "stale-generation"],
+    ["stale-dispatch", "stale-generation"],
+    ["stale-response", "stale-generation"],
+  ] as const) {
+    let reads = 0;
+    let broken = false;
+    const authority = b.createPrivacyRegistry();
+    const registry = {
+      ...authority,
+      snapshot: () => {
+        if (broken) throw new Error("synthetic snapshot failure");
+        return authority.snapshot();
+      },
+      get generation() {
+        if (mode === "stale-admission" && ++reads === 1) authority.replacePolicy([]);
+        return authority.generation;
+      },
+    };
+    const both = ["startup", "error", "exit", "dispose"].includes(mode);
+    const f = fixture({
+      registry,
+      maxRequests: both || mode.startsWith("queued-") ? 2 : 1,
+      byteLimit: both || mode.startsWith("queued-") ? 8 : 4,
+      ...(mode === "startup" ? { workerFactory: () => Promise.reject(new Error("startup")) } : {}),
+      ...(mode === "input-length" ? { limits: { inputUnits: 3 } } : {}),
+    });
+    const controller = new AbortController();
+    let first: Promise<b.BoundaryText> | undefined;
+    if (mode === "busy" || mode.startsWith("queued-")) {
+      first = f.send();
+      await f.clock.flush();
+      if (mode === "queued-timeout") f.port().held = true;
+    }
+    if (mode === "disposed") await f.dispose();
+    if (mode === "pre-aborted") controller.abort();
+    if (mode === "unreadable") broken = true;
+    const value = { ...input(), provenance, cut: { unit: "U" as const, limit: 0 } };
+    const result =
+      mode === "non-string"
+        ? f.protectData({ ...value, json: {} })
+        : f.protectText(value, { signal: controller.signal });
+    const queued = both ? f.protectData({ ...value, json: "safe" }) : undefined;
+    if (mode === "stale-dispatch") authority.replacePolicy([]);
+    await f.clock.flush();
+    if (mode === "active-cancel" || mode === "queued-cancel") controller.abort();
+    if (mode === "active-timeout" || mode === "queued-timeout") await f.clock.advance(30000);
+    if (mode === "error") f.port().onerror?.();
+    if (mode === "exit") f.port().onexit?.();
+    if (mode === "protocol") f.port().emit({ ...f.port().response(), type: "partial" });
+    if (mode === "stale-response") {
+      const response = f.port().response();
+      authority.addCredential("safe");
+      f.port().emit(response);
+    }
+    if (mode === "dispose") await f.dispose();
+    const expected = {
+      text: "[withheld: private text]",
+      withheld: true,
+      checkedComplete: false,
+      truncated,
+      reason,
+    };
+    expect(read(await result)).toMatchObject(expected);
+    if (queued) {
+      await f.clock.flush();
+      if (mode === "error") f.port().onerror?.();
+      if (mode === "exit") f.port().onexit?.();
+      expect(read(await queued)).toMatchObject(expected);
+    }
+    if (mode === "queued-cancel") {
+      expect(f.port().terminated).toBe(0);
+      expect(f.clock.pending).toBe(1);
+    }
+    if (mode === "queued-timeout") f.port().retirement.resolve();
+    await f.dispose();
+    if (first) await first;
+    expect(f.clock.pending).toBe(0);
+  }
 });
 
 test.each([
