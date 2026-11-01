@@ -166,10 +166,12 @@ export class FailureObservations {
     if (rows.some((r) => r.setup_eligible)) this.promote();
   }
   private promote(): void {
-    this.store.db.exec(`UPDATE failure_observations AS a SET class='undeclared_requirement'
+    this.store.db
+      .query(`UPDATE failure_observations AS a SET class='undeclared_requirement'
       WHERE a.class='setup' AND a.setup_eligible=1 AND a.finalized_at IS NOT NULL AND a.location IS NOT NULL
       AND EXISTS (SELECT 1 FROM failure_observations b WHERE b.setup_eligible=1 AND b.repo=a.repo
         AND b.signature=a.signature AND b.location IS NOT NULL AND b.location<>a.location
-        AND b.observed_at BETWEEN a.observed_at-604800000 AND a.observed_at+604800000)`);
+        AND b.observed_at BETWEEN a.observed_at-604800000 AND a.observed_at+604800000)`)
+      .run();
   }
 }
