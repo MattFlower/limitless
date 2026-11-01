@@ -629,3 +629,236 @@ test("ordinary and server-authorized follow-up snapshots are supported, missing 
   });
   rejects(() => captureRunTransferSnapshot(f.store, "absent", f.context), "missing");
 });
+
+function proseState() {
+  const verification = {
+    verdict: "CONFIRMED",
+    evidence: "Evidence",
+    trigger: "Trigger",
+    severity: "high",
+    category: "correctness",
+    attribution: "introduced",
+    attributionEvidence: {
+      change: "Change",
+      obligation: "Obligation",
+      obligationSource: "Source",
+      base: { setup: "ok", result: "Base result" },
+      head: "Head explanation",
+    },
+  };
+  const finding = {
+    severity: "major",
+    file: "a.ts",
+    line: 1,
+    title: "Finding",
+    detail: "Detail",
+    suggestion: "Suggestion",
+    failure_scenario: "Scenario",
+    verification,
+    duplicates: [
+      {
+        finder: 1,
+        line: 1,
+        title: "Duplicate",
+        detail: "Detail",
+        suggestion: "Suggestion",
+        failure_scenario: "Scenario",
+      },
+    ],
+  };
+  const review = {
+    verdict: "request_changes",
+    summary: "Saved review",
+    findings: [finding],
+    modelId: "fake/model",
+    checklist: [{ item: "Item", applies: "Applies", checked: "Checked", finding: "Finding" }],
+    panel: {
+      reports: [{ summary: "Report", findings: [finding] }],
+      candidates: [{ ...finding, id: "C1", finder: 1, vendor: "fake" }],
+      verdicts: [{ ...verification, id: "C1" }],
+      refuted: [],
+      capped: [],
+      warnings: ["Warning"],
+    },
+  };
+  const history = [{ round: 1, sha, blocking: [finding], followUps: [finding] }];
+  const state = {
+    spec: {
+      summary: "Spec",
+      assumptions: ["Assumption"],
+      requirements: ["Requirement"],
+      acceptance_criteria: [{ id: "AC-1", criterion: "Criterion", how_to_verify: "bun test" }],
+      out_of_scope: ["Excluded"],
+      blocking_questions: ["Question"],
+    },
+    lastReview: review,
+    reviewHistory: history,
+    reviewFollowUps: [finding],
+    lastVerifiedEvidence: { lastReview: review, reviewHistory: history },
+    completedChecks: { round: 2, values: { review } },
+    acceptance: {
+      snapshot: {
+        ticket: { number: 2, body: "Ticket", author: null },
+        parent: { number: 1, body: "Parent", author: null },
+      },
+      outcome: {
+        sha,
+        units: [{ unit: "U1", verdict: "unmet", citations: [], refusals: ["Refusal"] }],
+        summary: "Outcome",
+        passed: false,
+      },
+    },
+    sizeReport: { unavailable: "Unavailable" },
+  };
+  return JSON.parse(JSON.stringify(state)) as typeof state;
+}
+function replacePath(value: object, path: string, text: string) {
+  const keys = path.split(".");
+  const key = keys.pop();
+  let parent: object = value;
+  for (const part of keys) {
+    const child: unknown = Reflect.get(parent, part);
+    if (!child || typeof child !== "object") throw new Error("Missing fixture path");
+    parent = child;
+  }
+  if (!key || !Object.hasOwn(parent, key)) throw new Error("Missing fixture field");
+  Reflect.set(parent, key, text);
+}
+const prosePaths = [
+  "spec.acceptance_criteria.0.criterion",
+  "spec.requirements.0",
+  "spec.assumptions.0",
+  "spec.out_of_scope.0",
+  "spec.blocking_questions.0",
+  "lastReview.findings.0.suggestion",
+  "lastReview.findings.0.failure_scenario",
+  "lastReview.findings.0.verification.trigger",
+  "lastReview.findings.0.verification.attributionEvidence.change",
+  "lastReview.findings.0.verification.attributionEvidence.obligation",
+  "lastReview.findings.0.verification.attributionEvidence.obligationSource",
+  "lastReview.findings.0.verification.attributionEvidence.base.result",
+  "lastReview.findings.0.verification.attributionEvidence.head",
+  "lastReview.checklist.0.item",
+  "lastReview.checklist.0.applies",
+  "lastReview.checklist.0.checked",
+  "lastReview.checklist.0.finding",
+  "lastReview.panel.warnings.0",
+  "lastReview.panel.verdicts.0.trigger",
+  "lastReview.panel.verdicts.0.attributionEvidence.head",
+  "lastReview.panel.reports.0.findings.0.suggestion",
+  "lastReview.panel.candidates.0.failure_scenario",
+  "lastReview.findings.0.duplicates.0.suggestion",
+  "lastReview.findings.0.duplicates.0.failure_scenario",
+  "reviewHistory.0.blocking.0.suggestion",
+  "reviewHistory.0.followUps.0.failure_scenario",
+  "reviewFollowUps.0.suggestion",
+  "lastVerifiedEvidence.lastReview.findings.0.suggestion",
+  "lastVerifiedEvidence.reviewHistory.0.blocking.0.verification.attributionEvidence.head",
+  "completedChecks.values.review.findings.0.suggestion",
+  "acceptance.outcome.units.0.refusals.0",
+  "sizeReport.unavailable",
+];
+test.each(prosePaths)("redacts supported prose at %s without changing source or other values", (path) => {
+  const f = setup();
+  const state = { ...f.state, ...structuredClone(proseState()) };
+  f.store.setRunState(f.runId, state);
+  const expected = f.capture().payload;
+  const secret = ["snapshot", "schema-prose-credential"].join("-");
+  registerCredential("SNAPSHOT_SCHEMA_PROSE", secret);
+  replacePath(state, path, `Recorded ${secret}`);
+  f.store.setRunState(f.runId, state);
+  const before = sourceRows(f.store);
+  replacePath(expected.state, path, "Recorded [redacted]");
+  const { payload } = f.capture();
+  expect(payload).toEqual(expected);
+  expect(new TextDecoder().decode(encodeTransferJson(payload))).not.toContain(secret);
+  expect(sourceRows(f.store)).toEqual(before);
+});
+
+test("distinguishes attribution head prose from immutable commit head identity", () => {
+  const f = setup();
+  const state = { ...f.state, ...structuredClone(proseState()) };
+  const secret = ["12c4", "5d67"].join("");
+  const oid = secret + "e".repeat(32);
+  replacePath(state, "lastReview.findings.0.verification.attributionEvidence.head", `Observed ${oid}`);
+  f.store.setRunState(f.runId, state);
+  expect(f.capture().payload.state.lastReview).toBeDefined();
+  registerCredential("SNAPSHOT_HEAD_SUBSTRING", secret);
+  expect(f.capture().payload.state.lastReview?.findings[0]?.verification?.attributionEvidence?.head).toBe(
+    `Observed [redacted]${"e".repeat(32)}`,
+  );
+  f.store.setRunState(f.runId, {
+    ...state,
+    sizeReport: { base: sha, head: oid, mode: "two-dot", error: "Unavailable" },
+  });
+  rejects(f.capture, "invalid");
+  try {
+    f.capture();
+  } catch (error) {
+    expect(`${String(error)}${JSON.stringify(error, Object.getOwnPropertyNames(error))}`).not.toContain(
+      secret,
+    );
+    expect(error).not.toHaveProperty("cause");
+  }
+});
+
+test("explicit projections never read excluded columns and callback gets only repository kind and slug", () => {
+  const f = setup();
+  f.store.setRepoProfile(f.repo.id, { private: excluded });
+  for (const [table, denied] of [
+    ["repos", ["profile_json", "local_path"]],
+    ["invocations", ["session_id"]],
+    ["agent_jobs", ["request"]],
+  ] as const) {
+    const columns = f.store.db.query<{ name: string }, []>(`PRAGMA main.table_info(${table})`).all();
+    f.store.db.exec(
+      `CREATE TEMP VIEW ${table} AS SELECT ${columns
+        .map(({ name }) =>
+          (denied as readonly string[]).includes(name)
+            ? `json('read-trap:' || COALESCE(${name}, '')) AS ${name}`
+            : name,
+        )
+        .join(",")} FROM main.${table}`,
+    );
+    for (const column of [...denied, "*"]) {
+      expect(() => f.store.db.query(`SELECT ${column} FROM ${table}`).all()).toThrow();
+    }
+  }
+  const context = mock((source: SnapshotSourceContext) => {
+    expect(f.store.db.inTransaction).toBe(true);
+    expect(source.repository).toEqual({ kind: "github", slug: "example/project" });
+    return f.context(source);
+  });
+  expect(captureRunTransferSnapshot(f.store, f.runId, context).payload.invocations).toHaveLength(2);
+  expect(context).toHaveBeenCalledTimes(1);
+});
+
+test.each(["object key", "unclassified prose name", "spec command"])(
+  "refuses credentials in %s without exposing payloads",
+  (which) => {
+    const f = setup();
+    const secret = ["snapshot", "unclassified-credential"].join("-");
+    registerCredential("SNAPSHOT_UNCLASSIFIED", secret);
+    if (which === "spec command") {
+      const state = { ...f.state, ...proseState() };
+      replacePath(state, "spec.acceptance_criteria.0.how_to_verify", `echo ${secret}`);
+      f.store.setRunState(f.runId, state);
+    } else {
+      f.store.db
+        .query("UPDATE runs SET source_ref = ? WHERE id = ?")
+        .run(
+          JSON.stringify(which === "object key" ? { [secret]: "value" } : { description: secret }),
+          f.runId,
+        );
+    }
+    rejects(f.capture, "invalid");
+    try {
+      f.capture();
+    } catch (error) {
+      expect(`${String(error)}${JSON.stringify(error, Object.getOwnPropertyNames(error))}`).not.toContain(
+        secret,
+      );
+      expect(error).not.toHaveProperty("cause");
+    }
+  },
+);
