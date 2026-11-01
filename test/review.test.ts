@@ -803,6 +803,13 @@ describe("runReview panel", () => {
       system: { ...system, finders: [...system.finders] },
     });
     expect(high.out.decision?.blocking).toHaveLength(1);
+    const text = await panel([[candidate("src/a.ts", 1)]], () => ({ ...confirmed, severity: "medium" }), {
+      system: { ...system, finders: [...system.finders], severityRubric: "# Severity variant TEXT" },
+    });
+    const textPrompt = text.verifications[0]?.request.prompt;
+    expect(textPrompt).toContain("# Severity variant TEXT");
+    expect(textPrompt).not.toContain("# Severity by consequence");
+    expect(text.out.decision?.blocking).toEqual([]);
   });
 
   const causalSystem = { mode: "panel", finders: [{ prompt: "standard" }], causalAttribution: true } as const;
