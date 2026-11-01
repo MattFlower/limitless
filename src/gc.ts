@@ -69,14 +69,7 @@ export async function collectGarbage(
   cfg: Config,
   opts: { dryRun?: boolean; now?: number } = {},
 ): Promise<GcResult> {
-  const end = beginActivity("gc.collect");
-  try {
-    return await collect(store, cfg, opts);
-  } finally {
-    end();
-  }
-}
-async function collect(...[store, cfg, opts = {}]: Parameters<typeof collectGarbage>): Promise<GcResult> {
+  using _span = { [Symbol.dispose]: beginActivity("gc.collect") };
   const now = opts.now ?? Date.now();
   const dryRun = opts.dryRun ?? false;
   const result: GcResult = {
@@ -93,6 +86,7 @@ async function collect(...[store, cfg, opts = {}]: Parameters<typeof collectGarb
   const repos = new Map(store.listRepos().map((repo) => [repo.id, repo]));
   const workRoot = resolve(cfg.paths.work);
   const runRoot = resolve(cfg.paths.runs);
+  const scan = <T>(fn: () => T) => activity("gc.worktrees", fn, 50);
 
   const iterationRepos = new Set<string>();
   for (const repo of repos.values()) {
@@ -162,7 +156,7 @@ async function collect(...[store, cfg, opts = {}]: Parameters<typeof collectGarb
       return [];
     }
   }
-  const worktrees = activity("gc.worktrees", () => finished.flatMap(scanWorktree), 50);
+  const worktrees = scan(() => finished.flatMap(scanWorktree));
   for (const { run, repo, path, exists } of worktrees) {
     try {
       const cache = repo.kind === "local" && exists ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
@@ -172,22 +166,24 @@ async function collect(...[store, cfg, opts = {}]: Parameters<typeof collectGarb
         throw new Error(`repository cache outside ${cfg.paths.repos}`);
       }
       await withRepoLock(cache, async () => {
-        if (!existsSync(path)) return;
+        if (!scan(() => existsSync(path))) return;
         if (repo.kind === "local") {
           const owned = cachePath(cfg.paths, repo);
           if (
-            canonical(cache) !== canonical(owned) &&
+            scan(() => canonical(cache) !== canonical(owned)) &&
             (!repo.localPath || cache !== (await worktreeOwner(repo.localPath)))
           )
             throw new Error(`worktree is not registered to ${repo.slug}: ${path}`);
         }
-        if (lstatSync(path).isSymbolicLink() || !lstatSync(path).isDirectory()) {
+        if (scan(() => lstatSync(path).isSymbolicLink() || !lstatSync(path).isDirectory())) {
           throw new Error(`worktree path is not a directory: ${path}`);
         }
-        const listed = worktreePaths(
-          (await git(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout,
-        );
-        if (realpathSync(path).startsWith(realpathSync(workRoot) + sep) && listed.has(canonical(path))) {
+        const listing = await git(["git", "worktree", "list", "--porcelain"], { cwd: cache });
+        const registered = scan(() => {
+          const listed = worktreePaths(listing.stdout);
+          return realpathSync(path).startsWith(realpathSync(workRoot) + sep) && listed.has(canonical(path));
+        });
+        if (registered) {
           if (!dryRun) await git(["git", "worktree", "remove", "--force", path], { cwd: cache });
           result.worktrees.push(path);
         } else {
@@ -233,10 +229,10 @@ async function collect(...[store, cfg, opts = {}]: Parameters<typeof collectGarb
                     : cfg.retention.worktreeDays,
                 ),
             )
-            .map((run) => canonical(child(workRoot, run.id))),
+            .map((run) => scan(() => canonical(child(workRoot, run.id)))),
         );
         const listed = (await git(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout;
-        const prunable = prunablePaths(listed);
+        const prunable = scan(() => prunablePaths(listed));
         // Only prune the source when an eligible legacy worktree left stale metadata there.
         if (cache === repo.localPath && !prunable.some((path) => eligible.has(path))) return;
         const unrelated = prunable.filter((path) => !eligible.has(path));

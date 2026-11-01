@@ -854,6 +854,82 @@ test("GC awaits Git under its span without inflating synchronous scan timing", a
   }
 });
 
+for (const phase of ["validation", "canonical"] as const) {
+  test.each([
+    [49, false],
+    [50, false],
+    [51, false],
+    [102, false],
+    [51, true],
+  ] as const)(
+    `GC times actual worktree ${phase} as a synchronous pass at %sms, failure=%s`,
+    async (duration, fail) => {
+      const f = backgroundFixture();
+      const [run] = gcRuns(f, 1);
+      if (!run) throw new Error("missing run");
+      mkdirSync(run.worktree, { recursive: true });
+      const listing = `worktree ${run.worktree}\n\n`;
+      const gate = Promise.withResolvers<Awaited<ReturnType<typeof gitCommand.cacheGit>>>();
+      const ready = Promise.withResolvers<void>();
+      const originalLstat = fs.lstatSync;
+      const originalRealpath = fs.realpathSync;
+      let calls = 0;
+      const lstat = spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+        if (phase === "validation" && String(args[0]) === run.worktree) {
+          calls++;
+          f.advance(fail ? duration : duration / 2);
+          if (fail) throw new Error(f.marker);
+        }
+        return originalLstat(...args);
+      }) as typeof fs.lstatSync);
+      const realpath = spyOn(fs, "realpathSync").mockImplementation(((
+        ...args: Parameters<typeof fs.realpathSync>
+      ) => {
+        if (phase === "canonical" && [run.worktree, f.cfg.paths.work].includes(String(args[0]))) {
+          calls++;
+          f.advance(fail ? duration : duration / 4);
+          if (fail) throw new Error(f.marker);
+        }
+        return originalRealpath(...args);
+      }) as typeof fs.realpathSync);
+      const git = spyOn(gitCommand, "cacheGit").mockImplementation(() => {
+        ready.resolve();
+        return gate.promise;
+      });
+      let pending: ReturnType<typeof collectGarbage> | undefined;
+      try {
+        pending = collectGarbage(f.store, f.cfg, { dryRun: true });
+        if (!(fail && phase === "validation")) {
+          await ready.promise;
+          // This wait must never contribute to either synchronous filesystem pass.
+          f.advance(3000);
+        }
+        gate.resolve({ stdout: listing, stderr: "", exitCode: 0 });
+        const result = await pending;
+        if (fail) expect(result.errors).toEqual([expect.stringContaining(f.marker)]);
+        else expect(result.errors).toEqual([]);
+        expect(result.worktrees).toEqual(fail ? [] : [run.worktree]);
+        expect(calls).toBe(fail ? 1 : phase === "validation" ? 2 : 4);
+        stallReporter.sample(3000);
+        if (duration > 50) {
+          expect(f.lines.at(-1)).toContain(`gc.worktrees: count=1 total=${duration}ms max=${duration}ms`);
+        } else expect(f.lines.at(-1)).not.toContain("gc.worktrees");
+        expect(f.lines.at(-1)).not.toContain("active=");
+        for (const marker of [f.marker, f.root, run.run.id]) expect(f.lines.at(-1)).not.toContain(marker);
+        stallReporter.sample(3000);
+        expect(f.lines.at(-1)).not.toContain("gc.");
+      } finally {
+        gate.resolve({ stdout: listing, stderr: "", exitCode: 0 });
+        await pending?.catch(() => {});
+        git.mockRestore();
+        realpath.mockRestore();
+        lstat.mockRestore();
+        f.close();
+      }
+    },
+  );
+}
+
 test.each([50, 51])("thresholded synchronous activity retains exceptional completion at %sms", (duration) => {
   const f = timedStore();
   const error = new Error(crypto.randomUUID());

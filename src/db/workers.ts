@@ -564,14 +564,7 @@ export class WorkerStore {
       .immediate();
   }
   sweepAgentJobs() {
-    const end = beginActivity("workers.sweep-agent-jobs");
-    try {
-      return this.sweepAgentJobsWork();
-    } finally {
-      end();
-    }
-  }
-  private sweepAgentJobsWork() {
+    using _span = { [Symbol.dispose]: beginActivity("workers.sweep-agent-jobs") };
     this.store.db
       .transaction(() => {
         const now = this.now();
@@ -707,14 +700,7 @@ export class WorkerStore {
       );
   }
   sweep() {
-    const end = beginActivity("workers.sweep");
-    try {
-      return this.sweepWork();
-    } finally {
-      end();
-    }
-  }
-  private sweepWork() {
+    using _span = { [Symbol.dispose]: beginActivity("workers.sweep") };
     const now = this.now();
     const resumedAt = this.resumedAt ?? Number.NEGATIVE_INFINITY;
     for (const j of this.jobs("state IN ('queued','leased')")) {
