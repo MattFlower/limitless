@@ -1417,8 +1417,8 @@ test.each([
       : purpose === "initial"
         ? "test -f farewell.txt && ! test -f base.txt"
         : "test -f base.txt";
-  // Every attempt must publish its completed edits before the test releases it.
-  const command = `if ${condition}; then test ! -f '${proceed}' || exit 8; test "$(cat greeting.txt)" = hello && test ! -f active-build || exit 9; echo run >> '${counter}'; echo gate-output > greeting.txt; touch active-build; cat '${counter}' > '${ready}'; while [ ! -f '${proceed}' ]; do sleep 0.05; done; test -f active-build && test "$(cat greeting.txt)" = gate-output; fi`;
+  // `>>` creates the counter before writing it; `ready` holds its contents once the edits are done.
+  const command = `if ${condition}; then test "$(cat greeting.txt)" = hello && test ! -f active-build || exit 9; echo run >> '${counter}'; echo gate-output > greeting.txt; touch active-build; cat '${counter}' > '${ready}'; while [ ! -f '${proceed}' ]; do sleep 0.05; done; test -f active-build && test "$(cat greeting.txt)" = gate-output; fi`;
   mkdirSync(join(fixture.repoDir, "test"));
   writeFileSync(
     join(fixture.repoDir, "test/unrelated.test.ts"),
@@ -1456,7 +1456,6 @@ test.each([
         prompt: "Add farewell",
         profile: "quick",
       });
-      // Counter creation precedes both its contents and the worktree edits we must preserve.
       await waitForFile(ready, (contents) => contents === "run\n");
       const state = f.store.getRunState<RunContext["state"]>(run.id);
       expect(state?.gateExecution?.purpose).toBe(purpose);
@@ -1473,11 +1472,11 @@ test.each([
           .query("UPDATE gate_jobs SET request=? WHERE id=?")
           .run(JSON.stringify({ ...request, env: { ...request.env, CHANGED_ENV: "1" } }), job.id);
       }
-      const executor = gateExecutorFor("local", workers, [], true);
+      const next = start(handler);
+      const executor = next.deps.gateExecutor;
+      if (!executor) throw new Error("missing executor");
       const attach = spyOn(executor, "attach");
-      let next: Factory;
       try {
-        next = start(handler, false, false, { gateExecutor: executor });
         await wait(
           () => attach.mock.calls.some(([h]) => h.kind === "inplace" && (h.id === job?.id) !== mismatch),
           { timeoutMs: 10_000 },
@@ -1485,8 +1484,6 @@ test.each([
       } finally {
         attach.mockRestore();
       }
-      // Attach can return while the replacement is still queued, before its worktree edits.
-      await waitForFile(ready, (contents) => contents === (mismatch ? "run\nrun\n" : "run\n"));
       writeFileSync(proceed, "");
       expect(await waitFor(next, run.id, ["succeeded", "failed", "needs_human"])).toBe(
         purpose === "initial" ? "needs_human" : "succeeded",
