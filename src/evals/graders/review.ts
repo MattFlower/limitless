@@ -1,4 +1,4 @@
-import type { EvalGrade } from "../../core/types.ts";
+import type { EvalGrade, PanelRules } from "../../core/types.ts";
 import { blockingReviewFindings, reviewVerdict } from "../../pipeline/review.ts";
 import type { Review, StoredReview } from "../../pipeline/schemas.ts";
 import type { ReviewCase } from "../cases.ts";
@@ -65,8 +65,8 @@ export function matchedReviewDefects(item: ReviewCase, findings: Finding[], requ
  * finding, and the case verdict is derived from findings exactly as the engine does. The model's
  * verdict is never graded, so stored output without one is still evidence.
  */
-export function gradeReview(item: ReviewCase, output: StoredReview, causalAttribution = false): EvalGrade {
-  const blocking = blockingReviewFindings(output, undefined, undefined, causalAttribution);
+export function gradeReview(item: ReviewCase, output: StoredReview, rules: PanelRules = {}): EvalGrade {
+  const blocking = blockingReviewFindings(output, undefined, undefined, rules);
   const { required, caught } = matchedReviewDefects(item, blocking);
   const missed = required.filter((_, index) => !caught.has(index));
   const underRated = matchedReviewDefects(
@@ -83,7 +83,7 @@ export function gradeReview(item: ReviewCase, output: StoredReview, causalAttrib
     group.total++;
     if (caught.has(index)) group.caught++;
   }
-  const requestChanges = reviewVerdict(output, undefined, undefined, causalAttribution) === "request_changes";
+  const requestChanges = reviewVerdict(output, undefined, undefined, rules) === "request_changes";
   const falseBlock = item.kind === "clean" ? requestChanges : null;
   const pass = item.kind === "clean" ? !falseBlock : caught.size === required.length && requestChanges;
   return {

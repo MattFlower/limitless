@@ -803,7 +803,7 @@ test("strict judgment validation rejects duplicate, unknown and missing golds", 
   expect(normalizeJudgment({ matches: [match(null)] }, reviewCase, output)[0]?.finding).toBeNull();
 });
 
-test("system causal attribution controls blocking for judged panel findings", async () => {
+test("system panel rules control blocking for judged panel findings", async () => {
   const f = fixture();
   try {
     const output = reviewOutput();
@@ -818,7 +818,12 @@ test("system causal attribution controls blocking for judged panel findings", as
       trigger: "input",
       attribution: "preexisting_unchanged",
     };
-    for (const causalAttribution of [false, true]) {
+    for (const [rules, severity, caught] of [
+      [{}, "high", 1],
+      [{ causalAttribution: true }, "high", 0],
+      [{ severityRubric: true }, "medium", 0],
+    ] as const) {
+      first.verification.severity = severity;
       const run = f.factory.store.createEvalRun(
         {
           role: "review",
@@ -831,7 +836,7 @@ test("system causal attribution controls blocking for judged panel findings", as
               mode: "panel",
               finders: [{ target: "judge-a", prompt: "standard" }],
               implementerReport: "include",
-              ...(causalAttribution ? { causalAttribution: true } : {}),
+              ...rules,
             },
           ],
         },
@@ -844,8 +849,8 @@ test("system causal attribution controls blocking for judged panel findings", as
       f.factory.evals.judge(run.id, { judges: pair });
       await f.factory.evals.wait(run.id);
       expect(f.factory.evals.report(run.id)?.summaries[0]?.review?.judged).toMatchObject({
-        recall: { numerator: Number(!causalAttribution), denominator: 1 },
-        underRated: Number(causalAttribution),
+        recall: { numerator: caught, denominator: 1 },
+        underRated: 1 - caught,
       });
     }
     expect(f.calls).toHaveLength(2);

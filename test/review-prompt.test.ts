@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { CHECKLIST_CAP, checklistPrompt } from "../src/evals/checklist.ts";
-import { reviewPrompt } from "../src/pipeline/prompts.ts";
+import { reviewPrompt, verifierPrompt } from "../src/pipeline/prompts.ts";
+import { panelIdentity } from "../src/pipeline/review.ts";
 import { registerCredential } from "../src/util/proc.ts";
 
 test("probe finder requires reproduction and distinguishes negative results from environment errors", () => {
@@ -221,4 +222,22 @@ test("production and adversarial openings are unchanged and the eval additions a
   expect(blocks.get("adversarial-thorough-calibrated")).toBe(
     `${blocks.get("adversarial-thorough")}\n\n${blocks.get("adversarial-calibrated")}`,
   );
+});
+
+test("severityRubric replaces the verifier's consequence scale with the labelling rubric", () => {
+  const input = { prompt: "Fix the bug", spec: null, baseSha: "base", stat: "", candidates: [] };
+  const plain = verifierPrompt(input);
+  const rubric = verifierPrompt({ ...input, severityRubric: true });
+  expect(plain).toContain("- medium: wrong result on an edge path");
+  expect(rubric).not.toContain("- medium: wrong result on an edge path");
+  for (const instruction of [
+    "would this plausibly happen in the next month of normal factory operation?",
+    "- medium: a real defect with a contrived trigger",
+    "a secret or credential stored or shown unredacted",
+    "Edits outside the request's scope are not an undelivered requirement.",
+    "A new test that fails in normal runs stops deploys, so it is at least high.",
+    "behaviour the repository's own rules adopt",
+  ])
+    expect(rubric).toContain(instruction);
+  expect(panelIdentity({ severityRubric: true })).not.toBe(panelIdentity());
 });

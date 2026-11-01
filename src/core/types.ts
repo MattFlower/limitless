@@ -710,7 +710,11 @@ export interface ReviewSystem {
   implementerReport: "include" | "omit";
   /** Opt-in panel eval experiment: attribute verifier claims to the change. */
   causalAttribution?: true;
+  /** Eval only: the verifier rates by the labelling rubric and round 1 blocks only high or critical. */
+  severityRubric?: true;
 }
+/** The system options that change a panel's verifier prompt and what blocks. */
+export type PanelRules = Pick<ReviewSystem, "causalAttribution" | "severityRubric">;
 /** Trials an eval runs at once per provider, capped at the provider's `maxConcurrent` − 1 (at least 1). */
 export const DEFAULT_EVAL_CONCURRENCY = 2;
 export interface EvalRun {

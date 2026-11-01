@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "no
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { DEFAULT_DECISION_CONFIDENCE } from "../config.ts";
 import { parseAllow } from "../core/allow.ts";
+import type { PanelRules } from "../core/types.ts";
 import { auditDiff } from "../gates/audit.ts";
 import { detectGates, type GateConfig, gateScriptNames, pickScripts } from "../gates/detect.ts";
 import { runGates } from "../gates/run.ts";
@@ -204,12 +205,8 @@ export function schemaFor(item: Exclude<EvalCase, ImplementCase>) {
 export function storedSchemaFor(item: Exclude<EvalCase, ImplementCase>) {
   return "defects" in item ? StoredReviewSchema : schemaFor(item);
 }
-export function gradeCase(
-  item: Exclude<EvalCase, ImplementCase>,
-  output: unknown,
-  causalAttribution = false,
-) {
+export function gradeCase(item: Exclude<EvalCase, ImplementCase>, output: unknown, rules: PanelRules = {}) {
   if ("prompt" in item) return gradeTriage(item, TriageSchema.parse(output));
-  if ("defects" in item) return gradeReview(item, StoredReviewSchema.parse(output), causalAttribution);
+  if ("defects" in item) return gradeReview(item, StoredReviewSchema.parse(output), rules);
   return gradeVerify(item, VerifySchema.parse(output));
 }
