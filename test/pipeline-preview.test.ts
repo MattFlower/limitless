@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test";
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { type GateExecutor, gateProvenance, localExecutor } from "../src/gates/executor.ts";
 import type { GateRun } from "../src/gates/run.ts";
@@ -77,6 +77,102 @@ function successfulBrowser(agent: AgentSpec) {
 }
 
 describe("pipeline (fake agents, real git + gates)", () => {
+  test.each(["available", "unavailable"] as const)(
+    "catches browser exclusion or browser context undoing test-outcome reconciliation: %s",
+    async (context) => {
+      process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
+      await previewFixture();
+      writeFileSync(
+        join(repoDir, ".limitless.toml"),
+        readFileSync(join(repoDir, ".limitless.toml"), "utf8").replace(
+          'checks = [{ name = "no-bad", run = "! grep -rq BAD --include=*.txt ." }]',
+          'retry_files = "bun test {files}"\nchecks = [{ name = "test", run = "bun test" }]',
+        ),
+      );
+      writeFileSync(
+        join(repoDir, "ui.test.ts"),
+        'import { test, expect } from "bun:test"; test("UI interaction", () => expect(true).toBe(true));',
+      );
+      await sh(["git", "add", "."], { cwd: repoDir });
+      await sh(["git", "commit", "-qm", "browser covering fixture"], { cwd: repoDir });
+      let implementsCount = 0;
+      let verifies = 0;
+      let targeted = 0;
+      const executor = localExecutor();
+      const startGate = executor.start.bind(executor);
+      executor.start = (request, signal) => {
+        if (request.gates.checks.some((c) => c.run.includes(" -t "))) targeted++;
+        return startGate(request, signal);
+      };
+      const f = start(
+        (agent) => {
+          const role = roleOf(agent);
+          if (role === "triage") return { structured: triage() };
+          if (role === "spec") return { structured: browserSpec };
+          if (role === "holdout")
+            return { structured: { scenarios: holdout.scenarios.map((c) => ({ ...c, browser: true })) } };
+          if (role === "review") return { structured: approve };
+          if (role === "verify") {
+            verifies++;
+            expect(agent.browser).toBeDefined();
+            if (context === "available") successfulBrowser(agent);
+            else
+              agent.onEvent({
+                type: "warning",
+                id: "browser-unavailable",
+                code: "browser_unavailable",
+                text: "Browser unavailable",
+              });
+            f.tracker.blockModel("alpha/m", "unavailable alternative");
+            return {
+              structured: {
+                ...pass,
+                overall: "fail",
+                criteria: pass.criteria.map((c) => ({
+                  ...c,
+                  status: c.id === "AC-1" ? "unmet" : "blocked",
+                  blockedReason: c.id === "AC-1" ? null : "sandbox",
+                  test_outcome_only: true,
+                  evidence: "verifier UI test timed out",
+                  covering_tests: [{ file: "ui.test.ts", name: "UI interaction" }],
+                })),
+              },
+            };
+          }
+          implementsCount++;
+          return { files: { "ui/change.txt": "visible\n" } };
+        },
+        false,
+        false,
+        { gateExecutor: executor },
+      );
+      await fakeBrowserCache(browserCache(f.deps.cfg.paths.home));
+      const run = await f.createRun({ repo: repoDir, prompt: "Change the UI", profile: "standard" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("needs_human");
+      const state = f.store.getRunState<RunState>(run.id);
+      expect(targeted).toBe(1);
+      expect(implementsCount).toBe(1);
+      expect(verifies).toBe(1);
+      expect(state?.round).toBe(0);
+      expect(state?.feedback ?? "").toBe("");
+      expect(state?.verifyResults).toHaveLength(1);
+      expect(state?.verifyResults?.[0]?.browserContext).toBe(context);
+      expect(state?.verifyResults?.[0]?.modelOutput?.criteria[0]?.status).toBe("unmet");
+      expect(state?.verifyResults?.[0]?.modelOutput?.criteria[1]?.status).toBe("blocked");
+      for (const row of state?.verifyResults?.[0]?.criteria ?? []) {
+        expect(row.status).toBe("blocked");
+        expect(row.gateEvidence).toBeUndefined();
+        expect(row.evidence).toContain("acceptance remains unconfirmed");
+        expect(row.evidence).toContain("verifier UI test timed out");
+        expect(row.evidence).toContain("Factory covering test ui.test.ts › UI interaction");
+      }
+      const artifact = f.store.getArtifact(run.id, "verify-0.json");
+      expect(artifact).not.toContain("modelOutput");
+      expect(artifact).toContain("verifier UI test timed out");
+      expect(artifact).toContain("Factory covering test ui.test.ts › UI interaction");
+    },
+  );
+
   test.each([
     "available",
     "unavailable",

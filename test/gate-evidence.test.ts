@@ -29,7 +29,12 @@ import {
 import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
 import { formatVerifyFeedback } from "../src/pipeline/prompts.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
-import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
+import {
+  applyBrowserContext,
+  blockedOnly,
+  normalizeVerify,
+  preDeliveryVerifyArtifact,
+} from "../src/pipeline/verification.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -1427,24 +1432,60 @@ test("catches suppressing mixed evidence with an independent behavioral objectio
   );
 });
 
-test.each(["unmet", "blocked"] as const)(
-  "catches selecting or reconciling %s browser criteria through test-outcome evidence",
+test.each(["unmet", "unclear", "blocked"] as const)(
+  "catches excluding marked %s browser public/holdout rows or accepting incomplete factory evidence",
   (status) => {
     const input: Verify = {
       ...outcomeOnly,
-      criteria: outcomeOnly.criteria.map((c) => ({ ...c, status, blockedReason: "sandbox" })),
+      criteria: ["AC-1", "H-1"].map((id) => ({
+        ...outcomeOnly.criteria[0],
+        id,
+        status,
+        blockedReason: "sandbox",
+      })) as Verify["criteria"],
     };
     const browserSpec = {
       ...behaviouralSpec,
       acceptance_criteria: behaviouralSpec.acceptance_criteria.map((c) => ({ ...c, browser: true })),
     };
-    expect(selectCoveringTests(input, browserSpec)[0]?.tests).toEqual([]);
-    expect(
-      applyGateEvidence(input, browserSpec, holdout, sha, gates(), undefined, {
-        runs: [coveringRun()],
-        succeededStageIds: [13],
-      }),
-    ).toEqual(input);
+    const browserHoldout = {
+      scenarios: [
+        {
+          id: "H-1",
+          description: "UI",
+          steps: "click",
+          expected: "visible",
+          edge_case: false,
+          browser: true,
+        },
+      ],
+    };
+    for (const context of ["available", "unavailable"] as const) {
+      const prepared = applyBrowserContext(input, browserSpec, browserHoldout, context);
+      expect(selectCoveringTests(prepared).map((s) => s.tests)).toEqual(
+        input.criteria.map((c) => c.covering_tests ?? []),
+      );
+      for (const evidence of ["pass", "fail", "missing-report"] as const) {
+        const run = coveringRun();
+        if (!run.result) throw new Error("missing fixture result");
+        if (evidence === "fail") Object.assign(run.result, { ok: false, exitCode: 1 });
+        if (evidence === "missing-report") run.result.coveringTest = undefined;
+        const reconciled = applyGateEvidence(prepared, browserSpec, browserHoldout, sha, gates(), undefined, {
+          runs: [run],
+          succeededStageIds: [13],
+        });
+        if (evidence !== "pass") expect(reconciled).toEqual(prepared);
+        else {
+          for (const row of reconciled.criteria) {
+            expect(row.status).toBe("blocked");
+            expect(row.evidence).toContain("acceptance remains unconfirmed");
+            expect(row.evidence).toContain("Verifier ran");
+            expect(row.evidence).toContain("Factory covering test x.test.ts › passes");
+          }
+          expect(formatVerifyFeedback(reconciled, browserSpec, browserHoldout)).toBe("");
+        }
+      }
+    }
   },
 );
 

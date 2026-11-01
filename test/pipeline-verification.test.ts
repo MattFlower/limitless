@@ -1268,6 +1268,7 @@ test.each([
   "outcome-fail",
   "outcome-request",
   "outcome-recorded",
+  "outcome-verify-result",
   "outcome-private",
   "outcome-moved",
 ] as const)("factory covering tests bind behavioural criteria: %s", async (mode) => {
@@ -1278,7 +1279,9 @@ test.each([
     ...holdout,
     scenarios: holdout.scenarios.map((c) => ({ ...c, expected: "private covering expected response" })),
   };
-  const restartOutcome = mode === "outcome-request" || mode === "outcome-recorded";
+  const recordedResult = mode === "outcome-verify-result";
+  const requestCheckpoint = mode === "outcome-request" || recordedResult;
+  const restartOutcome = requestCheckpoint || mode === "outcome-recorded";
   process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
   writeFileSync(
     join(repoDir, "x.test.ts"),
@@ -1415,9 +1418,9 @@ test.each([
         action: "kill",
         when: (c) =>
           c.stage === "verify" &&
-          (mode === "outcome-request" || targeted > 0) &&
+          (requestCheckpoint || targeted > 0) &&
           c.checkpoint ===
-            (mode === "outcome-request"
+            (requestCheckpoint
               ? "covering-test-request"
               : mode === "outcome-recorded"
                 ? "covering-test-recorded"
@@ -1447,7 +1450,7 @@ test.each([
       await interrupted.promise;
       await f.stop();
       saved = f.store.getRunState<RunState>(run.id)?.coveringTestRuns;
-      if (mode === "outcome-request") expect(saved).toBeUndefined();
+      if (requestCheckpoint) expect(saved).toBeUndefined();
       else expect(saved).toHaveLength(1);
       if (restartOutcome)
         expect(
@@ -1467,6 +1470,54 @@ test.each([
       if (mode === "resume-retry")
         expect(f.store.getRunState<RunState>(run.id)?.verifyResults).toHaveLength(1);
       else expect(f.store.getRunState<RunState>(run.id)?.verifyResults).toBeUndefined();
+      if (recordedResult) {
+        // Catch removing the recorded-path executeCovering call: resume a conflict-resolution
+        // result recorded before reconciliation, with no pending observation or reusable execution.
+        const checkpoint = f.store.getRunState<RunState>(run.id);
+        const pending = checkpoint?.pendingVerify;
+        const base = f.store.getRun(run.id)?.baseSha;
+        if (!checkpoint || !pending || !base || !checkpoint.worktreePath)
+          throw new Error("missing verifier checkpoint");
+        const cwd = checkpoint.worktreePath;
+        const tree = (await sh(["git", "rev-parse", "HEAD^{tree}"], { cwd })).stdout.trim();
+        const sha = (
+          await sh(["git", "commit-tree", tree, "-p", pending.sha, "-p", base, "-m", "resolution fixture"], {
+            cwd,
+          })
+        ).stdout.trim();
+        await sh(["git", "reset", "--hard", sha], { cwd });
+        checkpoint.conflictRound = checkpoint.round;
+        checkpoint.preRebaseHead = pending.sha;
+        checkpoint.pendingRebaseSha = base;
+        checkpoint.verifyResults = [{ ...pending.modelOutput, ...pending, sha }];
+        checkpoint.lastVerify = { ...pending.modelOutput, modelId: pending.modelId };
+        delete checkpoint.pendingVerify;
+        f.store.setRunState(run.id, checkpoint);
+        const stored = f.store.getRunState<RunState>(run.id);
+        expect(stored?.pendingVerify).toBeUndefined();
+        expect(stored?.coveringTestRuns).toBeUndefined();
+        expect(stored?.verifyResults).toHaveLength(1);
+        expect(stored?.verifyResults?.[0]).toMatchObject({
+          sha,
+          round: checkpoint.round,
+          criteria: [
+            expect.objectContaining({ status: "unmet", test_outcome_only: true }),
+            ...pending.modelOutput.criteria.slice(1),
+          ],
+          modelOutput: pending.modelOutput,
+        });
+        expect(targeted).toBe(0);
+        const savedFeedback = checkpoint.feedback;
+        const countGate = executor.start.bind(executor);
+        executor.start = (request, signal) => {
+          if (request.gates.checks.some((c) => c.run.includes(" -t "))) {
+            expect(f.store.getRunState<RunState>(run.id)?.feedback).toBe(savedFeedback);
+            expect(implementationPrompts).toHaveLength(1);
+            expect(request.headSha).toBe(sha);
+          }
+          return countGate(request, signal);
+        };
+      }
       f.deps.faults = undefined;
       terminal = await executeRun(f.deps, run.id, new AbortController().signal);
     } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);

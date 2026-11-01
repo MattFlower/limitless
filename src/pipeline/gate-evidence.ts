@@ -260,18 +260,14 @@ export function applyGateEvidence(
   coveringTests?: { runs: CoveringTestRun[]; succeededStageIds: number[] },
 ): Verify {
   // A claimed met row with test requests still needs every requested factory execution.
-  const selected = selectCoveringTests(
-    {
-      ...verify,
-      criteria: verify.criteria.map((row) =>
-        row.status === "met" && row.covering_tests?.length
-          ? { ...row, status: "blocked", blockedReason: "sandbox" }
-          : row,
-      ),
-    },
-    spec,
-    holdout,
-  );
+  const selected = selectCoveringTests({
+    ...verify,
+    criteria: verify.criteria.map((row) =>
+      row.status === "met" && row.covering_tests?.length
+        ? { ...row, status: "blocked", blockedReason: "sandbox" }
+        : row,
+    ),
+  });
   return {
     ...verify,
     criteria: verify.criteria.map((row, index) => {
@@ -296,12 +292,7 @@ export function applyGateEvidence(
         failures.find(Boolean) ??
         (requested && !runs.length ? "no factory record" : undefined);
       if (outcome) {
-        if (
-          !testOutcomeOnly(row, spec, holdout) ||
-          !requested ||
-          coveringFailure ||
-          runs.some((run) => run?.unavailable)
-        )
+        if (!testOutcomeOnly(row) || !requested || coveringFailure || runs.some((run) => run?.unavailable))
           return row;
         const { gateEvidence: _gate, ...original } = row;
         return {
