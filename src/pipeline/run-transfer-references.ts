@@ -1,4 +1,3 @@
-import type { Repo } from "../core/types.ts";
 import type { PortableManifest } from "./portable.ts";
 import * as a from "./run-transfer-acceptance.ts";
 import { controlCommitMembers } from "./run-transfer-control.ts";
@@ -8,6 +7,7 @@ import { executionCommitDependencies } from "./run-transfer-execution.ts";
 import { agentJobCommitDependencies } from "./run-transfer-jobs.ts";
 import { outcomesCommitDependencies, type TransferOutcomes } from "./run-transfer-outcomes.ts";
 import { policyCanonical, policyCommitDependencies } from "./run-transfer-policy-schema.ts";
+import type { TransferRepository as Repo } from "./run-transfer-rows.ts";
 import type { RunPayloadV1 } from "./run-transfer-schema.ts";
 import { sizeCommitDependencies } from "./run-transfer-size.ts";
 

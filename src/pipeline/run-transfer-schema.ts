@@ -1,5 +1,4 @@
 import { z } from "zod";
-import type { Repo } from "../core/types.ts";
 import type { RunState } from "./context.ts";
 import type { PortableManifest } from "./portable.ts";
 import * as a from "./run-transfer-acceptance.ts";
@@ -13,6 +12,7 @@ import * as o from "./run-transfer-outcomes.ts";
 import { parseTransferPolicy } from "./run-transfer-policy-equality.ts";
 import * as p from "./run-transfer-policy-schema.ts";
 import { payloadCommitDependencies, validatePayloadReferences } from "./run-transfer-references.ts";
+import type { TransferRepository as Repo } from "./run-transfer-rows.ts";
 import * as r from "./run-transfer-rows.ts";
 import * as s from "./run-transfer-size.ts";
 
