@@ -41,7 +41,24 @@ export function verifyReceiptPayload(m: PortableManifest, blobs: ReadonlyMap<str
 }
 export function verifyProjectionIntegrity(db: Database, p: RunPayloadV1): void {
   const id = p.run.id;
-  if (policyCanonical(readOfflineProjection(db, id)) !== policyCanonical(p)) transferConflict();
+  // The private reader drops absent optional fields; check their stored defaults first.
+  const stored = db
+    .query<Record<string, unknown>, [string]>(
+      "SELECT no_baseline_cache AS noBaselineCache, models_json AS models, audit_allow AS allow, title_provenance AS titleProvenance FROM runs WHERE id = ?",
+    )
+    .get(id);
+  const defaults = { noBaselineCache: 0, models: "{}", allow: "[]", titleProvenance: null };
+  for (const [key, value] of Object.entries(defaults))
+    if (!Object.hasOwn(p.run, key) && stored?.[key] !== value) transferConflict();
+  const byOrdinal = <T extends { ordinal: number }>(rows: T[]) =>
+    rows.toSorted((a, b) => a.ordinal - b.ordinal);
+  const ordered = {
+    ...p,
+    stages: byOrdinal(p.stages),
+    invocations: byOrdinal(p.invocations),
+    questions: byOrdinal(p.questions),
+  };
+  if (policyCanonical(readOfflineProjection(db, id)) !== policyCanonical(ordered)) transferConflict();
   const semantic = readProjectionSemantics(db, id);
   const fields = ["header", "state", "jobs", "commits", "policyIdentity", "runExtras", "runFields"];
   if (p.followUp) fields.push("followUp");
@@ -61,22 +78,12 @@ export function verifyProjectionIntegrity(db: Database, p: RunPayloadV1): void {
     if (
       mapped.length !== p[kind].length ||
       rows.length !== mapped.length ||
-      mapped.some((r, i) => r.ordinal !== p[kind][i]?.ordinal || !rows.some((v) => v.id === r.local_id))
+      mapped.some((r, i) => r.ordinal !== ordered[kind][i]?.ordinal || !rows.some((v) => v.id === r.local_id))
     )
       transferConflict();
   }
   const versions = db
-    .query<
-      {
-        policy_id: string;
-        version: number;
-        kind: string;
-        digest: string;
-        record_json: string;
-        created_at: number;
-      },
-      [string]
-    >(
+    .query(
       "SELECT policy_id, version, kind, digest, record_json, created_at FROM run_policy_versions WHERE run_id = ? ORDER BY version",
     )
     .all(id);

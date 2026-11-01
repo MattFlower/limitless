@@ -111,6 +111,49 @@ test.each([1, 2] as const)("schema %i retains original JSON bytes and repeated b
   expect(() => commitOfflineTransfer(store.db, input)).not.toThrow();
 });
 
+test("unordered ordinal collections commit and repeat while retaining original bytes", () => {
+  const payload = portableProjectionFixture();
+  for (const kind of ["stages", "invocations", "questions"] as const) payload[kind].reverse();
+  const input = receiptFixture(payload);
+  expect(() => decodeRunPayload(payload, repo, JSON.parse(input.manifest))).not.toThrow();
+  const ids = commitOfflineTransfer(store.db, input),
+    before = snapshot();
+  reopen();
+  verifyOfflineReceipt(store.db, "child01");
+  expect(commitOfflineTransfer(store.db, input)).toEqual(ids);
+  expect(snapshot()).toEqual(before);
+  const exported = retainedOfflineExport(store.db, "child01");
+  expect(exported.manifest).toBe(input.manifest);
+  expect([...exported.blobs]).toEqual([...input.blobs]);
+  expect(exported.payload).toEqual(payload);
+});
+
+test.each([
+  ["noBaselineCache", "no_baseline_cache = 1"],
+  ["models", `models_json = '{"review":["fake/other"]}'`],
+  ["allow", `audit_allow = '["binary"]'`],
+  ["titleProvenance", "title_provenance = 'explicit'"],
+] as const)("omitted %s storage damage conflicts through every receipt entry point", (field, update) => {
+  const payload = portableProjectionFixture();
+  delete payload.run[field];
+  const input = receiptFixture(payload);
+  expect(decodeRunPayload(payload, repo, JSON.parse(input.manifest))).toEqual(payload);
+  commitOfflineTransfer(store.db, input);
+  reopen();
+  verifyOfflineReceipt(store.db, "child01");
+  store.db.exec(`UPDATE runs SET ${update} WHERE id = 'child01'`);
+  reopen();
+  const damaged = snapshot();
+  for (const operation of [
+    () => commitOfflineTransfer(store.db, input),
+    () => verifyOfflineReceipt(store.db, "child01"),
+    () => retainedOfflineExport(store.db, "child01"),
+  ]) {
+    rejects(operation, "conflict");
+    expect(snapshot()).toEqual(damaged);
+  }
+});
+
 const corruptions = [
   ["accounting", "UPDATE runs SET cost_usd = 99 WHERE id = 'child01'"],
   ["question", "UPDATE questions SET answer = 'changed' WHERE run_id = 'child01'"],
