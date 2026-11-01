@@ -120,11 +120,12 @@ test.skipIf(seatbeltSkip !== null)(
       const cache = process.env.LIMITLESS_BROWSER_MCP_CACHE ?? browserCache(join(homedir(), ".limitless"));
       const spec = browserSpec(cwd, scratch, cache);
       spec.browser = { cacheDir: cache, previewUrl: `http://127.0.0.1:${preview.port}` };
-      // Exactly the production launch configuration; the gaps are cleared because this probe is
-      // the evidence that decides whether CONFINEMENT_GAPS may drop them.
+      // Production launch configuration except for the longer action timeout below, for loaded hosts;
+      // the gaps are cleared because this probe decides whether CONFINEMENT_GAPS may drop them.
       const server = browserMcp(spec, "codex", []);
       if (!server)
         throw new Error("Pinned browser unavailable; provision it with scripts/provision-browser-mcp.ts");
+      server.args.push("--timeout-action", "15000");
       const directory = server.env.HOME;
       if (!directory) throw new Error("missing browser directory");
       // Exercise the production profile with its validated Node runtime, including APFS aliases.
