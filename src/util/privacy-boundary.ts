@@ -229,6 +229,10 @@ export type BoundaryCut = {
 };
 type Reason =
   | Refusal["refused"]
+  | "checker-busy"
+  | "checker-timeout"
+  | "checker-cancelled"
+  | "checker-failed"
   | "private-match"
   | "unchecked-provenance"
   | "stale-generation"
@@ -321,6 +325,25 @@ function read(value: unknown): Evidence {
 export function consumeBoundaryText(value: unknown): Projection {
   const { text, truncated, checkedComplete, withheld, policyDigest, reason } = read(value);
   return { text, truncated, checkedComplete, withheld, policyDigest, ...(reason ? { reason } : {}) };
+}
+/** Internal worker bridge: callers must validate the complete protocol before issuing. */
+export function issuePrivacyWorkerResult(
+  result: Projection,
+  generation: ReturnType<typeof currentPrivacyGeneration> | undefined,
+  registry = privacyRegistry,
+  limits: Partial<typeof privacyLimits> = {},
+): BoundaryText {
+  const { text, truncated, checkedComplete, withheld, policyDigest, reason } = result;
+  return issue({
+    ...context({ refused: "nonconvergent" }, { registry, limits }),
+    text,
+    truncated,
+    checkedComplete,
+    withheld,
+    policyDigest,
+    reason,
+    generation,
+  });
 }
 function admit(state: Evidence, text: string, output = false): Reason | undefined {
   if (!text.isWellFormed()) return "ill-formed";
