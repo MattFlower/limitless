@@ -68,6 +68,7 @@ import { activity } from "../util/stall.ts";
 import { FailureObservations, type ObservationFilter } from "./failure-observations.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
+import { timeStatements } from "./timing.ts";
 
 type RoundObservation = {
   state: string;
@@ -554,6 +555,7 @@ export class Store {
 
   constructor(path: string, migrationDir = MIGRATION_DIR) {
     this.db = new Database(path, { create: true, strict: true });
+    timeStatements(this.db);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA foreign_keys = ON");

@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, type Statement } from "bun:sqlite";
 import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { FailureObservation } from "../src/db/failure-observations.ts";
 import { Store } from "../src/db/store.ts";
 import { sh } from "../src/util/proc.ts";
+import { stallReporter } from "../src/util/stall.ts";
 
 const day = 86400000;
 function row(
@@ -108,6 +109,57 @@ test.each([
     if (b !== a) b.close();
     a.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("slow promotion UPDATE is attributed when observation insertion and finalization promote rows", () => {
+  const store = new Store(":memory:");
+  const lines: string[] = [];
+  let time = 0;
+  let executingPromotion = false;
+  const clock = spyOn(stallReporter, "now").mockImplementation(() => {
+    const at = time;
+    if (executingPromotion) time += 75;
+    return at;
+  });
+  const log = spyOn(console, "warn").mockImplementation((line: string) => lines.push(line));
+  try {
+    insert(store, row("a", "worker-a", 10 * day));
+    finalize(store, "a");
+    stallReporter.sample(0);
+    // Advance the clock only while the promotion's actual statement executes.
+    store.db.query = new Proxy(store.db.query, {
+      apply(target, receiver, args) {
+        const statement = Reflect.apply(target, receiver, args) as Statement;
+        if (!String(args[0]).startsWith("UPDATE failure_observations AS a")) return statement;
+        return {
+          run(...params: unknown[]) {
+            executingPromotion = true;
+            try {
+              return Reflect.apply(statement.run, statement, params);
+            } finally {
+              executingPromotion = false;
+            }
+          },
+        };
+      },
+    });
+    insert(store, row("b", "worker-b", 12 * day));
+    expect(store.failureObservations({ finalized: true }).map((r) => r.class)).toEqual([
+      "undeclared_requirement",
+    ]);
+    finalize(store, "b");
+    expect(store.failureObservations().map((r) => r.class)).toEqual([
+      "undeclared_requirement",
+      "undeclared_requirement",
+    ]);
+    stallReporter.sample(4000);
+    expect(lines[0]).toMatch(/store\.update-failure_observations-[a-f0-9]{8}: count=2 total=150ms max=75ms/);
+  } finally {
+    stallReporter.sample(0);
+    clock.mockRestore();
+    log.mockRestore();
+    store.close();
   }
 });
 
