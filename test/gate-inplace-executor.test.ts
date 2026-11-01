@@ -1478,18 +1478,16 @@ test.each([
           .query("UPDATE gate_jobs SET request=? WHERE id=?")
           .run(JSON.stringify({ ...request, env: { ...request.env, CHANGED_ENV: "1" } }), job.id);
       }
-      const next = start(handler);
-      const executor = next.deps.gateExecutor;
-      if (!executor) throw new Error("missing executor");
-      const attach = spyOn(executor, "attach");
-      try {
-        await wait(
-          () => attach.mock.calls.some(([h]) => h.kind === "inplace" && (h.id === job?.id) !== mismatch),
-          { timeoutMs: 10_000 },
-        );
-      } finally {
-        attach.mockRestore();
-      }
+      // Observe attachment from before the new engine exists, so an early resume cannot be missed.
+      const executor = gateExecutorFor("local", workers, [], true);
+      const attach = executor.attach.bind(executor);
+      let attached = false;
+      executor.attach = (h, ...rest) => {
+        attached ||= h.kind === "inplace" && (h.id === job?.id) !== mismatch;
+        return attach(h, ...rest);
+      };
+      const next = start(handler, false, false, { gateExecutor: executor });
+      await waitWhileProgressing(next, run.id, () => attached);
       writeFileSync(proceed, "");
       expect(await waitFor(next, run.id, ["succeeded", "failed", "needs_human"])).toBe(
         purpose === "initial" ? "needs_human" : "succeeded",
