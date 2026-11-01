@@ -462,6 +462,39 @@ test("late timers cannot issue twice or release another reservation", async () =
   spy.mockRestore();
 });
 
+test.each([30000, 30001])("completion at %i ms cannot beat a delayed deadline callback", async (elapsed) => {
+  let now = 0;
+  const f = fixture({ now: () => now, byteLimit: 8 });
+  const first = f.send();
+  await f.clock.flush();
+  const old = f.port();
+  const response = old.response();
+  old.held = true;
+  now = 10000;
+  const queued = f.send();
+  now = elapsed;
+  // Move only the injected time: the admission timer has not run yet.
+  old.emit(response);
+  await withheld(first, "checker-timeout");
+  await f.clock.flush();
+  expect(old.terminated).toBe(1);
+  expect(f.ports).toHaveLength(1);
+  expect(f.clock.pending).toBe(1);
+  old.emit(response);
+  old.retirement.resolve();
+  await f.clock.flush();
+  expect(f.ports).toHaveLength(2);
+  old.emit(response);
+  f.port().reply();
+  expect(read(await queued).withheld).toBe(false);
+  const reused = f.send();
+  await f.clock.flush();
+  f.port().reply();
+  expect(read(await reused).withheld).toBe(false);
+  expect(f.clock.pending).toBe(0);
+  await f.dispose();
+});
+
 test("dispatch does not restart the admission deadline", async () => {
   const f = fixture();
   const first = f.send();

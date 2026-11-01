@@ -123,8 +123,7 @@ export function createPrivacyChecker(options: Options = {}) {
   async function pump() {
     while (!disposed && pending.size) {
       await retiring;
-      const run = pending.values().next().value;
-      if (run) await run();
+      await pending.values().next().value?.();
     }
   }
   function wake() {
@@ -196,6 +195,7 @@ export function createPrivacyChecker(options: Options = {}) {
         port.onmessage = ({ data }) => {
           if (worker !== port || !pending.has(finish)) return;
           if (record(data) && "id" in data && data.id !== request.id) return;
+          if (now() >= deadline) return finish("checker-timeout", true);
           if (!current(authority)) return finish("stale-generation");
           if (
             !record(data) ||
