@@ -710,8 +710,11 @@ export interface ReviewSystem {
   implementerReport: "include" | "omit";
   /** Opt-in panel eval experiment: attribute verifier claims to the change. */
   causalAttribution?: true;
-  /** Eval only: the verifier rates by the labelling rubric and round 1 blocks only high or critical. */
-  severityRubric?: true;
+  /**
+   * Eval only: the verifier rates by the labelling rubric and round 1 blocks only high or critical.
+   * A string replaces the built-in rubric section of the verifier prompt, so variants need no release.
+   */
+  severityRubric?: true | string;
 }
 /** The system options that change a panel's verifier prompt and what blocks. */
 export type PanelRules = Pick<ReviewSystem, "causalAttribution" | "severityRubric">;
