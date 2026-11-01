@@ -542,6 +542,10 @@ describe("panel decision", () => {
         findings: [verified(verdict, severity, category)],
       };
       expect(blockingReviewFindings(review, undefined, undefined, rubric).length > 0).toBe(blocks);
+      // Custom rubric text changes only the verifier prompt, not what blocks.
+      expect(
+        blockingReviewFindings(review, undefined, undefined, { severityRubric: "# Severity" }).length > 0,
+      ).toBe(blocks);
       expect(reviewVerdict(review, undefined, undefined, rubric)).toBe(
         blocks ? "request_changes" : "approve",
       );
