@@ -542,6 +542,10 @@ describe("panel decision", () => {
         findings: [verified(verdict, severity, category)],
       };
       expect(blockingReviewFindings(review, undefined, undefined, rubric).length > 0).toBe(blocks);
+      // Custom rubric text changes only the verifier prompt, not what blocks.
+      expect(
+        blockingReviewFindings(review, undefined, undefined, { severityRubric: "# Severity" }).length > 0,
+      ).toBe(blocks);
       expect(reviewVerdict(review, undefined, undefined, rubric)).toBe(
         blocks ? "request_changes" : "approve",
       );
@@ -799,6 +803,13 @@ describe("runReview panel", () => {
       system: { ...system, finders: [...system.finders] },
     });
     expect(high.out.decision?.blocking).toHaveLength(1);
+    const text = await panel([[candidate("src/a.ts", 1)]], () => ({ ...confirmed, severity: "medium" }), {
+      system: { ...system, finders: [...system.finders], severityRubric: "# Severity variant TEXT" },
+    });
+    const textPrompt = text.verifications[0]?.request.prompt;
+    expect(textPrompt).toContain("# Severity variant TEXT");
+    expect(textPrompt).not.toContain("# Severity by consequence");
+    expect(text.out.decision?.blocking).toEqual([]);
   });
 
   const causalSystem = { mode: "panel", finders: [{ prompt: "standard" }], causalAttribution: true } as const;
