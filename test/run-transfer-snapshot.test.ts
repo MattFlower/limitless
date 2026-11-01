@@ -442,6 +442,76 @@ test("redacts descriptive text and excludes unrelated resources, requests, lease
     expect(text).not.toContain(`"${key}"`);
 });
 
+test("redacts acceptance ticket and parent bodies and manifest descriptions without changing source records", () => {
+  const f = setup();
+  const secret = ["snapshot", "acceptance-credential"].join("-");
+  registerCredential("SNAPSHOT_ACCEPTANCE_DESCRIPTION", secret);
+  f.store.setRunState(f.runId, {
+    ...f.state,
+    acceptance: {
+      snapshot: {
+        ticket: {
+          number: 2,
+          body: `Ticket ${secret}`,
+          author: { login: "ticket-author" },
+          parent: { number: 1, body: `Nested parent ${secret}`, author: null },
+        },
+        parent: { number: 1, body: `Parent ${secret}`, author: null },
+      },
+      manifest: [
+        {
+          id: "U1",
+          text: `Description ${secret}`,
+          item: `Item ${secret}`,
+          class: "behaviour",
+          sources: ["#1"],
+        },
+      ],
+    },
+  });
+  const before = sourceRows(f.store);
+  const { payload } = f.capture();
+  expect(payload.state.acceptance).toEqual({
+    snapshot: {
+      ticket: {
+        number: 2,
+        body: "Ticket [redacted]",
+        author: { login: "ticket-author" },
+        parent: { number: 1, body: "Nested parent [redacted]", author: null },
+      },
+      parent: { number: 1, body: "Parent [redacted]", author: null },
+    },
+    manifest: [
+      {
+        id: "U1",
+        text: "Description [redacted]",
+        item: "Item [redacted]",
+        class: "behaviour",
+        sources: ["#1"],
+      },
+    ],
+  });
+  expect(new TextDecoder().decode(encodeTransferJson(payload))).not.toContain(secret);
+  expect(sourceRows(f.store)).toEqual(before);
+});
+
+test.each(["login", "id"])("refuses credential-bearing acceptance %s identities", (field) => {
+  const f = setup();
+  const secret = `snapshot-acceptance-${field}-credential`;
+  registerCredential(`SNAPSHOT_ACCEPTANCE_${field}`, secret);
+  f.store.setRunState(f.runId, {
+    ...f.state,
+    acceptance: {
+      snapshot: {
+        ticket: { number: 2, body: "Ticket", author: { login: field === "login" ? secret : "author" } },
+        parent: { number: 1, body: "Parent", author: null },
+      },
+      manifest: [{ id: field === "id" ? secret : "U1", text: "Description", class: "docs", sources: ["#1"] }],
+    },
+  });
+  rejects(f.capture, "invalid");
+});
+
 test("local execution history carries no attach handle and short descriptive credentials are redacted", () => {
   const f = setup(),
     secret = ["t!", "k"].join("");

@@ -25,7 +25,7 @@ const descriptive = new Set(
     "title prompt summary question answer answers feedback error note notes detail evidence publicSummary " +
     "requirement requirementCitation reason finalText output failures diagnostic interrupted incomplete " +
     "implementerReport implementerIssue rebaseNote terminalReason needsHumanReason fastModeDisabledReason " +
-    "failure_reason provenanceError failureAttributionReason description steps expected"
+    "failure_reason provenanceError failureAttributionReason description steps expected body text item"
   ).split(" "),
 );
 // Unknown strings are identities or executable inputs until classified otherwise.
