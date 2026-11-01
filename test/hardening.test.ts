@@ -383,11 +383,11 @@ describe("process handling", () => {
     },
   );
 
-  test.each(["EPERM", "EACCES"])(
-    "Darwin discovery skips %s roots without losing ownership evidence",
+  test.each(["EPERM", "EACCES", "ENOENT", "ENOTDIR", "EIO"])(
+    "Darwin discovery retains %s roots without losing ownership evidence",
     async (code) => {
       const native = await loadNativeInspection(dir);
-      const denied = join(dir, "denied");
+      const denied = join(realpathSync(dir), "denied");
       const checkout = join(dir, "checkout");
       const scratch = join(dir, "scratch");
       for (const root of [denied, checkout, scratch]) mkdirSync(root);
@@ -402,7 +402,12 @@ describe("process handling", () => {
           null,
           new Set([process.pid]),
         );
-      const hiddenMember = (roots: string[], cwd: string, parent = 1, members = new Set<number>()) =>
+      const hiddenMember = (
+        roots: string[],
+        cwd: { path: string } | { errno: number },
+        parent = 1,
+        members = new Set<number>(),
+      ) =>
         native.hiddenDarwinProcessMember(
           native.unreadablePid,
           new Map([[native.unreadablePid, parent]]),
@@ -410,26 +415,45 @@ describe("process handling", () => {
           2000,
           roots,
           () => 2000,
-          () => ({ path: cwd }),
+          () => cwd,
         );
       for (const surviving of [checkout, scratch]) {
         const roots = [denied, surviving];
         for (const cwd of [denied, surviving]) {
           native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: cwd } });
-          expect(selected(roots).includes(native.unreadablePid)).toBe(cwd === surviving);
-          expect(hiddenMember(roots, cwd)).toBe(cwd === surviving);
+          expect(selected(roots)).toContain(native.unreadablePid);
+          expect(hiddenMember(roots, { path: cwd })).toBe(true);
         }
       }
-      // Without any readable cwd roots, unrelated orphans stay excluded even when
-      // their birth time and cwd cannot be inspected; markers and ancestry still work.
+      native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: denied } });
+      expect(selected([denied])).toContain(native.unreadablePid);
+      expect(hiddenMember([denied], { path: denied })).toBe(true);
+      // A root that cannot be canonicalized still requires fail-closed inspection
+      // when the read-allowlist exception does not apply.
+      for (const errno of [1, 13, 3, 5, 22]) {
+        native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { errno } });
+        const hidden = () => hiddenMember([denied], { errno });
+        const scanned = () => selected([denied]);
+        if (errno === 3) {
+          expect(hidden()).toBe(false);
+          expect(scanned()).toEqual([]);
+        } else {
+          expect(hidden).toThrow(
+            `Process cwd inspection failed for ${native.unreadablePid} (errno ${errno})`,
+          );
+          expect(scanned).toThrow(
+            `Process cwd inspection failed for ${native.unreadablePid} (errno ${errno})`,
+          );
+        }
+      }
       native.setUnreadableProcess({ parent: 1, born: { errno: 1 }, cwd: { errno: 1 } });
-      expect(selected([denied])).toEqual([]);
-      expect(hiddenMember([denied], denied)).toBe(false);
+      expect(() => selected([denied])).toThrow("Process birth time inspection failed");
+      native.setUnreadableProcess(null);
       native.setMemberMarker("this-invocation");
       expect(selected([denied])).toEqual([native.memberPid]);
       native.setUnreadableProcess({ parent: native.memberPid, born: { errno: 1 }, cwd: { errno: 1 } });
       expect(selected([denied]).sort()).toEqual([native.memberPid, native.unreadablePid]);
-      expect(hiddenMember([denied], denied, native.memberPid, new Set([native.memberPid]))).toBe(true);
+      expect(hiddenMember([denied], { errno: 1 }, native.memberPid, new Set([native.memberPid]))).toBe(true);
     },
   );
 

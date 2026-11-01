@@ -98,7 +98,7 @@ function darwinCwdDirectories(directories: readonly string[]): string[] {
   const homes = [resolve(home)];
   try {
     homes.push(realpathSync(home));
-  } catch {} // Gates deny home reads; independently validated roots still grant ownership.
+  } catch {} // Gates deny home reads; roots not proven broad still grant ownership.
   const broad = (root: string) =>
     root === sep || homes.some((home) => root === home || home.startsWith(`${root}${sep}`));
   // A broad root invalidates cwd ownership for the whole invocation, including
@@ -106,14 +106,10 @@ function darwinCwdDirectories(directories: readonly string[]): string[] {
   if (directories.some((directory) => broad(resolve(directory)))) return [];
   const roots: string[] = [];
   for (const directory of directories) {
-    let root: string;
+    let root = directory;
     try {
       root = realpathSync(directory);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR" || code === "EPERM" || code === "EACCES") continue;
-      throw new Error(`Process cwd root validation failed (${code ?? "unknown"})`, { cause: error });
-    }
+    } catch {} // Preserve unresolved roots and their downstream inspection semantics.
     if (broad(root)) return [];
     roots.push(root);
   }

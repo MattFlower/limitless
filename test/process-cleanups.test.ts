@@ -616,24 +616,10 @@ for (const source of ["cleanup", "discovery", "both-denied"] as const) {
           },
         },
         async () => {
-          if (source === "both-denied") {
-            const cleanups = store.listProcessCleanups();
-            const discoveries = store.listProcessDiscoveries();
-            await expect(recoverProcessCleanups(store)).rejects.toThrow(
-              "Process cwd root validation failed (EIO)",
-            );
-            store.close();
-            store = new Store(database);
-            await expectRecoveryRefusal("Process cwd root validation failed (EIO)");
-            expect(store.listProcessCleanups()).toEqual(cleanups);
-            expect(store.listProcessDiscoveries()).toEqual(discoveries);
-            expect(kill).not.toHaveBeenCalled();
-          } else {
-            await recoverProcessCleanups(store);
-            expect(kill.mock.calls).toEqual([[native.unreadablePid, "SIGKILL"]]);
-            expect(store.listProcessCleanups()).toEqual([]);
-            expect(store.listProcessDiscoveries()).toEqual([]);
-          }
+          await recoverProcessCleanups(store);
+          expect(kill.mock.calls).toEqual([[native.unreadablePid, "SIGKILL"]]);
+          expect(store.listProcessCleanups()).toEqual([]);
+          expect(store.listProcessDiscoveries()).toEqual([]);
         },
       );
     } finally {
