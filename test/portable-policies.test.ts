@@ -62,6 +62,27 @@ function snapshot() {
     state: store.db.query("SELECT state_json FROM runs WHERE id = ?").get(runId),
   };
 }
+const nestedKinds = ["provisional", "prepared", "supplement"] as const;
+function nestedTransition(kind: (typeof nestedKinds)[number]) {
+  if (kind !== "provisional") provisional();
+  if (kind === "supplement") finalizePreparePolicy(store, input());
+  const record = kind === "provisional" ? f.provisional : kind === "prepared" ? f.prepared : f.reviewed;
+  const state = kind === "provisional" ? initial : kind === "prepared" ? preparedState : reviewState;
+  const transition =
+    kind === "provisional"
+      ? recordProvisionalPolicy
+      : kind === "prepared"
+        ? finalizePreparePolicy
+        : appendPolicySupplement;
+  const expected = kind === "provisional" ? null : pin(kind === "prepared" ? f.provisional : f.prepared);
+  const expectedState = kind === "provisional" ? null : kind === "prepared" ? initial : preparedState;
+  return {
+    record,
+    state,
+    history: f.history.slice(0, record.version),
+    apply: () => transition(store, { runId, record, state, expected, expectedState }),
+  };
+}
 function errorCode(fn: () => unknown, code: RunTransferErrorCode) {
   try {
     fn();
@@ -129,6 +150,65 @@ test.each(["before", "state", "selection"])(
     expect(store.getRunState<unknown>(runId)).toEqual(preparedState);
     expect(exportPolicySelection(store, runId).version).toBe(2);
     expect(snapshot().versions).toHaveLength(2);
+  },
+);
+test.each([...nestedKinds])(
+  "caught nested %s failure rolls back only the transition and permits retry",
+  (kind) => {
+    const attempt = nestedTransition(kind);
+    const old = snapshot();
+    const operation = kind === "provisional" ? "INSERT" : "UPDATE";
+    store.db.exec(
+      `CREATE TRIGGER interrupt_policy BEFORE ${operation} ON run_policy_selections BEGIN SELECT RAISE(ABORT, 'Interrupted'); END`,
+    );
+    store.transaction(() => {
+      store.setSetting("outer-before", "kept");
+      expect(attempt.apply).toThrow("Interrupted");
+      expect(store.db.inTransaction).toBe(true);
+      store.setSetting("outer-after", "kept");
+    });
+    reopen();
+    expect(snapshot()).toEqual(old);
+    expect(store.getSetting<string | null>("outer-before", null)).toBe("kept");
+    expect(store.getSetting<string | null>("outer-after", null)).toBe("kept");
+    store.db.exec("DROP TRIGGER interrupt_policy");
+    store.transaction(() => expect(attempt.apply()).toEqual(pin(attempt.record)));
+    reopen();
+    expect(store.getRunState<unknown>(runId)).toEqual(attempt.state);
+    expect(exportPolicySelection(store, runId)).toEqual({
+      ...pin(attempt.record),
+      history: attempt.history,
+    });
+    expect(snapshot().versions).toHaveLength(attempt.record.version);
+  },
+);
+test.each(nestedKinds.flatMap((kind) => ["commit", "rollback"].map((end) => [kind, end] as const)))(
+  "successful nested %s remains subject to outer %s",
+  (kind, end) => {
+    const attempt = nestedTransition(kind);
+    const old = snapshot();
+    let next = old;
+    const outer = () =>
+      store.transaction(() => {
+        store.setSetting("outer", "written");
+        expect(attempt.apply()).toEqual(pin(attempt.record));
+        expect(store.db.inTransaction).toBe(true);
+        next = snapshot();
+        if (end === "rollback") throw new Error("Outer rollback");
+      });
+    if (end === "rollback") expect(outer).toThrow("Outer rollback");
+    else outer();
+    reopen();
+    expect(snapshot()).toEqual(end === "rollback" ? old : next);
+    expect(store.getSetting<string | null>("outer", null)).toBe(end === "rollback" ? null : "written");
+    if (end === "commit") {
+      expect(store.getRunState<unknown>(runId)).toEqual(attempt.state);
+      expect(exportPolicySelection(store, runId)).toEqual({
+        ...pin(attempt.record),
+        history: attempt.history,
+      });
+      expect(snapshot().versions).toHaveLength(attempt.record.version);
+    }
   },
 );
 test("two connections serialize competing versions; replay writes nothing and stale state conflicts", async () => {

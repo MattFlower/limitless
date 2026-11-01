@@ -90,7 +90,7 @@ function transition(
   input: PolicyTransition,
   kind: "provisional" | "prepared" | "supplement",
 ): PolicyPin {
-  return store.transaction(() => {
+  const apply = () => {
     const record = parseTransferPolicyRecord(input.record);
     if (
       kind === "supplement"
@@ -151,7 +151,9 @@ function transition(
       )
       .run(input.runId, record.policyId, record.version, record.recordId);
     return pin;
-  }, true);
+  };
+  // Bun's nested transaction uses a savepoint; Store.transaction alone joins its caller.
+  return store.transaction(() => store.db.transaction(apply).immediate(), true);
 }
 export const recordProvisionalPolicy = (store: Store, input: PolicyTransition): PolicyPin =>
   transition(store, input, "provisional");
