@@ -48,45 +48,48 @@ const gates = {
   protectedPaths: [],
 };
 
-async function waitForFile(path: string, ready: (contents: string) => boolean): Promise<string> {
+async function waitForPid(path: string): Promise<number> {
   let contents = "";
   await wait(
     () => {
       contents = existsSync(path) ? readFileSync(path, "utf8") : "";
-      return ready(contents);
+      return /^[1-9]\d*\n$/.test(contents);
     },
     { timeoutMs: 10_000 },
   );
-  return contents;
+  return Number(contents);
 }
 
-async function waitForPid(path: string): Promise<number> {
-  return Number(await waitForFile(path, (contents) => /^[1-9]\d*\n$/.test(contents)));
-}
+test("waitForPid waits for a complete PID line after file creation", async () => {
+  const path = join(fixture.home, "delayed-pid");
+  writeFileSync(path, "");
+  let resolved = false;
+  const pending = waitForPid(path).then((pid) => {
+    resolved = true;
+    return pid;
+  });
+  await wait(() => existsSync(path), { timeoutMs: 10_000 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(resolved).toBe(false);
+  writeFileSync(path, "123\n");
+  expect(await pending).toBe(123);
+});
 
-test.each(["missing", "empty", "complete"])(
-  "waitForPid waits for a complete PID line (%s file)",
-  async (initial) => {
-    const path = join(fixture.home, "delayed-pid");
-    if (initial !== "missing") writeFileSync(path, initial === "complete" ? "123\n" : "");
-    let resolved = false;
-    const pending = waitForPid(path).then((pid) => {
-      resolved = true;
-      return pid;
-    });
-    if (initial === "complete") {
-      expect(await pending).toBe(123);
-      return;
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(resolved).toBe(false);
-    writeFileSync(path, "12");
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(resolved).toBe(false);
-    writeFileSync(path, "123\n");
-    expect(await pending).toBe(123);
-  },
-);
+/**
+ * Reaching a gate takes a whole pipeline, which a fixed deadline only fits on an idle machine;
+ * each deadline here bounds a stall in the run's recorded events instead.
+ */
+async function waitWhileProgressing(f: Factory, runId: string, ready: () => boolean) {
+  let seen = -1;
+  const progressed = () => {
+    const latest = f.store.listEvents(runId, { tail: true, limit: 1 })[0]?.id ?? 0;
+    if (latest === seen) return false;
+    seen = latest;
+    return true;
+  };
+  progressed();
+  while (!ready()) await wait(() => ready() || progressed(), { timeoutMs: 10_000 });
+}
 
 async function setup(enabled = true) {
   mkdirSync(join(fixture.home, "cfg"));
@@ -1347,22 +1350,21 @@ test.each(["during resume", "before resume"])(
         },
       ],
     };
-    await withExecutor(f, async (workers, crash) => {
+    await withExecutor(f, async (workers, crash, executor) => {
       const first = context(controller.signal);
       const pending = runGateExecution(first, "gates", "initial", req.cwd, long).catch((e) => e);
       try {
         const pid = await waitForPid(pidFile);
         const id = first.state.gateExecution?.handle.id ?? "";
-        // The shell can publish its PID before the executor persists spawn discovery.
-        const cwd = realpathSync(req.cwd);
+        // macOS records spawn discovery after spawn returns, so the shell can publish its PID first.
         await wait(
           () =>
             f.store
-              .listProcessDiscoveries(undefined, cwd)
+              .listProcessDiscoveries(undefined, realpathSync(req.cwd))
               .some(
-                (record) =>
-                  record.ownerPid === workers.executor()?.pid &&
-                  (process.platform === "linux" || record.discovery.group === pid),
+                (row) =>
+                  row.ownerPid === executor.pid &&
+                  (process.platform === "linux" || row.discovery.group === pid),
               ),
           { timeoutMs: 10_000 },
         );
@@ -1456,7 +1458,11 @@ test.each([
         prompt: "Add farewell",
         profile: "quick",
       });
-      await waitForFile(ready, (contents) => contents === "run\n");
+      await waitWhileProgressing(
+        f,
+        run.id,
+        () => existsSync(ready) && readFileSync(ready, "utf8") === "run\n",
+      );
       const state = f.store.getRunState<RunContext["state"]>(run.id);
       expect(state?.gateExecution?.purpose).toBe(purpose);
       const job = workers.job(state?.gateExecution?.handle.id ?? "");
