@@ -216,7 +216,7 @@ export async function collectGarbage(
     const git = repo.kind === "github" ? cacheGit : sh;
     try {
       await withRepoLock(cache, async () => {
-        const eligible = new Set(
+        const candidates = new Set(
           finished
             .filter(
               (run) =>
@@ -229,8 +229,10 @@ export async function collectGarbage(
                     : cfg.retention.worktreeDays,
                 ),
             )
-            .map((run) => scan(() => canonical(child(workRoot, run.id)))),
+            .map((run) => child(workRoot, run.id)),
         );
+        // One measurement for the whole contiguous lookup, so many fast calls are still attributed.
+        const eligible = scan(() => new Set([...candidates].map(canonical)));
         const listed = (await git(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout;
         const prunable = scan(() => prunablePaths(listed));
         // Only prune the source when an eligible legacy worktree left stale metadata there.

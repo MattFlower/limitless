@@ -820,7 +820,7 @@ export class LandQueue {
 
   /** The repository's checks, taken from the base commit so the PR cannot weaken them. */
   private async checks(entry: LandEntry, cwd: string, baseSha: string, signal: AbortSignal): Promise<void> {
-    const end = beginActivity("land.check");
+    using _span = { [Symbol.dispose]: beginActivity("land.check") };
     const gateExecutor = this.deps.gateExecutor;
     const log = entry.runId
       ? join(this.deps.paths.runs, entry.runId, `land-${entry.id}.log`)
@@ -968,11 +968,7 @@ export class LandQueue {
         }
       })();
     } finally {
-      try {
-        rmSync(base, { recursive: true, force: true });
-      } finally {
-        end();
-      }
+      rmSync(base, { recursive: true, force: true });
     }
   }
 
@@ -1157,15 +1153,7 @@ export class LandQueue {
     });
   }
 
-  private async merge(...args: Parameters<LandQueue["mergeEntry"]>): Promise<void> {
-    const end = beginActivity("land.merge");
-    try {
-      return await this.mergeEntry(...args);
-    } finally {
-      end();
-    }
-  }
-  private async mergeEntry(
+  private async merge(
     entry: LandEntry,
     repo: Repo,
     cwd: string,
@@ -1174,6 +1162,7 @@ export class LandQueue {
     body: string,
     signal: AbortSignal,
   ): Promise<void> {
+    using _span = { [Symbol.dispose]: beginActivity("land.merge") };
     const guard = async () => {
       this.assertClaim(entry.id);
       if (!this.deps.requiresApproval?.has(entry.repo.toLowerCase())) return;

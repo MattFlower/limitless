@@ -930,6 +930,45 @@ for (const phase of ["validation", "canonical"] as const) {
   );
 }
 
+test("GC attributes many individually fast canonical lookups as one contiguous worktree pass", async () => {
+  const f = backgroundFixture();
+  // Worktrees are absent, so only the metadata pass canonicalizes their paths, 3 ms each.
+  const runs = gcRuns(f, 20);
+  mkdirSync(repos.cachePath(f.cfg.paths, f.repo), { recursive: true });
+  const originalRealpath = fs.realpathSync;
+  let calls = 0;
+  const realpath = spyOn(fs, "realpathSync").mockImplementation(((
+    ...args: Parameters<typeof fs.realpathSync>
+  ) => {
+    if (String(args[0]) === f.cfg.paths.work) {
+      calls++;
+      f.advance(3);
+    }
+    return originalRealpath(...args);
+  }) as typeof fs.realpathSync);
+  const git = spyOn(gitCommand, "cacheGit").mockImplementation(async () => {
+    // Git waits stay outside the synchronous pass.
+    f.advance(1000);
+    return { stdout: "", stderr: "", exitCode: 0 };
+  });
+  try {
+    const result = await collectGarbage(f.store, f.cfg, { dryRun: true });
+    // The empty cache directory is not a repository; only the iteration-ref pass may report that.
+    expect(result.errors.filter((e) => !e.includes(" iterations: "))).toEqual([]);
+    expect(result.metadata).toEqual([]);
+    expect(calls).toBe(runs.length);
+    stallReporter.sample(3000);
+    expect(f.lines.at(-1)).toContain("gc.worktrees: count=1 total=60ms max=60ms");
+    expect(f.lines.at(-1)).not.toContain("active=");
+    for (const marker of [f.marker, f.root, ...runs.map((r) => r.run.id)])
+      expect(f.lines.at(-1)).not.toContain(marker);
+  } finally {
+    git.mockRestore();
+    realpath.mockRestore();
+    f.close();
+  }
+});
+
 test.each([50, 51])("thresholded synchronous activity retains exceptional completion at %sms", (duration) => {
   const f = timedStore();
   const error = new Error(crypto.randomUUID());
