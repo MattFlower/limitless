@@ -70,6 +70,11 @@ const FinderSchema = z
     path: ["lens"],
     message: 'a lens finder uses the "standard" prompt',
   });
+/** `true` for the built-in rubric, or the verifier prompt's whole severity section as text. */
+const SeverityRubricSchema = z.union([
+  z.literal(true),
+  z.string().trim().min(1, "severityRubric text must not be empty"),
+]);
 const VerifierSchema = z
   .strictObject({
     target: TargetSchema.optional(),
@@ -157,7 +162,7 @@ const RosterReferenceSchema = z.strictObject({
   samples: z.never({ error: "samples is not supported on roster references" }).optional(),
   roster: z.enum(["quick", "standard", "deep"]),
   causalAttribution: z.literal(true).optional(),
-  severityRubric: z.literal(true).optional(),
+  severityRubric: SeverityRubricSchema.optional(),
   targets: z.array(TargetSchema).min(1),
   lenses: z.array(LensSchema).optional(),
   verifier: VerifierSchema.refine((v) => v.target !== undefined || v.targets !== undefined, {
@@ -171,7 +176,7 @@ export const EvalSystemSchema = ReviewSystemBaseSchema.safeExtend({
   samples: z.literal(2, { error: "samples must be 2" }).optional(),
   setup: z.literal(true).optional(),
   replayFrom: z.string().trim().min(1).optional(),
-  severityRubric: z.literal(true).optional(),
+  severityRubric: SeverityRubricSchema.optional(),
 })
   .refine((system) => !system.severityRubric || system.mode === "panel", {
     path: ["severityRubric"],

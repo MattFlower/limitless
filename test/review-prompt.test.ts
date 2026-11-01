@@ -240,4 +240,14 @@ test("severityRubric replaces the verifier's consequence scale with the labellin
   ])
     expect(rubric).toContain(instruction);
   expect(panelIdentity({ severityRubric: true })).not.toBe(panelIdentity());
+  const custom = verifierPrompt({ ...input, severityRubric: "# Severity variant\n- high: CUSTOM-HIGH" });
+  expect(custom).toContain(
+    "# Severity variant\n- high: CUSTOM-HIGH\n\nReturn exactly one result per candidate id.",
+  );
+  expect(custom).not.toContain("- medium: wrong result on an edge path");
+  expect(custom).not.toContain("would this plausibly happen in the next month");
+  const identities = new Set(
+    ([undefined, true, "# A", "# B"] as const).map((severityRubric) => panelIdentity({ severityRubric })),
+  );
+  expect(identities.size).toBe(4);
 });

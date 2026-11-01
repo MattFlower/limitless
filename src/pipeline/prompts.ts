@@ -684,7 +684,7 @@ export function verifierPrompt(input: {
   /** PR verification: the base may have moved past the fork point, so diff from the merge base as finders do. */
   externalChange?: boolean;
   causalAttribution?: boolean;
-  severityRubric?: boolean;
+  severityRubric?: boolean | string;
   stat: string;
   candidates: {
     id: string;
@@ -737,7 +737,7 @@ ${fence(promptJson(input.candidates, 2))}
 - PLAUSIBLE: realistic but not proven, including rare states (races, rare null paths, boundary off-by-ones, retry storms). Rare is not refuted.
 - REFUTED: only when the code shows the claim is false. Quote the guard or invariant that prevents it in evidence.
 
-${input.severityRubric ? RUBRIC_SEVERITY : CONSEQUENCE_SEVERITY}
+${typeof input.severityRubric === "string" ? input.severityRubric : input.severityRubric ? RUBRIC_SEVERITY : CONSEQUENCE_SEVERITY}
 
 Return exactly one result per candidate id. evidence quotes the relevant code with file:line; trigger states the inputs or state and the wrong outcome they produce; category is one of correctness, security, reliability, data, concurrency, compatibility, test-gap, cleanup, conventions.
 Do not modify files. You may run read-only commands and targeted tests; create temporary files only under TMPDIR.${
