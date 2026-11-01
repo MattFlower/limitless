@@ -9,7 +9,7 @@ import { discardChanges } from "../git/repos.ts";
 import { CancelledError, type RunContext } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { gateCommandScope, runGateExecution } from "./gate-execution.ts";
-import type { Verify } from "./schemas.ts";
+import type { Holdout, Spec, Verify } from "./schemas.ts";
 
 type Test = { file: string; name: string };
 export interface CoveringTestRun extends Test {
@@ -38,12 +38,30 @@ export const coveringPattern = (name: string): string =>
 const controls = (text: string) =>
   [...text].some((c) => c.charCodeAt(0) < 32 || (c.charCodeAt(0) >= 127 && c.charCodeAt(0) <= 159));
 
-export function selectCoveringTests(verify: Verify) {
-  return selectCoveringRequests(
-    verify.criteria.map((c) =>
-      c.status === "blocked" && c.blockedReason === "sandbox" ? (c.covering_tests ?? []) : [],
-    ),
+export function testOutcomeOnly(row: Verify["criteria"][number], spec?: Spec, holdout?: Holdout) {
+  return (
+    row.test_outcome_only === true &&
+    row.status !== "met" &&
+    !(row.status === "unmet" && row.requirement === "not_required") &&
+    ![...(spec?.acceptance_criteria ?? []), ...(holdout?.scenarios ?? [])].some(
+      (c) => c.id === row.id && c.browser === true,
+    )
   );
+}
+
+const coveringRequests = (verify: Verify, spec?: Spec, holdout?: Holdout) =>
+  verify.criteria.map((c) =>
+    (
+      c.test_outcome_only
+        ? testOutcomeOnly(c, spec, holdout)
+        : c.status === "blocked" && c.blockedReason === "sandbox"
+    )
+      ? (c.covering_tests ?? [])
+      : [],
+  );
+
+export function selectCoveringTests(verify: Verify, spec?: Spec, holdout?: Holdout) {
+  return selectCoveringRequests(coveringRequests(verify, spec, holdout));
 }
 
 export const acceptanceCoveringPolicy = { roundLimit: Infinity, groupFiles: true };
@@ -178,9 +196,7 @@ export async function runCoveringTests(
 ) {
   return runCoveringRequests(
     ctx,
-    verify.criteria.map((c) =>
-      c.status === "blocked" && c.blockedReason === "sandbox" ? (c.covering_tests ?? []) : [],
-    ),
+    coveringRequests(verify, ctx.state.spec ?? undefined, ctx.state.holdout),
     sha,
     checkHead,
   );

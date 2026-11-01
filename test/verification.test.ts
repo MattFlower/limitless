@@ -154,6 +154,21 @@ test("verifier asks for a public behavior summary and accepts an empty one", () 
   ).toBe(true);
 });
 
+test("catches marking mixed behavioral evidence as test-outcome-only and preserves old outputs", () => {
+  const prompt = verifyPrompt({ prompt: "make it work", spec, holdout, baseSha: "abc" });
+  expect(prompt).toContain(
+    "Do not set test_outcome_only when there is any independent behavioral or code-reading objection",
+  );
+  expect(prompt).toContain("must name them in covering_tests and set test_outcome_only true");
+  expect(prompt).toContain("exact testcase title");
+  const parsed = VerifySchema.parse({
+    criteria: [{ id: "AC-1", status: "unmet", evidence: "timeout", publicSummary: "" }],
+    overall: "fail",
+    notes: "",
+  });
+  expect(parsed.criteria[0]?.test_outcome_only).toBe(false);
+});
+
 test("private feedback uses only sanitized summaries while public evidence stays actionable", () => {
   const publicDiagnostic =
     'assertion failed at src/code.ts:12: parseInput returned 42 instead of 500 with --verbose "enabled"';

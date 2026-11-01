@@ -27,8 +27,9 @@ import {
   selectCoveringTests,
 } from "../src/pipeline/covering-tests.ts";
 import { applyGateEvidence, type GateEvidence, gateTestCommand } from "../src/pipeline/gate-evidence.ts";
+import { formatVerifyFeedback } from "../src/pipeline/prompts.ts";
 import { type Spec, type Verify, VerifySchema } from "../src/pipeline/schemas.ts";
-import { normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
+import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -1292,6 +1293,200 @@ function coveringRun(): CoveringTestRun {
 }
 const bindCovering = (value: Verify, runs: CoveringTestRun[], succeededStageIds = [13]) =>
   applyGateEvidence(value, behaviouralSpec, holdout, sha, gates(), undefined, { runs, succeededStageIds });
+
+const outcomeOnly: Verify = {
+  ...requested,
+  criteria: requested.criteria.map((c) => ({
+    ...c,
+    status: "unmet",
+    blockedReason: null,
+    test_outcome_only: true,
+    evidence: "Verifier ran x.test.ts › passes and observed a timeout",
+  })),
+};
+
+test.each(["unmet", "unclear", "blocked"] as const)(
+  "catches sending %s test-outcome feedback without factory execution or turning the row met",
+  (status) => {
+    const input: Verify = {
+      ...outcomeOnly,
+      criteria: outcomeOnly.criteria.map((c) => ({
+        ...c,
+        status,
+        blockedReason: status === "blocked" ? "sandbox" : null,
+      })),
+    };
+    const row = bindCovering(input, [coveringRun()]).criteria[0];
+    expect(row).toMatchObject({ status: "blocked", blockedReason: "environment" });
+    expect(row?.gateEvidence).toBeUndefined();
+    expect(row?.covering_tests).toEqual(input.criteria[0]?.covering_tests);
+    const evidence = row?.evidence ?? "";
+    expect(evidence).toStartWith("Factory execution did not reproduce the verifier's test outcome;");
+    expect(evidence).toContain("acceptance remains unconfirmed");
+    expect(evidence.indexOf(input.criteria[0]?.evidence ?? "")).toBeGreaterThan(0);
+    expect(evidence.indexOf("Factory covering test x.test.ts › passes")).toBeGreaterThan(
+      evidence.indexOf("Verifier ran"),
+    );
+    expect(blockedOnly(bindCovering(input, [coveringRun()]))).toBe(true);
+    expect(formatVerifyFeedback(bindCovering(input, [coveringRun()]), behaviouralSpec, holdout)).toBe("");
+  },
+);
+
+test.each([
+  "failed",
+  "partial",
+  "missing-record",
+  "missing-result",
+  "missing-report",
+  "unavailable",
+  "criterion-limit",
+  "round-limit",
+  "unsupported",
+  "skipped",
+  "unmatched",
+  "wrong-sha",
+  "wrong-provenance",
+  "dirty",
+  "failed-stage",
+] as const)("catches treating partial/failing evidence as a pass or ignoring limits: %s", (mode) => {
+  const input = structuredClone(outcomeOnly);
+  const row = input.criteria[0];
+  const run = coveringRun();
+  if (!row || !run.result) throw new Error("missing fixture");
+  const result = run.result;
+  const runs = [run];
+  if (mode === "failed" || mode === "partial") {
+    run.result.ok = false;
+    run.result.exitCode = 1;
+    run.result.coveringTest = { file: run.file, name: run.name, reason: "test failed" };
+    if (mode === "partial") {
+      const passing = coveringRun();
+      row.covering_tests?.push({ file: "x.test.ts", name: "other" });
+      runs.push({
+        ...passing,
+        name: "other",
+        result: { ...passing.result, coveringTest: { file: "x.test.ts", name: "other" } },
+      } as CoveringTestRun);
+    }
+  }
+  if (mode === "missing-record") runs.length = 0;
+  if (mode === "missing-result") run.result = undefined;
+  if (mode === "missing-report") result.coveringTest = undefined;
+  if (mode === "unavailable") run.unavailable = true;
+  if (mode === "unsupported") run.reason = "targeted retries not configured";
+  if (mode === "skipped" || mode === "unmatched")
+    result.coveringTest = {
+      file: run.file,
+      name: run.name,
+      reason: mode === "skipped" ? "named test skipped" : "name matched no tests",
+    };
+  if (mode === "wrong-sha") run.verifiedSha = "b".repeat(40);
+  if (mode === "wrong-provenance") result.executionProvenance = { sha: "b".repeat(40), trackedClean: true };
+  if (mode === "dirty") result.executionProvenance = { sha, trackedClean: false };
+  if (mode === "criterion-limit")
+    row.covering_tests = Array.from({ length: 4 }, () => ({ file: run.file, name: run.name }));
+  if (mode === "round-limit")
+    input.criteria.unshift(
+      ...Array.from(
+        { length: 10 },
+        (_, i) => ({ ...requested.criteria[0], id: `AC-${i + 2}` }) as Verify["criteria"][number],
+      ),
+    );
+  const reconciled = bindCovering(input, runs, mode === "failed-stage" ? [] : [13]);
+  expect(reconciled.criteria.at(-1)).toEqual(row);
+  expect(formatVerifyFeedback(reconciled, behaviouralSpec, holdout)).toContain("AC-1");
+});
+
+test("catches inferring a selection from prose, and blocking not_required holdouts", () => {
+  const rows: Verify["criteria"] = [
+    { ...outcomeOnly.criteria[0], test_outcome_only: false },
+    { ...outcomeOnly.criteria[0], covering_tests: [] },
+    { ...outcomeOnly.criteria[0], id: "H-1", requirement: "not_required" },
+  ] as Verify["criteria"];
+  const input = { ...outcomeOnly, criteria: rows };
+  expect(selectCoveringTests(input).every((s) => s.tests.length === 0)).toBe(true);
+  expect(bindCovering(input, [coveringRun()])).toEqual(input);
+  const followup = { ...input, criteria: [rows[2]] } as Verify;
+  expect(formatVerifyFeedback(followup, behaviouralSpec, holdout)).toBe("");
+  expect(blockedOnly(followup)).toBe(false);
+  expect(blockedOnly({ ...followup, criteria: [...followup.criteria, ...blocked.criteria] })).toBe(true);
+});
+
+test("catches suppressing mixed evidence with an independent behavioral objection", () => {
+  const input = {
+    ...outcomeOnly,
+    criteria: outcomeOnly.criteria.map((c) => ({
+      ...c,
+      test_outcome_only: false,
+      evidence: `${c.evidence}; the implementation also drops saved results on restart`,
+    })),
+  };
+  expect(bindCovering(input, [coveringRun()])).toEqual(input);
+  expect(formatVerifyFeedback(bindCovering(input, [coveringRun()]), behaviouralSpec, holdout)).toContain(
+    "drops saved results on restart",
+  );
+});
+
+test.each(["unmet", "blocked"] as const)(
+  "catches selecting or reconciling %s browser criteria through test-outcome evidence",
+  (status) => {
+    const input: Verify = {
+      ...outcomeOnly,
+      criteria: outcomeOnly.criteria.map((c) => ({ ...c, status, blockedReason: "sandbox" })),
+    };
+    const browserSpec = {
+      ...behaviouralSpec,
+      acceptance_criteria: behaviouralSpec.acceptance_criteria.map((c) => ({ ...c, browser: true })),
+    };
+    expect(selectCoveringTests(input, browserSpec)[0]?.tests).toEqual([]);
+    expect(
+      applyGateEvidence(input, browserSpec, holdout, sha, gates(), undefined, {
+        runs: [coveringRun()],
+        succeededStageIds: [13],
+      }),
+    ).toEqual(input);
+  },
+);
+
+test("catches exposing private text or raw modelOutput after test-outcome reconciliation", () => {
+  const privateHoldout = {
+    scenarios: [
+      {
+        id: "H-1",
+        description: "private scenario",
+        steps: "use the private fixture input",
+        expected: "private expected response",
+        edge_case: true,
+      },
+    ],
+  };
+  const input = {
+    ...outcomeOnly,
+    criteria: outcomeOnly.criteria.map((c) => ({
+      ...c,
+      id: "H-1",
+      evidence: `Verifier expected ${privateHoldout.scenarios[0]?.expected} but timed out`,
+    })),
+  };
+  const reconciled = applyGateEvidence(input, spec, privateHoldout, sha, undefined, undefined, {
+    runs: [coveringRun()],
+    succeededStageIds: [13],
+  });
+  expect(reconciled.criteria[0]?.status).toBe("blocked");
+  expect(reconciled.criteria[0]?.evidence).toContain("private expected response");
+  const artifact = preDeliveryVerifyArtifact(
+    { ...reconciled, modelId: "fake", round: 0, attempt: 0, modelOutput: input },
+    spec,
+    privateHoldout,
+    "",
+  );
+  const feedback = formatVerifyFeedback(reconciled, spec, privateHoldout);
+  expect(artifact).not.toContain("modelOutput");
+  for (const detail of ["private expected response", "use the private fixture input"]) {
+    expect(artifact).not.toContain(detail);
+    expect(feedback).not.toContain(detail);
+  }
+});
 
 test("behavioural coverage binds only the factory record and cites its exact command", () => {
   const run = coveringRun();

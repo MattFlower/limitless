@@ -1264,7 +1264,21 @@ test.each([
   "terminator-after",
   "forged-citation",
   "empty",
+  "outcome-pass",
+  "outcome-fail",
+  "outcome-request",
+  "outcome-recorded",
+  "outcome-private",
+  "outcome-moved",
 ] as const)("factory covering tests bind behavioural criteria: %s", async (mode) => {
+  // Outcome modes catch unmet feedback without reconciliation, partial passes, verifier re-invocation,
+  // cross-commit reuse and private evidence leaks, while sharing the real gate fixture.
+  const outcome = mode.startsWith("outcome-");
+  const privateHoldout = {
+    ...holdout,
+    scenarios: holdout.scenarios.map((c) => ({ ...c, expected: "private covering expected response" })),
+  };
+  const restartOutcome = mode === "outcome-request" || mode === "outcome-recorded";
   process.env.PATH = `${dirname(process.execPath)}:${process.env.PATH}`;
   writeFileSync(
     join(repoDir, "x.test.ts"),
@@ -1272,7 +1286,7 @@ test.each([
       Array.from(
         { length: 11 },
         (_, i) =>
-          `test${mode === "skip" && i === 0 ? ".skip" : ""}("passes ${i}", () => expect(true).toBe(true));`,
+          `test${mode === "skip" && i === 0 ? ".skip" : ""}("passes ${i}", () => expect(${mode === "outcome-fail" ? 'process.env.FACTORY_COVERING_TEST_FAIL !== "1"' : "true"}).toBe(true));`,
       ).join("\n"),
   );
   const terminator = mode === "terminator-before" || mode === "terminator-after";
@@ -1296,6 +1310,7 @@ test.each([
   }));
   let targeted = 0;
   let verifierCalls = 0;
+  const implementationPrompts: string[] = [];
   const commands: string[] = [];
   const executor = localExecutor();
   if (mode === "fresh") executor.freshCheckoutFor = () => true;
@@ -1310,31 +1325,55 @@ test.each([
         expect(request.env?.CI).toBe("1");
         expect(request.skipGateSlot).not.toBe(true);
         commands.push(check.run);
+        if (mode === "outcome-fail") request.env = { ...request.env, FACTORY_COVERING_TEST_FAIL: "1" };
       }
     return startGate(request, signal);
   };
+  if (mode === "outcome-moved") {
+    const attach = executor.attach.bind(executor);
+    executor.attach = (...args) => {
+      const execution = attach(...args);
+      const request = args[2];
+      if (!request?.gates.checks.some((c) => c.run.includes(" -t "))) return execution;
+      return {
+        ...execution,
+        result: execution.result.then(async (result) => {
+          await sh(["git", "commit", "--allow-empty", "-qm", "advance covering fixture"], {
+            cwd: request.cwd,
+          });
+          return result;
+        }),
+      };
+    };
+  }
   const f = start(
     (agent) => {
       const role = roleOf(agent);
       if (role === "triage") return { structured: triage() };
       if (role === "spec") return { structured: { ...spec, acceptance_criteria: criteria } };
-      if (role === "holdout") return { structured: holdout };
+      if (role === "holdout") return { structured: mode === "outcome-private" ? privateHoldout : holdout };
       if (role === "review") return { structured: approve };
       if (role === "verify") {
         verifierCalls++;
+        // No alternative verifier on restart: recovering a saved observation must not call a model.
+        if (outcome && mode !== "outcome-fail") f.tracker.blockModel("alpha/m", "unavailable alternative");
+        if (mode === "outcome-fail" && verifierCalls > 1) return { structured: pass };
         return {
           structured: {
             ...pass,
             overall: "fail",
             criteria: [
               ...criteria.map((c, i) => ({
-                id: c.id,
-                status: mode === "forged-citation" ? "met" : "blocked",
-                blockedReason: "sandbox",
+                id: mode === "outcome-private" ? "H-1" : c.id,
+                status: outcome ? "unmet" : mode === "forged-citation" ? "met" : "blocked",
+                test_outcome_only: outcome,
+                blockedReason: outcome ? null : "sandbox",
                 evidence:
                   mode === "forged-citation"
                     ? `Factory covering test x.test.ts › passes 0 passed at ${"a".repeat(40)} (stage 999); command: bun test`
-                    : "sandbox prevents test execution",
+                    : outcome
+                      ? `verifier test timed out${mode === "outcome-private" ? "; expected private covering expected response" : ""}`
+                      : "sandbox prevents test execution",
                 publicSummary: "",
                 covering_tests:
                   mode === "empty" || (mode === "resume-retry" && verifierCalls === 1)
@@ -1344,30 +1383,49 @@ test.each([
                         name: `${mode === "forged-citation" || (mode === "retry-limit" && verifierCalls === 1) ? "missing" : "passes"} ${i + j}`,
                       })),
               })),
-              ...pass.criteria.filter((c) => c.id.startsWith("H-")),
+              ...pass.criteria.filter((c) =>
+                mode === "outcome-private" ? c.id !== "H-1" : c.id.startsWith("H-"),
+              ),
             ],
           },
         };
       }
+      implementationPrompts.push(agent.prompt);
       return { files: { "farewell.txt": "goodbye\n" } };
     },
     false,
     false,
     { gateExecutor: executor },
   );
-  if (mode === "resume" || mode === "resume-retry" || mode === "inflight" || mode === "recorded")
+  let preDeliveryArtifact = "";
+  const putArtifact = f.store.putArtifact.bind(f.store);
+  f.store.putArtifact = (...args) => {
+    if (args[1] === "verify-0.json" && !preDeliveryArtifact) preDeliveryArtifact = args[3];
+    return putArtifact(...args);
+  };
+  if (
+    restartOutcome ||
+    mode === "resume" ||
+    mode === "resume-retry" ||
+    mode === "inflight" ||
+    mode === "recorded"
+  )
     f.deps.faults = {
       "store:save": {
         action: "kill",
         when: (c) =>
           c.stage === "verify" &&
-          targeted > 0 &&
+          (mode === "outcome-request" || targeted > 0) &&
           c.checkpoint ===
-            (mode === "inflight"
-              ? "gate-result"
-              : mode === "recorded"
+            (mode === "outcome-request"
+              ? "covering-test-request"
+              : mode === "outcome-recorded"
                 ? "covering-test-recorded"
-                : "verify-result"),
+                : mode === "inflight"
+                  ? "gate-result"
+                  : mode === "recorded"
+                    ? "covering-test-recorded"
+                    : "verify-result"),
       },
     };
   const interrupted = deferred<void>();
@@ -1379,11 +1437,22 @@ test.each([
     const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "standard" });
     let terminal: RunStatus;
     let saved: RunState["coveringTestRuns"];
-    if (mode === "resume" || mode === "resume-retry" || mode === "inflight" || mode === "recorded") {
+    if (
+      restartOutcome ||
+      mode === "resume" ||
+      mode === "resume-retry" ||
+      mode === "inflight" ||
+      mode === "recorded"
+    ) {
       await interrupted.promise;
       await f.stop();
       saved = f.store.getRunState<RunState>(run.id)?.coveringTestRuns;
-      expect(saved).toHaveLength(1);
+      if (mode === "outcome-request") expect(saved).toBeUndefined();
+      else expect(saved).toHaveLength(1);
+      if (restartOutcome)
+        expect(
+          f.store.getRunState<RunState>(run.id)?.pendingVerify?.modelOutput.criteria[0]?.test_outcome_only,
+        ).toBe(true);
       if (mode === "inflight") {
         expect(saved?.[0]?.result).toBeUndefined();
         expect(f.store.getRunState<RunState>(run.id)?.gateExecution?.purpose).toStartWith("covering-test:");
@@ -1402,6 +1471,45 @@ test.each([
       terminal = await executeRun(f.deps, run.id, new AbortController().signal);
     } else terminal = await waitFor(f, run.id, ["succeeded", "needs_human", "failed"]);
     const state = f.store.getRunState<RunState>(run.id);
+    if (outcome) {
+      expect(terminal).toBe(mode === "outcome-fail" ? "succeeded" : "needs_human");
+      expect(implementationPrompts).toHaveLength(mode === "outcome-fail" ? 2 : 1);
+      expect(targeted).toBe(1);
+      const record = state?.coveringTestRuns?.[0];
+      expect(state?.coveringTestRuns).toHaveLength(1);
+      if (mode === "outcome-moved") {
+        expect(f.store.getRun(run.id)?.error).toContain("Commit changed during verification");
+        expect(state?.verifyResults).toBeUndefined();
+        return;
+      }
+      expect(record?.verifiedSha).toBe(record?.result?.executionProvenance?.sha);
+      const row = state?.verifyResults?.[0]?.criteria[0];
+      expect(row?.status).toBe(mode === "outcome-fail" ? "unmet" : "blocked");
+      expect(row?.gateEvidence).toBeUndefined();
+      if (mode === "outcome-fail") {
+        expect(implementationPrompts[1]).toContain("AC-1");
+        expect(implementationPrompts[1]).toContain("verifier test timed out");
+      } else {
+        expect(verifierCalls).toBe(1);
+        expect(row?.evidence).toContain("acceptance remains unconfirmed");
+        expect(row?.evidence).toContain("verifier test timed out");
+        expect(row?.evidence).toContain("Factory covering test x.test.ts › passes 0");
+        expect(f.store.getRun(run.id)?.error).toContain("verification blocked by the environment");
+        expect(state?.round).toBe(0);
+        const artifact = preDeliveryArtifact;
+        expect(artifact).not.toContain("modelOutput");
+        if (mode === "outcome-private") {
+          expect(artifact).not.toContain("private covering expected response");
+          expect(f.store.getRun(run.id)?.error).not.toContain("private covering expected response");
+          expect(state?.terminalReason).not.toContain("private covering expected response");
+          expect(implementationPrompts.join("\n")).not.toContain("private covering expected response");
+        } else {
+          expect(artifact).toContain("verifier test timed out");
+          expect(artifact).toContain("Factory covering test x.test.ts › passes 0");
+        }
+      }
+      return;
+    }
     const limited = mode.endsWith("limit");
     expect(terminal, JSON.stringify({ error: f.store.getRun(run.id)?.error, state: state?.lastVerify })).toBe(
       limited || terminator || mode === "forged-citation" || mode === "empty" || mode === "skip"
