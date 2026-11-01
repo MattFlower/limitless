@@ -1,7 +1,7 @@
 import { dlopen, FFIType, ptr, toArrayBuffer } from "bun:ffi";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { sep } from "node:path";
+import { resolve, sep } from "node:path";
 
 // libproc and KERN_PROCARGS2 are also what macOS ps uses. Unlike ps, these calls
 // don't require launching a setuid executable (which worker sandboxes deny).
@@ -94,18 +94,30 @@ function darwinDescendant(
 
 function darwinCwdDirectories(directories: readonly string[]): string[] {
   if (!directories.length) return [];
+  const home = homedir();
+  const homes = [resolve(home)];
   try {
-    const home = realpathSync(homedir());
-    const roots = directories.map((directory) => realpathSync(directory));
-    // A broad root invalidates cwd ownership for the whole invocation, including
-    // scratch. Revalidate persisted roots too; older records have no safety check.
-    return roots.some((root) => root === sep || root === home || home.startsWith(`${root}${sep}`))
-      ? []
-      : roots;
-  } catch {
-    // An unchecked home or root must never establish ownership.
-    return [];
+    homes.push(realpathSync(home));
+  } catch {} // Gates deny home reads; independently validated roots still grant ownership.
+  const broad = (root: string) =>
+    root === sep || homes.some((home) => root === home || home.startsWith(`${root}${sep}`));
+  // A broad root invalidates cwd ownership for the whole invocation, including
+  // scratch. Revalidate persisted roots too; older records have no safety check.
+  if (directories.some((directory) => broad(resolve(directory)))) return [];
+  const roots: string[] = [];
+  for (const directory of directories) {
+    let root: string;
+    try {
+      root = realpathSync(directory);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") continue;
+      throw new Error(`Process cwd root validation failed (${code ?? "unknown"})`, { cause: error });
+    }
+    if (broad(root)) return [];
+    roots.push(root);
   }
+  return roots;
 }
 
 export function hiddenDarwinProcessMember(...args: Parameters<typeof hiddenDarwinMember>): boolean {

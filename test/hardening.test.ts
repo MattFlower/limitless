@@ -42,6 +42,7 @@ import {
   sh,
 } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { loadNativeInspection } from "./darwin-inspection-support.ts";
 import { expectProcessStopped } from "./process-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
@@ -55,40 +56,6 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const reserves = { claudeFiveHour: 0.8, claudeSevenDay: 0.85, codexWeekly: 0.9, codexFiveHour: 0.9 };
-
-async function loadNativeInspection(directory: string) {
-  const fixturePath = join(import.meta.dir, "darwin-inspection-fixture.ts");
-  const sourcePath = join(import.meta.dir, "../src/util/processes-darwin.ts");
-  const entry = join(directory, "native.ts");
-  writeFileSync(
-    entry,
-    `export * from ${JSON.stringify(sourcePath)}; export * from ${JSON.stringify(fixturePath)};`,
-  );
-  const build = await Bun.build({
-    entrypoints: [entry],
-    outdir: join(directory, "build"),
-    target: "bun",
-    plugins: [
-      {
-        name: "synthetic-libproc",
-        setup(builder) {
-          // Bun keeps built-in modules external; redirect the native import before bundling.
-          builder.onLoad({ filter: /processes-darwin\.ts$/ }, async (args) => ({
-            contents: (await Bun.file(args.path).text())
-              .replace('from "bun:ffi";', `from ${JSON.stringify(fixturePath)};`)
-              .replace('from "node:os";', `from ${JSON.stringify(fixturePath)};`),
-            loader: "ts",
-          }));
-        },
-      },
-    ],
-  });
-  expect(build.success).toBe(true);
-  const output = build.outputs[0];
-  if (!output) throw new Error("No synthetic native inspection build output");
-  return (await import(output.path)) as typeof import("../src/util/processes-darwin.ts") &
-    typeof import("./darwin-inspection-fixture.ts");
-}
 
 describe("process handling", () => {
   test("Linux ancestry fails closed when an ancestor disappears or is inaccessible", () => {
@@ -328,6 +295,8 @@ describe("process handling", () => {
     "home-alias",
     "ancestor-alias",
     "symlinked-home",
+    "home-trailing",
+    "home-dotdot",
   ] as const)("Darwin cwd discovery refuses unsafe %s roots", async (scenario) => {
     const native = await loadNativeInspection(dir);
     const users = join(dir, "users");
@@ -353,6 +322,8 @@ describe("process handling", () => {
       "home-alias": { roots: [join(dir, "home-alias"), scratch], cwd: scratch },
       "ancestor-alias": { roots: [join(dir, "ancestor-alias"), scratch], cwd: scratch },
       "symlinked-home": { roots: [home], cwd: checkout },
+      "home-trailing": { roots: [`${home}///`, scratch], cwd: scratch },
+      "home-dotdot": { roots: [`${checkout}/..`, scratch], cwd: scratch },
     };
     const { roots, cwd } = cases[scenario];
     native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: cwd } });
@@ -385,7 +356,7 @@ describe("process handling", () => {
   });
 
   test.each(["home", "root"] as const)(
-    "Darwin cwd discovery refuses an unresolvable %s while preserving independent membership",
+    "Darwin cwd discovery retains surviving roots with an unresolvable %s",
     async (missing) => {
       const native = await loadNativeInspection(dir);
       const home = join(dir, "home");
@@ -405,12 +376,74 @@ describe("process handling", () => {
           new Set([process.pid]),
         );
       native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: scratch } });
-      expect(selected()).not.toContain(native.unreadablePid);
+      expect(selected()).toContain(native.unreadablePid);
       native.setMemberMarker("this-invocation");
       native.setUnreadableProcess({ parent: native.memberPid, born: { errno: 1 }, cwd: { errno: 1 } });
       expect(selected().sort()).toEqual([native.memberPid, native.unreadablePid]);
     },
   );
+
+  test("unreadable Darwin home preserves safe roots and refuses its configured spelling", async () => {
+    const native = await loadNativeInspection(dir);
+    const home = join(dir, "home");
+    const checkout = join(home, "checkout");
+    const scratch = join(dir, "scratch");
+    mkdirSync(checkout, { recursive: true });
+    mkdirSync(scratch);
+    native.setHome(`${home}/./`);
+    native.setRealpathFailure({ path: home, code: "EACCES" });
+    for (const cwd of [checkout, scratch]) {
+      native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: cwd } });
+      for (const roots of [
+        [checkout, scratch],
+        [home, scratch],
+        [dir, scratch],
+      ]) {
+        const expected = roots[0] === checkout;
+        expect(
+          native
+            .markedDarwinProcesses(
+              process.getuid?.() ?? 0,
+              "unmarked",
+              native.leaderPid,
+              2000,
+              roots,
+              null,
+              new Set([process.pid]),
+            )
+            .includes(native.unreadablePid),
+        ).toBe(expected);
+        expect(
+          native.hiddenDarwinProcessMember(
+            42,
+            new Map([[42, 1]]),
+            new Set(),
+            2000,
+            roots,
+            () => 2000,
+            () => ({ path: cwd }),
+          ),
+        ).toBe(expected);
+      }
+    }
+    // A case alias is meaningful only on a filesystem that resolves it to this home.
+    native.setRealpathFailure(null);
+    const caseAlias = join(dir, "HOME");
+    if (existsSync(caseAlias)) {
+      native.setHome(home);
+      expect(
+        native.hiddenDarwinProcessMember(
+          42,
+          new Map([[42, 1]]),
+          new Set(),
+          2000,
+          [caseAlias, scratch],
+          () => 2000,
+          () => ({ path: scratch }),
+        ),
+      ).toBe(false);
+    }
+  });
 
   test("unsafe Darwin roots preserve marker, ancestry and session/group discovery without cwd", async () => {
     const native = await loadNativeInspection(dir);
@@ -1138,6 +1171,8 @@ describe("process handling", () => {
 
   test("cwd permission errors are ignored only under the read allowlist", async () => {
     const native = await loadNativeInspection(dir);
+    native.setHome(`${dir}-unreadable-home`);
+    native.setRealpathFailure({ path: native.homedir(), code: "EACCES" });
     const decide = (errno: number) =>
       native.hiddenDarwinProcessMember(
         42,

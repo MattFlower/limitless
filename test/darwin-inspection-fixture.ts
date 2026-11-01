@@ -1,3 +1,6 @@
+import { realpathSync as fsRealpathSync } from "node:fs";
+import { resolve } from "node:path";
+
 // Synthetic libproc snapshots: a visible member carries no invocation marker.
 export const leaderPid = 424242;
 export const memberPid = 424243;
@@ -18,6 +21,16 @@ let memberMarker: string | null = null;
 let errno = 3;
 let readAllowlist = false;
 let home = "/";
+
+let realpathFailure: { path: string; code: string } | null = null;
+export function setRealpathFailure(value: typeof realpathFailure): void {
+  realpathFailure = value;
+}
+export function realpathSync(path: string): string {
+  if (realpathFailure && resolve(path) === resolve(realpathFailure.path))
+    throw Object.assign(new Error("injected path validation failure"), { code: realpathFailure.code });
+  return fsRealpathSync(path);
+}
 
 export const homedir = () => home;
 export function setHome(value: string): void {

@@ -35,6 +35,7 @@ import {
   runProcess,
 } from "../src/util/proc.ts";
 import { seatbeltSkip } from "./confinement.ts";
+import { loadNativeInspection } from "./darwin-inspection-support.ts";
 import { expectProcessStopped } from "./process-support.ts";
 
 const test = (name: string, run: () => Promise<void>, timeout?: number) =>
@@ -550,6 +551,96 @@ test("unknown boot requires current ownership before signalling recorded identit
     kill.mockRestore();
   }
 });
+
+for (const source of ["cleanup", "discovery", "both-denied"] as const) {
+  test(`reopened Darwin ${source} roots preserve recovery coverage and evidence`, async () => {
+    const native = await loadNativeInspection(directory);
+    const scratch = join(directory, "scratch");
+    mkdirSync(scratch);
+    native.setLeaderBirth(null);
+    native.setUnreadableProcess({ parent: 1, born: 2n, cwd: { path: directory } });
+    const discovery = {
+      group: native.leaderPid,
+      started: 2000,
+      directories: [scratch, directory],
+      leader: { pid: native.leaderPid, birth: "1:0", session: native.leaderPid, group: native.leaderPid },
+      spawnedAt: "0",
+    };
+    const row: ProcessCleanup = {
+      runId: "a",
+      invocation: "vanished-leader",
+      directory,
+      pid: native.leaderPid,
+      birth: "1:0",
+      boot: "test-boot",
+      createdAt: 0,
+      discovery,
+    };
+    store.close();
+    const database = join(directory, "roots.db");
+    store = new Store(database);
+    if (source !== "discovery") store.recordProcessCleanup(row);
+    if (source !== "cleanup") store.recordProcessDiscovery({ ...row, discovery });
+    store.close();
+    rmSync(scratch, { recursive: true });
+    store = new Store(database);
+    if (source === "both-denied") native.setRealpathFailure({ path: directory, code: "EACCES" });
+    let alive = true;
+    const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      expect(pid).toBe(native.unreadablePid);
+      expect(signal).toBe("SIGKILL");
+      // Evidence must exist before signalling and until quiescence is confirmed.
+      expect(store.listProcessCleanups().some((entry) => entry.pid === pid)).toBe(true);
+      alive = false;
+      native.setUnreadableProcess(null);
+      return true;
+    });
+    try {
+      await processRecoveryInspection.run(
+        {
+          stopped: (pid) => pid !== native.unreadablePid || !alive,
+          birth: async (pid) => (pid === native.unreadablePid && alive ? "2:0" : null),
+          timeoutMs: 1000,
+          discover: async (marker, group, started, roots, leader, protectedPids, spawnedAt) => {
+            expect(leader).toBeNull();
+            return native.markedDarwinProcesses(
+              process.getuid?.() ?? 0,
+              marker,
+              group,
+              started,
+              roots,
+              leader,
+              protectedPids,
+              spawnedAt,
+            );
+          },
+        },
+        async () => {
+          if (source === "both-denied") {
+            const cleanups = store.listProcessCleanups();
+            const discoveries = store.listProcessDiscoveries();
+            await expect(recoverProcessCleanups(store)).rejects.toThrow(
+              "Process cwd root validation failed (EACCES)",
+            );
+            store.close();
+            store = new Store(database);
+            await expectRecoveryRefusal("Process cwd root validation failed (EACCES)");
+            expect(store.listProcessCleanups()).toEqual(cleanups);
+            expect(store.listProcessDiscoveries()).toEqual(discoveries);
+            expect(kill).not.toHaveBeenCalled();
+          } else {
+            await recoverProcessCleanups(store);
+            expect(kill.mock.calls).toEqual([[native.unreadablePid, "SIGKILL"]]);
+            expect(store.listProcessCleanups()).toEqual([]);
+            expect(store.listProcessDiscoveries()).toEqual([]);
+          }
+        },
+      );
+    } finally {
+      kill.mockRestore();
+    }
+  });
+}
 
 test("discovery context survives reopening and legacy-column inserts remain compatible", async () => {
   const row = await sleeper();
