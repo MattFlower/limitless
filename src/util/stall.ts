@@ -17,21 +17,21 @@ export class StallReporter {
     return entry;
   }
 
-  private record(entry: Activity | undefined, start: number) {
+  private record(entry: Activity | undefined, duration: number) {
     if (!entry) return;
-    const duration = this.now() - start;
     entry.count++;
     entry.total += duration;
     entry.max = Math.max(entry.max, duration);
   }
 
-  activity<T>(name: string, fn: () => T): T {
-    const entry = this.entry(name),
+  activity<T>(name: string, fn: () => T, minMs?: number): T {
+    const entry = minMs === undefined ? this.entry(name) : undefined,
       start = this.now();
     try {
       return fn();
     } finally {
-      this.record(entry, start);
+      const duration = this.now() - start;
+      if (minMs === undefined || duration > minMs) this.record(entry ?? this.entry(name), duration);
     }
   }
 
@@ -50,7 +50,7 @@ export class StallReporter {
         entry.active--;
         entry.starts -= start;
       }
-      this.record(entry, start);
+      this.record(entry, this.now() - start);
     };
   }
 
