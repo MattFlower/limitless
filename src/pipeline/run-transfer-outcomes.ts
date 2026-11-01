@@ -6,9 +6,19 @@ import * as s from "./schemas.ts";
 
 const object = z.strictObject,
   text = z.string();
+function knownMembers(input: unknown, parsed: unknown): boolean {
+  if (!input || typeof input !== "object") return true;
+  if (!parsed || typeof parsed !== "object") return false;
+  return Object.keys(input).every(
+    (key) => Object.hasOwn(parsed, key) && knownMembers(Reflect.get(input, key), Reflect.get(parsed, key)),
+  );
+}
 // Validate stored model bodies without applying defaults, trims, catches or clamps.
 export const storedInput = <S extends z.ZodType>(schema: S) =>
-  z.custom<z.input<S>>((v) => schema.safeParse(v).success);
+  z.custom<z.input<S>>((v) => {
+    const parsed = schema.safeParse(v);
+    return parsed.success && knownMembers(v, parsed.data);
+  });
 const finding = s.StoredReviewSchema.shape.findings.element.extend({
   label: r.oneOf("unaddressed regression new").optional(),
   prior: text.optional(),

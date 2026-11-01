@@ -38,7 +38,7 @@ export const transferControlSchema = object({
     ...r.fields("baseSha headSha", r.oid),
     initialComplete: z.boolean().optional(),
   }).optional(),
-  reviewBaseSha: r.oid.optional(),
+  ...r.fields("reviewBaseSha iterationBase", r.oid.optional()),
   reviewResolution: object({ sha: r.oid.optional(), feedback: text.optional() }).optional(),
   conflictFiles: z.array(text).optional(),
 
@@ -70,6 +70,7 @@ export const controlCommitMembers = [
   "verification.baseSha",
   "verification.headSha",
   "reviewBaseSha",
+  "iterationBase",
   "reviewResolution.sha",
   "publishedSha",
   "publishingSha",

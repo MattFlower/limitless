@@ -154,10 +154,11 @@ export const decodeTransferRun = boundary(
     }
     if (ref?.kind === "review-round" && "reviewedSha" in ref) json.parseTransferOid(ref.reviewedSha);
     if (repo.kind !== "github") throw new RunTransferError("unsupported");
+    const slug = repo.slug.toLowerCase();
     if (
-      run.repoSlug !== repo.slug ||
+      run.repoSlug.toLowerCase() !== slug ||
       ((ref?.kind === "issue" || ref?.kind === "pull_request") &&
-        (ref.repo !== repo.slug || json.parseTransferCounter(ref.number) === 0))
+        (identity.parse(ref.repo).toLowerCase() !== slug || json.parseTransferCounter(ref.number) === 0))
     )
       throw new RunTransferError(code);
     return run;
