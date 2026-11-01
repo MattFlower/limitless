@@ -5,6 +5,7 @@ import { CommentProcessed, ISSUE_CLAIM_STATUSES, type IssueRunSummary, linkedIss
 import { acceptanceRunRequest } from "../pipeline/acceptance.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
+import { defectRecordStatus, parseDefectEnvelope } from "./defect-publication.ts";
 import {
   ANSWER_UNSUPPORTED,
   commentRunRequest,
@@ -14,7 +15,7 @@ import {
   reservedAnswer,
   runGh,
 } from "./github.ts";
-import { githubIdentity } from "./github-identity.ts";
+import { type GitHubIdentity, githubIdentity } from "./github-identity.ts";
 import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "./issue-lifecycle.ts";
 import { ISSUE_TEXT_FIELDS, issueTextRefusal, issueTextSchema } from "./issue-trust.ts";
 
@@ -47,7 +48,8 @@ const issueSchema = z.object({
     }),
   ),
   state: z.enum(["OPEN", "CLOSED"]),
-  author: actor,
+  author: z.object({ login: z.string(), __typename: z.string().optional() }).nullable(),
+  includesCreatedEdit: z.boolean().nullable().optional(),
   editor: actor,
   lastEditedAt: date.nullable(),
   parent: issueTextSchema.nullable(),
@@ -185,6 +187,7 @@ export function issueEligibility(
     claim?: Run | null;
     latest?: IssueRunSummary | null;
     failureBoundary?: number | null;
+    defect?: { repo: string; factoryRepo?: string | null; identity?: GitHubIdentity | null };
   } = {},
 ): { eligible: true; priority: number } | { eligible: false; reason: string } {
   const trusts = (login: string | undefined) =>
@@ -214,7 +217,20 @@ export function issueEligibility(
         ) > failedIndex,
     );
   const failed = issue.labels.nodes.some((l) => l.name === "limitless:failed");
-  const textRefusal = issueTextRefusal(issue, trusted);
+  const origin = context.defect;
+  const envelope =
+    origin?.factoryRepo &&
+    origin.repo.toLowerCase() === origin.factoryRepo.toLowerCase() &&
+    origin.identity?.kind === "app" &&
+    issue.author?.__typename === "Bot" &&
+    issue.labels.nodes.some((l) => l.name === "defect")
+      ? parseDefectEnvelope(issue.body, "issue")
+      : undefined;
+  const authenticated =
+    !!envelope?.signature &&
+    origin?.identity?.kind === "app" &&
+    defectRecordStatus(issue, origin.identity, envelope.signature, "issue") === "match";
+  const textRefusal = issueTextRefusal(issue, trusted, authenticated);
   let reason = "";
   if (issue.state !== "OPEN") reason = "issue is closed";
   else if (textRefusal) reason = textRefusal;
@@ -255,7 +271,7 @@ export function issueEligibility(
     : { eligible: true, priority: Math.min(...approved.map((l) => Number(l.name.slice(9)))) };
 }
 
-const ISSUE_FIELDS = `${ISSUE_TEXT_FIELDS} title createdAt updatedAt state
+const ISSUE_FIELDS = `${ISSUE_TEXT_FIELDS} author { login __typename } includesCreatedEdit title createdAt updatedAt state
   parent { ${ISSUE_TEXT_FIELDS} }
   comments(last: 20) { totalCount nodes { databaseId body createdAt lastEditedAt author { login } } }
   labels(first:100) { totalCount nodes { name } } subIssuesSummary { total }
@@ -295,6 +311,12 @@ export function startIssueQueue(
   let retryNotBefore = 0;
   let nextTickAt = Infinity;
   let timer: ReturnType<typeof setTimeout>;
+  const identities = new Map<string, GitHubIdentity | null>();
+  const defect = (repo: string) => ({
+    repo,
+    factoryRepo: factory.cfg.githubDefects?.enabled ? factory.cfg.githubDefects.factoryRepo : null,
+    identity: identities.get(repo),
+  });
   const query = async (repo: string, fields: string) => {
     const [owner, name] = repo.split("/");
     const raw = await gh(
@@ -435,6 +457,7 @@ export function startIssueQueue(
           if (stopped) break;
           const identity = await (opts.lifecycle?.identity ?? githubIdentity)(repo).catch(() => null);
           if (stopped) break;
+          identities.set(repo, identity);
           const observed = new Map(issues.nodes.map((i) => [issueKey(repo, i.number), i]));
           factory.store.reconcileEpicAttention(
             repo,
@@ -518,6 +541,7 @@ export function startIssueQueue(
               }
             }
             const result = issueEligibility(issue, q.trusted, {
+              defect: defect(repo),
               blockers: states,
               claim: factory.store.issueClaim(repo, issue.number),
               ...latestContext(repo, issue.number, latest.get(issue.number)),
@@ -542,6 +566,7 @@ export function startIssueQueue(
       for (const { repo, issue, priority, states } of candidates) {
         if (stopped || factory.scheduler.draining) break;
         const current = issueEligibility(issue, q.trusted, {
+          defect: defect(repo),
           blockers: states,
           claim: factory.store.issueClaim(repo, issue.number),
           ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
@@ -557,6 +582,7 @@ export function startIssueQueue(
           const deferred = changedDuringPoll(repo, issue.number);
           if (deferred) return deferred;
           const eligibility = issueEligibility(issue, factory.cfg.githubQueue?.trusted ?? [], {
+            defect: defect(repo),
             blockers: states,
             ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
           });

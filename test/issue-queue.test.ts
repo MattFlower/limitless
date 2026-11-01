@@ -91,6 +91,98 @@ function acceptanceIssue(): QueueIssue {
   return i;
 }
 
+const defectApp = { kind: "app", botLogin: "factory[bot]", token: "fake-app-token" } as const;
+function defectIssue(): QueueIssue {
+  const i = issue();
+  i.author = { login: "factory", __typename: "Bot" };
+  i.body = `<!-- limitless-defect:v1:issue:${"a".repeat(64)}:${"b".repeat(32)} -->\nFactory evidence`;
+  i.includesCreatedEdit = false;
+  i.labels.nodes.push({ name: "defect" });
+  i.labels.totalCount++;
+  return i;
+}
+
+test.each([
+  ["trusted priority", null],
+  ["case-insensitive bot", null],
+  ["no priority", "no priority label"],
+  ["app priority", "priority application is untrusted or missing"],
+  ["missing actor", "priority application is untrusted or missing"],
+  ["wrong repo", "untrusted author"],
+  ["disabled", "untrusted author"],
+  ["no defect label", "untrusted author"],
+  ["no envelope", "untrusted author"],
+  ["edited", "untrusted author"],
+  ["untrusted edit history", "untrusted body editor: stranger"],
+  ["untrusted title", "untrusted title editor"],
+  ["incomplete", "incomplete issue evidence"],
+  ["unrelated bot", "untrusted author"],
+  ["human masquerading", "untrusted author"],
+  ["human slug", "untrusted author"],
+  ["unknown provenance", "untrusted author"],
+] as const)("authenticated App defect queue admission: %s", (mode, reason) => {
+  const i = defectIssue();
+  const defect = { repo: "OWNER/REPO", factoryRepo: "owner/repo" as string | null, identity: defectApp };
+  if (mode === "no priority") {
+    i.labels.nodes.shift();
+    i.labels.totalCount--;
+  }
+  if (mode === "app priority" || mode === "missing actor") {
+    const e = i.timelineItems.nodes[0];
+    if (e) e.actor = mode === "app priority" ? { login: defectApp.botLogin } : null;
+  }
+  if (mode === "wrong repo") defect.repo = "owner/product";
+  if (mode === "disabled") defect.factoryRepo = null;
+  if (mode === "no defect label") {
+    i.labels.nodes.pop();
+    i.labels.totalCount--;
+  }
+  if (mode === "no envelope") i.body = "missing evidence";
+  if (mode === "edited") {
+    i.lastEditedAt = at;
+    i.editor = { login: "stranger" };
+  }
+  if (mode === "untrusted edit history") i.userContentEdits.nodes.push({ editor: { login: "stranger" } });
+  if (mode === "untrusted title") {
+    i.timelineItems.nodes.push({
+      __typename: "RenamedTitleEvent",
+      actor: { login: "stranger" },
+      createdAt: at,
+    });
+    i.timelineItems.totalCount++;
+  }
+  if (mode === "incomplete") i.timelineItems.totalCount++;
+  if (mode === "unrelated bot") i.author = { login: "unrelated", __typename: "Bot" };
+  if (mode === "case-insensitive bot") i.author = { login: "FaCtOrY", __typename: "Bot" };
+  if (mode === "human slug") i.author = { login: "factory", __typename: "User" };
+  if (mode === "human masquerading") i.author = { login: defectApp.botLogin, __typename: "User" };
+  if (mode === "unknown provenance") delete i.includesCreatedEdit;
+  const trusted = ["owner"];
+  expect(issueEligibility(i, trusted, { defect })).toEqual(
+    reason ? { eligible: false, reason } : { eligible: true, priority: 1 },
+  );
+  expect(trusted).toEqual(["owner"]);
+});
+
+test("poll and final admission retain trusted-human approval for authenticated factory defects", async () => {
+  const h = harness();
+  h.cfg.githubDefects = { enabled: true, factoryRepo: "owner/repo", dailyCap: 10 };
+  h.identity = async () => defectApp;
+  const i = defectIssue();
+  const e = i.timelineItems.nodes[0];
+  if (!e) throw new Error("missing label event");
+  e.actor = { login: defectApp.botLogin };
+  h.data.set("owner/repo", [i]);
+  h.start();
+  await h.advance();
+  expect(h.requests).toEqual([]);
+  e.actor = { login: "owner" };
+  await h.advance(180_000);
+  expect(h.requests).toHaveLength(1);
+  expect(h.runs()).toMatchObject([{ requestedBy: "factory", sourceRef: { kind: "issue", number: 1 } }]);
+  expect(h.cfg.githubQueue?.trusted).toEqual(["owner"]);
+});
+
 test("queue routes trusted acceptance tickets without creating a build", async () => {
   const h = harness();
   const i = acceptanceIssue();
