@@ -134,8 +134,19 @@ const manifestV2Schema = manifestSchema.extend({
   phase: z.enum(["prepare", "triage", "clarify", "spec", "loop", "deliver", "accept", "done"]),
 });
 export type ManifestV2 = z.infer<typeof manifestV2Schema>;
-export type PortableManifest = ManifestV1 | ManifestV2;
-const portableManifestSchema = z.discriminatedUnion("schema", [manifestSchema, manifestV2Schema]);
+const manifestV3Schema = manifestV2Schema.extend({
+  schema: z.literal(3),
+  blobs: manifestV2Schema.shape.blobs.extend({
+    artifacts: z.array(blobSchema.extend({ role: z.enum(["artifact", "holdout"]) })),
+  }),
+});
+export type ManifestV3 = z.infer<typeof manifestV3Schema>;
+export type PortableManifest = ManifestV1 | ManifestV2 | ManifestV3;
+const portableManifestSchema = z.discriminatedUnion("schema", [
+  manifestSchema,
+  manifestV2Schema,
+  manifestV3Schema,
+]);
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value !== null && typeof value === "object")
@@ -151,11 +162,11 @@ export function effectId(id: string, intent: EffectIntent): string {
   return `fx1-${hash(canonical({ runId: runId.parse(id), intent: intentSchema.parse(intent) })).slice(0, 32)}`;
 }
 export function formatManifest(m: PortableManifest): string {
-  if (typeof m.schema === "number" && m.schema !== 1 && m.schema !== 2)
+  if (typeof m.schema === "number" && m.schema !== 1 && m.schema !== 2 && m.schema !== 3)
     throw new RunTransferError("unsupported");
   if (m.schema === 1) return canonical(manifestSchema.parse(m));
   try {
-    return canonical(manifestV2Schema.parse(m));
+    return canonical((m.schema === 3 ? manifestV3Schema : manifestV2Schema).parse(m));
   } catch (error) {
     rethrowRunTransfer(error, "invalid");
   }
@@ -172,12 +183,13 @@ export function parseManifest(text: string): PortableManifest | "malformed" | { 
       "schema" in value &&
       typeof value.schema === "number" &&
       value.schema !== 1 &&
-      value.schema !== 2
+      value.schema !== 2 &&
+      value.schema !== 3
     )
       return { unsupported: value.schema };
     const parsed = portableManifestSchema.safeParse(value);
     if (!parsed.success) return "malformed";
-    if (parsed.data.schema === 2 && canonical(parsed.data) !== text) return "malformed";
+    if (parsed.data.schema !== 1 && canonical(parsed.data) !== text) return "malformed";
     return parsed.data;
   } catch {
     return "malformed";

@@ -116,3 +116,10 @@ export const redactGateDiagnostics = <T extends GateResult>(result: T): T => ({
 export function redactGateStreams(stdout: string, stderr: string) {
   return { stdout: redactGateOutput(stdout), stderr: redactGateOutput(stderr) };
 }
+
+/** Decode JSON before sanitizing escaped credentials and terminal controls. */
+export function sanitizeArtifact(name: string, content: string): string {
+  return name.endsWith(".json")
+    ? JSON.stringify(redactGateData(JSON.parse(content)), null, content.includes("\n") ? 2 : undefined)
+    : redactGateOutput(content);
+}
