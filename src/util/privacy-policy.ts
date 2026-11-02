@@ -19,7 +19,8 @@ export function provisionPrivacyPolicy(
     try {
       const file = stat(join(configDir, "private-strings.txt"));
       const next = file ? `${file.dev}/${file.ino}/${file.size}/${file.mtimeMs}/${file.ctimeMs}` : "missing";
-      if (registry.ready && next === stamp) return;
+      // stat follows links: a missing target still needs the loader's dangling-link validation.
+      if (registry.ready && file && next === stamp) return;
       registry.replacePolicy(load(configDir, roots));
       stamp = next;
       failed = false;

@@ -43,12 +43,12 @@ test("policy freshness loads changes once, preserves equivalent authority, refus
     expect(registry.generation.policy).toBe(0);
     expect(check().withheld).toBe(false);
     expect(check('{"key":["safe","fine"]}', true).withheld).toBe(false);
-    expect(loads).toBe(1);
+    expect(loads).toBe(3);
     writeFileSync(file, "alpha-entry");
     expect(check("alpha-entry")).toMatchObject({ withheld: true, reason: "private-match" });
     const generation = registry.generation;
     check();
-    expect(loads).toBe(2);
+    expect(loads).toBe(4);
     writeFileSync(file, "# comment\nalpha-entry\nalpha-entry\n");
     check();
     expect(registry.generation).toEqual(generation);

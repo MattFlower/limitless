@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Worker } from "node:worker_threads";
@@ -1581,6 +1581,43 @@ test.each(["deadline", "dispose"])("a %s terminates a worker still starting", as
   await disposed;
   expect(terminated).toEqual(["terminated"]);
 });
+
+test.each(["text", "data", "worker"])(
+  "%s refuses a dangling symlink after missing-file provisioning",
+  async (kind) => {
+    const dir = mkdtempSync(join(tmpdir(), "privacy-symlink-"));
+    const registry = b.createPrivacyRegistry(undefined, undefined, true),
+      f = fixture({ registry }),
+      logs: string[] = [];
+    const file = join(dir, "private-strings.txt");
+    try {
+      provisionPrivacyPolicy(dir, [], { registry, log: (line) => logs.push(line) });
+      const policy = b.preparePrivacyPolicy(registry.snapshot());
+      expect(b.consumeBoundaryText(b.protectText({ ...input(), policy }, { registry })).withheld).toBe(false);
+      symlinkSync(join(dir, "missing-target"), file);
+      if (kind === "worker") {
+        const pending = f.send();
+        await f.run();
+        await withheld(pending, "unreadable-policy");
+      } else {
+        const receipt =
+          kind === "data"
+            ? b.protectData({ json: "{}", provenance: input().provenance, policy }, { registry })
+            : b.protectText({ ...input(), policy }, { registry });
+        expect(b.consumeBoundaryText(receipt)).toMatchObject({ withheld: true, reason: "unreadable-policy" });
+      }
+      expect(f.ports).toHaveLength(0);
+      expect(logs).toEqual(["Privacy policy unavailable; privacy checks will refuse."]);
+      rmSync(file);
+      const recovered = f.send();
+      await f.run();
+      expect(read(await recovered).withheld).toBe(false);
+    } finally {
+      await f.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("process checker shares lazy workers, refreshes authority and awaits retirement", async () => {
   const dir = mkdtempSync(join(tmpdir(), "privacy-checker-"));
