@@ -1,9 +1,17 @@
 import { expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import type { Worker } from "node:worker_threads";
 import * as b from "../src/util/privacy-boundary.ts";
 import {
   createPrivacyChecker,
   type PrivacyWorkerPort,
+  PrivacyWorkerUnavailable,
+  privacyWorkerEntries,
+  privacyWorkerEntry,
   privacyWorkerHandler,
+  startPrivacyWorker,
 } from "../src/util/privacy-checker.ts";
 import * as c from "../src/util/privacy-chunks.ts";
 import * as t from "../src/util/privacy-transport.ts";
@@ -880,6 +888,43 @@ test("disposal during startup retires the eventual worker and ignores late outpu
   expect(p.sent).toHaveLength(0);
 });
 
+test.each([false, true])(
+  "disposal while acquiring a stalled worker terminates it (async factory: %p)",
+  async (later) => {
+    for (let depth = 0; depth < 8; depth++) {
+      let constructed = 0,
+        terminated = 0;
+      const stalled = () =>
+        startPrivacyWorker(
+          "unused",
+          () =>
+            Object.assign(new EventEmitter(), {
+              ...{ postMessage() {}, ref() {}, unref() {} },
+              terminate: async () => void terminated++,
+            }) as unknown as Worker,
+        );
+      const factory = () => {
+        constructed++;
+        return stalled();
+      };
+      const checker = createPrivacyChecker({
+        registry: b.createPrivacyRegistry(),
+        workerFactory: later ? async () => factory() : factory,
+      });
+      const request = checker.protectText(input());
+      let microtasks = Promise.resolve();
+      for (let i = 0; i < depth; i++) microtasks = microtasks.then();
+      await microtasks;
+      const timer = Promise.withResolvers<string>();
+      const handle = setTimeout(() => timer.resolve("dispose still pending"), 200);
+      const outcome = await Promise.race([checker.dispose().then(() => "disposed"), timer.promise]);
+      clearTimeout(handle);
+      expect([depth, outcome, terminated]).toEqual([depth, "disposed", constructed]);
+      expect(read(await request).reason).toBe("checker-failed");
+    }
+  },
+);
+
 test("unreadable authority and core admission failures withhold", async () => {
   let broken = false;
   const registry = b.createPrivacyRegistry(undefined, () => {
@@ -1425,4 +1470,110 @@ test("omitted optional result metadata and local refusals below marker caps rema
   await withheld(small.send(), "input-length");
   expect(small.ports).toHaveLength(0);
   await small.dispose();
+});
+
+const releases = {
+  source: { kind: "source", root: "/checkout", version: "1.0.0", bun: "1" },
+  packaged: { kind: "packaged", sha: "a".repeat(40), version: "1.0.0", bun: "1" },
+} as const;
+const missing = join(import.meta.dir, "missing-privacy-worker.js");
+function resolvers(source: string, packaged: string, calls: string[]) {
+  return {
+    source: (root: string) => {
+      calls.push(`source:${root}`);
+      return source;
+    },
+    packaged: () => {
+      calls.push("packaged");
+      return packaged;
+    },
+  };
+}
+
+test("worker entry resolution uses only the release's own entry", () => {
+  const calls: string[] = [];
+  const [own, other] = [import.meta.path, join(import.meta.dir, "privacy-support.ts")];
+  expect(privacyWorkerEntry(releases.source, resolvers(own, other, calls))).toBe(own);
+  expect(privacyWorkerEntry(releases.packaged, resolvers(own, other, calls))).toBe(other);
+  expect(() => privacyWorkerEntry(releases.packaged, resolvers(own, missing, calls))).toThrow(
+    new PrivacyWorkerUnavailable("Missing packaged privacy worker entry"),
+  );
+  expect(() => privacyWorkerEntry(releases.source, resolvers(missing, own, calls))).toThrow(
+    new PrivacyWorkerUnavailable("Missing source privacy worker entry"),
+  );
+  expect(calls).toEqual(["source:/checkout", "packaged", "packaged", "source:/checkout"]);
+  expect(privacyWorkerEntries.packaged().endsWith("/util/privacy-worker.js")).toBe(true);
+  expect(existsSync(privacyWorkerEntries.source(join(import.meta.dir, "..")))).toBe(true);
+});
+
+const startups: Record<string, (worker: EventEmitter) => void> = {
+  "exits at startup": (worker) => queueMicrotask(() => worker.emit("exit", 1)),
+  "fails to load after online": (worker) =>
+    setImmediate(() => {
+      for (const event of ["online", "error", "exit"]) worker.emit(event);
+    }),
+  "throws on construction": () => {
+    throw new Error("not a worker");
+  },
+};
+function fakeWorker(startup = (_: EventEmitter) => {}, terminated: string[] = []) {
+  const worker = Object.assign(new EventEmitter(), {
+    ref() {},
+    unref() {},
+    postMessage() {},
+    terminate: async () => void terminated.push("terminated"),
+  });
+  startup(worker);
+  return worker as unknown as Worker;
+}
+
+test.each(["missing", ...Object.keys(startups)])(
+  "a %s worker entry withholds without another path",
+  async (mode) => {
+    const calls: string[] = [];
+    const constructed: string[] = [];
+    const sync = [spyOn(b, "protectText"), spyOn(b, "protectData")];
+    const checker = createPrivacyChecker({
+      registry: b.createPrivacyRegistry(),
+      workerFactory: () =>
+        startPrivacyWorker(
+          privacyWorkerEntry(
+            releases.packaged,
+            resolvers(missing, mode === "missing" ? missing : import.meta.path, calls),
+          ),
+          (path) => {
+            constructed.push(path);
+            return fakeWorker(startups[mode]);
+          },
+        ),
+    });
+    await withheld(checker.protectText(input()), "checker-unavailable");
+    await withheld(
+      checker.protectData({ json: "{}", provenance: { kind: "complete" } }),
+      "checker-unavailable",
+    );
+    expect(calls).toEqual(["packaged", "packaged"]);
+    expect(constructed).toEqual(mode === "missing" ? [] : [import.meta.path, import.meta.path]);
+    for (const spy of sync) {
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    }
+    await checker.dispose();
+  },
+);
+
+test.each(["deadline", "dispose"])("a %s terminates a worker still starting", async (mode) => {
+  const terminated: string[] = [];
+  const checker = createPrivacyChecker({
+    registry: b.createPrivacyRegistry(),
+    deadlineMs: mode === "deadline" ? 5 : 60_000,
+    workerFactory: () => startPrivacyWorker("entry", () => fakeWorker(undefined, terminated)),
+  });
+  const receipt = checker.protectText(input());
+  await new Promise((done) => setTimeout(done, 20));
+  expect(terminated).toEqual(mode === "deadline" ? ["terminated"] : []);
+  const disposed = checker.dispose();
+  await withheld(receipt, mode === "deadline" ? "checker-timeout" : "checker-failed");
+  await disposed;
+  expect(terminated).toEqual(["terminated"]);
 });

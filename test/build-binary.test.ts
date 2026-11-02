@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { buildConfig, buildSha, checkAssets, validateMetafile } from "../scripts/build-binary.ts";
 import { BUILD_DEFINES } from "../src/release.ts";
 import { sh } from "../src/util/proc.ts";
@@ -118,12 +118,13 @@ test("binary config seals autoloading and embeds only explicit identity", () => 
   const identity = { version: "3.2.1", sha: "d".repeat(40) };
   const config = buildConfig(identity, dir, dir);
   expect(config.outdir).toBe(dir);
-  expect(config.entrypoints).toHaveLength(1);
-  const entry = config.entrypoints?.[0];
-  expect(typeof entry).toBe("string");
-  if (typeof entry !== "string") throw new Error("Missing entrypoint");
+  expect(config.entrypoints).toHaveLength(2);
+  const [entry, worker] = config.entrypoints ?? [];
+  if (typeof entry !== "string" || typeof worker !== "string") throw new Error("Missing entrypoint");
   expect(entry.endsWith("/src/cli/main.ts")).toBe(true);
-  expect(existsSync(entry)).toBe(true);
+  // Bundled under the entries' common root (src), where the packaged privacy resolver looks.
+  expect(relative(join(entry, "../.."), worker)).toBe("util/privacy-worker.ts");
+  for (const path of [entry, worker]) expect(existsSync(path)).toBe(true);
   expect(config.target).toBe("bun");
   expect(config.format).toBe("esm");
   expect(config.bytecode).toBeFalsy();
