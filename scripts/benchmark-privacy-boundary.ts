@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, promises as fs } from "node:fs";
 import { arch, release, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { Worker } from "node:worker_threads";
 import { privacyLimits as L } from "../src/util/privacy-boundary.ts";
 import { agentEnv, runProcess } from "../src/util/proc.ts";
 
@@ -259,7 +260,103 @@ export async function measureRevision(a: API, fixture: () => ReturnType<typeof w
   const counts = { platform: r.platform, coverage, entries: entries.length, credentials: credentials.length };
   return { ...metadata, ...counts, availability, groups, decision: decideC21c(raw) };
 }
+type Fixture = ReturnType<typeof workload>;
+const ms = (u: { user: number; system: number }) => (u.user + u.system) / 1000;
+const busy = (w: Fixture) => ({ ...w, reason: "checker-busy", maximum: false });
+/** worker-all: the real checker, cold per trial, maximum policy. A daemon slice is wall time from entering daemon
+ * code to 64 microtask rounds after its latest entry; entries join one slice until a setImmediate heartbeat proves
+ * a real yield, so continuations count and awaiting the worker does not (see docs/privacy-boundaries.md). */
+export async function measureWorker(root: string, r = runtime) {
+  const load = (p: string) => import(join(root, `src/util/privacy-${p}.ts`));
+  const [b, k, c] = await Promise.all(["boundary", "checker", "chunks"].map(load));
+  const policy = workload("preparation");
+  const slots = "ascii-max astral-max recursive-max combined sparse form+1 forms+1 base64".split(" ");
+  const [bmp, eight] = [workload("bmp-max"), slots.map((n) => workload(n))];
+  const [groups, raw] = [{} as Record<string, unknown>, [] as (Trial & Record<string, unknown>)[]];
+  let [open, hops] = [undefined as { start: number; end: number; phases: Set<string> } | undefined, 0];
+  const tick = () => {
+    if (!open) return;
+    open.end = r.now();
+    if (--hops > 0) queueMicrotask(tick);
+  };
+  const own = <T>(phase: string, fn: () => T): T => {
+    open ??= { start: r.now(), end: 0, phases: new Set() };
+    open.phases.add(phase);
+    if (hops <= 0) queueMicrotask(tick);
+    hops = 64;
+    return fn();
+  };
+  const construct = (path: string, worker = new Worker(path), on = worker.on.bind(worker)) =>
+    Object.assign(worker, { on: (e: string, f: Fn) => on(e, (...a) => own(e, () => f(...a))) });
+  const consume = async (receipt: unknown, submitted: number) => {
+    const [latencyMs, parts] = [r.now() - submitted, [] as Uint8Array[]];
+    for (let i = 0; ; i++) {
+      const { bytes, done, ...metadata } = own("consume", () => c.consumeBoundaryChunk(receipt, i));
+      parts.push(bytes);
+      if (done) return { ...metadata, latencyMs, parts };
+      await r.pause(); // A consumer reads one bounded chunk per turn.
+    }
+  };
+  const series = async (label: string, jobs: Fixture[]) => {
+    const trials = [];
+    for (let trial = 0; trial < 7; trial++) {
+      r.gc();
+      await r.pause();
+      const registry = b.createPrivacyRegistry();
+      registry.replacePolicy(policy.entries);
+      policy.credentials.forEach(registry.addCredential);
+      const checker = k.createPrivacyChecker({
+        registry,
+        workerFactory: () => k.startPrivacyWorker(k.privacyWorkerEntry(), construct),
+        schedule: (f: () => void) => setImmediate(() => own("turn", f)),
+        setTimeout: (f: () => void, n: number) => setTimeout(() => own("timer", f), n),
+      });
+      const turns: [number, number, number, string][] = [];
+      const [idle, pending] = [[] as number[][], [] as unknown[]];
+      let [beating, last, heartbeat] = [true, r.now(), 0];
+      const beat = (now = r.now()) => {
+        if (open)
+          turns.push([open.start - start, open.end - open.start, now - last, [...open.phases].join()]);
+        else if (now - last > 2) idle.push([now - start, now - last]);
+        [open, last, heartbeat] = [undefined, now, heartbeat + 1];
+        if (beating) setImmediate(beat);
+      };
+      const [cpu, main, start] = [process.cpuUsage(), process.threadCpuUsage(), r.now()];
+      setImmediate(beat);
+      for (const w of jobs) {
+        await r.pause(); // Independent callers: one submission per turn.
+        const submitted = r.now();
+        const input = { text: w.text, json: w.text, provenance: { kind: "complete" } };
+        const receipt = own("submit", () => (w.data ? checker.protectData : checker.protectText)(input));
+        pending.push(receipt.then((v: unknown) => consume(v, submitted)));
+      }
+      const results = (await Promise.all(pending)) as Awaited<ReturnType<typeof consume>>[];
+      await own("dispose", () => checker.dispose());
+      beating = false;
+      await r.pause().then(() => beat()); // Closes the window after disposal; validation is outside it.
+      const [all, thread, wallMs] = [process.cpuUsage(cpu), process.threadCpuUsage(main), r.now() - start];
+      for (const [i, w] of jobs.entries()) {
+        const { parts = [], ...p } = results[i] ?? {};
+        validateCoverage(w, { ...p, text: Buffer.concat(parts).toString() });
+      }
+      const cpuMs = { workerAndRuntime: ms(all) - ms(thread), mainThreadWithHeartbeat: ms(thread) };
+      const [slice, latencyMs] = [Math.max(0, ...turns.map((t) => t[1])), results.map((p) => p.latencyMs)];
+      const timing = { slice, heartbeat, wallMs, cpuMs, ...r.memory(), turns, idle };
+      trials.push({ label, warmup: trial < 2, admitted: true, owned: true, ...timing, latencyMs });
+    }
+    raw.push(...trials);
+    const workloads = jobs.map(({ name, sizes, reason }) => ({ name, ...sizes, reason }));
+    groups[label] = { workloads, ...summarizeTrials(trials) };
+  };
+  await series("cold startup, maximum-policy transfer", [workload("plain")]);
+  await series("eight slots, then slot backpressure", [...eight, busy(bmp)]);
+  await series("byte backpressure (64 MiB pending)", [bmp, bmp, busy(bmp)]);
+  const method = "slice: wall ms per daemon turn; worker CPU: cpuUsage minus main threadCpuUsage";
+  const size = { entries: policy.entries.length, credentials: policy.credentials.length };
+  return { platform: r.platform, method, policy: size, groups, decision: decideC21c(raw) };
+}
 async function worker([root = "", name = "", ref = ""]: string[]) {
+  if (name === "worker-all") return { ref, pid: process.pid, name, ...(await measureWorker(root)) };
   const paths = ["proc", "credential-matcher", "privacy-boundary"].map((p) => join(root, `src/util/${p}.ts`));
   const found = [...paths, join(root, "src/gates/private.ts")].filter((p) => existsSync(p));
   const api = Object.assign({}, ...(await Promise.all(found.map((p) => import(p)))));

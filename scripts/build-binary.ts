@@ -82,7 +82,7 @@ export function buildConfig(
   uiDirectory: string,
 ): Bun.BuildConfig {
   return {
-    entrypoints: [resolve(root, "src/cli/main.ts")],
+    entrypoints: [resolve(root, "src/cli/main.ts"), resolve(root, "src/util/privacy-worker.ts")], // Lands at util/.
     outdir,
     target: "bun",
     format: "esm",

@@ -1,5 +1,8 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { Worker } from "node:worker_threads";
+import { Worker } from "node:worker_threads";
+import { type Release, release } from "../release.ts";
 import * as b from "./privacy-boundary.ts";
 import * as c from "./privacy-chunks.ts";
 import * as t from "./privacy-transport.ts";
@@ -21,6 +24,7 @@ export type PrivacyWorkerPort = Pick<Worker, "postMessage" | "ref" | "unref"> & 
   onerror?: (() => void) | null;
   onexit?: (() => void) | null;
   terminate(): Promise<unknown>;
+  ready?: Promise<void>;
 };
 type Options = {
   registry?: typeof b.privacyRegistry;
@@ -143,6 +147,44 @@ export function privacyWorkerHandler(port: Side, { schedule = setImmediate as t.
     if (!output?.ack(f, schedule)) t.fault();
   };
 }
+export class PrivacyWorkerUnavailable extends Error {}
+export const privacyWorkerReady = "privacy-worker-ready";
+export const privacyWorkerEntries = {
+  source: (root: string) => join(root, "src/util/privacy-worker.ts"),
+  packaged: () => join(import.meta.dir, "util/privacy-worker.js"),
+};
+/** Only the release's own entry is tried; a missing one fails closed instead of selecting another. */
+export function privacyWorkerEntry(info: Release = release, entries = privacyWorkerEntries) {
+  const entry = info.kind === "packaged" ? entries.packaged() : entries.source(info.root);
+  if (!existsSync(entry)) throw new PrivacyWorkerUnavailable(`Missing ${info.kind} privacy worker entry`);
+  return entry;
+}
+/** Owned at once; `ready` rejects if the entry fails, exits or is terminated before announcing itself. */
+export function startPrivacyWorker(entry: string, construct = (path: string) => new Worker(path)) {
+  const ready = Promise.withResolvers<void>();
+  ready.promise.catch(() => undefined); // Observed only when startup is awaited; retiring earlier is not a fault.
+  const unusable = () => ready.reject(new PrivacyWorkerUnavailable("Privacy worker entry did not start"));
+  let worker: Worker;
+  try {
+    worker = construct(entry);
+  } catch {
+    throw new PrivacyWorkerUnavailable("Privacy worker entry could not be constructed");
+  }
+  const port: PrivacyWorkerPort = {
+    postMessage: (value, transfer) => worker.postMessage(value, transfer),
+    ...{ ref: () => worker.ref(), unref: () => worker.unref(), ready: ready.promise },
+    terminate: () => Promise.all([unusable(), worker.terminate()]),
+  };
+  let started = false; // Bun reports `online` before loading the module, so the entry announces itself.
+  worker.on("message", (data) => {
+    if (started) return port.onmessage?.({ data });
+    started = data === privacyWorkerReady;
+    return started ? ready.resolve() : unusable();
+  });
+  worker.on("error", () => [unusable(), port.onerror?.()]);
+  worker.on("exit", () => [unusable(), port.onexit?.()]);
+  return port;
+}
 export function createPrivacyChecker(options: Options = {}) {
   const registry = options.registry ?? b.privacyRegistry;
   const limits = { ...b.privacyLimits, ...options.limits };
@@ -253,9 +295,10 @@ export function createPrivacyChecker(options: Options = {}) {
       try {
         if (!current(authority)) return finish("stale-generation");
         if (!worker) {
-          worker = await options.workerFactory?.();
-          if (!worker) throw new Error("Privacy worker unavailable");
+          const made = (options.workerFactory ?? (() => startPrivacyWorker(privacyWorkerEntry())))();
+          worker = made instanceof Promise ? await made : made; // A synchronous port is owned without yielding.
           worker.unref();
+          if (pending.has(finish) && !disposed) await worker.ready; // Retained: a deadline or disposal terminates it.
         }
         if (!pending.has(finish) || disposed) return void (await retire());
         const port = worker;
@@ -318,8 +361,8 @@ export function createPrivacyChecker(options: Options = {}) {
         port.ref();
         schedule(input.turn);
         await result.promise;
-      } catch {
-        finish("checker-failed", true);
+      } catch (error) {
+        finish(error instanceof PrivacyWorkerUnavailable ? "checker-unavailable" : "checker-failed", true);
       }
     });
     bytes += size;
