@@ -104,7 +104,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         .listInvocations(run.id)
         .filter((i) => i.role === "review")
         .map((i) => i.modelId),
-    ).toEqual([reviewer]);
+    ).toEqual([reviewer, reviewer]);
     const messages = f.store.listEvents(run.id).map((e) => e.message);
     expect(messages).not.toContain("Review done by the implementer's vendor (no other vendor available)");
     expect(

@@ -92,6 +92,8 @@ beforeEach(async () => {
   mode = "pass";
   queue = null;
   const cfg = loadConfig({ home: join(root, "data"), configDir: join(root, "cfg") });
+  // One review call per round keeps the review counts below readable.
+  cfg.reviewSamples = 1;
   const firstModel = models[0];
   if (!firstModel) throw new Error("missing model");
   factory = new Factory(cfg, {

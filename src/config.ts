@@ -79,6 +79,8 @@ export interface Config {
   reviewAvoidImplementerVendor: boolean;
   /** `single` (production today) or a verified finder panel with the profile's roster. */
   reviewMode: "single" | "panel";
+  /** `single` mode: 2 merges two independent adversarial reviews; 1 is one standard review. */
+  reviewSamples: 1 | 2;
   /** `panel`: single reviews still decide, and the profile's panel also runs and records `review-N.shadow.json`. */
   reviewShadow: "off" | "panel";
   /** How long a shadow panel may outlast its single review before it is aborted as a timeout. */
@@ -224,6 +226,7 @@ const REVIEW_KEYS: readonly string[] = [
   "implementer_report",
   "mode",
   "rosters",
+  "samples",
   "shadow",
   "shadow_grace_seconds",
   "trusted_reviewers",
@@ -399,6 +402,8 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     throw new Error('review.implementer_report must be "include" or "omit"');
   if (review.mode !== undefined && review.mode !== "single" && review.mode !== "panel")
     throw new Error('review.mode must be "single" or "panel"');
+  if (review.samples !== undefined && review.samples !== 1 && review.samples !== 2)
+    throw new Error("review.samples must be 1 or 2");
   if (review.shadow !== undefined && review.shadow !== "off" && review.shadow !== "panel")
     throw new Error('review.shadow must be "off" or "panel"');
   if (review.shadow === "panel" && review.mode === "panel")
@@ -664,6 +669,7 @@ export function loadConfig(overrides: LoadOptions = {}): Config {
     reviewImplementerReport: review.implementer_report === "omit" ? "omit" : "include",
     reviewAvoidImplementerVendor: review.avoid_implementer_vendor !== false,
     reviewMode: review.mode === "panel" ? "panel" : "single",
+    reviewSamples: review.samples === 1 ? 1 : 2,
     reviewShadow: review.shadow === "panel" ? "panel" : "off",
     reviewShadowGraceSeconds: grace,
     reviewTrustedReviewers: trusted,

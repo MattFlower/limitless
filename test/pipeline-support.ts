@@ -238,6 +238,9 @@ export function pipelineSetup(state: PipelineFixture) {
     if (!alpha || !beta) throw new Error("missing fixture models");
     const cfg = loadConfig({ home: join(state.home, "data"), configDir: join(state.home, "cfg") });
     cfg.githubOwner = "MattFlower";
+    // One review call per round keeps these flows' call counts readable; a test that writes
+    // `[review] samples` to its config gets the production default's two samples.
+    if ((cfg.raw.review as { samples?: unknown } | undefined)?.samples === undefined) cfg.reviewSamples = 1;
     state.factory = new Factory(cfg, {
       loadSource: () => 0,
       confinement: fakeConfinement,
