@@ -369,11 +369,17 @@ export const VerifySchema = z.object({
     z.object({
       id: z.string(),
       status: z.enum(["met", "unmet", "unclear", "blocked"]),
+      test_outcome_only: z
+        .boolean()
+        .default(false)
+        .describe(
+          "Negative evidence is only the outcome of the named covering_tests; false if there is any independent behavioral or code-reading objection",
+        ),
       covering_tests: z
         .array(z.object({ file: z.string(), name: z.string() }))
         .default([])
         .describe(
-          "Only for sandbox-blocked criteria: up to 3 tracked test files and exact titles for the factory to run",
+          "For sandbox-blocked or test-outcome-only criteria: up to 3 tracked test files and exact testcase titles for the factory to run",
         ),
       // A default, not optional: OpenAI strict mode requires every property, and an optional one made
       // every Codex verifier request fail with a 400.
