@@ -381,6 +381,7 @@ export function startIssueQueue(
     pending = false;
     limited = false;
     let failed = false;
+    let foreignQueries = 0;
     let unsubscribe = () => {};
     const invalidated = new Set<string>();
     const changedDuringPoll = (repo: string, number: number) =>
@@ -456,11 +457,17 @@ export function startIssueQueue(
           } while (after);
           const states = new Map<string, string>();
           const dependencies = Map.groupBy(
-            issues.nodes.flatMap((i) => blockers(i.body, repo)),
+            issues.nodes
+              .filter((i) => i.labels.nodes.some((l) => priority(l.name)))
+              .flatMap((i) => blockers(i.body, repo)),
             (b) => b.repo,
           );
           for (const [dependencyRepo, refs] of dependencies) {
             if (stopped || limited || now() < notBefore) break;
+            if (dependencyRepo !== repo.toLowerCase()) {
+              if (foreignQueries >= 10) continue;
+              foreignQueries++;
+            }
             const numbers = [...new Set(refs.map((b) => b.number))];
             const deps = await query(
               dependencyRepo === repo.toLowerCase() ? repo : dependencyRepo,

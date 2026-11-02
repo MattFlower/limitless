@@ -1116,6 +1116,61 @@ test("body dependencies are resolved by read-only aliased lookups; missing issue
   ).toBe(true);
 });
 
+test("body dependency queries ignore unlabelled untrusted issues across polls", async () => {
+  const h = harness();
+  const unlabelled = issue();
+  unlabelled.author = { login: "stranger" };
+  unlabelled.labels = { totalCount: 0, nodes: [] };
+  unlabelled.body = `Blocked by ${Array.from({ length: 40 }, (_, n) => `spam${n}/repo#9`).join(" ")}`;
+  h.data.set("owner/repo", [unlabelled, { ...issue(2), body: "Blocked by other/repo#9" }]);
+  h.states.set("other/repo#9", "OPEN");
+  const dependencyRepos = () => h.scopes.filter((_, n) => /i\d+:issue/.test(h.calls[n]?.[3] ?? ""));
+  h.start();
+  await h.advance();
+  expect(dependencyRepos()).toEqual(["other/repo"]);
+  expect(h.runs()).toHaveLength(0);
+  h.states.set("other/repo#9", "CLOSED");
+  await h.advance(180_000);
+  expect(dependencyRepos()).toEqual(["other/repo", "other/repo"]);
+  expect(h.runs()).toMatchObject([{ sourceRef: { number: 2 } }]);
+});
+
+test("body dependency queries share a ten-attempt budget across repositories each poll", async () => {
+  const h = harness({ max_issue_runs: 4 }, ["Owner/Repo", "Owner/Second"]);
+  const references = Array.from({ length: 14 }, (_, n) => `foreign${n}/repo#9`);
+  h.data.set("Owner/Repo", [
+    { ...issue(), body: `Blocked by ${references.slice(0, 2).join(" ")} FOREIGN1/REPO#9` },
+  ]);
+  h.data.set("Owner/Second", [
+    { ...issue(), body: `Blocked by ${references.slice(2).join(" ")} Owner/Second#9` },
+    { ...issue(2), body: "Blocked by #9" },
+    issue(3),
+    { ...commentIssue(4), comments: { totalCount: 1, nodes: [commandComment()] } },
+  ]);
+  for (const ref of references) h.states.set(ref, "CLOSED");
+  h.states.set("owner/second#9", "CLOSED");
+  h.intercept = (args) => {
+    if (/i\d+:issue/.test(args[3] ?? "") && args[3]?.includes('owner:"foreign0"'))
+      throw new Error("dependency query denied");
+  };
+  const dependencyRepos = () => h.scopes.filter((_, n) => /i\d+:issue/.test(h.calls[n]?.[3] ?? ""));
+  const expected = [...Array.from({ length: 10 }, (_, n) => `foreign${n}/repo`), "Owner/Second"];
+  h.start();
+  await h.advance();
+  expect(dependencyRepos()).toEqual(expected);
+  expect(
+    h
+      .runs()
+      .map((r) => r.sourceRef?.number)
+      .sort(),
+  ).toEqual([2, 3, 4]);
+  expect(h.runs().every((r) => r.sourceRef?.repo === "Owner/Second")).toBe(true);
+  expect(h.store.githubCommentProcessed({ repo: "Owner/Second", id: 1 })).toBe(true);
+  await h.advance(180_000);
+  expect(dependencyRepos()).toEqual([...expected, ...expected]);
+  expect(h.runs()).toHaveLength(3);
+});
+
 test.each(["other/repo#9", "https://github.com/other/repo/issues/9"])(
   "foreign body blocker %s resolves outside the configured queue repositories",
   async (reference) => {
