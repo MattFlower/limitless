@@ -15,7 +15,7 @@ type TextInput = Omit<Parameters<typeof b.protectText>[0], "policy">;
 type DataInput = Omit<Parameters<typeof b.protectData>[0], "policy">;
 type Input = Omit<TextInput, "text"> & { text?: string; json?: unknown };
 type Operation = "text" | "data";
-type Control = { signal?: AbortSignal };
+type Control = { signal?: AbortSignal; deadline?: number };
 type Final = t.Frame & ReturnType<typeof fixed> & { type: string };
 type Side = Pick<PrivacyWorkerPort, "postMessage" | "onmessage">;
 type Fixed = Record<string, unknown> & { cut?: Partial<b.BoundaryCut> };
@@ -31,6 +31,8 @@ type Options = {
   workerFactory?: () => PrivacyWorkerPort | Promise<PrivacyWorkerPort>;
   limits?: Partial<typeof b.privacyLimits>;
   maxRequests?: number;
+  maxWaiting?: number;
+  waitByteLimit?: number;
   deadlineMs?: number;
   byteLimit?: number;
   outputWindow?: number;
@@ -195,6 +197,9 @@ export function createPrivacyChecker(options: Options = {}) {
   const window = Math.min(t.maxChunk, Math.max(1, Math.trunc(options.outputWindow ?? t.maxChunk)));
   type Finish = (result: Projection | Reason, terminate?: boolean) => void;
   const pending = new Map<Finish, () => Promise<void>>();
+  const waiting = new Map<() => boolean, (reason: Reason) => void>();
+  let waitingBytes = 0;
+  let draining = false;
   let bytes = 0;
   let granted = 0;
   let sequence = 0;
@@ -222,6 +227,7 @@ export function createPrivacyChecker(options: Options = {}) {
           await port.terminate();
         } catch {
           disposed = true;
+          for (const end of waiting.values()) end("checker-failed");
           for (const finish of pending.keys()) finish("checker-failed");
         }
       })();
@@ -239,16 +245,28 @@ export function createPrivacyChecker(options: Options = {}) {
       if (!disposed && pending.size) wake();
     });
   }
-  function submit(operation: Operation, input: Input, signal?: AbortSignal): Promise<c.BoundaryChunks> {
+  function drain() {
+    if (draining) return;
+    draining = true;
+    try {
+      while (!disposed && waiting.keys().next().value?.()) {}
+    } finally {
+      draining = false;
+    }
+  }
+  function submit(operation: Operation, input: Input, control: Control): Promise<c.BoundaryChunks> {
+    const { signal, deadline } = control;
+    control = { signal, deadline };
     let generation: Generation | undefined;
+    let immediate: Snapshot | undefined;
     const refuse = (reason: Reason) =>
       Promise.resolve(issue(failure(reason, generation, input.provenance), generation));
-    let snapshot: Snapshot;
     try {
       registry.refreshPolicy();
-      snapshot = b.capturePrivacySnapshot(registry);
-      generation = snapshot.generation;
-      if (!snapshot.ready) return refuse("unreadable-policy");
+      // Preserve legacy preflight refusals; waiting callers capture snapshots only at admission.
+      if (deadline === undefined) immediate = b.capturePrivacySnapshot(registry);
+      generation = immediate?.generation ?? b.currentPrivacyGeneration(registry);
+      if (!(immediate?.ready ?? registry.ready)) return refuse("unreadable-policy");
       if (!current(generation)) return refuse("stale-generation");
     } catch {
       return refuse("unreadable-policy");
@@ -257,17 +275,80 @@ export function createPrivacyChecker(options: Options = {}) {
     if (signal?.aborted) return refuse("checker-cancelled");
     const payload = operation === "text" ? input.text : input.json;
     if (typeof payload !== "string") return refuse("nonconvergent");
-    if (payload.length > limits.inputUnits || Buffer.byteLength(payload) > limits.inputBytes)
-      return refuse("input-length");
-    const request = envelope(operation, input, snapshot, limits, window);
-    const size = request.stream.size;
-    if (pending.size >= (options.maxRequests ?? 8) || size + window > (options.byteLimit ?? 64 << 20) - bytes)
-      return refuse("checker-busy");
+    const retained = Buffer.byteLength(payload);
+    if (payload.length > limits.inputUnits || retained > limits.inputBytes) return refuse("input-length");
     input = { ...input, cut: input.cut && { ...input.cut }, provenance: { ...input.provenance } };
-    const authority = generation;
-    const deadline = now() + (options.deadlineMs ?? 30000);
-    const id = ++sequence;
     const result = Promise.withResolvers<c.BoundaryChunks>();
+    let stopWaiting: (() => void) | undefined;
+    const end = (reason: Reason) => {
+      if (stopWaiting && !waiting.has(tryAdmit)) return;
+      stopWaiting?.();
+      try {
+        generation = b.currentPrivacyGeneration(registry);
+      } catch {
+        generation = undefined;
+      }
+      result.resolve(issue(failure(reason, generation, input.provenance), generation));
+      drain();
+    };
+    const tryAdmit = () => {
+      if (deadline !== undefined && now() >= deadline) return end("checker-timeout") ?? true;
+      if (pending.size >= (options.maxRequests ?? 8)) return false;
+      let snapshot: Snapshot;
+      try {
+        if (!immediate) registry.refreshPolicy();
+        snapshot = immediate ?? b.capturePrivacySnapshot(registry);
+        generation = snapshot.generation;
+        if (!snapshot.ready) return end("unreadable-policy") ?? true;
+        if (!current(generation)) return end("stale-generation") ?? true;
+      } catch {
+        return end("unreadable-policy") ?? true;
+      }
+      const size = [
+        payload,
+        String(input.cut?.marker ?? ""),
+        ...snapshot.entries.map((e) => e.value),
+        ...snapshot.credentials,
+      ].reduce((total, text) => total + 4 + Buffer.byteLength(text), 0);
+      if (size + window > (options.byteLimit ?? 64 << 20) - bytes) return false;
+      stopWaiting?.();
+      admit(input, control, envelope(operation, input, snapshot, limits, window), generation, result);
+      return true;
+    };
+    if (!waiting.size && tryAdmit()) return result.promise;
+    if (deadline !== undefined && now() >= deadline) return refuse("checker-timeout");
+    if (
+      deadline === undefined ||
+      waiting.size >= (options.maxWaiting ?? 32) ||
+      retained > (options.waitByteLimit ?? 64 << 20) - waitingBytes
+    )
+      return refuse("checker-busy");
+    const cancel = () => end("checker-cancelled");
+    const timeout = setTimer(() => end("checker-timeout"), Math.max(0, deadline - now()));
+    stopWaiting = () => {
+      if (!waiting.delete(tryAdmit)) return;
+      waitingBytes -= retained;
+      clearTimer(timeout);
+      signal?.removeEventListener("abort", cancel);
+    };
+    generation = undefined;
+    waiting.set(tryAdmit, end);
+    waitingBytes += retained;
+    signal?.addEventListener("abort", cancel, { once: true });
+    return result.promise;
+  }
+  function admit(
+    input: Input,
+    control: Control,
+    request: ReturnType<typeof envelope>,
+    generation: Generation,
+    result: ReturnType<typeof Promise.withResolvers<c.BoundaryChunks>>,
+  ) {
+    const { signal } = control;
+    const size = request.stream.size;
+    const authority = generation;
+    const deadline = Math.min(control.deadline ?? Infinity, now() + (options.deadlineMs ?? 30000));
+    const id = ++sequence;
     let staged: ArrayBuffer[] | undefined;
     let timeout: Parameters<typeof clearTimeout>[0];
     const cancel = () => finish("checker-cancelled", active === finish);
@@ -291,6 +372,7 @@ export function createPrivacyChecker(options: Options = {}) {
         ),
       );
       staged = undefined;
+      drain();
     };
     pending.set(finish, async () => {
       active = finish;
@@ -374,10 +456,11 @@ export function createPrivacyChecker(options: Options = {}) {
     return result.promise;
   }
   return {
-    protectText: (input: TextInput, { signal }: Control = {}) => submit("text", input, signal),
-    protectData: (input: DataInput, { signal }: Control = {}) => submit("data", input, signal),
+    protectText: (input: TextInput, control: Control = {}) => submit("text", input, control),
+    protectData: (input: DataInput, control: Control = {}) => submit("data", input, control),
     async dispose() {
       disposed = true;
+      for (const end of waiting.values()) end("checker-failed");
       for (const finish of pending.keys()) finish("checker-failed", active === finish);
       await retire();
       await running;

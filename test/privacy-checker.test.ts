@@ -1648,3 +1648,183 @@ test("process checker is lazy and shared, refuses until provisioned, keeps equiv
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("deadline admission waits in FIFO order and refuses callers without deadlines", async () => {
+  const f = fixture({ maxRequests: 1 });
+  const snapshot = spyOn(f.registry, "snapshot");
+  const segments = spyOn(t, "segments");
+  const order: string[] = [];
+  try {
+    const a = f.send("A");
+    const deadline = f.clock.now() + 10000;
+    const b = f.protectText(input("B"), { deadline }).then((r) => {
+      order.push("B");
+      return r;
+    });
+    const c = f.protectText(input("C"), { deadline }).then((r) => {
+      order.push("C");
+      return r;
+    });
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    await withheld(f.send("D"), "checker-busy");
+    expect(snapshot).toHaveBeenCalledTimes(2);
+    expect(segments).toHaveBeenCalledTimes(1);
+    await f.run(1);
+    expect(f.port().sent.map((frame) => frame.id)).toEqual([1]);
+    await f.run(3);
+    expect(read(await a).text).toBe("A");
+    expect(order).toEqual([]);
+    expect(snapshot).toHaveBeenCalledTimes(3);
+    await f.run(4);
+    expect(read(await b).text).toBe("B");
+    expect(order).toEqual(["B"]);
+    await f.run();
+    expect(read(await c).text).toBe("C");
+    expect(order).toEqual(["B", "C"]);
+    expect([...new Set(f.port().sent.map((frame) => frame.id))]).toEqual([1, 2, 3]);
+    expect(f.clock.pending).toBe(0);
+  } finally {
+    snapshot.mockRestore();
+    segments.mockRestore();
+    await f.dispose();
+  }
+});
+
+test("waiting and processing use the same absolute deadline for text and data", async () => {
+  const f = fixture({ maxRequests: 1, deadlineMs: 30000 });
+  try {
+    const active = f.send();
+    await f.run(1);
+    const deadline = f.clock.now() + 5000;
+    const waiting = f.protectData({ json: '"safe"', provenance: input().provenance }, { deadline });
+    f.registry.replacePolicy([]);
+    await f.clock.advance(4999);
+    expect(f.clock.pending).toBe(2);
+    await f.clock.advance(1);
+    await withheld(waiting, "checker-timeout");
+    expect(f.port().sent.every((frame) => frame.id === 1)).toBe(true);
+    await f.run();
+    await active;
+    const processing = f.protectText(input(), { deadline: f.clock.now() + 5000 });
+    await f.run(1);
+    await f.clock.advance(4999);
+    expect(f.clock.pending).toBe(1);
+    await f.clock.advance(1);
+    await withheld(processing, "checker-timeout");
+    const before = f.port().sent.length;
+    await withheld(f.protectText(input(), { deadline: f.clock.now() }), "checker-timeout");
+    expect(f.port().sent).toHaveLength(before);
+    expect(f.clock.pending).toBe(0);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test.each(["abort", "dispose"])(
+  "%s ends waiters once and clears their timers and listeners",
+  async (mode) => {
+    const f = fixture({ maxRequests: 1 });
+    const controller = new AbortController();
+    const add = spyOn(controller.signal, "addEventListener");
+    const remove = spyOn(controller.signal, "removeEventListener");
+    let resolutions = 0;
+    const active = f.send();
+    const waiting = f
+      .protectText(input(), { signal: controller.signal, deadline: f.clock.now() + 1000 })
+      .then((r) => {
+        resolutions++;
+        return r;
+      });
+    expect(f.clock.pending).toBe(2);
+    f.registry.replacePolicy([]);
+    if (mode === "abort") controller.abort();
+    else await f.dispose();
+    await withheld(waiting, mode === "abort" ? "checker-cancelled" : "checker-failed");
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledTimes(1);
+    await f.dispose();
+    await active;
+    controller.abort();
+    await f.clock.advance(30000);
+    expect(resolutions).toBe(1);
+    expect(f.clock.pending).toBe(0);
+    expect(f.ports.flatMap((p) => p.sent)).toHaveLength(0);
+    add.mockRestore();
+    remove.mockRestore();
+  },
+);
+
+test.each([
+  { maxWaiting: 1, waitByteLimit: 100 },
+  { maxWaiting: 10, waitByteLimit: 3 },
+])("waiting count and UTF-8 byte limits bound retained inputs: %j", async (options) => {
+  const f = fixture({ maxRequests: 1, ...options });
+  const active = f.send();
+  const waiting = f.protectText(input("é"), { deadline: f.clock.now() + 1000 });
+  await withheld(f.protectText(input("é"), { deadline: f.clock.now() + 1000 }), "checker-busy");
+  await f.clock.advance(1000);
+  await withheld(waiting, "checker-timeout");
+  const reused = f.protectText(input("é"), { deadline: f.clock.now() + 1000 });
+  await f.run();
+  await active;
+  expect(read(await reused).text).toBe("é");
+  await f.dispose();
+});
+
+test("waiting captures the policy generation only when admitted", async () => {
+  const f = fixture({ maxRequests: 1 });
+  try {
+    const active = f.send();
+    const waiting = f.protectText(input(), { deadline: f.clock.now() + 1000 });
+    f.registry.replacePolicy([{ entry: 0, value: "synthetic-private" }]);
+    await f.run();
+    await withheld(active, "stale-generation");
+    expect(read(await waiting)).toMatchObject({ text: "safe", policyDigest: "privacy/1/0/0" });
+    expect(f.port().sent.every((frame) => (frame.generation as { policy: number }).policy === 1)).toBe(true);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("a byte-blocked FIFO head prevents smaller requests from overtaking", async () => {
+  const f = fixture({ byteLimit: 2 * charge("a") + W });
+  const segments = spyOn(t, "segments");
+  try {
+    const a = f.send("a");
+    const deadline = f.clock.now() + 1000;
+    const b = f.protectText(input("large"), { deadline });
+    const c = f.protectText(input("c"), { deadline });
+    expect(segments).toHaveBeenCalledTimes(1);
+    await withheld(f.send("d"), "checker-busy");
+    await f.run(4);
+    await a;
+    expect(f.port().sent.every((frame) => frame.id === 1)).toBe(true);
+    await f.run();
+    expect(read(await b).text).toBe("large");
+    expect(read(await c).text).toBe("c");
+  } finally {
+    segments.mockRestore();
+    await f.dispose();
+  }
+});
+
+test("admission preserves the remaining shared deadline after waiting", async () => {
+  const f = fixture({ maxRequests: 1 });
+  try {
+    const active = f.send();
+    const waiting = f.protectText(input(), { deadline: f.clock.now() + 5000 });
+    await f.clock.advance(4000);
+    await f.run(4);
+    await active;
+    expect(f.clock.pending).toBe(1);
+    await f.clock.advance(999);
+    expect(f.clock.pending).toBe(1);
+    await f.clock.advance(1);
+    await withheld(waiting, "checker-timeout");
+    await f.run();
+    expect(f.port().sent.every((frame) => frame.id === 1)).toBe(true);
+    expect(f.clock.pending).toBe(0);
+  } finally {
+    await f.dispose();
+  }
+});
