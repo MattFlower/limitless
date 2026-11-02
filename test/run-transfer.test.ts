@@ -3,7 +3,7 @@ import { linkSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { finalizePreparePolicy, recordProvisionalPolicy } from "../src/db/portable-policies.ts";
-import { readOfflineProjection } from "../src/db/portable-projection.ts";
+import { readOfflineProjection, readProjectionIds } from "../src/db/portable-projection.ts";
 import { Store } from "../src/db/store.ts";
 import { initialRunState } from "../src/pipeline/context.ts";
 import { formatManifest, type PortableManifest, parseManifest } from "../src/pipeline/portable.ts";
@@ -319,6 +319,50 @@ test.each(["build", "verify-change", "acceptance", "follow-up", "conflict", "ci"
   },
 );
 
+test("unordered payload rows preserve semantics, mappings and exact retained material after reopening", async () => {
+  const f = source(),
+    path = join(directory(), "offline.db"),
+    target = store(path),
+    api = facade(f, target),
+    c = await api.exportRun(f.runId, repository, signal());
+  const input = edit(c, (_m, p) => {
+    p.stages.reverse();
+    p.invocations.reverse();
+    p.questions.reverse();
+  });
+  const ids = await api.importRun(input, signal());
+  for (const kind of ["stages", "invocations", "questions"] as const)
+    expect(ids[kind]).toEqual(
+      new Map([
+        [2, 1],
+        [1, 2],
+      ]),
+    );
+  expect(readOfflineProjection(target.db, f.runId)).toEqual(c.payload);
+  target.close();
+  stores.splice(stores.indexOf(target), 1);
+  const reopened = store(path),
+    retained = facade({ ...f, s: reopened });
+  expect(readOfflineProjection(reopened.db, f.runId)).toEqual(c.payload);
+  expect(readProjectionIds(reopened.db, f.runId)).toEqual(ids);
+  retained.deps.key = () => {
+    throw new Error("Must retain opaque keys");
+  };
+  retained.deps.objects.export = mock(() => {
+    throw new Error("Must not repack");
+  });
+  const saved = await retained.exportRun(f.runId, repository, signal());
+  expect(saved.manifest).toBe(input.manifest);
+  expect(saved.blobs).toEqual(input.blobs);
+  expect(saved.digest).toBe(transferHash(new TextEncoder().encode(input.manifest)));
+  expect(saved.payload).toEqual({
+    ...c.payload,
+    stages: c.payload.stages.toReversed(),
+    invocations: c.payload.invocations.toReversed(),
+    questions: c.payload.questions.toReversed(),
+  });
+});
+
 test("validation rejects corrupt descriptors, headers, references, identities, policy and artifacts before object work", async () => {
   const f = source(),
     api = facade(f),
@@ -429,6 +473,23 @@ test("validation snapshots caller buffers and descriptors before awaiting", asyn
   finish.resolve();
   await pending;
   expect(await facade({ ...f, s: api.target }).exportRun(f.runId, repository, signal())).toEqual(expected);
+});
+
+test("noncanonical version-1 manifest is rejected before object validation or inspection", async () => {
+  const f = source(),
+    api = facade(f),
+    c = await api.exportRun(f.runId, repository, signal());
+  const input = edit(c, (m) => {
+    m.schema = 1;
+  });
+  input.manifest = JSON.stringify(JSON.parse(input.manifest), null, 2);
+  const before = snapshot(api.target),
+    calls = (api.deps.objects.validate as ReturnType<typeof mock>).mock.calls.length,
+    read = spyOn(reader, "read");
+  await rejected(api.importRun(input, signal()));
+  expect(snapshot(api.target)).toEqual(before);
+  expect(api.deps.objects.validate).toHaveBeenCalledTimes(calls);
+  expect(read).not.toHaveBeenCalled();
 });
 
 test("round-trip version-1 manifest bytes remain unchanged", async () => {

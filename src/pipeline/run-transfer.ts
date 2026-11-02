@@ -9,7 +9,12 @@ import { type BlobRef, formatManifest, type PortableManifest, parseManifest } fr
 import type { RunObjectExportInput, RunObjectIO } from "./run-object-contract.ts";
 import { inspectRunObjectCredentials } from "./run-object-privacy.ts";
 import { RunTransferError, rethrowRunTransfer } from "./run-transfer-errors.ts";
-import { receiptDescriptors, transferHash, verifyReceiptPayload } from "./run-transfer-integrity.ts";
+import {
+  receiptDescriptors,
+  receiptManifest,
+  transferHash,
+  verifyReceiptPayload,
+} from "./run-transfer-integrity.ts";
 import { encodeTransferJson } from "./run-transfer-json.ts";
 import { serializeTransfer, transferDatabaseIdentity } from "./run-transfer-queue.ts";
 import { decodeRunPayload, type RunPayloadV1 } from "./run-transfer-schema.ts";
@@ -53,7 +58,9 @@ export function createRunTransfer(deps: RunTransferDependencies) {
   };
   const payload = (m: PortableManifest, blobs: ReadonlyMap<string, Uint8Array>) => {
     const p = verifyReceiptPayload(m, blobs);
-    return decodeRunPayload(p, { id: "offline", kind: "github", slug: m.key.repo }, m);
+    decodeRunPayload(p, { id: "offline", kind: "github", slug: m.key.repo }, m);
+    // Validate semantics without replacing the representation retained in the state blob.
+    return p;
   };
   const objectInput = (p: RunPayloadV1, m: PortableManifest, bytes: Uint8Array) => {
     const objectFormat = p.commits[0]?.length === 64 ? ("sha256" as const) : ("sha1" as const);
@@ -158,6 +165,7 @@ export function createRunTransfer(deps: RunTransferDependencies) {
         const refs = receiptDescriptors(m);
         if (new Set(refs.map((r) => r.key)).size !== refs.length) throw new RunTransferError("invalid");
         const p = payload(m, blobs);
+        receiptManifest(text, transferHash(new TextEncoder().encode(text)), p.run.id);
         const source = transferDatabaseIdentity(deps.source.db),
           target = transferDatabaseIdentity(deps.offline.store.db);
         if (deps.offline.ownership !== "exclusive-offline" || source === target)
