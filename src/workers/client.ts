@@ -1128,3 +1128,4 @@ export async function runWorker(
     for (const release of held) release();
   }
 }
+export { machineState, verifyWorkerConfinement };

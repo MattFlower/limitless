@@ -175,3 +175,11 @@ test.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
     expect(second.exclusive).toBeGreaterThanOrEqual(first.exclusive);
   },
 );
+
+test("custom window duration keeps the strict boundary and suspend check; default stays unchanged", () => {
+  const anchor = { inclusive: 0, exclusive: 0 };
+  expect(windowOpen(anchor, { inclusive: 59_999, exclusive: 59_999 }, 60_000)).toBe(true);
+  expect(windowOpen(anchor, { inclusive: 60_000, exclusive: 60_000 }, 60_000)).toBe(false);
+  expect(windowOpen(anchor, { inclusive: 60_000, exclusive: 60_000 })).toBe(true);
+  expect(windowOpen(anchor, { inclusive: 7_000, exclusive: 5_000 }, 60_000)).toBe(false);
+});

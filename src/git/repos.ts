@@ -1724,6 +1724,29 @@ async function withTransportRepo<T>(
   });
 }
 
+export async function probePushAccess(paths: Paths, repo: Repo, signal?: AbortSignal): Promise<boolean> {
+  try {
+    signal?.throwIfAborted();
+    if (!repo.url || repo.kind === "local") return false;
+    const ref = `:refs/heads/limitless-access-probe-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+    const cmd = ["git", "push", "--dry-run", "--porcelain", repo.url, ref];
+    const probe = async (cwd: string) => (await remoteSh(cmd, { cwd, signal })).exitCode === 0;
+    const cache = cachePath(paths, repo);
+    if (existsSync(cache) && fs.statSync(cache).isDirectory()) {
+      const opts = { cwd: cache, signal, allowFail: true };
+      const result = await cacheGit(["git", "rev-parse", "--is-bare-repository"], opts);
+      if (result.exitCode === 0 && result.stdout.trim() === "true") return await probe(cache);
+    }
+    return await withScratch(paths.home, async (cwd) => {
+      await cacheGit(["git", "init", "-q", "--bare", "--template="], { cwd, signal });
+      return probe(cwd);
+    });
+  } catch {
+    signal?.throwIfAborted();
+    return false;
+  }
+}
+
 export async function pushBranch(
   repo: Repo,
   cwd: string,
