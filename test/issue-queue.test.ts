@@ -1145,9 +1145,13 @@ test.each([
   "wrong number",
   "wrong repo",
   "missing identity",
-])("foreign body blocker with %s remains unresolved despite a closed local issue", async (mode) => {
-  const h = harness();
-  h.data.set("owner/repo", [{ ...issue(), body: "Blocked by other/repo#9" }]);
+])("foreign body blocker with %s blocks only affected issues despite a closed local issue", async (mode) => {
+  const h = harness({ max_issue_runs: 3 });
+  h.data.set("owner/repo", [
+    { ...issue(), body: "Blocked by other/repo#9" },
+    issue(2),
+    { ...issue(3), body: "Blocked by #9" },
+  ]);
   h.states.set("owner/repo#9", "CLOSED");
   const response = { number: 9, state: "CLOSED", repository: { nameWithOwner: "other/repo" } };
   if (mode === "query error")
@@ -1173,8 +1177,51 @@ test.each([
     );
   h.start();
   await h.advance();
-  expect(h.runs()).toHaveLength(0);
+  expect(
+    h
+      .runs()
+      .map((r) => r.sourceRef?.number)
+      .sort(),
+  ).toEqual([2, 3]);
+  expect(h.scopes).toEqual(["owner/repo", "other/repo", "owner/repo"]);
+});
+
+test("an unreadable foreign blocker does not prevent unrelated comment commands", async () => {
+  const h = harness();
+  h.data.set("owner/repo", [
+    { ...issue(), body: "Blocked by other/repo#9" },
+    { ...commentIssue(2), comments: { totalCount: 1, nodes: [commandComment()] } },
+  ]);
+  h.intercept = (args) => {
+    if (args[3]?.includes('owner:"other"')) throw new Error("dependency query denied");
+  };
+  h.start();
+  await h.advance();
+  expect(h.runs()).toMatchObject([{ sourceRef: { number: 2 } }]);
+  expect(h.store.githubCommentProcessed({ repo: "owner/repo", id: 1 })).toBe(true);
+});
+
+test.each(["stopped", "rate limited"])("dependency query failure preserves %s polling", async (mode) => {
+  const h = harness();
+  h.data.set("owner/repo", [{ ...issue(), body: "Blocked by other/repo#9, #10" }]);
+  h.intercept = (args) => {
+    if (!args[3]?.includes('owner:"other"')) return;
+    if (mode === "stopped") {
+      h.stop();
+      throw new Error("dependency query cancelled");
+    }
+    h.response = {
+      errors: [{ message: "dependency query denied" }],
+      data: { repository: null, rateLimit: { ...h.rate, remaining: 0 } },
+    };
+  };
+  h.start();
+  await h.advance();
   expect(h.scopes).toEqual(["owner/repo", "other/repo"]);
+  expect(h.runs()).toHaveLength(0);
+  expect(h.clock.pending).toBe(mode === "stopped" ? 0 : 1);
+  await h.advance(180_000);
+  expect(h.calls).toHaveLength(2);
 });
 
 test("mixed local and foreign body blockers require both closed and deduplicate repository casing", async () => {

@@ -467,7 +467,12 @@ export function startIssueQueue(
               numbers
                 .map((n) => `i${n}:issue(number:${n}) { number state repository { nameWithOwner } }`)
                 .join(" "),
-            );
+            ).catch((e) => {
+              failed = true;
+              if (!stopped) log(redactCredentials(`Issue queue dependency ${dependencyRepo}: ${String(e)}`));
+              return null;
+            });
+            if (!deps) continue;
             for (const n of numbers) {
               const found = issueReference.safeParse(deps[`i${n}`]);
               const key = issueKey(dependencyRepo, n);
