@@ -1,11 +1,14 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Worker } from "node:worker_threads";
 import * as b from "../src/util/privacy-boundary.ts";
 import {
   createPrivacyChecker,
+  disposePrivacyChecker,
+  getPrivacyChecker,
   type PrivacyWorkerPort,
   PrivacyWorkerUnavailable,
   privacyWorkerEntries,
@@ -14,6 +17,7 @@ import {
   startPrivacyWorker,
 } from "../src/util/privacy-checker.ts";
 import * as c from "../src/util/privacy-chunks.ts";
+import { provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
 import * as t from "../src/util/privacy-transport.ts";
 import { privacyTexts } from "./privacy-support.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -1576,4 +1580,71 @@ test.each(["deadline", "dispose"])("a %s terminates a worker still starting", as
   await withheld(receipt, mode === "deadline" ? "checker-timeout" : "checker-failed");
   await disposed;
   expect(terminated).toEqual(["terminated"]);
+});
+
+test.each(["text", "data"] as const)(
+  "worker %s independently refuses a dangling policy symlink after missing-file provisioning",
+  async (kind) => {
+    const dir = mkdtempSync(join(tmpdir(), "privacy-checker-"));
+    const file = join(dir, "private-strings.txt");
+    const f = fixture({ registry: b.createPrivacyRegistry(undefined, undefined, true) });
+    const check = async () => {
+      const pending =
+        kind === "text" ? f.send() : f.protectData({ json: '{"a":"safe"}', provenance: input().provenance });
+      await f.run();
+      return read(await pending);
+    };
+    try {
+      provisionPrivacyPolicy(dir, [], { registry: f.registry, log: mock() });
+      expect((await check()).withheld).toBe(false);
+      symlinkSync("absent-target", file);
+      expect(await check()).toMatchObject({ withheld: true, reason: "unreadable-policy" });
+      expect(f.registry.ready).toBe(false);
+      rmSync(file);
+      expect((await check()).withheld).toBe(false);
+      expect(f.registry.ready).toBe(true);
+    } finally {
+      await f.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("process checker is lazy and shared, refuses until provisioned, keeps equivalent reloads, terminates on dispose", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "privacy-checker-"));
+  const f = fixture(),
+    port = new Port();
+  const previous = b.privacyRegistry.snapshot(),
+    refresh = b.privacyRegistry.refreshPolicy;
+  try {
+    await disposePrivacyChecker();
+    b.privacyRegistry.failPolicy();
+    const workerFactory = mock(() => port);
+    const checker = getPrivacyChecker({ workerFactory, schedule });
+    expect(getPrivacyChecker()).toBe(checker);
+    await withheld(checker.protectText(input()), "unreadable-policy");
+    expect(workerFactory).toHaveBeenCalledTimes(0);
+    provisionPrivacyPolicy(dir, []);
+    const pending = checker.protectText(input());
+    await f.clock.flush();
+    expect(workerFactory).toHaveBeenCalledTimes(1);
+    writeFileSync(join(dir, "private-strings.txt"), "# equivalent empty policy");
+    const second = checker.protectText(input());
+    await f.run();
+    expect(read(await pending).withheld).toBe(false);
+    expect(read(await second).withheld).toBe(false);
+    writeFileSync(join(dir, "private-strings.txt"), "safe");
+    const changed = checker.protectText(input());
+    await f.run();
+    await withheld(changed, "private-match");
+    await disposePrivacyChecker();
+    expect(port.terminated).toBe(1);
+  } finally {
+    await f.dispose();
+    await disposePrivacyChecker();
+    b.privacyRegistry.refreshPolicy = refresh;
+    b.privacyRegistry.replacePolicy(previous.entries);
+    if (!previous.ready) b.privacyRegistry.failPolicy();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

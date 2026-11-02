@@ -7,6 +7,7 @@ import { mountIntegrations } from "../integrations/index.ts";
 import { createApiToken } from "../server/api-token.ts";
 import { startHttp } from "../server/http.ts";
 import { startWorkerListener } from "../server/workers.ts";
+import { processPrivacy } from "../util/privacy-policy.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import { processCleanupStore, recoverProcessCleanups, redactCredentials } from "../util/proc.ts";
 
@@ -17,8 +18,11 @@ export async function startDaemon(
   mount = mountIntegrations,
   serve = Bun.serve<undefined>,
   recover = recoverProcessCleanups,
+  privacy = processPrivacy,
 ) {
-  return processCleanupStore.run(factory.store, () => startScopedDaemon(factory, ui, mount, serve, recover));
+  return processCleanupStore.run(factory.store, () =>
+    startScopedDaemon(factory, ui, mount, serve, recover, privacy),
+  );
 }
 
 async function startScopedDaemon(
@@ -27,8 +31,9 @@ async function startScopedDaemon(
   mount: typeof mountIntegrations,
   serve: typeof Bun.serve<undefined>,
   recover: typeof recoverProcessCleanups,
+  privacy: typeof processPrivacy,
 ) {
-  const credential = createApiToken(factory.cfg.paths.home);
+  let credential: ReturnType<typeof createApiToken> | undefined;
   const privateFiles: (() => void)[] = [];
   const protectAppKey = (cfg: Factory["cfg"]) => {
     if (cfg.githubApp) privateFiles.push(protectPrivateFile(cfg.githubApp.privateKeyPath));
@@ -45,13 +50,17 @@ async function startScopedDaemon(
       Promise.resolve().then(() => server?.stop(force)),
       Promise.resolve().then(() => workers?.stop()),
     ]);
-    credential.release();
+    credential?.release();
     detachSlots();
     for (const release of privateFiles) release();
+    await privacy.dispose();
     const failure = results.find((result) => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
   };
   try {
+    const { configDir, repos, work } = factory.cfg.paths;
+    privacy.provision(configDir, [repos, work]);
+    credential = createApiToken(factory.cfg.paths.home);
     factory.store.setSetting("executor.daemonRelease", factory.bootSha);
     detachSlots = await attachSlotPools(factory.store.db, factory.cfg.maxConcurrentGates);
     for (const [dir, files] of [
