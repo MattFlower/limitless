@@ -1125,6 +1125,9 @@ limitless eval policy --write          # write routing/policy.json and routing/E
 - The defaults are `--k 1`, `--max-usd 1.00`, all cases, and caching on (`--no-cache` forces fresh
   calls). `--max-usd` stops *scheduling* trials once recorded metered spend reaches the threshold.
   It is not a hard billing ceiling.
+- Review runs exclude `escapes-heldout` cases by default and print the excluded count. Use
+  `--include-heldout` to deliberately run every review case, or `--cases id,id` to run exactly
+  those IDs (takes precedence over the flag). The older `heldout` split remains included.
 - `--concurrency N` (default 2) runs up to N trials at once per provider, capped at the provider's
   `max_concurrent` − 1 (at least 1). A provider with `max_concurrent` of 2 or more always keeps a
   slot for production work; one with `max_concurrent = 1` still allows one eval call, which can take
