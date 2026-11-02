@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { decodeRunArtifacts, projectRunArtifacts } from "../pipeline/run-transfer-artifacts.ts";
 import {
   payloadFingerprint,
   receiptDescriptors,
@@ -56,6 +57,14 @@ function retained(db: Database, runId: string): OfflineTransferMaterial {
     if (payload.run.id !== runId || payloadFingerprint(payload) !== receipt.fingerprint)
       return transferConflict();
     verifyProjectionIntegrity(db, payload);
+    if (m.schema === 3)
+      projectRunArtifacts(
+        db,
+        runId,
+        decodeRunArtifacts(m, blobs, payload),
+        readProjectionIds(db, runId),
+        true,
+      );
     return { manifest: receipt.manifest, payload, blobs };
   } catch {
     return transferConflict();
@@ -69,6 +78,12 @@ export function verifyOfflineReceipt(db: Database, runId: string): void {
 }
 export function commitOfflineTransfer(db: Database, input: OfflineTransferMaterial) {
   if (db.inTransaction) throw new Error("Offline receipt commit requires its own transaction");
+  const parsed = receiptManifest(
+    input.manifest,
+    transferHash(new TextEncoder().encode(input.manifest)),
+    input.payload.run.id,
+  );
+  const artifacts = decodeRunArtifacts(parsed, input.blobs, input.payload);
   return db
     .transaction(() => {
       const id = input.payload.run.id;
@@ -85,6 +100,7 @@ export function commitOfflineTransfer(db: Database, input: OfflineTransferMateri
         return readProjectionIds(db, id);
       }
       const ids = writeOfflineProjection(db, input.payload);
+      projectRunArtifacts(db, id, artifacts, ids);
       db.query(
         "INSERT INTO run_transfer_receipts (run_id, manifest, digest, fingerprint) VALUES (?, ?, ?, ?)",
       ).run(id, input.manifest, digest, payloadFingerprint(input.payload));
