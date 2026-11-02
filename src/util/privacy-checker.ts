@@ -24,6 +24,7 @@ export type PrivacyWorkerPort = Pick<Worker, "postMessage" | "ref" | "unref"> & 
   onerror?: (() => void) | null;
   onexit?: (() => void) | null;
   terminate(): Promise<unknown>;
+  ready?: Promise<void>;
 };
 type Options = {
   registry?: typeof b.privacyRegistry;
@@ -147,7 +148,7 @@ export function privacyWorkerHandler(port: Side, { schedule = setImmediate as t.
   };
 }
 export class PrivacyWorkerUnavailable extends Error {}
-// The release build compiles this entry beside src/cli/main.ts, so it lands at util/ in the bundle root.
+export const privacyWorkerReady = "privacy-worker-ready";
 export const privacyWorkerEntries = {
   source: (root: string) => join(root, "src/util/privacy-worker.ts"),
   packaged: () => join(import.meta.dir, "util/privacy-worker.js"),
@@ -158,26 +159,33 @@ export function privacyWorkerEntry(info: Release = release, entries = privacyWor
   if (!existsSync(entry)) throw new PrivacyWorkerUnavailable(`Missing ${info.kind} privacy worker entry`);
   return entry;
 }
-/** Resolves once the entry is running; an entry that exits before then is unusable. */
+/** Owned at once; `ready` rejects if the entry fails, exits or is terminated before announcing itself. */
 export function startPrivacyWorker(entry: string, construct = (path: string) => new Worker(path)) {
-  const worker = construct(entry);
+  const ready = Promise.withResolvers<void>();
+  const unusable = () => ready.reject(new PrivacyWorkerUnavailable("Privacy worker entry did not start"));
+  let worker: Worker;
+  try {
+    worker = construct(entry);
+  } catch {
+    throw new PrivacyWorkerUnavailable("Privacy worker entry could not be constructed");
+  }
   const port: PrivacyWorkerPort = {
     postMessage: (value, transfer) => worker.postMessage(value, transfer),
-    ref: () => worker.ref(),
-    unref: () => worker.unref(),
-    terminate: () => worker.terminate(),
+    ...{ ref: () => worker.ref(), unref: () => worker.unref(), ready: ready.promise },
+    terminate: () => Promise.all([unusable(), worker.terminate()]),
   };
-  worker.on("message", (data) => port.onmessage?.({ data }));
-  worker.on("error", () => port.onerror?.());
-  worker.on("exit", () => port.onexit?.());
-  return new Promise<PrivacyWorkerPort>((resolve, reject) => {
-    worker.once("online", () => resolve(port));
-    worker.once("exit", () => reject(new PrivacyWorkerUnavailable("Privacy worker entry exited at startup")));
+  let started = false; // Bun reports `online` before loading the module, so the entry announces itself.
+  worker.on("message", (data) => {
+    if (started) return port.onmessage?.({ data });
+    started = data === privacyWorkerReady;
+    return started ? ready.resolve() : unusable();
   });
+  worker.on("error", () => [unusable(), port.onerror?.()]);
+  worker.on("exit", () => [unusable(), port.onexit?.()]);
+  return port;
 }
 export function createPrivacyChecker(options: Options = {}) {
   const registry = options.registry ?? b.privacyRegistry;
-  const workerFactory = options.workerFactory ?? (() => startPrivacyWorker(privacyWorkerEntry()));
   const limits = { ...b.privacyLimits, ...options.limits };
   const now = options.now ?? Date.now;
   const setTimer = options.setTimeout ?? setTimeout;
@@ -286,8 +294,9 @@ export function createPrivacyChecker(options: Options = {}) {
       try {
         if (!current(authority)) return finish("stale-generation");
         if (!worker) {
-          worker = await workerFactory();
+          worker = await (options.workerFactory ?? (() => startPrivacyWorker(privacyWorkerEntry())))();
           worker.unref();
+          await worker.ready; // Retained meanwhile: a deadline or disposal terminates it.
         }
         if (!pending.has(finish) || disposed) return void (await retire());
         const port = worker;

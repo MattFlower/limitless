@@ -82,8 +82,7 @@ export function buildConfig(
   uiDirectory: string,
 ): Bun.BuildConfig {
   return {
-    // The privacy worker is its own entry: packaged releases start it from the embedded bundle.
-    entrypoints: [resolve(root, "src/cli/main.ts"), resolve(root, "src/util/privacy-worker.ts")],
+    entrypoints: [resolve(root, "src/cli/main.ts"), resolve(root, "src/util/privacy-worker.ts")], // Lands at util/.
     outdir,
     target: "bun",
     format: "esm",

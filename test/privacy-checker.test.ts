@@ -1469,7 +1469,28 @@ test("worker entry resolution uses only the release's own entry", () => {
   expect(existsSync(privacyWorkerEntries.source(join(import.meta.dir, "..")))).toBe(true);
 });
 
-test.each(["missing", "exits at startup"])(
+const startups: Record<string, (worker: EventEmitter) => void> = {
+  "exits at startup": (worker) => queueMicrotask(() => worker.emit("exit", 1)),
+  "fails to load after online": (worker) =>
+    setImmediate(() => {
+      for (const event of ["online", "error", "exit"]) worker.emit(event);
+    }),
+  "throws on construction": () => {
+    throw new Error("not a worker");
+  },
+};
+function fakeWorker(startup = (_: EventEmitter) => {}, terminated: string[] = []) {
+  const worker = Object.assign(new EventEmitter(), {
+    ref() {},
+    unref() {},
+    postMessage() {},
+    terminate: async () => void terminated.push("terminated"),
+  });
+  startup(worker);
+  return worker as unknown as Worker;
+}
+
+test.each(["missing", ...Object.keys(startups)])(
   "a %s worker entry withholds without another path",
   async (mode) => {
     const calls: string[] = [];
@@ -1485,9 +1506,7 @@ test.each(["missing", "exits at startup"])(
           ),
           (path) => {
             constructed.push(path);
-            const worker = new EventEmitter();
-            queueMicrotask(() => worker.emit("exit", 1));
-            return worker as unknown as Worker;
+            return fakeWorker(startups[mode]);
           },
         ),
     });
@@ -1505,3 +1524,19 @@ test.each(["missing", "exits at startup"])(
     await checker.dispose();
   },
 );
+
+test.each(["deadline", "dispose"])("a %s terminates a worker still starting", async (mode) => {
+  const terminated: string[] = [];
+  const checker = createPrivacyChecker({
+    registry: b.createPrivacyRegistry(),
+    deadlineMs: mode === "deadline" ? 5 : 60_000,
+    workerFactory: () => startPrivacyWorker("entry", () => fakeWorker(undefined, terminated)),
+  });
+  const receipt = checker.protectText(input());
+  await new Promise((done) => setTimeout(done, 20));
+  expect(terminated).toEqual(mode === "deadline" ? ["terminated"] : []);
+  const disposed = checker.dispose();
+  await withheld(receipt, mode === "deadline" ? "checker-timeout" : "checker-failed");
+  await disposed;
+  expect(terminated).toEqual(["terminated"]);
+});
