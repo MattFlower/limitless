@@ -22,17 +22,15 @@ const nullable = (pattern: RegExp) => z.string().regex(pattern).nullable();
 const release = nullable(/^([0-9a-f]{40}|[0-9a-f]{64})$/);
 const parity = z.enum(["match", "differs", "unknown"]);
 const cli = object({ version: nullable(/^\d+\.\d+\.\d+$/), loggedIn: z.boolean() });
+const modes = object({ edit: z.boolean(), read: z.boolean(), confinedRead: z.boolean() });
+const backend = z.enum(["seatbelt", "bwrap-landlock"]);
 export const capabilitiesSchema = object({
   protocol: z.literal(1),
   release,
   checkpoints: z.array(z.literal([1, 2])),
   os: z.enum(["darwin", "linux"]),
   arch: z.enum(["arm64", "x64"]),
-  confinement: object({
-    backend: z.enum(["seatbelt", "bwrap-landlock"]),
-    verified: z.boolean(),
-    codex: object({ edit: z.boolean(), read: z.boolean(), confinedRead: z.boolean() }),
-  }),
+  confinement: object({ backend, verified: z.boolean(), codex: modes }),
   agents: object({ claude: cli, codex: cli }),
   privateStrings: object({ parity, policy: nullable(/^[0-9a-f]{40}$/) }),
   freeSlots: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
@@ -66,8 +64,7 @@ export interface CapabilityMonitor {
   start(): () => void;
 }
 export async function probeCapabilities(deps: ProbeDeps, signal: AbortSignal): Promise<Capabilities> {
-  const { cfg, cwd, scratch } = deps;
-  const platform = deps.platform ?? process.platform;
+  const { cfg, cwd, scratch, platform = process.platform, machineState: power = machineState } = deps;
   const safe = async <T>(probe: () => Promise<T>, fallback: T): Promise<T> => {
     try {
       return await probe();
@@ -104,17 +101,15 @@ export async function probeCapabilities(deps: ProbeDeps, signal: AbortSignal): P
       return verdict.ok && verdict.path !== null;
     }, false);
   }
-  const state =
-    platform === "darwin" ? await safe(() => (deps.machineState ?? machineState)(platform), null) : null;
+  const state = platform === "darwin" ? await safe(() => power(platform, signal), null) : null;
   signal.throwIfAborted();
-  const backend = platform === "darwin" ? "seatbelt" : "bwrap-landlock";
   return capabilitiesSchema.parse({
     protocol: 1,
     checkpoints: [1, 2],
     release: release.safeParse(deps.release).data ?? null,
     os: platform,
     arch: deps.arch ?? process.arch,
-    confinement: { backend, verified, codex },
+    confinement: { backend: platform === "darwin" ? "seatbelt" : "bwrap-landlock", verified, codex },
     agents,
     privateStrings: deps.parity?.() ?? { parity: "unknown", policy: null },
     freeSlots: deps.slots(),
@@ -128,12 +123,11 @@ function interval(tick: () => void, ms: number) {
 }
 function wait<T>(flight: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return flight;
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(signal.reason);
-    if (signal.aborted) return abort();
-    signal.addEventListener("abort", abort, { once: true });
-    flight.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
-  });
+  signal.throwIfAborted();
+  const cancelled = Promise.withResolvers<never>();
+  const abort = () => cancelled.reject(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  return Promise.race([flight, cancelled.promise]).finally(() => signal.removeEventListener("abort", abort));
 }
 export function createCapabilityMonitor(deps: MonitorDeps): CapabilityMonitor {
   const captured = AsyncLocalStorage.snapshot();

@@ -17,6 +17,7 @@ import {
   createCapabilityMonitor,
   type MonitorDeps,
 } from "../src/integrations/member-capabilities.ts";
+import * as proc from "../src/util/proc.ts";
 import { processScope, registerCredential } from "../src/util/proc.ts";
 
 let dir: string;
@@ -484,6 +485,44 @@ test("stop aborts an unfinished probe and prevents it from storing a result", as
   f.advance(30_000);
   f.tick();
   expect(f.deps.codex).not.toHaveBeenCalled();
+});
+
+test("stop cancels both default macOS power commands with the monitor signal", async () => {
+  const entered = Promise.withResolvers<void>();
+  const output = Promise.withResolvers<{ stdout: string; stderr: string; exitCode: number }>();
+  const signals: (AbortSignal | undefined)[] = [];
+  const cancelled: string[] = [];
+  const power = spyOn(proc, "sh").mockImplementation(async (args, opts) => {
+    signals.push(opts.signal);
+    opts.signal?.addEventListener("abort", () => {
+      cancelled.push(args[0] ?? "");
+      output.reject(opts.signal?.reason);
+    });
+    if (signals.length === 2) entered.resolve();
+    return output.promise;
+  });
+  const f = fixture({ machineState: undefined });
+  const stop = f.monitor.start();
+  const flight = f.monitor.refresh();
+  const rejected = flight.catch((error: unknown) => error);
+  try {
+    await entered.promise;
+    expect(power.mock.calls.map(([args]) => args)).toEqual([
+      ["/usr/bin/pmset", "-g", "batt"],
+      ["/usr/sbin/ioreg", "-c", "IOHIDSystem"],
+    ]);
+    expect(signals).toEqual([f.specs[0]?.signal, f.specs[0]?.signal]);
+    stop();
+    expect(cancelled).toEqual(["/usr/bin/pmset", "/usr/sbin/ioreg"]);
+    expect(signals.every((signal) => signal?.aborted)).toBe(true);
+    expect(await rejected).toBeInstanceOf(Error);
+    expect(f.monitor.current(f.deps.clock.sample())).toBeNull();
+  } finally {
+    stop();
+    output.resolve({ stdout: 'AC Power "HIDIdleTime" = 0', stderr: "", exitCode: 0 });
+    await rejected;
+    power.mockRestore();
+  }
 });
 
 test("access shares per URL, caches false for 60 seconds, detaches and isolates cancellation", async () => {
