@@ -1,10 +1,23 @@
 import { expect, test } from "bun:test";
-import { linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPrivateStrings } from "../src/gates/private.ts";
 import * as b from "../src/util/privacy-boundary.ts";
-import { privacyPolicyDiagnostic, provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
+import {
+  inspectPolicyFile,
+  privacyPolicyDiagnostic,
+  provisionPrivacyPolicy,
+} from "../src/util/privacy-policy.ts";
 
 test("policy freshness loads changes once, preserves equivalent authority, refuses failures and recovers", () => {
   const dir = mkdtempSync(join(tmpdir(), "privacy-policy-")),
@@ -30,10 +43,10 @@ test("policy freshness loads changes once, preserves equivalent authority, refus
     provisionPrivacyPolicy(dir, [], {
       registry,
       log: (line) => logs.push(line),
-      stat: (path) => {
+      inspect: (path) => {
         stats++;
         if (statFailed) throw new Error("private-entry");
-        return statSync(path, { throwIfNoEntry: false });
+        return inspectPolicyFile(path);
       },
       load: (...args) => {
         loads++;
@@ -43,12 +56,12 @@ test("policy freshness loads changes once, preserves equivalent authority, refus
     expect(registry.generation.policy).toBe(0);
     expect(check().withheld).toBe(false);
     expect(check('{"key":["safe","fine"]}', true).withheld).toBe(false);
-    expect(loads).toBe(3);
+    expect(loads).toBe(1);
     writeFileSync(file, "alpha-entry");
     expect(check("alpha-entry")).toMatchObject({ withheld: true, reason: "private-match" });
     const generation = registry.generation;
     check();
-    expect(loads).toBe(4);
+    expect(loads).toBe(2);
     writeFileSync(file, "# comment\nalpha-entry\nalpha-entry\n");
     check();
     expect(registry.generation).toEqual(generation);
@@ -57,6 +70,17 @@ test("policy freshness loads changes once, preserves equivalent authority, refus
     expect(check("beta-entry").reason).toBe("private-match");
     rmSync(file);
     expect(check("beta-entry").withheld).toBe(false);
+    check();
+    expect(loads).toBe(5);
+    writeFileSync(join(dir, "target"), "gamma-entry");
+    symlinkSync(join(dir, "target"), file);
+    expect(check("gamma-entry").reason).toBe("private-match");
+    writeFileSync(join(dir, "target"), "delta-entry");
+    utimesSync(join(dir, "target"), 1, 1);
+    expect(check("delta-entry").reason).toBe("private-match");
+    rmSync(file);
+    rmSync(join(dir, "target"));
+    expect(check("delta-entry").withheld).toBe(false);
     for (const kind of ["directory", "hardlinks", "stat"] as const) {
       if (kind === "directory") mkdirSync(file);
       else if (kind === "hardlinks") {

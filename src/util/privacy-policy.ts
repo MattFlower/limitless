@@ -1,28 +1,38 @@
-import { statSync } from "node:fs";
+import { lstatSync, type Stats, statSync } from "node:fs";
 import { join } from "node:path";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { privacyRegistry } from "./privacy-boundary.ts";
 import { disposePrivacyChecker } from "./privacy-checker.ts";
 import { redactCredentials } from "./proc.ts";
 
-const inspect = (path: string) => statSync(path, { throwIfNoEntry: false });
+const stamp = (s?: Stats) => (s ? `${s.dev}/${s.ino}/${s.size}/${s.mtimeMs}/${s.ctimeMs}` : "missing");
+/** One lstat tells true absence from a dangling link; only a symlinked policy also stats its target. */
+export const inspectPolicyFile = (path: string) => {
+  const link = lstatSync(path, { throwIfNoEntry: false });
+  return link?.isSymbolicLink()
+    ? `${stamp(link)}>${stamp(statSync(path, { throwIfNoEntry: false }))}`
+    : stamp(link);
+};
 export const privacyPolicyDiagnostic = "Privacy policy unavailable; privacy checks will refuse.";
 /** Bind once at startup; checks share this synchronous freshness/readiness boundary. */
 export function provisionPrivacyPolicy(
   configDir: string,
   roots: string[],
-  { registry = privacyRegistry, stat = inspect, load = loadPrivateStrings, log = console.error } = {},
+  {
+    registry = privacyRegistry,
+    inspect = inspectPolicyFile,
+    load = loadPrivateStrings,
+    log = console.error,
+  } = {},
 ) {
-  let stamp: string | undefined;
+  let loaded: string | undefined;
   let failed = false;
   registry.refreshPolicy = () => {
     try {
-      const file = stat(join(configDir, "private-strings.txt"));
-      const next = file ? `${file.dev}/${file.ino}/${file.size}/${file.mtimeMs}/${file.ctimeMs}` : "missing";
-      // stat follows links: a missing target still needs the loader's dangling-link validation.
-      if (registry.ready && file && next === stamp) return;
+      const next = inspect(join(configDir, "private-strings.txt"));
+      if (registry.ready && next === loaded) return;
       registry.replacePolicy(load(configDir, roots));
-      stamp = next;
+      loaded = next;
       failed = false;
     } catch {
       registry.failPolicy();
