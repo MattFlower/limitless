@@ -1,11 +1,12 @@
 import { isDeepStrictEqual } from "node:util";
 import type { Worker } from "node:worker_threads";
 import * as b from "./privacy-boundary.ts";
+import * as c from "./privacy-chunks.ts";
 import * as t from "./privacy-transport.ts";
 
 type Generation = ReturnType<typeof b.currentPrivacyGeneration>;
 type Snapshot = ReturnType<typeof b.capturePrivacySnapshot>;
-type Projection = ReturnType<typeof b.consumeBoundaryText>;
+type Projection = Omit<ReturnType<typeof b.consumeBoundaryText>, "text">;
 type Reason = NonNullable<Projection["reason"]>;
 type TextInput = Omit<Parameters<typeof b.protectText>[0], "policy">;
 type DataInput = Omit<Parameters<typeof b.protectData>[0], "policy">;
@@ -63,10 +64,9 @@ const int = (v: unknown, max = 2 ** 53) => Number.isSafeInteger(v) && Number(v) 
 const wire = (g: unknown, like: object) =>
   isDeepStrictEqual(g, like) &&
   `${Object.entries(like).map(([key, n]) => int(n) && key)}` === "policy,credentials,checker";
-const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }); // Keeps a leading U+FEFF.
+const marker = new TextEncoder().encode("[withheld: private text]");
 const digest = (g: Omit<Generation, "identity">) => `privacy/${g.policy}/${g.credentials}/${g.checker}`;
 const failure = (reason: Reason, generation?: Generation, provenance?: b.Provenance): Projection => ({
-  text: "[withheld: private text]",
   withheld: true,
   checkedComplete: false,
   truncated: provenance?.kind === "cut" ? true : provenance?.kind === "complete" ? false : undefined,
@@ -83,14 +83,13 @@ function projection(value: unknown, generation: Generation): value is Projection
   if (!record(value)) return false;
   return (
     Object.keys(value).every((key) =>
-      ["text", "truncated", "checkedComplete", "withheld", "policyDigest", "reason"].includes(key),
+      ["truncated", "checkedComplete", "withheld", "policyDigest", "reason"].includes(key),
     ) &&
-    typeof value.text === "string" &&
     typeof value.checkedComplete === "boolean" &&
     (value.truncated === undefined || typeof value.truncated === "boolean") &&
     value.policyDigest === digest(generation) &&
     (value.withheld === true
-      ? value.text === failure("checker-failed").text && reasons.some((reason) => reason === value.reason)
+      ? reasons.some((reason) => reason === value.reason)
       : value.withheld === false && value.checkedComplete === true && value.reason === undefined)
   );
 }
@@ -162,8 +161,8 @@ export function createPrivacyChecker(options: Options = {}) {
   let active: Finish | undefined;
   let retiring = Promise.resolve();
   let running: Promise<void> | undefined;
-  const issue = (result: Projection, generation?: Generation) =>
-    b.issuePrivacyWorkerResult(result, generation, registry, limits);
+  const issue = (result: Projection, generation?: Generation, parts?: ArrayBuffer[]) =>
+    c.issuePrivacyWorkerChunks(parts, result, generation, registry);
   const current = (generation: Generation) => {
     try {
       return same(generation, b.currentPrivacyGeneration(registry));
@@ -198,7 +197,7 @@ export function createPrivacyChecker(options: Options = {}) {
       if (!disposed && pending.size) wake();
     });
   }
-  function submit(operation: Operation, input: Input, signal?: AbortSignal): Promise<b.BoundaryText> {
+  function submit(operation: Operation, input: Input, signal?: AbortSignal): Promise<c.BoundaryChunks> {
     let generation: Generation | undefined;
     const refuse = (reason: Reason) =>
       Promise.resolve(issue(failure(reason, generation, input.provenance), generation));
@@ -224,7 +223,8 @@ export function createPrivacyChecker(options: Options = {}) {
     const authority = generation;
     const deadline = now() + (options.deadlineMs ?? 30000);
     const id = ++sequence;
-    const result = Promise.withResolvers<b.BoundaryText>();
+    const result = Promise.withResolvers<c.BoundaryChunks>();
+    let staged: ArrayBuffer[] | undefined;
     let timeout: Parameters<typeof clearTimeout>[0];
     const cancel = () => finish("checker-cancelled", active === finish);
     const finish: Finish = (value, terminate = false) => {
@@ -238,9 +238,15 @@ export function createPrivacyChecker(options: Options = {}) {
         if (terminate) void retire();
         else worker?.unref();
       }
+      if (typeof value === "string" && staged) staged.length = 0;
       result.resolve(
-        issue(typeof value === "string" ? failure(value, authority, input.provenance) : value, authority),
+        issue(
+          typeof value === "string" ? failure(value, authority, input.provenance) : value,
+          authority,
+          typeof value === "string" ? undefined : staged,
+        ),
       );
+      staged = undefined;
     };
     pending.set(finish, async () => {
       active = finish;
@@ -276,16 +282,25 @@ export function createPrivacyChecker(options: Options = {}) {
         };
         const input = t.sender("request", request.stream.bytes, t.maxChunk, post, request.meta);
         const output = t.receiver("result", window, limits.outputBytes, limits.outputUnits);
+        staged = output.parts;
+        let markerBytes = 0,
+          markerMismatch = 0;
         const receive = (d: Record<string, unknown>) => {
           if (d.version !== t.version || !wire(d.generation, request.generation)) return;
           if (input.ack(d, schedule)) return true;
           if (granted !== window) return; // Output needs the request sent, then each chunk's window credit.
-          if (output.chunk(d)) return post(["result", "ack", output.parts.length - 1]) ?? true;
+          if (output.chunk(d)) {
+            const payload = new Uint8Array(d.payload as ArrayBuffer);
+            for (let i = 0; i < Math.min(payload.length, marker.length - markerBytes); i++)
+              markerMismatch |= (payload[i] ?? 0) ^ (marker[markerBytes + i] ?? 0);
+            markerBytes = Math.min(marker.length + 1, markerBytes + payload.length);
+            return post(["result", "ack", output.parts.length - 1]) ?? true;
+          }
           if (!output.complete(d) || !Object.keys(d).every((key) => final.split(" ").includes(key))) return;
-          const text = utf8.decode(t.join(output.parts));
           const { truncated, checkedComplete, withheld, policyDigest, reason } = d;
-          const value = { text, truncated, checkedComplete, withheld, policyDigest, reason };
-          return text.length <= limits.outputUnits && projection(value, authority) && (finish(value) ?? true);
+          const value = { truncated, checkedComplete, withheld, policyDigest, reason };
+          if (withheld && (markerBytes !== marker.length || markerMismatch !== 0)) return;
+          return projection(value, authority) && (finish(value) ?? true);
         };
         port.onmessage = ({ data }) => {
           if (worker !== port || !pending.has(finish)) return;

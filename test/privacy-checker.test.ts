@@ -5,6 +5,8 @@ import {
   type PrivacyWorkerPort,
   privacyWorkerHandler,
 } from "../src/util/privacy-checker.ts";
+import * as c from "../src/util/privacy-chunks.ts";
+import * as t from "../src/util/privacy-transport.ts";
 import { privacyTexts } from "./privacy-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -125,8 +127,18 @@ function fixture(options: Options = {}) {
     send: (text = "safe", signal?: AbortSignal) => checker.protectText(input(text), { signal }),
   };
 }
-const read = b.consumeBoundaryText;
-async function withheld(value: Promise<b.BoundaryText>, reason: string) {
+// Test-only materialization; production consumers own their streaming UTF-8 boundaries.
+function read(receipt: unknown): ReturnType<typeof b.consumeBoundaryText> {
+  const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+  let text = "";
+  for (let index = 0; ; index++) {
+    const { bytes, done, ...metadata } = c.consumeBoundaryChunk(receipt, index);
+    text += decoder.decode(bytes, { stream: !done });
+    if (done) return { text, ...metadata };
+  }
+}
+const syncRead = b.consumeBoundaryText;
+async function withheld(value: Promise<c.BoundaryChunks>, reason: string) {
   expect(read(await value)).toMatchObject({ text: "[withheld: private text]", withheld: true, reason });
 }
 
@@ -136,6 +148,7 @@ test("worker operation equals synchronous projections", async () => {
   f.registry.replacePolicy([{ value: host, entry: 0 }]);
   f.registry.addCredential("ab");
   f.registry.addCredential("privacy-test-credential");
+  f.registry.addCredential(host.slice(0, 9));
   const policy = b.preparePrivacyPolicy(b.capturePrivacySnapshot(f.registry));
   const shown = { truncated: false, withheld: false, checkedComplete: true };
   const cut = { truncated: true, withheld: false, checkedComplete: true };
@@ -159,6 +172,10 @@ test("worker operation equals synchronous projections", async () => {
     [
       { ...input("safe\x1b[31m text"), terminal: true },
       { ...shown, text: "safe text" },
+    ],
+    [
+      { ...input("privacy-\x1b[31mtest-credential"), terminal: true },
+      { ...shown, text: "[redacted]" },
     ],
     [
       { ...input("safe tail"), cut: { unit: "U" as const, limit: 4 } },
@@ -197,7 +214,7 @@ test("worker operation equals synchronous projections", async () => {
   for (const [value, expected] of cases) {
     const result = f.protectText(value);
     await f.run();
-    const sync = read(b.protectText({ ...value, policy }, { registry: f.registry }));
+    const sync = syncRead(b.protectText({ ...value, policy }, { registry: f.registry }));
     expect(read(await result)).toEqual(sync);
     expect(read(await result)).toMatchObject(expected);
     expect(Object.keys(await result)).toEqual([]);
@@ -207,6 +224,7 @@ test("worker operation equals synchronous projections", async () => {
     ['{"ab":1}', { ...shown, text: '{"[withheld: private text]":1}' }],
     ['["ab","safe"]', { ...shown, text: '["[withheld: private text]","safe"]' }],
     ['["alpha", "beta", "safe"]', { ...shown, text: '["alpha","beta","safe"]' }],
+    [JSON.stringify(["aaaé😀\n"]), { ...shown, text: '["aaaé😀\\n"]' }],
     ['{"k":"privacy-test-credential"}', refused("private-match", false)],
     [`"${"a".repeat(32760)}\\u00e9"`, { ...cut, text: `"${"a".repeat(7)}` }],
   ] as const;
@@ -218,7 +236,9 @@ test("worker operation equals synchronous projections", async () => {
     };
     const result = f.protectData(value);
     await f.run();
-    expect(read(await result)).toEqual(read(b.protectData({ ...value, policy }, { registry: f.registry })));
+    expect(read(await result)).toEqual(
+      syncRead(b.protectData({ ...value, policy }, { registry: f.registry })),
+    );
     expect(read(await result)).toMatchObject(expected);
   }
   expect(f.ports).toHaveLength(1);
@@ -401,7 +421,19 @@ const faults: Record<string, (frame: Frame) => Frame[]> = {
   "bulk-final": (frame) => forged(frame, { text: "unvalidated partial" }),
   bytes: (frame) => forged(frame, { bytes: 5 }),
   chunks: (frame) => forged(frame, { chunks: 2 }),
+  "invalid-utf8": (frame) =>
+    frame.type === "chunk"
+      ? [{ ...frame, payload: new Uint8Array([0xc3, 0x28, 0x61, 0x61]).buffer }]
+      : [frame],
+  "incomplete-utf8": (frame) =>
+    frame.type === "chunk"
+      ? [{ ...frame, payload: new Uint8Array([0x61, 0x61, 0x61, 0xc3]).buffer }]
+      : [frame],
   shape: (frame) => forged(frame, { checkedComplete: "yes" }),
+  digest: (frame) => forged(frame, { policyDigest: "privacy/999/0/0" }),
+  truncation: (frame) => forged(frame, { truncated: "false" }),
+  unchecked: (frame) => forged(frame, { checkedComplete: false }),
+  "success-reason": (frame) => forged(frame, { reason: "private-match" }),
   "missing-id": ({ id: _id, ...frame }) => [frame as Frame],
   "extra-registry": (frame) => forged(frame, { registry: {} }),
   "extra-generation": (frame) => forged(frame, { identity: {} }),
@@ -430,7 +462,7 @@ const faults: Record<string, (frame: Frame) => Frame[]> = {
 };
 test.each(Object.keys(faults))("protocol fault: %s withholds and retires", async (fault) => {
   const f = fixture({ maxRequests: 1, byteLimit: charge() + W });
-  const issued = spyOn(b, "issuePrivacyWorkerResult");
+  const issued = spyOn(c, "issuePrivacyWorkerChunks");
   const result = f.send();
   await f.clock.flush();
   f.port().tamper = faults[fault] ?? ((frame) => [frame]);
@@ -705,7 +737,7 @@ test.each(["timeout", "cancel", "exit"])(
   "active %s after partial output waits for retirement; queued work has its own deadline",
   async (mode) => {
     const f = fixture({ byteLimit: 2 * charge() + W });
-    const issued = spyOn(b, "issuePrivacyWorkerResult");
+    const issued = spyOn(c, "issuePrivacyWorkerChunks");
     const controller = new AbortController();
     const a = f.send("safe", controller.signal);
     await f.clock.flush();
@@ -775,16 +807,20 @@ test("queued deadline and cancellation release reservations without terminating 
 
 test.each(["mid-transfer", "issuance"])("generation change %s withholds as stale", async (mode) => {
   const f = fixture();
-  const issue = b.issuePrivacyWorkerResult;
-  const issued = spyOn(b, "issuePrivacyWorkerResult").mockImplementation((...args) => {
+  const issue = c.issuePrivacyWorkerChunks;
+  let retainedAtIssue = 0;
+  const issued = spyOn(c, "issuePrivacyWorkerChunks").mockImplementation((...args) => {
     if (mode === "issuance") f.registry.replacePolicy([]);
-    return issue(...args);
+    const receipt = issue(...args);
+    retainedAtIssue = args[0]?.length ?? 0;
+    return receipt;
   });
   const result = f.send("é".repeat(20000));
   await f.run(1);
   if (mode === "mid-transfer") f.registry.addCredential("mid-synthetic-secret");
   await f.run();
   await withheld(result, "stale-generation");
+  expect(retainedAtIssue).toBe(0);
   expect(issued).toHaveBeenCalledTimes(1);
   issued.mockRestore();
   expect(f.port().terminated).toBe(mode === "mid-transfer" ? 1 : 0);
@@ -895,7 +931,8 @@ test.each(["text", "data"] as const)("%s enforces core input caps before admissi
     expect(f.port().sent.filter((frame) => frame.type === "chunk")).toHaveLength(1);
     const receipt = await admitted;
     expect(read(receipt).withheld).toBe(false);
-    expect(read(b.concat([receipt, receipt])).reason).toBe("input-length");
+    expect(b.consumeBoundaryText(receipt).reason).toBe("forged");
+    expect(b.consumeBoundaryText(b.concat([receipt as unknown as b.BoundaryText])).reason).toBe("forged");
     expect(clock.pending).toBe(0);
     await f.dispose();
   }
@@ -949,7 +986,7 @@ test.each([
       ...(mode === "input-length" ? { limits: { inputUnits: 3 } } : {}),
     });
     const controller = new AbortController();
-    let first: Promise<b.BoundaryText> | undefined;
+    let first: Promise<c.BoundaryChunks> | undefined;
     if (mode === "busy" || mode.startsWith("queued-")) {
       first = f.send();
       await f.clock.flush();
@@ -1014,7 +1051,7 @@ test.each([
     const f = fixture();
     f.registry.replacePolicy([{ value: entry, entry: 0 }]);
     const policy = b.preparePrivacyPolicy(b.capturePrivacySnapshot(f.registry));
-    expect(read(b.protectText({ ...input(json), policy }, { registry: f.registry })).withheld).toBe(
+    expect(syncRead(b.protectText({ ...input(json), policy }, { registry: f.registry })).withheld).toBe(
       !original,
     );
     const value = {
@@ -1025,7 +1062,9 @@ test.each([
     const result = f.protectData(value);
     await f.run();
     await withheld(result, "private-match");
-    expect(read(await result)).toEqual(read(b.protectData({ ...value, policy }, { registry: f.registry })));
+    expect(read(await result)).toEqual(
+      syncRead(b.protectData({ ...value, policy }, { registry: f.registry })),
+    );
     await f.dispose();
   },
 );
@@ -1080,7 +1119,7 @@ test("late timers cannot issue twice or release another reservation", async () =
       return clock.timer.set(callback, ms);
     },
   });
-  const spy = spyOn(b, "issuePrivacyWorkerResult");
+  const spy = spyOn(c, "issuePrivacyWorkerChunks");
   const a = f.send();
   await f.run(2);
   const timeout = callbacks[0];
@@ -1163,4 +1202,227 @@ test("failed retirement withholds queued work and prevents replacement computati
   expect(f.port().refs.at(-1)).toBe(false);
   await withheld(f.send(), "checker-failed");
   await f.dispose();
+});
+
+test.each(["", "aaaé😀\\u00e9", "s".repeat(32769)])(
+  "indexed chunks preserve exact cap-edge bytes (length %i)",
+  async (text) => {
+    const window = text.length > 99 ? t.maxChunk : W;
+    const expected = new TextEncoder().encode(text);
+    const f = fixture({
+      outputWindow: window,
+      maxRequests: 1,
+      limits: { outputBytes: expected.length, outputUnits: text.length },
+    });
+    const pending = f.send(text);
+    await f.run();
+    const receipt = await pending,
+      count = Math.ceil(expected.length / window);
+    expect(Reflect.ownKeys(receipt)).toEqual([]);
+    expect(b.consumeBoundaryText(receipt).reason).toBe("forged");
+    expect(b.consumeBoundaryText(b.concat([receipt as unknown as b.BoundaryText])).reason).toBe("forged");
+    const sends = f.port().sent.length;
+    for (let index = 0; index < count; index++) {
+      const chunk = c.consumeBoundaryChunk(receipt, index),
+        repeated = c.consumeBoundaryChunk(receipt, index);
+      expect(chunk).toMatchObject({
+        done: false,
+        withheld: false,
+        checkedComplete: true,
+        truncated: false,
+        policyDigest: "privacy/0/0/0",
+      });
+      expect(chunk.bytes).toEqual(expected.slice(index * window, (index + 1) * window));
+      expect(chunk.bytes.length).toBeLessThanOrEqual(t.maxChunk);
+      expect(chunk.bytes).not.toBe(repeated.bytes);
+      chunk.bytes.fill(0);
+      expect(c.consumeBoundaryChunk(receipt, index).bytes).toEqual(
+        expected.slice(index * window, (index + 1) * window),
+      );
+    }
+    expect(c.consumeBoundaryChunk(receipt, count)).toMatchObject({
+      bytes: new Uint8Array(),
+      done: true,
+      withheld: false,
+    });
+    for (const index of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, count + 1])
+      expect(c.consumeBoundaryChunk(receipt, index)).toMatchObject({
+        done: true,
+        reason: "forged",
+        bytes: new TextEncoder().encode("[withheld: private text]"),
+      });
+    for (const forged of [
+      { ...receipt },
+      structuredClone(receipt),
+      JSON.parse(JSON.stringify(receipt)),
+      null,
+      expected,
+    ])
+      expect(c.consumeBoundaryChunk(forged, 0).reason).toBe("forged");
+    expect(f.port().sent).toHaveLength(sends);
+    const next = f.send(text); // Retaining and reading a receipt holds no request capacity.
+    await f.run();
+    expect(c.consumeBoundaryChunk(await next, 0).withheld).toBe(false);
+    await f.dispose();
+  },
+);
+
+test("daemon validates bounded chunks and transfers the existing receiver array without materialization", async () => {
+  let receiving = false,
+    reads = 0;
+  let parts: ArrayBuffer[] | undefined;
+  const receiver = t.receiver,
+    decode = TextDecoder.prototype.decode,
+    issue = c.issuePrivacyWorkerChunks;
+  const sizes: number[] = [];
+  const decoding = spyOn(TextDecoder.prototype, "decode").mockImplementation(function (
+    this: TextDecoder,
+    input,
+    options,
+  ) {
+    if (receiving) {
+      sizes.push(input?.byteLength ?? 0);
+      expect(input === undefined || options?.stream === true).toBe(true);
+    }
+    return decode.call(this, input, options);
+  });
+  const joining = spyOn(t, "join").mockImplementation((value) => {
+    expect(receiving).toBe(false);
+    return Buffer.concat(value.map((part) => new Uint8Array(part)));
+  });
+  const receivingParts = spyOn(t, "receiver").mockImplementation((...args) => {
+    const result = receiver(...args);
+    if (args[0] !== "result") return result;
+    parts = result.parts;
+    const complete = result.complete;
+    return {
+      ...result,
+      complete: (frame) => {
+        const valid = complete(frame);
+        if (valid)
+          for (const [i, part] of result.parts.entries())
+            Object.defineProperty(result.parts, i, {
+              configurable: true,
+              get: () => {
+                reads++;
+                return part;
+              },
+            });
+        return valid;
+      },
+    };
+  });
+  const issuing = spyOn(c, "issuePrivacyWorkerChunks").mockImplementation((...args) => {
+    expect(args[0]).toBe(parts);
+    expect(reads).toBe(0);
+    return issue(...args);
+  });
+  const f = fixture();
+  try {
+    const pending = f.send("aaaé😀 tail");
+    await f.clock.flush();
+    const emit = f.port().emit.bind(f.port());
+    f.port().emit = (frame) => {
+      receiving = true;
+      try {
+        emit(frame);
+      } finally {
+        receiving = false;
+      }
+    };
+    await f.run();
+    const receipt = await pending;
+    expect(issuing).toHaveBeenCalledTimes(1);
+    expect(reads).toBe(0); // No array copy, payload copy or whole-result read during issuance.
+    expect(sizes).toEqual([4, 4, 4, 2, 0]);
+    expect(c.consumeBoundaryChunk(receipt, 0).bytes).toEqual(new Uint8Array([97, 97, 97, 195]));
+    expect(reads).toBe(1); // One indexed source read for one defensive copy.
+    if (!parts) throw new Error("Missing receiver array");
+    parts.length = 0; // An array clone in receipt evidence would still expose its old chunk.
+    expect(c.consumeBoundaryChunk(receipt, 0).done).toBe(true);
+  } finally {
+    decoding.mockRestore();
+    joining.mockRestore();
+    receivingParts.mockRestore();
+    issuing.mockRestore();
+    await f.dispose();
+  }
+});
+
+test.each(["between", "repeated", "end", "unavailable"])(
+  "every chunk read checks authority: %s",
+  async (mode) => {
+    let broken = false;
+    const authority = b.createPrivacyRegistry(),
+      registry = {
+        ...authority,
+        get generation() {
+          if (broken) throw new Error("source-bearing error");
+          return authority.generation;
+        },
+      };
+    const f = fixture({ registry });
+    const result = f.send("safe tail");
+    await f.run();
+    const receipt = await result;
+    expect(c.consumeBoundaryChunk(receipt, 0).withheld).toBe(false);
+    if (mode === "unavailable") broken = true;
+    else authority.replacePolicy([]);
+    const index = mode === "between" ? 1 : mode === "end" ? 3 : 0;
+    for (let n = 0; n < 2; n++) {
+      const chunk = c.consumeBoundaryChunk(receipt, index);
+      expect(chunk).toMatchObject({
+        done: true,
+        withheld: true,
+        reason: "stale-generation",
+        bytes: new TextEncoder().encode("[withheld: private text]"),
+      });
+      chunk.bytes.fill(0);
+    }
+    await f.dispose();
+  },
+);
+
+test.each([
+  "arbitrary",
+  "[withheld: privaXe text]",
+  "[withheld: private tex",
+  "x[withheld: private text]",
+  "[withheld: private text]x",
+  "[withheld: private text]",
+])("withheld metadata requires the exact marker: %s", async (text) => {
+  for (const checkedComplete of [true, false]) {
+    const f = fixture(),
+      result = f.send(text);
+    await f.clock.flush();
+    f.port().tamper = (frame) =>
+      forged(frame, { withheld: true, checkedComplete, reason: "private-match", truncated: undefined });
+    await f.run();
+    const receipt = await result;
+    expect(read(receipt)).toMatchObject({
+      text: "[withheld: private text]",
+      withheld: true,
+      checkedComplete: text === "[withheld: private text]" ? checkedComplete : false,
+      reason: text === "[withheld: private text]" ? "private-match" : "checker-failed",
+    });
+    await f.dispose();
+  }
+});
+
+test("omitted optional result metadata and local refusals below marker caps remain valid", async () => {
+  const f = fixture(),
+    pending = f.send();
+  await f.clock.flush();
+  f.port().tamper = (frame) => {
+    if (!resultFinal(frame)) return [frame];
+    const { reason: _reason, truncated: _truncated, ...rest } = frame;
+    return [rest];
+  };
+  await f.run();
+  expect(read(await pending)).toMatchObject({ text: "safe", truncated: undefined, withheld: false });
+  await f.dispose();
+  const small = fixture({ limits: { inputUnits: 0, outputBytes: 0, outputUnits: 0 } });
+  await withheld(small.send(), "input-length");
+  expect(small.ports).toHaveLength(0);
+  await small.dispose();
 });
