@@ -4,6 +4,7 @@ import { removeIterationRefs } from "./git/repos.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./pipeline/cancellation.ts";
 import { type Checkpointer, type EngineDeps, localCheckpointer, type RunState } from "./pipeline/context.ts";
 import { executeRun } from "./pipeline/engine.ts";
+import { beginActivity } from "./util/stall.ts";
 
 /**
  * Starts queued runs up to the concurrency limit, cancels on request, and re-queues runs that
@@ -18,6 +19,7 @@ export class Scheduler {
   private probeTimer: ReturnType<typeof setInterval> | null = null;
   private readonly probes = new Set<Promise<void>>();
   private drainEnabled = false;
+  private endDrain?: () => void;
   private readonly drainEvents = new EventTarget();
   private unsubscribe: (() => void) | null = null;
   loadPerCore?: number;
@@ -109,11 +111,14 @@ export class Scheduler {
   }
 
   drain(): void {
+    if (!this.stopping) this.endDrain ??= beginActivity("deploy.drain");
     this.drainEnabled = true;
     this.drainEvents.dispatchEvent(new Event("drain"));
   }
 
   resume(): void {
+    this.endDrain?.();
+    this.endDrain = undefined;
     this.drainEnabled = false;
     this.tick();
   }
@@ -188,6 +193,8 @@ export class Scheduler {
 
   /** Graceful shutdown: interrupt active runs and wait for them to unwind (they are re-queued). */
   async stop(): Promise<void> {
+    this.endDrain?.();
+    this.endDrain = undefined;
     this.stopping = true;
     if (this.probeDelay) clearTimeout(this.probeDelay);
     if (this.probeTimer) clearInterval(this.probeTimer);

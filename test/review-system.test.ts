@@ -243,7 +243,7 @@ test("causal attribution is an opt-in panel option preserved by parsing and rost
   const parsed = parseEvalReviewSystems(file(reference), "s.json")[0];
   if (!parsed) throw new Error("missing system");
   expect(expandRoster(parsed, DEFAULT_ROSTERS)).toMatchObject({ mode: "panel", causalAttribution: true });
-  expect(productionReviewSystem({ reviewImplementerReport: "include" })).not.toHaveProperty(
+  expect(productionReviewSystem({ reviewImplementerReport: "include", reviewSamples: 2 })).not.toHaveProperty(
     "causalAttribution",
   );
   const f = await evalFixture([verifierModel]);
@@ -323,14 +323,22 @@ test("verifier lists require distinct base models and a model outside all finder
   }
 });
 
-test("production derives one routed standard finder from [review] implementer_report", () => {
-  for (const mode of ["include", "omit"] as const)
-    expect(productionReviewSystem({ reviewImplementerReport: mode })).toEqual({
+test("production derives one routed finder from [review] implementer_report and samples", () => {
+  for (const mode of ["include", "omit"] as const) {
+    expect(productionReviewSystem({ reviewImplementerReport: mode, reviewSamples: 2 })).toEqual({
+      name: "production",
+      mode: "single",
+      finders: [{ prompt: "adversarial" }],
+      samples: 2,
+      implementerReport: mode,
+    });
+    expect(productionReviewSystem({ reviewImplementerReport: mode, reviewSamples: 1 })).toEqual({
       name: "production",
       mode: "single",
       finders: [{ prompt: "standard" }],
       implementerReport: mode,
     });
+  }
 });
 
 test("system hash ignores key order and name but not behaviour", () => {
@@ -597,6 +605,7 @@ test("single mode keeps the production review; a panel takes the profile's roste
     reviewImplementerReport: "omit",
     reviewMode: "single",
     reviewRosters: DEFAULT_ROSTERS,
+    reviewSamples: 2,
   } as const;
   for (const profile of ["quick", "standard", "deep"] as const) {
     expect(configuredReviewSystem(cfg, profile, lenses)).toEqual(productionReviewSystem(cfg));
@@ -831,7 +840,13 @@ test("two samples are limited to eval single systems, with unchanged legacy hash
       "systems.json",
     ),
   ).toThrow("samples is not supported on roster references");
-  expect(() => ReviewSystemSchema.parse(system({ samples: 2 }))).toThrow("eval-only until adopted");
+  expect(() => ReviewSystemSchema.parse(system({ samples: 2 }))).toThrow("with samples 2");
+  expect(() =>
+    ReviewSystemSchema.parse(system({ finders: [{ prompt: "adversarial" }], samples: 2, mode: "panel" })),
+  ).toThrow("samples requires mode");
+  expect(
+    ReviewSystemSchema.parse(system({ finders: [{ prompt: "adversarial" }], samples: 2 })),
+  ).toMatchObject({ samples: 2 });
   const base = system() as ReviewSystem;
   // The original hash was the canonical config alone (no name or union policy).
   const original = new Bun.CryptoHasher("sha256")

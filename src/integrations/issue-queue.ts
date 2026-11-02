@@ -361,6 +361,7 @@ export function startIssueQueue(
   };
   const tick = async () => {
     if (stopped) return;
+    const end = beginActivity("issue-queue.poll");
     startedAt = now();
     inFlight = true;
     pending = false;
@@ -653,6 +654,7 @@ export function startIssueQueue(
       failed = true;
       if (!stopped) log(redactCredentials(`Issue queue: ${String(e)}`));
     } finally {
+      end();
       unsubscribe();
       inFlight = false;
       const regular = now() + q.pollSeconds * 1000;

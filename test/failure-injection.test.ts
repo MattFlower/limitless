@@ -188,6 +188,8 @@ function factory(
 ) {
   const cfg = loadConfig({ home: join(root, "data"), configDir: join(root, "cfg") });
   cfg.maxConcurrentGates = 1;
+  // One review call per round keeps the review counts below readable.
+  cfg.reviewSamples = 1;
   const f = new Factory(cfg, {
     confinement: fakeConfinement,
     healthFetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),

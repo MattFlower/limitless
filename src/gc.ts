@@ -8,6 +8,7 @@ import { BASELINE_CACHE_TTL_MS } from "./gates/cache.ts";
 import { cacheGit, worktreeGit } from "./git/command.ts";
 import { cachePath, withRepoLock, worktreeOwner } from "./git/repos.ts";
 import { sh } from "./util/proc.ts";
+import { activity, beginActivity } from "./util/stall.ts";
 
 const DAY = 86_400_000;
 
@@ -68,6 +69,7 @@ export async function collectGarbage(
   cfg: Config,
   opts: { dryRun?: boolean; now?: number } = {},
 ): Promise<GcResult> {
+  using _span = { [Symbol.dispose]: beginActivity("gc.collect") };
   const now = opts.now ?? Date.now();
   const dryRun = opts.dryRun ?? false;
   const result: GcResult = {
@@ -84,6 +86,7 @@ export async function collectGarbage(
   const repos = new Map(store.listRepos().map((repo) => [repo.id, repo]));
   const workRoot = resolve(cfg.paths.work);
   const runRoot = resolve(cfg.paths.runs);
+  const scan = <T>(fn: () => T) => activity("gc.worktrees", fn, 50);
 
   const iterationRepos = new Set<string>();
   for (const repo of repos.values()) {
@@ -134,50 +137,63 @@ export async function collectGarbage(
     }
   }
 
-  for (const run of finished) {
+  function scanWorktree(run: Run) {
     const days =
       run.status === "failed" || run.status === "needs_human"
         ? cfg.retention.failedWorktreeDays
         : cfg.retention.worktreeDays;
-    if (!due(run, now, days)) continue;
+    if (!due(run, now, days)) return;
     const repo = repos.get(run.repoId);
     if (!repo) {
       result.errors.push(`${run.id}: registered repository missing`);
-      continue;
+      return;
     }
     try {
       const path = child(workRoot, run.id);
-      const cache =
-        repo.kind === "local" && existsSync(path) ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
+      return { repo, path, exists: existsSync(path) };
+    } catch (error) {
+      result.errors.push(`${run.id} worktree: ${(error as Error).message}`);
+    }
+  }
+  for (const run of finished) {
+    const worktree = scan(() => scanWorktree(run));
+    if (!worktree) continue;
+    const { repo, path, exists } = worktree;
+    try {
+      const cache = repo.kind === "local" && exists ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
       // The common repository is factory/user-owned; agents write only the linked checkout.
       const git = repo.kind === "github" ? cacheGit : sh;
       if (repo.kind === "github" && !resolve(cache).startsWith(resolve(cfg.paths.repos) + sep)) {
         throw new Error(`repository cache outside ${cfg.paths.repos}`);
       }
       await withRepoLock(cache, async () => {
-        if (!existsSync(path)) return;
+        if (!scan(() => existsSync(path))) return;
         if (repo.kind === "local") {
           const owned = cachePath(cfg.paths, repo);
           if (
-            canonical(cache) !== canonical(owned) &&
+            scan(() => canonical(cache) !== canonical(owned)) &&
             (!repo.localPath || cache !== (await worktreeOwner(repo.localPath)))
           )
             throw new Error(`worktree is not registered to ${repo.slug}: ${path}`);
         }
-        if (lstatSync(path).isSymbolicLink() || !lstatSync(path).isDirectory()) {
+        if (scan(() => lstatSync(path).isSymbolicLink() || !lstatSync(path).isDirectory())) {
           throw new Error(`worktree path is not a directory: ${path}`);
         }
-        const listed = worktreePaths(
-          (await git(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout,
-        );
-        if (realpathSync(path).startsWith(realpathSync(workRoot) + sep) && listed.has(canonical(path))) {
+        const listing = await git(["git", "worktree", "list", "--porcelain"], { cwd: cache });
+        const registered = scan(() => {
+          const listed = worktreePaths(listing.stdout);
+          return realpathSync(path).startsWith(realpathSync(workRoot) + sep) && listed.has(canonical(path));
+        });
+        if (registered) {
           if (!dryRun) await git(["git", "worktree", "remove", "--force", path], { cwd: cache });
           result.worktrees.push(path);
         } else {
           throw new Error(`worktree is not registered to ${repo.slug}: ${path}`);
         }
       });
-      if (!dryRun && !existsSync(path)) rmSync(`${path}.git-paths`, { force: true });
+      scan(() => {
+        if (!dryRun && !existsSync(path)) rmSync(`${path}.git-paths`, { force: true });
+      });
     } catch (error) {
       result.errors.push(`${run.id} worktree: ${(error as Error).message}`);
     }
@@ -203,7 +219,7 @@ export async function collectGarbage(
     const git = repo.kind === "github" ? cacheGit : sh;
     try {
       await withRepoLock(cache, async () => {
-        const eligible = new Set(
+        const candidates = new Set(
           finished
             .filter(
               (run) =>
@@ -216,10 +232,12 @@ export async function collectGarbage(
                     : cfg.retention.worktreeDays,
                 ),
             )
-            .map((run) => canonical(child(workRoot, run.id))),
+            .map((run) => child(workRoot, run.id)),
         );
+        // One measurement for the whole contiguous lookup, so many fast calls are still attributed.
+        const eligible = scan(() => new Set([...candidates].map(canonical)));
         const listed = (await git(["git", "worktree", "list", "--porcelain"], { cwd: cache })).stdout;
-        const prunable = prunablePaths(listed);
+        const prunable = scan(() => prunablePaths(listed));
         // Only prune the source when an eligible legacy worktree left stale metadata there.
         if (cache === repo.localPath && !prunable.some((path) => eligible.has(path))) return;
         const unrelated = prunable.filter((path) => !eligible.has(path));
@@ -240,11 +258,11 @@ export async function collectGarbage(
     }
   }
 
-  for (const run of finished) {
-    if (!due(run, now, cfg.retention.logDays)) continue;
+  function collectLogs(run: Run) {
+    if (!due(run, now, cfg.retention.logDays)) return;
     try {
       const dir = child(runRoot, run.id);
-      if (!existsSync(dir)) continue;
+      if (!existsSync(dir)) return;
       if (lstatSync(dir).isSymbolicLink() || !lstatSync(dir).isDirectory()) {
         throw new Error(`run directory is not a directory: ${dir}`);
       }
@@ -263,6 +281,7 @@ export async function collectGarbage(
       result.errors.push(`${run.id} logs: ${(error as Error).message}`);
     }
   }
+  activity("gc.logs", () => finished.forEach(collectLogs), 50);
 
   try {
     const cutoff = now - cfg.retention.debugEventDays * DAY;

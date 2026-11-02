@@ -2482,6 +2482,8 @@ describe("pipeline hardening", () => {
     let verifies = 0;
     let reviews = 0;
     const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "cfg") });
+    // One review call per round keeps the review count below readable.
+    cfg.reviewSamples = 1;
     const f = new Factory(cfg, {
       confinement: fakeConfinement,
       providers,

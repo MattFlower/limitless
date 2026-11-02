@@ -700,7 +700,7 @@ export interface ReviewSystem {
   setup?: true;
   /** Eval only: the source panel system for stored finder replay. */
   replayFrom?: string;
-  /** Eval only: union two independent single-review samples. */
+  /** Union two independent single-review samples (the production review, with the adversarial prompt). */
   samples?: 2;
   name: string;
   mode: "single" | "panel";

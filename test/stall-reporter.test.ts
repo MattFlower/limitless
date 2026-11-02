@@ -1,13 +1,24 @@
 import { Database } from "bun:sqlite";
 import { expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import * as fs from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Factory } from "../src/app.ts";
+import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import { WorkerStore } from "../src/db/workers.ts";
+import * as gateExecution from "../src/gates/executor.ts";
+import { collectGarbage } from "../src/gc.ts";
+import * as gitCommand from "../src/git/command.ts";
+import * as repos from "../src/git/repos.ts";
+import { startIssueQueue } from "../src/integrations/issue-queue.ts";
+import { LandQueue } from "../src/land/queue.ts";
 import { renderReport } from "../src/pipeline/report.ts";
 import { EventLoopLag } from "../src/server/event-loop-lag.ts";
 import { redactCredentials, registerCredential } from "../src/util/proc.ts";
-import { StallReporter, stallReporter } from "../src/util/stall.ts";
+import { activity, StallReporter, stallReporter } from "../src/util/stall.ts";
+import { waitClock } from "./wait-clock.ts";
 
 function timedStore() {
   const store = new Store(":memory:");
@@ -448,5 +459,764 @@ test("real credential and report paths preserve output and record their work", (
   } finally {
     clock.mockRestore();
     log.mockRestore();
+  }
+});
+
+function backgroundFixture() {
+  const f = timedStore();
+  const root = mkdtempSync(join(tmpdir(), "stall-background-"));
+  const marker = crypto.randomUUID();
+  const cfg = loadConfig({
+    home: root,
+    configDir: join(root, "config"),
+    raw: { github: { queue: { repos: [`owner/${marker}`], trusted: [marker] } } },
+  });
+  const repo = f.store.upsertRepo({
+    slug: `owner/${marker}`,
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  return {
+    ...f,
+    root,
+    cfg,
+    repo,
+    marker,
+    block() {
+      f.advance(3000);
+      stallReporter.sample(3000);
+    },
+    active(label: string, count = 1, elapsed = 3000) {
+      expect(f.lines.at(-1)).toContain(
+        `${label}: count=0 total=0ms max=0ms active=${count} elapsed=${elapsed}ms`,
+      );
+      expect(f.lines.at(-1)).not.toContain(marker);
+      expect(f.lines.at(-1)).not.toContain(root);
+      expect(f.lines.at(-1)).not.toContain(repo.id);
+    },
+    settled(label: string) {
+      stallReporter.sample(3000);
+      expect(f.lines.at(-1)).toContain(`${label}: count=1`);
+      expect(f.lines.at(-1)).not.toContain("active=");
+      stallReporter.sample(3000);
+      expect(f.lines.at(-1)).not.toContain(label);
+    },
+    close() {
+      f.close();
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+for (const operation of ["gc.collect", "workers.sweep", "workers.sweep-agent-jobs"] as const) {
+  test.each([false, true])(
+    `${operation} covers synchronous work and cleans up on failure=%s`,
+    async (fail) => {
+      const f = backgroundFixture();
+      const failure = new Error(f.marker);
+      const callback = () => {
+        f.block();
+        f.active(operation);
+        if (fail) throw failure;
+        return 0;
+      };
+      const workers = new WorkerStore(f.store, f.marker, {}, callback);
+      const finished = spyOn(f.store, "finishedRuns");
+      if (operation === "gc.collect")
+        finished.mockImplementation(() => {
+          callback();
+          return [];
+        });
+      try {
+        const invoke = () =>
+          operation === "gc.collect"
+            ? collectGarbage(f.store, f.cfg)
+            : operation === "workers.sweep"
+              ? workers.sweep()
+              : workers.sweepAgentJobs();
+        if (fail) {
+          let caught: unknown;
+          try {
+            await invoke();
+          } catch (error) {
+            caught = error;
+          }
+          expect(caught).toBe(failure);
+        } else await invoke();
+        f.settled(operation);
+        expect(f.lines.join("\n")).not.toContain(failure.message);
+      } finally {
+        finished.mockRestore();
+        f.close();
+      }
+    },
+  );
+}
+
+for (const action of ["start", "stop"] as const) {
+  test.each([
+    [49, false],
+    [50, false],
+    [51, false],
+    [3000, false],
+    [3000, true],
+  ] as const)(`Factory ${action} times agent-job retention at %sms, failure=%s`, async (duration, fail) => {
+    const f = backgroundFixture();
+    f.cfg.workers.listen = "127.0.0.1:0";
+    f.cfg.workers.agents = ["implement"];
+    const factory = new Factory(f.cfg, {
+      store: f.store,
+      providers: [],
+      cleanup: async () => ({
+        dryRun: false,
+        worktrees: [],
+        logs: [],
+        metadata: [],
+        debugEvents: 0,
+        baselineCache: 0,
+        feedItems: 0,
+        errors: [],
+      }),
+    });
+    const active = f.store.createRun(f.repo, { repo: f.repo.slug, prompt: f.marker });
+    const terminal = f.store.createRun(f.repo, { repo: f.repo.slug, prompt: f.marker });
+    f.store.updateRun(terminal.id, { status: "succeeded", finishedAt: 1 });
+    const request = {
+      runId: active.id,
+      invocationId: 1,
+      parentSha: "a".repeat(40),
+      prompt: f.marker,
+      timeoutMs: 1000,
+      target: {
+        modelId: "fake",
+        provider: "fake",
+        harness: "claude" as const,
+        model: "fake",
+        vendor: "fake",
+        tier: 1,
+        billing: "free" as const,
+      },
+    };
+    const kept = factory.workers.enqueueAgentJob(request);
+    const cancelled = factory.workers.enqueueAgentJob({ ...request, runId: terminal.id });
+    f.store.setRunState(active.id, { agentJob: { id: kept } });
+    f.store.setRunState(terminal.id, { agentJob: { id: cancelled } });
+    const originalState = f.store.getRunState.bind(f.store);
+    const failure = new Error(f.marker);
+    const state = spyOn(f.store, "getRunState").mockImplementation((id) => {
+      expect(id).toBe(active.id);
+      f.advance(duration);
+      if (fail) throw failure;
+      return originalState(id);
+    });
+    const cancel = spyOn(factory.workers, "cancelOpenAgentJobs");
+    const scheduler = spyOn(factory.scheduler, "start").mockImplementation(() => {
+      expect(cancel).toHaveBeenCalledWith(new Set([kept]));
+    });
+    try {
+      if (fail) {
+        if (action === "start") expect(() => factory.start()).toThrow(failure);
+        else await expect(factory.stop()).rejects.toBe(failure);
+        expect(cancel).not.toHaveBeenCalled();
+      } else {
+        if (action === "start") factory.start();
+        else await factory.stop();
+        expect(state).toHaveBeenCalledTimes(1);
+        expect(cancel).toHaveBeenCalledWith(new Set([kept]));
+        expect(factory.workers.agentJob(kept ?? "")?.state).toBe("queued");
+        expect(factory.workers.agentJob(cancelled ?? "")?.state).toBe("cancelled");
+      }
+      stallReporter.sample(3000);
+      if (duration > 50)
+        expect(f.lines.at(-1)).toContain(
+          `workers.retain-agent-jobs: count=1 total=${duration}ms max=${duration}ms`,
+        );
+      else expect(f.lines.at(-1)).not.toContain("workers.retain-agent-jobs");
+      for (const value of [f.marker, f.root, f.repo.id, active.id, terminal.id, kept, cancelled])
+        if (value) expect(f.lines.at(-1)).not.toContain(value);
+      expect(f.lines.at(-1)).not.toContain("active=");
+    } finally {
+      state.mockRestore();
+      cancel.mockRestore();
+      scheduler.mockRestore();
+      await factory.stop();
+      f.close();
+    }
+  });
+}
+
+test.each(["resume", "shutdown"] as const)(
+  "drain is one session across repeated requests until %s",
+  async (finish) => {
+    const f = backgroundFixture();
+    const factory = new Factory(f.cfg, { store: f.store, providers: [] });
+    try {
+      factory.scheduler.drain();
+      factory.scheduler.drain();
+      f.block();
+      f.active("deploy.drain");
+      await Promise.resolve();
+      factory.scheduler.drain();
+      f.block();
+      f.active("deploy.drain", 1, 6000);
+      if (finish === "resume") factory.scheduler.resume();
+      else await factory.scheduler.stop();
+      f.settled("deploy.drain");
+      if (finish === "resume") {
+        factory.scheduler.drain();
+        f.block();
+        f.active("deploy.drain");
+        factory.scheduler.resume();
+        f.settled("deploy.drain");
+      }
+    } finally {
+      await factory.stop();
+      f.close();
+    }
+  },
+);
+
+test.each(["success", "failure", "cancelled"] as const)(
+  "complete issue polling spans lifecycle work and awaits: %s",
+  async (outcome) => {
+    const f = backgroundFixture();
+    const factory = new Factory(f.cfg, { store: f.store, providers: [] });
+    const clock = waitClock();
+    const gate = Promise.withResolvers<string>();
+    const done = Promise.withResolvers<void>();
+    // Lifecycle reconciliation precedes the per-repository span.
+    const lifecycle = spyOn(f.store, "issueLifecycleRuns").mockImplementation(() => {
+      f.block();
+      f.active("issue-queue.poll");
+      expect(f.lines.at(-1)).not.toContain("issue-queue.repository");
+      return [];
+    });
+    const stop = startIssueQueue(factory, {
+      clock: { now: clock.now, set: clock.timer.set as typeof setTimeout, clear: clock.timer.clear },
+      gh: async (_args, signal) => {
+        signal?.addEventListener("abort", () => gate.reject(new Error(f.marker)), { once: true });
+        try {
+          return await gate.promise;
+        } finally {
+          done.resolve();
+        }
+      },
+      log: () => {},
+      lifecycle: { identity: async () => ({ kind: "owner" }) },
+    });
+    try {
+      await clock.advance(0);
+      f.block();
+      f.active("issue-queue.poll", 1, 6000);
+      expect(f.lines.at(-1)).toContain(
+        "issue-queue.repository: count=0 total=0ms max=0ms active=1 elapsed=3000ms",
+      );
+      if (outcome === "success")
+        gate.resolve("HTTP/2.0 200 OK\r\nDate: Thu, 01 Jan 2026 00:00:00 GMT\r\n\r\n{}");
+      else if (outcome === "failure") gate.reject(new Error(f.marker));
+      else stop();
+      await done.promise;
+      await clock.flush();
+      f.settled("issue-queue.poll");
+      expect(f.lines.join("\n")).not.toContain(f.marker);
+    } finally {
+      stop();
+      lifecycle.mockRestore();
+      await factory.stop();
+      f.close();
+    }
+  },
+);
+
+function landFixture(f: ReturnType<typeof backgroundFixture>) {
+  const entry = f.store.createLandEntry({
+    runId: null,
+    repo: f.repo.slug,
+    prUrl: `https://github.com/${f.repo.slug}/pull/123`,
+    approvedSha: "a".repeat(40),
+    baseBranch: "main",
+    headBranch: f.marker,
+  });
+  const queue = new LandQueue({ store: f.store, paths: f.cfg.paths });
+  const internals = queue as unknown as {
+    checks: (typeof queue)["checks"];
+    merge: (typeof queue)["merge"];
+    assertClaim: (id: number) => void;
+    mergeMetadata: (typeof queue)["mergeMetadata"];
+    landed: (typeof queue)["landed"];
+  };
+  const claim = spyOn(internals, "assertClaim").mockImplementation(() => {});
+  return { queue: internals, entry, claim };
+}
+
+test.each(["failure", "cancelled"] as const)(
+  "land checks retain overlapping spans through awaits: %s",
+  async (outcome) => {
+    const f = backgroundFixture();
+    const { queue, entry, claim } = landFixture(f);
+    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let calls = 0;
+    const exportCommit = spyOn(repos, "exportCommit").mockImplementation(async () => {
+      const gate = gates[calls++];
+      if (!gate) throw new Error("unexpected export");
+      return gate.promise;
+    });
+    const controllers = [new AbortController(), new AbortController()];
+    const failures = controllers.map((c) => {
+      c.signal.addEventListener("abort", () => gates[0]?.reject(c.signal.reason));
+      return new Error(f.marker);
+    });
+    const pending: Promise<unknown>[] = [];
+    try {
+      for (const [i, c] of controllers.entries()) {
+        pending.push(
+          queue
+            .checks({ ...entry, id: entry.id + i }, join(f.root, String(i)), "a".repeat(40), c.signal)
+            .catch((e: unknown) => e),
+        );
+      }
+      f.block();
+      f.active("land.check", 2, 6000);
+      if (outcome === "cancelled") controllers[0]?.abort(failures[0]);
+      else gates[0]?.reject(failures[0]);
+      expect(await pending[0]).toBe(failures[0]);
+      stallReporter.sample(3000);
+      expect(f.lines.at(-1)).toContain("land.check: count=1 total=3000ms max=3000ms active=1 elapsed=3000ms");
+      gates[1]?.reject(failures[1]);
+      expect(await pending[1]).toBe(failures[1]);
+      f.settled("land.check");
+      expect(f.lines.join("\n")).not.toContain(f.marker);
+    } finally {
+      for (const gate of gates) gate.reject(new Error("cleanup"));
+      await Promise.allSettled(pending);
+      exportCommit.mockRestore();
+      claim.mockRestore();
+      f.close();
+    }
+  },
+);
+
+test.each(["early", "failure", "cancelled", "success"] as const)(
+  "land merge span settles on %s",
+  async (outcome) => {
+    const f = backgroundFixture();
+    const { queue, entry, claim } = landFixture(f);
+    const gate = Promise.withResolvers<"merged">();
+    const controller = new AbortController();
+    const failure = new Error(f.marker);
+    controller.signal.addEventListener("abort", () => gate.reject(failure));
+    const getEntry = spyOn(f.store, "getLandEntry").mockImplementationOnce(() => {
+      f.block();
+      f.active("land.merge");
+      return { ...entry, state: outcome === "early" ? "cancelled" : "waiting_ci" };
+    });
+    const merge = spyOn(repos, "mergePullRequest").mockImplementation(() => gate.promise);
+    const metadata = spyOn(queue, "mergeMetadata").mockResolvedValue(null);
+    const landed = spyOn(queue, "landed").mockImplementation(() => {});
+    try {
+      const pending = queue
+        .merge(
+          entry,
+          f.repo,
+          join(f.root, "checkout"),
+          entry.approvedSha,
+          f.marker,
+          f.marker,
+          controller.signal,
+        )
+        .catch((e: unknown) => e);
+      if (outcome !== "early") {
+        f.block();
+        f.active("land.merge", 1, 6000);
+        if (outcome === "failure") gate.reject(failure);
+        else if (outcome === "cancelled") controller.abort();
+        else gate.resolve("merged");
+      }
+      expect(await pending).toBe(outcome === "failure" || outcome === "cancelled" ? failure : undefined);
+      f.settled("land.merge");
+      expect(f.lines.join("\n")).not.toContain(f.marker);
+    } finally {
+      getEntry.mockRestore();
+      merge.mockRestore();
+      metadata.mockRestore();
+      landed.mockRestore();
+      claim.mockRestore();
+      f.close();
+    }
+  },
+);
+
+function gcRuns(f: ReturnType<typeof backgroundFixture>, count = 3) {
+  return Array.from({ length: count }, () => {
+    const run = f.store.createRun(f.repo, { repo: f.repo.slug, prompt: f.marker });
+    f.store.updateRun(run.id, { status: "succeeded", finishedAt: 1 });
+    const logDir = join(f.cfg.paths.runs, run.id);
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(join(logDir, "inv-1.log"), f.marker);
+    return { run, logDir, worktree: join(f.cfg.paths.work, run.id) };
+  });
+}
+
+test.each([49, 50, 51])(
+  "GC thresholds per-run worktree scans and contiguous log passes at %sms, retained after span closes",
+  async (duration) => {
+    const f = backgroundFixture();
+    // Four log-stat calls keep the fake-clock increments exact at the 50 ms boundary.
+    const runs = gcRuns(f, 2);
+    const originalExists = fs.existsSync,
+      originalLstat = fs.lstatSync;
+    const seen = new Set<string>();
+    const exists = spyOn(fs, "existsSync").mockImplementation((path) => {
+      const key = String(path);
+      if (runs.some((r) => r.worktree === key) && !seen.has(key)) {
+        seen.add(key);
+        f.advance(duration);
+      }
+      return originalExists(path);
+    });
+    const lstat = spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+      if (runs.some((r) => r.logDir === String(args[0]))) f.advance(duration / (runs.length * 2));
+      return originalLstat(...args);
+    }) as typeof fs.lstatSync);
+    try {
+      const result = await collectGarbage(f.store, f.cfg, { now: Date.now() });
+      expect(result.errors).toEqual([]);
+      expect(result.logs).toHaveLength(2);
+      expect(result.worktrees).toEqual([]);
+      stallReporter.sample(3000);
+      expect(f.lines.at(-1)).not.toContain("active=");
+      for (const [label, count] of [
+        ["gc.worktrees", 2],
+        ["gc.logs", 1],
+      ] as const) {
+        if (duration > 50)
+          expect(f.lines.at(-1)).toContain(`${label}: count=${count} total=${count * 51}ms max=51ms`);
+        else expect(f.lines.at(-1)).not.toContain(label);
+      }
+      expect(f.lines.at(-1)).not.toContain(f.marker);
+      for (const { run } of runs) expect(f.lines.at(-1)).not.toContain(run.id);
+      stallReporter.sample(3000);
+      expect(f.lines.at(-1)).not.toContain("gc.");
+    } finally {
+      exists.mockRestore();
+      lstat.mockRestore();
+      f.close();
+    }
+  },
+);
+
+test("GC awaits Git under its span without inflating synchronous scan timing", async () => {
+  const f = backgroundFixture();
+  const runs = gcRuns(f, 1);
+  const run = runs[0];
+  if (!run) throw new Error("missing run");
+  mkdirSync(run.worktree, { recursive: true });
+  const gate = Promise.withResolvers<never>();
+  const ready = Promise.withResolvers<void>();
+  const originalExists = fs.existsSync;
+  let scanned = false;
+  const exists = spyOn(fs, "existsSync").mockImplementation((path) => {
+    if (String(path) === run.worktree && !scanned) {
+      f.advance(51);
+      scanned = true;
+    }
+    return originalExists(path);
+  });
+  const git = spyOn(gitCommand, "cacheGit").mockImplementation(() => {
+    ready.resolve();
+    return gate.promise;
+  });
+  try {
+    const pending = collectGarbage(f.store, f.cfg, { dryRun: true });
+    await ready.promise;
+    f.block();
+    f.active("gc.collect", 1, 3051);
+    gate.reject(new Error(f.marker));
+    const result = await pending;
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain(f.marker);
+    stallReporter.sample(3000);
+    expect(f.lines.at(-1)).not.toContain("active=");
+    // The first sample consumed the completed scan; the Git wait creates no second measurement.
+    expect(f.lines.at(-1)).not.toContain("gc.worktrees");
+    expect(f.lines[0]).toContain("gc.worktrees: count=1 total=51ms max=51ms");
+    expect(f.lines.join("\n")).not.toContain(f.marker);
+  } finally {
+    exists.mockRestore();
+    git.mockRestore();
+    f.close();
+  }
+});
+
+for (const phase of ["validation", "canonical"] as const) {
+  test.each([
+    [49, false],
+    [50, false],
+    [51, false],
+    [102, false],
+    [51, true],
+  ] as const)(
+    `GC times actual worktree ${phase} as a synchronous pass at %sms, failure=%s`,
+    async (duration, fail) => {
+      const f = backgroundFixture();
+      const [run] = gcRuns(f, 1);
+      if (!run) throw new Error("missing run");
+      mkdirSync(run.worktree, { recursive: true });
+      const listing = `worktree ${run.worktree}\n\n`;
+      const gate = Promise.withResolvers<Awaited<ReturnType<typeof gitCommand.cacheGit>>>();
+      const ready = Promise.withResolvers<void>();
+      const originalLstat = fs.lstatSync;
+      const originalRealpath = fs.realpathSync;
+      let calls = 0;
+      const lstat = spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+        if (phase === "validation" && String(args[0]) === run.worktree) {
+          calls++;
+          f.advance(fail ? duration : duration / 2);
+          if (fail) throw new Error(f.marker);
+        }
+        return originalLstat(...args);
+      }) as typeof fs.lstatSync);
+      const realpath = spyOn(fs, "realpathSync").mockImplementation(((
+        ...args: Parameters<typeof fs.realpathSync>
+      ) => {
+        if (phase === "canonical" && [run.worktree, f.cfg.paths.work].includes(String(args[0]))) {
+          calls++;
+          f.advance(fail ? duration : duration / 4);
+          if (fail) throw new Error(f.marker);
+        }
+        return originalRealpath(...args);
+      }) as typeof fs.realpathSync);
+      const git = spyOn(gitCommand, "cacheGit").mockImplementation(() => {
+        ready.resolve();
+        return gate.promise;
+      });
+      let pending: ReturnType<typeof collectGarbage> | undefined;
+      try {
+        pending = collectGarbage(f.store, f.cfg, { dryRun: true });
+        if (!(fail && phase === "validation")) {
+          await ready.promise;
+          // This wait must never contribute to either synchronous filesystem pass.
+          f.advance(3000);
+        }
+        gate.resolve({ stdout: listing, stderr: "", exitCode: 0 });
+        const result = await pending;
+        if (fail) expect(result.errors).toEqual([expect.stringContaining(f.marker)]);
+        else expect(result.errors).toEqual([]);
+        expect(result.worktrees).toEqual(fail ? [] : [run.worktree]);
+        expect(calls).toBe(fail ? 1 : phase === "validation" ? 2 : 4);
+        stallReporter.sample(3000);
+        if (duration > 50) {
+          expect(f.lines.at(-1)).toContain(`gc.worktrees: count=1 total=${duration}ms max=${duration}ms`);
+        } else expect(f.lines.at(-1)).not.toContain("gc.worktrees");
+        expect(f.lines.at(-1)).not.toContain("active=");
+        for (const marker of [f.marker, f.root, run.run.id]) expect(f.lines.at(-1)).not.toContain(marker);
+        stallReporter.sample(3000);
+        expect(f.lines.at(-1)).not.toContain("gc.");
+      } finally {
+        gate.resolve({ stdout: listing, stderr: "", exitCode: 0 });
+        await pending?.catch(() => {});
+        git.mockRestore();
+        realpath.mockRestore();
+        lstat.mockRestore();
+        f.close();
+      }
+    },
+  );
+}
+
+test.each([
+  [49, false],
+  [50, false],
+  [51, false],
+  [3000, false],
+  [3000, true],
+] as const)("GC times sidecar deletion at %sms, failure=%s", async (duration, fail) => {
+  const f = backgroundFixture();
+  const [run] = gcRuns(f, 1);
+  if (!run) throw new Error("missing run");
+  const sidecar = `${run.worktree}.git-paths`;
+  writeFileSync(sidecar, f.marker);
+  const originalRm = fs.rmSync;
+  const remove = spyOn(fs, "rmSync").mockImplementation((path, opts) => {
+    if (String(path) === sidecar) {
+      f.advance(duration);
+      if (fail) throw new Error(f.marker);
+    }
+    return originalRm(path, opts);
+  });
+  try {
+    const dry = await collectGarbage(f.store, f.cfg, { dryRun: true });
+    expect(dry.errors).toEqual([]);
+    expect(remove).not.toHaveBeenCalled();
+    expect(fs.existsSync(sidecar)).toBe(true);
+    stallReporter.sample(0);
+    const result = await collectGarbage(f.store, f.cfg);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(result.errors).toEqual(fail ? [`${run.run.id} worktree: ${f.marker}`] : []);
+    expect(fs.existsSync(sidecar)).toBe(fail);
+    stallReporter.sample(3000);
+    if (duration > 50)
+      expect(f.lines.at(-1)).toContain(`gc.worktrees: count=1 total=${duration}ms max=${duration}ms`);
+    else expect(f.lines.at(-1)).not.toContain("gc.worktrees");
+    expect(f.lines.at(-1)).not.toContain("active=");
+    for (const value of [f.marker, f.root, f.repo.id, run.run.id, sidecar])
+      expect(f.lines.at(-1)).not.toContain(value);
+  } finally {
+    remove.mockRestore();
+    f.close();
+  }
+});
+
+test("GC attributes many individually fast canonical lookups as one contiguous worktree pass", async () => {
+  const f = backgroundFixture();
+  // Worktrees are absent, so only the metadata pass canonicalizes their paths, 3 ms each.
+  const runs = gcRuns(f, 20);
+  mkdirSync(repos.cachePath(f.cfg.paths, f.repo), { recursive: true });
+  const originalRealpath = fs.realpathSync;
+  let calls = 0;
+  const realpath = spyOn(fs, "realpathSync").mockImplementation(((
+    ...args: Parameters<typeof fs.realpathSync>
+  ) => {
+    if (String(args[0]) === f.cfg.paths.work) {
+      calls++;
+      f.advance(3);
+    }
+    return originalRealpath(...args);
+  }) as typeof fs.realpathSync);
+  const git = spyOn(gitCommand, "cacheGit").mockImplementation(async () => {
+    // Git waits stay outside the synchronous pass.
+    f.advance(1000);
+    return { stdout: "", stderr: "", exitCode: 0 };
+  });
+  try {
+    const result = await collectGarbage(f.store, f.cfg, { dryRun: true });
+    // The empty cache directory is not a repository; only the iteration-ref pass may report that.
+    expect(result.errors.filter((e) => !e.includes(" iterations: "))).toEqual([]);
+    expect(result.metadata).toEqual([]);
+    expect(calls).toBe(runs.length);
+    stallReporter.sample(3000);
+    expect(f.lines.at(-1)).toContain("gc.worktrees: count=1 total=60ms max=60ms");
+    expect(f.lines.at(-1)).not.toContain("active=");
+    for (const marker of [f.marker, f.root, ...runs.map((r) => r.run.id)])
+      expect(f.lines.at(-1)).not.toContain(marker);
+  } finally {
+    git.mockRestore();
+    realpath.mockRestore();
+    f.close();
+  }
+});
+
+test.each([50, 51])("thresholded synchronous activity retains exceptional completion at %sms", (duration) => {
+  const f = timedStore();
+  const error = new Error(crypto.randomUUID());
+  try {
+    expect(() =>
+      activity(
+        "gc.logs",
+        () => {
+          f.advance(duration);
+          throw error;
+        },
+        50,
+      ),
+    ).toThrow(error);
+    stallReporter.sample(3000);
+    if (duration > 50) expect(f.lines.at(-1)).toContain("gc.logs: count=1 total=51ms max=51ms");
+    else expect(f.lines.at(-1)).not.toContain("gc.logs");
+    expect(f.lines.at(-1)).not.toContain(error.message);
+  } finally {
+    f.close();
+  }
+});
+
+test("successful land checks keep their span through gate completion", async () => {
+  const f = backgroundFixture();
+  const { queue, entry, claim } = landFixture(f);
+  const ready = Promise.withResolvers<void>();
+  const gate = Promise.withResolvers<Awaited<ReturnType<typeof gateExecution.executeGate>>>();
+  const exported = spyOn(repos, "exportCommit").mockResolvedValue(undefined);
+  const head = spyOn(repos, "headSha").mockResolvedValue(entry.approvedSha);
+  const execute = spyOn(gateExecution, "executeGate").mockImplementation(() => {
+    ready.resolve();
+    return gate.promise;
+  });
+  let pending: Promise<void> | undefined;
+  try {
+    pending = queue.checks(entry, join(f.root, "checkout"), entry.approvedSha, new AbortController().signal);
+    await ready.promise;
+    f.block();
+    f.active("land.check");
+    gate.resolve({ setupOk: true, setup: [], checks: [] });
+    await pending;
+    f.settled("land.check");
+  } finally {
+    gate.resolve({ setupOk: true, setup: [], checks: [] });
+    await pending?.catch(() => {});
+    execute.mockRestore();
+    head.mockRestore();
+    exported.mockRestore();
+    claim.mockRestore();
+    f.close();
+  }
+});
+
+test("land check cleanup remains in flight and cannot leak its span when filesystem cleanup fails", async () => {
+  const f = backgroundFixture();
+  const { queue, entry, claim } = landFixture(f);
+  const failure = new Error(f.marker);
+  const exported = spyOn(repos, "exportCommit").mockRejectedValue(new Error("export failed"));
+  const originalRm = fs.rmSync;
+  let calls = 0;
+  const rm = spyOn(fs, "rmSync").mockImplementation((path, options) => {
+    if (String(path) === join(f.root, "checkout-base") && ++calls === 2) {
+      f.block();
+      f.active("land.check");
+      throw failure;
+    }
+    return originalRm(path, options);
+  });
+  try {
+    const result = await queue
+      .checks(entry, join(f.root, "checkout"), entry.approvedSha, new AbortController().signal)
+      .catch((e: unknown) => e);
+    expect(result).toBe(failure);
+    f.settled("land.check");
+    expect(f.lines.join("\n")).not.toContain(f.marker);
+  } finally {
+    rm.mockRestore();
+    exported.mockRestore();
+    claim.mockRestore();
+    f.close();
+  }
+});
+
+test("GC records slow filesystem failures without publishing their data", async () => {
+  const f = backgroundFixture();
+  const [run] = gcRuns(f, 1);
+  if (!run) throw new Error("missing run");
+  const originalExists = fs.existsSync;
+  const exists = spyOn(fs, "existsSync").mockImplementation((path) => {
+    if (String(path) === run.worktree || String(path) === run.logDir) {
+      f.advance(51);
+      throw new Error(f.marker);
+    }
+    return originalExists(path);
+  });
+  try {
+    const result = await collectGarbage(f.store, f.cfg, { dryRun: true });
+    expect(result.errors).toHaveLength(2);
+    expect(result.errors.every((error) => error.includes(f.marker))).toBe(true);
+    stallReporter.sample(3000);
+    for (const label of ["gc.worktrees", "gc.logs"])
+      expect(f.lines.at(-1)).toContain(`${label}: count=1 total=51ms max=51ms`);
+    expect(f.lines.at(-1)).not.toContain("active=");
+    expect(f.lines.at(-1)).not.toContain(f.marker);
+    expect(f.lines.at(-1)).not.toContain(run.run.id);
+  } finally {
+    exists.mockRestore();
+    f.close();
   }
 });

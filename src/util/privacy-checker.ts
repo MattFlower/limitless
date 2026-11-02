@@ -1,5 +1,7 @@
+import { isDeepStrictEqual } from "node:util";
 import type { Worker } from "node:worker_threads";
 import * as b from "./privacy-boundary.ts";
+import * as t from "./privacy-transport.ts";
 
 type Generation = ReturnType<typeof b.currentPrivacyGeneration>;
 type Snapshot = ReturnType<typeof b.capturePrivacySnapshot>;
@@ -10,6 +12,9 @@ type DataInput = Omit<Parameters<typeof b.protectData>[0], "policy">;
 type Input = Omit<TextInput, "text"> & { text?: string; json?: unknown };
 type Operation = "text" | "data";
 type Control = { signal?: AbortSignal };
+type Final = t.Frame & ReturnType<typeof fixed> & { type: string };
+type Side = Pick<PrivacyWorkerPort, "postMessage" | "onmessage">;
+type Fixed = Record<string, unknown> & { cut?: Partial<b.BoundaryCut> };
 export type PrivacyWorkerPort = Pick<Worker, "postMessage" | "ref" | "unref"> & {
   onmessage?: ((event: { data: unknown }) => void) | null;
   onerror?: (() => void) | null;
@@ -23,19 +28,42 @@ type Options = {
   maxRequests?: number;
   deadlineMs?: number;
   byteLimit?: number;
+  outputWindow?: number;
+  schedule?: t.Schedule;
   now?: () => number;
   setTimeout?: (callback: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimeout?: typeof clearTimeout;
 };
-function envelope(id: number, operation: Operation, input: Input, s: Snapshot, limits: Options["limits"]) {
-  const { generation: original, ...policy } = s;
-  const { identity: _identity, ...generation } = original;
-  return { version: 1, id, sequence: 0, generation, operation, input, snapshot: policy, limits };
+/** Bounded fixed metadata (strings travel as payload segments); a valid request-final is its own normal form. */
+function fixed({ operation, kind, cut, terminal, entries, limits, chunk }: Fixed) {
+  const n = (v: unknown, max?: number) => (int(v, max) ? Number(v) : (Symbol() as never));
+  const unit = cut && (["U", "B", "CP"].includes(cut.unit as string) ? cut.unit : "-");
+  const limit = cut && Number.isSafeInteger(cut.limit) ? cut.limit : -1;
+  const bounds = cut && { limit, unit, side: cut.side === "tail" ? "tail" : "prefix" };
+  const fixedLimits = Object.keys(b.privacyLimits).map((key) => [key, n(Reflect.get(Object(limits), key))]);
+  return {
+    operation: operation === "data" ? operation : ("text" as const),
+    kind: (kind === "cut" || kind === "complete" ? kind : "legacy-unknown") as b.Provenance["kind"],
+    ...{ cut: bounds, terminal: !!terminal, entries: n(entries), chunk: n(chunk, t.maxChunk) || n(-1) },
+    limits: Object.fromEntries(fixedLimits) as typeof b.privacyLimits,
+  };
+}
+function envelope(operation: Operation, input: Input, s: Snapshot, limits: object, chunk: number) {
+  const { identity: _identity, ...generation } = s.generation;
+  const texts = [String(operation === "text" ? input.text : input.json), String(input.cut?.marker ?? "")];
+  const stream = t.segments([...texts, ...s.entries.map(({ value }) => value), ...s.credentials]);
+  const meta = { ...input, operation, kind: input.provenance.kind, entries: s.entries.length, limits, chunk };
+  return { generation, stream, meta: fixed(meta) };
 }
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null;
 const same = (a: object, b: object) =>
   Object.entries(a).every(([key, value]) => Reflect.get(b, key) === value);
+const int = (v: unknown, max = 2 ** 53) => Number.isSafeInteger(v) && Number(v) >= 0 && Number(v) <= max;
+const wire = (g: unknown, like: object) =>
+  isDeepStrictEqual(g, like) &&
+  `${Object.entries(like).map(([key, n]) => int(n) && key)}` === "policy,credentials,checker";
+const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }); // Keeps a leading U+FEFF.
 const digest = (g: Omit<Generation, "identity">) => `privacy/${g.policy}/${g.credentials}/${g.checker}`;
 const failure = (reason: Reason, generation?: Generation, provenance?: b.Provenance): Projection => ({
   text: "[withheld: private text]",
@@ -66,23 +94,54 @@ function projection(value: unknown, generation: Generation): value is Projection
       : value.withheld === false && value.checkedComplete === true && value.reason === undefined)
   );
 }
+const final =
+  "version id direction type sequence generation chunks bytes truncated checkedComplete withheld policyDigest reason";
+function operate(f: Final, parts: ArrayBuffer[]) {
+  if (Object.keys(f).length !== 15 || !isDeepStrictEqual(f, { ...f, ...fixed(f as Fixed) })) t.fault();
+  const [text = "", marker, ...rest] = t.decodeSegments(parts);
+  if (marker === undefined || !(f.entries <= rest.length)) t.fault();
+  const entries = rest.slice(0, f.entries).map((value, entry) => ({ value, entry }));
+  const local = b.createPrivacyRegistry();
+  const generation: Generation = { ...f.generation, identity: local.generation.identity };
+  const registry = { ...local, generation };
+  const snapshot = { entries, credentials: rest.slice(f.entries), generation };
+  const policy = b.preparePrivacyPolicy(snapshot, { limits: f.limits });
+  const provenance: b.Provenance = f.kind === "cut" ? { kind: "cut", truncated: true } : { kind: f.kind };
+  const cut = f.cut && ({ ...f.cut, marker } as b.BoundaryCut);
+  const input = { provenance, policy, cut, terminal: f.terminal };
+  const result =
+    f.operation === "data"
+      ? b.protectData({ ...input, json: text }, { registry })
+      : b.protectText({ ...input, text }, { registry });
+  return b.consumeBoundaryText(result);
+}
 /** Worker-only handler; preparation and the entire synchronous operation stay here. */
-export function privacyWorkerHandler(port: Pick<PrivacyWorkerPort, "postMessage" | "onmessage">) {
+export function privacyWorkerHandler(port: Side, { schedule = setImmediate as t.Schedule } = {}) {
+  let head: Final | undefined;
+  let last = 0; // Daemon IDs only increase: frames for another or a finished request are ignored.
+  let input = t.receiver("request", t.maxChunk, Infinity);
+  let output: ReturnType<typeof t.sender> | undefined;
   port.onmessage = ({ data }) => {
-    const request = data as ReturnType<typeof envelope>;
-    if (request.version !== 1 || request.sequence !== 0) throw new Error("Invalid privacy request");
-    const local = b.createPrivacyRegistry();
-    const generation: Generation = { ...request.generation, identity: local.generation.identity };
-    const registry = { ...local, generation };
-    const policy = b.preparePrivacyPolicy({ ...request.snapshot, generation }, { limits: request.limits });
-    const input = { ...request.input, policy };
-    const result =
-      request.operation === "data"
-        ? b.protectData({ ...input, json: input.json }, { registry })
-        : b.protectText({ ...input, text: input.text ?? "" }, { registry });
-    const output = b.consumeBoundaryText(result);
-    const { version, id, generation: wire } = request;
-    port.postMessage({ version, id, generation: wire, sequence: 1, type: "complete", result: output });
+    const f = data as Final;
+    if (head ? f.id !== head.id : f.id <= last) return;
+    if (!head && f.direction === "request" && f.type === "chunk" && f.sequence === 0) head = f;
+    if (!head || f.version !== t.version || !wire(f.generation, head.generation)) t.fault();
+    const { id, generation } = head ?? f;
+    last = id;
+    const post: t.Post = (step, rest, transfer) => {
+      port.postMessage(t.frame(id, generation, step, rest), transfer);
+      if (step[0] === "result" && step[1] === "complete") {
+        head = output = undefined;
+        input = t.receiver("request", t.maxChunk, Infinity);
+      }
+    };
+    if (!output && input.chunk(f)) return post(["request", "ack", f.sequence]);
+    if (!output && input.complete(f)) {
+      const { text, ...result } = operate(f, input.parts);
+      output = t.sender("result", t.encode(text), f.chunk, post, result);
+      return schedule(output.turn);
+    }
+    if (!output?.ack(f, schedule)) t.fault();
   };
 }
 export function createPrivacyChecker(options: Options = {}) {
@@ -91,9 +150,12 @@ export function createPrivacyChecker(options: Options = {}) {
   const now = options.now ?? Date.now;
   const setTimer = options.setTimeout ?? setTimeout;
   const clearTimer = options.clearTimeout ?? clearTimeout;
+  const schedule = options.schedule ?? setImmediate;
+  const window = Math.min(t.maxChunk, Math.max(1, Math.trunc(options.outputWindow ?? t.maxChunk)));
   type Finish = (result: Projection | Reason, terminate?: boolean) => void;
   const pending = new Map<Finish, () => Promise<void>>();
   let bytes = 0;
+  let granted = 0;
   let sequence = 0;
   let disposed = false;
   let worker: PrivacyWorkerPort | undefined;
@@ -152,14 +214,16 @@ export function createPrivacyChecker(options: Options = {}) {
     if (signal?.aborted) return refuse("checker-cancelled");
     const payload = operation === "text" ? input.text : input.json;
     if (typeof payload !== "string") return refuse("nonconvergent");
-    const size = Buffer.byteLength(payload);
-    if (payload.length > limits.inputUnits || size > limits.inputBytes) return refuse("input-length");
-    if (pending.size >= (options.maxRequests ?? 8) || size > (options.byteLimit ?? Infinity) - bytes)
+    if (payload.length > limits.inputUnits || Buffer.byteLength(payload) > limits.inputBytes)
+      return refuse("input-length");
+    const request = envelope(operation, input, snapshot, limits, window);
+    const size = request.stream.size;
+    if (pending.size >= (options.maxRequests ?? 8) || size + window > (options.byteLimit ?? 64 << 20) - bytes)
       return refuse("checker-busy");
     input = { ...input, cut: input.cut && { ...input.cut }, provenance: { ...input.provenance } };
     const authority = generation;
     const deadline = now() + (options.deadlineMs ?? 30000);
-    const request = envelope(++sequence, operation, input, snapshot, limits);
+    const id = ++sequence;
     const result = Promise.withResolvers<b.BoundaryText>();
     let timeout: Parameters<typeof clearTimeout>[0];
     const cancel = () => finish("checker-cancelled", active === finish);
@@ -170,6 +234,7 @@ export function createPrivacyChecker(options: Options = {}) {
       signal?.removeEventListener("abort", cancel);
       if (active === finish) {
         active = undefined;
+        granted = 0;
         if (terminate) void retire();
         else worker?.unref();
       }
@@ -200,28 +265,43 @@ export function createPrivacyChecker(options: Options = {}) {
             finish("checker-failed");
           }
         };
+        const post: t.Post = (step, rest, transfer) => {
+          if (worker !== port || active !== finish) return;
+          if (step[1] === "complete") granted = window;
+          try {
+            port.postMessage(t.frame(id, request.generation, step, rest), transfer);
+          } catch {
+            finish("checker-failed", true);
+          }
+        };
+        const input = t.sender("request", request.stream.bytes, t.maxChunk, post, request.meta);
+        const output = t.receiver("result", window, limits.outputBytes, limits.outputUnits);
+        const receive = (d: Record<string, unknown>) => {
+          if (d.version !== t.version || !wire(d.generation, request.generation)) return;
+          if (input.ack(d, schedule)) return true;
+          if (granted !== window) return; // Output needs the request sent, then each chunk's window credit.
+          if (output.chunk(d)) return post(["result", "ack", output.parts.length - 1]) ?? true;
+          if (!output.complete(d) || !Object.keys(d).every((key) => final.split(" ").includes(key))) return;
+          const text = utf8.decode(t.join(output.parts));
+          const { truncated, checkedComplete, withheld, policyDigest, reason } = d;
+          const value = { text, truncated, checkedComplete, withheld, policyDigest, reason };
+          return text.length <= limits.outputUnits && projection(value, authority) && (finish(value) ?? true);
+        };
         port.onmessage = ({ data }) => {
           if (worker !== port || !pending.has(finish)) return;
-          if (record(data) && "id" in data && data.id !== request.id) return;
+          if (record(data) && "id" in data && data.id !== id) return;
           if (now() >= deadline) return finish("checker-timeout", true);
-          if (!current(authority)) return finish("stale-generation");
-          if (
-            !record(data) ||
-            data.id !== request.id ||
-            data.version !== 1 ||
-            data.sequence !== 1 ||
-            !record(data.generation) ||
-            !same(request.generation, data.generation) ||
-            data.type !== "complete" ||
-            !projection(data.result, authority)
-          )
+          if (!current(authority)) return finish("stale-generation", true);
+          try {
+            if (!record(data) || data.id !== id || !receive(data)) finish("checker-failed", true);
+          } catch {
             finish("checker-failed", true);
-          else finish(data.result);
+          }
         };
         if (!current(authority)) return finish("stale-generation");
         if (now() >= deadline) return finish("checker-timeout", true);
         port.ref();
-        port.postMessage(request);
+        schedule(input.turn);
         await result.promise;
       } catch {
         finish("checker-failed", true);
