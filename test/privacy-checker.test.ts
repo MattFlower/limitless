@@ -152,6 +152,7 @@ test("worker operation equals synchronous projections", async () => {
   const cases = [
     [input(), { ...shown, text: "safe" }],
     [input("é😀é"), { ...shown, text: "é😀é" }],
+    [input("\uFEFFsafe"), { ...shown, text: "\uFEFFsafe" }],
     [input(host), refused("private-match", false)],
     [input(`${"a".repeat(32760)}${host}`), refused("private-match", false)],
     [input("ab"), refused("private-match", false)],
@@ -386,6 +387,17 @@ const faults: Record<string, (frame: Frame) => Frame[]> = {
     frame.type === "ack"
       ? [{ ...frame, direction: "result", type: "chunk", payload: new ArrayBuffer(1) }]
       : [frame],
+  // A well-formed zero-chunk result final before the request transfer finished.
+  "early-final": (frame) =>
+    frame.type === "ack"
+      ? [
+          {
+            ...frame,
+            ...{ direction: "result", type: "complete", chunks: 0, bytes: 0, truncated: false },
+            ...{ checkedComplete: true, withheld: false, policyDigest: "privacy/0/0/0" },
+          },
+        ]
+      : [frame],
 };
 test.each(Object.keys(faults))("protocol fault: %s withholds and retires", async (fault) => {
   const f = fixture({ maxRequests: 1, byteLimit: charge() + W });
@@ -397,7 +409,7 @@ test.each(Object.keys(faults))("protocol fault: %s withholds and retires", async
   await withheld(result, "checker-failed");
   expect(issued).toHaveBeenCalledTimes(1);
   // Output arriving before its grant is refused, never acknowledged.
-  if (fault === "early-output")
+  if (fault === "early-output" || fault === "early-final")
     expect(f.port().sent.some((frame) => frame.direction === "result")).toBe(false);
   issued.mockRestore();
   expect(f.port().terminated).toBe(1);
@@ -428,8 +440,17 @@ test("wrong and late IDs do not settle other requests, idle workers are unref'd"
   await a;
   expect(f.port().refs.at(-1)).toBe(false);
   const late = [...f.port().received];
+  // Daemon frames of the finished request replayed to the real worker, idle and mid-transfer, are ignored.
+  const stale = [...f.port().sent];
+  const replay = () => {
+    const count = f.port().received.length;
+    for (const data of stale) f.port().worker.onmessage?.({ data });
+    expect(f.port().received).toHaveLength(count);
+  };
+  replay();
   const next = f.send();
   await f.run(1);
+  replay();
   for (const frame of late) f.port().emit(frame);
   await f.clock.flush();
   expect(settled).toBe(1);

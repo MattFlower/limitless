@@ -105,14 +105,16 @@ export function privacyWorkerHandler(
   { schedule = setImmediate as t.Schedule } = {},
 ) {
   let head: Final | undefined;
+  let last = 0; // Daemon IDs only increase: frames for another or a finished request are ignored.
   let input = t.receiver("request", t.maxChunk, Infinity);
   let output: ReturnType<typeof t.sender> | undefined;
   port.onmessage = ({ data }) => {
     const f = data as Final;
+    if (head ? f.id !== head.id : f.id <= last) return;
     if (!head && f.direction === "request" && f.type === "chunk" && f.sequence === 0) head = f;
-    if (!head || f.version !== t.version || f.id !== head.id || !same(head.generation, f.generation))
-      t.fault();
+    if (!head || f.version !== t.version || !same(head.generation, f.generation)) t.fault();
     const { id, generation } = head ?? f;
+    last = id;
     const post: t.Post = (step, rest, transfer) => {
       port.postMessage(t.frame(id, generation, step, rest), transfer);
       if (step[0] === "result" && step[1] === "complete") {
@@ -265,12 +267,13 @@ export function createPrivacyChecker(options: Options = {}) {
         const receive = (d: Record<string, unknown>) => {
           if (d.version !== t.version || !same(request.generation, d.generation as object)) return;
           if (input.ack(d, schedule)) return true;
-          // Owned and bounded: this ACK returns the chunk's window credit and grants the next one.
-          if (granted === window && output.chunk(d))
-            return post(["result", "ack", output.parts.length - 1]) ?? true;
+          // No output, even a zero-chunk final, before the request transfer ends. Owned and bounded:
+          if (granted !== window) return; // each ACK returns its chunk's window credit, granting the next.
+          if (output.chunk(d)) return post(["result", "ack", output.parts.length - 1]) ?? true;
           if (!output.complete(d) || !Object.keys(d).every((key) => final.split(" ").includes(key))) return;
           const parts = output.parts.map((part) => new Uint8Array(part));
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(parts));
+          const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }); // keep a leading U+FEFF
+          const text = decoder.decode(Buffer.concat(parts));
           const { truncated, checkedComplete, withheld, policyDigest, reason } = d;
           const result = { text, truncated, checkedComplete, withheld, policyDigest, reason };
           return (
