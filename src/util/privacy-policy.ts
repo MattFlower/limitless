@@ -6,13 +6,9 @@ import { disposePrivacyChecker } from "./privacy-checker.ts";
 import { redactCredentials } from "./proc.ts";
 
 const stamp = (s?: Stats) => (s ? `${s.dev}/${s.ino}/${s.size}/${s.mtimeMs}/${s.ctimeMs}` : "missing");
-/** One lstat tells true absence from a dangling link; only a symlinked policy also stats its target. */
-export const inspectPolicyFile = (path: string) => {
-  const link = lstatSync(path, { throwIfNoEntry: false });
-  return link?.isSymbolicLink()
-    ? `${stamp(link)}>${stamp(statSync(path, { throwIfNoEntry: false }))}`
-    : stamp(link);
-};
+/** One probe: lstat watches a cached absence (a dangling link appears), stat a loaded file through any link. */
+export const inspectPolicyFile = (path: string, follow: boolean) =>
+  stamp((follow ? statSync : lstatSync)(path, { throwIfNoEntry: false }));
 export const privacyPolicyDiagnostic = "Privacy policy unavailable; privacy checks will refuse.";
 /** Bind once at startup; checks share this synchronous freshness/readiness boundary. */
 export function provisionPrivacyPolicy(
@@ -26,13 +22,17 @@ export function provisionPrivacyPolicy(
   } = {},
 ) {
   let loaded: string | undefined;
+  let follow = false;
   let failed = false;
   registry.refreshPolicy = () => {
     try {
-      const next = inspect(join(configDir, "private-strings.txt"));
-      if (registry.ready && next === loaded) return;
+      const path = join(configDir, "private-strings.txt");
+      if (registry.ready && inspect(path, follow) === loaded) return;
+      // Reloads pick the next routine probe, stamped before reading so a concurrent edit reloads again.
+      const present = inspect(path, false) !== "missing";
+      const next = present ? inspect(path, true) : "missing";
       registry.replacePolicy(load(configDir, roots));
-      loaded = next;
+      [loaded, follow] = [next, present];
       failed = false;
     } catch {
       registry.failPolicy();

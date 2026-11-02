@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import {
   linkSync,
   mkdirSync,
@@ -24,11 +25,14 @@ test("policy freshness loads changes once, preserves equivalent authority, refus
     file = join(dir, "private-strings.txt");
   const registry = b.createPrivacyRegistry(undefined, undefined, true),
     logs: string[] = [];
-  let stats = 0,
-    loads = 0,
+  let loads = 0,
     statFailed = false;
+  // Real filesystem probes, so a symlinked policy can't hide a second stat behind one inspect call.
+  const lstat = spyOn(fs, "lstatSync"),
+    stat = spyOn(fs, "statSync");
+  const probes = () => lstat.mock.calls.length + stat.mock.calls.length;
   const check = (text = "safe", data = false) => {
-    const before = stats;
+    const [before, loadsBefore] = [probes(), loads];
     const input = {
       policy: b.preparePrivacyPolicy(registry.snapshot()),
       provenance: { kind: "complete" } as const,
@@ -36,17 +40,16 @@ test("policy freshness loads changes once, preserves equivalent authority, refus
     const receipt = data
       ? b.protectData({ ...input, json: text }, { registry })
       : b.protectText({ ...input, text }, { registry });
-    expect(stats - before).toBe(1);
+    if (loads === loadsBefore && !statFailed) expect(probes() - before).toBe(1);
     return b.consumeBoundaryText(receipt);
   };
   try {
     provisionPrivacyPolicy(dir, [], {
       registry,
       log: (line) => logs.push(line),
-      inspect: (path) => {
-        stats++;
+      inspect: (path, follow) => {
         if (statFailed) throw new Error("private-entry");
-        return inspectPolicyFile(path);
+        return inspectPolicyFile(path, follow);
       },
       load: (...args) => {
         loads++;
@@ -78,9 +81,21 @@ test("policy freshness loads changes once, preserves equivalent authority, refus
     writeFileSync(join(dir, "target"), "delta-entry");
     utimesSync(join(dir, "target"), 1, 1);
     expect(check("delta-entry").reason).toBe("private-match");
+    check();
+    expect(loads).toBe(7);
+    rmSync(join(dir, "target"));
+    expect(check().reason).toBe("unreadable-policy");
+    writeFileSync(join(dir, "target"), "delta-entry");
+    expect(check("delta-entry").reason).toBe("private-match");
     rmSync(file);
     rmSync(join(dir, "target"));
     expect(check("delta-entry").withheld).toBe(false);
+    symlinkSync(join(dir, "target"), file);
+    expect(check().reason).toBe("unreadable-policy");
+    rmSync(file);
+    expect(check().withheld).toBe(false);
+    expect(logs).toEqual(Array(2).fill(privacyPolicyDiagnostic));
+    logs.length = 0;
     for (const kind of ["directory", "hardlinks", "stat"] as const) {
       if (kind === "directory") mkdirSync(file);
       else if (kind === "hardlinks") {
@@ -99,6 +114,8 @@ test("policy freshness loads changes once, preserves equivalent authority, refus
       expect(check().withheld).toBe(false);
     }
   } finally {
+    lstat.mockRestore();
+    stat.mockRestore();
     rmSync(dir, { recursive: true, force: true });
   }
 });
