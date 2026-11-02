@@ -180,7 +180,7 @@ import { readPrHead, roundSection, withPrLock } from "./review-round.ts";
 import { savedReviewSample, saveReviewSample } from "./review-samples.ts";
 import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
-import { bindRunClaim, type RunClaim, renewRunClaim } from "./run-claim.ts";
+import { bindRunClaim, type RunClaim, renewRunClaim, sharedRepository } from "./run-claim.ts";
 import { implementerView } from "./run-transfer-roles.ts";
 import {
   type Holdout,
@@ -233,7 +233,7 @@ export async function executeRun(
     checkpointer.writeRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const shared = repo.kind === "github" && repoSettings(deps.cfg, run.repoSlug).shared === true;
+  const shared = sharedRepository(deps.cfg, repo, run.repoSlug);
   let claim: RunClaim | undefined;
   let error: unknown;
   if (shared) {
