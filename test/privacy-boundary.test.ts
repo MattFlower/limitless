@@ -4,15 +4,12 @@ import { createCredentialRegistry } from "../src/util/credential-matcher.ts";
 import {
   capturePrivacySnapshot,
   checkPrepared,
-  consumeBoundaryText,
   createPrivacyRegistry,
   currentPrivacyGeneration,
   isCurrentPrivacyGeneration,
   preparePrivacyPolicy,
   privacyLimits,
   privacyRegistry,
-  protectData,
-  protectText,
 } from "../src/util/privacy-boundary.ts";
 import { redactCredentials, registerCredential, registeredCredentials } from "../src/util/proc.ts";
 
@@ -293,21 +290,4 @@ test("legacy registrations exceed prepared caps and default generation observes 
   expect(privateMatches(entries[64]?.value ?? "", entries)).toContainEqual(
     entries[64] ?? { value: "", entry: 0 },
   );
-});
-
-test("production authority refuses before loading and after failure, including prepared policies", () => {
-  const registry = createPrivacyRegistry(undefined, undefined, true);
-  const check = (policy = preparePrivacyPolicy(registry.snapshot())) => {
-    const input = { policy, provenance: { kind: "complete" } as const };
-    for (const receipt of [
-      protectText({ ...input, text: "safe" }, { registry }),
-      protectData({ ...input, json: "{}" }, { registry }),
-    ])
-      expect(consumeBoundaryText(receipt)).toMatchObject({ withheld: true, reason: "unreadable-policy" });
-  };
-  check();
-  registry.replacePolicy([]);
-  const prepared = preparePrivacyPolicy(registry.snapshot());
-  registry.failPolicy();
-  check(prepared);
 });

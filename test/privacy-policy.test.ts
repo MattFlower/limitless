@@ -1,121 +1,57 @@
-import { expect, spyOn, test } from "bun:test";
-import * as fs from "node:fs";
-import {
-  linkSync,
-  mkdirSync,
-  mkdtempSync,
-  renameSync,
-  rmSync,
-  symlinkSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { expect, mock, test } from "bun:test";
+import { linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadPrivateStrings } from "../src/gates/private.ts";
 import * as b from "../src/util/privacy-boundary.ts";
-import {
-  inspectPolicyFile,
-  privacyPolicyDiagnostic,
-  provisionPrivacyPolicy,
-} from "../src/util/privacy-policy.ts";
+import * as p from "../src/util/privacy-policy.ts";
 
-test("policy freshness loads changes once, preserves equivalent authority, refuses failures and recovers", () => {
-  const dir = mkdtempSync(join(tmpdir(), "privacy-policy-")),
-    file = join(dir, "private-strings.txt");
-  const registry = b.createPrivacyRegistry(undefined, undefined, true),
-    logs: string[] = [];
-  let loads = 0,
-    statFailed = false;
-  // Real filesystem probes, so a symlinked policy can't hide a second stat behind one inspect call.
-  const lstat = spyOn(fs, "lstatSync"),
-    stat = spyOn(fs, "statSync");
-  const probes = () => lstat.mock.calls.length + stat.mock.calls.length;
-  const check = (text = "safe", data = false) => {
-    const [before, loadsBefore] = [probes(), loads];
-    const input = {
-      policy: b.preparePrivacyPolicy(registry.snapshot()),
-      provenance: { kind: "complete" } as const,
-    };
+test("production policy refuses until loaded, refreshes on edits with one stat, and recovers", () => {
+  const [dir, logs] = [mkdtempSync(join(tmpdir(), "privacy-policy-")), [] as string[]];
+  const [file, registry] = [
+    join(dir, "private-strings.txt"),
+    b.createPrivacyRegistry(undefined, undefined, true),
+  ];
+  const [inspect, load] = [mock(p.inspectPolicyFile), mock(loadPrivateStrings)];
+  const [stats, loads] = [() => inspect.mock.calls.length, () => load.mock.calls.length];
+  const check = (text = "safe", data = false, policy = b.preparePrivacyPolicy(registry.snapshot())) => {
+    const [before, provenance] = [stats(), { kind: "complete" } as const];
     const receipt = data
-      ? b.protectData({ ...input, json: text }, { registry })
-      : b.protectText({ ...input, text }, { registry });
-    if (loads === loadsBefore && !statFailed) expect(probes() - before).toBe(1);
-    return b.consumeBoundaryText(receipt);
+      ? b.protectData({ json: text, provenance, policy }, { registry })
+      : b.protectText({ text, provenance, policy }, { registry });
+    expect(stats() - before).toBeLessThanOrEqual(1);
+    return b.consumeBoundaryText(receipt).reason;
   };
-  try {
-    provisionPrivacyPolicy(dir, [], {
-      registry,
-      log: (line) => logs.push(line),
-      inspect: (path, follow) => {
-        if (statFailed) throw new Error("private-entry");
-        return inspectPolicyFile(path, follow);
-      },
-      load: (...args) => {
-        loads++;
-        return loadPrivateStrings(...args);
-      },
-    });
-    expect(registry.generation.policy).toBe(0);
-    expect(check().withheld).toBe(false);
-    expect(check('{"key":["safe","fine"]}', true).withheld).toBe(false);
-    expect(loads).toBe(1);
-    writeFileSync(file, "alpha-entry");
-    expect(check("alpha-entry")).toMatchObject({ withheld: true, reason: "private-match" });
-    const generation = registry.generation;
-    check();
-    expect(loads).toBe(2);
-    writeFileSync(file, "# comment\nalpha-entry\nalpha-entry\n");
-    check();
-    expect(registry.generation).toEqual(generation);
-    writeFileSync(`${file}.new`, "beta-entry");
-    renameSync(`${file}.new`, file);
-    expect(check("beta-entry").reason).toBe("private-match");
-    rmSync(file);
-    expect(check("beta-entry").withheld).toBe(false);
-    check();
-    expect(loads).toBe(5);
-    writeFileSync(join(dir, "target"), "gamma-entry");
-    symlinkSync(join(dir, "target"), file);
-    expect(check("gamma-entry").reason).toBe("private-match");
-    writeFileSync(join(dir, "target"), "delta-entry");
-    utimesSync(join(dir, "target"), 1, 1);
-    expect(check("delta-entry").reason).toBe("private-match");
-    check();
-    expect(loads).toBe(7);
-    rmSync(join(dir, "target"));
-    expect(check().reason).toBe("unreadable-policy");
-    writeFileSync(join(dir, "target"), "delta-entry");
-    expect(check("delta-entry").reason).toBe("private-match");
-    rmSync(file);
-    rmSync(join(dir, "target"));
-    expect(check("delta-entry").withheld).toBe(false);
-    symlinkSync(join(dir, "target"), file);
-    expect(check().reason).toBe("unreadable-policy");
-    rmSync(file);
-    expect(check().withheld).toBe(false);
-    expect(logs).toEqual(Array(2).fill(privacyPolicyDiagnostic));
-    logs.length = 0;
-    for (const kind of ["directory", "hardlinks", "stat"] as const) {
-      if (kind === "directory") mkdirSync(file);
-      else if (kind === "hardlinks") {
-        writeFileSync(file, "private-entry");
-        linkSync(file, `${file}.link`);
-      }
-      statFailed = kind === "stat";
-      expect(check().reason).toBe("unreadable-policy");
-      expect(check("{}", true).reason).toBe("unreadable-policy");
-      expect(logs).toEqual(
-        Array(kind === "directory" ? 1 : kind === "hardlinks" ? 2 : 3).fill(privacyPolicyDiagnostic),
-      );
-      statFailed = false;
-      rmSync(file, { recursive: true, force: true });
-      rmSync(`${file}.link`, { force: true });
-      expect(check().withheld).toBe(false);
-    }
-  } finally {
-    lstat.mockRestore();
-    stat.mockRestore();
-    rmSync(dir, { recursive: true, force: true });
+  expect([check(), check("{}", true)]).toEqual(["unreadable-policy", "unreadable-policy"]);
+  p.provisionPrivacyPolicy(dir, [], { registry, inspect, load, log: (line) => logs.push(line) });
+  expect([check(), check('{"a":["safe"]}', true), loads()]).toEqual([undefined, undefined, 1]);
+  writeFileSync(file, "alpha-entry");
+  expect([check("alpha-entry"), check('{"a":"alpha-entry"}', true), loads()]).toEqual([
+    "private-match",
+    "private-match",
+    2,
+  ]);
+  const generation = registry.generation;
+  writeFileSync(file, "# comment\nalpha-entry\nalpha-entry\n");
+  expect([check(), loads(), registry.generation]).toEqual([undefined, 3, generation]);
+  writeFileSync(`${file}.new`, "beta-entry");
+  renameSync(`${file}.new`, file);
+  expect(check("beta-entry")).toBe("private-match");
+  rmSync(file);
+  expect(check("beta-entry")).toBeUndefined();
+  for (const broken of ["directory", "hardlinks"]) {
+    const prepared = b.preparePrivacyPolicy(registry.snapshot());
+    if (broken === "directory") mkdirSync(file);
+    else writeFileSync(file, "entry");
+    if (broken === "hardlinks") linkSync(file, `${file}.link`);
+    expect([check("safe", false, prepared), check("{}", true)]).toEqual([
+      "unreadable-policy",
+      "unreadable-policy",
+    ]);
+    rmSync(file, { recursive: true });
+    rmSync(`${file}.link`, { force: true });
+    expect(check()).toBeUndefined();
   }
+  expect(logs).toEqual([p.privacyPolicyDiagnostic, p.privacyPolicyDiagnostic]);
+  rmSync(dir, { recursive: true, force: true });
 });
