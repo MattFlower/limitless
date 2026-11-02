@@ -44,10 +44,10 @@ export function issuePrivacyWorkerChunks(
     generation,
     registry,
   };
-  if (!current(state)) {
+  if (!registry.ready || !current(state)) {
     if (parts) parts.length = 0;
     state.parts = undefined;
-    state.metadata = refuse(state.metadata, "stale-generation");
+    state.metadata = refuse(state.metadata, registry.ready ? "stale-generation" : "unreadable-policy");
   }
   const receipt = Object.freeze({}) as BoundaryChunks;
   receipts.set(receipt, state);
@@ -67,10 +67,10 @@ export function consumeBoundaryChunk(
     reason: "forged",
   };
   if (!state) return { ...forged, bytes: marker.slice(), done: true };
-  if (!current(state)) {
+  if (!state.registry.ready || !current(state)) {
     if (state.parts) state.parts.length = 0;
     state.parts = undefined;
-    state.metadata = refuse(state.metadata, "stale-generation");
+    state.metadata = refuse(state.metadata, state.registry.ready ? "stale-generation" : "unreadable-policy");
     return { ...state.metadata, bytes: marker.slice(), done: true };
   }
   const { parts, metadata } = state;
