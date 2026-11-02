@@ -25,37 +25,37 @@ afterAll(async () => {
 const signal = () => new AbortController().signal;
 const noop = async () => {};
 const binary = Buffer.from([0, 255, 128, 192, 10]);
-const secret = () => `${randomUUID()}${String.fromCharCode(0x96ea)}`;
+const makeNeedle = () => `${randomUUID()}${String.fromCharCode(0x96ea)}`;
 
 // A complete offline bundle with a tag and blob outside the advertised commit closure.
-function fixture(location = "", credential = secret()) {
+function fixture(location = "", needle = makeNeedle()) {
   const objects = new Map<string, { type: "commit" | "tree" | "blob" | "tag"; bytes: Buffer }>();
   const add = (type: "commit" | "tree" | "blob" | "tag", bytes: Buffer) => {
     const oid = createHash("sha1").update(`${type} ${bytes.length}\0`).update(bytes).digest("hex");
     objects.set(oid, { type, bytes });
     return oid;
   };
-  const blob = add("blob", location === "blob" ? Buffer.concat([binary, Buffer.from(credential)]) : binary);
+  const blob = add("blob", location === "blob" ? Buffer.concat([binary, Buffer.from(needle)]) : binary);
   const tree = add(
     "tree",
     Buffer.concat([
-      Buffer.from(`100644 ${location === "tree" ? credential : "payload"}\0`),
+      Buffer.from(`100644 ${location === "tree" ? needle : "payload"}\0`),
       Buffer.from(blob, "hex"),
     ]),
   );
   const oid = add(
     "commit",
     Buffer.from(
-      `tree ${tree}\nauthor ${location === "metadata" ? credential : "Test"} <test@example.com> 1 +0000\ncommitter Test <test@example.com> 1 +0000\n\n${location === "commit" ? credential : "message"}\n`,
+      `tree ${tree}\nauthor ${location === "metadata" ? needle : "Test"} <test@example.com> 1 +0000\ncommitter Test <test@example.com> 1 +0000\n\n${location === "commit" ? needle : "message"}\n`,
     ),
   );
   add(
     "tag",
     Buffer.from(
-      `object ${oid}\ntype commit\ntag extra\ntagger Test <test@example.com> 1 +0000\n\n${location === "tag" ? credential : "tag"}\n`,
+      `object ${oid}\ntype commit\ntag extra\ntagger Test <test@example.com> 1 +0000\n\n${location === "tag" ? needle : "tag"}\n`,
     ),
   );
-  add("blob", Buffer.from(location === "unreachable" ? credential : "unreachable"));
+  add("blob", Buffer.from(location === "unreachable" ? needle : "unreachable"));
   const header = Buffer.alloc(12);
   header.write("PACK");
   header.writeUInt32BE(2, 4);
@@ -83,7 +83,7 @@ function fixture(location = "", credential = secret()) {
     requiredCommits: [oid],
     refs: [{ name, oid }],
   };
-  return { input, objects, credential };
+  return { input, objects, needle };
 }
 
 test.each(["metadata", "commit", "tree", "blob", "tag"])(
@@ -92,7 +92,7 @@ test.each(["metadata", "commit", "tree", "blob", "tag"])(
     const f = fixture(location),
       path = await mkdtemp(join(root, "split-"));
     const registry = createCredentialRegistry();
-    registry.add(f.credential);
+    registry.add(f.needle);
     let projected = false;
     await expect(
       createRunObjectPrivacyValidator({
@@ -138,7 +138,7 @@ test("physical inventory catches unreachable credentials after structural valida
     projected = false;
   await expect(
     (async () => {
-      await createRunObjectPrivacyValidator({ scratchRoot: path, credentials: () => [f.credential] })(
+      await createRunObjectPrivacyValidator({ scratchRoot: path, credentials: () => [f.needle] })(
         f.input,
         async () => {
           projected = true;
@@ -176,7 +176,7 @@ test("binary content stays unchanged and destination registry is independent", a
   expect(inspected).toBe(5);
   expect(f.input.bytes).toEqual(original);
   await expect(
-    createRunObjectPrivacyValidator({ scratchRoot: path, credentials: () => [f.credential] })(
+    createRunObjectPrivacyValidator({ scratchRoot: path, credentials: () => [f.needle] })(
       f.input,
       noop,
       signal(),
@@ -189,9 +189,9 @@ test("binary content stays unchanged and destination registry is independent", a
 test.each(["enumeration", "read", "cancel-enumeration", "empty-registry"])(
   "partial inspection fails closed without exposing underlying data: %s",
   async (fault) => {
-    const credential = secret(),
+    const needle = makeNeedle(),
       controller = new AbortController();
-    const payload = `private payload ${credential}`;
+    const payload = `private payload ${needle}`;
     const reader: PrivateObjectReader = {
       async *objects() {
         yield { oid: "first", type: "blob" };
@@ -207,7 +207,7 @@ test.each(["enumeration", "read", "cancel-enumeration", "empty-registry"])(
     let retained = false;
     const validate = createRunObjectPrivacyValidator({
       scratchRoot: root,
-      credentials: () => (fault === "empty-registry" ? [] : [credential]),
+      credentials: () => (fault === "empty-registry" ? [] : [needle]),
       validate: async (_input, inspect) => {
         await inspect(reader);
       },
@@ -223,7 +223,7 @@ test.each(["enumeration", "read", "cancel-enumeration", "empty-registry"])(
       message: fault === "cancel-enumeration" ? "Run transfer was aborted" : "Run transfer data is invalid",
     });
     expect(error).not.toHaveProperty("cause");
-    expect(JSON.stringify(error)).not.toContain(credential);
+    expect(JSON.stringify(error)).not.toContain(needle);
     expect(String(error)).not.toContain("private payload");
   },
 );
@@ -251,7 +251,7 @@ test.each(["success", "failure", "cancel", "claim-wait", "claim-lost"])(
     try {
       const validation = createRunObjectPrivacyValidator({
         scratchRoot: path,
-        credentials: () => [f.credential],
+        credentials: () => [f.needle],
         runProcess: async (options) => {
           const result = await runProcess(options);
           if (++reads === f.objects.size + 1) {
@@ -259,8 +259,8 @@ test.each(["success", "failure", "cancel", "claim-wait", "claim-lost"])(
             ready.resolve();
             await release.promise;
             if (outcome === "failure") {
-              options.onRawChunk?.(`private payload ${f.credential}`, "stdout");
-              throw new Error(`private payload ${f.credential}`, { cause: result });
+              options.onRawChunk?.(`private payload ${f.needle}`, "stdout");
+              throw new Error(`private payload ${f.needle}`, { cause: result });
             }
             if (outcome.startsWith("claim-")) throw control;
           }
@@ -305,7 +305,7 @@ test.each(["success", "failure", "cancel", "claim-wait", "claim-lost"])(
           message: outcome === "cancel" ? "Run transfer was aborted" : "Run transfer data is invalid",
         });
         expect(error).not.toHaveProperty("cause");
-        expect(String(error)).not.toContain(f.credential);
+        expect(String(error)).not.toContain(f.needle);
       }
       for (const log of logs) expect(log).not.toHaveBeenCalled();
     } finally {
@@ -324,7 +324,7 @@ test("export default boundary rejects registered credentials and returns clean o
       scratch = join(path, "scratch");
     await mkdir(source);
     await mkdir(scratch);
-    registerCredential(`OBJECT_TEST_${randomUUID()}`, f.credential);
+    registerCredential(`OBJECT_TEST_${randomUUID()}`, f.needle);
     const bundle = join(path, "input.bundle");
     await writeFile(bundle, f.input.bytes);
     await sh(["git", "init", "--bare", "--template=", "--object-format=sha1"], { cwd: source });
@@ -402,7 +402,7 @@ test.each(["missing-callback", "cleanup-failure", "invalid-structure"])(
       validate: fault === "missing-callback" ? noop : undefined,
       removeScratch: async (dir) => {
         await rm(dir, { recursive: true });
-        if (fault === "cleanup-failure") throw new Error(secret());
+        if (fault === "cleanup-failure") throw new Error(makeNeedle());
       },
     });
     const error: unknown = await validate(input, noop, signal()).then(
