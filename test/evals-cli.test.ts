@@ -120,6 +120,84 @@ evalRoles("CLI %s submits options, follows HTTP results and emits JSON", async (
   }
 });
 
+test("review CLI reports daemon exclusions without following and accepts older responses", async () => {
+  for (const excludedHeldout of [7, 0, undefined]) {
+    const printed: string[] = [];
+    const bodies: unknown[] = [];
+    await evalCommand(
+      ["run", "review"],
+      { models: "candidate-a" },
+      {
+        api: async <T>(_path: string, init?: RequestInit) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return { id: "eval-fixture", excludedHeldout } as T;
+        },
+        print: (text) => printed.push(text),
+        wait: async () => {},
+      },
+    );
+    expect(bodies).toEqual([{ role: "review", models: ["candidate-a"], cache: true }]);
+    expect(printed).toEqual([
+      "eval-fixture",
+      ...(excludedHeldout === undefined ? [] : [`Excluded ${excludedHeldout} escapes-heldout cases.`]),
+    ]);
+  }
+});
+
+test("review CLI forwards held-out opt-in and prints actual HTTP selection counts", async () => {
+  const f = await evalFixture();
+  try {
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({
+        role: "review",
+        version: 1,
+        cases: [
+          { ...reviewCase, id: "dev", split: "escapes-dev" },
+          { ...reviewCase, id: "secret", split: "escapes-heldout" },
+        ],
+      }),
+    );
+    const post = (createHttpRoutes(f.factory)["/api/evals"] as { POST: Route }).POST;
+    for (const [flags, expectedIds, count] of [
+      [{}, ["dev"], 1],
+      [{ "include-heldout": true }, ["dev", "secret"], 0],
+      [{ cases: "secret", "include-heldout": true }, ["secret"], 0],
+    ] as const) {
+      const printed: string[] = [];
+      await evalCommand(
+        ["run", "review"],
+        { models: "candidate-a", "max-usd": "0", ...flags },
+        {
+          async api<T>(path: string, init?: RequestInit) {
+            const sent = JSON.parse(String(init?.body));
+            expect(sent.includeHeldout).toBe("include-heldout" in flags ? true : undefined);
+            const response = await post(
+              requestWithParams(`http://localhost${path}`, {
+                ...init,
+                headers: { "content-type": "application/json" },
+              }),
+              localServer,
+            );
+            expect(response.status).toBe(202);
+            return (await response.json()) as T;
+          },
+          print: (text) => printed.push(text),
+          wait: async () => {},
+        },
+      );
+      const id = printed[0];
+      if (!id) throw new Error("missing id");
+      expect(printed[1]).toBe(`Excluded ${count} escapes-heldout cases.`);
+      expect(f.factory.store.listEvalTrials(id).map((t) => t.caseId)).toEqual([...expectedIds]);
+      await f.factory.evals.wait(id);
+    }
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    await f.close();
+  }
+});
+
 test("policy CLI previews exactly the written overlay, preserves other cells, and never writes on validation failure", async () => {
   const { evidence, input, local, subscription, response } = await import("./evals-policy-support.ts");
   const { generatePolicy } = await import("../src/evals/policy.ts");
@@ -414,7 +492,7 @@ test("CLI validates --concurrency, records it on the run and shows it in reports
   }
 });
 
-test("CLI entrypoint recognizes round flags", () => {
+test("CLI entrypoint recognizes round and held-out flags", () => {
   const child = Bun.spawnSync([
     process.execPath,
     join(import.meta.dir, "../src/cli/main.ts"),
@@ -429,11 +507,13 @@ test("CLI entrypoint recognizes round flags", () => {
     "effort",
     "--concurrency",
     "3",
+    "--include-heldout",
     "--help",
   ]);
   expect(child.exitCode).toBe(0);
   expect(child.stdout.toString()).toContain("--strategy retry|effort|switch");
   expect(child.stdout.toString()).toContain("[--concurrency N]");
+  expect(child.stdout.toString()).toContain("--include-heldout");
 });
 
 /** The committed implement pins only, so triage stays an unpinned cell these tests can update. */

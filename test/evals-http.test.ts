@@ -110,6 +110,53 @@ test("API persists immediately, runs in background, lists and reports trials and
   }
 });
 
+test("review API returns default exclusions and resumes older explicit held-out selections", async () => {
+  const f = await evalFixture();
+  try {
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({
+        role: "review",
+        version: 1,
+        cases: [
+          { ...reviewCase, id: "old-heldout", base: f.sha, head: f.sha, split: "heldout" },
+          { ...reviewCase, id: "escape", base: f.sha, head: f.sha, split: "escapes-heldout" },
+        ],
+      }),
+    );
+    f.respond(() => ({ structured: reviewOutput() }));
+    const post = (createHttpRoutes(f.factory)["/api/evals"] as { POST: Route }).POST;
+    const response = await post(
+      requestWithParams("http://localhost/api/evals", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: "review", models: ["candidate-a"] }),
+      }),
+      server,
+    );
+    expect(response.status).toBe(202);
+    const result = (await response.json()) as { id: string; excludedHeldout?: number };
+    expect(result.excludedHeldout).toBe(1);
+    await f.factory.evals.wait(result.id);
+    expect(f.factory.evals.report(result.id)?.trials.map((t) => [t.caseId, t.status])).toEqual([
+      ["old-heldout", "ok"],
+    ]);
+    expect(f.calls).toHaveLength(1);
+    // Older runs stored explicit IDs but had no includeHeldout field.
+    const request = { role: "review", models: ["candidate-a"], k: 1, maxUsd: 0 } as const;
+    const old = f.factory.store.createEvalRun({ ...request, models: [...request.models] }, [], {
+      request: { ...request, caseIds: ["escape"] },
+    });
+    f.factory.store.updateEvalRun(old.id, "interrupted");
+    const resumed = f.factory.evals.resume(old.id);
+    if (!resumed) throw new Error("missing resumed eval");
+    expect(f.factory.store.listEvalTrials(resumed.id).map((t) => t.caseId)).toEqual(["escape"]);
+    await f.factory.evals.wait(resumed.id);
+  } finally {
+    await f.close();
+  }
+});
+
 test("eval API shares JSON, Origin and Cloudflare guards and validates before persistence", async () => {
   const f = await evalFixture();
   try {
