@@ -1,7 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
+import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import {
@@ -205,6 +208,65 @@ describe("pipeline (fake agents, real git + gates)", () => {
       expect(resumed.store.getRunState<RunState>(next.id)?.lastReview?.mode).not.toBe("panel");
     },
   );
+
+  test("a restart reruns only the unfinished review sample and keeps the finished one's blocker", async () => {
+    mkdirSync(join(home, "cfg"), { recursive: true });
+    writeFileSync(join(home, "cfg", "config.toml"), "[review]\nsamples = 2\n");
+    const blocker = {
+      severity: "major",
+      security: false,
+      ...findingEvidence,
+      file: "farewell.txt",
+      line: 1,
+      title: "Wrong farewell text",
+      detail: "The file says the wrong text",
+      suggestion: "Correct the text",
+    };
+    const finished = deferred<void>();
+    let reviews = 0;
+    const f = start(async (s) => {
+      const role = roleOf(s);
+      if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+      if (role === "review") {
+        if (++reviews === 1)
+          return { structured: { ...approve, verdict: "request_changes", findings: [blocker] } };
+        // The daemon dies once the other sample is saved.
+        await finished.promise;
+        throw new SimulatedTermination("daemon stopped during the second review sample");
+      }
+      return { files: { "farewell.txt": "goodbye\n" } };
+    });
+    const put = f.store.putArtifact.bind(f.store);
+    const saving = spyOn(f.store, "putArtifact").mockImplementation((...args) => {
+      put(...args);
+      if (args[1] === "review-0.sample-0.json") finished.resolve();
+    });
+    await f.stop();
+    const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+    expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("running");
+    saving.mockRestore();
+    f.store.close();
+    factory = null;
+    const resumedReviews: string[] = [];
+    const implementPrompts: string[] = [];
+    const resumed = start((s) => {
+      const role = roleOf(s);
+      if (role === "review") {
+        resumedReviews.push(s.prompt);
+        return { structured: approve };
+      }
+      implementPrompts.push(s.prompt);
+      return { files: { "farewell.txt": "goodbye, friend\n" } };
+    });
+    expect(await waitFor(resumed, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+    // Round 1 reran only the interrupted sample; the saved sample's blocker sent the change back.
+    expect(resumedReviews).toHaveLength(3);
+    expect(implementPrompts).toHaveLength(1);
+    expect(implementPrompts[0]).toContain("Wrong farewell text");
+    expect(resumed.store.listEvents(run.id).map((e) => e.message)).toContain(
+      "review: reusing finished sample 1 from before the restart",
+    );
+  });
 
   test("review context and follow-ups survive a factory restart", async () => {
     let reviews = 0;

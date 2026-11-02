@@ -532,11 +532,13 @@ async function runUnion<T extends Invoked>(
       output: z.custom<Review>(() => false, failure.error).safeParse(null),
     };
   const reviews = samples.map((s) => request.schema.parse(s.output));
+  const priorCount = input.prompt.previous?.findings.length ?? 0;
+  // Reports citing different prior blockers (or one citing none) never merge, so none loses its status.
   const findings = mergeReports(
     reviews.flatMap((r, finder) =>
       r.findings.map((f) => ({ ...f, finder: samples[finder]?.index ?? finder })),
     ),
-    () => undefined,
+    (f) => citedPriorIndex(f, priorCount),
   ).map(({ finder: _finder, raisedBy: _raisedBy, ...finding }) => finding);
   const modelVerdict = reviews.some((r) => r.verdict === "request_changes") ? "request_changes" : "approve";
   const decision = decide(

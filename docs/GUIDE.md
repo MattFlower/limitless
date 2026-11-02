@@ -965,6 +965,8 @@ are in [REASONING_EFFORT](REASONING_EFFORT.md).
 By default a review is one routed adversarial finder run twice as independent samples, with
 their findings merged (`[review] mode = "single"`); a finding either sample blocks on blocks the
 round. Both samples run at the same time; a review costs about twice one reviewer's tokens.
+Each finished sample is kept as a `review-N.sample-K.json` artifact, so a restart reruns only an
+unfinished one.
 `[review] samples = 1` goes back to one standard review. With `mode = "panel"`,
 several finders run in parallel, their reports are merged, and a verifier rules on each candidate
 before anything blocks. The verifier never runs on a model that raised the candidate. It prefers a

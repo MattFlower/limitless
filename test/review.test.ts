@@ -2373,6 +2373,42 @@ describe("two-sample single review", () => {
       expect(union.decision).toBeUndefined();
     },
   );
+  test("reports citing different prior blockers never merge, so a cited blocker still blocks", async () => {
+    const cite = (prior: string, scenario: string) => ({
+      ...finding("minor"),
+      label: "unaddressed" as const,
+      prior,
+      file: "src/retry.ts",
+      line: 10,
+      title: "Retry loses the cancellation signal",
+      failure_scenario: scenario,
+    });
+    const priorBlocker = { ...finding("major"), file: "src/retry.ts", line: 10 };
+    const union = (samples: Review[], prior: Review["findings"]) =>
+      runReview(
+        { invoke: async (_r, _f, sample) => ({ result: result(samples[sample ?? 0]) }) },
+        { ...input, prompt: { ...prompt, previous: { sha: "fixbase", findings: prior } } },
+      );
+    // The longer report cites a prior finding that does not exist; it must not absorb the valid P1.
+    const invalid = await union(
+      [
+        output([cite("P1", "A retry runs after cancellation.")]),
+        output([cite("P2", "After cancellation the retry still runs and ignores the signal.")]),
+      ],
+      [priorBlocker],
+    );
+    expect(invalid.decision?.review.verdict).toBe("request_changes");
+    expect(invalid.decision?.blocking.map((f) => f.prior)).toEqual(["P1"]);
+    // Two valid citations of different prior blockers stay two blocking findings.
+    const both = await union(
+      [
+        output([cite("P1", "A retry runs after cancellation.")]),
+        output([cite("P2", "A retry runs after cancellation.")]),
+      ],
+      [priorBlocker, { ...priorBlocker, line: 20 }],
+    );
+    expect(both.decision?.blocking.map((f) => f.prior).sort()).toEqual(["P1", "P2"]);
+  });
   test("without sample recording, an invocation error reaches the caller once both samples settle", async () => {
     const held = deferred<void>();
     let settled = false;
