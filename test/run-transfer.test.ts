@@ -279,7 +279,7 @@ test.each(["build", "verify-change", "acceptance", "follow-up", "conflict", "ci"
       c = await api.exportRun(f.runId, repository, signal());
     expect(snapshot(f.s)).toEqual(before);
     expect(parseManifest(c.manifest)).toMatchObject({
-      schema: 2,
+      schema: 3,
       blobs: { artifacts: [], objects: kind === "no-objects" ? [] : [expect.any(Object)] },
     });
     const ids = await api.importRun(c, signal());
@@ -393,7 +393,7 @@ test("validation rejects corrupt descriptors, headers, references, identities, p
       p.state.slottedCommands = [];
     },
     (m: PortableManifest) => {
-      m.blobs.artifacts.push({ ...m.blobs.state });
+      Object.assign(m, { schema: 2, blobs: { ...m.blobs, artifacts: [{ ...m.blobs.state }] } });
     },
     (m: PortableManifest) => {
       m.runId = "another1";
@@ -419,7 +419,7 @@ test("validation rejects corrupt descriptors, headers, references, identities, p
       const b = input.blobs.values().next().value;
       if (b) b[0] = (b[0] ?? 0) ^ 1;
     }
-    if (variant === "version") input.manifest = input.manifest.replace('"schema":2', '"schema":3');
+    if (variant === "version") input.manifest = input.manifest.replace('"schema":3', '"schema":4');
     if (variant === "syntax") input.manifest = "{";
     await rejected(api.importRun(input, signal()));
     expect(snapshot(api.target)).toEqual(before);
