@@ -581,9 +581,10 @@ test("closed dependencies and merged PRs allow a trusted, edited issue", () => {
   i.closedByPullRequestsReferences = { totalCount: 1, nodes: [{ state: "MERGED" }] };
   expect(
     issueEligibility(i, ["owner"], {
+      repo: "owner/repo",
       blockers: new Map([
-        [9, "CLOSED"],
-        [10, "CLOSED"],
+        ["owner/repo#9", "CLOSED"],
+        ["owner/repo#10", "CLOSED"],
       ]),
     }),
   ).toEqual({ eligible: true, priority: 1 });
@@ -643,18 +644,23 @@ test.each([
   "2) Blocked by #12",
   " \t* BLOCKED BY: #12",
   "+ Blocked by #12",
+  "Blocked by Other/Repo#12",
+  "Blocked by https://github.com/other/repo/issues/12",
+  "Blocked by #12, other/repo#12\r\nBlocked by: #13",
 ])("body blocker shape: %s", (body) => {
   const candidate = { ...issue(), body };
   const states = new Map([
-    [12, "OPEN"],
-    [13, "OPEN"],
+    ["owner/repo#12", "OPEN"],
+    ["owner/repo#13", "OPEN"],
+    ["other/repo#12", "OPEN"],
   ]);
-  const check = () => issueEligibility(candidate, ["owner"], { blockers: states });
+  const check = () => issueEligibility(candidate, ["owner"], { repo: "OWNER/REPO", blockers: states });
   expect(check()).toEqual({ eligible: false, reason: "open or unresolved body blocker" });
-  states.set(12, "CLOSED");
+  states.set("owner/repo#12", "CLOSED");
+  states.set("other/repo#12", "CLOSED");
   if (body.includes("#13"))
     expect(check()).toEqual({ eligible: false, reason: "open or unresolved body blocker" });
-  states.set(13, "CLOSED");
+  states.set("owner/repo#13", "CLOSED");
   expect(check()).toEqual({ eligible: true, priority: 1 });
 });
 
@@ -735,7 +741,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
   if (!fresh) for (const repo of repos) store.githubCommentBoundary(repo, at);
   const clock = waitClock();
   const data = new Map(repos.map((r) => [r, [] as QueueIssue[]]));
-  const states = new Map<number, string | null>();
+  const states = new Map<string, string | null>();
   const labels = new Map<number, Set<string>>();
   const comments = new Map<number, string[]>();
   const calls: string[][] = [];
@@ -751,6 +757,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
     clock,
     data,
     states,
+    dependencyResponses: new Map<string, unknown>(),
     calls,
     delays,
     logs,
@@ -858,10 +865,21 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
                 ) ?? issue(),
             }
           : Object.fromEntries(
-              [...query.matchAll(/i(\d+):issue/g)].map((m) => [
-                `i${m[1]}`,
-                states.get(Number(m[1])) ? { state: states.get(Number(m[1])) } : null,
-              ]),
+              [...query.matchAll(/i(\d+):issue/g)].map((m) => {
+                const key = `${owner}/${name}#${m[1]}`.toLowerCase();
+                return [
+                  `i${m[1]}`,
+                  h.dependencyResponses.has(key)
+                    ? h.dependencyResponses.get(key)
+                    : states.get(key)
+                      ? {
+                          number: Number(m[1]),
+                          state: states.get(key),
+                          repository: { nameWithOwner: `${owner}/${name}` },
+                        }
+                      : null,
+                ];
+              }),
             );
       return JSON.stringify({ data: { repository, rateLimit: h.rate } });
     },
@@ -1080,14 +1098,14 @@ test("body dependencies are resolved by read-only aliased lookups; missing issue
   const i = issue();
   i.body = "Blocked by #9\nblocked BY #10";
   h.data.set("owner/repo", [i]);
-  h.states.set(9, "CLOSED");
+  h.states.set("owner/repo#9", "CLOSED");
   h.start();
   await h.advance();
   expect(h.runs()).toHaveLength(0);
-  h.states.set(10, "OPEN");
+  h.states.set("owner/repo#10", "OPEN");
   await h.advance(180_000);
   expect(h.runs()).toHaveLength(0);
-  h.states.set(10, "CLOSED");
+  h.states.set("owner/repo#10", "CLOSED");
   await h.advance(180_000);
   expect(h.runs()).toHaveLength(1);
   expect(h.calls).toHaveLength(6);
@@ -1098,11 +1116,193 @@ test("body dependencies are resolved by read-only aliased lookups; missing issue
   ).toBe(true);
 });
 
+test("body dependency queries ignore unlabelled untrusted issues across polls", async () => {
+  const h = harness();
+  const unlabelled = issue();
+  unlabelled.author = { login: "stranger" };
+  unlabelled.labels = { totalCount: 0, nodes: [] };
+  unlabelled.body = `Blocked by ${Array.from({ length: 40 }, (_, n) => `spam${n}/repo#9`).join(" ")}`;
+  h.data.set("owner/repo", [unlabelled, { ...issue(2), body: "Blocked by other/repo#9" }]);
+  h.states.set("other/repo#9", "OPEN");
+  const dependencyRepos = () => h.scopes.filter((_, n) => /i\d+:issue/.test(h.calls[n]?.[3] ?? ""));
+  h.start();
+  await h.advance();
+  expect(dependencyRepos()).toEqual(["other/repo"]);
+  expect(h.runs()).toHaveLength(0);
+  h.states.set("other/repo#9", "CLOSED");
+  await h.advance(180_000);
+  expect(dependencyRepos()).toEqual(["other/repo", "other/repo"]);
+  expect(h.runs()).toMatchObject([{ sourceRef: { number: 2 } }]);
+});
+
+test("body dependency queries share a ten-attempt budget across repositories each poll", async () => {
+  const h = harness({ max_issue_runs: 4 }, ["Owner/Repo", "Owner/Second"]);
+  const references = Array.from({ length: 14 }, (_, n) => `foreign${n}/repo#9`);
+  h.data.set("Owner/Repo", [
+    { ...issue(), body: `Blocked by ${references.slice(0, 2).join(" ")} FOREIGN1/REPO#9` },
+  ]);
+  h.data.set("Owner/Second", [
+    { ...issue(), body: `Blocked by ${references.slice(2).join(" ")} Owner/Second#9` },
+    { ...issue(2), body: "Blocked by #9" },
+    issue(3),
+    { ...commentIssue(4), comments: { totalCount: 1, nodes: [commandComment()] } },
+  ]);
+  for (const ref of references) h.states.set(ref, "CLOSED");
+  h.states.set("owner/second#9", "CLOSED");
+  h.intercept = (args) => {
+    if (/i\d+:issue/.test(args[3] ?? "") && args[3]?.includes('owner:"foreign0"'))
+      throw new Error("dependency query denied");
+  };
+  const dependencyRepos = () => h.scopes.filter((_, n) => /i\d+:issue/.test(h.calls[n]?.[3] ?? ""));
+  const expected = [...Array.from({ length: 10 }, (_, n) => `foreign${n}/repo`), "Owner/Second"];
+  h.start();
+  await h.advance();
+  expect(dependencyRepos()).toEqual(expected);
+  expect(
+    h
+      .runs()
+      .map((r) => r.sourceRef?.number)
+      .sort(),
+  ).toEqual([2, 3, 4]);
+  expect(h.runs().every((r) => r.sourceRef?.repo === "Owner/Second")).toBe(true);
+  expect(h.store.githubCommentProcessed({ repo: "Owner/Second", id: 1 })).toBe(true);
+  await h.advance(180_000);
+  expect(dependencyRepos()).toEqual([...expected, ...expected]);
+  expect(h.runs()).toHaveLength(3);
+});
+
+test.each(["other/repo#9", "https://github.com/other/repo/issues/9"])(
+  "foreign body blocker %s resolves outside the configured queue repositories",
+  async (reference) => {
+    const h = harness();
+    h.data.set("owner/repo", [{ ...issue(), body: `Blocked by ${reference}` }]);
+    h.states.set("owner/repo#9", "CLOSED");
+    h.states.set("other/repo#9", "OPEN");
+    h.start();
+    await h.advance();
+    expect(h.runs()).toHaveLength(0);
+    expect(h.scopes).toEqual(["owner/repo", "other/repo"]);
+    expect(h.calls[1]?.[3]).toContain('repository(owner:"other", name:"repo")');
+    expect(h.calls[1]?.[3]).toContain("i9:issue(number:9)");
+    h.states.set("other/repo#9", "CLOSED");
+    await h.advance(180_000);
+    expect(h.runs()).toHaveLength(1);
+    expect(h.scopes).toEqual(["owner/repo", "other/repo", "owner/repo", "other/repo"]);
+  },
+);
+
+test.each([
+  "query error",
+  "null",
+  "missing",
+  "unknown state",
+  "missing state",
+  "wrong number",
+  "wrong repo",
+  "missing identity",
+])("foreign body blocker with %s blocks only affected issues despite a closed local issue", async (mode) => {
+  const h = harness({ max_issue_runs: 3 });
+  h.data.set("owner/repo", [
+    { ...issue(), body: "Blocked by other/repo#9" },
+    issue(2),
+    { ...issue(3), body: "Blocked by #9" },
+  ]);
+  h.states.set("owner/repo#9", "CLOSED");
+  const response = { number: 9, state: "CLOSED", repository: { nameWithOwner: "other/repo" } };
+  if (mode === "query error")
+    h.intercept = (args) => {
+      if (args[3]?.includes('owner:"other"')) throw new Error("dependency query denied");
+    };
+  else
+    h.dependencyResponses.set(
+      "other/repo#9",
+      mode === "null"
+        ? null
+        : mode === "missing"
+          ? undefined
+          : mode === "missing identity"
+            ? { state: "CLOSED" }
+            : {
+                ...response,
+                ...(mode === "unknown state" ? { state: "UNEXPECTED" } : {}),
+                ...(mode === "missing state" ? { state: undefined } : {}),
+                ...(mode === "wrong number" ? { number: 10 } : {}),
+                ...(mode === "wrong repo" ? { repository: { nameWithOwner: "owner/repo" } } : {}),
+              },
+    );
+  h.start();
+  await h.advance();
+  expect(
+    h
+      .runs()
+      .map((r) => r.sourceRef?.number)
+      .sort(),
+  ).toEqual([2, 3]);
+  expect(h.scopes).toEqual(["owner/repo", "other/repo", "owner/repo"]);
+});
+
+test("an unreadable foreign blocker does not prevent unrelated comment commands", async () => {
+  const h = harness();
+  h.data.set("owner/repo", [
+    { ...issue(), body: "Blocked by other/repo#9" },
+    { ...commentIssue(2), comments: { totalCount: 1, nodes: [commandComment()] } },
+  ]);
+  h.intercept = (args) => {
+    if (args[3]?.includes('owner:"other"')) throw new Error("dependency query denied");
+  };
+  h.start();
+  await h.advance();
+  expect(h.runs()).toMatchObject([{ sourceRef: { number: 2 } }]);
+  expect(h.store.githubCommentProcessed({ repo: "owner/repo", id: 1 })).toBe(true);
+});
+
+test.each(["stopped", "rate limited"])("dependency query failure preserves %s polling", async (mode) => {
+  const h = harness();
+  h.data.set("owner/repo", [{ ...issue(), body: "Blocked by other/repo#9, #10" }]);
+  h.intercept = (args) => {
+    if (!args[3]?.includes('owner:"other"')) return;
+    if (mode === "stopped") {
+      h.stop();
+      throw new Error("dependency query cancelled");
+    }
+    h.response = {
+      errors: [{ message: "dependency query denied" }],
+      data: { repository: null, rateLimit: { ...h.rate, remaining: 0 } },
+    };
+  };
+  h.start();
+  await h.advance();
+  expect(h.scopes).toEqual(["owner/repo", "other/repo"]);
+  expect(h.runs()).toHaveLength(0);
+  expect(h.clock.pending).toBe(mode === "stopped" ? 0 : 1);
+  await h.advance(180_000);
+  expect(h.calls).toHaveLength(2);
+});
+
+test("mixed local and foreign body blockers require both closed and deduplicate repository casing", async () => {
+  const h = harness();
+  h.data.set("owner/repo", [{ ...issue(), body: "Blocked by #9, other/repo#9, Other/Repo#9" }]);
+  h.states.set("owner/repo#9", "CLOSED");
+  h.states.set("other/repo#9", "OPEN");
+  h.start();
+  await h.advance();
+  expect(h.runs()).toHaveLength(0);
+  expect(h.scopes).toEqual(["owner/repo", "owner/repo", "other/repo"]);
+  expect(h.calls[2]?.[3]?.match(/i9:issue/g)).toHaveLength(1);
+  h.states.set("owner/repo#9", "OPEN");
+  h.states.set("other/repo#9", "CLOSED");
+  await h.advance(180_000);
+  expect(h.runs()).toHaveLength(0);
+  h.states.set("owner/repo#9", "CLOSED");
+  await h.advance(180_000);
+  expect(h.runs()).toHaveLength(1);
+});
+
 test("poll query reads title evidence and looks up all body blockers", async () => {
   const h = harness();
   h.data.set("owner/repo", [{ ...issue(), body: "- Blocked by: #12, #13" }]);
-  h.states.set(12, "CLOSED");
-  h.states.set(13, "CLOSED");
+  h.states.set("owner/repo#12", "CLOSED");
+  h.states.set("owner/repo#13", "CLOSED");
   h.start();
   await h.advance();
   expect(h.calls).toHaveLength(2);
@@ -1596,7 +1796,7 @@ test("queue preserves the first configured repository spelling and existing repo
       { ...issue(), body: "Blocked by #9" },
       { ...commentIssue(2), comments: { nodes: [commandComment()], totalCount: 1 } },
     ]);
-    h.states.set(9, "CLOSED");
+    h.states.set("owner/repo#9", "CLOSED");
     h.start();
     await h.advance();
     expect(h.requests).toHaveLength(2);
@@ -1991,7 +2191,7 @@ test("App bot issues and priority labels never inherit the owner's trust", () =>
 test("issue queue scopes both list and dependency GraphQL calls to the repository", async () => {
   const h = harness();
   h.data.set("owner/repo", [{ ...issue(), body: "Blocked by #9" }]);
-  h.states.set(9, "CLOSED");
+  h.states.set("owner/repo#9", "CLOSED");
   h.start();
   await h.advance();
   expect(h.scopes).toEqual(["owner/repo", "owner/repo"]);
