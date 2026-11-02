@@ -1,10 +1,14 @@
-import { type Run, TERMINAL_STATUSES } from "../core/types.ts";
+import { type Config, repoSettings } from "../config.ts";
+import { type Repo, type Run, TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { ClaimLostError, ClaimWaitError, rethrowClaimControl } from "../integrations/claim-errors.ts";
 import { claimGuard, claimScope, type ScopedClaim } from "../integrations/claim-guard.ts";
 import { canonicalRepo } from "../integrations/lease-store.ts";
 import type { LeaseManager } from "../integrations/leases.ts";
 import { claimKey, claimRef } from "./portable.ts";
+
+export const sharedRepository = (cfg: Pick<Config, "repos">, repo: Pick<Repo, "kind">, slug: string) =>
+  repoSettings(cfg, slug).shared === true && repo.kind === "github";
 
 /** Binding and updater must come from the same manager. */
 export type RunClaim = Readonly<{
