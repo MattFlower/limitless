@@ -24,7 +24,12 @@ import type { RunPatch, Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
-import { redactGateData, redactGateDiagnostics, redactGateOutput } from "../gates/output.ts";
+import {
+  redactGateData,
+  redactGateDiagnostics,
+  redactGateOutput,
+  sanitizeArtifact,
+} from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
 import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
@@ -521,10 +526,7 @@ export class RunContext {
 
   /** Artifacts are outward copies; decode JSON so escaped controls are sanitized as text. */
   artifact(name: string, kind: string, content: string): void {
-    const safe = name.endsWith(".json")
-      ? JSON.stringify(redactGateData(JSON.parse(content)), null, content.includes("\n") ? 2 : undefined)
-      : redactGateOutput(content);
-    this.store.putArtifact(this.run.id, name, kind, safe);
+    this.store.putArtifact(this.run.id, name, kind, sanitizeArtifact(name, content));
   }
 
   get complexity(): Complexity {

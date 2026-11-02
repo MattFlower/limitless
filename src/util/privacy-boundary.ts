@@ -1,4 +1,9 @@
-import { decodedLayers, type PrivateStrings, stripPartialEscapes } from "../gates/private.ts";
+import {
+  decodedLayers,
+  type PrivateStrings,
+  privateStringsDigest,
+  stripPartialEscapes,
+} from "../gates/private.ts";
 import {
   CredentialMatcher,
   createCredentialRegistry,
@@ -17,7 +22,7 @@ export const privacyRefusals = [
   "ill-formed",
   "nonconvergent",
 ] as const;
-type Refusal = { refused: (typeof privacyRefusals)[number] };
+type Refusal = { refused: (typeof privacyRefusals)[number] | "unreadable-policy" };
 export const privacyLimits = {
   entries: 64,
   credentials: 1024,
@@ -36,8 +41,13 @@ export const privacyLimits = {
   depth: 32,
   nodes: 10000,
 };
-export function createPrivacyRegistry(secrets = createCredentialRegistry(), checker = () => "privacy/1") {
+export function createPrivacyRegistry(
+  secrets = createCredentialRegistry(),
+  checker = () => "privacy/1",
+  requirePolicy = false,
+) {
   let entries: PrivateStrings = [];
+  let ready = !requirePolicy;
   let policy = 0;
   let label = checker();
   let semantics = 0;
@@ -50,21 +60,29 @@ export function createPrivacyRegistry(secrets = createCredentialRegistry(), chec
     return Object.freeze({ identity, policy, credentials: secrets.generation, checker: semantics });
   };
   return {
+    get ready() {
+      return ready;
+    },
+    failPolicy() {
+      ready = false;
+    },
+    refreshPolicy: () => {},
     get entries() {
       return copy();
     },
     replacePolicy(value: PrivateStrings) {
+      if (!requirePolicy || privateStringsDigest(value) !== privateStringsDigest(entries)) policy++;
       entries = value.map((entry) => ({ ...entry }));
-      policy++;
+      ready = true;
     },
     addCredential: secrets.add,
     get generation() {
       return generation();
     },
-    snapshot: () => ({ entries: copy(), credentials: secrets.values(), generation: generation() }),
+    snapshot: () => ({ ready, entries: copy(), credentials: secrets.values(), generation: generation() }),
   };
 }
-export const privacyRegistry = createPrivacyRegistry(credentialRegistry);
+export const privacyRegistry = createPrivacyRegistry(credentialRegistry, undefined, true);
 export const capturePrivacySnapshot = (registry = privacyRegistry) => registry.snapshot();
 export const currentPrivacyGeneration = (registry = privacyRegistry) => registry.generation;
 export function isCurrentPrivacyGeneration(prepared: Prepared, registry = privacyRegistry): boolean {
@@ -87,6 +105,7 @@ export function preparePrivacyPolicy(
 ) {
   const limits = { ...privacyLimits, ...options.limits };
   const refuse = (refused: Refusal["refused"]): Refusal => ({ refused });
+  if (!snapshot.ready) return refuse("unreadable-policy");
   if (snapshot.entries.length > limits.entries) return refuse("entries-count");
   if (snapshot.credentials.length > limits.credentials) return refuse("credentials-count");
   const originals = [...snapshot.entries.map(({ value }) => value), ...snapshot.credentials];
@@ -313,14 +332,17 @@ function issue(state: Evidence): BoundaryText {
   } catch {
     state = withheld(state, "nonconvergent");
   }
-  if (!current(state)) state = withheld(state, "stale-generation");
+  if (!state.registry.ready) state = withheld(state, "unreadable-policy");
+  else if (!current(state)) state = withheld(state, "stale-generation");
   const value = Object.freeze({}) as BoundaryText;
   receipts.set(value, state);
   return value;
 }
 function read(value: unknown): Evidence {
   const state = typeof value === "object" && value !== null ? receipts.get(value as BoundaryText) : undefined;
-  if (!state) return withheld(context({ refused: "nonconvergent" }, {}), "forged");
+  if (!state)
+    return withheld(context({ refused: "nonconvergent" }, { registry: createPrivacyRegistry() }), "forged");
+  if (!state.registry.ready) return withheld(state, "unreadable-policy");
   return current(state) ? state : withheld(state, "stale-generation");
 }
 export function consumeBoundaryText(value: unknown): Projection {
@@ -402,7 +424,27 @@ type TextInput = {
   cut?: BoundaryCut;
   terminal?: boolean;
 };
-export function protectText(
+export function protectText(input: TextInput, options: Options = {}): BoundaryText {
+  return protectTextPrepared({ ...input, policy: refreshPolicy(input.policy, options) }, options);
+}
+function refreshPolicy(policy: Prepared, options: Options): Prepared {
+  const registry = options.registry ?? privacyRegistry;
+  try {
+    const wasCurrent = isCurrentPrivacyGeneration(policy, registry);
+    registry.refreshPolicy();
+    if (!registry.ready) return { refused: "unreadable-policy" };
+    return (wasCurrent && !isCurrentPrivacyGeneration(policy, registry)) ||
+      ("refused" in policy && policy.refused === "unreadable-policy")
+      ? preparePrivacyPolicy(
+          registry.snapshot(),
+          "refused" in policy ? {} : { limits: policy.limits, counters: policy.counters },
+        )
+      : policy;
+  } catch {
+    return { refused: "unreadable-policy" };
+  }
+}
+function protectTextPrepared(
   { text, provenance, policy, cut, terminal }: TextInput,
   options: Options = {},
 ): BoundaryText {
@@ -432,6 +474,12 @@ export function protectText(
 }
 type Diagnostic = null | boolean | number | string | Diagnostic[] | { [key: string]: Diagnostic };
 export function protectData(
+  input: Omit<TextInput, "text"> & { json: unknown },
+  options: Options = {},
+): BoundaryText {
+  return protectDataPrepared({ ...input, policy: refreshPolicy(input.policy, options) }, options);
+}
+function protectDataPrepared(
   { json, provenance, policy, cut, terminal }: Omit<TextInput, "text"> & { json: unknown },
   options: Options = {},
 ): BoundaryText {
@@ -446,7 +494,7 @@ export function protectData(
     ...options,
     limits: { ...limits, outputUnits: limits.inputUnits, outputBytes: limits.inputBytes },
   };
-  const original = protectText({ text: json, provenance, policy, terminal }, candidateOptions);
+  const original = protectTextPrepared({ text: json, provenance, policy, terminal }, candidateOptions);
   const state = read(original);
   if (state.withheld) return original;
   let parsed: unknown;
@@ -454,7 +502,7 @@ export function protectData(
     parsed = JSON.parse(json);
   } catch (error) {
     if (error instanceof SyntaxError)
-      return protectText({ text: json, provenance, policy, cut, terminal }, options);
+      return protectTextPrepared({ text: json, provenance, policy, cut, terminal }, options);
     return issue(withheld(state, "nonconvergent"));
   }
   let reason: Reason = "nonconvergent";
@@ -464,7 +512,7 @@ export function protectData(
   };
   const marker = "[withheld: private text]";
   const field = (text: string) => {
-    const result = read(protectText({ text, provenance, policy, terminal }, candidateOptions));
+    const result = read(protectTextPrepared({ text, provenance, policy, terminal }, candidateOptions));
     if (result.withheld) {
       if (result.reason === "private-match") return marker;
       return fail(result.reason ?? "nonconvergent");
@@ -503,7 +551,7 @@ export function protectData(
   };
   try {
     const text = JSON.stringify(visit(parsed, 0));
-    return protectText({ text, provenance, policy, cut }, options);
+    return protectTextPrepared({ text, provenance, policy, cut }, options);
   } catch {
     return issue(withheld(state, reason));
   }
@@ -529,7 +577,10 @@ export function concat(
 ): BoundaryText {
   let state = values.length
     ? read(values[0])
-    : withheld(context({ refused: "nonconvergent" }, {}), "unchecked-provenance");
+    : withheld(
+        context({ refused: "nonconvergent" }, { registry: createPrivacyRegistry() }),
+        "unchecked-provenance",
+      );
   if (!values.length) return issue(state);
   try {
     const components = values.map(read);

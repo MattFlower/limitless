@@ -6,7 +6,14 @@ import { loadPrivateStrings } from "../gates/private.ts";
 import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import type { RunState } from "../pipeline/context.ts";
 import { redactCredentials, registeredCredentials } from "../util/proc.ts";
-import { ClaimObserverSuppressed, isClaimLossProjection, observerDispatchGuard } from "./claim-projection.ts";
+import { ClaimControlError } from "./claim-errors.ts";
+import {
+  ClaimObserverSuppressed,
+  isClaimLossProjection,
+  type ObserverAuthority,
+  observerClaimGuard,
+  observerDispatchGuard,
+} from "./claim-projection.ts";
 import type { GhRunner } from "./github.ts";
 import { githubIdentity } from "./github-identity.ts";
 
@@ -20,7 +27,11 @@ const commentAllowed = (run: Run, event: string) =>
 export const lifecycleMarker = (runId: string, event: string) =>
   `<!-- limitless-lifecycle:${runId}:${event} -->`;
 export const ISSUE_LIFECYCLE_CALL_CAP = 50;
-export type IssueLifecycleOptions = { identity?: typeof githubIdentity; maxCalls?: number };
+export type IssueLifecycleOptions = {
+  identity?: typeof githubIdentity;
+  maxCalls?: number;
+  authority?: ObserverAuthority;
+};
 const cursors = new WeakMap<Store, { key: string; deferred: boolean }>();
 const sessions = new WeakMap<AbortSignal, Set<string>>();
 const exhausted = Symbol("lifecycle call budget exhausted");
@@ -56,20 +67,21 @@ export async function reconcileIssueLifecycle(
     freshLabels = new Set();
     sessions.set(signal, freshLabels);
   }
-  const call = (runId: string, repo: string | undefined, args: string[], before?: () => void) => {
-    const guard = observerDispatchGuard(store, runId);
+  const call = (snapshot: Run, repo: string | undefined, args: string[], before?: () => void) => {
+    const guard = observerClaimGuard(store, cfg, snapshot, opts.authority);
     guard();
     if (signal.aborted || remaining <= 0) throw exhausted;
     remaining--;
     before?.();
     return gh(["api", ...args], signal, undefined, repo, guard);
   };
+  const quiet = (error: unknown) =>
+    error instanceof ClaimObserverSuppressed || error instanceof ClaimControlError;
   const logFailure = (
     code: "field-withheld" | "body-suppressed" | "labels-failed" | "publication-failed",
     error?: unknown,
   ) => {
-    if (!signal.aborted && error !== exhausted && !(error instanceof ClaimObserverSuppressed))
-      log(`Issue lifecycle: ${code}`);
+    if (!signal.aborted && error !== exhausted && !quiet(error)) log(`Issue lifecycle: ${code}`);
   };
   const openQuestions = (run: Run) => store.listQuestions(run.id).filter((q) => q.answer === null);
   const questionSet = (run: Run) =>
@@ -188,14 +200,15 @@ export async function reconcileIssueLifecycle(
   const cursor = cursors.get(store);
   const start = Math.max(0, work.findIndex((w) => w.key === cursor?.key) + (cursor?.deferred ? 0 : 1));
   const ordered = [...work.slice(start), ...work.slice(0, start)];
-  const postingLogin = async (runId: string, repo: string, eligible: () => boolean) => {
+  const postingLogin = async (snapshot: Run, repo: string, eligible: () => boolean) => {
     const identity = await (opts.identity ?? githubIdentity)(repo);
     if (!eligible()) return null;
     if (identity.kind === "app") return identity.botLogin;
     // Look up the owner only when the POST can follow in this poll.
     reserve(2);
-    return z.object({ login: z.string() }).parse(JSON.parse(String(await call(runId, undefined, ["user"]))))
-      .login;
+    return z
+      .object({ login: z.string() })
+      .parse(JSON.parse(String(await call(snapshot, undefined, ["user"])))).login;
   };
   for (const { snapshot, repo, number, effect: task, key } of ordered) {
     if (signal.aborted || remaining <= 0) return;
@@ -265,9 +278,7 @@ export async function reconcileIssueLifecycle(
                     }),
                   }),
                 })
-                .parse(
-                  JSON.parse(String(await call(snapshot.id, repo, ["graphql", "-f", `query=${query}`]))),
-                );
+                .parse(JSON.parse(String(await call(snapshot, repo, ["graphql", "-f", `query=${query}`]))));
               if (evidence.errors?.length) throw new Error("incomplete failure timeline evidence");
               save("failure", "removing", {
                 body: String(evidence.data.repository.issue.timelineItems.totalCount),
@@ -298,7 +309,7 @@ export async function reconcileIssueLifecycle(
                 .array(z.object({ name: z.string() }))
                 .parse(
                   JSON.parse(
-                    String(await call(snapshot.id, repo, [`${path}/labels?per_page=100&page=${plan.page}`])),
+                    String(await call(snapshot, repo, [`${path}/labels?per_page=100&page=${plan.page}`])),
                   ),
                 );
               plan.current.push(...current.map((l) => l.name));
@@ -323,7 +334,7 @@ export async function reconcileIssueLifecycle(
             save("labels", "pending", { body: JSON.stringify(plan) });
             if (target === labels[2] && failure?.state === "removing") {
               if (plan.current.includes(labels[2])) {
-                await call(snapshot.id, repo, [
+                await call(snapshot, repo, [
                   `${path}/labels/${encodeURIComponent(labels[2])}`,
                   "-X",
                   "DELETE",
@@ -348,7 +359,7 @@ export async function reconcileIssueLifecycle(
               save(effect, "pending");
               try {
                 await call(
-                  snapshot.id,
+                  snapshot,
                   repo,
                   add
                     ? [`${path}/labels`, "-X", "POST", "-f", `labels[]=${label}`]
@@ -414,9 +425,7 @@ export async function reconcileIssueLifecycle(
               }),
             )
             .parse(
-              JSON.parse(
-                String(await call(snapshot.id, repo, [`${path}/comments?per_page=100&page=${page}`])),
-              ),
+              JSON.parse(String(await call(snapshot, repo, [`${path}/comments?per_page=100&page=${page}`]))),
             );
           stale ||= !eligible();
           const found = comments.find(
@@ -439,7 +448,7 @@ export async function reconcileIssueLifecycle(
         save(effect, "done");
         continue;
       }
-      const login = await postingLogin(snapshot.id, repo, eligible);
+      const login = await postingLogin(snapshot, repo, eligible);
       if (!eligible()) {
         save(effect, "done");
         continue;
@@ -462,7 +471,7 @@ export async function reconcileIssueLifecycle(
       const created = z.object({ id: z.number().int().positive() }).parse(
         JSON.parse(
           String(
-            await call(snapshot.id, repo, [`${path}/comments`, "-X", "POST", "-f", `body=${body}`], () => {
+            await call(snapshot, repo, [`${path}/comments`, "-X", "POST", "-f", `body=${body}`], () => {
               save(effect, "pending", { body, login, page: 1 });
             }),
           ),
@@ -474,8 +483,7 @@ export async function reconcileIssueLifecycle(
         cursors.set(store, { key, deferred: true });
         return;
       }
-      if (error instanceof ClaimObserverSuppressed || isClaimLossProjection(store.getRun(snapshot.id)))
-        continue;
+      if (quiet(error) || isClaimLossProjection(store.getRun(snapshot.id))) continue;
       if (questions && !eligible()) {
         const checkpoint = store.issueLifecycleEffects(run.id, repo, number).find((e) => e.effect === effect);
         save(effect, checkpoint?.page ? "recovering" : "done", { page: checkpoint?.page ?? 0 });

@@ -4,6 +4,7 @@ import { TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
+import { sharedRepository } from "../pipeline/run-claim.ts";
 import { ClaimObserverSuppressed, isClaimLossProjection, observerDispatchGuard } from "./claim-projection.ts";
 import { type GhRunner, runGh } from "./github.ts";
 import { githubSh, githubUrlRepo } from "./github-identity.ts";
@@ -283,6 +284,12 @@ export function startGitHubNotifier(
     if (msg.kind !== "run") return;
     const run = msg.run;
     if (isClaimLossProjection(run)) return;
+    // D15: Shared mode requires the managed lifecycle, which owns these comments.
+    if (
+      repoSettings(cfg, run.repoSlug).shared === true &&
+      sharedRepository(cfg, store.getRepo(run.repoId) ?? { kind: "local" }, run.repoSlug)
+    )
+      return;
     if (
       run.prUrl &&
       (run.status === "needs_human" || (["succeeded", "resolved"].includes(run.status) && !run.merged))

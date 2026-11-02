@@ -144,6 +144,7 @@ test("a local run without a transfer receipt conflicts without writes", () => {
 test.each([1, 2] as const)("schema %i retains original JSON bytes and repeated blob references", (schema) => {
   const input = receiptFixture();
   const manifest = JSON.parse(input.manifest) as PortableManifest;
+  if (manifest.schema === 3) throw new Error("Expected legacy fixture");
   manifest.schema = schema;
   const bytes = new TextEncoder().encode(`\n${JSON.stringify(input.payload, null, 2)}\n`);
   input.blobs = new Map(input.blobs).set(manifest.blobs.state.key, bytes);

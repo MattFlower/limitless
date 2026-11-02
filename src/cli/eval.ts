@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { type Config, loadConfig } from "../config.ts";
 import { EvalRequestSchema } from "../evals/cases.ts";
 import { policyDiff, proposedOverlay, renderEvidence } from "../evals/evidence.ts";
 import { formatEvalReport } from "../evals/format.ts";
@@ -18,10 +19,13 @@ import { type EvalReviewSystem, parseEvalReviewSystems } from "../pipeline/revie
 import { DEFAULT_POLICY, REMOVED_MODELS } from "../router/catalog.ts";
 import { overlayPolicy, parsePolicy, validatePolicy } from "../router/policy.ts";
 import { parseTarget } from "../router/targets.ts";
+import { provisionPrivacyPolicy } from "../util/privacy-policy.ts";
 
 export { formatEvalReport } from "../evals/format.ts";
 
 export interface EvalCliIO {
+  config?: () => Pick<Config, "paths">;
+  provisionPrivacy?: typeof provisionPrivacyPolicy;
   files?: {
     read: (path: string) => Promise<string | null>;
     write: (path: string, text: string) => Promise<void>;
@@ -193,6 +197,8 @@ export async function evalCommand(
     strategy: flags.strategy,
   };
   EvalRequestSchema.parse(request);
+  const { configDir, repos, work } = (io.config ?? (() => loadConfig({ readOnly: true })))().paths;
+  (io.provisionPrivacy ?? provisionPrivacyPolicy)(configDir, [repos, work]);
   const { id, excludedHeldout } = await io.api<{ id: string; excludedHeldout?: number }>("/api/evals", {
     method: "POST",
     body: JSON.stringify(request),

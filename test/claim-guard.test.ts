@@ -469,10 +469,17 @@ test("client IO clears scope through awaits and ambiguous-result readback", asyn
   ]);
 });
 
-test("source boundaries permit claim bindings only at execution entry", async () => {
+test("source boundaries restrict claim scopes to execution, observer validation and explicit exits", async () => {
   const execution = "src/pipeline/run-claim.ts";
   const engine = "src/pipeline/engine.ts";
-  const allowed = new Set(["src/integrations/claim-ref.ts", "src/integrations/leases.ts", execution, engine]);
+  const observer = "src/integrations/claim-projection.ts";
+  const scoped = new Set([execution, engine, observer]);
+  const allowed = new Set([
+    "src/integrations/claim-ref.ts",
+    "src/integrations/leases.ts",
+    "src/db/store.ts",
+    ...scoped,
+  ]);
   const references: string[] = [];
   for await (const path of new Bun.Glob("src/**/*.ts").scan({
     cwd: new URL("..", import.meta.url).pathname,
@@ -488,7 +495,8 @@ test("source boundaries permit claim bindings only at execution entry", async ()
     }
     expect(source).not.toMatch(/\bbindClaim\b/);
     if (path !== execution && path !== engine) {
-      expect(source).not.toMatch(/claimScope\.run\b|\b(?:bindRunClaim|validateRunClaim|renewRunClaim)\b/);
+      expect(source).not.toMatch(/\b(?:bindRunClaim|renewRunClaim)\b/);
+      if (path !== observer) expect(source).not.toMatch(/claimScope\.run\b|\bvalidateRunClaim\b/);
       const runtime =
         path === "src/pipeline/context.ts"
           ? source.replace('import type { RunClaim } from "./run-claim.ts";', "")
@@ -500,15 +508,17 @@ test("source boundaries permit claim bindings only at execution entry", async ()
         "src/integrations/control-ref.ts",
         "src/integrations/control-receipt.ts",
         "src/integrations/github-identity.ts",
+        "src/integrations/github-poller.ts",
         "src/git/repos.ts",
         "src/pipeline/context.ts",
+        observer,
         execution,
         engine,
       ]).toContain(path);
     if (/\bhasClaimScope\b/.test(source)) expect(path).toBe("src/pipeline/engine.ts");
     if (/\bclaimScope\b/.test(source)) {
       expect(allowed.has(path)).toBe(true);
-      const operation = path === execution || path === engine ? "claimScope.run" : "claimScope.exit";
+      const operation = scoped.has(path) ? "claimScope.run" : "claimScope.exit";
       expect(source.replace(/import .*claimScope.*\n/, "").replaceAll(operation, "")).not.toMatch(
         /\bclaimScope\b/,
       );

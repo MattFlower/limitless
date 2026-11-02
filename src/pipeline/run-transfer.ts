@@ -8,6 +8,7 @@ import { registeredCredentials } from "../util/proc.ts";
 import { type BlobRef, formatManifest, type PortableManifest, parseManifest } from "./portable.ts";
 import type { RunObjectExportInput, RunObjectIO } from "./run-object-contract.ts";
 import { inspectRunObjectCredentials } from "./run-object-privacy.ts";
+import { decodeRunArtifacts, encodeRunArtifacts } from "./run-transfer-artifacts.ts";
 import { RunTransferError, rethrowRunTransfer } from "./run-transfer-errors.ts";
 import {
   receiptDescriptors,
@@ -52,7 +53,7 @@ export function createRunTransfer(deps: RunTransferDependencies) {
     const m = parseManifest(text);
     if (m === "malformed") throw new RunTransferError("invalid");
     if ("unsupported" in m) throw new RunTransferError("unsupported");
-    if (m.blobs.artifacts.length) throw new RunTransferError("unsupported");
+    if (m.schema !== 3 && m.blobs.artifacts.length) throw new RunTransferError("unsupported");
     if (m.blobs.objects.length > 1) throw new RunTransferError("invalid");
     return m;
   };
@@ -119,7 +120,14 @@ export function createRunTransfer(deps: RunTransferDependencies) {
           }
           const captured = captureRunTransferSnapshot(deps.source, runId, (source) => {
             const context = deps.manifestContext(source);
-            return { ...context, manifest: { ...context.manifest, schema: 2 } };
+            return {
+              ...context,
+              manifest: {
+                ...context.manifest,
+                schema: 3,
+                blobs: { ...context.manifest.blobs, artifacts: [] },
+              },
+            };
           });
           const p = captured.payload,
             m = captured.context.manifest;
@@ -131,6 +139,9 @@ export function createRunTransfer(deps: RunTransferDependencies) {
             return { key, digest: transferHash(bytes), size: bytes.byteLength };
           };
           const state = blob(encodeTransferJson(p));
+          const artifacts = encodeRunArtifacts(captured.artifacts, runId, captured.ordinals.invocations).map(
+            ({ role, bytes }) => ({ ...blob(bytes), role }),
+          );
           const expected = objectInput(p, m, new Uint8Array());
           const bundle = await deps.objects.export(
             {
@@ -143,7 +154,7 @@ export function createRunTransfer(deps: RunTransferDependencies) {
           );
           if (!!bundle !== !!p.commits.length) throw new RunTransferError("incomplete");
           const objects = bundle ? [blob(bundle.bytes)] : [];
-          const final = { ...m, schema: 2 as const, blobs: { state, objects, artifacts: [] } };
+          const final = { ...m, schema: 3 as const, blobs: { state, objects, artifacts } };
           const text = formatManifest(final);
           const validated = payload(final, blobs);
           await validateObjects(validated, final, blobs, signal);
@@ -165,6 +176,7 @@ export function createRunTransfer(deps: RunTransferDependencies) {
         const refs = receiptDescriptors(m);
         if (new Set(refs.map((r) => r.key)).size !== refs.length) throw new RunTransferError("invalid");
         const p = payload(m, blobs);
+        decodeRunArtifacts(m, blobs, p);
         receiptManifest(text, transferHash(new TextEncoder().encode(text)), p.run.id);
         const source = transferDatabaseIdentity(deps.source.db),
           target = transferDatabaseIdentity(deps.offline.store.db);

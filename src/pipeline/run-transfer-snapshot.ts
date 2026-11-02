@@ -4,6 +4,7 @@ import type { Store } from "../db/store.ts";
 import { redactCredentials, registeredCredentials } from "../util/proc.ts";
 import type { RunState } from "./context.ts";
 import { formatManifest, type PortableManifest } from "./portable.ts";
+import { readTransferArtifacts } from "./run-transfer-artifacts.ts";
 import { RunTransferError } from "./run-transfer-errors.ts";
 import type { FollowUpInput } from "./run-transfer-followups.ts";
 import { sourceOrdinals } from "./run-transfer-ordinals.ts";
@@ -186,6 +187,7 @@ export const captureRunTransferSnapshot = boundary(
           payload: validated,
           context: { manifest, policyPin, ...(byteInputs ? { byteInputs } : {}) },
           ordinals: sourceOrdinals(rows),
+          artifacts: readTransferArtifacts(store.db, runId),
         };
       })
       .deferred(),
