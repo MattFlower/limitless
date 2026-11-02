@@ -1,6 +1,6 @@
 import { expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Worker } from "node:worker_threads";
@@ -1581,6 +1581,34 @@ test.each(["deadline", "dispose"])("a %s terminates a worker still starting", as
   await disposed;
   expect(terminated).toEqual(["terminated"]);
 });
+
+test.each(["text", "data"] as const)(
+  "worker %s independently refuses a dangling policy symlink after missing-file provisioning",
+  async (kind) => {
+    const dir = mkdtempSync(join(tmpdir(), "privacy-checker-"));
+    const file = join(dir, "private-strings.txt");
+    const f = fixture({ registry: b.createPrivacyRegistry(undefined, undefined, true) });
+    const check = async () => {
+      const pending =
+        kind === "text" ? f.send() : f.protectData({ json: '{"a":"safe"}', provenance: input().provenance });
+      await f.run();
+      return read(await pending);
+    };
+    try {
+      provisionPrivacyPolicy(dir, [], { registry: f.registry, log: mock() });
+      expect((await check()).withheld).toBe(false);
+      symlinkSync("absent-target", file);
+      expect(await check()).toMatchObject({ withheld: true, reason: "unreadable-policy" });
+      expect(f.registry.ready).toBe(false);
+      rmSync(file);
+      expect((await check()).withheld).toBe(false);
+      expect(f.registry.ready).toBe(true);
+    } finally {
+      await f.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("process checker is lazy and shared, refuses until provisioned, keeps equivalent reloads, terminates on dispose", async () => {
   const dir = mkdtempSync(join(tmpdir(), "privacy-checker-"));

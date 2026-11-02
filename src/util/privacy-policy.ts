@@ -1,16 +1,20 @@
-import { statSync } from "node:fs";
+import { lstatSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { privacyRegistry } from "./privacy-boundary.ts";
 import { disposePrivacyChecker } from "./privacy-checker.ts";
 import { redactCredentials } from "./proc.ts";
 
-/** The one routine probe per check: identity, size and modification time, following any link. */
+/** At most two metadata probes capture both the path itself and any link target. */
 export function inspectPolicyFile(path: string) {
-  const s = statSync(path, { throwIfNoEntry: false });
-  return s ? `${s.dev}/${s.ino}/${s.size}/${s.mtimeMs}/${s.ctimeMs}` : "missing";
+  const entry = lstatSync(path, { throwIfNoEntry: false });
+  if (!entry) return "missing";
+  return [entry, statSync(path, { throwIfNoEntry: false })]
+    .map((s) => (s ? `${s.dev}/${s.ino}/${s.size}/${s.mtimeMs}/${s.ctimeMs}` : "missing"))
+    .join(":");
 }
 export const privacyPolicyDiagnostic = "Privacy policy unavailable; privacy checks will refuse.";
+const failedRegistries = new WeakSet<typeof privacyRegistry>();
 /** Bind once at startup; checks share this synchronous freshness/readiness boundary. */
 export function provisionPrivacyPolicy(
   configDir: string,
@@ -24,7 +28,6 @@ export function provisionPrivacyPolicy(
 ) {
   const path = join(configDir, "private-strings.txt");
   let loaded: string | undefined;
-  let failed = false;
   registry.refreshPolicy = () => {
     try {
       // Stamped before reading, so an edit racing the load differs from `loaded` and reloads next check.
@@ -33,11 +36,11 @@ export function provisionPrivacyPolicy(
       loaded = undefined;
       registry.replacePolicy(load(configDir, roots));
       loaded = stamp;
-      failed = false;
+      failedRegistries.delete(registry);
     } catch {
       registry.failPolicy();
-      if (!failed) {
-        failed = true;
+      if (!failedRegistries.has(registry)) {
+        failedRegistries.add(registry);
         log(redactCredentials(privacyPolicyDiagnostic));
       }
     }
