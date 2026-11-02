@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { existsSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -38,7 +38,14 @@ async function check(hidden: string[] = []) {
     assert.notEqual(await Promise.race([Promise.all(exits), late]), "late", `${release.kind} disposal`);
   }
   assert.equal(exits.length, 1, `${release.kind} worker count`);
-  const visible = hidden.filter((path) => existsSync(join(path, "src/util/privacy-worker.ts")));
+  const visible = hidden.filter((path) => {
+    try {
+      readFileSync(join(path, "src/util/privacy-worker.ts"));
+      return true;
+    } catch {
+      return false;
+    }
+  });
   return { kind: release.kind, entry, workers: 1, results: "safe, private-match", disposed: true, visible };
 }
 /** Hides the checkout from the packaged child: Seatbelt on macOS, a private tmpfs mount on Linux. */
