@@ -271,47 +271,28 @@ git. It loads no owner configuration and uses only synthetic data. `bun
 scripts/benchmark-credential-redaction.ts <baseline-proc.ts>` remains the credential-only
 comparison. Keep snapshots and output in scratch; tests never assert timings.
 
-### c2.1c.3 scope reconciliation (implementation pending)
+### c2.1c.3 real-worker checker and measured envelope
 
-The revised acceptance scope does not fit its 250 changed non-test line cap. The checkout
-contains `privacyWorkerHandler`, bounded transport and chunk receipts, but the checker still
-requires an injected worker factory. There is no real worker entry, packaged worker or
-`probe-privacy-worker.ts`; the benchmark has no `worker-all` workload. Its current synchronous
-call instrumentation cannot establish complete asynchronous daemon turns: promise continuations
-without an event-loop yield must count together, and worker wait time must be excluded.
+`createPrivacyChecker` starts `src/util/privacy-worker.ts` by default. `privacyWorkerEntry` selects the entry from the release identity: a source checkout uses `<root>/src/util/privacy-worker.ts`, and the packaged binary (which `scripts/build-binary.ts` compiles with the worker as a second entry) uses `util/privacy-worker.js` in its embedded bundle. A missing entry, or one that exits before `online`, withholds the request as `checker-unavailable`. The other entry, another execution path and synchronous checking are never tried. Transport, generations and lifecycle are unchanged from c2.1c.1–c2.1c.2.
 
-Re-estimate before implementation (changed lines are additions plus deletions, including scripts
-and documentation; these are estimates, not delivered counts):
+The manual probe `bun scripts/probe-privacy-worker.ts` (not part of `bun test`) checks startup, an expected safe result, an expected `private-match` refusal and the awaited worker exit. It runs first from source, then from a candidate binary built from a scratch copy of the checkout. The copy is deleted before the binary runs in a separate scratch directory. The build uses a placeholder identity, and the release build's clean-tree check is unchanged. The packaged process isn't sandboxed: the evidence is that its source copy is gone and its worker loads from `/$bunfs`. On macOS both stages passed and the scratch was removed. Linux: pending.
 
-| Proposed delivery, in dependency order | Non-test lines | Test lines | Required evidence |
-| --- | ---: | ---: | --- |
-| Entry and build wiring | 50–70 | 35–55 | Dedicated handler entry; release-selected source/package resolvers; fixed fail-closed failure; executable worker bundled with dependencies; preserve build identity, resources and autoload protections. Fake-only resolution and build-config mutations. |
-| Portable acceptance probe | 85–115 | 0 | Source and candidate-package startup, independently expected safe/withheld bytes and awaited disposal. Candidate verification preserves the production clean-tree check. Owned scratch and child handles cleaned in finally paths; prove source reads unavailable to the packaged process on each platform. Changing cwd is insufficient. |
-| Worker measurement and evidence | 160–215 | 20–35 | Complete daemon turns, including microtasks, transfer and bounded consumption; separately identified worker CPU and elapsed latency; cold maximum-policy transfer, text/data maxima, expensive refusals, eight slots and slot/byte backpressure. Retain raw warmups, timed samples, workload metadata and heartbeat observations; publish measured platform envelope. |
+`bun scripts/benchmark-privacy-boundary.ts --worker <root> worker-all <label>` needs no git. Each group runs two warmups and five timed trials, every trial with a fresh registry, checker and worker under the maximum policy (64 entries, 1,024 credentials, 1 Mi U originals). Groups:
+- **cold:** one 1-unit text, covering cold startup and policy transfer.
+- **eight slots:** ASCII, astral and recursive data at the input cap; depth/nodes combined; sparse (`private-match`); one decoded form over 32 Mi U (`form-length`); decoded forms over 64 Mi U in total (`forms-total`); base64 at the cap. A ninth, BMP-cap request is then refused `checker-busy` (slot backpressure).
+- **bytes:** two BMP-cap texts, then a third refused by the 64-MiB reservation.
 
-Together this is **295–400 non-test lines**, exceeding the cap before implementation. Split
-at these boundaries rather than compressing lifecycle, isolation or measurement checks to fit.
-The final delivery's estimate includes 30–40 documentation lines. Each proposed delivery stays
-below 250 lines, subject to its own specification and implementation count. Production adoption
-remains deferred; c2.2 must be re-estimated before labelling and depends on all three deliveries.
+Each submission gets its own turn. Results are consumed one 32-KiB chunk per turn and validated after the window closes. A turn is the gap between `setImmediate` heartbeats. Its slice is the main thread's CPU in that gap (`process.threadCpuUsage`), so time spent waiting on the worker doesn't count. The turn's wall time is reported separately. Worker CPU is `process.cpuUsage` minus main-thread CPU, so it includes runtime helper threads. macOS arm64 (10 cores, Bun 1.4.3), inside a factory run with load average 7–12. Results in milliseconds:
 
-No asynchronous performance acceptance is claimed. The synchronous figures above remain the
-only recorded platform measurements; they must not be reused as worker figures.
+| Group | macOS slice: worst incl. warmups / timed median | macOS wall gap: worst / median | macOS worker CPU median | macOS latency medians | Linux (all columns) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Cold | 3.7 / 1.5 | 16.8 / 7.1 | 603 | 296 | pending |
+| Eight slots + slot backpressure | 6.8 / 4.9 | 104.1 / 20.4 | 18,597 | 1,928–16,859; refusal 2 | pending |
+| Byte backpressure | 8.8 / 4.0 | 181.5 / 11.7 | 11,974 | 5,139 and 9,974; refusal 1 | pending |
 
-| New worker evidence | macOS | Linux |
-| --- | --- | --- |
-| Source/package probe with source unavailable | pending | pending |
-| Warmup-inclusive worst daemon turn and timed median | pending | pending |
-| Worker CPU, elapsed latency and heartbeat observations | pending | pending |
-
-Planned Linux handoff commands, **unavailable until the probe and workload are implemented**:
-`bun scripts/probe-privacy-worker.ts` and
-`bun scripts/benchmark-privacy-boundary.ts --worker "$PWD" worker-all candidate`.
-Run from the candidate checkout root with Bun and installed dependencies; the benchmark mode
-must need no git. The probe specification must state its platform isolation-tool prerequisites.
-Run and record macOS first; leave Linux cells pending for the orchestrator. Any daemon slice
-over 50 ms, including a warmup or refusal, fails acceptance and needs a separately estimated fix.
-Finite samples establish a measured envelope, not a universal latency guarantee.
+- No daemon execution slice exceeded 8.8 ms, warmups included. Two earlier runs with the same measurement peaked at 10.0 ms and, with GC logging, 9.1 ms. Peak RSS was 4.0 GiB.
+- Wall time is a different matter. Across five runs, the main thread stalled for 65–222 ms while large requests were transferring or being checked, 1.1–2.7 s into eight-slot and byte trials (most often about 1.3 s after the BMP submissions). It ran at most 0.4 ms of CPU in any such turn. JSC GC logging put every main-heap pause at 5.8 ms or less, so the stall is neither daemon code nor main-thread GC. Its cause is unconfirmed: OS descheduling under load and blocking by the worker's large allocations are both candidates.
+- Wall-clock acceptance is therefore not claimed. The stall needs its own estimated investigation before c2.2 relies on wall-clock latency. These finite samples establish a measured envelope, not a universal latency guarantee.
 
 ## c2 adversarial regression matrix
 
@@ -388,7 +369,7 @@ envelope through the worker checker.
 | --- | --- | --- | --- |
 | c2.1c.1 / c2.1b.3 (#1102) | Worker checker protocol, generations, lifecycle and reservations. | 170–220 / 100–150 | Fake-port generation, protocol, capacity and lifecycle mutations. |
 | c2.1c.2 / c2.1c.1 (#1103) | Bounded transport, result authority and service integration. | 140–200 / 80–120 | Backpressure and semantic parity through fake ports. |
-| c2.1c.3 / c2.1c.2 (#1104) | Compiled worker entry, real-worker probes, benchmark rerun and design update; split into the three proposed deliveries above. | 295–400 / 55–90 total | Pending: macOS and Linux probes, packaged execution; no daemon slice over 50 ms, warmups included. |
+| c2.1c.3 / c2.1c.2 (#1104) | Compiled worker entry, real-worker probes, benchmark rerun and design update. | 120–180 / 30–60 | macOS and Linux probes, packaged execution; no daemon slice over 50 ms, warmups included. |
 | c2.2 / c2.1c.3 (#928) | Complete bounded gate capture, excerpts/tail and gate metadata; 2–3 deliveries. | 400–600 / 300–500 | proc/gates/feedback tests; split/overlap/cap cases and whole gate benchmark reporting worst daemon stall beside medians; meet the 50-ms synchronous-slice budget including concurrent gates and transfers. Other producers remain explicitly unaudited. |
 | c2.3 / c2.2 (#929) | Harness logs/results/events, prompts and post-merge/worker persistence; 2–3 deliveries. | 400–600 / 300–500 | harness/pipeline/workers restart tests; no unchecked log append, flags survive persistence. |
 | c2.4 / c2.3 (#930) | MCP transport/results, REST/SSE, privateOutputData, feed/digest/change/report adapters and optional metadata storage; 2–3 deliveries. | 450–650 / 350–550 | MCP/feed/digest/report/HTTP tests plus old-writer/new-reader and rollback migration fixtures. |

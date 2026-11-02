@@ -1,9 +1,17 @@
 import { expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import type { Worker } from "node:worker_threads";
 import * as b from "../src/util/privacy-boundary.ts";
 import {
   createPrivacyChecker,
   type PrivacyWorkerPort,
+  PrivacyWorkerUnavailable,
+  privacyWorkerEntries,
+  privacyWorkerEntry,
   privacyWorkerHandler,
+  startPrivacyWorker,
 } from "../src/util/privacy-checker.ts";
 import * as c from "../src/util/privacy-chunks.ts";
 import * as t from "../src/util/privacy-transport.ts";
@@ -1426,3 +1434,74 @@ test("omitted optional result metadata and local refusals below marker caps rema
   expect(small.ports).toHaveLength(0);
   await small.dispose();
 });
+
+const releases = {
+  source: { kind: "source", root: "/checkout", version: "1.0.0", bun: "1" },
+  packaged: { kind: "packaged", sha: "a".repeat(40), version: "1.0.0", bun: "1" },
+} as const;
+const missing = join(import.meta.dir, "missing-privacy-worker.js");
+function resolvers(source: string, packaged: string, calls: string[]) {
+  return {
+    source: (root: string) => {
+      calls.push(`source:${root}`);
+      return source;
+    },
+    packaged: () => {
+      calls.push("packaged");
+      return packaged;
+    },
+  };
+}
+
+test("worker entry resolution uses only the release's own entry", () => {
+  const calls: string[] = [];
+  const [own, other] = [import.meta.path, join(import.meta.dir, "privacy-support.ts")];
+  expect(privacyWorkerEntry(releases.source, resolvers(own, other, calls))).toBe(own);
+  expect(privacyWorkerEntry(releases.packaged, resolvers(own, other, calls))).toBe(other);
+  expect(() => privacyWorkerEntry(releases.packaged, resolvers(own, missing, calls))).toThrow(
+    new PrivacyWorkerUnavailable("Missing packaged privacy worker entry"),
+  );
+  expect(() => privacyWorkerEntry(releases.source, resolvers(missing, own, calls))).toThrow(
+    new PrivacyWorkerUnavailable("Missing source privacy worker entry"),
+  );
+  expect(calls).toEqual(["source:/checkout", "packaged", "packaged", "source:/checkout"]);
+  expect(privacyWorkerEntries.packaged().endsWith("/util/privacy-worker.js")).toBe(true);
+  expect(existsSync(privacyWorkerEntries.source(join(import.meta.dir, "..")))).toBe(true);
+});
+
+test.each(["missing", "exits at startup"])(
+  "a %s worker entry withholds without another path",
+  async (mode) => {
+    const calls: string[] = [];
+    const constructed: string[] = [];
+    const sync = [spyOn(b, "protectText"), spyOn(b, "protectData")];
+    const checker = createPrivacyChecker({
+      registry: b.createPrivacyRegistry(),
+      workerFactory: () =>
+        startPrivacyWorker(
+          privacyWorkerEntry(
+            releases.packaged,
+            resolvers(missing, mode === "missing" ? missing : import.meta.path, calls),
+          ),
+          (path) => {
+            constructed.push(path);
+            const worker = new EventEmitter();
+            queueMicrotask(() => worker.emit("exit", 1));
+            return worker as unknown as Worker;
+          },
+        ),
+    });
+    await withheld(checker.protectText(input()), "checker-unavailable");
+    await withheld(
+      checker.protectData({ json: "{}", provenance: { kind: "complete" } }),
+      "checker-unavailable",
+    );
+    expect(calls).toEqual(["packaged", "packaged"]);
+    expect(constructed).toEqual(mode === "missing" ? [] : [import.meta.path, import.meta.path]);
+    for (const spy of sync) {
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    }
+    await checker.dispose();
+  },
+);

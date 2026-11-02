@@ -1,5 +1,8 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { Worker } from "node:worker_threads";
+import { Worker } from "node:worker_threads";
+import { type Release, release } from "../release.ts";
 import * as b from "./privacy-boundary.ts";
 import * as c from "./privacy-chunks.ts";
 import * as t from "./privacy-transport.ts";
@@ -143,8 +146,38 @@ export function privacyWorkerHandler(port: Side, { schedule = setImmediate as t.
     if (!output?.ack(f, schedule)) t.fault();
   };
 }
+export class PrivacyWorkerUnavailable extends Error {}
+// The release build compiles this entry beside src/cli/main.ts, so it lands at util/ in the bundle root.
+export const privacyWorkerEntries = {
+  source: (root: string) => join(root, "src/util/privacy-worker.ts"),
+  packaged: () => join(import.meta.dir, "util/privacy-worker.js"),
+};
+/** Only the release's own entry is tried; a missing one fails closed instead of selecting another. */
+export function privacyWorkerEntry(info: Release = release, entries = privacyWorkerEntries) {
+  const entry = info.kind === "packaged" ? entries.packaged() : entries.source(info.root);
+  if (!existsSync(entry)) throw new PrivacyWorkerUnavailable(`Missing ${info.kind} privacy worker entry`);
+  return entry;
+}
+/** Resolves once the entry is running; an entry that exits before then is unusable. */
+export function startPrivacyWorker(entry: string, construct = (path: string) => new Worker(path)) {
+  const worker = construct(entry);
+  const port: PrivacyWorkerPort = {
+    postMessage: (value, transfer) => worker.postMessage(value, transfer),
+    ref: () => worker.ref(),
+    unref: () => worker.unref(),
+    terminate: () => worker.terminate(),
+  };
+  worker.on("message", (data) => port.onmessage?.({ data }));
+  worker.on("error", () => port.onerror?.());
+  worker.on("exit", () => port.onexit?.());
+  return new Promise<PrivacyWorkerPort>((resolve, reject) => {
+    worker.once("online", () => resolve(port));
+    worker.once("exit", () => reject(new PrivacyWorkerUnavailable("Privacy worker entry exited at startup")));
+  });
+}
 export function createPrivacyChecker(options: Options = {}) {
   const registry = options.registry ?? b.privacyRegistry;
+  const workerFactory = options.workerFactory ?? (() => startPrivacyWorker(privacyWorkerEntry()));
   const limits = { ...b.privacyLimits, ...options.limits };
   const now = options.now ?? Date.now;
   const setTimer = options.setTimeout ?? setTimeout;
@@ -253,8 +286,7 @@ export function createPrivacyChecker(options: Options = {}) {
       try {
         if (!current(authority)) return finish("stale-generation");
         if (!worker) {
-          worker = await options.workerFactory?.();
-          if (!worker) throw new Error("Privacy worker unavailable");
+          worker = await workerFactory();
           worker.unref();
         }
         if (!pending.has(finish) || disposed) return void (await retire());
@@ -318,8 +350,8 @@ export function createPrivacyChecker(options: Options = {}) {
         port.ref();
         schedule(input.turn);
         await result.promise;
-      } catch {
-        finish("checker-failed", true);
+      } catch (error) {
+        finish(error instanceof PrivacyWorkerUnavailable ? "checker-unavailable" : "checker-failed", true);
       }
     });
     bytes += size;
