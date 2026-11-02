@@ -12,6 +12,13 @@ const a = "a".repeat(40),
 const name = (oid: string) => `refs/limitless-run-objects/run-1/${oid}`;
 const deferred = () => Promise.withResolvers<void>();
 
+function expectOfflineCalls(calls: { cmd: string[] }[]) {
+  for (const { cmd } of calls) {
+    expect(["rev-parse", "cat-file", "rev-list", "update-ref", "bundle"]).toContain(cmd[1] ?? "");
+    expect(cmd.some((arg) => /^(?:origin|upstream)$|^refs\/remotes\/|:\/\//.test(arg))).toBe(false);
+  }
+}
+
 function fixture() {
   const root = join(tmpdir(), "fake-run-object-export");
   const input: RunObjectExportInput = {
@@ -249,6 +256,7 @@ test.each(["shallow", "missing-commit", "missing-blob", "non-commit", "format", 
     }
     if (fault === "empty-output") f.state.empty = true;
     await expect(f.run(f.input, new AbortController().signal)).rejects.toMatchObject({ code });
+    expectOfflineCalls(f.calls);
     expect(f.refs.size).toBe(2);
     expect(f.scratch.size).toBe(0);
   },
@@ -269,6 +277,7 @@ test.each(["format", `type:${a}`, "closure", "scratch", `create:${a}`, `create:$
       expect(error).toBeInstanceOf(RunTransferError);
       expect(String(error)).not.toContain("private Git diagnostic");
       if (cancel) expect(error).toMatchObject({ code: "aborted" });
+      expectOfflineCalls(f.calls);
       expect([...f.refs]).toEqual([
         ["refs/heads/main", a],
         ["refs/limitless-run-objects/neighbor/keep", b],
@@ -314,6 +323,7 @@ test.each(["changed", "deletion-failure", "scratch-failure"])(
         throw new Error("cleanup failure");
     };
     await expect(f.run(f.input, new AbortController().signal)).rejects.toMatchObject({ code: "unavailable" });
+    expectOfflineCalls(f.calls);
     expect(f.events.slice(-3)).toEqual([`delete:${a}`, `delete:${b}`, "remove"]);
     expect(f.refs.has(name(b))).toBe(false);
     expect(f.refs.get(name(a))).toBe(
