@@ -313,6 +313,7 @@ export const EvalRequestSchema = z
     k: z.number().int().positive().default(1),
     maxUsd: z.number().finite().nonnegative().default(1),
     caseIds: unique.optional(),
+    includeHeldout: z.boolean().optional(),
     cache: z.boolean().default(true),
     concurrency: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).default(DEFAULT_EVAL_CONCURRENCY),
     rounds: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
@@ -444,7 +445,15 @@ export function validateRequest(
   }
   for (const id of request.caseIds ?? [])
     if (!file.cases.some((c) => c.id === id)) throw new Error(`Unknown case ID: ${id}`);
-  const cases = file.cases.filter((c) => !request.caseIds || request.caseIds.includes(c.id));
+  const excludeHeldout = file.role === "review" && !request.caseIds && !request.includeHeldout;
+  const excludedHeldout = excludeHeldout
+    ? file.cases.filter((c) => "split" in c && c.split === "escapes-heldout").length
+    : 0;
+  const cases = file.cases.filter((c) =>
+    request.caseIds
+      ? request.caseIds.includes(c.id)
+      : !excludeHeldout || !("split" in c && c.split === "escapes-heldout"),
+  );
   const models = resolvedSystems?.map((system) => system.finders[0]?.target ?? "") ?? resolved;
-  return { request: { ...request, models: [...new Set(models)], systems }, cases };
+  return { request: { ...request, models: [...new Set(models)], systems }, cases, excludedHeldout };
 }

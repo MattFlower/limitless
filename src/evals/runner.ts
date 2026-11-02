@@ -156,14 +156,19 @@ export class EvalRunner {
     deps.store.recoverEvals();
   }
 
-  submit(input: unknown, resume?: ResumeFrom): EvalRun {
+  submit(input: unknown, resume?: ResumeFrom): EvalRun & { excludedHeldout: number } {
     if (this.stopping) throw new Error("daemon is stopping");
     // Reject unsupported roles before accessing any dataset or repository.
     const parsed = EvalRequestSchema.parse(input);
     const file = loadRoleCases(parsed.role, this.casePath);
     for (const item of file.cases)
       if ("defects" in item) seedContent(item, this.casePath ?? defaultCasePath(parsed.role));
-    const { request, cases } = validateRequest(input, file, this.deps.router, this.deps.cfg.reviewRosters);
+    const { request, cases, excludedHeldout } = validateRequest(
+      input,
+      file,
+      this.deps.router,
+      this.deps.cfg.reviewRosters,
+    );
     if (request.replayFinders)
       validateReplay(
         this.deps.store,
@@ -262,7 +267,7 @@ export class EvalRunner {
       .then(() => this.execute(run, file, cases, request.cache, controller.signal, predecessors))
       .finally(() => this.active.delete(run.id));
     this.active.set(run.id, { controller, done });
-    return run;
+    return { ...run, excludedHeldout };
   }
 
   /**
