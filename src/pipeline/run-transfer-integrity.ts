@@ -23,11 +23,9 @@ export function receiptManifest(text: string, digest: string, runId: string): Po
     return transferConflict();
   return m;
 }
-export const receiptDescriptors = (m: PortableManifest) => [
-  m.blobs.state,
-  ...m.blobs.artifacts,
-  ...m.blobs.objects,
-];
+export function receiptDescriptors({ blobs }: PortableManifest) {
+  return [blobs.state, ...blobs.artifacts, ...blobs.objects];
+}
 export function verifyReceiptPayload(m: PortableManifest, blobs: ReadonlyMap<string, Uint8Array>) {
   const refs = receiptDescriptors(m);
   if (new Set(refs.map((r) => r.key)).size !== blobs.size) return transferConflict();
@@ -41,6 +39,13 @@ export function verifyReceiptPayload(m: PortableManifest, blobs: ReadonlyMap<str
 }
 export function verifyProjectionIntegrity(db: Database, p: RunPayloadV1): void {
   const id = p.run.id;
+  for (const [table, key, columns] of [
+    ["runs", "id", ["merged", "github_webhook_verified", "pr_closed_unmerged", "no_baseline_cache"]],
+    ["invocations", "run_id", ["fast"]],
+  ] as const) {
+    const invalid = columns.map((c) => `typeof(${c}) != 'integer' OR ${c} NOT IN (0, 1)`).join(" OR ");
+    if (db.query(`SELECT 1 FROM ${table} WHERE ${key} = ? AND (${invalid})`).get(id)) transferConflict();
+  }
   // The private reader drops absent optional fields; check their stored defaults first.
   const stored = db
     .query<Record<string, unknown>, [string]>(

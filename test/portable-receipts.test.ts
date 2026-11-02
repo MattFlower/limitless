@@ -55,26 +55,74 @@ test.each(["receipt", "blob"])("a late %s failure rolls back the entire projecti
   expect(snapshot()).toEqual(before);
 });
 
-test("lost commit result repeats with unchanged identities, accounting and retained material", () => {
-  const input = receiptFixture();
-  commitOfflineTransfer(store.db, input);
-  const before = snapshot(),
-    ids = readProjectionIds(store.db, input.payload.run.id);
-  reopen();
-  expect(commitOfflineTransfer(store.db, input)).toEqual(ids);
-  expect(snapshot()).toEqual(before);
-  expect(store.getRun(input.payload.run.id)).toMatchObject({
-    costUsd: 1.25,
-    costEquivUsd: 8.5,
-    tokensIn: 1234,
-    tokensOut: 98,
+test.each([false, true])(
+  "lost commit result repeats with valid booleans %s and unchanged material",
+  (value) => {
+    const payload = portableProjectionFixture();
+    payload.run.merged = payload.run.githubWebhookVerified = payload.run.prClosedUnmerged = value;
+    if (value) payload.run.noBaselineCache = true;
+    else delete payload.run.noBaselineCache;
+    const input = receiptFixture(payload);
+    commitOfflineTransfer(store.db, input);
+    const before = snapshot(),
+      ids = readProjectionIds(store.db, input.payload.run.id);
+    reopen();
+    verifyOfflineReceipt(store.db, input.payload.run.id);
+    expect(commitOfflineTransfer(store.db, input)).toEqual(ids);
+    expect(retainedOfflineExport(store.db, input.payload.run.id)).toEqual(input);
+    expect(snapshot()).toEqual(before);
+    expect(store.getRun(input.payload.run.id)).toMatchObject({
+      costUsd: 1.25,
+      costEquivUsd: 8.5,
+      tokensIn: 1234,
+      tokensOut: 98,
+    });
+    const different = structuredClone(input);
+    const manifest = JSON.parse(input.manifest) as PortableManifest;
+    manifest.sequence++;
+    different.manifest = formatManifest(manifest);
+    rejects(() => commitOfflineTransfer(store.db, different), "conflict");
+    expect(snapshot()).toEqual(before);
+  },
+);
+
+test.each([
+  ["runs", "merged", 2, "integer"],
+  ["runs", "github_webhook_verified", 2, "integer"],
+  ["runs", "pr_closed_unmerged", 2, "integer"],
+  ["runs", "no_baseline_cache", 2, "integer"],
+  ["invocations", "fast", 2, "integer"],
+  ["runs", "merged", 0.5, "real"],
+  ["runs", "pr_closed_unmerged", "false", "text"],
+  ["invocations", "fast", new Uint8Array([48]), "blob"],
+] as const)("%s.%s storage %s (%s) conflicts without repair after reopen", (table, column, value, type) => {
+  const payload = portableProjectionFixture();
+  Object.assign(payload.run, {
+    merged: false,
+    githubWebhookVerified: false,
+    prClosedUnmerged: false,
+    noBaselineCache: false,
   });
-  const different = structuredClone(input);
-  const manifest = JSON.parse(input.manifest) as PortableManifest;
-  manifest.sequence++;
-  different.manifest = formatManifest(manifest);
-  rejects(() => commitOfflineTransfer(store.db, different), "conflict");
-  expect(snapshot()).toEqual(before);
+  for (const invocation of payload.invocations) invocation.fast = false;
+  const input = receiptFixture(payload);
+  commitOfflineTransfer(store.db, input);
+  const key = table === "runs" ? "id" : "run_id";
+  // Corrupt only the last invocation so verification must inspect every projected row.
+  const where = `${key} = 'child01'${table === "invocations" ? " AND id = (SELECT max(id) FROM invocations)" : ""}`;
+  store.db.query(`UPDATE ${table} SET ${column} = ? WHERE ${where}`).run(value);
+  reopen();
+  expect(
+    store.db.query(`SELECT ${column} AS value, typeof(${column}) AS type FROM ${table} WHERE ${where}`).get(),
+  ).toEqual({ value, type });
+  const damaged = snapshot();
+  for (const operation of [
+    () => commitOfflineTransfer(store.db, input),
+    () => verifyOfflineReceipt(store.db, "child01"),
+    () => retainedOfflineExport(store.db, "child01"),
+  ]) {
+    rejects(operation, "conflict");
+    expect(snapshot()).toEqual(damaged);
+  }
 });
 test("a local run without a transfer receipt conflicts without writes", () => {
   const input = receiptFixture();
