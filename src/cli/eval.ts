@@ -186,17 +186,20 @@ export async function evalCommand(
     k: numeric("k"),
     maxUsd: numeric("max-usd"),
     caseIds: typeof flags.cases === "string" ? flags.cases.split(",") : undefined,
+    ...(flags["include-heldout"] === undefined ? {} : { includeHeldout: flags["include-heldout"] }),
     cache: !flags["no-cache"],
     concurrency: numeric("concurrency"),
     rounds: numeric("rounds"),
     strategy: flags.strategy,
   };
   EvalRequestSchema.parse(request);
-  const { id } = await io.api<{ id: string }>("/api/evals", {
+  const { id, excludedHeldout } = await io.api<{ id: string; excludedHeldout?: number }>("/api/evals", {
     method: "POST",
     body: JSON.stringify(request),
   });
   io.print(id);
+  if (value === "review" && excludedHeldout !== undefined)
+    io.print(`Excluded ${excludedHeldout} escapes-heldout cases.`);
   if (!flags.follow) return;
   for (;;) {
     const report = await io.api<EvalReport>(`/api/evals/${encodeURIComponent(id)}`);

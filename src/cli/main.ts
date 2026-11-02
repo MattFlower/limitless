@@ -34,7 +34,7 @@ Usage:
   limitless retry <run> [--model role=chain]  Retry, inheriting or replacing model chains
   limitless eval run <role> --models codex/luna@low,claude/opus@high [--k N] [--cases id,id] [--max-usd X] [--concurrency N] [--no-cache] [--follow]
         implement only: [--rounds N] [--strategy retry|effort|switch]
-        review only: --systems <file.json> [--replay-finders <evalId>] instead of --models
+        review only: --include-heldout (include escapes-heldout); --systems <file.json> [--replay-finders <evalId>] instead of --models
   limitless eval report <eval-id> [--json]
   limitless eval judge <eval-id> --judges model[@effort],model[@effort] [--max-usd N]
   limitless eval resume <eval-id>         Continue an interrupted or failed eval; unchanged finished trials carry over
@@ -328,6 +328,7 @@ async function main(): Promise<void> {
       rounds: { type: "string" },
       strategy: { type: "string" },
       cases: { type: "string" },
+      "include-heldout": { type: "boolean" },
       "max-usd": { type: "string" },
       concurrency: { type: "string" },
       "no-cache": { type: "boolean" },

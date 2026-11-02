@@ -531,7 +531,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       }),
     },
     "/api/evals": {
-      POST: handle(async (req) => json({ id: factory.evals.submit(await body<unknown>(req)).id }, 202)),
+      POST: handle(async (req) => {
+        const { id, excludedHeldout } = factory.evals.submit(await body<unknown>(req));
+        return json({ id, excludedHeldout }, 202);
+      }),
       GET: handle(() => json(store.listEvalRuns())),
     },
     "/api/evals/policy": handle((req) => {
