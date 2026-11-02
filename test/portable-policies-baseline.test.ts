@@ -5,8 +5,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { exportPolicySelection, recordProvisionalPolicy } from "../src/db/portable-policies.ts";
+import { commitOfflineTransfer, verifyOfflineReceipt } from "../src/db/portable-receipts.ts";
 import { Store } from "../src/db/store.ts";
 import { RunTransferError } from "../src/pipeline/run-transfer-errors.ts";
+import { portableProjectionFixture } from "./portable-projection-support.ts";
+import { receiptFixture } from "./portable-receipts-support.ts";
 import { policyFixture } from "./run-transfer-policy-support.ts";
 
 const baseline = "a723999c8c6298bf71b555d0abb84fea2329a8de";
@@ -14,6 +17,7 @@ const available = spawnSync("git", ["cat-file", "-e", `${baseline}^{commit}`]).s
 test.skipIf(!available)(
   `rollback runs the real pre-C09 source (${available ? "baseline available" : "baseline absent in shallow checkout"})`,
   () => {
+    execFileSync("git", ["cat-file", "-e", `${baseline}^{commit}`]);
     const home = mkdtempSync(join(tmpdir(), "policy-baseline-"));
     const root = join(home, "source");
     const driver = resolve(import.meta.dir, "portable-policies-baseline-driver.ts");
@@ -45,6 +49,16 @@ test.skipIf(!available)(
       const f = policyFixture();
       let policyRun: string;
       let rows: unknown[];
+      const importedTables = [
+        "run_projection_ids",
+        "run_projections",
+        "run_policy_selections",
+        "run_transfer_receipts",
+        "run_transfer_blobs",
+      ];
+      const imported = () =>
+        importedTables.map((table) => store.db.query(`SELECT * FROM ${table} ORDER BY rowid`).all());
+      let sidecars: ReturnType<typeof imported>;
       try {
         expect(store.db.query("SELECT run_id FROM run_policy_versions").all()).toEqual([]);
         expect(store.db.query("SELECT run_id FROM run_policy_selections").all()).toEqual([]);
@@ -60,6 +74,8 @@ test.skipIf(!available)(
           expected: null,
           expectedState: null,
         });
+        commitOfflineTransfer(store.db, receiptFixture(portableProjectionFixture(policyFixture("single"))));
+        sidecars = imported();
         rows = store.db.query("SELECT run_id, record_json, digest FROM run_policy_versions").all();
       } finally {
         store.close();
@@ -82,6 +98,14 @@ test.skipIf(!available)(
         expect(store.db.query("SELECT run_id, record_json, digest FROM run_policy_versions").all()).toEqual(
           rows,
         );
+        expect(imported()).toEqual(sidecars);
+        verifyOfflineReceipt(store.db, "child01");
+        expect(
+          store.db.query("SELECT * FROM run_policy_selections WHERE run_id = ?").get(before.runId),
+        ).toBeNull();
+        expect(
+          store.db.query("SELECT * FROM run_transfer_receipts WHERE run_id = ?").get(before.runId),
+        ).toBeNull();
         expect(exportPolicySelection(store, policyRun).digest).toBe(f.provisional.recordId);
         try {
           exportPolicySelection(store, before.runId);

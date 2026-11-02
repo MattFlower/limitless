@@ -41,6 +41,7 @@ import { RuntimePolicy } from "./router/runtime-policy.ts";
 import { Scheduler } from "./scheduler.ts";
 import { redactCredentialData, redactCredentials } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
+import { activity } from "./util/stall.ts";
 
 export interface FactoryOptions {
   agentExecutor?: EngineDeps["agentExecutor"];
@@ -335,7 +336,7 @@ export class Factory {
         .filter((p) => p.sshForward && this.tracker.isEnabled(p.id))
         .map((p) => p.sshForward as NonNullable<ProviderDef["sshForward"]>),
     );
-    this.workers.cancelOpenAgentJobs(this.keptAgentJobs());
+    this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
     this.scheduler.start();
   }
 
@@ -346,7 +347,7 @@ export class Factory {
     await this.gcInFlight;
     this.tunnels.stop();
     await Promise.all([this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
-    this.workers.cancelOpenAgentJobs(this.keptAgentJobs());
+    this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
   }
 
   private keptAgentJobs(): ReadonlySet<string> {

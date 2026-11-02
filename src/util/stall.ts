@@ -76,5 +76,5 @@ export class StallReporter {
 }
 
 export const stallReporter = new StallReporter();
-export const activity = <T>(name: string, fn: () => T): T => stallReporter.activity(name, fn);
+export const activity = <T>(name: string, fn: () => T, min?: number) => stallReporter.activity(name, fn, min);
 export const beginActivity = (name: string) => stallReporter.beginActivity(name);
