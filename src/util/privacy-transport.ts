@@ -1,3 +1,4 @@
+import { fail } from "node:assert";
 /** Internal stop-and-wait framing between the privacy checker and its worker; never persisted. */
 export const version = 2;
 export const maxChunk = 32 * 1024;
@@ -21,7 +22,6 @@ export function* encode(text: string) {
     else yield* [0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63)];
   }
 }
-/** Length-prefixed segments; `size` is the exact wire charge and the request's final byte total. */
 export function segments(texts: string[]) {
   const bytes = function* () {
     for (const text of texts) {
@@ -32,7 +32,6 @@ export function segments(texts: string[]) {
   };
   return { size: texts.reduce((total, text) => total + 4 + Buffer.byteLength(text), 0), bytes: bytes() };
 }
-/** Stop-and-wait sender: one payload chunk per scheduled turn, the next only after that chunk's ACK. */
 export function sender(direction: Direction, bytes: Iterator<number>, max: number, post: Post, end: object) {
   let sent = 0;
   let size = 0;
@@ -56,7 +55,6 @@ export function sender(direction: Direction, bytes: Iterator<number>, max: numbe
   };
   return { turn, ack };
 }
-/** Exact-sequence reassembly under a byte cap; the final frame must match both received totals. */
 export function receiver(direction: Direction, max: number, cap: number) {
   const parts: ArrayBuffer[] = [];
   let size = 0;
@@ -71,12 +69,9 @@ export function receiver(direction: Direction, max: number, cap: number) {
   const complete = (f: Received) => at(f, "complete") && f.chunks === parts.length && f.bytes === size;
   return { chunk, complete, parts };
 }
-export const fault = (): never => {
-  throw new Error("Malformed privacy payload");
-};
-/** Fatal decoding of a complete reassembled request; any malformed or truncated byte throws. */
+export const fault = (): never => fail("Malformed privacy payload");
 export function decodeSegments(parts: ArrayBuffer[]) {
-  const bytes = Buffer.concat(parts.map((part) => new Uint8Array(part)));
+  const bytes = join(parts);
   const texts: string[] = [];
   for (let i = 0, end = 0; i < bytes.length; i = end) {
     end = i + 4 + bytes.readUInt32BE(i);
@@ -84,6 +79,7 @@ export function decodeSegments(parts: ArrayBuffer[]) {
   }
   return texts;
 }
+export const join = (parts: ArrayBuffer[]) => Buffer.concat(parts.map((part) => new Uint8Array(part)));
 /** Lenient decoding is safe because only the exact canonical re-encoding is accepted. */
 function decode(bytes: Uint8Array) {
   let text = "";

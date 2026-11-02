@@ -284,6 +284,15 @@ test.each([
   "bytes",
   "chunks",
   "trailing",
+  "chunk-bound",
+  "chunk-zero",
+  "segments",
+  "wire-generation",
+  "metadata",
+  "control-text",
+  "limits",
+  "kind",
+  "cut-unit",
 ])("worker refuses %s request transfers without running the operation", async (fault) => {
   const f = fixture();
   f.registry.replacePolicy([{ value: "entry-synthetic", entry: 0 }]);
@@ -307,6 +316,26 @@ test.each([
     bytes: [first, second, { ...final, bytes: Number(final.bytes) + 1 }],
     chunks: [first, second, { ...final, chunks: 3 }],
     trailing: [first, { ...second, payload: new Uint8Array([0, 0]).buffer }, { ...final, bytes: 32770 }],
+    "chunk-bound": [first, second, { ...final, chunk: 65536 }],
+    "chunk-zero": [first, second, { ...final, chunk: 0 }],
+    // Only the input segment: the required marker segment is missing.
+    segments: [
+      { ...first, payload: new Uint8Array([0, 0, 0, 1, 0x61]).buffer },
+      { ...final, sequence: 1, chunks: 1, bytes: 5, entries: 0 },
+    ],
+    "wire-generation": [first, second, final].map((frame) => ({
+      ...frame,
+      generation: { policy: "1", credentials: 0, checker: 0 },
+    })),
+    metadata: [
+      first,
+      second,
+      Object.fromEntries(Object.entries(final).filter(([key]) => key !== "operation")),
+    ],
+    "control-text": [first, second, { ...final, note: "x".repeat(1000) }],
+    limits: [first, second, { ...final, limits: { ...b.privacyLimits, inputBytes: "33554432" } }],
+    kind: [first, second, { ...final, kind: "x".repeat(1000) }],
+    "cut-unit": [first, second, { ...final, cut: { limit: 2, unit: ["U"], side: "prefix" } }],
   }[fault] as Frame[];
   const posted: Frame[] = [];
   const side = {
