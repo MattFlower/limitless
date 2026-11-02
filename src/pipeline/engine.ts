@@ -130,7 +130,7 @@ import {
   type RunState,
   redactPostMergeComparisons,
 } from "./context.ts";
-import { runCoveringTests, succeededCoveringStages } from "./covering-tests.ts";
+import { changedCoveringTestFiles, runCoveringTests, succeededCoveringStages } from "./covering-tests.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import {
@@ -2403,6 +2403,7 @@ async function oneRound(
   let interruption: ClaimControlError | undefined;
   try {
     const verifiedSha = await headSha(cwd);
+    const coveringChangedFiles = await changedCoveringTestFiles(cwd, baseSha, verifiedSha, ctx.signal);
     const checkVerifiedHead = async () => {
       if ((await headSha(cwd)) !== verifiedSha)
         throw new NeedsHumanError(
@@ -2430,6 +2431,7 @@ async function oneRound(
           {
             runs: ctx.state.coveringTestRuns ?? [],
             succeededStageIds: succeededCoveringStages(ctx),
+            changedFiles: coveringChangedFiles,
           },
         ),
         ctx.state.spec as Spec,

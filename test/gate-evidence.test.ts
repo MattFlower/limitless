@@ -22,6 +22,7 @@ import { BunTestCoverage, MAX_SKIPPED_TESTS } from "../src/gates/test-coverage.t
 import { confinementScope } from "../src/harness/sandbox.ts";
 import {
   type CoveringTestRun,
+  changedCoveringTestFiles,
   coveringTestCommand,
   coveringTestRefusal,
   selectCoveringTests,
@@ -1297,7 +1298,56 @@ function coveringRun(): CoveringTestRun {
   };
 }
 const bindCovering = (value: Verify, runs: CoveringTestRun[], succeededStageIds = [13]) =>
-  applyGateEvidence(value, behaviouralSpec, holdout, sha, gates(), undefined, { runs, succeededStageIds });
+  applyGateEvidence(value, behaviouralSpec, holdout, sha, gates(), undefined, {
+    runs,
+    succeededStageIds,
+    changedFiles: ["x.test.ts"],
+  });
+
+test.each([
+  "untouched",
+  "spec-named",
+  "claimed-met",
+  "mixed-blocked",
+  "mixed-met",
+  "retained",
+  "citation-only",
+  "unavailable",
+])("covering tests cannot establish unverified relevance: %s", (mode) => {
+  const runs = [coveringRun()];
+  if (mode.startsWith("mixed")) {
+    const other = coveringRun();
+    if (!other.result) throw new Error("missing result");
+    other.file = "other.test.ts";
+    other.stageId = 14;
+    other.result.coveringTest = { file: other.file, name: other.name };
+    runs.push(other);
+  }
+  const input =
+    mode === "retained" || mode === "citation-only"
+      ? bindCovering(requested, runs)
+      : structuredClone(requested);
+  const row = input.criteria[0];
+  if (!row) throw new Error("missing row");
+  if (mode === "claimed-met" || mode === "mixed-met") row.status = "met";
+  row.covering_tests = mode === "citation-only" ? [] : runs.map(({ file, name }) => ({ file, name }));
+  const publicSpec = structuredClone(behaviouralSpec);
+  const criterion = publicSpec.acceptance_criteria[0];
+  if (mode === "spec-named" && criterion) criterion.how_to_verify = "bun test x.test.ts";
+  const result = applyGateEvidence(input, publicSpec, holdout, sha, gates(), undefined, {
+    runs,
+    succeededStageIds: [13, 14],
+    changedFiles: mode === "unavailable" ? undefined : mode.startsWith("mixed") ? ["x.test.ts"] : [],
+  }).criteria[0];
+  expect(result).toMatchObject({ status: "blocked", blockedReason: "sandbox" });
+  expect(result?.evidence).toContain(
+    "Covering tests passed, but their relevance to the criterion is unverified",
+  );
+  for (const run of runs)
+    expect(result?.evidence).toContain(
+      `Factory covering test ${run.file} › ${run.name} passed at ${sha} (stage ${run.stageId}); command: ${run.result?.command}`,
+    );
+});
 
 const outcomeOnly: Verify = {
   ...requested,
@@ -1883,6 +1933,58 @@ describe('outer', () => describe('inner', () => test('passes', () => expect(true
   await sh(["git", "add", "."], { cwd });
   await sh(["git", "commit", "-qm", "covering fixture"], { cwd });
   return (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+});
+
+test("covering relevance uses added and modified files at the pinned committed merge base diff", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "covering-relevance-"));
+  try {
+    await coveringSeed(cwd);
+    writeFileSync(join(cwd, "modified.test.ts"), "original\n");
+    await sh(["git", "add", "."], { cwd });
+    await sh(["git", "commit", "-qm", "base"], { cwd });
+    const base = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    writeFileSync(join(cwd, "modified.test.ts"), "changed\n");
+    writeFileSync(join(cwd, "added.test.ts"), "added\n");
+    await sh(["git", "add", "."], { cwd });
+    await sh(["git", "commit", "-qm", "verified"], { cwd });
+    const verified = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
+    const reconcile = async (file: string, baseSha = base) => {
+      const run = coveringRun();
+      if (!run.result) throw new Error("missing result");
+      run.file = file;
+      run.verifiedSha = verified;
+      run.result.executionProvenance = { sha: verified, trackedClean: true };
+      run.result.coveringTest = { file, name: run.name };
+      const input = {
+        ...requested,
+        criteria: requested.criteria.map((c) => ({
+          ...c,
+          covering_tests: [{ file, name: run.name }],
+        })),
+      };
+      const evidence = {
+        runs: [run],
+        succeededStageIds: [13],
+        changedFiles: await changedCoveringTestFiles(cwd, baseSha, verified),
+      };
+      return applyGateEvidence(input, behaviouralSpec, holdout, verified, undefined, undefined, evidence)
+        .criteria[0];
+    };
+    for (const file of ["added.test.ts", "modified.test.ts"]) {
+      expect(await reconcile(file)).toMatchObject({
+        status: "met",
+        gateEvidence: { sha: verified, stageId: 13 },
+      });
+    }
+    writeFileSync(join(cwd, "x.test.ts"), "uncommitted change\n");
+    expect((await reconcile("x.test.ts"))?.status).toBe("blocked");
+    await sh(["git", "add", "."], { cwd });
+    await sh(["git", "commit", "-qm", "later"], { cwd });
+    expect((await reconcile("x.test.ts"))?.status).toBe("blocked");
+    expect((await reconcile("added.test.ts", "f".repeat(40)))?.status).toBe("blocked");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("covering commands validate trusted configuration and tracked, contained test files before running", async () => {

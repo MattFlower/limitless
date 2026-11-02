@@ -35,6 +35,27 @@ export function coveringTestUnavailable(run: CoveringTestRun | undefined): boole
 
 export const coveringPattern = (name: string): string =>
   `(?:^| )${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+
+/** Re-derived on reconciliation; working-tree edits and later commits cannot establish relevance. */
+export async function changedCoveringTestFiles(
+  cwd: string,
+  base: string,
+  sha: string,
+  signal?: AbortSignal,
+): Promise<string[] | undefined> {
+  if (![base, sha].every((rev) => /^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(rev))) return;
+  try {
+    const diff = await worktreeGit(
+      ["git", "diff", "--no-renames", "--diff-filter=AM", "--name-only", "-z", `${base}...${sha}`, "--"],
+      { cwd, signal, allowFail: true },
+    );
+    if (diff.exitCode === 0 && !diff.stdout.includes("\uFFFD"))
+      return diff.stdout.split("\0").filter(Boolean);
+  } catch {
+    signal?.throwIfAborted();
+  }
+}
+
 const controls = (text: string) =>
   [...text].some((c) => c.charCodeAt(0) < 32 || (c.charCodeAt(0) >= 127 && c.charCodeAt(0) <= 159));
 

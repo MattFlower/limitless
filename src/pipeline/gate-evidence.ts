@@ -164,6 +164,11 @@ function refusal(
 
 export const coveringCitation = (run: CoveringTestRun, sha: string): string =>
   `Factory covering test ${run.file} › ${run.name} passed at ${sha} (stage ${run.stageId}); command: ${run.result?.executedCommand ?? run.result?.command}`;
+
+function coveringTestsRelevant(runs: (CoveringTestRun | undefined)[], changedFiles?: string[]): boolean {
+  return runs.every((run) => run && changedFiles?.includes(run.file.replace(/^\.\//, "")));
+}
+
 type Binding = {
   evidence: string;
   gateEvidence: NonNullable<Verify["criteria"][number]["gateEvidence"]>;
@@ -257,7 +262,7 @@ export function applyGateEvidence(
   sha: string,
   gates?: GateEvidence,
   baseline?: GateRun | null,
-  coveringTests?: { runs: CoveringTestRun[]; succeededStageIds: number[] },
+  coveringTests?: { runs: CoveringTestRun[]; succeededStageIds: number[]; changedFiles?: string[] },
 ): Verify {
   // A claimed met row with test requests still needs every requested factory execution.
   const selected = selectCoveringTests({
@@ -317,8 +322,27 @@ export function applyGateEvidence(
       if (row.gateEvidence) {
         const reason = citationRefusal(row.gateEvidence, sha, coveringTests, gate) ?? coveringFailure;
         if (reason) return refuse("Factory citation unavailable", reason);
-        if (!sandbox && !requested) return row;
       }
+      const cited = coveringTests?.runs.find((run) => run.stageId === row.gateEvidence?.stageId);
+      const relevanceRuns = requested ? runs : cited ? [cited] : [];
+      if (
+        !coveringFailure &&
+        relevanceRuns.length &&
+        !coveringTestsRelevant(relevanceRuns, coveringTests?.changedFiles)
+      )
+        return {
+          ...row,
+          status: "blocked" as const,
+          blockedReason: "sandbox" as const,
+          gateEvidence: undefined,
+          evidence: redactGateOutput(
+            [
+              "Covering tests passed, but their relevance to the criterion is unverified; every named test file must be added or modified in the verified change.",
+              ...relevanceRuns.map((run) => (run ? coveringCitation(run, sha) : "")),
+            ].join("\n"),
+          ),
+        };
+      if (row.gateEvidence && !sandbox && !requested) return row;
       if (requested) {
         if (coveringFailure)
           return refuse(

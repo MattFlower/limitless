@@ -1394,7 +1394,16 @@ test.each([
         };
       }
       implementationPrompts.push(agent.prompt);
-      return { files: { "farewell.txt": "goodbye\n" } };
+      return {
+        files: {
+          "farewell.txt": "goodbye\n",
+          ...(!outcome && mode !== "resume"
+            ? {
+                "x.test.ts": `${readFileSync(join(repoDir, "x.test.ts"), "utf8")}\n// Cover the changed behavior.\n`,
+              }
+            : {}),
+        },
+      };
     },
     false,
     false,
@@ -1562,6 +1571,18 @@ test.each([
       return;
     }
     const limited = mode.endsWith("limit");
+    if (mode === "resume") {
+      expect(terminal).toBe("needs_human");
+      expect(state?.lastVerify?.criteria[0]).toMatchObject({ status: "blocked", blockedReason: "sandbox" });
+      expect(state?.lastVerify?.criteria[0]?.evidence).toContain("relevance to the criterion is unverified");
+      expect(state?.lastVerify?.criteria[0]?.evidence).toContain(
+        "Factory covering test x.test.ts › passes 0",
+      );
+      expect(targeted).toBe(1);
+      expect(verifierCalls).toBe(2);
+      expect(state?.coveringTestRuns?.[0]).toEqual(saved?.[0]);
+      return;
+    }
     expect(terminal, JSON.stringify({ error: f.store.getRun(run.id)?.error, state: state?.lastVerify })).toBe(
       limited || terminator || mode === "forged-citation" || mode === "empty" || mode === "skip"
         ? "needs_human"
@@ -1618,7 +1639,7 @@ test.each([
       );
       expect(commands[0]).toBe("bun test -t '(?:^| )passes 0$' './x.test.ts'");
       if (mode === "inflight" || mode === "recorded") expect(record?.stageId).toBe(saved?.[0]?.stageId);
-      if (mode === "resume" || mode === "resume-retry" || mode === "recorded") {
+      if (mode === "resume-retry" || mode === "recorded") {
         expect(verifierCalls).toBe(mode === "resume-retry" ? 2 : 1);
         expect(record).toEqual(saved?.[0]);
       }
