@@ -1286,12 +1286,14 @@ test.each([
   writeFileSync(
     join(repoDir, "x.test.ts"),
     `import {test, expect} from "bun:test";\n` +
+      (mode === "resume" ? 'import {value} from "./helper.ts";\n' : "") +
       Array.from(
         { length: 11 },
         (_, i) =>
-          `test${mode === "skip" && i === 0 ? ".skip" : ""}("passes ${i}", () => expect(${mode === "outcome-fail" ? 'process.env.FACTORY_COVERING_TEST_FAIL !== "1"' : "true"}).toBe(true));`,
+          `test${mode === "skip" && i === 0 ? ".skip" : ""}("passes ${i}", () => expect(${mode === "outcome-fail" ? 'process.env.FACTORY_COVERING_TEST_FAIL !== "1"' : mode === "resume" ? "value > 0" : "true"}).toBe(true));`,
       ).join("\n"),
   );
+  if (mode === "resume") writeFileSync(join(repoDir, "helper.ts"), "export const value = 1;\n");
   const terminator = mode === "terminator-before" || mode === "terminator-after";
   const retryTemplate =
     mode === "terminator-before"
@@ -1394,7 +1396,17 @@ test.each([
         };
       }
       implementationPrompts.push(agent.prompt);
-      return { files: { "farewell.txt": "goodbye\n" } };
+      return {
+        files: {
+          "farewell.txt": "goodbye\n",
+          ...(mode === "resume" ? { "helper.ts": "export const value = 2;\n" } : {}),
+          ...(!outcome && mode !== "resume"
+            ? {
+                "x.test.ts": `${readFileSync(join(repoDir, "x.test.ts"), "utf8")}\n// Cover the changed behavior.\n`,
+              }
+            : {}),
+        },
+      };
     },
     false,
     false,
@@ -1450,6 +1462,14 @@ test.each([
       await interrupted.promise;
       await f.stop();
       saved = f.store.getRunState<RunState>(run.id)?.coveringTestRuns;
+      if (mode === "resume") {
+        const cwd = f.store.getRunState<RunState>(run.id)?.worktreePath;
+        if (!cwd) throw new Error("missing resumed checkout");
+        writeFileSync(
+          join(cwd, "x.test.ts"),
+          `${readFileSync(join(cwd, "x.test.ts"), "utf8")}\n// Dirty edit is not verified evidence.\n`,
+        );
+      }
       if (requestCheckpoint) expect(saved).toBeUndefined();
       else expect(saved).toHaveLength(1);
       if (restartOutcome)
@@ -1562,6 +1582,20 @@ test.each([
       return;
     }
     const limited = mode.endsWith("limit");
+    if (mode === "resume") {
+      expect(terminal).toBe("succeeded");
+      expect(state?.lastVerify?.criteria[0]).toMatchObject({
+        status: "met",
+        gateEvidence: { sha: state?.lastVerifiedSha, stageId: saved?.[0]?.stageId },
+      });
+      expect(state?.lastVerify?.criteria[0]?.evidence).toContain(
+        "Factory covering test x.test.ts › passes 0",
+      );
+      expect(targeted).toBe(1);
+      expect(verifierCalls).toBe(1);
+      expect(state?.coveringTestRuns?.[0]).toEqual(saved?.[0]);
+      return;
+    }
     expect(terminal, JSON.stringify({ error: f.store.getRun(run.id)?.error, state: state?.lastVerify })).toBe(
       limited || terminator || mode === "forged-citation" || mode === "empty" || mode === "skip"
         ? "needs_human"
@@ -1618,7 +1652,7 @@ test.each([
       );
       expect(commands[0]).toBe("bun test -t '(?:^| )passes 0$' './x.test.ts'");
       if (mode === "inflight" || mode === "recorded") expect(record?.stageId).toBe(saved?.[0]?.stageId);
-      if (mode === "resume" || mode === "resume-retry" || mode === "recorded") {
+      if (mode === "resume-retry" || mode === "recorded") {
         expect(verifierCalls).toBe(mode === "resume-retry" ? 2 : 1);
         expect(record).toEqual(saved?.[0]);
       }

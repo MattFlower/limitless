@@ -4,7 +4,9 @@ import { randomUUID } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { sep } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { credentialMatcher, credentialRegistry } from "./credential-matcher.ts";
+import { type CompleteCapture, completeOutputCapture } from "./proc-capture.ts";
 import type { DarwinInvocationLeader } from "./processes-darwin.ts";
 import { activity } from "./stall.ts";
 import { terminalRedactor } from "./terminal-redaction.ts";
@@ -756,6 +758,8 @@ export interface ProcOptions {
   env: Record<string, string>;
   stdin?: string;
   encoding?: BufferEncoding;
+  /** Retain complete pre-redaction UTF-8 output in memory, within the aggregate privacy cap. */
+  captureComplete?: boolean;
   signal?: AbortSignal;
   /** Hard wall-clock limit. */
   timeoutMs?: number;
@@ -775,6 +779,7 @@ export interface ProcOptions {
 }
 
 export interface ProcResult {
+  capture?: CompleteCapture;
   exitCode: number | null;
   signal: string | null;
   cancelled: boolean;
@@ -858,6 +863,8 @@ function stillRunning(pid: number): boolean {
  * Mark a child and its descendants so shutdown also finds detached, reparented processes.
  */
 export function runProcess(opts: ProcOptions): Promise<ProcResult> {
+  if (opts.captureComplete && opts.encoding !== undefined && opts.encoding !== "utf8")
+    return Promise.reject(new Error("Complete output capture requires UTF-8 encoding"));
   assertProcessesStopped();
   const recovering = recoverScopedProcesses();
   return recovering ? recovering.then(() => startProcess(opts)) : startProcess(opts);
@@ -1080,8 +1087,11 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       else opts.signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    child.stdout.setEncoding(opts.encoding ?? "utf8");
-    child.stderr.setEncoding("utf8");
+    const capture = opts.captureComplete ? completeOutputCapture() : undefined;
+    if (!capture) {
+      child.stdout.setEncoding(opts.encoding ?? "utf8");
+      child.stderr.setEncoding("utf8");
+    }
     const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
       const redactor = terminalRedactor();
       const emit = (text: string) => {
@@ -1102,12 +1112,33 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     };
     const stdoutOutput = streamOutput("stdout", out);
     const stderrOutput = streamOutput("stderr", err);
-    child.stdout.on("data", stdoutOutput.push);
-    child.stderr.on("data", stderrOutput.push);
-    child.stdout.on("end", stdoutOutput.flush);
-    child.stderr.on("end", stderrOutput.flush);
+    if (capture) {
+      for (const stream of ["stdout", "stderr"] as const) {
+        const output = stream === "stdout" ? stdoutOutput : stderrOutput;
+        // Preserve setEncoding's replacement decoding and callback framing independently.
+        const decoder = new StringDecoder("utf8");
+        child[stream].on("data", (bytes: Buffer) => {
+          capture.push(stream, bytes);
+          const decoded = decoder.write(bytes);
+          if (decoded) output.push(decoded);
+        });
+        child[stream].on("end", () => {
+          capture.push(stream);
+          const decoded = decoder.end();
+          if (decoded) output.push(decoded);
+          output.flush();
+        });
+        child[stream].on("error", capture.fail);
+      }
+    } else {
+      child.stdout.on("data", stdoutOutput.push);
+      child.stderr.on("data", stderrOutput.push);
+      child.stdout.on("end", stdoutOutput.flush);
+      child.stderr.on("end", stderrOutput.flush);
+    }
 
     child.on("error", (e) => {
+      capture?.fail();
       const text = `\n[spawn error] ${e.message}`;
       if (opts.redactOutput) stderrOutput.push(text);
       else stderr = appendTail(stderr, text, "stderr");
@@ -1141,11 +1172,17 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         stdoutTruncated: truncated.stdout,
         stderrTruncated: truncated.stderr,
         durationMs: Date.now() - started,
+        ...(capture
+          ? {
+              capture: capture.finish(cancelled || timedOut || idleTimedOut || code === null || sig !== null),
+            }
+          : {}),
       });
     });
 
     // A child that exits before reading its input raises EPIPE on stdin; that must not crash us.
     child.stdin.on("error", (e) => {
+      capture?.fail();
       const text = `\n[stdin error] ${e.message}`;
       if (opts.redactOutput) stderrOutput.push(text);
       else stderr = appendTail(stderr, text, "stderr");

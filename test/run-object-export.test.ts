@@ -41,6 +41,7 @@ function fixture() {
     scratch = new Set<string>();
   let serial = 0,
     bytes = new Uint8Array();
+  let validation = async () => {};
   const state = {
     input,
     refs,
@@ -122,6 +123,18 @@ function fixture() {
   };
   const run = createRunObjectExporter({
     scratchRoot: root,
+    validate: async (_input, inspect) => {
+      await state.step("validate");
+      expect([...scratch].some((dir) => dir.startsWith(join(root, "run-objects-")))).toBe(false);
+      await validation();
+      await inspect({
+        async *objects() {
+          yield { oid: a, type: "blob" };
+        },
+        type: async () => "blob",
+        read: async () => bytes,
+      });
+    },
     worktreeGit: runner("worktree"),
     cacheGit: runner("cache"),
     makeScratch: async (prefix) => {
@@ -141,8 +154,25 @@ function fixture() {
       scratch.delete(dir);
     },
   });
-  return { ...state, run, state };
+  return { ...state, run, state, failValidation: (check: () => Promise<void>) => (validation = check) };
 }
+
+test("export refuses failed private validation after owned cleanup without returning bytes", async () => {
+  const f = fixture();
+  f.failValidation(async () => {
+    throw new Error("private validation payload");
+  });
+  let accepted = false;
+  const error: unknown = await f.run(f.input, new AbortController().signal).then(
+    () => (accepted = true),
+    (error: unknown) => error,
+  );
+  expect(accepted).toBe(false);
+  expect(error).toMatchObject({ code: "invalid", message: "Run transfer data is invalid" });
+  expect(error).not.toHaveProperty("cause");
+  expect(f.events.at(-1)).toBe("validate");
+  expect(f.refs.size).toBe(2);
+});
 
 test("captured, normalized commits use deterministic explicit refs and include unpublished ancestry", async () => {
   const f = fixture();
