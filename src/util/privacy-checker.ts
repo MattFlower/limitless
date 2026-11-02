@@ -107,7 +107,7 @@ function operate(f: Final, parts: ArrayBuffer[]) {
   const local = b.createPrivacyRegistry();
   const generation: Generation = { ...f.generation, identity: local.generation.identity };
   const registry = { ...local, generation };
-  const snapshot = { entries, credentials: rest.slice(f.entries), generation };
+  const snapshot = { ready: true, entries, credentials: rest.slice(f.entries), generation };
   const policy = b.preparePrivacyPolicy(snapshot, { limits: f.limits });
   const provenance: b.Provenance = f.kind === "cut" ? { kind: "cut", truncated: true } : { kind: f.kind };
   const cut = f.cut && ({ ...f.cut, marker } as b.BoundaryCut);
@@ -245,8 +245,10 @@ export function createPrivacyChecker(options: Options = {}) {
       Promise.resolve(issue(failure(reason, generation, input.provenance), generation));
     let snapshot: Snapshot;
     try {
+      registry.refreshPolicy();
       snapshot = b.capturePrivacySnapshot(registry);
       generation = snapshot.generation;
+      if (!snapshot.ready) return refuse("unreadable-policy");
       if (!current(generation)) return refuse("stale-generation");
     } catch {
       return refuse("unreadable-policy");
@@ -381,4 +383,14 @@ export function createPrivacyChecker(options: Options = {}) {
       await running;
     },
   };
+}
+let processChecker: ReturnType<typeof createPrivacyChecker> | undefined;
+export function getPrivacyChecker(options: Omit<Options, "registry"> = {}) {
+  processChecker ??= createPrivacyChecker({ ...options, registry: b.privacyRegistry });
+  return processChecker;
+}
+export async function disposePrivacyChecker() {
+  const checker = processChecker;
+  processChecker = undefined;
+  await checker?.dispose();
 }

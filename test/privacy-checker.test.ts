@@ -1,11 +1,14 @@
 import { expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Worker } from "node:worker_threads";
 import * as b from "../src/util/privacy-boundary.ts";
 import {
   createPrivacyChecker,
+  disposePrivacyChecker,
+  getPrivacyChecker,
   type PrivacyWorkerPort,
   PrivacyWorkerUnavailable,
   privacyWorkerEntries,
@@ -14,6 +17,7 @@ import {
   startPrivacyWorker,
 } from "../src/util/privacy-checker.ts";
 import * as c from "../src/util/privacy-chunks.ts";
+import { provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
 import * as t from "../src/util/privacy-transport.ts";
 import { privacyTexts } from "./privacy-support.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -1576,4 +1580,71 @@ test.each(["deadline", "dispose"])("a %s terminates a worker still starting", as
   await withheld(receipt, mode === "deadline" ? "checker-timeout" : "checker-failed");
   await disposed;
   expect(terminated).toEqual(["terminated"]);
+});
+
+test("process checker shares lazy workers, refreshes authority and awaits retirement", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "privacy-checker-"));
+  const f = fixture({ registry: b.privacyRegistry }),
+    port = new Port();
+  const previous = b.privacyRegistry.snapshot(),
+    refresh = b.privacyRegistry.refreshPolicy;
+  b.privacyRegistry.refreshPolicy = () => {};
+  let made = 0;
+  try {
+    await disposePrivacyChecker();
+    b.privacyRegistry.failPolicy();
+    const shared = getPrivacyChecker({
+      workerFactory: () => {
+        made++;
+        return new Port();
+      },
+      schedule,
+    });
+    expect(getPrivacyChecker()).toBe(shared);
+    await withheld(shared.protectText(input()), "unreadable-policy");
+    await withheld(f.protectData({ json: "{}", provenance: { kind: "complete" } }), "unreadable-policy");
+    expect(made).toBe(0);
+    await disposePrivacyChecker();
+    port.held = true;
+    const checker = getPrivacyChecker({
+      workerFactory: () => {
+        made++;
+        return port;
+      },
+      schedule,
+    });
+    expect(port.refs).toHaveLength(0);
+    provisionPrivacyPolicy(dir, []);
+    const pending = checker.protectText(input());
+    await f.clock.flush();
+    expect(made).toBe(1);
+    writeFileSync(join(dir, "private-strings.txt"), "# equivalent empty policy");
+    const second = checker.protectText(input());
+    await f.run();
+    expect(read(await pending).withheld).toBe(false);
+    expect(read(await second).withheld).toBe(false);
+    b.privacyRegistry.failPolicy();
+    expect(read(await pending).reason).toBe("unreadable-policy");
+    writeFileSync(join(dir, "private-strings.txt"), "safe");
+    const changed = checker.protectText(input());
+    await f.run();
+    await withheld(changed, "private-match");
+    let done = false;
+    const disposing = disposePrivacyChecker().then(() => {
+      done = true;
+    });
+    await f.clock.flush();
+    expect(port.terminated).toBe(1);
+    expect(done).toBe(false);
+    port.retirement.resolve();
+    await disposing;
+  } finally {
+    port.retirement.resolve();
+    await f.dispose();
+    await disposePrivacyChecker();
+    b.privacyRegistry.refreshPolicy = refresh;
+    b.privacyRegistry.replacePolicy(previous.entries);
+    if (!previous.ready) b.privacyRegistry.failPolicy();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

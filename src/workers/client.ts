@@ -22,6 +22,7 @@ import { type ConfinementBackend, confinementScope, platformConfinement } from "
 import { removeScratch, restoreDirectoryPermissions, writeRoots } from "../harness/scratch.ts";
 import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
 import { prepareReaderCheckout, runToolAgent } from "../pipeline/agent-executor.ts";
+import { processPrivacy } from "../util/privacy-policy.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import {
   agentEnv,
@@ -250,12 +251,13 @@ type FenceTimer = {
   clear: (timer: ReturnType<typeof setTimeout> | undefined) => void;
 };
 
-export async function runWorker(
+async function runScopedWorker(
   coordinator: string,
   cfg: Config,
   releaseSha: string,
   signal: AbortSignal,
   options: {
+    privacy?: typeof processPrivacy;
     capabilityRunner?: CapabilityRunner;
     probeAgents?: typeof probeAgents;
     capabilityRefreshMs?: number;
@@ -1126,5 +1128,15 @@ export async function runWorker(
   } finally {
     store.close();
     for (const release of held) release();
+  }
+}
+export async function runWorker(...args: Parameters<typeof runScopedWorker>) {
+  const privacy = args[4]?.privacy ?? processPrivacy;
+  try {
+    const { configDir, repos, work } = args[1].paths;
+    privacy.provision(configDir, [repos, work]);
+    return await runScopedWorker(...args);
+  } finally {
+    await privacy.dispose();
   }
 }
