@@ -271,6 +271,48 @@ git. It loads no owner configuration and uses only synthetic data. `bun
 scripts/benchmark-credential-redaction.ts <baseline-proc.ts>` remains the credential-only
 comparison. Keep snapshots and output in scratch; tests never assert timings.
 
+### c2.1c.3 scope reconciliation (implementation pending)
+
+The revised acceptance scope does not fit its 250 changed non-test line cap. The checkout
+contains `privacyWorkerHandler`, bounded transport and chunk receipts, but the checker still
+requires an injected worker factory. There is no real worker entry, packaged worker or
+`probe-privacy-worker.ts`; the benchmark has no `worker-all` workload. Its current synchronous
+call instrumentation cannot establish complete asynchronous daemon turns: promise continuations
+without an event-loop yield must count together, and worker wait time must be excluded.
+
+Re-estimate before implementation (changed lines are additions plus deletions, including scripts
+and documentation; these are estimates, not delivered counts):
+
+| Proposed delivery, in dependency order | Non-test lines | Test lines | Required evidence |
+| --- | ---: | ---: | --- |
+| Entry and build wiring | 50–70 | 35–55 | Dedicated handler entry; release-selected source/package resolvers; fixed fail-closed failure; executable worker bundled with dependencies; preserve build identity, resources and autoload protections. Fake-only resolution and build-config mutations. |
+| Portable acceptance probe | 85–115 | 0 | Source and candidate-package startup, independently expected safe/withheld bytes and awaited disposal. Candidate verification preserves the production clean-tree check. Owned scratch and child handles cleaned in finally paths; prove source reads unavailable to the packaged process on each platform. Changing cwd is insufficient. |
+| Worker measurement and evidence | 160–215 | 20–35 | Complete daemon turns, including microtasks, transfer and bounded consumption; separately identified worker CPU and elapsed latency; cold maximum-policy transfer, text/data maxima, expensive refusals, eight slots and slot/byte backpressure. Retain raw warmups, timed samples, workload metadata and heartbeat observations; publish measured platform envelope. |
+
+Together this is **295–400 non-test lines**, exceeding the cap before implementation. Split
+at these boundaries rather than compressing lifecycle, isolation or measurement checks to fit.
+The final delivery's estimate includes 30–40 documentation lines. Each proposed delivery stays
+below 250 lines, subject to its own specification and implementation count. Production adoption
+remains deferred; c2.2 must be re-estimated before labelling and depends on all three deliveries.
+
+No asynchronous performance acceptance is claimed. The synchronous figures above remain the
+only recorded platform measurements; they must not be reused as worker figures.
+
+| New worker evidence | macOS | Linux |
+| --- | --- | --- |
+| Source/package probe with source unavailable | pending | pending |
+| Warmup-inclusive worst daemon turn and timed median | pending | pending |
+| Worker CPU, elapsed latency and heartbeat observations | pending | pending |
+
+Planned Linux handoff commands, **unavailable until the probe and workload are implemented**:
+`bun scripts/probe-privacy-worker.ts` and
+`bun scripts/benchmark-privacy-boundary.ts --worker "$PWD" worker-all candidate`.
+Run from the candidate checkout root with Bun and installed dependencies; the benchmark mode
+must need no git. The probe specification must state its platform isolation-tool prerequisites.
+Run and record macOS first; leave Linux cells pending for the orchestrator. Any daemon slice
+over 50 ms, including a warmup or refusal, fails acceptance and needs a separately estimated fix.
+Finite samples establish a measured envelope, not a universal latency guarantee.
+
 ## c2 adversarial regression matrix
 
 Each row names the inventory classes it covers. Use explicit synthetic policy/credentials,
@@ -346,7 +388,7 @@ envelope through the worker checker.
 | --- | --- | --- | --- |
 | c2.1c.1 / c2.1b.3 (#1102) | Worker checker protocol, generations, lifecycle and reservations. | 170–220 / 100–150 | Fake-port generation, protocol, capacity and lifecycle mutations. |
 | c2.1c.2 / c2.1c.1 (#1103) | Bounded transport, result authority and service integration. | 140–200 / 80–120 | Backpressure and semantic parity through fake ports. |
-| c2.1c.3 / c2.1c.2 (#1104) | Compiled worker entry, real-worker probes, benchmark rerun and design update. | 120–180 / 30–60 | macOS and Linux probes, packaged execution; no daemon slice over 50 ms, warmups included. |
+| c2.1c.3 / c2.1c.2 (#1104) | Compiled worker entry, real-worker probes, benchmark rerun and design update; split into the three proposed deliveries above. | 295–400 / 55–90 total | Pending: macOS and Linux probes, packaged execution; no daemon slice over 50 ms, warmups included. |
 | c2.2 / c2.1c.3 (#928) | Complete bounded gate capture, excerpts/tail and gate metadata; 2–3 deliveries. | 400–600 / 300–500 | proc/gates/feedback tests; split/overlap/cap cases and whole gate benchmark reporting worst daemon stall beside medians; meet the 50-ms synchronous-slice budget including concurrent gates and transfers. Other producers remain explicitly unaudited. |
 | c2.3 / c2.2 (#929) | Harness logs/results/events, prompts and post-merge/worker persistence; 2–3 deliveries. | 400–600 / 300–500 | harness/pipeline/workers restart tests; no unchecked log append, flags survive persistence. |
 | c2.4 / c2.3 (#930) | MCP transport/results, REST/SSE, privateOutputData, feed/digest/change/report adapters and optional metadata storage; 2–3 deliveries. | 450–650 / 350–550 | MCP/feed/digest/report/HTTP tests plus old-writer/new-reader and rollback migration fixtures. |
