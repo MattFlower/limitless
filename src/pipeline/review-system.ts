@@ -135,19 +135,24 @@ const ReviewSystemBaseSchema = z
   }) satisfies z.ZodType<ReviewSystem>;
 
 export const ReviewSystemSchema = ReviewSystemBaseSchema.safeExtend({
-  samples: z.never({ error: "samples is eval-only until adopted" }).optional(),
+  samples: z.literal(2, { error: "samples must be 2" }).optional(),
 })
   .refine((system) => !system.finders.some(isEvalOnly), {
     path: ["finders"],
     message: `the ${quoted(EVAL_ONLY_PROMPTS, "or")} prompt is eval-only`,
   })
+  .refine((system) => system.samples === undefined || system.mode === "single", {
+    path: ["samples"],
+    message: 'samples requires mode "single"',
+  })
   .refine(
     (system) =>
       system.mode !== "single" ||
-      (system.finders.length === 1 && system.finders.every((f) => f.prompt === "standard")),
+      (system.finders.length === 1 &&
+        system.finders.every((f) => f.prompt === (system.samples === 2 ? "adversarial" : "standard"))),
     {
       path: ["finders"],
-      message: 'mode "single" uses the "standard" prompt',
+      message: 'mode "single" uses the "standard" prompt, or "adversarial" with samples 2',
     },
   );
 
@@ -291,12 +296,19 @@ export function parseEvalReviewSystems(text: string, source: string): EvalReview
   return parsed.data.systems;
 }
 
-/** Production reviews with one routed standard finder, honoring `[review] implementer_report`. */
-export function productionReviewSystem(cfg: Pick<Config, "reviewImplementerReport">): ReviewSystem {
+/**
+ * Production reviews with one routed finder, honoring `[review] implementer_report`: by default the
+ * union of two independent adversarial samples, or one standard review with `[review] samples = 1`.
+ */
+export function productionReviewSystem(
+  cfg: Pick<Config, "reviewImplementerReport" | "reviewSamples">,
+): ReviewSystem {
   return ReviewSystemSchema.parse({
     name: "production",
     mode: "single",
-    finders: [{ prompt: "standard" }],
+    ...(cfg.reviewSamples === 2
+      ? { finders: [{ prompt: "adversarial" }], samples: 2 }
+      : { finders: [{ prompt: "standard" }] }),
     implementerReport: cfg.reviewImplementerReport,
   });
 }
@@ -412,7 +424,7 @@ export function readReviewLenses(contents: string | null, warn: (message: string
  * its base lenses, while switching panel mode off applies to the next review of every run.
  */
 export function configuredReviewSystem(
-  cfg: Pick<Config, "reviewImplementerReport" | "reviewMode" | "reviewRosters">,
+  cfg: Pick<Config, "reviewImplementerReport" | "reviewMode" | "reviewRosters" | "reviewSamples">,
   profile: ResolvedProfile,
   lenses: RepoReviewLens[] | undefined,
 ): ReviewSystem {

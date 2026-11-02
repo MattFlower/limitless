@@ -177,6 +177,7 @@ import {
   type VerifierRequest,
 } from "./review.ts";
 import { readPrHead, roundSection, withPrLock } from "./review-round.ts";
+import { savedReviewSample, saveReviewSample } from "./review-samples.ts";
 import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import { bindRunClaim, type RunClaim, renewRunClaim } from "./run-claim.ts";
@@ -2219,7 +2220,15 @@ async function oneRound(
         const shadow = invokeGuard.getStore();
         return {
           skipAny: !!shadow,
-          invoke: async (request, index) => {
+          invoke: async (request, index, sample) => {
+            // A restart reuses a finished sample of a two-sample review instead of re-rolling it.
+            const kept = shadow ? undefined : sample;
+            const saved =
+              kept === undefined ? undefined : savedReviewSample(ctx, round, kept, request, reviewedSha);
+            if (saved) {
+              ctx.log(`review: reusing finished sample ${(kept ?? 0) + 1} from before the restart`);
+              return saved;
+            }
             const finder = system.finders[index];
             const vendor = ctx.state.implementer?.vendor;
             const constraints: RouteConstraints = {
@@ -2233,7 +2242,9 @@ async function oneRound(
             // One deadline covers a local finder's slot waits and fallbacks; past it, the panel skips it.
             const deadline = finder?.local ? Date.now() + request.timeoutMs : undefined;
             try {
-              return await call(request, constraints, finder?.target, deadline);
+              const invoked = await call(request, constraints, finder?.target, deadline);
+              if (kept !== undefined) saveReviewSample(ctx, round, kept, request, reviewedSha, invoked);
+              return invoked;
             } catch (error) {
               if ((shadow || (finder?.local && !ctx.run.models?.review)) && error instanceof NoCapacityError)
                 throw new FinderSkipped(error.message);

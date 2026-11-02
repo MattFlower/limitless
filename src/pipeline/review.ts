@@ -306,6 +306,10 @@ export interface ReviewDeps<T extends Invoked> {
   /** Runs a finder; `sample` distinguishes fresh calls of a two-sample single system. */
   invoke: (request: ReviewRequest, finder: number, sample?: number) => Promise<T>;
   samples?: ReviewSample[];
+  /**
+   * Evals only: records each sample of a two-sample review, a failed invocation included, so a retry
+   * reuses the other. Without it a sample's invocation error is rethrown once both settle.
+   */
   onSample?: (sample: ReviewSample) => void;
   /**
    * Panel only: one read-only verifier batch, routed away from every vendor that raised it and never
@@ -408,7 +412,14 @@ export type ReviewOutcome<T> = T & {
   panel?: PanelRecord;
 };
 
-export function reviewRequest(input: ReviewInput): ReviewRequest {
+export function reviewRequest(reviewInput: ReviewInput): ReviewRequest {
+  // A lone single finder's prompt frames the review; "standard" keeps the plain single prompt.
+  const single = reviewInput.system?.mode === "single" ? reviewInput.system.finders : [];
+  const framing = single.length === 1 ? single[0]?.prompt : undefined;
+  const input =
+    framing && framing !== "standard" && !reviewInput.prompt.finder
+      ? { ...reviewInput, prompt: { ...reviewInput.prompt, finder: framing } }
+      : reviewInput;
   const checklist = input.prompt.finder === "adversarial-checklist";
   if (checklist && !input.checklist)
     throw new Error("adversarial-checklist: missing prepared base checklist");
@@ -468,6 +479,8 @@ async function runUnion<T extends Invoked>(
         result = invoked.result;
       } catch (error) {
         rethrowClaimControl(error);
+        // Production lets a cancellation or capacity error reach the engine, as a single review does.
+        if (!deps.onSample) throw error;
         result = {
           status: "error",
           finalText: "",
@@ -519,11 +532,13 @@ async function runUnion<T extends Invoked>(
       output: z.custom<Review>(() => false, failure.error).safeParse(null),
     };
   const reviews = samples.map((s) => request.schema.parse(s.output));
+  const priorCount = input.prompt.previous?.findings.length ?? 0;
+  // Reports citing different prior blockers (or one citing none) never merge, so none loses its status.
   const findings = mergeReports(
     reviews.flatMap((r, finder) =>
       r.findings.map((f) => ({ ...f, finder: samples[finder]?.index ?? finder })),
     ),
-    () => undefined,
+    (f) => citedPriorIndex(f, priorCount),
   ).map(({ finder: _finder, raisedBy: _raisedBy, ...finding }) => finding);
   const modelVerdict = reviews.some((r) => r.verdict === "request_changes") ? "request_changes" : "approve";
   const decision = decide(

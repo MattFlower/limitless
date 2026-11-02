@@ -428,7 +428,7 @@ test("review implementer report defaults to include and accepts only include or 
     // A misspelt key would otherwise silently keep the default.
     writeFileSync(join(configDir, "config.toml"), '[review]\nimplementer-report = "omit"\n');
     expect(config).toThrow(
-      "review.implementer-report: unknown key (allowed: avoid_implementer_vendor, implementer_report, mode, rosters, shadow, shadow_grace_seconds, trusted_reviewers)",
+      "review.implementer-report: unknown key (allowed: avoid_implementer_vendor, implementer_report, mode, rosters, samples, shadow, shadow_grace_seconds, trusted_reviewers)",
     );
     writeFileSync(join(configDir, "config.toml"), 'review = "omit"\n');
     expect(config).toThrow("review must be a table");
@@ -491,13 +491,19 @@ test("invalid provider concurrency and unknown providers fail config loading", (
   }
 });
 
-test("review mode defaults to single; rosters default per profile and are validated", () => {
+test("review mode defaults to single with two samples; rosters default per profile and are validated", () => {
   const root = mkdtempSync(join(tmpdir(), "limitless-review-rosters-"));
   const configDir = join(root, "config");
   mkdirSync(configDir);
   const config = () => loadConfig({ home: join(root, "data"), configDir });
   try {
-    expect(config()).toMatchObject({ reviewMode: "single", reviewRosters: DEFAULT_ROSTERS });
+    expect(config()).toMatchObject({
+      reviewMode: "single",
+      reviewSamples: 2,
+      reviewRosters: DEFAULT_ROSTERS,
+    });
+    writeFileSync(join(configDir, "config.toml"), "[review]\nsamples = 1\n");
+    expect(config().reviewSamples).toBe(1);
     writeFileSync(
       join(configDir, "config.toml"),
       '[review]\nmode = "panel"\n[review.rosters]\nquick = [{ prompt = "careful", family = "implementer" }]\n',
@@ -508,6 +514,8 @@ test("review mode defaults to single; rosters default per profile and are valida
     });
     for (const [toml, message] of [
       ['mode = "triple"', 'review.mode must be "single" or "panel"'],
+      ["samples = 3", "review.samples must be 1 or 2"],
+      ['samples = "2"', "review.samples must be 1 or 2"],
       ["rosters = { quick = [] }", "a roster needs at least one finder"],
       [
         'rosters = { deep = [{ prompt = "adversarial", lens = { name = "a", focus = "b" } }] }',

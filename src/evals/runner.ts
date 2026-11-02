@@ -838,9 +838,6 @@ export class EvalRunner {
           ? { ...prepared.review, ...(system ? { system } : {}) }
           : undefined;
       const finder = system?.mode === "single" ? system.finders[0]?.prompt : undefined;
-      if (reviewInput && finder && finder !== "standard") {
-        reviewInput.prompt = { ...reviewInput.prompt, finder };
-      }
       if (finder === "adversarial-checklist" && reviewInput && "defects" in effective)
         reviewInput.checklist = checklistPrompt(await readFileAt(cwd, effective.base, "AGENTS.md"));
       const request = reviewInput ? reviewRequest(reviewInput) : undefined;
