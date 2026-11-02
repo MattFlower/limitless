@@ -353,11 +353,10 @@ export async function measureWorker(root: string, r = runtime) {
   await series("byte backpressure (64 MiB pending)", [bmp, bmp, busy(bmp)]);
   const method = "slice: wall ms per daemon turn; worker CPU: cpuUsage minus main threadCpuUsage";
   const size = { entries: policy.entries.length, credentials: policy.credentials.length };
-  const decision = decideC21c(raw);
-  return { name: "worker-all", platform: r.platform, method, policy: size, groups, decision };
+  return { platform: r.platform, method, policy: size, groups, decision: decideC21c(raw) };
 }
 async function worker([root = "", name = "", ref = ""]: string[]) {
-  if (name === "worker-all") return { ref, pid: process.pid, ...(await measureWorker(root)) };
+  if (name === "worker-all") return { ref, pid: process.pid, name, ...(await measureWorker(root)) };
   const paths = ["proc", "credential-matcher", "privacy-boundary"].map((p) => join(root, `src/util/${p}.ts`));
   const found = [...paths, join(root, "src/gates/private.ts")].filter((p) => existsSync(p));
   const api = Object.assign({}, ...(await Promise.all(found.map((p) => import(p)))));

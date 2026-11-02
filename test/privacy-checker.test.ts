@@ -888,6 +888,43 @@ test("disposal during startup retires the eventual worker and ignores late outpu
   expect(p.sent).toHaveLength(0);
 });
 
+test.each([false, true])(
+  "disposal while acquiring a stalled worker terminates it (async factory: %p)",
+  async (later) => {
+    for (let depth = 0; depth < 8; depth++) {
+      let constructed = 0,
+        terminated = 0;
+      const stalled = () =>
+        startPrivacyWorker(
+          "unused",
+          () =>
+            Object.assign(new EventEmitter(), {
+              ...{ postMessage() {}, ref() {}, unref() {} },
+              terminate: async () => void terminated++,
+            }) as unknown as Worker,
+        );
+      const factory = () => {
+        constructed++;
+        return stalled();
+      };
+      const checker = createPrivacyChecker({
+        registry: b.createPrivacyRegistry(),
+        workerFactory: later ? async () => factory() : factory,
+      });
+      const request = checker.protectText(input());
+      let microtasks = Promise.resolve();
+      for (let i = 0; i < depth; i++) microtasks = microtasks.then();
+      await microtasks;
+      const timer = Promise.withResolvers<string>();
+      const handle = setTimeout(() => timer.resolve("dispose still pending"), 200);
+      const outcome = await Promise.race([checker.dispose().then(() => "disposed"), timer.promise]);
+      clearTimeout(handle);
+      expect([depth, outcome, terminated]).toEqual([depth, "disposed", constructed]);
+      expect(read(await request).reason).toBe("checker-failed");
+    }
+  },
+);
+
 test("unreadable authority and core admission failures withhold", async () => {
   let broken = false;
   const registry = b.createPrivacyRegistry(undefined, () => {

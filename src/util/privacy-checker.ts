@@ -162,6 +162,7 @@ export function privacyWorkerEntry(info: Release = release, entries = privacyWor
 /** Owned at once; `ready` rejects if the entry fails, exits or is terminated before announcing itself. */
 export function startPrivacyWorker(entry: string, construct = (path: string) => new Worker(path)) {
   const ready = Promise.withResolvers<void>();
+  ready.promise.catch(() => undefined); // Observed only when startup is awaited; retiring earlier is not a fault.
   const unusable = () => ready.reject(new PrivacyWorkerUnavailable("Privacy worker entry did not start"));
   let worker: Worker;
   try {
@@ -294,9 +295,10 @@ export function createPrivacyChecker(options: Options = {}) {
       try {
         if (!current(authority)) return finish("stale-generation");
         if (!worker) {
-          worker = await (options.workerFactory ?? (() => startPrivacyWorker(privacyWorkerEntry())))();
+          const made = (options.workerFactory ?? (() => startPrivacyWorker(privacyWorkerEntry())))();
+          worker = made instanceof Promise ? await made : made; // A synchronous port is owned without yielding.
           worker.unref();
-          await worker.ready; // Retained meanwhile: a deadline or disposal terminates it.
+          if (pending.has(finish) && !disposed) await worker.ready; // Retained: a deadline or disposal terminates it.
         }
         if (!pending.has(finish) || disposed) return void (await retire());
         const port = worker;
