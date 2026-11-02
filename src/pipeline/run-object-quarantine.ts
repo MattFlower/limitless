@@ -126,8 +126,8 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
         }
       };
       // Raw cat-file output uses lossless streaming beyond sh's bounded text output.
-      const readObject = async (type: string, oid: string) => {
-        const chunks: Uint8Array[] = [];
+      const readObject = async (type: string, oid: string, size: number, raw?: Buffer) => {
+        let length = 0;
         const result = await (deps.runProcess ?? runProcess)({
           cmd: ["git", `--git-dir=${repo}`, "--no-replace-objects", "cat-file", type, oid],
           cwd: scratch ?? deps.scratchRoot,
@@ -137,7 +137,10 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
           timeoutMs: 300_000,
           tailLimit: 0,
           onRawChunk: (chunk, stream) => {
-            if (stream === "stdout") chunks.push(Buffer.from(chunk, "latin1"));
+            if (stream !== "stdout") return;
+            const offset = length;
+            length += chunk.length;
+            if (length <= size) raw?.write(chunk, offset, chunk.length, "latin1");
           },
         }).catch(() => {
           throw new RunTransferError(signal.aborted ? "aborted" : "corrupt");
@@ -145,7 +148,7 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
         if (signal.aborted) throw new RunTransferError("aborted");
         if (result.exitCode !== 0 || result.cancelled || result.timedOut || result.idleTimedOut)
           throw new RunTransferError("corrupt");
-        return Buffer.concat(chunks);
+        if (length !== size) throw new RunTransferError("corrupt");
       };
       await git(["init", "--bare", `--template=${templates}`, `--object-format=${objectFormat}`, repo]);
       await writeFile(bundle, bytes, { mode: 0o600 });
@@ -166,7 +169,8 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
       for (const oid of commits)
         if ((await git(["cat-file", "-t", oid])).trim() !== "commit") throw invalid();
       await git(["rev-list", "--objects", "--missing=error", "--quiet", ...commits, "--"]);
-      const inventory = new Map<string, PrivateObjectType>();
+      const inventory = new Map<string, { type: PrivateObjectType; size: number }>();
+      let total = 0n;
       const listing = await git([
         "cat-file",
         "--batch-all-objects",
@@ -175,11 +179,14 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
       for (const line of listing.trimEnd().split("\n")) {
         const match = /^([a-f0-9]+) (commit|tree|blob|tag) (0|[1-9][0-9]*)$/.exec(line);
         if (!match || !validOID(match[1] ?? "") || inventory.has(match[1] ?? "")) throw invalid();
-        inventory.set(match[1] ?? "", match[2] as PrivateObjectType);
-        const raw = await readObject(match[2] ?? "", match[1] ?? "");
-        if (BigInt(raw.length) !== BigInt(match[3] ?? "-1")) throw invalid();
+        const size = BigInt(match[3] ?? "-1");
+        if (size > 104_857_600n) throw new RunTransferError("unsupported");
+        total += size;
+        inventory.set(match[1] ?? "", { type: match[2] as PrivateObjectType, size: Number(size) });
       }
       if (inventory.size !== count) throw invalid();
+      if (total > 2_147_483_648n) throw new RunTransferError("unsupported");
+      for (const [oid, { type, size }] of inventory) await readObject(type, oid, size);
       const check = (...oids: string[]) => {
         if (!active) throw new RunTransferError("unavailable");
         if (signal.aborted) throw new RunTransferError("aborted");
@@ -198,7 +205,7 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
                   const item = entries.next();
                   return item.done
                     ? { done: true, value: undefined }
-                    : { done: false, value: { oid: item.value[0], type: item.value[1] } };
+                    : { done: false, value: { oid: item.value[0], type: item.value[1].type } };
                 },
               };
             },
@@ -206,12 +213,15 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
         },
         async type(oid) {
           check(oid);
-          return inventory.get(oid) as PrivateObjectType;
+          return inventory.get(oid)?.type as PrivateObjectType;
         },
         read(oid) {
           const task = (async () => {
             check(oid);
-            const raw = await readObject(inventory.get(oid) ?? "", oid);
+            const object = inventory.get(oid);
+            if (!object) throw invalid();
+            const raw = Buffer.alloc(object.size);
+            await readObject(object.type, oid, object.size, raw);
             check(oid);
             return raw;
           })();

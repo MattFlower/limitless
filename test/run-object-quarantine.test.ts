@@ -147,9 +147,10 @@ function fakeInput(): RunObjectBundle {
     ]),
   };
 }
-async function fake(fault = "", abort = false) {
+async function fake(fault = "", abort = false, bodies = [["x"]], size = "1", faultRead = 1) {
   const path = await sandbox(),
-    calls: { cmd: string[]; options: GitOptions }[] = [];
+    calls: { cmd: string[]; options: GitOptions }[] = [],
+    bodyCalls: string[][] = [];
   const controller = new AbortController();
   const input = fakeInput();
   const runner = async (cmd: string[], options: GitOptions) => {
@@ -184,7 +185,7 @@ async function fake(fault = "", abort = false) {
             : event === "inventory"
               ? fault === "bad-inventory"
                 ? "garbage"
-                : `${oid} commit ${fault === "size" ? 2 : 1}\n`
+                : `${oid} commit ${fault === "size" ? 2 : size}\n${fault === "late-inventory" ? "garbage\n" : ""}`
               : event === "read"
                 ? "x"
                 : "",
@@ -194,26 +195,114 @@ async function fake(fault = "", abort = false) {
     scratchRoot: path,
     cacheGit: runner,
     runProcess: async (options) => {
-      const { stdout } = await runner(options.cmd, options);
-      options.onRawChunk?.(stdout, "stdout");
-      if (abort && fault.startsWith("stream-")) controller.abort();
+      const chunks = bodies[Math.min(bodyCalls.length, bodies.length - 1)] ?? [];
+      bodyCalls.push(options.cmd);
+      await runner(options.cmd, options);
+      options.onRawChunk?.("ignored diagnostic", "stderr");
+      for (const chunk of chunks) options.onRawChunk?.(chunk, "stdout");
+      const streamFault = bodyCalls.length === faultRead ? fault : "";
+      if (abort && streamFault.startsWith("stream-")) controller.abort();
       return {
         stdout: "",
         stderr: "",
-        exitCode: fault === "stream-exit" ? 1 : 0,
+        exitCode: streamFault === "stream-exit" ? 1 : 0,
         signal: null,
-        cancelled: fault === "stream-cancelled",
-        timedOut: fault === "stream-timeout",
-        idleTimedOut: fault === "stream-idle",
+        cancelled: streamFault === "stream-cancelled",
+        timedOut: streamFault === "stream-timeout",
+        idleTimedOut: streamFault === "stream-idle",
         truncated: false,
         durationMs: 0,
       };
     },
   });
-  return { path, calls, input, controller, validate };
+  return { path, calls, bodyCalls, input, controller, validate };
 }
 
 describe("orchestration", () => {
+  test.each(["omitted", "late-inventory", "unsafe-size"])(
+    "rejects %s inventory before reading any bodies",
+    async (fault) => {
+      const f = await fake(fault, false, [["x"]], fault === "unsafe-size" ? "9007199254740993" : "1");
+      if (fault === "omitted") {
+        const bytes = Buffer.from(f.input.bytes);
+        bytes.writeUInt32BE(2, bytes.indexOf("\n\n") + 10);
+        f.input.bytes = bytes;
+      }
+      let inspections = 0;
+      await expect(
+        f.validate(
+          f.input,
+          async () => {
+            inspections++;
+          },
+          signal(),
+        ),
+      ).rejects.toMatchObject({ code: fault === "unsafe-size" ? "unsupported" : "invalid" });
+      expect(f.bodyCalls).toHaveLength(0);
+      expect(inspections).toBe(0);
+      await clean(f.path);
+    },
+  );
+  test.each([
+    ["eager", "short"],
+    ["eager", "long"],
+    ["inspection", "short"],
+    ["inspection", "long"],
+  ])("rejects %s %s streamed bodies as corrupt", async (phase, fault) => {
+    const exact = [content.subarray(0, 2).toString("latin1"), content.subarray(2).toString("latin1")];
+    const wrong = fault === "short" ? [exact[0] ?? ""] : [...exact, Buffer.from([255]).toString("latin1")];
+    const f = await fake("", false, phase === "eager" ? [wrong] : [exact, wrong], `${content.length}`);
+    let inspections = 0;
+    await expect(
+      f.validate(
+        f.input,
+        async (reader) => {
+          inspections++;
+          await reader.read(f.input.requiredCommits[0] ?? "");
+        },
+        signal(),
+      ),
+    ).rejects.toMatchObject({ code: "corrupt" });
+    expect(inspections).toBe(phase === "eager" ? 0 : 1);
+    expect(f.bodyCalls).toHaveLength(phase === "eager" ? 1 : 2);
+    await clean(f.path);
+  });
+  test.each(["binary", "empty"])("accepts exact-size %s streams in both phases", async (kind) => {
+    const bytes = kind === "empty" ? Buffer.alloc(0) : content;
+    const chunks = [...bytes].map((byte) => Buffer.from([byte]).toString("latin1"));
+    const f = await fake("", false, [chunks], `${bytes.length}`);
+    await f.validate(
+      f.input,
+      async (reader) => {
+        expect(await reader.read(f.input.requiredCommits[0] ?? "")).toEqual(bytes);
+      },
+      signal(),
+    );
+    expect(f.bodyCalls).toHaveLength(2);
+    await clean(f.path);
+  });
+  test.each(["stream-exit", "stream-cancelled", "stream-timeout", "stream-idle"])(
+    "preserves inspection read failure and cancellation at %s",
+    async (fault) => {
+      for (const abort of [false, true]) {
+        const f = await fake(fault, abort, [["x"]], "1", 2);
+        let inspections = 0;
+        await expect(
+          f.validate(
+            f.input,
+            async (reader) => {
+              inspections++;
+              await reader.read(f.input.requiredCommits[0] ?? "");
+            },
+            f.controller.signal,
+          ),
+        ).rejects.toMatchObject({ code: abort ? "aborted" : "corrupt" });
+        expect(inspections).toBe(1);
+        expect(f.bodyCalls).toHaveLength(2);
+        await clean(f.path);
+      }
+    },
+  );
   test.each([
     "init",
     "bundle",
@@ -382,10 +471,58 @@ describe("orchestration", () => {
 });
 
 describe("offline proof", () => {
-  test("reads a valid blob above the subprocess text-output ceiling", async () => {
+  test.each(["object", "aggregate"])(
+    "rejects the expanded %s limit before any body read or inspection",
+    async (limit) => {
+      const { input } = sample(),
+        path = await sandbox();
+      const original = Buffer.from(input.bytes),
+        pack = original.subarray(original.indexOf("\n\n") + 2, -20),
+        entries = [pack];
+      // Reuse one expanded buffer; only the small compressed entries accumulate.
+      const bytes = Buffer.alloc(limit === "object" ? 104_857_601 : 104_857_600, 97),
+        count = limit === "object" ? 1 : 21;
+      for (let index = 0; index < count; index++) {
+        bytes.writeUInt32BE(index);
+        entries.push(packFor("sha1", [{ type: 3, bytes }]).subarray(12, -20));
+      }
+      const body = Buffer.concat(entries);
+      body.writeUInt32BE(pack.readUInt32BE(8) + count, 8);
+      const oversized = withPack(input, Buffer.concat([body, createHash("sha1").update(body).digest()]));
+      const metadataCalls: string[][] = [],
+        bodyCalls: string[][] = [];
+      let inspections = 0;
+      await expect(
+        createRunObjectValidator({
+          scratchRoot: path,
+          cacheGit: async (cmd, options) => {
+            metadataCalls.push(cmd);
+            return cacheGit(cmd, options);
+          },
+          runProcess: async (options) => {
+            bodyCalls.push(options.cmd);
+            // A regression must fail without expanding gigabytes in the test runner.
+            throw new Error("oversized inventory reached a body read");
+          },
+        })(
+          oversized,
+          async () => {
+            inspections++;
+          },
+          signal(),
+        ),
+      ).rejects.toMatchObject({ code: "unsupported" });
+      expect(metadataCalls.some((cmd) => cmd.includes("--batch-all-objects"))).toBe(true);
+      expect(bodyCalls).toHaveLength(0);
+      expect(inspections).toBe(0);
+      await clean(path);
+    },
+    120_000,
+  );
+  test("reads a valid binary blob exactly at the expanded object cap", async () => {
     const source = await mkdtemp(join(root, "large-source-")),
       path = await sandbox();
-    const bytes = Buffer.alloc(50_000_001, 97);
+    const bytes = Buffer.alloc(104_857_600, 97);
     bytes.set([0, 255, 254, 128], 65_535);
     await git(source, ["init", "--template="]);
     await writeFile(join(source, "large"), bytes);
@@ -536,9 +673,14 @@ describe("unreachable object", () => {
         old = original.subarray(original.indexOf("\n\n") + 2, -width);
       const extra = Buffer.from([0, 255, 254, 128, 0, 13, 10, 1]),
         oid = hashObject(format, "blob", extra);
-      const single = packFor(format, [{ type: 3, bytes: extra }]);
+      const empty = Buffer.alloc(0),
+        emptyOID = hashObject(format, "blob", empty);
+      const single = packFor(format, [
+        { type: 3, bytes: extra },
+        { type: 3, bytes: empty },
+      ]);
       const body = Buffer.concat([old, single.subarray(12, -width)]);
-      body.writeUInt32BE(old.readUInt32BE(8) + 1, 8);
+      body.writeUInt32BE(old.readUInt32BE(8) + 2, 8);
       const updated = withPack(input, Buffer.concat([body, createHash(format).update(body).digest()]));
       await createRunObjectValidator({ scratchRoot: path })(
         updated,
@@ -546,8 +688,11 @@ describe("unreachable object", () => {
           const inventory = [];
           for await (const item of reader.objects()) inventory.push(item.oid);
           expect(inventory).toContain(oid);
+          expect(inventory).toContain(emptyOID);
           expect(await reader.type(oid)).toBe("blob");
           expect(await reader.read(oid)).toEqual(extra);
+          expect(await reader.type(emptyOID)).toBe("blob");
+          expect(await reader.read(emptyOID)).toEqual(empty);
         },
         signal(),
       );
