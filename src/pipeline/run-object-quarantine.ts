@@ -2,18 +2,18 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { cacheGit } from "../git/command.ts";
 import type { GitOptions } from "../git/confinement.ts";
-import { agentEnv } from "../util/proc.ts";
+import { agentEnv, runProcess } from "../util/proc.ts";
 import type { PrivateObjectReader, PrivateObjectType, RunObjectIO } from "./run-object-contract.ts";
 import { RunTransferError } from "./run-transfer-errors.ts";
 
 export interface RunObjectQuarantineDependencies {
   scratchRoot: string;
   cacheGit?: (cmd: string[], options: GitOptions) => Promise<{ stdout: string }>;
+  runProcess?: typeof runProcess;
   makeScratch?: (prefix: string) => Promise<string>;
   removeScratch?: (path: string) => Promise<void>;
 }
 
-/** Offline import boundary; only the awaited callback receives temporary object authority. */
 export function createRunObjectValidator(deps: RunObjectQuarantineDependencies): RunObjectIO["validate"] {
   return async (input, inspect, signal) => {
     let scratch: string | undefined;
@@ -125,6 +125,28 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
           throw new RunTransferError(signal.aborted ? "aborted" : "corrupt");
         }
       };
+      // Raw cat-file output uses lossless streaming beyond sh's bounded text output.
+      const readObject = async (type: string, oid: string) => {
+        const chunks: Uint8Array[] = [];
+        const result = await (deps.runProcess ?? runProcess)({
+          cmd: ["git", `--git-dir=${repo}`, "--no-replace-objects", "cat-file", type, oid],
+          cwd: scratch ?? deps.scratchRoot,
+          env,
+          signal,
+          encoding: "latin1",
+          timeoutMs: 300_000,
+          tailLimit: 0,
+          onRawChunk: (chunk, stream) => {
+            if (stream === "stdout") chunks.push(Buffer.from(chunk, "latin1"));
+          },
+        }).catch(() => {
+          throw new RunTransferError(signal.aborted ? "aborted" : "corrupt");
+        });
+        if (signal.aborted) throw new RunTransferError("aborted");
+        if (result.exitCode !== 0 || result.cancelled || result.timedOut || result.idleTimedOut)
+          throw new RunTransferError("corrupt");
+        return Buffer.concat(chunks);
+      };
       await git(["init", "--bare", `--template=${templates}`, `--object-format=${objectFormat}`, repo]);
       await writeFile(bundle, bytes, { mode: 0o600 });
       await git(["bundle", "verify", bundle]);
@@ -154,7 +176,7 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
         const match = /^([a-f0-9]+) (commit|tree|blob|tag) (0|[1-9][0-9]*)$/.exec(line);
         if (!match || !validOID(match[1] ?? "") || inventory.has(match[1] ?? "")) throw invalid();
         inventory.set(match[1] ?? "", match[2] as PrivateObjectType);
-        const raw = Buffer.from(await git(["cat-file", match[2] ?? "", match[1] ?? ""]), "latin1");
+        const raw = await readObject(match[2] ?? "", match[1] ?? "");
         if (BigInt(raw.length) !== BigInt(match[3] ?? "-1")) throw invalid();
       }
       if (inventory.size !== count) throw invalid();
@@ -189,7 +211,7 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
         read(oid) {
           const task = (async () => {
             check(oid);
-            const raw = Buffer.from(await git(["cat-file", inventory.get(oid) ?? "", oid]), "latin1");
+            const raw = await readObject(inventory.get(oid) ?? "", oid);
             check(oid);
             return raw;
           })();
@@ -215,14 +237,13 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
       throw new RunTransferError(signal.aborted ? "aborted" : unavailable ? "unavailable" : "invalid");
     } finally {
       active = false;
-      const cleanup = async (dir: string) => {
-        try {
-          await (deps.removeScratch ?? ((path) => rm(path, { recursive: true, force: true })))(dir);
-        } catch {
-          throw new RunTransferError("unavailable");
-        }
-      };
-      if (scratch) await cleanup(scratch);
+      const remove = deps.removeScratch ?? ((path: string) => rm(path, { recursive: true, force: true }));
+      if (scratch)
+        await Promise.resolve(scratch)
+          .then(remove)
+          .catch(() => {
+            throw new RunTransferError("unavailable");
+          });
     }
     if (signal.aborted) throw new RunTransferError("aborted");
   };

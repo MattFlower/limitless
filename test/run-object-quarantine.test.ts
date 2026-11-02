@@ -14,7 +14,7 @@ import type {
 import { createRunObjectExporter } from "../src/pipeline/run-object-export.ts";
 import { createRunObjectValidator } from "../src/pipeline/run-object-quarantine.ts";
 import { RunTransferError } from "../src/pipeline/run-transfer-errors.ts";
-import { sh } from "../src/util/proc.ts";
+import { runProcess, sh } from "../src/util/proc.ts";
 
 let root: string;
 const signal = () => new AbortController().signal;
@@ -190,7 +190,26 @@ async function fake(fault = "", abort = false) {
                 : "",
     };
   };
-  const validate = createRunObjectValidator({ scratchRoot: path, cacheGit: runner });
+  const validate = createRunObjectValidator({
+    scratchRoot: path,
+    cacheGit: runner,
+    runProcess: async (options) => {
+      const { stdout } = await runner(options.cmd, options);
+      options.onRawChunk?.(stdout, "stdout");
+      if (abort && fault.startsWith("stream-")) controller.abort();
+      return {
+        stdout: "",
+        stderr: "",
+        exitCode: fault === "stream-exit" ? 1 : 0,
+        signal: null,
+        cancelled: fault === "stream-cancelled",
+        timedOut: fault === "stream-timeout",
+        idleTimedOut: fault === "stream-idle",
+        truncated: false,
+        durationMs: 0,
+      };
+    },
+  });
   return { path, calls, input, controller, validate };
 }
 
@@ -204,6 +223,10 @@ describe("orchestration", () => {
     "rev-list",
     "inventory",
     "read",
+    "stream-exit",
+    "stream-cancelled",
+    "stream-timeout",
+    "stream-idle",
     "noncommit",
     "bad-inventory",
     "size",
@@ -359,6 +382,51 @@ describe("orchestration", () => {
 });
 
 describe("offline proof", () => {
+  test("reads a valid blob above the subprocess text-output ceiling", async () => {
+    const source = await mkdtemp(join(root, "large-source-")),
+      path = await sandbox();
+    const bytes = Buffer.alloc(50_000_001, 97);
+    bytes.set([0, 255, 254, 128], 65_535);
+    await git(source, ["init", "--template="]);
+    await writeFile(join(source, "large"), bytes);
+    await git(source, ["add", "large"]);
+    await git(source, [
+      "-c",
+      "user.name=Test",
+      "-c",
+      "user.email=test@example.com",
+      "commit",
+      "-m",
+      "large blob",
+    ]);
+    const commit = await git(source, ["rev-parse", "HEAD"]),
+      blob = hashObject("sha1", "blob", bytes);
+    const input = await createRunObjectExporter({ scratchRoot: root })(
+      {
+        repository: { path: source, lockPath: source, trust: "factory-owned" },
+        runScope: "large",
+        commits: [commit],
+        objectFormat: "sha1",
+      },
+      signal(),
+    );
+    if (!input) throw new Error("expected export");
+    await rm(source, { recursive: true });
+    let inspected = false;
+    await createRunObjectValidator({ scratchRoot: path })(
+      input,
+      async (reader) => {
+        inspected = true;
+        expect(await reader.type(blob)).toBe("blob");
+        const raw = await reader.read(blob);
+        expect(raw.byteLength).toBe(bytes.length);
+        expect(Buffer.from(raw).equals(bytes)).toBe(true);
+      },
+      signal(),
+    );
+    expect(inspected).toBe(true);
+    await clean(path);
+  }, 30_000);
   test.each(["sha1", "sha256"] as const)(
     "unpublished %s closure survives retention and source removal",
     async (format) => {
@@ -560,6 +628,28 @@ describe("hostile configuration", () => {
 });
 
 describe("inspection lifetime", () => {
+  test("reader subprocess failures hide private diagnostics and still clean up", async () => {
+    const { input, blob } = sample(),
+      path = await sandbox();
+    let inspecting = false;
+    await createRunObjectValidator({
+      scratchRoot: path,
+      runProcess: async (options) => {
+        if (inspecting) throw new Error("private Git diagnostic");
+        return runProcess(options);
+      },
+    })(
+      input,
+      async (reader) => {
+        inspecting = true;
+        const error: unknown = await reader.read(blob).catch((error: unknown) => error);
+        expect(error).toMatchObject({ code: "corrupt" });
+        expect(String(error)).not.toContain("private Git diagnostic");
+      },
+      signal(),
+    );
+    await clean(path);
+  });
   test("in-flight reads cannot escape inspection and finish before scratch removal", async () => {
     const { input, blob } = sample(),
       path = await sandbox();
@@ -570,9 +660,9 @@ describe("inspection lifetime", () => {
       read: Promise<Uint8Array> | undefined;
     const validation = createRunObjectValidator({
       scratchRoot: path,
-      cacheGit: async (cmd, options) => {
-        const result = await cacheGit(cmd, options);
-        if (inspecting && cmd.includes("cat-file")) {
+      runProcess: async (options) => {
+        const result = await runProcess(options);
+        if (inspecting) {
           reading.resolve();
           await finish.promise;
         }
