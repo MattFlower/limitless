@@ -306,6 +306,10 @@ export interface ReviewDeps<T extends Invoked> {
   /** Runs a finder; `sample` distinguishes fresh calls of a two-sample single system. */
   invoke: (request: ReviewRequest, finder: number, sample?: number) => Promise<T>;
   samples?: ReviewSample[];
+  /**
+   * Evals only: records each sample of a two-sample review, a failed invocation included, so a retry
+   * reuses the other. Without it a sample's invocation error is rethrown once both settle.
+   */
   onSample?: (sample: ReviewSample) => void;
   /**
    * Panel only: one read-only verifier batch, routed away from every vendor that raised it and never
@@ -475,8 +479,7 @@ async function runUnion<T extends Invoked>(
         result = invoked.result;
       } catch (error) {
         rethrowClaimControl(error);
-        // Production lets a cancellation or capacity error reach the engine, as a single review does;
-        // evals record the failed sample so a retry reuses the other.
+        // Production lets a cancellation or capacity error reach the engine, as a single review does.
         if (!deps.onSample) throw error;
         result = {
           status: "error",
