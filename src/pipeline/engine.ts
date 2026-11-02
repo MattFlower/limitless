@@ -130,7 +130,7 @@ import {
   type RunState,
   redactPostMergeComparisons,
 } from "./context.ts";
-import { changedCoveringTestFiles, runCoveringTests, succeededCoveringStages } from "./covering-tests.ts";
+import { relevantCoveringTestFiles, runCoveringTests, succeededCoveringStages } from "./covering-tests.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { applyGateEvidence, gateTestCommand } from "./gate-evidence.ts";
 import {
@@ -2403,7 +2403,6 @@ async function oneRound(
   let interruption: ClaimControlError | undefined;
   try {
     const verifiedSha = await headSha(cwd);
-    const coveringChangedFiles = await changedCoveringTestFiles(cwd, baseSha, verifiedSha, ctx.signal);
     const checkVerifiedHead = async () => {
       if ((await headSha(cwd)) !== verifiedSha)
         throw new NeedsHumanError(
@@ -2419,7 +2418,7 @@ async function oneRound(
     };
     const browserOutput = (value: Verify, context?: BrowserContext) =>
       applyBrowserContext(value, ctx.state.spec as Spec, ctx.state.holdout as Holdout, context);
-    const resolveVerify = (value: Verify, context?: BrowserContext) =>
+    const resolveVerify = async (value: Verify, context?: BrowserContext) =>
       normalizeVerify(
         applyGateEvidence(
           browserOutput(value, context),
@@ -2431,7 +2430,13 @@ async function oneRound(
           {
             runs: ctx.state.coveringTestRuns ?? [],
             succeededStageIds: succeededCoveringStages(ctx),
-            changedFiles: coveringChangedFiles,
+            relevantFiles: await relevantCoveringTestFiles(
+              cwd,
+              baseSha,
+              verifiedSha,
+              (ctx.state.coveringTestRuns ?? []).map((run) => run.file),
+              ctx.signal,
+            ),
           },
         ),
         ctx.state.spec as Spec,
@@ -2571,7 +2576,7 @@ async function oneRound(
           const { modelOutput, modelId, browserContext } = pendingVerify(attempt) ?? (await obtainOutput());
           await executeCovering(modelOutput, browserContext);
           await checkVerifiedHead();
-          const v = resolveVerify(modelOutput, browserContext);
+          const v = await resolveVerify(modelOutput, browserContext);
           ctx.state.lastVerify = { ...v, modelId };
           ctx.state.verifyResults = [
             ...(ctx.state.verifyResults ?? []),
@@ -2678,7 +2683,7 @@ async function oneRound(
         const output = VerifySchema.parse(original);
         await executeCovering(output, recorded?.browserContext);
         await checkVerifiedHead();
-        verify = resolveVerify(output, recorded?.browserContext);
+        verify = await resolveVerify(output, recorded?.browserContext);
       } else verify = await verifyAttempt(pending?.attempt ?? 0);
     }
     if (recorded) {

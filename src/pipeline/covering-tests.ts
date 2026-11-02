@@ -1,3 +1,6 @@
+import { posix } from "node:path";
+import { parse } from "@babel/parser";
+import { traverseFast } from "@babel/types";
 import type { GateConfig } from "../gates/detect.ts";
 import { quoteRetryFiles, singleBunTest } from "../gates/docs.ts";
 import { validRetryFiles } from "../gates/junit.ts";
@@ -37,10 +40,11 @@ export const coveringPattern = (name: string): string =>
   `(?:^| )${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
 
 /** Re-derived on reconciliation; working-tree edits and later commits cannot establish relevance. */
-export async function changedCoveringTestFiles(
+export async function relevantCoveringTestFiles(
   cwd: string,
   base: string,
   sha: string,
+  files: string[],
   signal?: AbortSignal,
 ): Promise<string[] | undefined> {
   if (![base, sha].every((rev) => /^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(rev))) return;
@@ -49,8 +53,47 @@ export async function changedCoveringTestFiles(
       ["git", "diff", "--no-renames", "--diff-filter=AM", "--name-only", "-z", `${base}...${sha}`, "--"],
       { cwd, signal, allowFail: true },
     );
-    if (diff.exitCode === 0 && !diff.stdout.includes("\uFFFD"))
-      return diff.stdout.split("\0").filter(Boolean);
+    if (diff.exitCode !== 0 || diff.timedOut || diff.stdout.includes("\uFFFD")) return;
+    const changed = diff.stdout.split("\0").filter(Boolean);
+    const relevant = [...changed];
+    for (const file of new Set(files.map((file) => file.replace(/^\.\//, "")))) {
+      if (changed.includes(file)) continue;
+      try {
+        const content = await worktreeGit(["git", "show", `${sha}:${file}`], {
+          cwd,
+          signal,
+          allowFail: true,
+        });
+        if (content.exitCode !== 0 || content.timedOut || content.stdout.includes("\uFFFD")) continue;
+        const ast = parse(content.stdout, {
+          sourceType: "unambiguous",
+          plugins: /\.[cm]?[jt]sx$/.test(file) ? ["typescript", "jsx"] : ["typescript"],
+          tokens: true,
+        });
+        // Empty import-from and side-effect imports share an empty AST specifier list.
+        const tokens = ast.tokens?.filter((token) => typeof token.type !== "string") ?? [];
+        const fromSources = new Set(
+          tokens.filter((_, i) => tokens[i - 1]?.value === "from").map((t) => t.start),
+        );
+        let related = false;
+        traverseFast(ast, (node) => {
+          const source =
+            (node.type === "ImportDeclaration" && fromSources.has(node.source.start)) ||
+            node.type === "ExportNamedDeclaration" ||
+            node.type === "ExportAllDeclaration" ||
+            node.type === "ImportExpression"
+              ? node.source
+              : undefined;
+          if (source?.type !== "StringLiteral" || !/^\.\.?\//.test(source.value)) return;
+          const target = posix.normalize(posix.join(posix.dirname(file), source.value));
+          if (!target.startsWith("../") && changed.includes(target)) related = true;
+        });
+        if (related) relevant.push(file);
+      } catch {
+        signal?.throwIfAborted();
+      }
+    }
+    return relevant;
   } catch {
     signal?.throwIfAborted();
   }
