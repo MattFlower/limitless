@@ -1,4 +1,4 @@
-import { expect, spyOn } from "bun:test";
+import { expect, mock, spyOn } from "bun:test";
 import * as subprocess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -9,6 +9,7 @@ import { Store } from "../src/db/store.ts";
 import { compareGates, runGates } from "../src/gates/run.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
+import { privacyLimits } from "../src/util/privacy-boundary.ts";
 import {
   CommandError,
   ProcessTerminationError,
@@ -22,6 +23,7 @@ import {
   runProcess,
   sh,
 } from "../src/util/proc.ts";
+import { processCaptureObserver } from "../src/util/proc-capture.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { expectProcessStopped } from "./process-support.ts";
 import { test } from "./read-policy-support.ts";
@@ -32,6 +34,7 @@ type Chunk = { stream: "stdout" | "stderr"; text: string | Buffer };
 async function withChunks<T>(
   chunks: Chunk[] | ((token: string | undefined) => Chunk[]),
   run: () => Promise<T>,
+  finish: { beforeEnd?: (child: subprocess.ChildProcess) => void; code?: number; signal?: string } = {},
 ): Promise<T> {
   const spawnFixture = (_bin: string, args?: readonly string[]) => {
     const stdout = new PassThrough();
@@ -50,9 +53,10 @@ async function withChunks<T>(
         stdout.write(`${token}\n`);
       for (const chunk of typeof chunks === "function" ? chunks(token) : chunks)
         ({ stdout, stderr })[chunk.stream].write(chunk.text);
+      finish.beforeEnd?.(child);
       stdout.end();
       stderr.end();
-      setImmediate(() => child.emit("close", 0, null));
+      setImmediate(() => child.emit("close", finish.code ?? 0, finish.signal ?? null));
     });
     return child;
   };
@@ -65,6 +69,141 @@ async function withChunks<T>(
 }
 
 const options = (): ProcOptions => ({ cmd: ["fixture"], cwd: process.cwd(), env: {} });
+const captured = (opts?: Partial<ProcOptions>) =>
+  runProcess({ ...options(), captureComplete: true, ...opts });
+
+test("complete capture preserves split UTF-8 and pre-redaction text on both streams", async () => {
+  const secret = "synthetic-complete-capture-credential";
+  registerCredential("COMPLETE_CAPTURE_TEST_TOKEN", secret);
+  const text = `\uFEFFé€🔑\u001b[31m${secret}\u001b[0m\nlast`;
+  const bytes = Buffer.from(text);
+  const chunks = Array.from(bytes, (_, i) =>
+    (["stdout", "stderr"] as const).map((stream) => ({ stream, text: bytes.subarray(i, i + 1) })),
+  ).flat();
+  const lines: string[] = [];
+  const raw = { stdout: "", stderr: "" };
+  const result = await withChunks(
+    chunks,
+    () =>
+      captured({
+        redactOutput: true,
+        onRawChunk: (chunk, stream) => {
+          raw[stream] += chunk;
+        },
+        onStdoutLine: (line) => lines.push(line),
+        onStderrLine: (line) => lines.push(line),
+      }),
+    { code: 7 },
+  );
+  expect(result.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: text });
+  expect(raw).toEqual({ stdout: text, stderr: text });
+  expect(result.stdout).toBe("\uFEFFé€🔑[redacted]\nlast");
+  expect(result.stderr).toBe(result.stdout);
+  expect(lines).toEqual(["\uFEFFé€🔑[redacted]", "\uFEFFé€🔑[redacted]", "last", "last"]);
+  expect(result.exitCode).toBe(7);
+});
+
+test.each(["stdout", "stderr"] as const)("capture refuses malformed %s bytes", async (stream) => {
+  for (const bytes of [Buffer.from([0xff]), Buffer.from([0xf0, 0x9f])]) {
+    const result = await withChunks(
+      [
+        { stream, text: "unpublished-capture-sentinel" },
+        { stream, text: bytes },
+      ],
+      () => captured(),
+    );
+    expect(result.capture).toEqual({ provenance: { kind: "legacy-unknown" } });
+    expect(result[stream]).toBe("unpublished-capture-sentinel\uFFFD");
+    expect(result).toMatchObject({ exitCode: 0, signal: null, timedOut: false, cancelled: false });
+  }
+});
+
+test("capture shares one UTF-16 cap and discards overflow while draining", async () => {
+  const out = "🔑".repeat(privacyLimits.inputUnits / 4);
+  const err = "e".repeat(privacyLimits.inputUnits / 2);
+  for (const extra of [false, true]) {
+    let retained = 0;
+    const observed: number[] = [];
+    const chunks: Chunk[] = [
+      { stream: "stdout", text: out },
+      { stream: "stderr", text: err },
+    ];
+    if (extra) chunks.push({ stream: "stderr", text: "!" }, { stream: "stdout", text: "after-overflow" });
+    const run = () =>
+      withChunks(chunks, () => captured({ tailLimit: 14, onRawChunk: () => observed.push(retained) }));
+    const result = await processCaptureObserver.run((units) => {
+      expect(units).toBeLessThanOrEqual(privacyLimits.inputUnits);
+      retained = units;
+    }, run);
+    expect(observed).toEqual(
+      extra ? [out.length, privacyLimits.inputUnits, 0, 0] : [out.length, privacyLimits.inputUnits],
+    );
+    expect(result.capture).toEqual(
+      extra
+        ? { provenance: { kind: "cut", truncated: true } }
+        : { provenance: { kind: "complete" }, stdout: out, stderr: err },
+    );
+    if (extra) expect(result.stdout).toBe("after-overflow");
+  }
+});
+
+test.each(["stdout", "stderr", "spawn", "signal", "cancel", "invalid after overflow"])(
+  "capture is textless unknown after %s",
+  async (failure) => {
+    const controller = new AbortController();
+    const chunks: Chunk[] = [{ stream: "stdout", text: "partial" }];
+    if (failure === "invalid after overflow")
+      chunks.push(
+        { stream: "stderr", text: "x".repeat(privacyLimits.inputUnits) },
+        { stream: "stdout", text: Buffer.from([0xff]) },
+      );
+    const result = await withChunks(chunks, () => captured({ signal: controller.signal }), {
+      signal: failure === "signal" ? "SIGTERM" : undefined,
+      beforeEnd: (child) => {
+        if (failure === "stdout" || failure === "stderr")
+          child[failure]?.emit("error", new Error("unpublished-stream-error"));
+        if (failure === "spawn") child.emit("error", new Error("injected spawn failure"));
+        if (failure === "cancel") controller.abort();
+      },
+    });
+    expect(result.capture).toEqual({ provenance: { kind: "legacy-unknown" } });
+    expect(result).toMatchObject({
+      cancelled: failure === "cancel",
+      timedOut: false,
+      idleTimedOut: false,
+      signal: failure === "signal" ? "SIGTERM" : null,
+    });
+    expect(result.stderr).not.toContain("unpublished-stream-error");
+    expect(result.stdout).toStartWith("partial");
+  },
+);
+
+test("legacy result shape and pre-dispatch encoding refusal", async () => {
+  const result = await withChunks([{ stream: "stdout", text: "ok" }], () => runProcess(options()));
+  expect(result).toEqual({
+    exitCode: 0,
+    signal: null,
+    cancelled: false,
+    cancelKilled: false,
+    timedOut: false,
+    idleTimedOut: false,
+    stdout: "ok",
+    stderr: "",
+    truncated: false,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    durationMs: expect.any(Number),
+  });
+  const spawn = spyOn(subprocess, "spawn");
+  const dispatchGuard = mock(() => {});
+  try {
+    await expect(captured({ encoding: "latin1", dispatchGuard })).rejects.toThrow("requires UTF-8");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(dispatchGuard).not.toHaveBeenCalled();
+  } finally {
+    spawn.mockRestore();
+  }
+});
 
 test("bounded framing releases oversized lines on both streams and preserves separate startup lines", async () => {
   const lines: string[] = [];
@@ -882,8 +1021,9 @@ for (const [idle, code] of [
     try {
       const cmd = [process.execPath, "-e", `process.exit(${code})`];
       const timeout = idle ? { idleTimeoutMs: 100_000 } : { timeoutMs: 100_000 };
-      const result = await runProcess({ cmd, cwd: process.cwd(), env: {}, ...timeout });
+      const result = await captured({ cmd, ...timeout });
       expect(result).toMatchObject({ exitCode: code, signal: null, timedOut: false, idleTimedOut: false });
+      expect(result.capture).toEqual({ provenance: { kind: "complete" }, stdout: "", stderr: "" });
       if (!idle && code === 0) {
         await expect(sh(cmd, { cwd: process.cwd(), ...timeout })).resolves.toMatchObject({
           exitCode: 0,
@@ -911,8 +1051,10 @@ test("a live direct child is still killed and reported as timed out", async () =
     cwd: process.cwd(),
     env: {},
     timeoutMs: 25,
+    captureComplete: true,
   });
   expect(result).toMatchObject({ timedOut: true, exitCode: null, signal: "SIGKILL" });
+  expect(result.capture).toEqual({ provenance: { kind: "legacy-unknown" } });
 }, 15_000);
 
 for (const [idle, code] of [
@@ -970,8 +1112,9 @@ for (const [idle, code] of [
       ];
       const timeout = idle ? { idleTimeoutMs: 100_000, idleNow: () => now } : { timeoutMs: 100_000 };
       const opts = { cwd: process.cwd(), ...timeout };
-      const result = await processInspection.run(inspect, () => runProcess({ cmd, env: {}, ...opts }));
+      const result = await processInspection.run(inspect, () => captured({ cmd, ...opts }));
       expect(result).toMatchObject({ exitCode: code, signal: null, timedOut: !idle, idleTimedOut: idle });
+      expect(result.capture).toEqual({ provenance: { kind: "legacy-unknown" } });
       if (!idle && code === 0) {
         await expect(
           processInspection.run(inspect, () => sh(cmd, { ...opts, allowFail: true })),
