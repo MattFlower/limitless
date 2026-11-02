@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { cacheGit } from "../git/command.ts";
 import type { GitOptions } from "../git/confinement.ts";
+import { rethrowClaimControl } from "../integrations/claim-errors.ts";
 import { agentEnv, runProcess } from "../util/proc.ts";
 import type { PrivateObjectReader, PrivateObjectType, RunObjectIO } from "./run-object-contract.ts";
 import { RunTransferError } from "./run-transfer-errors.ts";
@@ -121,7 +122,8 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
           );
           signal.throwIfAborted();
           return result.stdout;
-        } catch {
+        } catch (error) {
+          rethrowClaimControl(error);
           throw new RunTransferError(signal.aborted ? "aborted" : "corrupt");
         }
       };
@@ -142,7 +144,8 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
             length += chunk.length;
             if (length <= size) raw?.write(chunk, offset, chunk.length, "latin1");
           },
-        }).catch(() => {
+        }).catch((error: unknown) => {
+          rethrowClaimControl(error);
           throw new RunTransferError(signal.aborted ? "aborted" : "corrupt");
         });
         if (signal.aborted) throw new RunTransferError("aborted");
@@ -243,6 +246,7 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
       }
       signal.throwIfAborted();
     } catch (error) {
+      rethrowClaimControl(error);
       if (error instanceof RunTransferError) throw error;
       throw new RunTransferError(signal.aborted ? "aborted" : unavailable ? "unavailable" : "invalid");
     } finally {
@@ -251,7 +255,8 @@ export function createRunObjectValidator(deps: RunObjectQuarantineDependencies):
       if (scratch)
         await Promise.resolve(scratch)
           .then(remove)
-          .catch(() => {
+          .catch((error: unknown) => {
+            rethrowClaimControl(error);
             throw new RunTransferError("unavailable");
           });
     }
