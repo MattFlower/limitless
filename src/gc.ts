@@ -142,22 +142,23 @@ export async function collectGarbage(
       run.status === "failed" || run.status === "needs_human"
         ? cfg.retention.failedWorktreeDays
         : cfg.retention.worktreeDays;
-    if (!due(run, now, days)) return [];
+    if (!due(run, now, days)) return;
     const repo = repos.get(run.repoId);
     if (!repo) {
       result.errors.push(`${run.id}: registered repository missing`);
-      return [];
+      return;
     }
     try {
       const path = child(workRoot, run.id);
-      return [{ run, repo, path, exists: existsSync(path) }];
+      return { repo, path, exists: existsSync(path) };
     } catch (error) {
       result.errors.push(`${run.id} worktree: ${(error as Error).message}`);
-      return [];
     }
   }
-  const worktrees = scan(() => finished.flatMap(scanWorktree));
-  for (const { run, repo, path, exists } of worktrees) {
+  for (const run of finished) {
+    const worktree = scan(() => scanWorktree(run));
+    if (!worktree) continue;
+    const { repo, path, exists } = worktree;
     try {
       const cache = repo.kind === "local" && exists ? await worktreeOwner(path) : cachePath(cfg.paths, repo);
       // The common repository is factory/user-owned; agents write only the linked checkout.
@@ -190,7 +191,9 @@ export async function collectGarbage(
           throw new Error(`worktree is not registered to ${repo.slug}: ${path}`);
         }
       });
-      if (!dryRun && !existsSync(path)) rmSync(`${path}.git-paths`, { force: true });
+      scan(() => {
+        if (!dryRun && !existsSync(path)) rmSync(`${path}.git-paths`, { force: true });
+      });
     } catch (error) {
       result.errors.push(`${run.id} worktree: ${(error as Error).message}`);
     }

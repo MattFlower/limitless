@@ -556,6 +556,98 @@ for (const operation of ["gc.collect", "workers.sweep", "workers.sweep-agent-job
   );
 }
 
+for (const action of ["start", "stop"] as const) {
+  test.each([
+    [49, false],
+    [50, false],
+    [51, false],
+    [3000, false],
+    [3000, true],
+  ] as const)(`Factory ${action} times agent-job retention at %sms, failure=%s`, async (duration, fail) => {
+    const f = backgroundFixture();
+    f.cfg.workers.listen = "127.0.0.1:0";
+    f.cfg.workers.agents = ["implement"];
+    const factory = new Factory(f.cfg, {
+      store: f.store,
+      providers: [],
+      cleanup: async () => ({
+        dryRun: false,
+        worktrees: [],
+        logs: [],
+        metadata: [],
+        debugEvents: 0,
+        baselineCache: 0,
+        feedItems: 0,
+        errors: [],
+      }),
+    });
+    const active = f.store.createRun(f.repo, { repo: f.repo.slug, prompt: f.marker });
+    const terminal = f.store.createRun(f.repo, { repo: f.repo.slug, prompt: f.marker });
+    f.store.updateRun(terminal.id, { status: "succeeded", finishedAt: 1 });
+    const request = {
+      runId: active.id,
+      invocationId: 1,
+      parentSha: "a".repeat(40),
+      prompt: f.marker,
+      timeoutMs: 1000,
+      target: {
+        modelId: "fake",
+        provider: "fake",
+        harness: "claude" as const,
+        model: "fake",
+        vendor: "fake",
+        tier: 1,
+        billing: "free" as const,
+      },
+    };
+    const kept = factory.workers.enqueueAgentJob(request);
+    const cancelled = factory.workers.enqueueAgentJob({ ...request, runId: terminal.id });
+    f.store.setRunState(active.id, { agentJob: { id: kept } });
+    f.store.setRunState(terminal.id, { agentJob: { id: cancelled } });
+    const originalState = f.store.getRunState.bind(f.store);
+    const failure = new Error(f.marker);
+    const state = spyOn(f.store, "getRunState").mockImplementation((id) => {
+      expect(id).toBe(active.id);
+      f.advance(duration);
+      if (fail) throw failure;
+      return originalState(id);
+    });
+    const cancel = spyOn(factory.workers, "cancelOpenAgentJobs");
+    const scheduler = spyOn(factory.scheduler, "start").mockImplementation(() => {
+      expect(cancel).toHaveBeenCalledWith(new Set([kept]));
+    });
+    try {
+      if (fail) {
+        if (action === "start") expect(() => factory.start()).toThrow(failure);
+        else await expect(factory.stop()).rejects.toBe(failure);
+        expect(cancel).not.toHaveBeenCalled();
+      } else {
+        if (action === "start") factory.start();
+        else await factory.stop();
+        expect(state).toHaveBeenCalledTimes(1);
+        expect(cancel).toHaveBeenCalledWith(new Set([kept]));
+        expect(factory.workers.agentJob(kept ?? "")?.state).toBe("queued");
+        expect(factory.workers.agentJob(cancelled ?? "")?.state).toBe("cancelled");
+      }
+      stallReporter.sample(3000);
+      if (duration > 50)
+        expect(f.lines.at(-1)).toContain(
+          `workers.retain-agent-jobs: count=1 total=${duration}ms max=${duration}ms`,
+        );
+      else expect(f.lines.at(-1)).not.toContain("workers.retain-agent-jobs");
+      for (const value of [f.marker, f.root, f.repo.id, active.id, terminal.id, kept, cancelled])
+        if (value) expect(f.lines.at(-1)).not.toContain(value);
+      expect(f.lines.at(-1)).not.toContain("active=");
+    } finally {
+      state.mockRestore();
+      cancel.mockRestore();
+      scheduler.mockRestore();
+      await factory.stop();
+      f.close();
+    }
+  });
+}
+
 test.each(["resume", "shutdown"] as const)(
   "drain is one session across repeated requests until %s",
   async (finish) => {
@@ -769,10 +861,11 @@ function gcRuns(f: ReturnType<typeof backgroundFixture>, count = 3) {
 }
 
 test.each([49, 50, 51])(
-  "GC aggregates synchronous filesystem passes at %sms, retained after span closes",
+  "GC thresholds per-run worktree scans and contiguous log passes at %sms, retained after span closes",
   async (duration) => {
     const f = backgroundFixture();
-    const runs = gcRuns(f);
+    // Four log-stat calls keep the fake-clock increments exact at the 50 ms boundary.
+    const runs = gcRuns(f, 2);
     const originalExists = fs.existsSync,
       originalLstat = fs.lstatSync;
     const seen = new Set<string>();
@@ -780,7 +873,7 @@ test.each([49, 50, 51])(
       const key = String(path);
       if (runs.some((r) => r.worktree === key) && !seen.has(key)) {
         seen.add(key);
-        f.advance(duration / runs.length);
+        f.advance(duration);
       }
       return originalExists(path);
     });
@@ -791,12 +884,16 @@ test.each([49, 50, 51])(
     try {
       const result = await collectGarbage(f.store, f.cfg, { now: Date.now() });
       expect(result.errors).toEqual([]);
-      expect(result.logs).toHaveLength(3);
+      expect(result.logs).toHaveLength(2);
       expect(result.worktrees).toEqual([]);
       stallReporter.sample(3000);
       expect(f.lines.at(-1)).not.toContain("active=");
-      for (const label of ["gc.worktrees", "gc.logs"]) {
-        if (duration > 50) expect(f.lines.at(-1)).toContain(`${label}: count=1 total=51ms max=51ms`);
+      for (const [label, count] of [
+        ["gc.worktrees", 2],
+        ["gc.logs", 1],
+      ] as const) {
+        if (duration > 50)
+          expect(f.lines.at(-1)).toContain(`${label}: count=${count} total=${count * 51}ms max=51ms`);
         else expect(f.lines.at(-1)).not.toContain(label);
       }
       expect(f.lines.at(-1)).not.toContain(f.marker);
@@ -929,6 +1026,49 @@ for (const phase of ["validation", "canonical"] as const) {
     },
   );
 }
+
+test.each([
+  [49, false],
+  [50, false],
+  [51, false],
+  [3000, false],
+  [3000, true],
+] as const)("GC times sidecar deletion at %sms, failure=%s", async (duration, fail) => {
+  const f = backgroundFixture();
+  const [run] = gcRuns(f, 1);
+  if (!run) throw new Error("missing run");
+  const sidecar = `${run.worktree}.git-paths`;
+  writeFileSync(sidecar, f.marker);
+  const originalRm = fs.rmSync;
+  const remove = spyOn(fs, "rmSync").mockImplementation((path, opts) => {
+    if (String(path) === sidecar) {
+      f.advance(duration);
+      if (fail) throw new Error(f.marker);
+    }
+    return originalRm(path, opts);
+  });
+  try {
+    const dry = await collectGarbage(f.store, f.cfg, { dryRun: true });
+    expect(dry.errors).toEqual([]);
+    expect(remove).not.toHaveBeenCalled();
+    expect(fs.existsSync(sidecar)).toBe(true);
+    stallReporter.sample(0);
+    const result = await collectGarbage(f.store, f.cfg);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(result.errors).toEqual(fail ? [`${run.run.id} worktree: ${f.marker}`] : []);
+    expect(fs.existsSync(sidecar)).toBe(fail);
+    stallReporter.sample(3000);
+    if (duration > 50)
+      expect(f.lines.at(-1)).toContain(`gc.worktrees: count=1 total=${duration}ms max=${duration}ms`);
+    else expect(f.lines.at(-1)).not.toContain("gc.worktrees");
+    expect(f.lines.at(-1)).not.toContain("active=");
+    for (const value of [f.marker, f.root, f.repo.id, run.run.id, sidecar])
+      expect(f.lines.at(-1)).not.toContain(value);
+  } finally {
+    remove.mockRestore();
+    f.close();
+  }
+});
 
 test("GC attributes many individually fast canonical lookups as one contiguous worktree pass", async () => {
   const f = backgroundFixture();
