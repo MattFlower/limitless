@@ -5,7 +5,8 @@ import type { GitOptions } from "../git/confinement.ts";
 import { withRepoLock } from "../git/repos.ts";
 import { agentEnv } from "../util/proc.ts";
 import type { RunObjectIO } from "./run-object-contract.ts";
-import { RunTransferError, type RunTransferErrorCode } from "./run-transfer-errors.ts";
+import { createRunObjectPrivacyValidator } from "./run-object-privacy.ts";
+import { RunTransferError, type RunTransferErrorCode, rethrowRunTransfer } from "./run-transfer-errors.ts";
 
 type GitRunner = (cmd: string[], options: GitOptions) => Promise<{ stdout: string }>;
 export interface RunObjectExportDependencies {
@@ -15,10 +16,13 @@ export interface RunObjectExportDependencies {
   makeScratch?: (prefix: string) => Promise<string>;
   readBundle?: (path: string) => Promise<Uint8Array>;
   removeScratch?: (path: string) => Promise<void>;
+  credentials?: () => readonly string[];
+  validate?: RunObjectIO["validate"];
 }
 
-/** Isolated committed-object export; no production caller until private validation is composed. */
+/** Isolated committed-object export; accepted bytes have passed private quarantine inspection. */
 export function createRunObjectExporter(deps: RunObjectExportDependencies): RunObjectIO["export"] {
+  const validate = createRunObjectPrivacyValidator(deps);
   return async (input, signal) => {
     let code: RunTransferErrorCode = "invalid";
     try {
@@ -120,11 +124,15 @@ export function createRunObjectExporter(deps: RunObjectExportDependencies): RunO
           await cleanup();
         }
       });
+      code = "invalid";
+      await validate(result, async () => {}, signal);
       signal.throwIfAborted();
       return result;
     } catch (error) {
-      if (error instanceof RunTransferError) throw error;
-      throw new RunTransferError(signal.aborted ? "aborted" : code);
+      rethrowRunTransfer(
+        error,
+        signal.aborted ? "aborted" : error instanceof RunTransferError ? error.code : code,
+      );
     }
   };
 }
