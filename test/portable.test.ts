@@ -15,6 +15,7 @@ import {
   formatManifest,
   type ManifestV1,
   type ManifestV2,
+  type ManifestV3,
   manifestDigest,
   parseManifest,
 } from "../src/pipeline/portable.ts";
@@ -364,17 +365,22 @@ test.each<[string, (text: string) => string]>([
   ],
   ["alternate number notation", (text) => text.replace('"generation":0', '"generation":0e0')],
   ["alternate string escape", (text) => text.replace('"prepare"', '"prepar\\u0065"')],
-])("manifest spelling %s is rejected only for V2", (_name, spelling) => {
+])("manifest spelling %s is rejected for V2 and V3", (_name, spelling) => {
   const v1 = manifest();
   const v2: ManifestV2 = { ...v1, schema: 2 };
   const canonicalV2 = canonicalFixture.replace('"schema":1', '"schema":2');
   expect(formatManifest(v2)).toBe(canonicalV2);
   expect(parseManifest(canonicalV2)).toEqual(v2);
   expect(parseManifest(spelling(canonicalV2))).toBe("malformed");
+  const v3: ManifestV3 = { ...v2, schema: 3, blobs: { ...v2.blobs, artifacts: [] } };
+  const canonicalV3 = canonicalFixture.replace('"schema":1', '"schema":3');
+  expect(formatManifest(v3)).toBe(canonicalV3);
+  expect(parseManifest(canonicalV3)).toEqual(v3);
+  expect(parseManifest(spelling(canonicalV3))).toBe("malformed");
   expect(parseManifest(spelling(canonicalFixture))).toEqual(v1);
 });
 
-test.each([3, 999])("manifest version %s stays unsupported at every entry point", (schema) => {
+test.each([4, 999])("manifest version %s stays unsupported at every entry point", (schema) => {
   for (const value of [{ ...manifest(), schema }, { schema }, { schema, phase: null, runId: false }]) {
     expect(parseManifest(JSON.stringify(value))).toEqual({ unsupported: schema });
     for (const action of [formatManifest, manifestDigest]) {
@@ -390,7 +396,7 @@ test.each([3, 999])("manifest version %s stays unsupported at every entry point"
   }
 });
 
-test.each([1, 2])("malformed supported manifest version %s stays malformed", (schema) => {
+test.each([1, 2, 3])("malformed supported manifest version %s stays malformed", (schema) => {
   const value = { schema, phase: null };
   expect(parseManifest(JSON.stringify(value))).toBe("malformed");
   for (const action of [formatManifest, manifestDigest])
@@ -497,7 +503,8 @@ test("parser inspects numeric versions before validating and never coerces schem
   for (const schema of ["1", "2"])
     expect(parseManifest(JSON.stringify({ ...manifest(), schema }))).toBe("malformed");
   expect(parseManifest(JSON.stringify({ ...fullManifest(), schema: 2, extra: "future" }))).toBe("malformed");
-  expect(parseManifest('{"schema":3}')).toEqual({ unsupported: 3 });
+  expect(parseManifest('{"schema":3}')).toBe("malformed");
+  expect(parseManifest('{"schema":4}')).toEqual({ unsupported: 4 });
   expect(parseManifest(JSON.stringify({ schema: -2.5, extra: "future" }))).toEqual({
     unsupported: -2.5,
   });
@@ -515,4 +522,14 @@ test("valid manifest boundaries include both SHA lengths, run ID limits and maxi
   expect(
     parseManifest(JSON.stringify({ ...manifest(), key: { kind: "run", repo: slug, runId: "short" } })),
   ).toBe("malformed");
+});
+
+test("version 3 requires canonical text and tagged artifact references only", () => {
+  const m: ManifestV3 = { ...manifest(), schema: 3, blobs: { ...manifest().blobs, artifacts: [] } };
+  expect(parseManifest(formatManifest(m))).toEqual(m);
+  expect(parseManifest(JSON.stringify(m))).toBe("malformed");
+  const tagged = { ...m, blobs: { ...m.blobs, artifacts: [{ ...blob, role: "holdout" as const }] } };
+  expect(parseManifest(formatManifest(tagged))).toEqual(tagged);
+  expect(parseManifest(formatManifest(tagged).replace(',"role":"holdout"', ""))).toBe("malformed");
+  expect(parseManifest(formatManifest(tagged).replace('"holdout"', '"unknown"'))).toBe("malformed");
 });
