@@ -21,6 +21,7 @@ import { checklistPrompt } from "../src/evals/checklist.ts";
 import { checkPrivateText, loadPrivateStrings } from "../src/gates/private.ts";
 import { compareGates } from "../src/gates/run.ts";
 import type { ModelDef } from "../src/router/catalog.ts";
+import { reviewCase } from "./evals-reading-support.ts";
 import { evalFixture } from "./evals-support.ts";
 
 // M5.2 adjudicated cases are review-040..review-108; the 2026-10-16 fresh clean set follows them.
@@ -769,7 +770,7 @@ test("M5.2 cases preserve previous cases and load with pins, adjudicated labels 
   }
 });
 
-test("all new review ids validate without scheduling model calls", () => {
+test("review selections protect escape held-out cases while preserving deliberate IDs and other splits", () => {
   const model: ModelDef = {
     id: "candidate-a",
     provider: "fixture",
@@ -800,6 +801,45 @@ test("all new review ids validate without scheduling model calls", () => {
   const caseIds = file.cases.slice(53).map((item) => item.id);
   const result = validateRequest({ role: "review", models: [model.id], caseIds, maxUsd: 0 }, file, router);
   expect(result.cases.map((item) => item.id)).toEqual(caseIds);
+  const mixed = ReviewCaseFileSchema.parse({
+    role: "review",
+    version: 1,
+    cases: ["escapes-heldout", "dev", "heldout", undefined, "escapes-dev", "escapes-heldout"].map(
+      (split, index) => ({ ...reviewCase, id: `case-${index}`, split }),
+    ),
+  });
+  const base = { role: "review", models: [model.id] };
+  for (const options of [{}, { includeHeldout: false }]) {
+    const selected = validateRequest({ ...base, ...options }, mixed, router);
+    expect(selected.cases.map((c) => c.id)).toEqual(["case-1", "case-2", "case-3", "case-4"]);
+    expect(selected.excludedHeldout).toBe(2);
+  }
+  const all = validateRequest({ ...base, includeHeldout: true }, mixed, router);
+  expect(all.cases.map((c) => c.id)).toEqual(["case-0", "case-1", "case-2", "case-3", "case-4", "case-5"]);
+  expect(all.excludedHeldout).toBe(0);
+  for (const includeHeldout of [undefined, true]) {
+    const explicit = validateRequest(
+      { ...base, caseIds: ["case-5", "case-2", "case-0"], includeHeldout },
+      mixed,
+      router,
+    );
+    expect(explicit.cases.map((c) => c.id)).toEqual(["case-0", "case-2", "case-5"]);
+    expect(explicit.excludedHeldout).toBe(0);
+    for (const [caseIds, error] of [
+      [["missing"], "Unknown case ID: missing"],
+      [["case-0", "case-0"], "duplicate IDs"],
+      [[], "Too small"],
+    ] as const)
+      expect(() => validateRequest({ ...base, caseIds, includeHeldout }, mixed, router)).toThrow(error);
+  }
+  for (const includeHeldout of ["true", 1, null])
+    expect(() => validateRequest({ ...base, includeHeldout }, mixed, router)).toThrow();
+  const triage = loadCases();
+  for (const includeHeldout of [undefined, true]) {
+    const unchanged = validateRequest({ ...base, role: "triage", includeHeldout }, triage, router);
+    expect(unchanged.cases.map((c) => c.id)).toEqual(triage.cases.map((c) => c.id));
+    expect(unchanged.excludedHeldout).toBe(0);
+  }
 });
 
 test("fixed-seed review split groups whole PRs and reproduces the pre-registered assignment", () => {
