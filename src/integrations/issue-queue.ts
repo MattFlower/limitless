@@ -86,11 +86,20 @@ export function trustedAcceptanceLabel(issue: QueueIssue, trusted: string[]): bo
 }
 const issueKey = (repo: string, number: number) => `${repo.toLowerCase()}#${number}`;
 const priority = (s: string) => /^priority:(10|[0-9])$/.test(s);
-const blockers = (body: string) =>
+const blockers = (body: string, repo: string) =>
   body
     .split(/\r?\n/)
     .filter((line) => /^[\t ]*(?:(?:[-*+]|\d+[.)])[\t ]+)?blocked by\b:?/i.test(line))
-    .flatMap((line) => [...line.matchAll(/#([1-9][0-9]*)\b/g)].map((m) => Number(m[1])));
+    .flatMap((line) =>
+      [
+        ...line.matchAll(
+          /(?:https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/issues\/|([\w.-]+\/[\w.-]+)#|#)([1-9][0-9]*)\b/gi,
+        ),
+      ].map((m) => ({
+        repo: (m[1] ?? m[2] ?? repo).toLowerCase(),
+        number: Number(m[3]),
+      })),
+    );
 
 /** Undefined means incomplete evidence: preserve the saved observation. */
 export function epicAttention(
@@ -183,7 +192,8 @@ export function issueEligibility(
   issue: QueueIssue,
   trusted: string[],
   context: {
-    blockers?: ReadonlyMap<number, string>;
+    repo?: string;
+    blockers?: ReadonlyMap<string, string>;
     claim?: Run | null;
     latest?: IssueRunSummary | null;
     failureBoundary?: number | null;
@@ -239,7 +249,11 @@ export function issueEligibility(
   else if (!approved.length) reason = "priority application is untrusted or missing";
   else if (issue.subIssuesSummary.total) reason = "epic has sub-issues";
   else if (issue.blockedBy.nodes.some((b) => b.state !== "CLOSED")) reason = "open native blocker";
-  else if (blockers(issue.body).some((n) => context.blockers?.get(n) !== "CLOSED"))
+  else if (
+    blockers(issue.body, context.repo ?? "").some(
+      (b) => context.blockers?.get(issueKey(b.repo, b.number)) !== "CLOSED",
+    )
+  )
     reason = "open or unresolved body blocker";
   else if (issue.labels.nodes.some((l) => l.name === "limitless:in-progress"))
     reason = "factory status label";
@@ -373,7 +387,7 @@ export function startIssueQueue(
       invalidated.has(issueKey(repo, number))
         ? "linked run changed during the poll; retrying next poll"
         : null;
-    const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<number, string> }[] =
+    const candidates: { repo: string; issue: QueueIssue; priority: number; states: Map<string, string> }[] =
       [];
     const snapshots = new Map<string, Map<number, IssueRunSummary>>();
     try {
@@ -440,19 +454,25 @@ export function startIssueQueue(
                 throw new Error("Open issue pagination interrupted");
             }
           } while (after);
-          const states = new Map<number, string>();
-          const numbers = [...new Set(issues.nodes.flatMap((i) => blockers(i.body)))];
-          if (numbers.length && !stopped && !limited && now() >= notBefore) {
+          const states = new Map<string, string>();
+          const dependencies = Map.groupBy(
+            issues.nodes.flatMap((i) => blockers(i.body, repo)),
+            (b) => b.repo,
+          );
+          for (const [dependencyRepo, refs] of dependencies) {
+            if (stopped || limited || now() < notBefore) break;
+            const numbers = [...new Set(refs.map((b) => b.number))];
             const deps = await query(
-              repo,
-              numbers.map((n) => `i${n}:issue(number:${n}) { state }`).join(" "),
+              dependencyRepo === repo.toLowerCase() ? repo : dependencyRepo,
+              numbers
+                .map((n) => `i${n}:issue(number:${n}) { number state repository { nameWithOwner } }`)
+                .join(" "),
             );
             for (const n of numbers) {
-              const found = z
-                .object({ state: z.enum(["OPEN", "CLOSED"]) })
-                .nullable()
-                .parse(deps[`i${n}`]);
-              if (found) states.set(n, found.state);
+              const found = issueReference.safeParse(deps[`i${n}`]);
+              const key = issueKey(dependencyRepo, n);
+              if (found.success && issueKey(found.data.repository.nameWithOwner, found.data.number) === key)
+                states.set(key, found.data.state);
             }
           }
           if (stopped) break;
@@ -543,6 +563,7 @@ export function startIssueQueue(
             }
             const result = issueEligibility(issue, q.trusted, {
               defect: defect(repo),
+              repo,
               blockers: states,
               claim: factory.store.issueClaim(repo, issue.number),
               ...latestContext(repo, issue.number, latest.get(issue.number)),
@@ -568,6 +589,7 @@ export function startIssueQueue(
         if (stopped || factory.scheduler.draining) break;
         const current = issueEligibility(issue, q.trusted, {
           defect: defect(repo),
+          repo,
           blockers: states,
           claim: factory.store.issueClaim(repo, issue.number),
           ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
@@ -584,6 +606,7 @@ export function startIssueQueue(
           if (deferred) return deferred;
           const eligibility = issueEligibility(issue, factory.cfg.githubQueue?.trusted ?? [], {
             defect: defect(repo),
+            repo,
             blockers: states,
             ...latestContext(repo, issue.number, snapshots.get(repo.toLowerCase())?.get(issue.number)),
           });
