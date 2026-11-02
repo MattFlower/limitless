@@ -49,13 +49,34 @@ export function sender(direction: Direction, bytes: Iterator<number>, max: numbe
   };
   const ack = (f: Received, schedule: Schedule) => {
     if (f.direction !== direction || f.type !== "ack" || !waiting || f.sequence !== sent - 1) return false;
+    if (
+      Object.keys(f).length !== 6 ||
+      !Object.keys(f).every((key) =>
+        ["version", "id", "direction", "type", "sequence", "generation"].includes(key),
+      ) ||
+      f.version !== version ||
+      !Number.isSafeInteger(f.id) ||
+      Number(f.id) < 0
+    )
+      return false;
+    const g = f.generation;
+    if (!g || typeof g !== "object" || Object.keys(g).length !== 3) return false;
+    if (
+      !Object.entries(g).every(
+        ([key, n]) => ["policy", "credentials", "checker"].includes(key) && Number.isSafeInteger(n) && n >= 0,
+      )
+    )
+      return false;
     waiting = false;
     schedule(turn);
     return true;
   };
   return { turn, ack };
 }
-export function receiver(direction: Direction, max: number, cap: number) {
+export function receiver(direction: Direction, max: number, cap: number, unitCap?: number) {
+  const decoder =
+    unitCap === undefined ? undefined : new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  let units = 0;
   const parts: ArrayBuffer[] = [];
   let size = 0;
   const at = (f: Received, type: string) =>
@@ -63,10 +84,16 @@ export function receiver(direction: Direction, max: number, cap: number) {
   const chunk = ({ payload, ...f }: Received) => {
     if (!at(f, "chunk") || Object.keys(f).length !== 6 || !(payload instanceof ArrayBuffer)) return false;
     if (!payload.byteLength || payload.byteLength > max || size + payload.byteLength > cap) return false;
+    units += decoder?.decode(payload, { stream: true }).length ?? 0;
+    if (units > (unitCap ?? Infinity)) return false;
     size += payload.byteLength;
     return parts.push(payload) > 0;
   };
-  const complete = (f: Received) => at(f, "complete") && f.chunks === parts.length && f.bytes === size;
+  const complete = (f: Received) =>
+    at(f, "complete") &&
+    f.chunks === parts.length &&
+    f.bytes === size &&
+    (decoder?.decode().length ?? 0) === 0;
   return { chunk, complete, parts };
 }
 export const fault = (): never => fail("Malformed privacy payload");

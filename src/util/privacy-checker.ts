@@ -275,7 +275,7 @@ export function createPrivacyChecker(options: Options = {}) {
           }
         };
         const input = t.sender("request", request.stream.bytes, t.maxChunk, post, request.meta);
-        const output = t.receiver("result", window, limits.outputBytes);
+        const output = t.receiver("result", window, limits.outputBytes, limits.outputUnits);
         const receive = (d: Record<string, unknown>) => {
           if (d.version !== t.version || !wire(d.generation, request.generation)) return;
           if (input.ack(d, schedule)) return true;

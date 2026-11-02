@@ -450,6 +450,120 @@ test.each(Object.keys(faults))("protocol fault: %s withholds and retires", async
   await f.dispose();
 });
 
+test.each([
+  ["ASCII", "aaaa", 4],
+  ["split multibyte", "aaaé", 4],
+  ["split astral", "aaa😀", 5],
+] as const)("output unit cap: %s is enforced before ACK", async (_kind, exact, cap) => {
+  for (const overflow of [false, true]) {
+    const f = fixture({ limits: { outputUnits: cap }, maxRequests: 1, byteLimit: charge() + W });
+    const result = f.send();
+    await f.clock.flush();
+    const old = f.port();
+    // A fake worker supplies output independently of the real operation's own output caps.
+    old.worker.onmessage = ({ data }) => {
+      const { payload: _payload, ...frame } = data as Frame;
+      if (frame.type === "chunk") old.emit({ ...frame, type: "ack" });
+    };
+    await f.run();
+    const request = old.sent[0];
+    if (!request) throw new Error("No request");
+    const base = {
+      version: request.version,
+      id: request.id,
+      generation: request.generation,
+      direction: "result",
+    };
+    const text = exact + (overflow ? "a" : "");
+    const bytes = Buffer.from(text);
+    let chunks = 0;
+    for (let i = 0; i < bytes.length; i += W)
+      old.emit({
+        ...base,
+        type: "chunk",
+        sequence: chunks++,
+        payload: Uint8Array.from(bytes.subarray(i, i + W)).buffer,
+      });
+    const acks = old.sent.filter((frame) => frame.type === "ack");
+    expect(acks.map((frame) => frame.sequence)).toEqual(
+      overflow ? [0] : Array.from({ length: chunks }, (_, i) => i),
+    );
+    old.emit({
+      ...base,
+      type: "complete",
+      sequence: chunks,
+      chunks,
+      bytes: bytes.length,
+      truncated: false,
+      checkedComplete: true,
+      withheld: false,
+      policyDigest: "privacy/0/0/0",
+    });
+    if (overflow) {
+      await withheld(result, "checker-failed");
+      expect(old.terminated).toBe(1);
+      const next = f.send();
+      await withheld(f.send(), "checker-busy");
+      await f.run();
+      expect(read(await next)).toMatchObject({ withheld: false, text: "safe" });
+      expect(f.ports).toHaveLength(2);
+      expect(old.terminated).toBe(1);
+    } else expect(read(await result)).toMatchObject({ withheld: false, text: exact });
+    expect(f.clock.pending).toBe(0);
+    await f.dispose();
+  }
+});
+
+test.each(["request", "result"])("ACK control fields: malformed %s ACKs fail closed", async (direction) => {
+  const mutations = [
+    (frame: Frame) => ({ ...frame, extra: true }),
+    (frame: Frame) => ({ ...frame, note: "x".repeat(100000) }),
+    (frame: Frame) => ({ ...frame, sequence: "0" }),
+    (frame: Frame) => ({ ...frame, direction: direction === "request" ? "result" : "request" }),
+  ];
+  for (const mutate of mutations) {
+    const f = fixture({ maxRequests: 1, byteLimit: charge() + W });
+    const result = f.send();
+    await f.clock.flush();
+    const old = f.port();
+    const operation = spyOn(b, "protectText");
+    try {
+      if (direction === "request")
+        old.tamper = (frame) => [frame.type === "ack" ? (mutate(frame) as Frame) : frame];
+      else {
+        const post = old.postMessage.bind(old);
+        old.postMessage = (value, transfer) => {
+          const frame = value as Frame;
+          post(frame.type === "ack" ? mutate(frame) : frame, transfer);
+        };
+        // An unsolicited malformed ACK during request assembly must not run the operation.
+        await f.run(1);
+        const first = old.sent[0];
+        if (!first) throw new Error("No request");
+        const { payload: _payload, ...control } = first;
+        expect(() =>
+          old.worker.onmessage?.({ data: mutate({ ...control, direction: "result", type: "ack" }) }),
+        ).toThrow();
+        expect(operation).not.toHaveBeenCalled();
+      }
+      await f.run();
+      await withheld(result, "checker-failed");
+      expect(operation).toHaveBeenCalledTimes(direction === "request" ? 0 : 1);
+      expect(old.terminated).toBe(1);
+      expect(f.clock.pending).toBe(0);
+      const next = f.send();
+      await withheld(f.send(), "checker-busy");
+      await f.run();
+      expect(read(await next)).toMatchObject({ withheld: false, text: "safe" });
+      expect(f.ports).toHaveLength(2);
+      expect(old.terminated).toBe(1);
+    } finally {
+      operation.mockRestore();
+      await f.dispose();
+    }
+  }
+});
+
 test("wrong and late IDs do not settle other requests, idle workers are unref'd", async () => {
   const f = fixture();
   expect(f.ports).toHaveLength(0);
