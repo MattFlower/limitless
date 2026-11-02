@@ -233,6 +233,7 @@ type Reason =
   | "checker-timeout"
   | "checker-cancelled"
   | "checker-failed"
+  | "checker-unavailable"
   | "private-match"
   | "unchecked-provenance"
   | "stale-generation"
