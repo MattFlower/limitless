@@ -532,6 +532,41 @@ test("one worktree failure leaves other items retryable", async () => {
   expect(existsSync(badPath)).toBe(false);
 });
 
+test("worktree processing errors precede later validation errors and do not stop remaining runs", async () => {
+  const bad = run("succeeded", 4);
+  const missing = run("succeeded", 4);
+  const good = run("succeeded", 4);
+  const badPath = await worktree(bad.id);
+  const goodPath = await worktree(good.id);
+  const finished = spyOn(store, "finishedRuns").mockReturnValue(
+    [bad, missing, good].map((r) => ({
+      ...r,
+      status: "succeeded",
+      finishedAt: now - 4 * DAY,
+      repoId: r.id === missing.id ? "missing-repository" : repo.id,
+    })),
+  );
+  const originalSh = proc.sh;
+  const git = spyOn(proc, "sh").mockImplementation((cmd, opts) => {
+    if (cmd.includes("remove") && cmd.includes(badPath))
+      return Promise.reject(new Error("injected Git failure"));
+    return originalSh(cmd, opts);
+  });
+  try {
+    const result = await collectGarbage(store, cfg, { now });
+    expect(result.errors).toEqual([
+      `${bad.id} worktree: injected Git failure`,
+      `${missing.id}: registered repository missing`,
+    ]);
+    expect(result.worktrees).toEqual([goodPath]);
+    expect(existsSync(badPath)).toBe(true);
+    expect(existsSync(goodPath)).toBe(false);
+  } finally {
+    git.mockRestore();
+    finished.mockRestore();
+  }
+});
+
 test("uncapped finished-run query and dry-run metadata reporting", async () => {
   for (let i = 0; i < 110; i++) run("succeeded", 4);
   const eligible = run("succeeded", 4);

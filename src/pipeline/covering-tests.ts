@@ -38,12 +38,23 @@ export const coveringPattern = (name: string): string =>
 const controls = (text: string) =>
   [...text].some((c) => c.charCodeAt(0) < 32 || (c.charCodeAt(0) >= 127 && c.charCodeAt(0) <= 159));
 
-export function selectCoveringTests(verify: Verify) {
-  return selectCoveringRequests(
-    verify.criteria.map((c) =>
-      c.status === "blocked" && c.blockedReason === "sandbox" ? (c.covering_tests ?? []) : [],
-    ),
+export function testOutcomeOnly(row: Verify["criteria"][number]) {
+  return (
+    row.test_outcome_only === true &&
+    row.status !== "met" &&
+    !(row.status === "unmet" && row.requirement === "not_required")
   );
+}
+
+const coveringRequests = (verify: Verify) =>
+  verify.criteria.map((c) =>
+    (c.test_outcome_only ? testOutcomeOnly(c) : c.status === "blocked" && c.blockedReason === "sandbox")
+      ? (c.covering_tests ?? [])
+      : [],
+  );
+
+export function selectCoveringTests(verify: Verify) {
+  return selectCoveringRequests(coveringRequests(verify));
 }
 
 export const acceptanceCoveringPolicy = { roundLimit: Infinity, groupFiles: true };
@@ -176,14 +187,7 @@ export async function runCoveringTests(
   sha: string,
   checkHead: () => Promise<void>,
 ) {
-  return runCoveringRequests(
-    ctx,
-    verify.criteria.map((c) =>
-      c.status === "blocked" && c.blockedReason === "sandbox" ? (c.covering_tests ?? []) : [],
-    ),
-    sha,
-    checkHead,
-  );
+  return runCoveringRequests(ctx, coveringRequests(verify), sha, checkHead);
 }
 
 export async function runCoveringRequests(
