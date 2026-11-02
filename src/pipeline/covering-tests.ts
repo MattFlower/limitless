@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import type { GateConfig } from "../gates/detect.ts";
 import { quoteRetryFiles, singleBunTest } from "../gates/docs.ts";
 import { validRetryFiles } from "../gates/junit.ts";
@@ -41,6 +42,7 @@ export async function relevantCoveringTestFiles(
   cwd: string,
   base: string,
   sha: string,
+  files: string[],
   signal?: AbortSignal,
 ): Promise<string[] | undefined> {
   if (![base, sha].every((rev) => /^(?:[a-f\d]{40}|[a-f\d]{64})$/i.test(rev))) return;
@@ -50,7 +52,36 @@ export async function relevantCoveringTestFiles(
       { cwd, signal, allowFail: true },
     );
     if (diff.exitCode !== 0 || diff.timedOut || diff.stdout.includes("\uFFFD")) return;
-    return diff.stdout.split("\0").filter(Boolean);
+    const changed = new Set(diff.stdout.split("\0").filter(Boolean));
+    const relevant = new Set(changed);
+    for (const file of new Set(files.map((file) => file.replace(/^\.\//, "")))) {
+      if (changed.has(file)) continue;
+      try {
+        const content = await worktreeGit(["git", "show", `${sha}:${file}`], {
+          cwd,
+          signal,
+          allowFail: true,
+        });
+        if (content.exitCode !== 0 || content.timedOut || content.stdout.includes("\uFFFD")) continue;
+        const imports = new Bun.Transpiler({
+          loader: /\.[cm]?[jt]sx$/.test(file) ? "tsx" : "ts",
+        }).scanImports(content.stdout);
+        if (
+          imports.some(({ kind, path }) => {
+            if (!["import-statement", "dynamic-import"].includes(kind) || !/^\.\.?\//.test(path))
+              return false;
+            const target = posix.normalize(posix.join(posix.dirname(file), path));
+            return (
+              !target.startsWith("../") && target !== ".." && !posix.isAbsolute(target) && changed.has(target)
+            );
+          })
+        )
+          relevant.add(file);
+      } catch {
+        signal?.throwIfAborted();
+      }
+    }
+    return [...relevant];
   } catch {
     signal?.throwIfAborted();
   }

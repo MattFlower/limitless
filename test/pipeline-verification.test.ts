@@ -1583,14 +1583,16 @@ test.each([
     }
     const limited = mode.endsWith("limit");
     if (mode === "resume") {
-      expect(terminal).toBe("needs_human");
-      expect(state?.lastVerify?.criteria[0]).toMatchObject({ status: "blocked", blockedReason: "sandbox" });
-      expect(state?.lastVerify?.criteria[0]?.evidence).toContain("relevance to the criterion is unverified");
+      expect(terminal).toBe("succeeded");
+      expect(state?.lastVerify?.criteria[0]).toMatchObject({
+        status: "met",
+        gateEvidence: { sha: state?.lastVerifiedSha, stageId: saved?.[0]?.stageId },
+      });
       expect(state?.lastVerify?.criteria[0]?.evidence).toContain(
         "Factory covering test x.test.ts › passes 0",
       );
       expect(targeted).toBe(1);
-      expect(verifierCalls).toBe(2);
+      expect(verifierCalls).toBe(1);
       expect(state?.coveringTestRuns?.[0]).toEqual(saved?.[0]);
       return;
     }
