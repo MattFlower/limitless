@@ -264,6 +264,7 @@ discovers an owner.
 | `[review] implementer_report` | `"include"` | `"omit"` drops the implementer's self-report from review prompts (production and review evals). The request, spec, diff and checks stay. |
 | `[review] avoid_implementer_vendor` | `true` | `false` lets production single reviews follow the review routing chain regardless of the implementer's vendor. Panel finders, shadows, verification, verify-change and follow-up re-checks keep their vendor rules. Older releases refuse to start with this key set because `[review]` keys are validated strictly; remove it before rolling back past this release. |
 | `[review] mode`, `[review.rosters]` | `"single"`, see below | `"panel"` reviews with a verified finder panel whose roster depends on the profile; see [Review configuration](#review-configuration-and-lenses). |
+| `[review] samples` | `2` | `single` mode: `2` merges two independent adversarial reviews (held-out recall +11.7 points for 2 of 18 clean false blocks); `1` runs one standard review at half the tokens. Older releases refuse to start with this key set because `[review]` keys are validated strictly; remove it before rolling back past this release. |
 | `[review] shadow` | `"off"` | `"panel"` also runs the profile's panel beside each single review, for comparison only; see [Shadow panel](#shadow-panel). Needs `mode = "single"`. |
 | `[review] shadow_grace_seconds` | `300` | How long a shadow panel may run after its single review finishes before it is aborted and recorded as `timeout`. `0` stops it as soon as the single review finishes. |
 | `[review] trusted_reviewers` | `[]` | GitHub logins, besides the repository owner, whose inline PR review comments count as evidence in `limitless review shadow-report`. |
@@ -961,7 +962,10 @@ are in [REASONING_EFFORT](REASONING_EFFORT.md).
 
 ### Review configuration and lenses
 
-By default a review is one routed finder (`[review] mode = "single"`). With `mode = "panel"`,
+By default a review is one routed adversarial finder run twice as independent samples, with
+their findings merged (`[review] mode = "single"`); a finding either sample blocks on blocks the
+round. Both samples run at the same time; a review costs about twice one reviewer's tokens.
+`[review] samples = 1` goes back to one standard review. With `mode = "panel"`,
 several finders run in parallel, their reports are merged, and a verifier rules on each candidate
 before anything blocks. The verifier never runs on a model that raised the candidate. It prefers a
 vendor that neither raised it nor implemented the change, then the implementer's vendor, then a

@@ -41,7 +41,7 @@ const { start } = pipelineSetup({
 describe("pipeline (fake agents, real git + gates)", () => {
   test("a reload during implementation updates the later review in the same run", async () => {
     mkdirSync(join(home, "cfg"));
-    writeFileSync(join(home, "cfg", "config.toml"), "[review]\n");
+    writeFileSync(join(home, "cfg", "config.toml"), "[review]\nsamples = 1\n");
     const reviews: string[] = [];
     const f = start((s) => {
       const role = roleOf(s);
@@ -51,7 +51,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
         return { structured: approve };
       }
       mkdirSync(f.cfg.paths.configDir, { recursive: true });
-      writeFileSync(join(f.cfg.paths.configDir, "config.toml"), '[review]\nimplementer_report = "omit"\n');
+      writeFileSync(
+        join(f.cfg.paths.configDir, "config.toml"),
+        '[review]\nsamples = 1\nimplementer_report = "omit"\n',
+      );
       expect(f.reloadConfig().applied).toEqual(["review.implementer_report"]);
       return { files: { "farewell.txt": "goodbye\n" }, text: "RELOAD_REPORT_SENTINEL" };
     });
@@ -504,14 +507,18 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(gates.map((g) => g.summary)).toEqual(["blocking: no-bad", "1 checks ok"]);
   });
 
-  test("review blockers loop back to the implementer", async () => {
+  test("a blocker from either of the two adversarial review samples loops back to the implementer", async () => {
     let reviews = 0;
     let implementPrompts: string[] = [];
+    const reviewPrompts: string[] = [];
+    mkdirSync(join(home, "cfg"), { recursive: true });
+    writeFileSync(join(home, "cfg", "config.toml"), "[review]\nsamples = 2\n");
     const f = start((s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
       if (role === "review") {
         reviews++;
+        reviewPrompts.push(s.prompt);
         return reviews === 1
           ? {
               structured: {
@@ -538,7 +545,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     });
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
     expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
-    expect(reviews).toBe(2);
+    // Two samples per round; the first round's other sample approved.
+    expect(reviews).toBe(4);
+    expect(reviewPrompts.every((p) => p.startsWith("You are an adversarial code reviewer"))).toBe(true);
     expect(implementPrompts[1]).toContain("Wrong text");
   });
 

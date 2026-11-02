@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import { type AgentResult, emptyUsage } from "../src/harness/types.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
+import { NoCapacityError } from "../src/pipeline/context.ts";
 import { MERGE_RULES } from "../src/pipeline/panel-merge.ts";
 import * as prompts from "../src/pipeline/prompts.ts";
 import { formatReviewFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
@@ -1628,6 +1629,10 @@ describe("runReview panel", () => {
     expect(formatReviewFeedback([prior], true)).toContain(
       "Also reported by another finder at line 2, not separately verified: dup. DUP_DETAIL",
     );
+    // A two-sample single review has no verifier.
+    expect(formatReviewFeedback([prior])).toContain(
+      "Also reported by the other review sample at line 2: dup. DUP_DETAIL",
+    );
   });
 
   test("the panel cache identity covers the finder prompts and the merge rules", () => {
@@ -2344,6 +2349,8 @@ describe("two-sample single review", () => {
               },
             };
           },
+          // Evals record each sample, failed ones included.
+          onSample: () => {},
         },
         input,
       );
@@ -2366,6 +2373,25 @@ describe("two-sample single review", () => {
       expect(union.decision).toBeUndefined();
     },
   );
+  test("without sample recording, an invocation error reaches the caller once both samples settle", async () => {
+    const held = deferred<void>();
+    let settled = false;
+    const unavailable = new NoCapacityError("no reviewer available");
+    const running = runReview(
+      {
+        invoke: async (_r, _f, sample) => {
+          if (sample === 1) throw unavailable;
+          await held.promise;
+          settled = true;
+          return { result: result(output([finding("major")])) };
+        },
+      },
+      input,
+    );
+    held.resolve();
+    await expect(running).rejects.toBe(unavailable);
+    expect(settled).toBe(true);
+  });
 });
 
 for (const mode of ["samples", "panel"] as const) {

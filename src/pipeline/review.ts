@@ -408,7 +408,14 @@ export type ReviewOutcome<T> = T & {
   panel?: PanelRecord;
 };
 
-export function reviewRequest(input: ReviewInput): ReviewRequest {
+export function reviewRequest(reviewInput: ReviewInput): ReviewRequest {
+  // A lone single finder's prompt frames the review; "standard" keeps the plain single prompt.
+  const single = reviewInput.system?.mode === "single" ? reviewInput.system.finders : [];
+  const framing = single.length === 1 ? single[0]?.prompt : undefined;
+  const input =
+    framing && framing !== "standard" && !reviewInput.prompt.finder
+      ? { ...reviewInput, prompt: { ...reviewInput.prompt, finder: framing } }
+      : reviewInput;
   const checklist = input.prompt.finder === "adversarial-checklist";
   if (checklist && !input.checklist)
     throw new Error("adversarial-checklist: missing prepared base checklist");
@@ -468,6 +475,9 @@ async function runUnion<T extends Invoked>(
         result = invoked.result;
       } catch (error) {
         rethrowClaimControl(error);
+        // Production lets a cancellation or capacity error reach the engine, as a single review does;
+        // evals record the failed sample so a retry reuses the other.
+        if (!deps.onSample) throw error;
         result = {
           status: "error",
           finalText: "",

@@ -231,7 +231,7 @@ export function formatReviewFeedback(findings: Review["findings"], panel = false
   return `### Code review findings (must fix)\n${findings
     .map(
       (f) =>
-        `- **${f.verification?.severity ?? f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}${(f.duplicates ?? []).map((d) => `\n  Also reported by another finder at line ${d.line}, not separately verified: ${d.title}. ${d.detail}`).join("")}${f.verification ? `\n  Verified (${f.verification.verdict}) evidence: ${f.verification.evidence}\n  Trigger: ${f.verification.trigger}` : panel ? "\n  Unverified: the verifier gave no ruling, so it blocks until a review rules on it." : ""}`,
+        `- **${f.verification?.severity ?? f.severity}** ${f.file ? `${f.file}${f.line ? `:${f.line}` : ""} — ` : ""}${f.title}\n  ${f.detail}${f.suggestion ? `\n  Suggestion: ${f.suggestion}` : ""}${(f.duplicates ?? []).map((d) => `\n  Also reported ${panel ? "by another finder" : "by the other review sample"} at line ${d.line}${panel ? ", not separately verified" : ""}: ${d.title}. ${d.detail}`).join("")}${f.verification ? `\n  Verified (${f.verification.verdict}) evidence: ${f.verification.evidence}\n  Trigger: ${f.verification.trigger}` : panel ? "\n  Unverified: the verifier gave no ruling, so it blocks until a review rules on it." : ""}`,
     )
     .join("\n")}`;
 }

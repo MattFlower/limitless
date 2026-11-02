@@ -69,6 +69,7 @@ export function reloadedConfig(current: Config, next: Config): { cfg: Config; re
       ...(reloadableSection("review")
         ? {
             reviewMode: next.reviewMode,
+            reviewSamples: next.reviewSamples,
             reviewShadow: next.reviewShadow,
             reviewShadowGraceSeconds: next.reviewShadowGraceSeconds,
             reviewTrustedReviewers: next.reviewTrustedReviewers,
