@@ -5,8 +5,9 @@ import type { ReviewRequest } from "./review.ts";
 import { parseArtifact } from "./shadow-report.ts";
 
 /**
- * A finished sample of a two-sample review is kept as an artifact, keyed by its exact prompt, so a
- * restart reruns only the unfinished sample: a completed sample's findings are never re-rolled away.
+ * A finished sample of a two-sample review is kept as an artifact, keyed by its exact prompt and the
+ * commit it reviewed, so a restart reruns only the unfinished sample: a completed sample's findings are
+ * never re-rolled away. The prompt alone is not enough: a first review names HEAD, not its SHA.
  */
 const name = (round: number, sample: number) => `review-${round}.sample-${sample}.json`;
 const promptKey = (request: ReviewRequest) =>
@@ -17,6 +18,7 @@ const usable = (request: ReviewRequest, result: InvokeOutcome["result"]) =>
 
 const SavedSchema = z.object({
   prompt: z.string(),
+  sha: z.string(),
   targetId: z.string(),
   invocationId: z.number().int(),
   result: z.custom<InvokeOutcome["result"]>(
@@ -29,6 +31,7 @@ export function saveReviewSample(
   round: number,
   sample: number,
   request: ReviewRequest,
+  sha: string,
   invoked: InvokeOutcome,
 ): void {
   if (!usable(request, invoked.result)) return;
@@ -37,6 +40,7 @@ export function saveReviewSample(
     "review-sample",
     JSON.stringify({
       prompt: promptKey(request),
+      sha,
       targetId: invoked.target.targetId ?? invoked.target.modelId,
       invocationId: invoked.invocation.id,
       result: invoked.result,
@@ -44,15 +48,21 @@ export function saveReviewSample(
   );
 }
 
-/** The sample saved for this exact request, or undefined when it must run (again). */
+/** The sample saved for this exact request and commit, or undefined when it must run (again). */
 export function savedReviewSample(
   ctx: RunContext,
   round: number,
   sample: number,
   request: ReviewRequest,
+  sha: string,
 ): InvokeOutcome | undefined {
   const saved = SavedSchema.safeParse(parseArtifact(ctx.store.getArtifact(ctx.run.id, name(round, sample))));
-  if (!saved.success || saved.data.prompt !== promptKey(request) || !usable(request, saved.data.result))
+  if (
+    !saved.success ||
+    saved.data.sha !== sha ||
+    saved.data.prompt !== promptKey(request) ||
+    !usable(request, saved.data.result)
+  )
     return undefined;
   const invocation = ctx.store.getInvocation(saved.data.invocationId);
   if (invocation?.runId !== ctx.run.id || invocation.status !== "ok") return undefined;

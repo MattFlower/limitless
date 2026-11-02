@@ -2223,7 +2223,8 @@ async function oneRound(
           invoke: async (request, index, sample) => {
             // A restart reuses a finished sample of a two-sample review instead of re-rolling it.
             const kept = shadow ? undefined : sample;
-            const saved = kept === undefined ? undefined : savedReviewSample(ctx, round, kept, request);
+            const saved =
+              kept === undefined ? undefined : savedReviewSample(ctx, round, kept, request, reviewedSha);
             if (saved) {
               ctx.log(`review: reusing finished sample ${(kept ?? 0) + 1} from before the restart`);
               return saved;
@@ -2242,7 +2243,7 @@ async function oneRound(
             const deadline = finder?.local ? Date.now() + request.timeoutMs : undefined;
             try {
               const invoked = await call(request, constraints, finder?.target, deadline);
-              if (kept !== undefined) saveReviewSample(ctx, round, kept, request, invoked);
+              if (kept !== undefined) saveReviewSample(ctx, round, kept, request, reviewedSha, invoked);
               return invoked;
             } catch (error) {
               if ((shadow || (finder?.local && !ctx.run.models?.review)) && error instanceof NoCapacityError)
