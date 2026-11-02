@@ -2430,13 +2430,7 @@ async function oneRound(
           {
             runs: ctx.state.coveringTestRuns ?? [],
             succeededStageIds: succeededCoveringStages(ctx),
-            relevantFiles: await relevantCoveringTestFiles(
-              cwd,
-              baseSha,
-              verifiedSha,
-              (ctx.state.coveringTestRuns ?? []).map((run) => run.file),
-              ctx.signal,
-            ),
+            relevantFiles: await relevantCoveringTestFiles(cwd, baseSha, verifiedSha, ctx.signal),
           },
         ),
         ctx.state.spec as Spec,

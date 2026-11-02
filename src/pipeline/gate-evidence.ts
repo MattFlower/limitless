@@ -337,7 +337,7 @@ export function applyGateEvidence(
           gateEvidence: undefined,
           evidence: redactGateOutput(
             [
-              "Covering tests passed, but their relevance to the criterion is unverified; every named test file must be added or modified in the verified change, or directly import a file that is.",
+              "Covering tests passed, but their relevance to the criterion is unverified; every named test file must be added or modified in the verified change.",
               ...relevanceRuns.map((run) => (run ? coveringCitation(run, sha) : "")),
             ].join("\n"),
           ),

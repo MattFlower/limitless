@@ -1286,12 +1286,14 @@ test.each([
   writeFileSync(
     join(repoDir, "x.test.ts"),
     `import {test, expect} from "bun:test";\n` +
+      (mode === "resume" ? 'import {value} from "./helper.ts";\n' : "") +
       Array.from(
         { length: 11 },
         (_, i) =>
-          `test${mode === "skip" && i === 0 ? ".skip" : ""}("passes ${i}", () => expect(${mode === "outcome-fail" ? 'process.env.FACTORY_COVERING_TEST_FAIL !== "1"' : "true"}).toBe(true));`,
+          `test${mode === "skip" && i === 0 ? ".skip" : ""}("passes ${i}", () => expect(${mode === "outcome-fail" ? 'process.env.FACTORY_COVERING_TEST_FAIL !== "1"' : mode === "resume" ? "value > 0" : "true"}).toBe(true));`,
       ).join("\n"),
   );
+  if (mode === "resume") writeFileSync(join(repoDir, "helper.ts"), "export const value = 1;\n");
   const terminator = mode === "terminator-before" || mode === "terminator-after";
   const retryTemplate =
     mode === "terminator-before"
@@ -1397,6 +1399,7 @@ test.each([
       return {
         files: {
           "farewell.txt": "goodbye\n",
+          ...(mode === "resume" ? { "helper.ts": "export const value = 2;\n" } : {}),
           ...(!outcome && mode !== "resume"
             ? {
                 "x.test.ts": `${readFileSync(join(repoDir, "x.test.ts"), "utf8")}\n// Cover the changed behavior.\n`,
@@ -1459,6 +1462,14 @@ test.each([
       await interrupted.promise;
       await f.stop();
       saved = f.store.getRunState<RunState>(run.id)?.coveringTestRuns;
+      if (mode === "resume") {
+        const cwd = f.store.getRunState<RunState>(run.id)?.worktreePath;
+        if (!cwd) throw new Error("missing resumed checkout");
+        writeFileSync(
+          join(cwd, "x.test.ts"),
+          `${readFileSync(join(cwd, "x.test.ts"), "utf8")}\n// Dirty edit is not verified evidence.\n`,
+        );
+      }
       if (requestCheckpoint) expect(saved).toBeUndefined();
       else expect(saved).toHaveLength(1);
       if (restartOutcome)

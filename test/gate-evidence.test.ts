@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -1297,11 +1298,16 @@ function coveringRun(): CoveringTestRun {
     },
   };
 }
-const bindCovering = (value: Verify, runs: CoveringTestRun[], succeededStageIds = [13]) =>
+const bindCovering = (
+  value: Verify,
+  runs: CoveringTestRun[],
+  succeededStageIds = [13],
+  relevantFiles: string[] | undefined = ["x.test.ts"],
+) =>
   applyGateEvidence(value, behaviouralSpec, holdout, sha, gates(), undefined, {
     runs,
     succeededStageIds,
-    relevantFiles: ["x.test.ts"],
+    relevantFiles,
   });
 
 test.each([
@@ -1340,6 +1346,7 @@ test.each([
     relevantFiles: mode === "unavailable" ? undefined : mode.startsWith("mixed") ? ["x.test.ts"] : [],
   }).criteria[0];
   expect(result).toMatchObject({ status: "blocked", blockedReason: "sandbox" });
+  expect(result?.gateEvidence).toBeUndefined();
   expect(result?.evidence).toContain(
     "Covering tests passed, but their relevance to the criterion is unverified",
   );
@@ -1371,7 +1378,7 @@ test.each(["unmet", "unclear", "blocked"] as const)(
         blockedReason: status === "blocked" ? "sandbox" : null,
       })),
     };
-    const row = bindCovering(input, [coveringRun()]).criteria[0];
+    const row = bindCovering(input, [coveringRun()], [13], []).criteria[0];
     expect(row).toMatchObject({ status: "blocked", blockedReason: "environment" });
     expect(row?.gateEvidence).toBeUndefined();
     expect(row?.covering_tests).toEqual(input.criteria[0]?.covering_tests);
@@ -1936,15 +1943,15 @@ describe('outer', () => describe('inner', () => test('passes', () => expect(true
 });
 
 const importCases: [string, string, boolean, string?][] = [
-  ["import from", 'import {x} from "../modified.ts";', true],
-  ["TypeScript assertion", 'import {x} from "../modified.ts"; const y = <number>x;', true],
-  ["TSX", 'import {x} from "../modified.ts"; const y: number = x; const view = <div/>;', true, "tsx"],
-  ["JSX", 'import {x} from "../modified.ts"; const view = <div/>;', true, "jsx"],
-  ["export from", 'export {x} from "../added.ts";', true],
-  ["export all", 'export * from "../modified.ts";', true],
-  ["dynamic literal", 'const load = () => import("../modified.ts");', true],
-  ["normalization", 'import {x} from "./../nested/../modified.ts";', true],
-  ["type import", 'import type {X} from "../modified.ts";', true],
+  ["import from", 'import {x} from "../modified.ts";', false],
+  ["TypeScript assertion", 'import {x} from "../modified.ts"; const y = <number>x;', false],
+  ["TSX", 'import {x} from "../modified.ts"; const y: number = x; const view = <div/>;', false, "tsx"],
+  ["JSX", 'import {x} from "../modified.ts"; const view = <div/>;', false, "jsx"],
+  ["export from", 'export {x} from "../added.ts";', false],
+  ["export all", 'export * from "../modified.ts";', false],
+  ["dynamic literal", 'const load = () => import("../modified.ts");', false],
+  ["normalization", 'import {x} from "./../nested/../modified.ts";', false],
+  ["type import", 'import type {X} from "../modified.ts";', false],
   ["unchanged target", 'import {x} from "../unchanged.ts";', false],
   ["package", 'import {x} from "modified.ts";', false],
   ["variable", 'const path = "../modified.ts"; import(path);', false],
@@ -1960,7 +1967,7 @@ const importCases: [string, string, boolean, string?][] = [
   ["require", 'require("../modified.ts");', false],
   ["method", 'const obj = {import(p) {}}; obj.import("../modified.ts");', false],
   ["extension inference", 'export * from "../modified";', false],
-  ["empty import from", 'import {} from /* target */ "../modified.ts";', true],
+  ["empty import from", 'import {} from /* target */ "../modified.ts";', false],
   ["commented side effect", 'import /* from */ "../modified.ts";', false],
   ["parse failure", 'import {x} from "../modified.ts"; const = ;', false],
 ];
@@ -1969,12 +1976,14 @@ const relevanceSeed = seeded(async (cwd) => {
   mkdirSync(join(cwd, "test"));
   for (const [i, [, code, , extension = "ts"]] of importCases.entries())
     writeFileSync(join(cwd, `test/import-${i}.test.${extension}`), code);
-  for (const file of ["modified.test.ts", "modified.ts", "unchanged.ts"])
+  for (const file of ["modified.test.ts", "modified.ts", "unchanged.ts", "rename-from.test.ts"])
     writeFileSync(join(cwd, file), "export const x = 1;\n");
   await sh(["git", "add", "."], { cwd });
   await sh(["git", "commit", "-qm", "base"], { cwd });
   const base = (await sh(["git", "rev-parse", "HEAD"], { cwd })).stdout.trim();
-  for (const file of ["modified.test.ts", "added.test.ts", "modified.ts", "added.ts"])
+  renameSync(join(cwd, "rename-from.test.ts"), join(cwd, "renamed.test.ts"));
+  await sh(["git", "config", "diff.renames", "true"], { cwd });
+  for (const file of ["modified.test.ts", "added.test.ts", "modified.ts", "added.ts", "line\nbreak.test.ts"])
     writeFileSync(join(cwd, file), "export const x = 2;\n");
   await sh(["git", "add", "."], { cwd });
   await sh(["git", "commit", "-qm", "verified"], { cwd });
@@ -2015,13 +2024,13 @@ async function reconcileCovering(
     );
     if (mode === "citation-only" && input.criteria[0]) input.criteria[0].covering_tests = [];
   }
-  evidence.relevantFiles = (await relevantCoveringTestFiles(cwd, base, verified, files)) ?? [];
+  evidence.relevantFiles = (await relevantCoveringTestFiles(cwd, base, verified)) ?? [];
   return applyGateEvidence(input, behaviouralSpec, holdout, verified, undefined, undefined, evidence)
     .criteria[0];
 }
 
 test.each(importCases)(
-  "committed covering import relevance: %s",
+  "unchanged test imports cannot establish relevance: %s",
   async (_label, code, related, extension = "ts") => {
     const cwd = mkdtempSync(join(tmpdir(), "covering-import-"));
     try {
@@ -2037,7 +2046,7 @@ test.each(importCases)(
         expect(row?.blockedReason).toBe("sandbox");
         expect(row?.gateEvidence).toBeUndefined();
         expect(row?.evidence).toContain("relevance to the criterion is unverified");
-        expect(row?.evidence).toContain("or directly import a file that is");
+        expect(row?.evidence).toContain("every named test file must be added or modified");
       }
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -2046,18 +2055,20 @@ test.each(importCases)(
 );
 
 test.each(["sandbox", "claimed-met", "retained", "citation-only"])(
-  "import relevance applies to every covering citation: %s",
+  "file relevance applies to every covering citation: %s",
   async (mode) => {
     const cwd = mkdtempSync(join(tmpdir(), "covering-paths-"));
     try {
       const {
         value: { base, verified },
       } = await relevanceSeed(cwd);
-      expect(await reconcileCovering(cwd, base, verified, ["test/import-0.test.ts"], mode)).toMatchObject({
+      expect(
+        await reconcileCovering(cwd, base, verified, ["added.test.ts", "modified.test.ts"], mode),
+      ).toMatchObject({
         status: "met",
         gateEvidence: { sha: verified, stageId: 13 },
       });
-      const files = mode === "citation-only" ? ["x.test.ts"] : ["test/import-0.test.ts", "x.test.ts"];
+      const files = mode === "citation-only" ? ["x.test.ts"] : ["modified.test.ts", "test/import-0.test.ts"];
       const mixed = await reconcileCovering(cwd, base, verified, files, mode);
       expect(mixed).toMatchObject({ status: "blocked", blockedReason: "sandbox" });
       expect(mixed?.gateEvidence).toBeUndefined();
@@ -2083,8 +2094,25 @@ test("covering relevance stays pinned across dirty edits, later commits and unav
       "missing.test.ts",
     ];
     const reconcile = () => Promise.all(files.map((file) => reconcileCovering(cwd, base, verified, [file])));
+    expect(await relevantCoveringTestFiles(cwd, base, verified)).toEqual([
+      "added.test.ts",
+      "added.ts",
+      "line\nbreak.test.ts",
+      "modified.test.ts",
+      "modified.ts",
+      "renamed.test.ts",
+    ]);
+    const aborted = AbortSignal.abort(new Error("cancelled diff"));
+    await expect(relevantCoveringTestFiles(cwd, base, verified, aborted)).rejects.toThrow("cancelled diff");
     const before = await reconcile();
-    expect(before.map((r) => r?.status)).toEqual(["met", "met", "met", "blocked", "blocked"]);
+    const tree = (await sh(["git", "rev-parse", `${verified}^{tree}`], { cwd })).stdout.trim();
+    const divergentBase = (
+      await sh(["git", "commit-tree", tree, "-p", base, "-m", "base branch"], { cwd })
+    ).stdout.trim();
+    expect(await relevantCoveringTestFiles(cwd, divergentBase, verified)).toEqual(
+      await relevantCoveringTestFiles(cwd, base, verified),
+    );
+    expect(before.map((r) => r?.status)).toEqual(["met", "met", "blocked", "blocked", "blocked"]);
     writeFileSync(join(cwd, "x.test.ts"), 'export * from "./modified.ts";');
     writeFileSync(join(cwd, "test/import-0.test.ts"), 'export * from "../unchanged.ts";');
     writeFileSync(join(cwd, "missing.test.ts"), 'export * from "./modified.ts";');
