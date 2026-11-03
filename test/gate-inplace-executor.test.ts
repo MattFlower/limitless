@@ -134,7 +134,9 @@ async function withExecutor(
   sha = release,
   realConfinement = false,
   beforeRun = "",
+  onRegistered?: () => Promise<void>,
 ) {
+  const ready = join(fixture.home, `executor-ready-${randomUUID()}`);
   const script = `
     import { runInplaceExecutor } from ${JSON.stringify(new URL("../src/gates/inplace.ts", import.meta.url).pathname)};
     import { seatbeltBackend } from ${JSON.stringify(new URL("../src/harness/sandbox.ts", import.meta.url).pathname)};
@@ -142,6 +144,7 @@ async function withExecutor(
     import { appendFileSync } from 'node:fs';
     import { gitBackend } from ${JSON.stringify(new URL("../src/git/confinement.ts", import.meta.url).pathname)};
     import { processBootInspection } from ${JSON.stringify(new URL("../src/util/proc.ts", import.meta.url).pathname)};
+    import { WorkerStore as ExecutorWorkers } from ${JSON.stringify(new URL("../src/db/workers.ts", import.meta.url).pathname)};
     const controller = new AbortController();
     process.once('SIGTERM', () => controller.abort());
     const cfg = ${JSON.stringify({ paths: f.cfg.paths, port: f.cfg.port, maxConcurrentGates: 1, readPolicy: f.cfg.readPolicy })};
@@ -154,6 +157,16 @@ async function withExecutor(
       }
     }
     ${beforeRun}
+    const firstLease = ExecutorWorkers.prototype.leaseInplace;
+    let announced = false;
+    ExecutorWorkers.prototype.leaseInplace = function (...args) {
+      const job = firstLease.apply(this, args);
+      if (!announced) {
+        announced = true;
+        appendFileSync(${JSON.stringify(ready)}, 'ready');
+      }
+      return job;
+    };
     await processBootInspection.run(() => "test-boot", () => runInplaceExecutor(cfg, ${JSON.stringify(sha)}, controller.signal));
   `;
   const child = Bun.spawn([process.execPath, "--eval", script], {
@@ -169,6 +182,9 @@ async function withExecutor(
   const stderr = new Response(child.stderr).text();
   try {
     await wait(() => f.workers.executor(undefined, false)?.pid === child.pid, { timeoutMs: 10_000 });
+    await onRegistered?.();
+    // Registration precedes slot-pool writes and the first daemon-release observation.
+    await wait(() => existsSync(ready), { timeoutMs: 10_000 });
     await confinementScope.run(fakeConfinement, () =>
       fn(
         f.workers,
@@ -1113,6 +1129,88 @@ test.each(["disabled", "absent", "dead", "release"])(
       );
   },
 );
+
+test("executor fixture waits for the startup capacity commit and first release observation", async () => {
+  const { f } = await setup();
+  const paused = join(fixture.home, "capacity-paused");
+  const proceed = join(fixture.home, "capacity-proceed");
+  const trace = join(fixture.home, "capacity-trace");
+  const resumeFixture = Promise.withResolvers<void>();
+  let registered = false;
+  const version = () => f.store.db.query("PRAGMA data_version").get();
+  let beforeStartupCommit: ReturnType<typeof version>;
+  const execution = withExecutor(
+    f,
+    async (_workers, _crash, child) => {
+      const before = version();
+      await wait(() => existsSync(trace), { timeoutMs: 10_000 });
+      const evidence = JSON.parse(readFileSync(trace, "utf8"));
+      expect(evidence.pid).toBe(child.pid);
+      expect(evidence.database).toBe(f.cfg.paths.db);
+      expect(evidence.changes).toBe(1);
+      expect(evidence.statements).toContain("UPDATE slot_pools SET capacity = ? WHERE pool = ?");
+      console.info(JSON.stringify({ evidence, beforeStartupCommit, afterStartupCommit: version() }));
+      expect(version()).not.toEqual(beforeStartupCommit);
+      expect(version()).toEqual(before);
+      await Bun.sleep(3 * f.workers.times.tick);
+      expect(version()).toEqual(before);
+    },
+    release,
+    false,
+    `
+      import { DatabaseSlotPool } from ${JSON.stringify(new URL("../src/gates/slots.ts", import.meta.url).pathname)};
+      import { existsSync, writeFileSync } from 'node:fs';
+      const setLimit = DatabaseSlotPool.prototype.setLimit;
+      DatabaseSlotPool.prototype.setLimit = function (limit) {
+        if (!this.db) return setLimit.call(this, limit);
+        writeFileSync(${JSON.stringify(paused)}, '');
+        const deadline = Date.now() + 10_000;
+        while (!existsSync(${JSON.stringify(proceed)})) {
+          if (Date.now() > deadline) throw new Error('capacity barrier timed out');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        }
+        const statements = [];
+        const db = this.db;
+        const query = db.query;
+        db.query = new Proxy(query, {
+          apply(target, self, args) {
+            statements.push(args[0]);
+            return Reflect.apply(target, self, args);
+          },
+        });
+        const before = db.query('SELECT total_changes() n').get().n;
+        try {
+          setLimit.call(this, limit);
+          writeFileSync(${JSON.stringify(trace)}, JSON.stringify({
+            pid: process.pid, database: db.filename, connection: db.handle,
+            statements, changes: db.query('SELECT total_changes() n').get().n - before,
+          }));
+        } finally {
+          db.query = query;
+        }
+      };
+    `,
+    async () => {
+      registered = true;
+      await resumeFixture.promise;
+    },
+  );
+  // Attach a rejection handler while the parent controls both sides of startup.
+  void execution.catch(() => {});
+  try {
+    await wait(() => registered, { timeoutMs: 10_000 });
+    await wait(() => existsSync(paused), { timeoutMs: 10_000 });
+    beforeStartupCommit = version();
+    resumeFixture.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    writeFileSync(proceed, "");
+    await execution;
+  } finally {
+    resumeFixture.resolve();
+    writeFileSync(proceed, "");
+    await execution;
+  }
+});
 
 test("idle executor uses no write transactions, and release mismatches never lease", async () => {
   const { f, req } = await setup();
