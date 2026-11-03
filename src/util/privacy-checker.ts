@@ -208,8 +208,8 @@ export function createPrivacyChecker(options: Options = {}) {
   let active: Finish | undefined;
   let retiring = Promise.resolve();
   let running: Promise<void> | undefined;
-  const issue = (result: Projection, generation?: Generation, parts?: ArrayBuffer[]) =>
-    c.issuePrivacyWorkerChunks(parts, result, generation, registry);
+  const issue = (result: Projection, generation?: Generation, parts?: ArrayBuffer[], text?: string) =>
+    c.issuePrivacyWorkerChunks(parts, result, generation, registry, text);
   const current = (generation: Generation) => {
     try {
       return same(generation, b.currentPrivacyGeneration(registry));
@@ -264,7 +264,7 @@ export function createPrivacyChecker(options: Options = {}) {
     try {
       registry.refreshPolicy();
       // Preserve legacy preflight refusals; waiting callers capture snapshots only at admission.
-      if (deadline === undefined) immediate = b.capturePrivacySnapshot(registry, true);
+      if (deadline === undefined) immediate = registry.snapshot(true);
       generation = immediate?.generation ?? b.currentPrivacyGeneration(registry);
       if (!(immediate?.ready ?? registry.ready)) return refuse("unreadable-policy");
       if (!current(generation)) return refuse("stale-generation");
@@ -318,7 +318,7 @@ export function createPrivacyChecker(options: Options = {}) {
         const required = size(immediate) + (immediate ? 0 : registry.wireBytes);
         if (!eligible()) return true;
         if (!fits(required)) return false;
-        const snapshot = immediate ?? b.capturePrivacySnapshot(registry, true);
+        const snapshot = immediate ?? registry.snapshot(true);
         if (!eligible()) return true;
         const authority = snapshot.generation;
         const valid = current(authority);
@@ -396,6 +396,7 @@ export function createPrivacyChecker(options: Options = {}) {
           typeof value === "string" ? failure(value, authority, input.provenance) : value,
           authority,
           typeof value === "string" ? undefined : staged,
+          input.cut?.limit === 0 ? input.text : undefined,
         ),
       );
       staged = undefined;

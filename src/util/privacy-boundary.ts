@@ -97,8 +97,7 @@ export function createPrivacyRegistry(
   };
 }
 export const privacyRegistry = createPrivacyRegistry(credentialRegistry, undefined, true);
-export const capturePrivacySnapshot = (registry = privacyRegistry, worker = false) =>
-  registry.snapshot(worker);
+export const capturePrivacySnapshot = (registry = privacyRegistry) => registry.snapshot();
 export const currentPrivacyGeneration = (registry = privacyRegistry) => registry.generation;
 export function isCurrentPrivacyGeneration(prepared: Prepared, registry = privacyRegistry): boolean {
   const current = currentPrivacyGeneration(registry);

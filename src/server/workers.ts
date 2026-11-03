@@ -316,12 +316,8 @@ export async function startWorkerListener(
       if (action === "events" && event.success)
         workers.event(id, { ...event.data, result: remoteGateData(event.data.result) });
       else if (result.success) {
-        const run = result.data.run;
-        workers.complete(id, {
-          ...run,
-          setup: run.setup.map(remoteGateData),
-          checks: run.checks.map(remoteGateData),
-        });
+        const { setup: s, checks: c, ...run } = result.data.run;
+        workers.complete(id, { ...run, setup: s.map(remoteGateData), checks: c.map(remoteGateData) });
       }
       return json({ ok: true });
     } catch (error) {

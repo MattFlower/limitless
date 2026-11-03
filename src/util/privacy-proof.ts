@@ -75,11 +75,12 @@ export async function checkAndSign(
     { signal, deadline },
   );
   const { registry } = checker,
-    key = signer();
+    key = signer(),
+    bound = { registry, input: cut?.limit === 0 ? hash(text) : undefined };
   if (!key) return;
   const parts: Uint8Array[] = [];
   for (let index = 0; ; index++) {
-    const part = consumeBoundaryChunk(receipt, index);
+    const part = consumeBoundaryChunk(receipt, index, bound);
     if (part.withheld || !part.checkedComplete) return;
     if (part.done) break;
     parts.push(part.bytes);

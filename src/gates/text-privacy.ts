@@ -21,11 +21,9 @@ export const textPrivacySchema = z.strictObject({
 export type TextPrivacy = z.infer<typeof textPrivacySchema>;
 export const withheldText = (reason: unknown, timedOut = false) =>
   `[withheld: ${typeof reason === "string" && /^[a-z-]{1,40}$/.exec(reason)?.[0] === reason ? reason : "unproven"}${timedOut ? "; timed out" : ""}]`;
-export const gatePrivacyScope = new AsyncLocalStorage<{
-  checker: ReturnType<typeof createPrivacyChecker>;
-  registry: ReturnType<typeof createPrivacyChecker>["registry"];
-  signer?: () => Buffer | undefined;
-}>();
+type Checker = ReturnType<typeof createPrivacyChecker>;
+type Scope = { checker: Checker; registry: Checker["registry"]; signer?: () => Buffer | undefined };
+export const gatePrivacyScope = new AsyncLocalStorage<Scope>();
 export const IDENTITY_CAP = 65536;
 export function gateIdentities(r: GateResult): string {
   const values = [
@@ -51,22 +49,17 @@ const ATTRIBUTION_PARTS = new Set([
   "unrecognized attribution reason",
 ]);
 /** Release only whole, fixed attribution parts joined by "; "; anything else becomes fixed text. */
+const part = (s: string) => ATTRIBUTION_PARTS.has(s) || /^\d+ unattributed (?:failure|error)s?$/.test(s);
 export const attributionReason = (value: unknown): string =>
-  typeof value === "string" &&
-  value
-    .split("; ")
-    .every((part) => ATTRIBUTION_PARTS.has(part) || /^\d+ unattributed (?:failure|error)s?$/.test(part))
-    ? value
-    : "unrecognized attribution reason";
+  typeof value === "string" && value.split("; ").every(part) ? value : "unrecognized attribution reason";
 const claim = ({ mac: _mac, ...field }: TextPrivacy["output"]) => field;
 /** Worker text-privacy records are claims, never proofs: keep them as MAC-free attestations. */
 export function remoteGateData(r: GateResult): GateResult {
   const { textPrivacy, ...out } = r;
-  if (textPrivacy)
-    out.remoteAttestation = {
-      output: claim(textPrivacy.output),
-      ...(textPrivacy.identities ? { identities: claim(textPrivacy.identities) } : {}),
-    };
+  if (textPrivacy) {
+    const { output, identities } = textPrivacy;
+    out.remoteAttestation = { output: claim(output), ...(identities && { identities: claim(identities) }) };
+  }
   if (out.failureAttributionReason !== undefined)
     out.failureAttributionReason = attributionReason(out.failureAttributionReason);
   for (const key of ["firstAttempt", "targetedRetry", "retryAttempt"] as const)

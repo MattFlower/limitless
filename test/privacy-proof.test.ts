@@ -121,6 +121,46 @@ test("no key, forged receipt, stale receipt and withheld text cannot sign", asyn
     ["PRIVACY_CHECKER_SEMANTICS", "checkAndSign", "provisionProofKey", "verifier"].sort(),
   );
 });
+test("receipts cannot be replayed against other input or another registry", async () => {
+  const f = fixture(),
+    cut = { limit: 0, unit: "U" as const, marker: "" },
+    strict = createPrivacyRegistry();
+  f.registry.refreshPolicy = () => {};
+  f.registry.replacePolicy([{ value: "forbidden-value", entry: 0 }]);
+  strict.replacePolicy([{ value: "forbidden-value", entry: 0 }]);
+  const safe = await f.checker.protectText({
+    text: "safe",
+    cut,
+    terminal: true,
+    provenance: { kind: "complete" },
+  });
+  const replay = { registry: f.registry, protectText: async () => safe };
+  expect(await f.sign("forbidden-value", { checker: replay, cut })).toBeUndefined();
+  expect(await f.sign("safe", { checker: replay, cut: { ...cut, limit: 0 } })).toBeDefined();
+  // A non-verdict receipt cannot be presented as a verdict-only one for other text.
+  const full = await f.checker.protectText({ text: "", terminal: true, provenance: { kind: "complete" } });
+  expect(
+    await f.sign("forbidden-value", {
+      checker: { registry: f.registry, protectText: async () => full },
+      cut,
+    }),
+  ).toBeUndefined();
+  // Bytes checked under a permissive registry never sign under a stricter one.
+  const permissive = createPrivacyChecker({ registry: createPrivacyRegistry() });
+  checkers.push(permissive);
+  for (const options of [{}, { cut }]) {
+    const receipt = await permissive.protectText({
+      text: "forbidden-value",
+      terminal: true,
+      provenance: { kind: "complete" },
+      ...options,
+    });
+    const checker = { registry: strict, protectText: async () => receipt };
+    const proof = await f.sign("forbidden-value", { checker, ...options });
+    expect(proof).toBeUndefined();
+    expect(p.verifier(strict, f.signer).verify(proof, "output", "forbidden-value")).toBe(false);
+  }
+});
 test("cut proofs cover rendering bytes, with verdict-only empty cuts covering input", async () => {
   const f = fixture();
   const proof = await f.sign("safe text", { cut: { limit: 4, unit: "U", marker: "" } });
