@@ -266,10 +266,22 @@ const busy = (w: Fixture) => ({ ...w, reason: "checker-busy", maximum: false });
 /** worker-all: the real checker, cold per trial, maximum policy. A daemon slice is wall time from entering daemon
  * code to 64 microtask rounds after its latest entry; entries join one slice until a setImmediate heartbeat proves
  * a real yield, so continuations count and awaiting the worker does not (see docs/privacy-boundaries.md). */
-export async function measureWorker(root: string, r = runtime) {
+export type ProducerOperation = {
+  run: (
+    checker: ReturnType<typeof import("../src/util/privacy-checker.ts").createPrivacyChecker>,
+    own: <T>(phase: string, fn: () => T) => T,
+  ) => unknown;
+  check: (value: unknown) => Record<string, unknown>;
+  dimensions: object;
+};
+export async function measureWorker(
+  root: string,
+  r = runtime,
+  producers?: Record<string, ProducerOperation>,
+) {
   const load = (p: string) => import(join(root, `src/util/privacy-${p}.ts`));
   const [b, k, c] = await Promise.all(["boundary", "checker", "chunks"].map(load));
-  const policy = workload("preparation");
+  const policy = workload(producers ? "plain" : "preparation");
   const slots = "ascii-max astral-max recursive-max combined sparse form+1 forms+1 base64".split(" ");
   const [bmp, eight] = [workload("bmp-max"), slots.map((n) => workload(n))];
   const [groups, raw] = [{} as Record<string, unknown>, [] as (Trial & Record<string, unknown>)[]];
@@ -297,8 +309,8 @@ export async function measureWorker(root: string, r = runtime) {
       await r.pause(); // A consumer reads one bounded chunk per turn.
     }
   };
-  const series = async (label: string, jobs: Fixture[]) => {
-    const trials = [];
+  const series = async (label: string, jobs: Fixture[], producer?: ProducerOperation) => {
+    const trials: (Trial & Record<string, unknown>)[] = [];
     for (let trial = 0; trial < 7; trial++) {
       r.gc();
       await r.pause();
@@ -323,17 +335,26 @@ export async function measureWorker(root: string, r = runtime) {
       };
       const [cpu, main, start] = [process.cpuUsage(), process.threadCpuUsage(), r.now()];
       setImmediate(beat);
-      for (const w of jobs) {
-        await r.pause(); // Independent callers: one submission per turn.
-        const submitted = r.now();
-        const input = { text: w.text, json: w.text, provenance: { kind: "complete" } };
-        const receipt = own("submit", () => (w.data ? checker.protectData : checker.protectText)(input));
-        pending.push(receipt.then((v: unknown) => consume(v, submitted)));
+      let value: unknown;
+      try {
+        if (producer) value = await own(label, () => producer.run(checker, own));
+        for (const w of jobs) {
+          await r.pause(); // Independent callers: one submission per turn.
+          const submitted = r.now();
+          const input = { text: w.text, json: w.text, provenance: { kind: "complete" } };
+          const receipt = own("submit", () => (w.data ? checker.protectData : checker.protectText)(input));
+          pending.push(receipt.then((v: unknown) => consume(v, submitted)));
+        }
+        await Promise.all(pending);
+      } finally {
+        try {
+          await own("dispose", () => checker.dispose());
+        } finally {
+          beating = false;
+          await r.pause().then(() => beat());
+        }
       }
       const results = (await Promise.all(pending)) as Awaited<ReturnType<typeof consume>>[];
-      await own("dispose", () => checker.dispose());
-      beating = false;
-      await r.pause().then(() => beat()); // Closes the window after disposal; validation is outside it.
       const [all, thread, wallMs] = [process.cpuUsage(cpu), process.threadCpuUsage(main), r.now() - start];
       for (const [i, w] of jobs.entries()) {
         const { parts = [], ...p } = results[i] ?? {};
@@ -342,15 +363,40 @@ export async function measureWorker(root: string, r = runtime) {
       const cpuMs = { workerAndRuntime: ms(all) - ms(thread), mainThreadWithHeartbeat: ms(thread) };
       const [slice, latencyMs] = [Math.max(0, ...turns.map((t) => t[1])), results.map((p) => p.latencyMs)];
       const timing = { slice, heartbeat, wallMs, cpuMs, ...r.memory(), turns, idle };
-      trials.push({ label, warmup: trial < 2, admitted: true, owned: true, ...timing, latencyMs });
+      const observed = { ...timing, latencyMs, ...producer?.check(value) };
+      trials.push({ label, warmup: trial < 2, admitted: true, owned: true, ...observed });
     }
     raw.push(...trials);
     const workloads = jobs.map(({ name, sizes, reason }) => ({ name, ...sizes, reason }));
-    groups[label] = { workloads, ...summarizeTrials(trials) };
+    const median = (values: number[]) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)] ?? null;
+    const metrics =
+      "wallMs cpuMs.workerAndRuntime cpuMs.mainThreadWithHeartbeat submissionMs latencyMs addedLatencyMs";
+    const medians = Object.fromEntries(
+      metrics.split(" ").map((key) => [
+        key,
+        median(
+          trials.slice(2).flatMap((t) => {
+            const value: unknown = key.split(".").reduce((v, k) => Reflect.get(Object(v), k), t);
+            return value == null ? [] : (Array.isArray(value) ? value : [value]).map(Number);
+          }),
+        ),
+      ]),
+    );
+    groups[label] = {
+      workloads,
+      dimensions: producer?.dimensions,
+      status: "available",
+      medians,
+      ...summarizeTrials(trials),
+      exceeds50ms: trials.some((t) => t.slice > 50),
+    };
   };
-  await series("cold startup, maximum-policy transfer", [workload("plain")]);
-  await series("eight slots, then slot backpressure", [...eight, busy(bmp)]);
-  await series("byte backpressure (64 MiB pending)", [bmp, bmp, busy(bmp)]);
+  if (producers) for (const [label, producer] of Object.entries(producers)) await series(label, [], producer);
+  else {
+    await series("cold startup, maximum-policy transfer", [workload("plain")]);
+    await series("eight slots, then slot backpressure", [...eight, busy(bmp)]);
+    await series("byte backpressure (64 MiB pending)", [bmp, bmp, busy(bmp)]);
+  }
   const method = "slice: wall ms per daemon turn; worker CPU: cpuUsage minus main threadCpuUsage";
   const size = { entries: policy.entries.length, credentials: policy.credentials.length };
   return { platform: r.platform, method, policy: size, groups, decision: decideC21c(raw) };
@@ -362,20 +408,28 @@ async function worker([root = "", name = "", ref = ""]: string[]) {
   const api = Object.assign({}, ...(await Promise.all(found.map((p) => import(p)))));
   return { ref, pid: process.pid, ...(await measureRevision(api, () => workload(name))) };
 }
-async function command(cmd: string[], cwd = process.cwd()) {
-  const env = agentEnv({ GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" });
-  const r = await runProcess({ cmd, cwd, env, tailLimit: 1_000_000 });
-  if (r.exitCode !== 0 || r.truncated) throw Error(r.stderr || "Incomplete report");
+export async function command(cmd: string[], cwd = process.cwd(), environment?: Record<string, string>) {
+  const env = environment ?? agentEnv({ GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" });
+  const r = await runProcess({ cmd, cwd, env, tailLimit: 50_000_000 });
+  if (r.exitCode !== 0 || r.truncated) throw Error(r.stderr || "Failed command or incomplete report");
   return r.stdout.trim();
 }
-async function launch({ ref, name }: Job) {
+export async function launch(
+  { ref, name }: Job,
+  script = import.meta.path,
+  environment?: (root: string) => Record<string, string>,
+) {
   const root = await fs.mkdtemp(join(tmpdir(), "privacy-boundary-"));
   const result = (async () => {
     const sha = await command(["git", "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]);
-    await command(["git", "archive", `--output=${root}/snapshot.tar`, sha, "src"]);
+    await command(["git", "archive", `--output=${root}/snapshot.tar`, sha, "src", "package.json"]);
     await command(["tar", "-xf", `${root}/snapshot.tar`, "-C", root]);
     await fs.symlink(resolve("node_modules"), join(root, "node_modules"), "dir");
-    const raw = await command([process.execPath, import.meta.path, "--worker", root, name, sha], root);
+    const raw = await command(
+      [process.execPath, script, "--worker", root, name, sha],
+      root,
+      environment?.(root),
+    );
     return { ref, name, report: JSON.parse(raw) as unknown };
   })();
   return { result, cleanup: () => fs.rm(root, { recursive: true, force: true }) };
