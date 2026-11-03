@@ -66,6 +66,11 @@ export function createControlRefReader(deps: SharedStoreDeps): ControlRefReader 
 
 export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient {
   const io = createCompanionIO(deps, CONTROL_REF_RESPONSE_LIMIT);
+  const trusted = new Map<string, ControlRefTip>();
+  const remember = (ref: string, sha: string, bytes: Uint8Array): ControlRefTip => {
+    trusted.set(ref, { sha, bytes: Uint8Array.from(bytes) });
+    return { sha, bytes };
+  };
   async function read(
     key: ControlKey,
     signal?: AbortSignal,
@@ -87,7 +92,9 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
       if (signal?.aborted) fail("aborted");
       if (head === absent) return { kind: "absent" };
       const { object } = parse(z.object({ ref: z.literal(ref), object: target }), head);
-      if (object.sha === known?.sha) return { kind: "tip", tip: known };
+      const cached = trusted.get(ref);
+      if (object.sha === known?.sha && cached?.sha === object.sha)
+        return { kind: "tip", tip: { sha: cached.sha, bytes: Uint8Array.from(cached.bytes) } };
       const commit = parse(commitSchema, await io.call(`git/commits/${object.sha}`, undefined, signal));
       if (commit.sha !== object.sha) fail("corrupt");
       if (commit.message !== "limitless-control: 1" && commit.message !== "limitless-control: 1\n")
@@ -106,7 +113,7 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
         fail("unsupported");
       const content = await io.content(entry.sha, signal);
       if (signal?.aborted) fail("aborted");
-      return { kind: "tip", tip: { sha: commit.sha, bytes: io.open(aad, content) } };
+      return { kind: "tip", tip: remember(ref, commit.sha, io.open(aad, content)) };
     } catch (e) {
       rethrowClaimControl(e);
       if (signal?.aborted) fail("aborted");
@@ -174,7 +181,8 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
         const success = z.object({
           data: z.object({ updateRefs: z.object({ clientMutationId: z.null() }) }),
         });
-        if (success.safeParse(response).success) return { kind: "applied", tip: { sha: commit, bytes } };
+        if (success.safeParse(response).success)
+          return { kind: "applied", tip: remember(ref, commit, bytes) };
         const after = await read(k, signal);
         if (signal?.aborted || after.kind === "unconfirmed") return { kind: "unconfirmed" };
         if (after.kind === "absent") return observed ? { kind: "unconfirmed" } : unchanged();

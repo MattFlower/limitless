@@ -284,25 +284,57 @@ test("measured member-hour uses fewer than 600 REST calls with real parity and a
   f.list("apple\npear");
   await f.publish();
   let refreshes = 0;
+  let observation: Observed<Capabilities> | null = null;
   f.monitor.refresh = async () => {
     refreshes++;
     f.data.privateStrings.parity = await checkParity(f);
     expect(f.data.privateStrings.parity).toBe("match");
-    return { at: f.clock.sample(), value: f.data };
+    observation = { at: f.clock.sample(), value: f.data };
+    return observation;
   };
-  f.monitor.current = () => null;
+  f.monitor.current = () => observation;
+  let nextAdvert = Number.POSITIVE_INFINITY;
+  let interval = 0;
+  let fire = () => {};
+  const advertiser = createMemberAdvertiser({
+    ...f,
+    member,
+    monitor: f.monitor,
+    clock: f.clock,
+    timer: {
+      set: ((callback: () => void, ms: number) => {
+        fire = callback;
+        interval = ms;
+        nextAdvert = f.clock.sample().inclusive + ms;
+        return 1;
+      }) as unknown as typeof setInterval,
+      clear: () => {
+        nextAdvert = Number.POSITIVE_INFINITY;
+      },
+    },
+  });
   f.remote.calls = [];
-  f.start();
+  await f.monitor.refresh();
+  stops.push(advertiser.start());
   await flush();
-  for (let n = 1; n < 120; n++) {
-    f.time(1_000 + n * 30_000);
-    if (n % 2 === 0) await f.tick();
-    else await f.monitor.refresh();
+  let nextRefresh = 31_000;
+  while (Math.min(nextRefresh, nextAdvert) < 3_601_000) {
+    const now = Math.min(nextRefresh, nextAdvert);
+    f.time(now);
+    if (now === nextRefresh) {
+      await f.monitor.refresh();
+      nextRefresh += 30_000;
+    }
+    if (now === nextAdvert) {
+      nextAdvert += interval;
+      fire();
+      await flush();
+    }
   }
-  expect(refreshes).toBe(120);
-  expect(f.remote.calls.filter(isCas)).toHaveLength(60);
   const rest = f.remote.calls.filter((call) => call.url !== graphqlUrl).length;
   const graphql = f.remote.calls.length - rest;
   console.log(`Member-hour: REST=${rest}, GraphQL=${graphql}`);
   expect(rest).toBeLessThan(600);
+  expect(refreshes).toBe(120);
+  expect(f.remote.calls.filter(isCas)).toHaveLength(60);
 });
