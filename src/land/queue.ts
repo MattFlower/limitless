@@ -1048,12 +1048,11 @@ export class LandQueue {
         try {
           await this.claimWait(entry, signal);
         } catch (error) {
-          if (error instanceof LandClaimWait && !signal.aborted)
-            this.owned(entry.id, () => {
-              const current = this.store.getLandEntry(entry.id);
-              if (current?.state === "checking" && current.pushedSha === head)
-                this.store.updateLandEntry(entry.id, { pushedSha: null });
-            });
+          this.owned(entry.id, () => {
+            const current = this.store.getLandEntry(entry.id);
+            if (current?.state === "checking" && current.pushedSha === head)
+              this.store.updateLandEntry(entry.id, { pushedSha: null });
+          });
           throw error;
         }
       },
@@ -1235,9 +1234,13 @@ export class LandQueue {
     using _span = { [Symbol.dispose]: beginActivity("land.merge") };
     const guard = async () => {
       this.assertClaim(entry.id);
+      const shared = sharedRepository(this.deps.cfg ?? { repos: {} }, repo, entry.repo);
       if (!this.deps.requiresApproval?.has(entry.repo.toLowerCase())) {
-        await this.claimWait(entry, signal);
-        this.assertClaim(entry.id);
+        if (shared) {
+          await this.claimWait(entry, signal);
+          signal.throwIfAborted();
+          this.assertClaim(entry.id);
+        }
         return;
       }
       let evidence: Awaited<ReturnType<LandQueue["approvalEvidence"]>>;
@@ -1271,20 +1274,14 @@ export class LandQueue {
         this.parkApproval(entry, signal, evidence.seen);
         throw new LandApprovalStopped();
       }
-      const observations = this.store.githubReviewObservationCount(entry.prUrl);
+      if (!shared) return;
       await this.claimWait(entry, signal);
+      signal.throwIfAborted();
       this.assertClaim(entry.id);
-      // A review saved during the claim read supersedes the evidence that qualified above.
-      if (
-        observations !== this.store.githubReviewObservationCount(entry.prUrl) ||
-        !this.qualifies({ ...entry, pushedSha: sha }, evidence)
-      ) {
-        this.parkApproval(
-          entry,
-          signal,
-          evidence.seen,
-          "Review state changed during the final approval check",
-        );
+      // Only current review evidence can revoke approval while the claim read is pending.
+      const seen = this.store.githubReview(entry.prUrl);
+      if (!this.qualifies({ ...entry, pushedSha: sha }, { seen, login: evidence.login })) {
+        this.parkApproval(entry, signal, seen, "Review state changed during the final approval check");
         throw new LandApprovalStopped();
       }
     };
