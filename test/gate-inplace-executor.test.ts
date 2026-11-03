@@ -1147,6 +1147,13 @@ test.each(["before capacity commit", "after first lease"])(
   "executor fixture waits for the startup capacity commit and first release observation: %s",
   async (observation) => {
     const { f } = await setup();
+    // withExecutor configures a limit of 1, so startup must change capacity on every host.
+    const seededCapacity = 2;
+    f.store.db
+      .query(
+        "INSERT INTO slot_pools (pool, capacity) VALUES ('gate', ?) ON CONFLICT(pool) DO UPDATE SET capacity = excluded.capacity",
+      )
+      .run(seededCapacity);
     const paused = join(fixture.home, "capacity-paused");
     const proceed = join(fixture.home, "capacity-proceed");
     const committed = join(fixture.home, "capacity-committed");
@@ -1158,7 +1165,11 @@ test.each(["before capacity commit", "after first lease"])(
     let awaitingLease = false;
     let fixtureReady = "";
     let entered = false;
-    const version = () => f.store.db.query("PRAGMA data_version").get();
+    const version = () => {
+      const row = f.store.db.query<{ data_version: number }, []>("PRAGMA data_version").get();
+      if (!row) throw new Error("Missing data_version");
+      return row.data_version;
+    };
     let beforeStartupCommit: ReturnType<typeof version>;
     const execution = withExecutor(
       f,
@@ -1219,6 +1230,8 @@ test.each(["before capacity commit", "after first lease"])(
         ExecutorWorkers.prototype.leaseInplace = function (...args) {
           if (!capacity) return lease.apply(this, args);
           try {
+            // attachSlotPools has returned, including the capacity transaction's COMMIT.
+            if (db.inTransaction) throw new Error('capacity transaction is still active');
             const evidence = {
               ...capacity, changes: db.query('SELECT total_changes() n').get().n - capacity.before,
               row: db.query("SELECT pool, capacity FROM slot_pools WHERE pool = 'gate'").get(),
@@ -1257,6 +1270,9 @@ test.each(["before capacity commit", "after first lease"])(
       });
       expect(existsSync(paused)).toBe(true);
       expect(existsSync(proceed)).toBe(false);
+      expect(f.store.db.query("SELECT capacity FROM slot_pools WHERE pool = 'gate'").get()).toEqual({
+        capacity: seededCapacity,
+      });
       beforeStartupCommit = version();
       expect(entered).toBe(false);
       if (observation === "before capacity commit") {
@@ -1268,7 +1284,7 @@ test.each(["before capacity commit", "after first lease"])(
       expect(version()).toEqual(beforeStartupCommit);
       writeFileSync(proceed, "");
       await wait(() => existsSync(committed), { timeoutMs: 10_000 });
-      expect(version()).not.toEqual(beforeStartupCommit);
+      await wait(() => version() !== beforeStartupCommit, { timeoutMs: 10_000 });
       const afterStartupCommit = version();
       if (observation === "before capacity commit") {
         awaitingLease = true;
