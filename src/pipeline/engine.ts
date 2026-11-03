@@ -181,6 +181,7 @@ import { savedReviewSample, saveReviewSample } from "./review-samples.ts";
 import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import { bindRunClaim, type RunClaim, renewRunClaim, sharedRepository } from "./run-claim.ts";
+import { implementerView } from "./run-transfer-roles.ts";
 import {
   type Holdout,
   HoldoutSchema,
@@ -1544,6 +1545,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
           ctx.state.roundsOnImplementer = 0;
         }
+        const view = implementerView(ctx.state);
         const { result, target } = await ctx.invoke({
           role: "implement",
           stage,
@@ -1562,19 +1564,19 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
             : {}),
           prompt: implementPrompt({
             prompt:
-              merge && ctx.state.reviewResolution
+              merge && view.reviewResolution
                 ? (reviewRound(ctx)?.owner.prompt ?? ctx.run.prompt)
                 : ctx.run.prompt,
-            spec: merge && ctx.state.reviewResolution ? null : (ctx.state.spec ?? null),
+            spec: merge && view.reviewResolution ? null : (view.spec ?? null),
             gates,
-            baseline: ctx.state.baseline ?? null,
-            baseSha: ctx.state.verification?.baseSha ?? baseSha,
-            externalChange: ctx.state.flow === "verify-change",
-            round: !merge && ctx.state.reviewResolution?.sha ? round - 2 : round,
+            baseline: view.baseline ?? null,
+            baseSha: view.verification?.baseSha ?? baseSha,
+            externalChange: view.flow === "verify-change",
+            round: !merge && view.reviewResolution?.sha ? round - 2 : round,
             feedback:
               [
-                ctx.state.feedback,
-                ...(ctx.state.lastAudit ?? [])
+                view.feedback,
+                ...(view.lastAudit ?? [])
                   .filter(
                     (f) =>
                       f.severity === "warn" &&
@@ -1584,7 +1586,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
               ]
                 .filter(Boolean)
                 .join("\n\n") || null,
-            hasHoldout: ctx.state.flow !== "verify-change" && profile(ctx) !== "quick",
+            hasHoldout: view.flow !== "verify-change" && profile(ctx) !== "quick",
             resolution: merge,
           }),
         });
