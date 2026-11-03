@@ -1,4 +1,4 @@
-import { expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evalCommand, formatEvalReport } from "../src/cli/eval.ts";
@@ -6,6 +6,9 @@ import { createHttpRoutes } from "../src/server/http.ts";
 import { reviewCase } from "./evals-reading-support.ts";
 import { evalFixture, verifierModel } from "./evals-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { resetProcessPrivacy } from "./privacy-process-support.ts";
+
+afterEach(resetProcessPrivacy);
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
 setDefaultTimeout(30_000);
