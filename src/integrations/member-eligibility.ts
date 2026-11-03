@@ -71,6 +71,10 @@ export function taskNeeds(
     let executable = false;
     let failed = false;
     const chain = task.models?.[role];
+    if (chain != null && (!Array.isArray(chain) || !chain.every((group) => typeof group === "string"))) {
+      unsupported.push(role);
+      continue;
+    }
     const base: RouteConstraints = { billing: "free_first" };
     if (role === "implement")
       Object.assign(base, {
@@ -78,8 +82,8 @@ export function taskNeeds(
         prefer: task.implementer?.ref,
         preferPolicyRevision: task.implementer?.policyRevision,
       });
-    const shapes: RouteConstraints[] = chain === undefined ? [base] : [{ chain }];
-    if (chain === undefined && role === "review")
+    const shapes: RouteConstraints[] = chain == null ? [base] : [{ chain }];
+    if (chain == null && role === "review")
       shapes.push(
         ...deps.reviewTargets.prefer.map((prefer) => ({ ...base, prefer })),
         ...deps.reviewTargets.only.map((only) => ({ only })),

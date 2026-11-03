@@ -14,7 +14,7 @@ import {
 import type { Phase } from "../src/pipeline/context.ts";
 import type { ModelDef, Policy, ProviderDef } from "../src/router/catalog.ts";
 import type { ProviderTracker } from "../src/router/providers.ts";
-import { Router } from "../src/router/router.ts";
+import { type RouteConstraints, Router } from "../src/router/router.ts";
 import { type ClockSample, windowOpen } from "../src/util/claim-clock.ts";
 
 afterEach(() => mock.restore());
@@ -272,6 +272,63 @@ test("pinned chains exclude free, preference, escalation and review targets; emp
   expect(taskNeeds(t, f)).toMatchObject({ logins: ["codex"], versions: ["codex"], unsupported: [] });
   if (t.models) t.models.review = [];
   expect(taskNeeds(t, f).unsupported).toEqual(["review"]);
+});
+
+test.each([
+  ["implement", "edit"],
+  ["review", "read"],
+] as const)("runtime null %s pin discovers codex and gates admission", async (role, mode) => {
+  const f = gateFixture();
+  const t = task("fake/m", "loop");
+  Object.assign(t.models ?? {}, { [role]: null });
+  f.policy[role] = { default: ["fake/m"] };
+  if (role === "implement") {
+    const codex = f.models.find((model) => model.provider === "codex");
+    if (!codex) throw new Error("missing test model");
+    codex.source = "code";
+  }
+  const shape: RouteConstraints =
+    role === "implement"
+      ? { billing: "free_first", minTier: 1 }
+      : { billing: "free_first", prefer: "codex/m" };
+  Object.assign(shape, { chain: null });
+  for (const complexity of ["trivial", "small", "medium", "large"] as const)
+    expect(f.router.preview(role, complexity, shape)).toContainEqual({
+      modelId: "codex/m",
+      eligible: true,
+      reason: null,
+    });
+  expect(taskNeeds(t, { ...f, reviewTargets: reviewTargets(cfg) })).toMatchObject({
+    logins: expect.arrayContaining(["codex"]),
+    versions: expect.arrayContaining(["codex"]),
+    codexModes: [mode],
+    unsupported: [],
+  });
+  f.data.agents.codex.loggedIn = false;
+  expect(await f.gate.admit(t)).toEqual(["login"]);
+  f.data.agents.codex.loggedIn = true;
+  f.data.confinement.codex[mode] = false;
+  expect(await f.gate.admit(t)).toEqual(["confinement"]);
+  f.data.confinement.codex[mode] = true;
+  expect(await f.gate.admit(t)).toEqual([]);
+});
+
+test.each([
+  { pin: "fake/m" },
+  { pin: {} },
+  { pin: 0 },
+  { pin: false },
+  { pin: ["fake/m", null] },
+  { pin: [["fake/m"]] },
+])("uninterpretable runtime pin %j refuses route without throwing", ({ pin }) => {
+  const t = task("fake/m", "loop");
+  Object.assign(t.models ?? {}, { implement: pin });
+  let needs: ReturnType<typeof taskNeeds> | undefined;
+  expect(() => {
+    needs = taskNeeds(t, catalog());
+  }).not.toThrow();
+  expect(needs?.unsupported).toEqual(["implement"]);
+  if (needs) expect(canContinue(needs, caps())).toEqual(["route"]);
 });
 
 test.each([
