@@ -477,6 +477,7 @@ test("source boundaries restrict claim scopes to execution, observer validation 
   const allowed = new Set([
     "src/integrations/claim-ref.ts",
     "src/integrations/leases.ts",
+    "src/integrations/member-advert.ts",
     "src/db/store.ts",
     ...scoped,
   ]);

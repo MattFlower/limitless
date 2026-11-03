@@ -62,8 +62,8 @@ export function createMemberAdvertiser(deps: {
   const run = () => {
     if (running || own.signal.aborted) return;
     running = true;
-    void claimScope
-      .exit(tick)
+    const work = claimScope.exit(tick);
+    void work
       .catch(() => {
         if (!own.signal.aborted) console.error("Member advert refresh failed");
       })
