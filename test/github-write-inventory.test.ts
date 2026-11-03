@@ -9,6 +9,7 @@ import {
   type Symbol as CompilerSymbol,
   SymbolFlags,
   type Type,
+  TypeFlags,
 } from "typescript/unstable/async";
 
 // Covers symbol/type-resolvable values. Laundering through unknown, any, casts or
@@ -60,7 +61,7 @@ function property(n: ts.Node | undefined, name: string): ts.Node | undefined | n
       else continue;
     }
     if (!ts.isPropertyAssignment(p)) {
-      if (p.name?.getText() === name) return null;
+      if (p.name && (ts.isIdentifier(p.name) ? p.name.text : text(p.name)) === name) return null;
       else continue;
     }
     if ((ts.isIdentifier(p.name) ? p.name.text : text(p.name)) === name) value = p.initializer;
@@ -73,17 +74,28 @@ function nonGitHub(n: ts.Node | undefined): boolean {
   const origin = prefix?.match(/^https?:\/\/[^/?#]+(?=[/?#]|$)/)?.[0];
   if (!origin || (n && ts.isTemplateExpression(n) && origin === prefix)) return false;
   try {
-    const host = new URL(origin).hostname;
+    const host = new URL(origin).hostname.replace(/\.$/, "");
     return host !== "github.com" && !host.endsWith(".github.com");
   } catch {
     return false;
   }
 }
-function fetchRead(args: readonly ts.Node[]) {
+async function fetchRead(args: readonly ts.Node[], checker: Checker) {
   if (nonGitHub(args[0])) return true;
-  if (args.length < 2) return true;
-  const method = property(args[1], "method");
-  return method === undefined || text(method ?? undefined) === "GET";
+  const method = args.length < 2 ? undefined : property(args[1], "method");
+  if (method !== undefined) return text(method ?? undefined) === "GET";
+  // Without an init override, Request inputs carry their own (unknown) method.
+  async function urlInput(t: Type | undefined): Promise<boolean> {
+    if (!t) return false;
+    if (t.isUnionType()) {
+      for (const part of await t.getTypes()) if (!(await urlInput(part))) return false;
+      return true;
+    }
+    if (t.flags & TypeFlags.StringLike) return true;
+    const url = await checker.resolveName("URL", SymbolFlags.Type);
+    return url !== undefined && (await t.getSymbol())?.id === url.id;
+  }
+  return args[0] !== undefined && urlInput(await checker.getTypeAtLocation(args[0]));
 }
 function argv(n: ts.Node | undefined): (string | undefined)[] | undefined {
   if (!n || !ts.isArrayLiteralExpression(n)) return undefined;
@@ -100,25 +112,37 @@ function commandRead(args: (string | undefined)[] | undefined, credential = fals
     return true;
   if (args[1] === "auth" && args[2] === "token") return !credential;
   if (args[1] !== "api") return false;
-  const flags = args.slice(2);
+  const flags = args.slice(3);
   const dangerous = flags.some(
     (a) => a && /^(?:-X|-f|-F|--method(?:=|$)|--input(?:=|$)|--field(?:=|$)|--raw-field(?:=|$))/.test(a),
   );
   if (!dangerous) return true;
-  const queries = flags.filter((a) => a?.startsWith("query=")).map((a) => a?.slice(6));
+  if (args[2] !== "graphql") return false;
+  const queries: string[] = [];
+  // Only field flag values supply the operation; templates and other output
+  // options do not. Duplicate query fields remain ambiguous, including compact flags.
+  for (let i = 0; i < flags.length; i++) {
+    const flag = flags[i] ?? "";
+    const field = flag.match(/^(?:-[fF]|--(?:raw-)?field(?:=|$))(.*)$/);
+    const method = flag.match(/^(?:-X|--method(?:=|$))(.*)$/);
+    if (field) {
+      const value = field[1] || flags[++i] || "";
+      const assignment = value.match(/^([^=@[\]]+)=(.*)$/s);
+      if (!assignment) return false;
+      if (assignment[1] === "query") queries.push(assignment[2] ?? "");
+    } else if (method) {
+      if (!["GET", "POST"].includes(method[1] || flags[++i] || "")) return false;
+    } else if (["--template", "-t", "--jq", "-q", "--header", "-H", "--hostname", "--cache"].includes(flag)) {
+      if (++i >= flags.length) return false;
+    } else if (
+      !/^(?:--(?:template|jq|header|hostname|cache)=|-[tqH].)/.test(flag) &&
+      !["--paginate", "--slurp", "--silent", "--include", "-i", "--verbose"].includes(flag)
+    ) {
+      return false;
+    }
+  }
   return (
-    args[2] === "graphql" &&
-    queries.length === 1 &&
-    /^\s*query\b/.test(queries[0] ?? "") &&
-    !/\bmutation\b/.test(queries[0] ?? "") &&
-    !flags.some(
-      (a, i) =>
-        a === "--input" ||
-        a?.startsWith("--input=") ||
-        (/^(?:--method=|-X.)/.test(a ?? "") &&
-          !["--method=POST", "-XPOST", "--method=GET", "-XGET"].includes(a ?? "")) ||
-        ((a === "-X" || a === "--method") && !["POST", "GET"].includes(flags[i + 1] ?? "")),
-    )
+    queries.length === 1 && /^\s*query\b/.test(queries[0] ?? "") && !/\bmutation\b/.test(queries[0] ?? "")
   );
 }
 async function include(
@@ -130,7 +154,7 @@ async function include(
   const args = call.arguments;
   if (root === "fetch" && nonGitHub(args[0])) return false;
   if (args.some(ts.isSpreadElement)) return true;
-  if (root === "fetch") return !fetchRead(args);
+  if (root === "fetch") return !(await fetchRead(args, checker));
   if (["ghClient", "Call", "pollerCall", "companionCall"].includes(root)) {
     const body = args[root === "Call" || root === "pollerCall" ? 2 : 1];
     if (!body) return false;
@@ -661,7 +685,40 @@ test("read classification keeps uncertain dispatch and excludes only proven read
     ["auth", `sh(['gh', 'auth', 'token'])`, null],
     ["api", `runGh(['api', 'user'])`, null],
     ["query", `runGh(['api', 'graphql', '-f', 'query=query { viewer { login } }'])`, null],
+    ["compactQuery", `runGh(['api', 'graphql', '-fquery=query { viewer { login } }'])`, null],
+    ["longQuery", `runGh(['api', 'graphql', '--raw-field=query=query { viewer { login } }'])`, null],
+    ["typedQuery", `runGh(['api', 'graphql', '-F', 'query=query { viewer { login } }'])`, null],
     ["mutation", `runGh(['api', 'graphql', '-f', 'query=mutation { update { id } }'])`, "runGh"],
+    [
+      "compactMutationOverride",
+      `runGh(['api', 'graphql', '-f', 'query=query { viewer { login } }', '-fquery=mutation { update { id } }'])`,
+      "runGh",
+    ],
+    [
+      "typedMutationOverride",
+      `runGh(['api', 'graphql', '-f', 'query=query { viewer { login } }', '-Fquery=mutation { update { id } }'])`,
+      "runGh",
+    ],
+    [
+      "longMutationOverride",
+      `runGh(['api', 'graphql', '-f', 'query=query { viewer { login } }', '--field=query=mutation { update { id } }'])`,
+      "runGh",
+    ],
+    [
+      "formattedMutation",
+      `runGh(['api', 'graphql', '--template', 'query=query { viewer { login } }', '-fquery=mutation { update { id } }'])`,
+      "runGh",
+    ],
+    [
+      "templateOnly",
+      `runGh(['api', 'graphql', '--template', 'query=query { viewer { login } }', '-f', 'owner=example'])`,
+      "runGh",
+    ],
+    [
+      "queryFromInput",
+      `runGh(['api', 'graphql', '-f', 'query=query { viewer { login } }', '--input', '-'])`,
+      "runGh",
+    ],
     ["variableQuery", `runGh(['api', 'graphql', '-f', part])`, "runGh"],
     ["post", `runGh(['api', 'user', '-X', 'POST'])`, "runGh"],
     ["method", `runGh(['api', 'user', '--method', method])`, "runGh"],
@@ -684,6 +741,20 @@ test("read classification keeps uncertain dispatch and excludes only proven read
     ["fetchRead", `fetch(url)`, null],
     ["fetchOptions", `fetch(url, {headers: {}})`, null],
     ["fetchGet", `fetch(url, {method: 'GET'})`, null],
+    ["fetchUrlObject", `fetch(new URL(url))`, null],
+    ["requestPost", `fetch(new Request(url, {method: 'POST'}))`, "fetch"],
+    ["requestOptions", `fetch(new Request(url, {method: 'POST'}), {headers: {}})`, "fetch"],
+    ["requestGetOverride", `fetch(new Request(url, {method: 'POST'}), {method: 'GET'})`, null],
+    ["requestPostOverride", `fetch(new Request(url), {method: 'POST'})`, "fetch"],
+    ["requestVariable", `const request: Request = new Request(url); fetch(request)`, "fetch"],
+    [
+      "requestUnion",
+      `const request: string | Request = Math.random() ? url : new Request(url); fetch(request)`,
+      "fetch",
+    ],
+    ["quotedGetter", `fetch(url, {get 'method'() { return 'POST'; }})`, "fetch"],
+    ["quotedSetter", `fetch(url, {set 'method'(value: string) {}})`, "fetch"],
+    ["quotedMethod", `fetch(url, {'method': 'POST'})`, "fetch"],
     ["fetchPost", `fetch(url, {method: 'POST'})`, "fetch"],
     ["fetchUnknownMethod", `fetch(url, {method})`, "fetch"],
     ["fetchUnknownOptions", `fetch(url, body)`, "fetch"],
@@ -695,6 +766,10 @@ test("read classification keeps uncertain dispatch and excludes only proven read
     ["localTemplate", `fetch(\`https://example.com/path/\${part}\`, {method: "POST"})`, null],
     ["uncertainOrigin", `fetch(\`https://\${part}/path\`, {method: "POST"})`, "fetch"],
     ["githubTemplate", `fetch(\`https://api.github.com/\${part}\`, {method: "POST"})`, "fetch"],
+    ["githubDnsDot", `fetch('https://api.github.com./path', {method: 'POST'})`, "fetch"],
+    ["githubDnsDotTemplate", `fetch(\`https://api.github.com./\${part}\`, {method: 'POST'})`, "fetch"],
+    ["githubRootDnsDot", `fetch('https://github.com./path', {method: 'POST'})`, "fetch"],
+    ["localDnsDot", `fetch('https://example.com./path', {method: 'POST'})`, null],
     ["variableUrl", `fetch(url, {method: 'POST'})`, "fetch"],
   ];
   await fixture(
