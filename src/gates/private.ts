@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
   closeSync,
   fstatSync,
@@ -140,9 +140,9 @@ export function loadPrivateStrings(
   }
 }
 export type PrivateStrings = ReturnType<typeof loadPrivateStrings>;
-export function privateStringsDigest(entries: PrivateStrings): string {
+export function privateStringsDigest(entries: PrivateStrings, key?: Uint8Array): string {
   const values = [...new Set(entries.map(({ value }) => value))].sort();
-  return createHash("sha256")
+  return (key === undefined ? createHash("sha256") : createHmac("sha256", key))
     .update(JSON.stringify(["limitless-private-strings/1", ...values]))
     .digest("hex");
 }
