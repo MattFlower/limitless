@@ -38,9 +38,10 @@ type Group = {
 test("entries and continuations merge until a heartbeat, excluding worker waits and idle", async () => {
   await temporary(async (root) => {
     await fakeRevision(root);
-    let clock = 0;
+    let [clock, cpu] = [0, 0];
     const runtime = {
       now: () => clock,
+      cpu: () => cpu,
       pause,
       gc: () => {},
       memory: () => ({ heap: 0, peakRSS: 0 }),
@@ -58,7 +59,9 @@ test("entries and continuations merge until a heartbeat, excluding worker waits 
             clock += 3;
           });
           await pause();
-          clock += 100; // A worker's waiting time, with no implementation entry.
+          clock += 100; // A worker's waiting time: no implementation entry and an idle main thread.
+          await pause();
+          [clock, cpu] = [clock + 40, cpu + 30]; // Resumed implementation work with no entry: CPU-busy.
           await pause();
           own("after-worker", () => {
             clock += 7;
@@ -71,11 +74,12 @@ test("entries and continuations merge until a heartbeat, excluding worker waits 
     const group = result.groups.merged as Group;
     expect(group.raw).toHaveLength(7);
     for (const trial of group.raw) {
-      expect(trial.turns.map((t) => t[1])).toEqual([5, 7]);
+      expect(trial.turns.map((t) => t[1])).toEqual([5, 40, 7]);
       expect(trial.turns[0]?.[3]).toContain("first,second");
-      expect(trial.turns[1]?.[3]).toContain("after-worker");
+      expect(trial.turns[1]?.[3]).toBe("resumed");
+      expect(trial.turns[2]?.[3]).toContain("after-worker");
       expect(trial.idle.map((gap) => gap[1])).toEqual([100]);
-      expect(trial.slice).toBe(7);
+      expect(trial.slice).toBe(40);
     }
     const { count } = await import(join(root, "src/util/privacy-checker.ts"));
     expect(count()).toBe(7);
@@ -91,6 +95,7 @@ test("64 microtask rounds restart at re-entry; warmup maxima and measured median
       root,
       {
         now: () => clock,
+        cpu: () => 0,
         pause,
         gc: () => {},
         memory: () => ({ heap: 0, peakRSS: 0 }),
@@ -268,7 +273,7 @@ test("bad CLI arguments fail before launching a worker", async () => {
   expect(failed.stderr.toString().trim()).toStartWith("benchmark-gate-output: unknown workload(s) bogus;");
 });
 
-test("implementation work resumed by setImmediate, timers, sleeps and XML parsing is owned through worker()", async () => {
+test("implementation work resumed by file I/O, imported or captured timers and sleeps is owned through worker()", async () => {
   await temporary(async (root) => {
     await fakeRevision(root);
     await fs.mkdir(join(root, "src/gates"));
@@ -276,15 +281,24 @@ test("implementation work resumed by setImmediate, timers, sleeps and XML parsin
       join(root, "src/util/privacy-boundary.ts"),
       "export const privacyRegistry={replacePolicy(){}}; export function registerCredential(){}",
     );
+    // Scheduling APIs are imported or captured at module initialization, before any benchmark wrapper exists, and
+    // each resumption does synchronous work before (or without) touching an instrumented API.
     await fs.writeFile(
       join(root, "src/gates/junit.ts"),
-      `const busy=(n)=>{const t=performance.now();while(performance.now()-t<n);};
+      `import { promises as fs } from 'node:fs';
+      import { setImmediate as later } from 'node:timers/promises';
+      const captured=setImmediate;
+      const cpu=()=>{const u=process.threadCpuUsage();return (u.user+u.system)/1000;};
+      const busy=(n)=>{const t=cpu();while(cpu()-t<n);};
       export async function readJUnit(){
-        await new Promise((r)=>setImmediate(r)); busy(30);
-        await new Promise((r)=>setTimeout(r,1)); busy(30);
-        await Bun.sleep(1); busy(30);
-        await Bun.file(import.meta.path).text(); Bun.XML.parse('<a/>'); busy(30);
-        return {failedFiles:['sample.test.ts']};
+        await later(); busy(40);
+        await new Promise((r)=>captured(r)); busy(40);
+        await new Promise((r)=>setTimeout(r,1)); busy(40);
+        await Bun.sleep(1); busy(40);
+        await fs.readFile(import.meta.path); busy(40);
+        await Bun.file(import.meta.path).text(); busy(40);
+        const root=Bun.XML.parse('<a/>',{compact:false}); // The wrapper must forward the readers' options.
+        return root.name==='a'?{failedFiles:['sample.test.ts']}:root;
       }`,
     );
     const { registry: workloads, worker } = await import("../scripts/benchmark-gate-output.ts");
@@ -295,11 +309,12 @@ test("implementation work resumed by setImmediate, timers, sleeps and XML parsin
       const group = report.groups["readJUnit/1"] as { raw: (Group["raw"][number] & { parses: number })[] };
       expect(group.raw).toHaveLength(7);
       for (const trial of group.raw) {
-        const owned = trial.turns.filter((t) => t[1] >= 29);
-        expect(owned.map((t) => t[3])).toEqual(
-          ["immediate", "timer", "sleep", "XML.parse"].map((p) => expect.stringContaining(p)),
-        );
-        expect(trial.idle.filter((gap) => (gap[1] ?? 0) >= 29)).toEqual([]);
+        const owned = trial.turns.filter((t) => t[1] >= 39);
+        expect(owned).toHaveLength(6);
+        for (const turn of owned) expect(turn[3]).toContain("resumed");
+        expect(owned[5]?.[3]).toContain("XML.parse");
+        expect(trial.slice).toBeGreaterThanOrEqual(40);
+        expect(trial.idle.filter((gap) => (gap[1] ?? 0) >= 39)).toEqual([]);
         expect(trial.parses).toBe(1);
       }
       expect(setImmediate.name).toBe("setImmediate");

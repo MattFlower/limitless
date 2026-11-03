@@ -263,7 +263,6 @@ export async function measureRevision(a: API, fixture: () => ReturnType<typeof w
 type Fixture = ReturnType<typeof workload>;
 const ms = (u: { user: number; system: number }) => (u.user + u.system) / 1000;
 const busy = (w: Fixture) => ({ ...w, reason: "checker-busy", maximum: false });
-const unowned = setImmediate; // Producer instrumentation wraps setImmediate; the heartbeat stays unowned.
 type Checker = ReturnType<typeof import("../src/util/privacy-checker.ts").createPrivacyChecker>;
 /** worker-all: the real checker, cold per trial, maximum policy. A daemon slice is wall time from entering daemon
  * code to 64 microtask rounds after its latest entry; entries join one slice until a setImmediate heartbeat proves
@@ -273,7 +272,10 @@ export type ProducerOperation = {
   check: (value: unknown) => Record<string, unknown>;
   dimensions: object;
 };
-export async function measureWorker(root: string, r = runtime, ops?: Record<string, ProducerOperation>) {
+type Clocks = typeof runtime & { cpu?: () => number }; // cpu: main-thread ms
+type Ops = Record<string, ProducerOperation>;
+export async function measureWorker(root: string, r: Clocks = runtime, ops?: Ops) {
+  const mainMs = r.cpu ?? (() => ms(process.threadCpuUsage()));
   const load = (p: string) => import(join(root, `src/util/privacy-${p}.ts`));
   const [b, k, c] = await Promise.all(["boundary", "checker", "chunks"].map(load));
   const policy = workload(ops ? "plain" : "preparation");
@@ -320,13 +322,17 @@ export async function measureWorker(root: string, r = runtime, ops?: Record<stri
       });
       const turns: [number, number, number, string][] = [];
       const [idle, pending] = [[] as number[][], [] as unknown[]];
-      let [beating, last, heartbeat] = [true, r.now(), 0];
-      const beat = (now = r.now()) => {
+      let [beating, last, heartbeat, spent] = [true, r.now(), 0, mainMs()];
+      const beat = (now = r.now(), used = producer ? mainMs() : 0) => {
+        // Only implementation code and this heartbeat run on the main thread in a producer trial, so a gap the main
+        // thread spent mostly on CPU is owned however the code resumed (I/O, captured or imported timers).
+        if (producer && now - last > 2 && used - spent >= (now - last) / 2)
+          open = { start: last, end: now, phases: new Set([...(open?.phases ?? []), "resumed"]) };
         if (open)
           turns.push([open.start - start, open.end - open.start, now - last, [...open.phases].join()]);
         else if (now - last > 2) idle.push([now - start, now - last]);
-        [open, last, heartbeat] = [undefined, now, heartbeat + 1];
-        if (beating) unowned(beat);
+        [open, last, heartbeat, spent] = [undefined, now, heartbeat + 1, used];
+        if (beating) setImmediate(beat);
       };
       const [cpu, main, start] = [process.cpuUsage(), process.threadCpuUsage(), r.now()];
       setImmediate(beat);
@@ -385,7 +391,8 @@ export async function measureWorker(root: string, r = runtime, ops?: Record<stri
     await series("eight slots, then slot backpressure", [...eight, busy(bmp)]);
     await series("byte backpressure (64 MiB pending)", [bmp, bmp, busy(bmp)]);
   }
-  const method = "slice: wall ms per daemon turn; worker CPU: cpuUsage minus main threadCpuUsage";
+  const resumed = ops ? " or producer gap >2 ms at >=50% main-thread CPU (resumed)" : "";
+  const method = `slice: wall ms per daemon turn${resumed}; worker CPU: cpuUsage minus main threadCpuUsage`;
   const size = { entries: policy.entries.length, credentials: policy.credentials.length };
   return { platform: r.platform, method, policy: size, groups, decision: decideC21c(raw) };
 }

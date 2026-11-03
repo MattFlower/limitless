@@ -1,5 +1,4 @@
 /** Synthetic producers; checker-refusals and worker-ingress are deferred to slice 2f. */
-import { EventEmitter } from "node:events";
 import { existsSync, promises as fs } from "node:fs";
 import { join } from "node:path";
 import {
@@ -59,32 +58,15 @@ export async function worker(root: string, name: string) {
         [checker, submissionMs, latencyMs, parses] = [current, [], [], 0];
         const start = performance.now(),
           protect = checker.protectText;
-        // Every implementation resumption (I/O events, scheduled turns, timers, sleeps, XML parses) re-enters
-        // ownership, so work after a yield is owned until the next heartbeat rather than escaping both buckets.
+        // Entries only label phases: measureWorker owns every CPU-busy heartbeat gap of a producer trial, however
+        // the implementation resumed (file I/O, imported or captured timers), so no resumption escapes both buckets.
         const enter = (phase: string, f: Fn) =>
           function (this: unknown, ...x: unknown[]) {
             return own(phase, () => f.apply(this, x));
           };
-        const later =
-          (f: Fn, phase: string): Fn =>
-          (cb, ...x) =>
-            f(enter(phase, cb as Fn), ...x);
-        const sleep =
-          (f: Fn): Fn =>
-          async (...x) =>
-            enter("sleep", (v) => v)(await f(...x));
-        const patches: [object, string, (f: Fn) => Fn][] = [
-          [EventEmitter.prototype, "emit", (f) => enter("emit", f)],
-          [globalThis, "setImmediate", (f) => later(f, "immediate")],
-          [globalThis, "setTimeout", (f) => later(f, "timer")],
-          [Bun, "sleep", sleep],
-          [Bun.XML, "parse", (f) => enter("XML.parse", (...x) => [parses++, f(...x)][1])],
-        ];
-        const restore = patches.map(([o, k, patch]) => {
-          const f = Reflect.get(o, k) as Fn;
-          Reflect.set(o, k, patch(f));
-          return () => Reflect.set(o, k, f);
-        });
+        const original = Bun.XML.parse,
+          parse = original as Fn;
+        Bun.XML.parse = enter("XML.parse", (...x) => [parses++, parse(...x)][1]) as typeof original;
         checker.protectText = (i, c) => {
           const start = performance.now(),
             result = own("submission", () => protect(i, c));
@@ -97,7 +79,7 @@ export async function worker(root: string, name: string) {
           return await run();
         } finally {
           elapsed = performance.now() - start;
-          for (const undo of restore) undo();
+          Bun.XML.parse = original;
         }
       },
       check: (v) => ({
