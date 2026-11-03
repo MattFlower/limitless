@@ -274,20 +274,26 @@ test("pinned chains exclude free, preference, escalation and review targets; emp
   expect(taskNeeds(t, f).unsupported).toEqual(["review"]);
 });
 
-test.each(["unknown/m", "http/m", "decision/m", "codex/m@bogus", "bad provider/m", "codex/m@", ""])(
-  "non-executable reference %j adds no requirement and refuses route",
-  (reference) => {
-    const f = catalog();
-    const t = task("fake/m", "loop");
-    if (t.models) t.models.implement = [reference];
-    let needs: ReturnType<typeof taskNeeds> | undefined;
-    expect(() => {
-      needs = taskNeeds(t, f);
-    }).not.toThrow();
-    expect(needs).toMatchObject({ logins: [], versions: [], unsupported: ["implement"] });
-    if (needs) expect(canContinue(needs, caps())).toEqual(["route"]);
-  },
-);
+test.each([
+  "unknown/m",
+  "http/m",
+  "decision/m",
+  "codex/m@bogus",
+  "bad provider/m",
+  "codex/m@",
+  "codex/m@|",
+  "",
+])("non-executable reference %j adds no requirement and refuses route", (reference) => {
+  const f = catalog();
+  const t = task("fake/m", "loop");
+  if (t.models) t.models.implement = [reference];
+  let needs: ReturnType<typeof taskNeeds> | undefined;
+  expect(() => {
+    needs = taskNeeds(t, f);
+  }).not.toThrow();
+  expect(needs).toMatchObject({ logins: [], versions: [], unsupported: ["implement"] });
+  if (needs) expect(canContinue(needs, caps())).toEqual(["route"]);
+});
 
 test("excluded origins, unknown providers and unsupported transport effort are dropped independently", () => {
   const f = catalog();
@@ -656,12 +662,48 @@ test("legacy CLI provider kinds and explicit efforts keep their requirements", (
   }
 });
 
-test("a preview that cannot inspect malformed grouped references refuses without throwing", () => {
+test.each(["fake/m", "codex/m@high"])("malformed group preserves executable peer %s", (reference) => {
   const f = catalog();
-  const t = task("fake/m");
-  if (t.models) t.models.review = ["codex/m|codex/m@"];
-  expect(taskNeeds(t, f).unsupported).toEqual(["review"]);
+  const t = task("fake/m", "loop");
+  if (t.models) t.models.implement = [`${reference}|codex/m@`];
+  const shape = { chain: t.models?.implement };
+  expect(f.router.preview("implement", "small", shape)).toContainEqual({
+    modelId: "codex/m@",
+    eligible: false,
+    reason: expect.any(String),
+  });
+  const needs = taskNeeds(t, f);
+  expect(needs.unsupported).toEqual([]);
+  expect(needs.versions).toEqual(reference === "fake/m" ? [] : ["codex"]);
+  expect(canContinue(needs, caps())).toEqual([]);
 });
+
+test.each(["chain", "policy"])(
+  "malformed %s groups preserve executable peers and later sources",
+  (source) => {
+    const f = catalog();
+    const t = task("fake/m");
+    const group = "fake/m|codex/m@";
+    if (source === "chain" && t.models) t.models.implement = [group, "codex/m@high"];
+    else {
+      delete t.models?.implement;
+      f.policy.implement = { default: [group] };
+      t.implementer = { ref: "codex/m@high" };
+    }
+    const shape = source === "chain" ? { chain: t.models?.implement } : { prefer: t.implementer?.ref };
+    expect(f.router.route("implement", "small", shape, false).candidates.map((c) => c.modelId)).toEqual(
+      source === "chain" ? ["fake/m", "codex/m"] : ["codex/m", "fake/m"],
+    );
+    const needs = taskNeeds(t, f);
+    expect(needs).toMatchObject({
+      unsupported: [],
+      logins: ["codex"],
+      versions: ["codex"],
+      codexModes: ["edit"],
+    });
+    expect(canContinue(needs, caps())).toEqual([]);
+  },
+);
 
 test("gate uses the review override instead of roster targets", async () => {
   const f = gateFixture();

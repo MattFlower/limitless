@@ -317,6 +317,7 @@ export class Router {
       const group: ModelTarget[] = [];
       const start = skipped.length;
       const visited: string[] = [];
+      const previewModels = preview ? new Map<string, ModelDef>() : undefined;
       for (const reference of ids) {
         let resolved: ReturnType<Router["resolve"]>;
         try {
@@ -327,6 +328,7 @@ export class Router {
           continue;
         }
         const { model: m, effort, targetId: id } = resolved;
+        previewModels?.set(id, m);
         if (fromPolicy && this.tracker.def(m.provider)?.billing === "free") policyFreeModels.add(m.id);
         if (seen.has(id)) continue;
         seen.add(id);
@@ -368,7 +370,7 @@ export class Router {
       group.sort(this.compareCandidates);
       if (preview) {
         const orderedIds = visited.sort((a, b) =>
-          this.compareCandidates(this.model(parseTarget(a).modelId), this.model(parseTarget(b).modelId)),
+          this.compareCandidates(previewModels?.get(a), previewModels?.get(b)),
         );
         for (const modelId of orderedIds) {
           const reason = skipped.slice(start).find((s) => s.modelId === modelId)?.reason ?? null;
