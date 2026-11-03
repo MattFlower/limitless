@@ -134,7 +134,8 @@ async function withExecutor(
   sha = release,
   realConfinement = false,
   beforeRun = "",
-  onRegistered?: () => Promise<void>,
+  onRegistered?: (ready: string) => Promise<void>,
+  onReadyCheck?: (ready: boolean) => void,
 ) {
   const ready = join(fixture.home, `executor-ready-${randomUUID()}`);
   const script = `
@@ -180,11 +181,19 @@ async function withExecutor(
     stderr: "pipe",
   });
   const stderr = new Response(child.stderr).text();
+  let failed = false;
   try {
     await wait(() => f.workers.executor(undefined, false)?.pid === child.pid, { timeoutMs: 10_000 });
-    await onRegistered?.();
+    await onRegistered?.(ready);
     // Registration precedes slot-pool writes and the first daemon-release observation.
-    await wait(() => existsSync(ready), { timeoutMs: 10_000 });
+    await wait(
+      () => {
+        const observed = existsSync(ready);
+        onReadyCheck?.(observed);
+        return observed;
+      },
+      { timeoutMs: 10_000 },
+    );
     await confinementScope.run(fakeConfinement, () =>
       fn(
         f.workers,
@@ -195,10 +204,14 @@ async function withExecutor(
         child,
       ),
     );
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill(beforeRun ? "SIGKILL" : "SIGTERM");
     await child.exited;
-    expect(await stderr).toBe("");
+    const output = await stderr;
+    if (!failed) expect(output).toBe("");
   }
 }
 
@@ -1130,87 +1143,156 @@ test.each(["disabled", "absent", "dead", "release"])(
   },
 );
 
-test("executor fixture waits for the startup capacity commit and first release observation", async () => {
-  const { f } = await setup();
-  const paused = join(fixture.home, "capacity-paused");
-  const proceed = join(fixture.home, "capacity-proceed");
-  const trace = join(fixture.home, "capacity-trace");
-  const resumeFixture = Promise.withResolvers<void>();
-  let registered = false;
-  const version = () => f.store.db.query("PRAGMA data_version").get();
-  let beforeStartupCommit: ReturnType<typeof version>;
-  const execution = withExecutor(
-    f,
-    async (_workers, _crash, child) => {
-      const before = version();
-      await wait(() => existsSync(trace), { timeoutMs: 10_000 });
-      const evidence = JSON.parse(readFileSync(trace, "utf8"));
-      expect(evidence.pid).toBe(child.pid);
-      expect(evidence.database).toBe(f.cfg.paths.db);
-      expect(evidence.changes).toBe(1);
-      expect(evidence.statements).toContain("UPDATE slot_pools SET capacity = ? WHERE pool = ?");
-      console.info(JSON.stringify({ evidence, beforeStartupCommit, afterStartupCommit: version() }));
+test.each(["before capacity commit", "after first lease"])(
+  "executor fixture waits for the startup capacity commit and first release observation: %s",
+  async (observation) => {
+    const { f } = await setup();
+    const paused = join(fixture.home, "capacity-paused");
+    const proceed = join(fixture.home, "capacity-proceed");
+    const committed = join(fixture.home, "capacity-committed");
+    const finishLease = join(fixture.home, "finish-first-lease");
+    const trace = join(fixture.home, "capacity-trace");
+    const resumeFixture = Promise.withResolvers<void>();
+    const readinessChecked = Promise.withResolvers<boolean>();
+    const leaseReadinessChecked = Promise.withResolvers<boolean>();
+    let awaitingLease = false;
+    let fixtureReady = "";
+    let entered = false;
+    const version = () => f.store.db.query("PRAGMA data_version").get();
+    let beforeStartupCommit: ReturnType<typeof version>;
+    const execution = withExecutor(
+      f,
+      async (_workers, _crash, child) => {
+        entered = true;
+        if (!existsSync(trace)) throw new Error("Executor fixture callback entered before startup readiness");
+        const evidence = JSON.parse(readFileSync(trace, "utf8"));
+        expect(evidence.pid).toBe(child.pid);
+        expect(evidence.database).toBe(f.cfg.paths.db);
+        expect(evidence.connection).toBeNumber();
+        expect(evidence.changes).toBe(1);
+        expect(evidence.statement).toBe("UPDATE slot_pools SET capacity = ? WHERE pool = ?");
+        expect(evidence.row).toEqual({ pool: "gate", capacity: 1 });
+        expect(evidence.committed).toBe(true);
+        expect(evidence.daemonRelease).toBe(release);
+        expect(evidence.leaseCompleted).toBe(true);
+        const afterStartupCommit = version();
+        console.info(JSON.stringify({ observation, evidence, beforeStartupCommit, afterStartupCommit }));
+        expect(afterStartupCommit).not.toEqual(beforeStartupCommit);
+        await Bun.sleep(3 * f.workers.times.tick);
+        expect(version()).toEqual(afterStartupCommit);
+      },
+      release,
+      false,
+      `
+        import { Database } from 'bun:sqlite';
+        import { Store as ExecutorStore } from ${JSON.stringify(new URL("../src/db/store.ts", import.meta.url).pathname)};
+        import { existsSync, writeFileSync } from 'node:fs';
+        const query = Database.prototype.query;
+        const getSetting = ExecutorStore.prototype.getSetting;
+        const lease = ExecutorWorkers.prototype.leaseInplace;
+        let capacity, db, daemonRelease;
+        const waitForFile = (path) => {
+          const deadline = Date.now() + 10_000;
+          while (!existsSync(path)) {
+            if (Date.now() > deadline) throw new Error('executor startup barrier timed out: ' + path);
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+          }
+        };
+        // Hook the SQL call itself, including Store's per-connection timing wrapper.
+        Database.prototype.query = function (sql, ...args) {
+          if (!capacity && sql === 'UPDATE slot_pools SET capacity = ? WHERE pool = ?') {
+            db = this;
+            capacity = {
+              pid: process.pid, database: db.filename, connection: db.handle, statement: sql,
+              before: query.call(db, 'SELECT total_changes() n').get().n,
+            };
+            writeFileSync(${JSON.stringify(paused)}, '');
+            waitForFile(${JSON.stringify(proceed)});
+          }
+          return query.call(this, sql, ...args);
+        };
+        ExecutorStore.prototype.getSetting = function (key, ...args) {
+          const value = getSetting.call(this, key, ...args);
+          if (key === 'executor.daemonRelease') daemonRelease = value;
+          return value;
+        };
+        ExecutorWorkers.prototype.leaseInplace = function (...args) {
+          if (!capacity) return lease.apply(this, args);
+          try {
+            const evidence = {
+              ...capacity, changes: db.query('SELECT total_changes() n').get().n - capacity.before,
+              row: db.query("SELECT pool, capacity FROM slot_pools WHERE pool = 'gate'").get(),
+              committed: !db.inTransaction, daemonRelease,
+            };
+            writeFileSync(${JSON.stringify(committed)}, JSON.stringify(evidence));
+            waitForFile(${JSON.stringify(finishLease)});
+            const job = lease.apply(this, args);
+            writeFileSync(${JSON.stringify(trace)}, JSON.stringify({
+              ...evidence, daemonRelease, leaseCompleted: true,
+            }));
+            return job;
+          } finally {
+            Database.prototype.query = query;
+            ExecutorStore.prototype.getSetting = getSetting;
+            ExecutorWorkers.prototype.leaseInplace = lease;
+          }
+        };
+      `,
+      async (ready) => {
+        fixtureReady = ready;
+        await resumeFixture.promise;
+      },
+      (ready) => {
+        readinessChecked.resolve(ready);
+        if (awaitingLease) leaseReadinessChecked.resolve(ready);
+      },
+    );
+    // The parent controls both barriers; keep early failures handled until it awaits execution.
+    void execution.catch(() => {});
+    try {
+      await wait(() => !!fixtureReady, { timeoutMs: 10_000 });
+      await wait(() => existsSync(paused), {
+        timeoutMs: 10_000,
+        description: "Missing executor startup capacity barrier (UPDATE slot_pools)",
+      });
+      expect(existsSync(paused)).toBe(true);
+      expect(existsSync(proceed)).toBe(false);
+      beforeStartupCommit = version();
+      expect(entered).toBe(false);
+      if (observation === "before capacity commit") {
+        resumeFixture.resolve();
+        // This acknowledges the fixture's real readiness check, or propagates early callback entry.
+        expect(await Promise.race([readinessChecked.promise, execution])).toBe(false);
+        expect(entered).toBe(false);
+      }
+      expect(version()).toEqual(beforeStartupCommit);
+      writeFileSync(proceed, "");
+      await wait(() => existsSync(committed), { timeoutMs: 10_000 });
       expect(version()).not.toEqual(beforeStartupCommit);
-      expect(version()).toEqual(before);
-      await Bun.sleep(3 * f.workers.times.tick);
-      expect(version()).toEqual(before);
-    },
-    release,
-    false,
-    `
-      import { DatabaseSlotPool } from ${JSON.stringify(new URL("../src/gates/slots.ts", import.meta.url).pathname)};
-      import { existsSync, writeFileSync } from 'node:fs';
-      const setLimit = DatabaseSlotPool.prototype.setLimit;
-      DatabaseSlotPool.prototype.setLimit = function (limit) {
-        if (!this.db) return setLimit.call(this, limit);
-        writeFileSync(${JSON.stringify(paused)}, '');
-        const deadline = Date.now() + 10_000;
-        while (!existsSync(${JSON.stringify(proceed)})) {
-          if (Date.now() > deadline) throw new Error('capacity barrier timed out');
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-        }
-        const statements = [];
-        const db = this.db;
-        const query = db.query;
-        db.query = new Proxy(query, {
-          apply(target, self, args) {
-            statements.push(args[0]);
-            return Reflect.apply(target, self, args);
-          },
-        });
-        const before = db.query('SELECT total_changes() n').get().n;
-        try {
-          setLimit.call(this, limit);
-          writeFileSync(${JSON.stringify(trace)}, JSON.stringify({
-            pid: process.pid, database: db.filename, connection: db.handle,
-            statements, changes: db.query('SELECT total_changes() n').get().n - before,
-          }));
-        } finally {
-          db.query = query;
-        }
-      };
-    `,
-    async () => {
-      registered = true;
-      await resumeFixture.promise;
-    },
-  );
-  // Attach a rejection handler while the parent controls both sides of startup.
-  void execution.catch(() => {});
-  try {
-    await wait(() => registered, { timeoutMs: 10_000 });
-    await wait(() => existsSync(paused), { timeoutMs: 10_000 });
-    beforeStartupCommit = version();
-    resumeFixture.resolve();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    writeFileSync(proceed, "");
-    await execution;
-  } finally {
-    resumeFixture.resolve();
-    writeFileSync(proceed, "");
-    await execution;
-  }
-});
+      const afterStartupCommit = version();
+      if (observation === "before capacity commit") {
+        awaitingLease = true;
+        expect(await Promise.race([leaseReadinessChecked.promise, execution])).toBe(false);
+      }
+      expect(entered).toBe(false);
+      writeFileSync(finishLease, "");
+      await wait(() => existsSync(fixtureReady), { timeoutMs: 10_000 });
+      if (observation === "after first lease") {
+        resumeFixture.resolve();
+        expect(await Promise.race([readinessChecked.promise, execution])).toBe(true);
+      }
+      await execution;
+      expect(entered).toBe(true);
+      expect(version()).toEqual(afterStartupCommit);
+    } finally {
+      resumeFixture.resolve();
+      writeFileSync(proceed, "");
+      writeFileSync(finishLease, "");
+      // Cleanup must not replace a missing-barrier diagnostic with a later callback failure.
+      await execution.catch(() => {});
+    }
+  },
+);
 
 test("idle executor uses no write transactions, and release mismatches never lease", async () => {
   const { f, req } = await setup();
