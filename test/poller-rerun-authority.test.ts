@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
@@ -17,6 +17,7 @@ import { mountIntegrations } from "../src/integrations/index.ts";
 import { createLeaseManager } from "../src/integrations/leases.ts";
 import { mapClaimInterruption } from "../src/pipeline/claim-interruption.ts";
 import { claimRef } from "../src/pipeline/portable.ts";
+import { validateRunClaim } from "../src/pipeline/run-claim.ts";
 import { GitHub } from "./claim-github-fake.ts";
 import { pollerHarness, respond, SHA, url } from "./github-poller-support.ts";
 
@@ -146,19 +147,19 @@ async function manager(db = h.store, member = "m-0123456789abcdef") {
     },
   };
 }
-async function held(kind: "pr" | "issue" = "pr") {
-  const holder = h.store.createRun(h.repo("o/r"), {
-    repo: "o/r",
+async function held(kind: "pr" | "issue" = "pr", repo = "o/r", number = 1) {
+  const holder = h.store.createRun(h.repo(repo), {
+    repo,
     prompt: "holder",
     source: "github",
-    sourceRef: { kind: kind === "pr" ? "pull_request" : "issue", repo: "o/r", number: 1 },
+    sourceRef: { kind: kind === "pr" ? "pull_request" : "issue", repo, number },
   });
   h.store.updateRun(holder.id, { status: "running" });
   const m = await manager();
   const result = await m.leases.acquire(
-    "o/r",
-    claimRef({ kind, repo: "o/r", number: 1 }),
-    { kind, number: 1, run: holder.id, status: "running" },
+    repo,
+    claimRef({ kind, repo, number }),
+    { kind, number, run: holder.id, status: "running" },
     { takeover: false },
   );
   if (result.kind !== "held") throw new Error(`Not held: ${result.kind}`);
@@ -166,6 +167,14 @@ async function held(kind: "pr" | "issue" = "pr") {
   const authority: ObserverAuthority = (key) =>
     claimRef(key) === result.handle.ref ? { binding, leases: m.leases } : undefined;
   return { ...m, binding, handle: result.handle, authority, holder };
+}
+function trackHolder(runId: string) {
+  const prUrl = url("o/r", 1);
+  const tracked = h.store.githubTracked().find((pr) => pr.url === prUrl);
+  if (!tracked?.runId) throw new Error("Missing tracked run");
+  h.store.db.query("UPDATE runs SET pr_url = NULL WHERE id = ?").run(tracked.runId);
+  h.store.updateRun(runId, { prUrl });
+  expect(h.store.githubTracked().find((pr) => pr.url === prUrl)?.runId).toBe(runId);
 }
 function advanceLease(ms: number) {
   time += ms;
@@ -262,8 +271,31 @@ test("a refused rerun still classifies the remaining failures", async () => {
   expect(h.logs).toEqual([]);
 });
 
+test.each([
+  { kind: "issue", repo: "o/r", number: 1 },
+  { kind: "pr", repo: "o/r", number: 3 },
+  { kind: "pr", repo: "o/other", number: 1 },
+] as const)("PR authority refuses a valid binding for $kind $repo#$number", async (key) => {
+  const a = await held(key.kind, key.repo, key.number);
+  if (key.kind === "issue") trackHolder(a.holder.id);
+  const holder = h.store.getRun(a.holder.id);
+  if (!holder) throw new Error("Missing holder");
+  const authority = mock(() => ({ binding: a.binding, leases: a.leases }));
+  validateRunClaim(holder, h.store, a);
+  expect(holder.status).toBe("running");
+  expect(holder.error).toBeNull();
+  expect(a.binding.cancelled()).toBe(false);
+  expect(a.binding.lost).toBe(false);
+  expect(a.binding.windowOpen()).toBe(true);
+  start(authority);
+  await h.advance(0);
+  expect(authority).toHaveBeenCalledWith({ kind: "pr", repo: "o/r", number: 1 });
+  unclaimed();
+});
+
 test.each(["issue only", "cancelled", "terminal"])("PR authority refuses %s", async (mode) => {
   const a = await held(mode === "issue only" ? "issue" : "pr");
+  if (mode === "issue only") trackHolder(a.holder.id);
   if (mode === "cancelled") h.store.updateRun(a.holder.id, { error: "cancelled by operator" });
   if (mode === "terminal") h.store.updateRun(a.holder.id, { status: "succeeded" });
   start(a.authority);
@@ -271,35 +303,38 @@ test.each(["issue only", "cancelled", "terminal"])("PR authority refuses %s", as
   unclaimed();
 });
 
-test("lost PR generation and projected loss survive store reopen", async () => {
-  const a = await held();
-  const other = new Store(":memory:");
-  cleanup.push(() => other.close());
-  advanceLease(602_000);
-  const b = await manager(other, "m-fedcba9876543210");
-  expect(
-    (
-      await b.leases.acquire(
-        "o/r",
-        a.handle.ref,
-        { kind: "pr", number: 1, run: a.holder.id, status: "running" },
-        { takeover: true },
-      )
-    ).kind,
-  ).toBe("held");
-  cleanup.push(a.leases.start({ active: () => true, onLost: a.binding.onLost }));
-  await a.tick();
-  expect(a.binding.lost).toBe(true);
-  const stop = start(a.authority);
-  await h.advance(0);
-  unclaimed();
-  mapClaimInterruption(h.store, a.holder.id, new ClaimLostError());
-  stop();
-  h.reopen();
-  start(a.authority);
-  await h.advance(0);
-  unclaimed();
-});
+test.each(["latched binding", "cold start"])(
+  "lost PR generation and projected loss survive store reopen: %s",
+  async (mode) => {
+    const a = await held();
+    const other = new Store(":memory:");
+    cleanup.push(() => other.close());
+    advanceLease(602_000);
+    const b = await manager(other, "m-fedcba9876543210");
+    expect(
+      (
+        await b.leases.acquire(
+          "o/r",
+          a.handle.ref,
+          { kind: "pr", number: 1, run: a.holder.id, status: "running" },
+          { takeover: true },
+        )
+      ).kind,
+    ).toBe("held");
+    cleanup.push(a.leases.start({ active: () => true, onLost: a.binding.onLost }));
+    await a.tick();
+    expect(a.binding.lost).toBe(true);
+    const stop = start(a.authority);
+    await h.advance(0);
+    unclaimed();
+    mapClaimInterruption(h.store, a.holder.id, new ClaimLostError());
+    stop();
+    h.reopen();
+    start(mode === "cold start" ? () => undefined : a.authority);
+    await h.advance(0);
+    unclaimed();
+  },
+);
 
 test.each(["resolver", "malformed", "store"])("%s failure pauses only reruns", async (mode) => {
   const a = await held();
