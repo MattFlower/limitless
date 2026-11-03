@@ -30,6 +30,7 @@ import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "../src/inte
 import { createLeaseManager } from "../src/integrations/leases.ts";
 import { mapClaimInterruption } from "../src/pipeline/claim-interruption.ts";
 import { claimKey, claimRef } from "../src/pipeline/portable.ts";
+import { invocationScratch, processScope } from "../src/util/proc.ts";
 import { GitHub } from "./claim-github-fake.ts";
 import { prNode } from "./github-poller-support.ts";
 import { waitClock } from "./wait-clock.ts";
@@ -445,26 +446,46 @@ test("terminal reporting ignores the binding cancellation probe and removes labe
   expect(cancelled).not.toHaveBeenCalled();
 });
 
-test("subscribers and their microtasks and timers exit closed writer scopes", async () => {
+test.each([false, true])("subscribers exit writer scopes (transaction: %s)", async (transaction) => {
   const run = fixture();
   const a = await held(run);
   advance(420_000);
-  const seen: boolean[] = [];
+  const scopes = () => [processScope.getStore(), invocationScratch.getStore(), hasClaimScope()];
+  const seen: unknown[][] = [];
   const timer = Promise.withResolvers<void>();
   cleanup.push(
     store.subscribe((msg) => {
       if (msg.kind !== "run") return;
-      seen.push(hasClaimScope());
-      queueMicrotask(() => seen.push(hasClaimScope()));
+      seen.push(scopes());
+      queueMicrotask(() => seen.push(scopes()));
       setTimeout(() => {
-        seen.push(hasClaimScope());
+        seen.push(scopes());
         timer.resolve();
       }, 0);
     }),
   );
-  claimScope.run([a.binding], () => store.updateRun(run.id, { status: "cancelled" }));
+  const scope = {
+    signal: new AbortController().signal,
+    killGraceMs: 0,
+    children: new Map(),
+    scratchDirs: new Set<string>(),
+  };
+  processScope.run(scope, () =>
+    invocationScratch.run(dir, () =>
+      claimScope.run([a.binding], () => {
+        const publish = () => {
+          store.updateRun(run.id, { status: "cancelled" });
+          if (transaction) expect(seen).toEqual([]);
+        };
+        if (transaction) store.transaction(publish);
+        else publish();
+        expect(seen).toHaveLength(1);
+        expect(scopes()).toEqual([scope, dir, true]);
+      }),
+    ),
+  );
   await timer.promise;
-  expect(seen).toEqual([false, false, false]);
+  expect(seen).toEqual(Array.from({ length: 3 }, () => [undefined, undefined, false]));
 });
 
 test("subscriber poller timers and terminal notifier dispatch outside the previous run's scope", async () => {

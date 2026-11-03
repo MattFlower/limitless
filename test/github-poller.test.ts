@@ -1,10 +1,11 @@
-import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, expect, setSystemTime, spyOn, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import type { RunStatus } from "../src/core/types.ts";
+import type { RunStatus, StreamMessage } from "../src/core/types.ts";
 import { githubWebhook } from "../src/integrations/github.ts";
 import {
   diffPr,
@@ -12,8 +13,11 @@ import {
   normalizePr,
   OBSERVE_QUERY,
   rollup as rollupOf,
+  startGitHubPoller,
 } from "../src/integrations/github-poller.ts";
+import { githubToken } from "../src/integrations/github-token.ts";
 import { hasOtherApproval } from "../src/land/queue.ts";
+import { invocationScratch, processScope } from "../src/util/proc.ts";
 import { type PrNode, pollerHarness, prNode, respond, SHA, url } from "./github-poller-support.ts";
 
 // The pure rollup test at the end of this file uses no harness at all.
@@ -1910,4 +1914,88 @@ test("review authority remains monotonic across delayed polls, direct reads and 
   });
   expect(h.store.githubReview(node.url)).toEqual(newer);
   expect(JSON.parse(snapshotOf(node.url))).toMatchObject({ revision: 7, ciPending: true });
+});
+
+test.each([false, true])("poll timers survive the waking run (direct callback: %s)", async (direct) => {
+  h = pollerHarness();
+  const run = h.factoryPr("o/r", 1);
+  let wake = (_msg: StreamMessage) => {};
+  const subscribe = h.store.subscribe.bind(h.store);
+  const subscription = spyOn(h.store, "subscribe").mockImplementation((listener) => {
+    wake = listener;
+    return subscribe(listener);
+  });
+  const scratch = mkdtempSync(join(tmpdir(), "poll-waker-"));
+  const abort = new AbortController();
+  let lookups = 0;
+  let ghCalls = 0;
+  const lookup = async () => {
+    processScope.getStore()?.signal.throwIfAborted();
+    const inherited = invocationScratch.getStore();
+    if (inherited) realpathSync(inherited);
+    expect(processScope.getStore()).toBeUndefined();
+    expect(inherited).toBeUndefined();
+    lookups++;
+    return {
+      stdout: "fake-poll-token",
+      stderr: "",
+      exitCode: 0,
+      signal: null,
+      cancelled: false,
+      timedOut: false,
+      idleTimedOut: false,
+      truncated: false,
+      durationMs: 0,
+    };
+  };
+  const stop = startGitHubPoller(h.store, {
+    client: async (...args) => {
+      await githubToken(undefined, lookup);
+      return h.gh.client(...args);
+    },
+    gh: async () => {
+      await githubToken(undefined, lookup);
+      ghCalls++;
+      return JSON.stringify({
+        state: "CLOSED",
+        headRefOid: SHA,
+        headRefName: "test",
+        isCrossRepository: false,
+        headRepository: { name: "r" },
+        headRepositoryOwner: { login: "o" },
+      });
+    },
+    seconds: 15,
+    log: (s) => h.logs.push(s),
+    clock: {
+      now: h.clock.now,
+      set: ((fn: () => void, ms: number) =>
+        h.clock.timer.set(AsyncLocalStorage.bind(fn), ms)) as unknown as typeof setTimeout,
+      clear: h.clock.timer.clear,
+    },
+  });
+  try {
+    processScope.run(
+      { signal: abort.signal, killGraceMs: 0, children: new Map(), scratchDirs: new Set() },
+      () =>
+        invocationScratch.run(scratch, () => {
+          h.store.updateRun(run.id, { status: "succeeded" });
+          if (direct) wake({ kind: "run", run: { ...run, prUrl: url("o/r", 1) } });
+        }),
+    );
+    abort.abort();
+    rmSync(scratch, { recursive: true, force: true });
+    for (const ms of [0, 60_000]) {
+      h.store.recordConflictTrigger(url("o/r", 1), SHA, "poller", h.clock.now());
+      await h.advance(ms);
+    }
+    expect(ghCalls).toBe(2);
+    expect(h.gh.graphql()).toHaveLength(2);
+    expect(lookups).toBeGreaterThanOrEqual(4);
+    expect(h.logs).toEqual([]);
+  } finally {
+    stop();
+    subscription.mockRestore();
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });

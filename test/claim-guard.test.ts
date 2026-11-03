@@ -478,7 +478,6 @@ test("source boundaries restrict claim scopes to execution, observer validation 
     "src/integrations/claim-ref.ts",
     "src/integrations/leases.ts",
     "src/integrations/member-advert.ts",
-    "src/db/store.ts",
     ...scoped,
   ]);
   const references: string[] = [];

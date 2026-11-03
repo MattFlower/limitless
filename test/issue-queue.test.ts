@@ -1,4 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHmac } from "node:crypto";
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,7 +33,7 @@ import { RunContext } from "../src/pipeline/context.ts";
 import { buildReport } from "../src/pipeline/report.ts";
 import { reviewRoundPrompt } from "../src/pipeline/review-round.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
-import { registerCredential } from "../src/util/proc.ts";
+import { invocationScratch, processScope, registerCredential } from "../src/util/proc.ts";
 import { stallReporter } from "../src/util/stall.ts";
 import { feedRound } from "./feed-support.ts";
 import { legacyLatestIssueRun } from "./issue-queue-reference.ts";
@@ -883,7 +884,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
             );
       return JSON.stringify({ data: { repository, rateLimit: h.rate } });
     },
-    start() {
+    start(contextTimers = false) {
       stop = startIssueQueue(factory, {
         gh: h.gh,
         lifecycle: {
@@ -896,7 +897,7 @@ function harness(rawQueue: Record<string, unknown> | null = {}, repos = ["owner/
           now: clock.now,
           set: ((fn: () => void, ms: number) => {
             delays.push(ms);
-            return clock.timer.set(fn, ms);
+            return clock.timer.set(contextTimers ? AsyncLocalStorage.bind(fn) : fn, ms);
           }) as unknown as typeof setTimeout,
           clear: clock.timer.clear,
         },
@@ -6205,4 +6206,33 @@ test("polled comment admission rechecks body history against current trust after
   expect(h.runs()).toEqual([]);
   expect(h.store.issueClaim("owner/repo", candidate.number)).toBeNull();
   expect(h.logs.join("\n")).toContain("Run admission refused: untrusted body editor: collaborator");
+});
+
+test("pollNow cannot lend a dead run context to later queue ticks", async () => {
+  const h = harness({ max_issue_runs: 2 });
+  const scratch = mkdtempSync(join(tmpdir(), "queue-waker-"));
+  cleanups.push(async () => rmSync(scratch, { recursive: true, force: true }));
+  const abort = new AbortController();
+  h.intercept = () => {
+    expect(processScope.getStore()).toBeUndefined();
+    expect(invocationScratch.getStore()).toBeUndefined();
+  };
+  h.start(true);
+  processScope.run(
+    { signal: abort.signal, killGraceMs: 0, children: new Map(), scratchDirs: new Set() },
+    () => invocationScratch.run(scratch, () => h.pollNow()),
+  );
+  abort.abort();
+  rmSync(scratch, { recursive: true, force: true });
+  for (const number of [1, 2]) {
+    h.data.set("owner/repo", [issue(number)]);
+    await h.advance(number === 1 ? 0 : 180_000);
+    expect(h.requests).toHaveLength(number);
+    expect(h.logs).toEqual([]);
+  }
+  const calls = h.calls.length;
+  h.stop();
+  h.pollNow();
+  await h.advance(180_000);
+  expect(h.calls).toHaveLength(calls);
 });

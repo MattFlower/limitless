@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as subprocess from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -242,11 +243,14 @@ for (const boundary of ["identity", "recovery"] as const) {
       let stop: (() => Promise<void>) | undefined;
       const start = async () => {
         if (observer === "notifier") {
-          stop = notifier((...args) => {
-            requestSignal = args[1];
-            request = runGh(...args);
-            return request;
-          });
+          // Explicitly bind this dispatch's recovery fixture; subscribers use the Store context.
+          stop = notifier(
+            AsyncLocalStorage.bind((...args: Parameters<GhRunner>) => {
+              requestSignal = args[1];
+              request = runGh(...args);
+              return request;
+            }),
+          );
           store.updateRun(id, { status: "queued" });
         } else
           await reconcileIssueLifecycle(store, cfg, runGh, signal, () => {}, {
