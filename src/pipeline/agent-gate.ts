@@ -15,14 +15,16 @@ import {
   retryRegressions,
 } from "../gates/run.ts";
 import { gateSlotScope } from "../gates/slots.ts";
+import { textPrivacySchema } from "../gates/text-privacy.ts";
 import { worktreeGit } from "../git/command.ts";
 import { exportGateSnapshot, snapshotTree } from "../git/repos.ts";
 import { commandScope } from "../harness/sandbox.ts";
 import { withScratch } from "../harness/scratch.ts";
 import type { RunContext } from "./context.ts";
+import { transferCoveringTestEvidenceSchema, transferDictionary } from "./run-transfer-gates.ts";
 
 // Validate durable evidence before allowing it to suppress an execution, including nested retries.
-const resultSchema: z.ZodType<GateResult> = z.lazy(() =>
+export const resultSchema: z.ZodType<GateResult> = z.lazy(() =>
   z.object({
     name: z.string(),
     command: z.string(),
@@ -30,13 +32,19 @@ const resultSchema: z.ZodType<GateResult> = z.lazy(() =>
     exitCode: z.number().int().nullable(),
     durationMs: z.number().nonnegative(),
     output: z.string(),
+    textPrivacy: textPrivacySchema.optional(),
+    remoteAttestation: textPrivacySchema.optional(),
     failures: z.string().optional(),
     timedOut: z.boolean().optional(),
     confinementError: z.boolean().optional(),
     firstAttempt: resultSchema.optional(),
     targetedRetry: resultSchema.optional(),
+    retryAttempt: resultSchema.optional(),
+    executedCommand: z.string().optional(),
+    coveringTest: transferCoveringTestEvidenceSchema.optional(),
+    coveringTests: z.array(transferCoveringTestEvidenceSchema).optional(),
     failedFiles: z.array(z.string()).optional(),
-    failedFileTimes: z.record(z.string(), z.number()).optional(),
+    failedFileTimes: transferDictionary(z.number()).optional(),
     failureAttributionComplete: z.boolean().optional(),
     failureAttributionReason: z.string().optional(),
     testCoverage: z
