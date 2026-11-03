@@ -1235,7 +1235,11 @@ export class LandQueue {
     using _span = { [Symbol.dispose]: beginActivity("land.merge") };
     const guard = async () => {
       this.assertClaim(entry.id);
-      if (!this.deps.requiresApproval?.has(entry.repo.toLowerCase())) return this.claimWait(entry, signal);
+      if (!this.deps.requiresApproval?.has(entry.repo.toLowerCase())) {
+        await this.claimWait(entry, signal);
+        this.assertClaim(entry.id);
+        return;
+      }
       let evidence: Awaited<ReturnType<LandQueue["approvalEvidence"]>>;
       let reads = 0;
       do {
@@ -1268,6 +1272,7 @@ export class LandQueue {
         throw new LandApprovalStopped();
       }
       await this.claimWait(entry, signal);
+      this.assertClaim(entry.id);
     };
     const merging = this.owned(entry.id, () => {
       signal.throwIfAborted();

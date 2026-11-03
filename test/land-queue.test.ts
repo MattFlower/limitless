@@ -780,6 +780,51 @@ test.each([false, true])(
   },
 );
 
+test.each([false, true])(
+  "shared land loses ownership during the final merge claim read (approval required: %s)",
+  async (required) => {
+    const { entry, head, fake, claims } = await claimLandFixture();
+    store.updateLandEntry(entry.id, { pushedSha: head });
+    reviewObservation(head);
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    const ready = deferred<void>();
+    const release = deferred<void>();
+    const read = claims.client.read;
+    claims.client.read = async (...args) => {
+      if (store.getLandEntry(entry.id)?.state === "merging") {
+        ready.resolve();
+        await release.promise;
+      }
+      return read(...args);
+    };
+    const push = spyOn(repos, "pushExistingBranch");
+    const q = queue({
+      cfg: sharedLandConfig,
+      claims: claims.client,
+      gateExecutor: fake.executor,
+      requiresApproval: required ? new Set([SLUG]) : undefined,
+    });
+    try {
+      await ready.promise;
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "merging", pushedSha: head });
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      const before = claimSnapshot(entry);
+      const approval = store.approvalFor(entry.prUrl);
+      release.resolve();
+      await waitWithoutClock(() => clock.pending === 1, 15_000);
+      expect(ghCalls("pr merge")).toHaveLength(0);
+      expect(claimSnapshot(entry)).toEqual(before);
+      expect(store.approvalFor(entry.prUrl)).toEqual(approval);
+      expect(fake.requests).toHaveLength(0);
+      expect(push).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await q.stop();
+      push.mockRestore();
+    }
+  },
+);
+
 test("local land ignores an injected claim reader", async () => {
   const { entry, fake, claims } = await claimLandFixture();
   claims.refs.set(prClaimRef, claimResult("held"));
