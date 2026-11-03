@@ -478,7 +478,7 @@ test("equal timestamps and commands cannot let older or rejected completions cha
   expect(workers.lease("runner")?.id).toBe(olderSuccess);
   const worker = workers.worker("runner");
   if (!worker) throw new Error("Missing worker");
-  workers.heartbeat(worker, caps([olderSuccess]));
+  workers.heartbeat(worker, caps([olderSuccess]), "match");
   const newer = workers.enqueue(req);
   expect(workers.lease("runner")?.id).toBe(newer);
   expect(workers.complete(newer, failed)).toBe(true);
@@ -1739,7 +1739,7 @@ test.each(["dispatch", "reattach", "live"])(
     workers.approve(pairing.code);
     const worker = workers.worker("runner");
     if (!worker) throw new Error("missing worker fixture");
-    workers.heartbeat(worker, caps());
+    workers.heartbeat(worker, caps(), "match");
     const executor = gateExecutorFor("lan", workers, [req.repo]);
     const controller = new AbortController();
     const previous = gateSlots.limit;
@@ -2162,7 +2162,14 @@ test("streamed and final crafted output is validated and redacted at the coordin
   const credential = "coordinator-output-credential-513";
   registerCredential("COORDINATOR_OUTPUT_TEST", credential);
   writeFileSync(join(cfg.paths.configDir, "private-strings.txt"), "synthetic-private-worker-host\n");
-  await call("/worker/heartbeat", caps(), token);
+  await call(
+    "/worker/heartbeat",
+    {
+      ...caps(),
+      privateStringsDigest: privateStringsDigest(loadPrivateStrings(cfg.paths.configDir)),
+    },
+    token,
+  );
   const id = workers.enqueue(req);
   await call("/worker/lease", {}, token);
   const run = await confinementScope.run(fakeConfinement, () =>
@@ -2281,7 +2288,7 @@ function restartGate(timer: GateTimer, resumedAt: number | null | undefined, per
   workers.approve(workers.pair("runner", "a".repeat(64), "b".repeat(64)).code);
   const worker = workers.worker("runner");
   if (!worker) throw new Error("missing worker fixture");
-  workers.heartbeat(worker, caps());
+  workers.heartbeat(worker, caps(), "match");
   const id = workers.enqueue({
     repo: "test/repo",
     cwd: home,
@@ -2583,7 +2590,7 @@ test("registering a credential after dispatch preserves the active lease and its
   workers.approve(pending.code);
   const worker = workers.worker("runner");
   if (!worker) throw new Error("Missing worker");
-  workers.heartbeat(worker, caps());
+  workers.heartbeat(worker, caps(), "match");
   const id = workers.enqueue(req);
   const leased = workers.lease(worker.name);
   expect(leased).toMatchObject({ id, state: "leased", worker: worker.name });
@@ -4333,7 +4340,7 @@ test("current update warnings and ordered setup warnings survive and clear indep
   const beat = (warning?: string) => {
     const row = workers.worker("runner");
     if (!row) throw new Error("Missing worker");
-    workers.heartbeat(row, { ...caps(), ...(warning ? { updateWarning: warning } : {}) });
+    workers.heartbeat(row, { ...caps(), ...(warning ? { updateWarning: warning } : {}) }, "match");
   };
   const warning = "Worker update failed: frozen installation failed";
   workers = new WorkerStore(store, "a".repeat(40));
@@ -7875,3 +7882,18 @@ describe("outer", () => {
     await worker.stop();
   }
 }, 45_000);
+
+test.each(["match", "differs", "unknown"] as const)(
+  "gate leasing requires matching policy parity: %s",
+  async (parity) => {
+    const req = await request();
+    workers.pairingKey = "test-pairing-key";
+    workers.approve(workers.pair("parity-runner", "a".repeat(64), "b".repeat(64)).code);
+    const worker = workers.worker("parity-runner");
+    if (!worker) throw new Error("Missing worker");
+    workers.heartbeat(worker, caps(), parity);
+    const id = workers.enqueue(req);
+    expect(workers.lease(worker.name)?.id ?? null).toBe(parity === "match" ? id : null);
+    expect(workers.job(id)?.state).toBe(parity === "match" ? "leased" : "queued");
+  },
+);

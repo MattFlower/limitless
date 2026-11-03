@@ -4,24 +4,42 @@ import { Store } from "../db/store.ts";
 import { canonicalGateCwd, WorkerStore } from "../db/workers.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, platformConfinement, withCommandScratch } from "../harness/sandbox.ts";
+import { processPrivacy } from "../util/privacy-policy.ts";
 import { processBirthSync, processCleanupStore, redactCredentials } from "../util/proc.ts";
 import { executeGate, type GateRequest } from "./executor.ts";
 import { attachSlotPools } from "./slots.ts";
 
 /** An independent owner whose jobs and capacity survive coordinator shutdown. */
-export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal: AbortSignal) {
-  const store = new Store(cfg.paths.db);
+export async function runInplaceExecutor(
+  cfg: Config,
+  releaseSha: string,
+  signal: AbortSignal,
+  privacy = processPrivacy,
+) {
+  let store: Store | undefined;
+  try {
+    privacy.provision(cfg.paths.configDir, [cfg.paths.repos, cfg.paths.work]);
+    store = new Store(cfg.paths.db);
+    await executeInplace(cfg, releaseSha, signal, store);
+  } finally {
+    try {
+      store?.close();
+    } finally {
+      await privacy.dispose();
+    }
+  }
+}
+async function executeInplace(cfg: Config, releaseSha: string, signal: AbortSignal, store: Store) {
   const workers = new WorkerStore(store, releaseSha);
   const owner = randomUUID();
   const birth = processBirthSync(process.pid);
   if (!birth) {
-    store.close();
     throw new Error("Executor process identity unavailable");
   }
-  const detach = attachSlotPools(store.db, cfg.maxConcurrentGates);
   store.db
     .query("INSERT INTO executors (id,pid,birth,release_sha) VALUES (?,?,?,?)")
     .run(owner, process.pid, birth, releaseSha);
+  const detach = attachSlotPools(store.db, cfg.maxConcurrentGates);
   const pendingStops = new Map<string, string>();
   const confirmStops = () => {
     for (const [id, cwd] of pendingStops) {
@@ -119,6 +137,5 @@ export async function runInplaceExecutor(cfg: Config, releaseSha: string, signal
   } finally {
     store.db.query("DELETE FROM executors WHERE id=?").run(owner);
     detach();
-    store.close();
   }
 }

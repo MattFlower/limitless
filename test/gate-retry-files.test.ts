@@ -2,7 +2,7 @@ import { describe, expect } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
+import { attributedJUnitCounts, RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import { detectGates, readRetryFiles } from "../src/gates/detect.ts";
 import { executeGate, type GateRunner, gateProvenance } from "../src/gates/executor.ts";
 import { extractFailures } from "../src/gates/failures.ts";
@@ -61,6 +61,36 @@ describe("JUnit failure files", () => {
           ? { attributedCounts: { tests: 1, failures: 1 - errors, errors, skipped: 0 } }
           : { failureAttributionReason: `1 unattributed ${_kind === "suite errors" ? "error" : "failure"}` }),
       });
+    } finally {
+      f.close();
+    }
+  });
+
+  test("attribution exceptions expose only factory reasons, including counter counts", () => {
+    const f = fixture();
+    try {
+      let failureAttributionReason: string | undefined;
+      const root = Bun.XML.parse(suite("test/a.test.ts", 'failures="1"', "<testcase><failure/></testcase>"), {
+        compact: false,
+      });
+      expect(
+        attributedJUnitCounts(
+          root,
+          new Set(["test/a.test.ts"]),
+          f.cwd,
+          (file) => file,
+          () => {
+            throw new TypeError("secret-ish detail");
+          },
+          (reason) => {
+            failureAttributionReason = reason;
+          },
+        ),
+      ).toBeUndefined();
+      expect(failureAttributionReason).toBe("Invalid JUnit evidence");
+      expect(parseJUnit(suite("test/a.test.ts", 'failures="2"'), f.cwd)?.failureAttributionReason).toBe(
+        "2 unattributed failures",
+      );
     } finally {
       f.close();
     }
