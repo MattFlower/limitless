@@ -74,6 +74,8 @@ function covers(check: GateEvidence["checks"][number], requestedCommand: string)
 
 const clean = (result: GateComparison["result"]): boolean =>
   result.ok &&
+  !result.textPrivacy?.output.withheld &&
+  !result.remoteAttestation?.output.withheld &&
   result.exitCode === 0 &&
   !result.timedOut &&
   !confinementFailed(result) &&

@@ -231,7 +231,7 @@ OS/architecture, confinement backend and successful probe identity, agent CLI ve
 status, private-strings parity/version, free execution slots, power state and draining state.
 Endpoints and capability details live privately. Logins advertise availability, never tokens;
 private-strings parity is checked against the restricted shared policy, never a public digest.
-Expire adverts after 90 seconds without heartbeat; this removes eligibility, not a live claim.
+Refresh adverts every 60 seconds and expire them after 180 seconds; this removes eligibility, not a live claim.
 
 A machine claims only work it can complete: all remaining agent roles, gates, publication and
 storage access must be supported, including required independent verification and policy parity.

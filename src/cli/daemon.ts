@@ -8,6 +8,7 @@ import { createApiToken } from "../server/api-token.ts";
 import { startHttp } from "../server/http.ts";
 import { startWorkerListener } from "../server/workers.ts";
 import { processPrivacy } from "../util/privacy-policy.ts";
+import { provisionProofKey } from "../util/privacy-proof.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import { processCleanupStore, recoverProcessCleanups, redactCredentials } from "../util/proc.ts";
 
@@ -60,6 +61,7 @@ async function startScopedDaemon(
   try {
     const { configDir, repos, work } = factory.cfg.paths;
     privacy.provision(configDir, [repos, work]);
+    provisionProofKey(configDir);
     credential = createApiToken(factory.cfg.paths.home);
     factory.store.setSetting("executor.daemonRelease", factory.bootSha);
     detachSlots = await attachSlotPools(factory.store.db, factory.cfg.maxConcurrentGates);

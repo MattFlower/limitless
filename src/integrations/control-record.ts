@@ -54,6 +54,7 @@ export type InputReceipt = z.infer<typeof receipt>;
 const value = z
   .union([
     receipt,
+    z.strictObject({ kind: z.literal("policy"), name: z.literal("private-strings"), digest }),
     // Callers supply timestamps from authenticated GitHub observations, never a local clock.
     z.strictObject({
       kind: z.literal("boundary"),
@@ -81,7 +82,7 @@ const value = z
   });
 export type ControlValue = z.infer<typeof value>;
 const key = z.strictObject({
-  kind: z.enum(["receipt", "boundary", "run-index", "member", "land-authority"]),
+  kind: z.enum(["receipt", "boundary", "run-index", "member", "land-authority", "policy"]),
   id: digest,
 }) satisfies z.ZodType<ControlKey>;
 const manifest = z
@@ -135,7 +136,9 @@ export function controlKey(namer: ControlNamer, input: unknown): ControlKey {
         ? [v.claim.repo, v.runId]
         : v.kind === "member"
           ? [v.member]
-          : [v.repo];
+          : v.kind === "policy"
+            ? [v.name]
+            : [v.repo];
   return checked(() => key.parse(snapshotJson(namer.derive(v.kind, components))), "invalid");
 }
 const equal = (a: unknown, b: unknown) => canonicalJson(a) === canonicalJson(b);
@@ -195,7 +198,7 @@ export function validateControlReplacement(
   }
   const prior = validateControlValue(before);
   if (!equal(controlKey(namer, prior), controlKey(namer, next))) fail("invalid");
-  if (prior.kind === "member" || prior.kind === "land-authority") return next;
+  if (prior.kind === "member" || prior.kind === "land-authority" || prior.kind === "policy") return next;
   if (prior.kind !== "receipt") {
     if (!equal(prior, next)) fail("invalid");
     return next;

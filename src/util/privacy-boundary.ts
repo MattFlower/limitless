@@ -11,6 +11,7 @@ import {
   credentialVariants,
 } from "./credential-matcher.ts";
 import { terminalRedactor } from "./terminal-redaction.ts";
+export const PRIVACY_CHECKER_SEMANTICS = "privacy/1";
 export const privacyRefusals = [
   "entries-count",
   "credentials-count",
@@ -43,7 +44,7 @@ export const privacyLimits = {
 };
 export function createPrivacyRegistry(
   secrets = createCredentialRegistry(),
-  checker = () => "privacy/1",
+  checker = () => PRIVACY_CHECKER_SEMANTICS,
   requirePolicy = false,
 ) {
   let entries: PrivateStrings = [];
@@ -60,6 +61,9 @@ export function createPrivacyRegistry(
     return Object.freeze({ identity, policy, credentials: secrets.generation, checker: semantics });
   };
   return {
+    get semantics() {
+      return checker();
+    },
     get ready() {
       return ready;
     },
@@ -72,7 +76,7 @@ export function createPrivacyRegistry(
     },
     // Admission sizing without retaining a policy snapshot or encoded payload.
     get wireBytes() {
-      return [...entries.map(({ value }) => value), ...secrets.values()].reduce(
+      return [...entries.map(({ value }) => value), ...secrets.values(true)].reduce(
         (total, text) => total + 4 + Buffer.byteLength(text),
         0,
       );
@@ -83,10 +87,15 @@ export function createPrivacyRegistry(
       ready = true;
     },
     addCredential: secrets.add,
+    // Credentials the worker never receives; the checker matches them before dispatch.
+    mainThreadCredentials: () => secrets.mainThreadValues(),
     get generation() {
       return generation();
     },
-    snapshot: () => ({ ready, entries: copy(), credentials: secrets.values(), generation: generation() }),
+    snapshot(worker = false) {
+      const credentials = secrets.values(worker);
+      return { ready, entries: copy(), credentials, generation: generation() };
+    },
   };
 }
 export const privacyRegistry = createPrivacyRegistry(credentialRegistry, undefined, true);
