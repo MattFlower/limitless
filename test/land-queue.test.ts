@@ -2158,7 +2158,7 @@ test("three requests submitted together all land, with no further request", asyn
   expect(gateLog()).toEqual(["start", "end", "start", "end", "start", "end"]);
 });
 
-test("a checking entry whose merge commit is already on the remote tolerates lagging reads and lands", async () => {
+test.each([false, true])("a checking entry resumes a confirmed push (shared: %s)", async (shared) => {
   const pr = delivered(1, "pr-1");
   const head = await pushBranch("pr-1", "change-1.txt", "one\n", 1);
   await advanceBase();
@@ -2180,36 +2180,48 @@ test("a checking entry whose merge commit is already on the remote tolerates lag
     approvedSha: head,
   });
   store.updateLandEntry(entry.id, { state: "checking", pushedSha: mergeSha, attempts: 1 });
-  let caughtUp = false;
-  let reads = 0;
-  queue({
-    ciPollMs: 100,
-    client: async () => {
-      reads++;
-      return {
-        url: url(1),
-        state: "OPEN",
-        headRefOid: caughtUp ? mergeSha : head,
-        mergedAt: null,
-        mergedBy: null,
-        ci: "SUCCESS",
-        failing: [],
-      };
-    },
-  });
-  await waitFor(() => reads > 0);
-  await settleIdle();
-  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", pushedSha: mergeSha });
-  await waitFor(() => reads >= 2); // Reconciliation accepted the approved head; CI still waits.
-  expect(ghCalls("pr merge")).toEqual([]);
-  caughtUp = true;
-  await settle();
-  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: mergeSha, attempts: 2 });
-  expect(await remoteHead("pr-1")).toBe(mergeSha); // nothing was pushed again
-  expect(ghCalls("pr merge")).toEqual([
-    `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${mergeSha} --subject PR 1 (#1) --body-file -`,
-  ]);
-  expect(gateLog()).toEqual([]); // the checks had already run before the crash
+  const cfg = loadConfig({ ...paths, raw: { repos: { [SLUG]: { shared } } } });
+  const claims = landClaims();
+  const push = spyOn(repos, "pushExistingBranch");
+  try {
+    let green = false;
+    let reads = 0;
+    queue({
+      cfg,
+      claims: claims.client,
+      polling: false,
+      ciPollMs: 100,
+      client: async () => {
+        reads++;
+        return {
+          url: url(1),
+          state: "OPEN",
+          headRefOid: mergeSha,
+          mergedAt: null,
+          mergedBy: null,
+          ci: green ? "SUCCESS" : "PENDING",
+          failing: [],
+        };
+      },
+    });
+    await waitFor(() => reads > 0);
+    await settleIdle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", pushedSha: mergeSha });
+    await waitFor(() => reads >= 2);
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(await remoteHead("pr-1")).toBe(mergeSha);
+    green = true;
+    await settle();
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: mergeSha, attempts: 2 });
+    expect(await remoteHead("pr-1")).toBe(mergeSha); // nothing was pushed again
+    expect(ghCalls("pr merge")).toEqual([
+      `pr merge ${url(1)} --squash --delete-branch --match-head-commit ${mergeSha} --subject PR 1 (#1) --body-file -`,
+    ]);
+    expect(gateLog()).toEqual([]); // the checks had already run before the crash
+    expect(push).not.toHaveBeenCalled();
+  } finally {
+    push.mockRestore();
+  }
 });
 
 test("a base that moved is merged in and pushed with the lease; an up-to-date entry pushes nothing", async () => {
@@ -3066,10 +3078,16 @@ test("a restart during checking re-runs the checks from the start", async () => 
   expect(gateLog()).toEqual(["start", "start", "end"]); // the killed check never finished
 });
 
-test("a restart during waiting_ci resumes waiting on the pushed commit", async () => {
+test.each([
+  { shared: false, baseMoved: false },
+  { shared: true, baseMoved: false },
+  { shared: false, baseMoved: true },
+  { shared: true, baseMoved: true },
+])("a restart during waiting_ci preserves checks and pushes (%j)", async ({ shared, baseMoved }) => {
   const pr = delivered(1, "pr-1");
   const approved = await pushBranch("pr-1", "one.txt", "one\n", 1);
   observe(1, approved);
+  if (baseMoved) await advanceBase();
   // Polling off: the queue reads `gh pr view` instead of the poller's saved observation.
   const view: GitHubPrView = {
     url: url(1),
@@ -3080,31 +3098,274 @@ test("a restart during waiting_ci resumes waiting on the pushed commit", async (
     ci: "PENDING",
     failing: [],
   };
-  const q = queue({ polling: false, client: async () => ({ ...view }) });
-  const entry = await q.request({ target: pr.run.id, sha: approved });
-  await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
-  await q.stop();
-  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "waiting_ci", pushedSha: approved });
-  view.ci = "SUCCESS";
-  observe(1, approved, "SUCCESS");
-  const saved = store.githubPrData(url(1));
-  let reads = 0;
-  queue({
+  const cfg = loadConfig({ ...paths, raw: { repos: { [SLUG]: { shared } } } });
+  const claims = landClaims();
+  const push = spyOn(repos, "pushExistingBranch");
+  try {
+    const q = queue({
+      cfg,
+      claims: claims.client,
+      polling: false,
+      client: async () => ({ ...view, headRefOid: await remoteHead("pr-1") }),
+    });
+    const entry = await q.request({ target: pr.run.id, sha: approved });
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+    await q.stop();
+    const pushed = await remoteHead("pr-1");
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "waiting_ci", pushedSha: pushed });
+    if (baseMoved) expect(pushed).not.toBe(approved);
+    else expect(pushed).toBe(approved);
+    expect(push).toHaveBeenCalledTimes(baseMoved ? 1 : 0);
+    expect(gateLog()).toEqual(["start", "end"]);
+    view.ci = "SUCCESS";
+    view.headRefOid = pushed;
+    observe(1, pushed, "SUCCESS");
+    const saved = store.githubPrData(url(1));
+    let reads = 0;
+    queue({
+      cfg,
+      claims: claims.client,
+      client: async () => {
+        reads++;
+        return { ...view };
+      },
+    });
+    ci = () => null;
+    await settle();
+    expect(reads).toBeGreaterThan(0);
+    expect(store.githubPrData(url(1))).toBe(saved);
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    const merges = ghCalls("pr merge");
+    expect(merges).toHaveLength(1);
+    expect(merges[0]).toContain(`--match-head-commit ${pushed}`);
+    expect(merges[0]).not.toContain("--auto");
+    expect(gateLog()).toEqual(["start", "end"]);
+    expect(push).toHaveBeenCalledTimes(baseMoved ? 1 : 0);
+  } finally {
+    push.mockRestore();
+  }
+});
+
+test.each([false, true])(
+  "a restart before push dispatch recovers the checkpoint (shared: %s)",
+  async (shared) => {
+    const pr = delivered(1, "pr-1");
+    const approved = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, approved);
+    approve(1, approved);
+    await advanceBase();
+    ci = () => null; // Only the remote-verified client below supplies CI.
+    const cfg = loadConfig({ ...paths, raw: { repos: { [SLUG]: { shared } } } });
+    const claims = landClaims();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const push = repos.pushExistingBranch;
+    let pushing = false;
+    const publication = spyOn(repos, "pushExistingBranch").mockImplementation(async (...args) => {
+      pushing = true;
+      try {
+        return await push(...args);
+      } finally {
+        pushing = false;
+      }
+    });
+    const execute = proc.sh;
+    let held = false;
+    const boundary = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+      const result = await execute(cmd, opts);
+      if (pushing && !held && cmd.includes("merge-base") && cmd.includes("--is-ancestor")) {
+        held = true;
+        entered.resolve();
+        await release.promise;
+        opts?.signal?.throwIfAborted();
+      }
+      return result;
+    });
+    let pushes = 0;
+    const spawn = subprocess.spawn;
+    const dispatch = spyOn(subprocess, "spawn").mockImplementation(((
+      bin: string,
+      args: readonly string[],
+      opts: subprocess.SpawnOptions,
+    ) => {
+      if (args.includes("push")) pushes++;
+      return spawn(bin, args, opts);
+    }) as typeof subprocess.spawn);
+    const client: LandPrClient = async () => {
+      const head = await remoteHead("pr-1");
+      return {
+        url: url(1),
+        state: "OPEN",
+        headRefOid: head,
+        mergedAt: null,
+        mergedBy: null,
+        ci: head === approved ? "PENDING" : "SUCCESS",
+        failing: [],
+      };
+    };
+    const first = queue({ cfg, claims: claims.client, polling: false, client });
+    try {
+      const entry = await first.request({ target: pr.run.id });
+      await entered.promise;
+      const checkpoint = store.getLandEntry(entry.id)?.pushedSha;
+      expect(checkpoint).toBeTruthy();
+      expect(checkpoint).not.toBe(approved);
+      expect(await remoteHead("pr-1")).toBe(approved);
+      expect(pushes).toBe(0);
+      expect(publication).toHaveBeenCalledTimes(1);
+      const stopping = first.stop();
+      release.resolve();
+      await stopping;
+      expect(store.getLandEntry(entry.id)?.pushedSha).toBe(checkpoint);
+      expect(gateLog()).toEqual(["start", "end"]);
+      queue({ cfg, claims: claims.client, polling: false, client, ciPollMs: 100, ciTimeoutMs: 1_000 });
+      await settle();
+      const pushed = await remoteHead("pr-1");
+      expect(pushed).not.toBe(approved);
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: pushed, attempts: 2 });
+      expect(gateLog()).toEqual(["start", "end", "start", "end"]);
+      expect(publication).toHaveBeenCalledTimes(2);
+      expect(pushes).toBe(1);
+      expect(ghCalls("pr merge")).toHaveLength(1);
+      expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${pushed}`);
+    } finally {
+      release.resolve();
+      await first.stop();
+      boundary.mockRestore();
+      publication.mockRestore();
+      dispatch.mockRestore();
+    }
+  },
+);
+
+test("a shared resume preserves an unpushed checkpoint until the run claim is released", async () => {
+  const { entry, head: approved, claims } = await claimLandFixture();
+  await advanceBase();
+  const checkpoint = "a".repeat(40);
+  store.updateLandEntry(entry.id, { state: "checking", pushedSha: checkpoint });
+  claims.refs.set(prClaimRef, claimResult("held"));
+  ci = () => null;
+  const releaseChecks = deferred<void>();
+  const fake = fakeLandGates(async (req) => {
+    await releaseChecks.promise;
+    return retryRun(req);
+  });
+  const push = spyOn(repos, "pushExistingBranch");
+  const ciHeads: string[] = [];
+  const q = queue({
+    cfg: sharedLandConfig,
+    claims: claims.client,
+    gateExecutor: fake.executor,
+    polling: false,
     client: async () => {
-      reads++;
-      return { ...view };
+      const head = await remoteHead("pr-1");
+      ciHeads.push(head);
+      return {
+        url: url(1),
+        state: "OPEN",
+        headRefOid: head,
+        mergedAt: null,
+        mergedBy: null,
+        ci: head === approved ? "PENDING" : "SUCCESS",
+        failing: [],
+      };
     },
   });
-  ci = () => null;
-  await settle();
-  expect(reads).toBeGreaterThan(0);
-  expect(store.githubPrData(url(1))).toBe(saved);
-  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
-  const merges = ghCalls("pr merge");
-  expect(merges).toHaveLength(1);
-  expect(merges[0]).toContain(`--match-head-commit ${approved}`);
-  expect(merges[0]).not.toContain("--auto");
+  try {
+    await claimParked(entry, heldClaim);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", pushedSha: checkpoint });
+    expect(fake.requests).toHaveLength(0);
+    expect(push).not.toHaveBeenCalled();
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(ciHeads).toEqual([]);
+    expect(await remoteHead("pr-1")).toBe(approved);
+
+    claims.refs.set(prClaimRef, claimResult("released"));
+    await clock.advance(30_000);
+    await waitWithoutClock(() => fake.requests.length === 1, 15_000);
+    expect(store.getLandEntry(entry.id)?.pushedSha).toBeNull();
+    expect(push).not.toHaveBeenCalled();
+    expect(ghCalls("pr merge")).toEqual([]);
+    releaseChecks.resolve();
+    await settle();
+    const pushed = await remoteHead("pr-1");
+    expect(pushed).not.toBe(approved);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: pushed });
+    expect(fake.requests).toHaveLength(1);
+    expect(fake.requests[0]?.headSha).toBe(pushed);
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(ciHeads).toContain(pushed);
+    expect(ghCalls("pr merge")).toHaveLength(1);
+    expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${pushed}`);
+  } finally {
+    releaseChecks.resolve();
+    await q.stop();
+    push.mockRestore();
+  }
 });
+
+test.each(["checkpoint", "cancel", "claim", "head"] as const)(
+  "a deferred recovery head cannot override a changed %s",
+  async (change) => {
+    const pr = delivered(1, "pr-1");
+    const approved = await pushBranch("pr-1", "one.txt", "one\n");
+    observe(1, approved);
+    ci = () => null;
+    const entry = store.createLandEntry({
+      runId: pr.run.id,
+      repo: SLUG,
+      prUrl: url(1),
+      baseBranch: "main",
+      headBranch: "pr-1",
+      approvedSha: approved,
+    });
+    store.updateLandEntry(entry.id, { state: "checking", pushedSha: "a".repeat(40) });
+    const entered = deferred<void>();
+    const response = deferred<GitHubPrView | null>();
+    const push = spyOn(repos, "pushExistingBranch");
+    const q = queue({
+      client: async () => {
+        entered.resolve();
+        return response.promise;
+      },
+    });
+    try {
+      await entered.promise;
+      if (change === "checkpoint") store.updateLandEntry(entry.id, { pushedSha: "b".repeat(40) });
+      // Change durable state without aborting the read, exercising the transaction's active check.
+      if (change === "cancel") store.updateLandEntry(entry.id, { state: "cancelled", reason: "cancelled" });
+      if (change === "claim")
+        expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      const before = claimSnapshot(entry);
+      response.resolve({
+        url: url(1),
+        state: "OPEN",
+        headRefOid: change === "head" ? "c".repeat(40) : approved,
+        mergedAt: null,
+        mergedBy: null,
+        ci: "SUCCESS",
+        failing: [],
+      });
+      await waitWithoutClock(() => clock.pending === 1, 15_000);
+      await q.stop();
+      if (change === "head")
+        expect(store.getLandEntry(entry.id)).toMatchObject({
+          state: "blocked",
+          reason: "head moved after approval",
+          pushedSha: "a".repeat(40),
+        });
+      else expect(claimSnapshot(entry)).toEqual(before);
+      expect(push).not.toHaveBeenCalled();
+      expect(gateLog()).toEqual([]);
+      expect(ghCalls("pr merge")).toEqual([]);
+      expect(await remoteHead("pr-1")).toBe(approved);
+    } finally {
+      response.resolve(null);
+      await q.stop();
+      push.mockRestore();
+    }
+  },
+);
 
 test.each(["merged", "failed", "exception"] as const)(
   "a late merge result after reclaim leaves the newer claim unchanged: %s",

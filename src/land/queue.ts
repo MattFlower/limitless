@@ -515,10 +515,9 @@ export class LandQueue {
   }
 
   /**
-   * One checkout for a first attempt and for a resume. `pushed_sha` is the entry's progress: with it
-   * recorded, this queue already pushed that commit and has only CI and the merge left. A crash
-   * between the push and the `waiting_ci` update therefore resumes instead of pushing the factory's
-   * own merge commit again, which the lease would refuse as a head that moved after approval.
+   * One checkout for a first attempt and for a resume. `pushed_sha` is recorded before publication:
+   * confirm it against the current PR head before skipping preparation. A confirmed push resumes
+   * with only CI and the merge left, including a crash before the `waiting_ci` update.
    */
   private async land(entry: LandEntry, signal: AbortSignal): Promise<void> {
     await this.claimWait(entry, signal);
@@ -540,6 +539,16 @@ export class LandQueue {
       if (!fresh.headRefOid) throw new LandBlocked("PR head is missing");
       if (headMoved(fresh.headRefOid ?? "", entry.pushedSha, entry.approvedSha))
         throw new LandBlocked("head moved after approval");
+      if (fresh.headRefOid === entry.approvedSha && fresh.headRefOid !== entry.pushedSha) {
+        const recovered = this.owned(entry.id, () => {
+          signal.throwIfAborted();
+          const current = this.store.getLandEntry(entry.id);
+          if (!current || !this.isActive(current) || current.pushedSha !== entry.pushedSha) return null;
+          return this.store.updateLandEntry(entry.id, { pushedSha: null });
+        });
+        if (!recovered) return;
+        entry = recovered;
+      }
     }
     const preflight = z.object({
       url: z.literal(entry.prUrl),

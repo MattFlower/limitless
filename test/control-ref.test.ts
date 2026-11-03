@@ -7,6 +7,7 @@ import {
   type ControlKey,
   type ControlRefOutcome,
   type ControlRefRead,
+  type ControlRefTip,
   createControlRefClient,
   createControlRefReader,
 } from "../src/integrations/control-ref.ts";
@@ -197,6 +198,140 @@ for (const outcome of ["absence", "valid blob", "invalid blob"])
     );
     expect(disposed).toBe(true);
   });
+
+for (const identity of ["kind", "id"] as const)
+  for (const operation of ["uncached read", "cached read", "write"] as const)
+    test(`matching known SHA cannot authenticate a transplant across ${identity} during ${operation}`, async () => {
+      const remote = new Remote();
+      const { sha } = seed(remote);
+      const client = writer(remote);
+      const source = await (operation === "uncached read" ? reader(remote) : client).read(key);
+      if (source.kind !== "tip") throw new Error("Expected source tip");
+      const transplanted: ControlKey =
+        identity === "kind" ? { ...key, kind: "member" } : { ...key, id: "f".repeat(64) };
+      remote.refs.set(ref(transplanted), sha);
+      remote.calls = [];
+      await rejects(
+        operation === "write"
+          ? client.write(transplanted, sha, payload, undefined, source.tip)
+          : client.read(transplanted, undefined, source.tip),
+        "corrupt",
+      );
+      for (const path of responsePaths) expect(remote.calls.filter((c) => matches(path, c))).toHaveLength(1);
+      expect(writes(remote.calls)).toHaveLength(0);
+    });
+
+for (const hint of ["forged", "missing", "separate client"] as const)
+  test(`an uncached ${hint} known tip requires full authentication`, async () => {
+    const remote = new Remote();
+    const { sha } = seed(remote);
+    const source = await reader(remote).read(key);
+    if (source.kind !== "tip") throw new Error("Expected source tip");
+    const known =
+      hint === "separate client"
+        ? source.tip
+        : ({ sha, ...(hint === "forged" ? { bytes: Buffer.from("forged") } : {}) } as ControlRefTip);
+    remote.calls = [];
+    expect(await reader(remote).read(key, undefined, known)).toEqual({
+      kind: "tip",
+      tip: { sha, bytes: payload },
+    });
+    for (const path of responsePaths) expect(remote.calls.filter((c) => matches(path, c))).toHaveLength(1);
+  });
+
+for (const hint of ["forged", "missing", "mutated"] as const)
+  test(`authenticated known tips ignore ${hint} caller bytes and return independent copies`, async () => {
+    const remote = new Remote();
+    const { sha } = seed(remote);
+    const client = reader(remote);
+    const original = await client.read(key);
+    if (original.kind !== "tip") throw new Error("Expected source tip");
+    const known =
+      hint === "mutated"
+        ? original.tip
+        : ({ sha, ...(hint === "forged" ? { bytes: Buffer.from("forged") } : {}) } as ControlRefTip);
+    original.tip.bytes.fill(0);
+    remote.calls = [];
+    const result = await client.read({ ...key }, undefined, known);
+    expect(result).toEqual({ kind: "tip", tip: { sha, bytes: payload } });
+    expect(remote.calls.filter(isMeta)).toHaveLength(1);
+    expect(remote.calls.filter(isRead("git/"))).toHaveLength(1);
+    if (result.kind !== "tip") throw new Error("Expected cached tip");
+    expect(result.tip).not.toBe(known);
+    expect(result.tip.bytes.buffer).not.toBe(original.tip.bytes.buffer);
+    result.tip.bytes.fill(1);
+    result.tip.sha = "e".repeat(40);
+    expect(await client.read(key, undefined, { sha, bytes: result.tip.bytes })).toEqual({
+      kind: "tip",
+      tip: { sha, bytes: payload },
+    });
+    remote.metadata = { id: "id", nameWithOwner: "Example/Companion", isPrivate: false };
+    await rejects(client.read(key, undefined, known), "configuration");
+  });
+
+test("confirmed writes own their cached bytes and save the next read and write's object downloads", async () => {
+  const remote = new Remote();
+  const client = writer(remote);
+  const input = Buffer.from(payload);
+  const result = await client.write(key, null, input);
+  if (result.kind !== "applied") throw new Error("Expected applied write");
+  const { sha } = result.tip;
+  input.fill(0);
+  result.tip.bytes.fill(1);
+  remote.calls = [];
+  const read = await client.read(key, undefined, result.tip);
+  expect(read).toEqual({ kind: "tip", tip: { sha, bytes: payload } });
+  if (read.kind !== "tip") throw new Error("Expected cached tip");
+  expect(read.tip.bytes.buffer).not.toBe(result.tip.bytes.buffer);
+  expect(remote.calls.filter(isMeta)).toHaveLength(1);
+  expect(remote.calls.filter(isRead("git/"))).toHaveLength(1);
+  read.tip.bytes.fill(2);
+  remote.calls = [];
+  expect(await client.write(key, sha, payload, undefined, read.tip)).toMatchObject({ kind: "applied" });
+  expect(remote.calls.filter(isMeta)).toHaveLength(1);
+  expect(remote.calls.filter(isRead("git/"))).toHaveLength(1);
+  expect(writes(remote.calls)).toHaveLength(4);
+});
+
+test("omitting known or moving the remote tip still authenticates every object", async () => {
+  const remote = new Remote();
+  seed(remote);
+  const client = reader(remote);
+  const original = await client.read(key);
+  if (original.kind !== "tip") throw new Error("Expected source tip");
+  for (const moved of [false, true]) {
+    const sha = moved ? seed(remote).sha : original.tip.sha;
+    remote.calls = [];
+    expect(await client.read(key, undefined, moved ? original.tip : undefined)).toEqual({
+      kind: "tip",
+      tip: { sha, bytes: payload },
+    });
+    for (const path of responsePaths) expect(remote.calls.filter((c) => matches(path, c))).toHaveLength(1);
+  }
+});
+
+test("an unconfirmed write does not establish trusted content", async () => {
+  const remote = new Remote();
+  const client = writer(remote);
+  let dispatched = false;
+  remote.hook = async (call, next) => {
+    if (isCas(call)) {
+      await next();
+      dispatched = true;
+    }
+    return dispatched ? json({}, 503) : next();
+  };
+  expect(await client.write(key, null, payload)).toEqual({ kind: "unconfirmed" });
+  remote.hook = undefined;
+  const sha = remote.refs.get(ref(key));
+  if (!sha) throw new Error("Expected dispatched write");
+  remote.calls = [];
+  expect(await client.read(key, undefined, { sha, bytes: Buffer.from("forged") })).toEqual({
+    kind: "tip",
+    tip: { sha, bytes: payload },
+  });
+  for (const path of responsePaths) expect(remote.calls.filter((c) => matches(path, c))).toHaveLength(1);
+});
 
 test("independent control envelopes bind both identities; IO seals fresh authenticated frames", async () => {
   const remote = new Remote();
