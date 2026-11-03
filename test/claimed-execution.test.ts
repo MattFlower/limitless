@@ -1,5 +1,7 @@
 import { afterEach, expect, mock, spyOn } from "bun:test";
 import * as subprocess from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { Run } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
@@ -8,14 +10,19 @@ import * as merges from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
-import { bindClaim, claimGuard } from "../src/integrations/claim-guard.ts";
+import { bindClaim, claimGuard, claimScope } from "../src/integrations/claim-guard.ts";
 import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import * as identity from "../src/integrations/github-identity.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
+import type { Capabilities } from "../src/integrations/member-capabilities.ts";
+import { type CapabilityGate, createCapabilityGate } from "../src/integrations/member-eligibility.ts";
+import type { AgentCall } from "../src/pipeline/agent-executor.ts";
 import { initialRunState, localCheckpointer, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
-import type { RunClaim } from "../src/pipeline/run-claim.ts";
+import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
+import { bindRunClaim, type RunClaim } from "../src/pipeline/run-claim.ts";
+import { windowOpen } from "../src/util/claim-clock.ts";
 import * as proc from "../src/util/proc.ts";
 import { approve, pipelineSetup, roleOf, triage } from "./pipeline-support.ts";
 import { postMergeWorkerFixture } from "./post-merge-worker-support.ts";
@@ -79,6 +86,14 @@ function authority(run: Run) {
     },
   };
 }
+function passingGate() {
+  return {
+    admit: mock(async () => []),
+    canContinue: mock<CapabilityGate["canContinue"]>(async () => []),
+    capableNow: mock(() => true),
+    forget: mock<CapabilityGate["forget"]>(() => {}),
+  };
+}
 const signal = () => new AbortController().signal;
 async function fixture(publication = false) {
   const bare = publication ? await githubFixture() : "unused";
@@ -90,6 +105,7 @@ async function fixture(publication = false) {
         : { files: { "farewell.txt": "goodbye\n" } },
   );
   await f.stop();
+  f.deps.capability = passingGate();
   registerGithub(f, bare);
   shared(f);
   const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
@@ -411,6 +427,7 @@ test.each(
     return { files: { "farewell.txt": "goodbye\n" } };
   });
   await f.stop();
+  f.deps.capability = passingGate();
   registerGithub(f, bare);
   shared(f);
   const workers = postMergeWorkerFixture(f, "fail");
@@ -777,4 +794,283 @@ test("local execution retains startup ordering before owned-process recovery", a
     resume.resolve();
   }
   expect(await work).toBe("running");
+});
+
+test.each(["resume", "prepare", "missing", "throw"])("capability refuses %s before any stage", async (at) => {
+  const { f, run, claim } = await fixture();
+  const gate = passingGate();
+  let calls = 0;
+  gate.canContinue.mockImplementation(async () => {
+    if (at === "prepare" && calls++ === 0) return [];
+    if (at === "throw") throw new Error("private probe detail");
+    return ["login"];
+  });
+  expect(
+    await executeRun(
+      { ...f.deps, runClaim: claim, capability: at === "missing" ? undefined : gate },
+      run.id,
+      signal(),
+    ),
+  ).toBe("queued");
+  expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:capability");
+  expect(f.store.listStages(run.id)).toHaveLength(0);
+  expect(f.store.listInvocations(run.id)).toHaveLength(0);
+  expect(claim.update).toHaveBeenCalledTimes(at === "prepare" ? 1 : 0);
+  if (at !== "missing") expect(gate.forget.mock.calls).toEqual([[run.id]]);
+  expect(JSON.stringify(f.store.listEvents(run.id))).not.toContain("private probe detail");
+});
+
+test("restarted capability wait checks before renewing a closed window", async () => {
+  const { f, run, claim } = await fixture(true);
+  const gate = passingGate();
+  gate.canContinue.mockResolvedValue(["login"]);
+  claim.close();
+  const deps = { ...f.deps, runClaim: claim, capability: gate };
+  expect(await executeRun(deps, run.id, signal())).toBe("queued");
+  expect(claim.update).not.toHaveBeenCalled();
+  const reopened = new Store(f.cfg.paths.db);
+  try {
+    gate.canContinue.mockResolvedValue([]);
+    claim.update.mockImplementation(async () => {
+      claim.open();
+      return "applied";
+    });
+    const status = await executeRun({ ...deps, store: reopened }, run.id, signal());
+    expect(reopened.getRun(run.id)?.error).toBeNull();
+    expect(status).toBe("succeeded");
+    expect(claim.update).toHaveBeenCalledTimes(1);
+    expect(reopened.listStages(run.id).some((s) => s.name === "implement")).toBe(true);
+    expect(gate.forget).toHaveBeenCalledTimes(2);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("capability refusal precedes implement bookkeeping and invocation", async () => {
+  const { f, run, claim } = await fixture(true);
+  const gate = passingGate();
+  gate.canContinue.mockImplementation(async (task) => (task.phase === "loop" ? ["os"] : []));
+  expect(await executeRun({ ...f.deps, runClaim: claim, capability: gate }, run.id, signal())).toBe("queued");
+  expect(f.store.listStages(run.id).map((s) => s.name)).toEqual(["prepare", "triage"]);
+  expect(f.store.listInvocations(run.id).map((i) => i.role)).toEqual(["triage"]);
+  expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:capability");
+});
+
+test("capability loss leaves checkpoint and cancellation probes available", async () => {
+  const { f, run, claim } = await fixture();
+  const gate = passingGate();
+  gate.capableNow.mockReturnValue(false);
+  const repo = f.store.getRepo(run.repoId);
+  if (!repo) throw new Error("missing repo");
+  const bound = bindRunClaim(run, f.store, claim, gate);
+  const ctx = new RunContext({ ...f.deps, capability: gate }, run, repo, signal(), undefined, undefined, {
+    shared: true,
+    claim: bound,
+  });
+  ctx.state.githubWait = { reason: "claim:capability", since: 1, nextAttemptAt: 2 };
+  await claimScope.run([bound.binding], async () => {
+    ctx.checkCancelled();
+    ctx.checkpointer.writeRun(run.id, { status: "queued" });
+    await ctx.save();
+  });
+  expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:capability");
+  expect(gate.capableNow).not.toHaveBeenCalled();
+});
+
+test("cancellation during an awaited capability refusal wins", async () => {
+  const { f, run, claim } = await fixture();
+  const gate = passingGate();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<Awaited<ReturnType<CapabilityGate["canContinue"]>>>();
+  gate.canContinue.mockImplementation(() => {
+    entered.resolve();
+    return release.promise;
+  });
+  const controller = new AbortController();
+  const work = executeRun({ ...f.deps, runClaim: claim, capability: gate }, run.id, controller.signal);
+  await entered.promise;
+  controller.abort();
+  release.resolve(["os"]);
+  expect(await work).toBe("cancelled");
+  expect(f.store.getRunState<RunState>(run.id)?.githubWait).toBeUndefined();
+  expect(claim.update).not.toHaveBeenCalled();
+});
+
+test("capability claim-control errors keep their identity", async () => {
+  const { f, run, claim } = await fixture();
+  const repo = f.store.getRepo(run.repoId);
+  if (!repo) throw new Error("missing repo");
+  const gate = passingGate();
+  const ctx = new RunContext({ ...f.deps, capability: gate }, run, repo, signal(), undefined, undefined, {
+    shared: true,
+    claim,
+  });
+  for (const error of [new ClaimLostError(), new ClaimWaitError("lease")]) {
+    gate.canContinue.mockRejectedValue(error);
+    expect(await ctx.requireCapability("prepare").catch((e: unknown) => e)).toBe(error);
+  }
+});
+
+test("local completion never calls an injected refusing capability gate", async () => {
+  const { f, run } = await fixture(true);
+  shared(f, false);
+  const gate = passingGate();
+  gate.canContinue.mockResolvedValue(["os"]);
+  gate.capableNow.mockReturnValue(false);
+  expect(await executeRun({ ...f.deps, capability: gate }, run.id, signal())).toBe("succeeded");
+  for (const method of Object.values(gate)) expect(method).not.toHaveBeenCalled();
+});
+
+const writeFamily = (cmd: readonly string[]) =>
+  cmd.includes("push")
+    ? "push"
+    : cmd.includes("--disable-auto")
+      ? "disable"
+      : cmd.includes("pr") && cmd.includes("create")
+        ? "create"
+        : cmd.includes("pr") && cmd.includes("edit")
+          ? "edit"
+          : cmd.includes("pr") && cmd.includes("comment")
+            ? "comment"
+            : undefined;
+
+test.each(["push", "create", "edit", "disable", "comment"])(
+  "capability loss refuses the individual %s dispatch",
+  async (family) => {
+    const { f, run, claim } = await fixture(true);
+    let capable = true;
+    const gate = passingGate();
+    gate.capableNow.mockImplementation(() => capable);
+    const writes: string[] = [];
+    const spawnReal = subprocess.spawn;
+    const recorder = spyOn(subprocess, "spawn").mockImplementation(((
+      bin: string,
+      args: readonly string[],
+      opts: subprocess.SpawnOptions,
+    ) => {
+      const write = writeFamily(args);
+      if (write) writes.push(write);
+      return spawnReal(bin, args, opts);
+    }) as typeof subprocess.spawn);
+    restores.push(() => recorder.mockRestore());
+    if (family === "edit")
+      writeFileSync(
+        join(home, "bin", "gh"),
+        `#!/bin/sh
+case "$1:$2" in
+pr:list) echo 'https://github.com/test/repo/pull/1';;
+esac
+`,
+        { mode: 0o755 },
+      );
+    const process = proc.runProcess;
+    const boundary = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (writeFamily(opts.cmd) === family) capable = false;
+      return process(opts);
+    });
+    restores.push(() => boundary.mockRestore());
+    const create = repos.createPullRequest;
+    const extra = spyOn(repos, "createPullRequest").mockImplementation(async (...args) => {
+      const url = await create(...args);
+      if (family === "disable" || family === "comment") {
+        await runGh(["pr", "merge", url, "--disable-auto"]);
+        await runGh(["pr", "comment", url, "--body", "review"]);
+      }
+      return url;
+    });
+    restores.push(() => extra.mockRestore());
+    const status = await executeRun({ ...f.deps, runClaim: claim, capability: gate }, run.id, signal());
+    expect(f.store.getRun(run.id)?.error).toBeNull();
+    expect(status).toBe("queued");
+    expect(writes).toEqual(
+      family === "push"
+        ? []
+        : family === "comment"
+          ? ["push", "create", "disable"]
+          : family === "disable"
+            ? ["push", "create"]
+            : ["push"],
+    );
+    expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:capability");
+    expect(gate.forget.mock.calls).toEqual([[run.id]]);
+  },
+);
+
+test("shared implement keeps LAN publication local and pushes only in deliver", async () => {
+  const { f, run, claim } = await fixture(true);
+  f.cfg.workers.agents = ["implement"];
+  f.cfg.workers.repos = ["test/repo"];
+  const lan = lanAgentExecutor(f.workers, f.cfg);
+  const calls: AgentCall[] = [];
+  f.deps.agentExecutor = {
+    kind: "lan",
+    run: (call, local) => {
+      if (call.role === "implement") {
+        calls.push(call);
+        expect(call.publication).toBeUndefined();
+        // Use a worker-eligible harness identity; the local callback still uses the fake harness.
+        call.spec.target.harness = "claude";
+      }
+      return lan.run(call, local);
+    },
+  };
+  const pushes: string[] = [];
+  const push = repos.pushBranch;
+  const recorder = spyOn(repos, "pushBranch").mockImplementation(async (...args) => {
+    pushes.push(f.store.getRunState<RunState>(run.id)?.phase ?? "missing");
+    return push(...args);
+  });
+  restores.push(() => recorder.mockRestore());
+  expect(await executeRun({ ...f.deps, runClaim: claim }, run.id, signal())).toBe("succeeded");
+  expect(calls).toHaveLength(1);
+  expect(f.store.db.query("SELECT count(*) AS n FROM agent_jobs").get()).toEqual({ n: 0 });
+  expect(pushes).toEqual(["deliver"]);
+});
+
+test.each(["darwin", "linux"] as const)("real continuation gate with expired advert on %s", async (os) => {
+  const { f, run, claim } = await fixture(true);
+  const now = { inclusive: 181_000, exclusive: 181_000 };
+  const caps: Capabilities = {
+    protocol: 1,
+    release: null,
+    checkpoints: [1, 2],
+    os,
+    arch: "arm64",
+    confinement: {
+      backend: "seatbelt",
+      verified: true,
+      codex: { edit: true, read: true, confinedRead: true },
+    },
+    agents: { claude: { version: "1.0.0", loggedIn: true }, codex: { version: "1.0.0", loggedIn: true } },
+    privateStrings: { parity: "match", policy: null },
+    freeSlots: 1,
+    power: "ac",
+    draining: false,
+  };
+  const snapshot = { at: now, value: caps };
+  const advertAt = { inclusive: 1_000, exclusive: 1_000 };
+  const advertiser = { fresh: mock((time: typeof now) => windowOpen(advertAt, time, 180_000)) };
+  const gate = createCapabilityGate({
+    monitor: {
+      current: () => snapshot,
+      refresh: async () => snapshot,
+      access: async () => ({ at: now, value: true }),
+      start: () => () => {},
+    },
+    advertiser,
+    router: f.deps.router,
+    tracker: f.deps.tracker,
+    cfg: f.cfg,
+    clock: { sample: () => now },
+    freeSlots: () => 1,
+    draining: () => false,
+  });
+  expect(await executeRun({ ...f.deps, runClaim: claim, capability: gate }, run.id, signal())).toBe(
+    os === "darwin" ? "succeeded" : "queued",
+  );
+  expect(advertiser.fresh).not.toHaveBeenCalled();
+  if (os === "linux") {
+    expect(f.store.listStages(run.id)).toHaveLength(0);
+    expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:capability");
+  } else expect(f.store.listStages(run.id).some((s) => s.name === "implement")).toBe(true);
 });

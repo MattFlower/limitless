@@ -217,7 +217,17 @@ const ROUNDS_PER_IMPLEMENTER = 2;
 class ReaderSetupError extends NeedsHumanError {}
 
 /** Execute (or resume) one run to completion. Never throws. */
-export async function executeRun(
+export async function executeRun(...args: Parameters<typeof executeRunInner>): Promise<RunStatus> {
+  const [deps, runId] = args;
+  const run = deps.store.getRun(runId);
+  const repo = run && deps.store.getRepo(run.repoId);
+  const shared = run && repo && sharedRepository(deps.cfg, repo, run.repoSlug);
+  return executeRunInner(...args).finally(() => {
+    if (shared) deps.capability?.forget(runId);
+  });
+}
+
+async function executeRunInner(
   deps: EngineDeps,
   runId: string,
   signal: AbortSignal,
@@ -239,7 +249,7 @@ export async function executeRun(
   if (shared) {
     try {
       const authority = deps.runClaim;
-      claim = bindRunClaim(run, deps.store, authority);
+      claim = bindRunClaim(run, deps.store, authority, deps.capability);
     } catch (caught) {
       error = selectClaimControl([caught]) ?? new ClaimWaitError("unavailable");
     }
@@ -332,6 +342,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (ctx.execution.shared) {
       await recoverScopedProcesses();
       if (!ctx.execution.claim) throw ctx.execution.error ?? new ClaimWaitError("unavailable");
+      await ctx.requireCapability(ctx.state.phase);
       await renewRunClaim(ctx.execution.claim);
       claimGuard();
     }
@@ -1552,7 +1563,8 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           mode: "edit",
           complexity: ctx.complexity,
           constraints,
-          ...(!merge &&
+          ...(!ctx.execution.shared &&
+          !merge &&
           !reviewRound(ctx) &&
           !ctx.run.deliveryBranch &&
           !ctx.run.prUrl &&

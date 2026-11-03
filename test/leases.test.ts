@@ -18,6 +18,7 @@ import {
   type LeaseHandle,
   type LeaseWant,
 } from "../src/integrations/leases.ts";
+import { waitingForCapability, withCapabilityLapse } from "../src/pipeline/run-claim.ts";
 import { LEASE } from "../src/util/claim-clock.ts";
 import { GitHub } from "./claim-github-fake.ts";
 
@@ -132,7 +133,7 @@ function fixture(gh = new GitHub(), identity = member, probe = () => {}) {
       await callback?.();
     },
     start(manager: Awaited<ReturnType<typeof createLeaseManager>>, active = true) {
-      const stop = manager.start({ active: () => active, onLost: lost });
+      const stop = manager.start({ active: withCapabilityLapse(store, () => active), onLost: lost });
       cleanup.push(stop);
       return stop;
     },
@@ -1048,7 +1049,7 @@ test("the first renewal tick renews recovered ownership only when active", async
   f.confirmed();
   const manager = await f.create();
   const seen = mock((h: LeaseHandle) => h.ref === ref);
-  const stop = manager.start({ active: seen, onLost: f.lost });
+  const stop = manager.start({ active: withCapabilityLapse(f.store, seen), onLost: f.lost });
   cleanup.push(stop);
   f.advance(LEASE.renewMs);
   await f.tick();
@@ -1216,3 +1217,70 @@ test.each(["renewable", "unusable", "expired"] as const)(
     expect(f.lost).toHaveBeenCalledTimes(mode === "expired" ? 1 : 0);
   },
 );
+
+test("capability wait permits one in-flight renewal, then only the other run renews", async () => {
+  const f = fixture();
+  const manager = await f.create();
+  const repository = f.store.upsertRepo({
+    slug: repo,
+    kind: "github",
+    url: null,
+    localPath: null,
+    defaultBranch: "main",
+    mergePolicy: "pr",
+  });
+  const a = f.store.createRun(repository, { repo, prompt: "A" });
+  const b = f.store.createRun(repository, { repo, prompt: "B" });
+  for (const [run, number] of [
+    [a, 12],
+    [b, 13],
+  ] as const)
+    held(
+      await manager.acquire(
+        repo,
+        `refs/limitless/claims/${number}`,
+        { kind: "issue", number, run: run.id, status: "running" },
+        { takeover: false },
+      ),
+    );
+  const active = mock(() => true);
+  cleanup.push(manager.start({ active: withCapabilityLapse(f.store, active), onLost: f.lost }));
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.gh.fault = async (request) => {
+    if (request.step === "update" && f.gh.update(request).name === ref) {
+      entered.resolve();
+      await release.promise;
+    }
+  };
+  f.advance(LEASE.renewMs);
+  const first = f.tick();
+  await entered.promise;
+  f.store.updateRun(
+    a.id,
+    { status: "queued" },
+    { githubWait: { reason: "claim:capability", since: 1, nextAttemptAt: 2 } },
+  );
+  expect(waitingForCapability(f.store, a.id)).toBe(true);
+  release.resolve();
+  await first;
+  const writes = () => f.gh.calls("update").map((r) => f.gh.update(r).name);
+  expect(writes()).toEqual([ref, "refs/limitless/claims/13", ref, "refs/limitless/claims/13"]);
+  f.advance(LEASE.renewMs);
+  await f.tick();
+  expect(writes()).toEqual([
+    ref,
+    "refs/limitless/claims/13",
+    ref,
+    "refs/limitless/claims/13",
+    "refs/limitless/claims/13",
+  ]);
+  f.store.updateRun(a.id, { status: "running" });
+  expect(waitingForCapability(f.store, a.id)).toBe(false);
+  f.store.updateRun(
+    a.id,
+    { status: "queued" },
+    { githubWait: { reason: "claim:lease", since: 1, nextAttemptAt: 2 } },
+  );
+  expect(waitingForCapability(f.store, a.id)).toBe(false);
+});

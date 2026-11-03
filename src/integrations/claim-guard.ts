@@ -8,6 +8,7 @@ export interface ScopedClaim {
   readonly lost: boolean;
   cancelled(): boolean;
   windowOpen(): boolean;
+  capable?(): boolean;
   onLost(h: LeaseHandle, tip: ClaimTip | null): void;
 }
 
@@ -73,5 +74,17 @@ export function claimGuard(): void {
     if (stage === "cancelled" && blocked) throw new ClaimWaitError("cancelled");
     if (unavailable) throw new ClaimWaitError("unavailable");
     if (blocked) throw new ClaimWaitError("lease");
+  }
+}
+
+export function dispatchGuard(): void {
+  claimGuard();
+  for (const claim of scope.getStore() ?? []) {
+    try {
+      if (!claim.capable || claim.capable() === true) continue;
+    } catch (error) {
+      rethrowClaimControl(error);
+    }
+    throw new ClaimWaitError("capability");
   }
 }

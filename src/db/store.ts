@@ -1695,6 +1695,14 @@ export class Store {
       .run(repo.toLowerCase(), epic, runId);
   }
 
+  releaseAcceptanceLimit(repo: string, epic: number): void {
+    this.db
+      .query(
+        "UPDATE acceptance_epic_limits SET comment = 'pending' WHERE repo = ? AND epic = ? AND comment = 'requested'",
+      )
+      .run(repo.toLowerCase(), epic);
+  }
+
   latestIssueRun(repo: string, number: number): Run | null {
     const latest = this.latestIssueRuns(repo, [number]).get(number);
     return latest ? this.getRun(latest.id) : null;

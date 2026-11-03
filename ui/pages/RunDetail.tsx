@@ -315,8 +315,13 @@ export const RunDetail: Component = () => {
                   <Show when={r().status === "queued" && r().githubWait}>
                     {(wait) => (
                       <div class="text-dim">
-                        waiting for GitHub since {formatDateTime(wait().since)}; next try{" "}
-                        {formatDateTime(wait().nextAttemptAt)}; gives up {formatDateTime(wait().deadline)}
+                        waiting for {wait().reason === "claim:capability" ? "a capable member" : "GitHub"}{" "}
+                        since {formatDateTime(wait().since)}; next{" "}
+                        {wait().reason === "claim:capability" ? "check" : "try"}{" "}
+                        {formatDateTime(wait().nextAttemptAt)}
+                        <Show when={wait().reason !== "claim:capability"}>
+                          ; gives up {formatDateTime(wait().deadline)}
+                        </Show>
                       </div>
                     )}
                   </Show>

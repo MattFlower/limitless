@@ -24,7 +24,7 @@ import * as privacy from "../gates/private.ts";
 import { checkPublicationText } from "../gates/publication.ts";
 import { withScratch } from "../harness/scratch.ts";
 import { rethrowClaimControl } from "../integrations/claim-errors.ts";
-import { claimGuard } from "../integrations/claim-guard.ts";
+import { dispatchGuard as claimDispatchGuard } from "../integrations/claim-guard.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import { GitHubIdentityError, githubSh, githubUrlRepo } from "../integrations/github-identity.ts";
 import { checkDiscreetBranch, DiscreetError } from "../pipeline/markers.ts";
@@ -140,7 +140,7 @@ type RemoteOpts = {
 };
 const remoteSh = (cmd: string[], opts: RemoteOpts, guard?: () => void, repo?: string) => {
   const dispatchGuard = () => {
-    claimGuard();
+    claimDispatchGuard();
     try {
       guard?.();
     } catch (cause) {
