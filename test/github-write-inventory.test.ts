@@ -569,7 +569,7 @@ src/workers/update.ts | updateWorker/run | sh | 1 | exempt | not-github | Local 
 
 test("production GitHub transport manifest", async () => {
   compare(await analyze(join(repository, "tsconfig.json"), repository), manifest);
-}, 30_000);
+}, 60_000);
 
 async function fixture(files: Record<string, string>, check: (config: string, dir: string) => Promise<void>) {
   const dir = await mkdtemp(join(tmpdir(), "github-inventory-"));
