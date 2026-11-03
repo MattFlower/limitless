@@ -293,14 +293,18 @@ export function credentialVariants(secret: string): string[] {
   return [...new Set(variants)];
 }
 export function createCredentialRegistry(onAdd?: (value: string) => void) {
-  const values = new Set<string>();
+  const values = new Set<string>(),
+    mainThreadOnly = new Set<string>();
   return {
     get generation() {
       return values.size;
     },
     has: (value: string) => values.has(value),
-    values: () => [...values],
-    addMainThreadOnly: (value: string) => onAdd?.(value),
+    values: (worker = false) => [...values].filter((value) => !worker || !mainThreadOnly.has(value)),
+    addMainThreadOnly(value: string): void {
+      mainThreadOnly.add(value);
+      this.add(value);
+    },
     add: (value: string) => {
       if (value && !values.has(value)) {
         values.add(value);

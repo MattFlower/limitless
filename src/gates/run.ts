@@ -356,7 +356,7 @@ export function targetedRetrySkipReason(
   if (r.exitCode == null) return "missing exit status";
   if (r.exitCode === 0) return "no nonzero exit status";
   if (r.failureAttributionComplete !== true)
-    return `failure attribution incomplete: ${r.failureAttributionReason ?? "missing or inconsistent whole-stream/JUnit evidence"}`;
+    return "failure attribution incomplete: missing or inconsistent whole-stream/JUnit evidence";
   const placeholderReason = "retry_files must contain {files} once as an unquoted standalone argument";
   if (cfg.retryFiles?.split("{files}").length !== 2) return placeholderReason;
   if (!r.failedFiles?.length) return "absent retry files";

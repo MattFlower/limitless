@@ -10,8 +10,8 @@ import {
   credentialRegistry,
   credentialVariants,
 } from "./credential-matcher.ts";
-import { PRIVACY_CHECKER_SEMANTICS } from "./privacy-semantics.ts";
 import { terminalRedactor } from "./terminal-redaction.ts";
+export const PRIVACY_CHECKER_SEMANTICS = "privacy/1";
 export const privacyRefusals = [
   "entries-count",
   "credentials-count",
@@ -76,7 +76,7 @@ export function createPrivacyRegistry(
     },
     // Admission sizing without retaining a policy snapshot or encoded payload.
     get wireBytes() {
-      return [...entries.map(({ value }) => value), ...secrets.values()].reduce(
+      return [...entries.map(({ value }) => value), ...secrets.values(true)].reduce(
         (total, text) => total + 4 + Buffer.byteLength(text),
         0,
       );
@@ -90,11 +90,15 @@ export function createPrivacyRegistry(
     get generation() {
       return generation();
     },
-    snapshot: () => ({ ready, entries: copy(), credentials: secrets.values(), generation: generation() }),
+    snapshot(worker = false) {
+      const credentials = secrets.values(worker);
+      return { ready, entries: copy(), credentials, generation: generation() };
+    },
   };
 }
 export const privacyRegistry = createPrivacyRegistry(credentialRegistry, undefined, true);
-export const capturePrivacySnapshot = (registry = privacyRegistry) => registry.snapshot();
+export const capturePrivacySnapshot = (registry = privacyRegistry, worker = false) =>
+  registry.snapshot(worker);
 export const currentPrivacyGeneration = (registry = privacyRegistry) => registry.generation;
 export function isCurrentPrivacyGeneration(prepared: Prepared, registry = privacyRegistry): boolean {
   const current = currentPrivacyGeneration(registry);

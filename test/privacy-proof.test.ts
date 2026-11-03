@@ -12,11 +12,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkPublicationText } from "../src/gates/publication.ts";
+import { credentialRegistry } from "../src/util/credential-matcher.ts";
 import { createPrivacyRegistry, privacyRegistry } from "../src/util/privacy-boundary.ts";
-import { createPrivacyChecker } from "../src/util/privacy-checker.ts";
+import { createPrivacyChecker, privacyWorkerEntry, startPrivacyWorker } from "../src/util/privacy-checker.ts";
+import { consumeBoundaryChunk } from "../src/util/privacy-chunks.ts";
 import { provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
 import * as p from "../src/util/privacy-proof.ts";
-import { redactCredentials } from "../src/util/proc.ts";
+import { agentEnv, redactCredentials, registeredCredentials } from "../src/util/proc.ts";
 
 const dirs: string[] = [];
 const checkers: ReturnType<typeof createPrivacyChecker>[] = [];
@@ -66,7 +69,22 @@ test("receipt proofs bind key, kind, field, bytes, entries and semantics", async
   expect(p.verifier(other, f.signer).verify(proof, "output", "safe text")).toBe(false);
   const hex = f.state.key?.toString("hex") ?? "missing";
   expect(redactCredentials(hex)).toBe("[redacted]");
-  expect(privacyRegistry.snapshot().credentials).not.toContain(hex);
+  expect(registeredCredentials()).toContain(hex);
+  expect(privacyRegistry.snapshot().credentials).toContain(hex);
+  expect(privacyRegistry.snapshot(true).credentials).not.toContain(hex);
+  expect(() =>
+    checkPublicationText(
+      Buffer.from(hex).toString("base64"),
+      "test",
+      registeredCredentials().map((value) => ({ value, entry: 0 })),
+    ),
+  ).toThrow();
+  process.env.PROOF_ENV_TEST = hex;
+  try {
+    expect(agentEnv().PROOF_ENV_TEST).toBeUndefined();
+  } finally {
+    delete process.env.PROOF_ENV_TEST;
+  }
 });
 test("one fresh snapshot serves all fields until the next verifier", async () => {
   const f = fixture(),
@@ -199,4 +217,60 @@ test("first startup provisions a missing config directory", () => {
   const stat = lstatSync(join(dir, "privacy-proof.key"));
   expect(stat.isFile()).toBe(true);
   expect(stat.mode & 0o077).toBe(0);
+});
+
+test("verdict-only receipts cannot be replayed to sign unchecked input", async () => {
+  const f = fixture();
+  f.registry.refreshPolicy = () => {};
+  f.registry.replacePolicy([{ value: "forbidden-value", entry: 0 }]);
+  const cut = { limit: 0, unit: "U" as const, marker: "" };
+  const receipt = await f.checker.protectText({
+    text: "safe",
+    cut,
+    terminal: true,
+    provenance: { kind: "complete" },
+  });
+  const checker = { registry: f.registry, protectText: async () => receipt };
+  expect(await f.sign("forbidden-value", { checker, cut })).toBeUndefined();
+  const proof = await f.sign("safe", { checker, cut });
+  expect(p.verifier(f.registry, f.signer).verify(proof, "output", "safe")).toBe(true);
+});
+
+test("main-thread credentials never enter worker snapshots on either admission path", async () => {
+  const f = fixture(),
+    hex = f.state.key?.toString("hex");
+  if (!hex) throw new Error("Missing key");
+  const registry = createPrivacyRegistry(credentialRegistry);
+  let chunks = 0,
+    leaked = false;
+  const checker = createPrivacyChecker({
+    registry,
+    workerFactory: () => {
+      const port = startPrivacyWorker(privacyWorkerEntry()),
+        post = port.postMessage;
+      port.postMessage = (value, transfer) => {
+        if (
+          value &&
+          typeof value === "object" &&
+          "payload" in value &&
+          value.payload instanceof ArrayBuffer
+        ) {
+          chunks++;
+          leaked ||= Buffer.from(value.payload).includes(Buffer.from(hex));
+        }
+        post(value, transfer);
+      };
+      return port;
+    },
+  });
+  checkers.push(checker);
+  for (const deadline of [undefined, Date.now() + 30_000]) {
+    const receipt = await checker.protectText(
+      { text: "safe", provenance: { kind: "complete" } },
+      { deadline },
+    );
+    expect(consumeBoundaryChunk(receipt, 0, registry).withheld).toBe(false);
+  }
+  expect(chunks).toBeGreaterThanOrEqual(2);
+  expect(leaked).toBe(false);
 });

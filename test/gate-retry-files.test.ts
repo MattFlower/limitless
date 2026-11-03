@@ -14,6 +14,7 @@ import {
   retryRegressions,
   runGates,
   runLocalGates,
+  targetedRetrySkipReason,
 } from "../src/gates/run.ts";
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
@@ -1487,4 +1488,33 @@ test.each([
   } finally {
     f.close();
   }
+});
+
+test("targeted retry diagnostics never interpolate unparsed attribution", () => {
+  const result: GateResult = {
+    name: "test",
+    command: "bun test",
+    ok: false,
+    exitCode: 1,
+    durationMs: 0,
+    output: "",
+    failureAttributionComplete: false,
+  };
+  for (const reason of ["leak secret-token", "Ambiguous testcase; secret-token"])
+    expect(
+      targetedRetrySkipReason(
+        undefined,
+        { ...result, failureAttributionReason: reason },
+        { setup: [], checks: [], source: ".limitless.toml", protectedPaths: [] },
+        ".",
+      ),
+    ).toBe("failure attribution incomplete: missing or inconsistent whole-stream/JUnit evidence");
+  expect(
+    targetedRetrySkipReason(
+      undefined,
+      { ...result, failureAttributionReason: "1 unattributed error" },
+      { setup: [], checks: [], source: ".limitless.toml", protectedPaths: [] },
+      ".",
+    ),
+  ).toBe("failure attribution incomplete: missing or inconsistent whole-stream/JUnit evidence");
 });
