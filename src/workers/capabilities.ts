@@ -3,13 +3,14 @@ import { CLAUDE_VERSION, CODEX_VERSION } from "../harness/versions.ts";
 import { agentEnv, redactCredentials, sh } from "../util/proc.ts";
 
 export type Cli = { version: string | null; loggedIn: boolean };
+type ProbeStatus = { timedOut?: boolean; cancelled?: boolean; idleTimedOut?: boolean };
 export const loginArgs = { claude: ["auth", "status"], codex: ["login", "status"] };
 export const loggedIn = (result: { exitCode: number | null; stdout: string } | null) =>
   result?.exitCode === 0 && !/"loggedIn"\s*:\s*false/.test(result.stdout);
 export type CapabilityRunner = (
   args: string[],
   options: Parameters<typeof sh>[1],
-) => Promise<{ exitCode: number | null; stdout: string; stderr?: string }>;
+) => Promise<{ exitCode: number | null; stdout: string; stderr?: string } & ProbeStatus>;
 
 async function command(
   name: keyof typeof loginArgs,
