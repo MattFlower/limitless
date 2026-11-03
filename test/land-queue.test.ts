@@ -2179,12 +2179,14 @@ test.each([false, true])("a checking entry resumes a confirmed push (shared: %s)
   });
   store.updateLandEntry(entry.id, { state: "checking", pushedSha: mergeSha, attempts: 1 });
   const cfg = loadConfig({ ...paths, raw: { repos: { [SLUG]: { shared } } } });
+  const claims = landClaims();
   const push = spyOn(repos, "pushExistingBranch");
   try {
     let green = false;
     let reads = 0;
     queue({
       cfg,
+      claims: claims.client,
       polling: false,
       ciPollMs: 100,
       client: async () => {
@@ -3095,10 +3097,12 @@ test.each([
     failing: [],
   };
   const cfg = loadConfig({ ...paths, raw: { repos: { [SLUG]: { shared } } } });
+  const claims = landClaims();
   const push = spyOn(repos, "pushExistingBranch");
   try {
     const q = queue({
       cfg,
+      claims: claims.client,
       polling: false,
       client: async () => ({ ...view, headRefOid: await remoteHead("pr-1") }),
     });
@@ -3118,6 +3122,7 @@ test.each([
     let reads = 0;
     queue({
       cfg,
+      claims: claims.client,
       client: async () => {
         reads++;
         return { ...view };
@@ -3149,6 +3154,7 @@ test.each([false, true])(
     await advanceBase();
     ci = () => null; // Only the remote-verified client below supplies CI.
     const cfg = loadConfig({ ...paths, raw: { repos: { [SLUG]: { shared } } } });
+    const claims = landClaims();
     const entered = deferred<void>();
     const release = deferred<void>();
     const push = repos.pushExistingBranch;
@@ -3169,6 +3175,7 @@ test.each([false, true])(
         held = true;
         entered.resolve();
         await release.promise;
+        opts?.signal?.throwIfAborted();
       }
       return result;
     });
@@ -3194,7 +3201,7 @@ test.each([false, true])(
         failing: [],
       };
     };
-    const first = queue({ cfg, polling: false, client });
+    const first = queue({ cfg, claims: claims.client, polling: false, client });
     try {
       const entry = await first.request({ target: pr.run.id });
       await entered.promise;
@@ -3209,7 +3216,7 @@ test.each([false, true])(
       await stopping;
       expect(store.getLandEntry(entry.id)?.pushedSha).toBe(checkpoint);
       expect(gateLog()).toEqual(["start", "end"]);
-      queue({ cfg, polling: false, client, ciPollMs: 100, ciTimeoutMs: 1_000 });
+      queue({ cfg, claims: claims.client, polling: false, client, ciPollMs: 100, ciTimeoutMs: 1_000 });
       await settle();
       const pushed = await remoteHead("pr-1");
       expect(pushed).not.toBe(approved);
@@ -3228,6 +3235,72 @@ test.each([false, true])(
     }
   },
 );
+
+test("a shared resume preserves an unpushed checkpoint until the run claim is released", async () => {
+  const { entry, head: approved, claims } = await claimLandFixture();
+  await advanceBase();
+  const checkpoint = "a".repeat(40);
+  store.updateLandEntry(entry.id, { state: "checking", pushedSha: checkpoint });
+  claims.refs.set(prClaimRef, claimResult("held"));
+  ci = () => null;
+  const releaseChecks = deferred<void>();
+  const fake = fakeLandGates(async (req) => {
+    await releaseChecks.promise;
+    return retryRun(req);
+  });
+  const push = spyOn(repos, "pushExistingBranch");
+  const ciHeads: string[] = [];
+  const q = queue({
+    cfg: sharedLandConfig,
+    claims: claims.client,
+    gateExecutor: fake.executor,
+    polling: false,
+    client: async () => {
+      const head = await remoteHead("pr-1");
+      ciHeads.push(head);
+      return {
+        url: url(1),
+        state: "OPEN",
+        headRefOid: head,
+        mergedAt: null,
+        mergedBy: null,
+        ci: head === approved ? "PENDING" : "SUCCESS",
+        failing: [],
+      };
+    },
+  });
+  try {
+    await claimParked(entry, heldClaim);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", pushedSha: checkpoint });
+    expect(fake.requests).toHaveLength(0);
+    expect(push).not.toHaveBeenCalled();
+    expect(ghCalls("pr merge")).toEqual([]);
+    expect(ciHeads).toEqual([]);
+    expect(await remoteHead("pr-1")).toBe(approved);
+
+    claims.refs.set(prClaimRef, claimResult("released"));
+    await clock.advance(30_000);
+    await waitWithoutClock(() => fake.requests.length === 1, 15_000);
+    expect(store.getLandEntry(entry.id)?.pushedSha).toBeNull();
+    expect(push).not.toHaveBeenCalled();
+    expect(ghCalls("pr merge")).toEqual([]);
+    releaseChecks.resolve();
+    await settle();
+    const pushed = await remoteHead("pr-1");
+    expect(pushed).not.toBe(approved);
+    expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: pushed });
+    expect(fake.requests).toHaveLength(1);
+    expect(fake.requests[0]?.headSha).toBe(pushed);
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(ciHeads).toContain(pushed);
+    expect(ghCalls("pr merge")).toHaveLength(1);
+    expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${pushed}`);
+  } finally {
+    releaseChecks.resolve();
+    await q.stop();
+    push.mockRestore();
+  }
+});
 
 test.each(["checkpoint", "cancel", "claim", "head"] as const)(
   "a deferred recovery head cannot override a changed %s",
