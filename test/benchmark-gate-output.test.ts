@@ -250,11 +250,64 @@ test("local worker policy and key stay in scratch; snapshots and owned workers c
 });
 
 test("bad CLI arguments fail before launching a worker", async () => {
-  await expect(compare(["HEAD"], ["gate-5mib"])).rejects.toThrow("need two refs");
-  await expect(compare(["HEAD", "HEAD"], ["unknown"])).rejects.toThrow("known workloads");
+  const invoke: typeof launch = () => {
+    throw Error("no worker may launch");
+  };
+  await expect(compare(["HEAD"], ["gate-5mib"], invoke)).rejects.toThrow("expected two refs, got 1; usage:");
+  await expect(compare(["HEAD", "HEAD"], ["gate-5mib", "bogus"], invoke)).rejects.toThrow(
+    "unknown workload(s) bogus; known: gate-5mib",
+  );
   await expect(
-    compare(["not-a-real-revision-for-producer-benchmark", "HEAD"], ["gate-5mib"]),
-  ).rejects.toThrow();
+    compare(["HEAD", "not-a-real-revision-for-producer-benchmark"], ["gate-5mib"], invoke),
+  ).rejects.toThrow('ref "not-a-real-revision-for-producer-benchmark" does not name a commit');
+  const cli = (...args: string[]) =>
+    Bun.spawnSync([process.execPath, "scripts/benchmark-gate-output.ts", ...args], { stderr: "pipe" });
+  const failed = cli("HEAD", "HEAD", "bogus");
+  expect(failed.exitCode).toBe(1);
+  expect(failed.stdout.toString()).toBe("");
+  expect(failed.stderr.toString().trim()).toStartWith("benchmark-gate-output: unknown workload(s) bogus;");
+});
+
+test("implementation work resumed by setImmediate, timers, sleeps and XML parsing is owned through worker()", async () => {
+  await temporary(async (root) => {
+    await fakeRevision(root);
+    await fs.mkdir(join(root, "src/gates"));
+    await fs.appendFile(
+      join(root, "src/util/privacy-boundary.ts"),
+      "export const privacyRegistry={replacePolicy(){}}; export function registerCredential(){}",
+    );
+    await fs.writeFile(
+      join(root, "src/gates/junit.ts"),
+      `const busy=(n)=>{const t=performance.now();while(performance.now()-t<n);};
+      export async function readJUnit(){
+        await new Promise((r)=>setImmediate(r)); busy(30);
+        await new Promise((r)=>setTimeout(r,1)); busy(30);
+        await Bun.sleep(1); busy(30);
+        await Bun.file(import.meta.path).text(); Bun.XML.parse('<a/>'); busy(30);
+        return {failedFiles:['sample.test.ts']};
+      }`,
+    );
+    const { registry: workloads, worker } = await import("../scripts/benchmark-gate-output.ts");
+    const check = (v: unknown) => validate(JSON.stringify(v) === '{"failedFiles":["sample.test.ts"]}');
+    workloads.yielding = ({ a }) => [["readJUnit", 1, () => (a.readJUnit as () => unknown)(), check]];
+    try {
+      const report = await worker(root, "yielding");
+      const group = report.groups["readJUnit/1"] as { raw: (Group["raw"][number] & { parses: number })[] };
+      expect(group.raw).toHaveLength(7);
+      for (const trial of group.raw) {
+        const owned = trial.turns.filter((t) => t[1] >= 29);
+        expect(owned.map((t) => t[3])).toEqual(
+          ["immediate", "timer", "sleep", "XML.parse"].map((p) => expect.stringContaining(p)),
+        );
+        expect(trial.idle.filter((gap) => (gap[1] ?? 0) >= 29)).toEqual([]);
+        expect(trial.parses).toBe(1);
+      }
+      expect(setImmediate.name).toBe("setImmediate");
+      expect(Bun.XML.parse.name).toBe("parse");
+    } finally {
+      delete workloads.yielding;
+    }
+  });
 });
 
 test("missing proof APIs remain unavailable at every identity boundary", async () => {

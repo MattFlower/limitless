@@ -263,25 +263,20 @@ export async function measureRevision(a: API, fixture: () => ReturnType<typeof w
 type Fixture = ReturnType<typeof workload>;
 const ms = (u: { user: number; system: number }) => (u.user + u.system) / 1000;
 const busy = (w: Fixture) => ({ ...w, reason: "checker-busy", maximum: false });
+const unowned = setImmediate; // Producer instrumentation wraps setImmediate; the heartbeat stays unowned.
+type Checker = ReturnType<typeof import("../src/util/privacy-checker.ts").createPrivacyChecker>;
 /** worker-all: the real checker, cold per trial, maximum policy. A daemon slice is wall time from entering daemon
  * code to 64 microtask rounds after its latest entry; entries join one slice until a setImmediate heartbeat proves
  * a real yield, so continuations count and awaiting the worker does not (see docs/privacy-boundaries.md). */
 export type ProducerOperation = {
-  run: (
-    checker: ReturnType<typeof import("../src/util/privacy-checker.ts").createPrivacyChecker>,
-    own: <T>(phase: string, fn: () => T) => T,
-  ) => unknown;
+  run: (checker: Checker, own: <T>(phase: string, fn: () => T) => T) => unknown;
   check: (value: unknown) => Record<string, unknown>;
   dimensions: object;
 };
-export async function measureWorker(
-  root: string,
-  r = runtime,
-  producers?: Record<string, ProducerOperation>,
-) {
+export async function measureWorker(root: string, r = runtime, ops?: Record<string, ProducerOperation>) {
   const load = (p: string) => import(join(root, `src/util/privacy-${p}.ts`));
   const [b, k, c] = await Promise.all(["boundary", "checker", "chunks"].map(load));
-  const policy = workload(producers ? "plain" : "preparation");
+  const policy = workload(ops ? "plain" : "preparation");
   const slots = "ascii-max astral-max recursive-max combined sparse form+1 forms+1 base64".split(" ");
   const [bmp, eight] = [workload("bmp-max"), slots.map((n) => workload(n))];
   const [groups, raw] = [{} as Record<string, unknown>, [] as (Trial & Record<string, unknown>)[]];
@@ -331,7 +326,7 @@ export async function measureWorker(
           turns.push([open.start - start, open.end - open.start, now - last, [...open.phases].join()]);
         else if (now - last > 2) idle.push([now - start, now - last]);
         [open, last, heartbeat] = [undefined, now, heartbeat + 1];
-        if (beating) setImmediate(beat);
+        if (beating) unowned(beat);
       };
       const [cpu, main, start] = [process.cpuUsage(), process.threadCpuUsage(), r.now()];
       setImmediate(beat);
@@ -368,20 +363,13 @@ export async function measureWorker(
     }
     raw.push(...trials);
     const workloads = jobs.map(({ name, sizes, reason }) => ({ name, ...sizes, reason }));
-    const median = (values: number[]) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)] ?? null;
-    const metrics =
-      "wallMs cpuMs.workerAndRuntime cpuMs.mainThreadWithHeartbeat submissionMs latencyMs addedLatencyMs";
-    const medians = Object.fromEntries(
-      metrics.split(" ").map((key) => [
-        key,
-        median(
-          trials.slice(2).flatMap((t) => {
-            const value: unknown = key.split(".").reduce((v, k) => Reflect.get(Object(v), k), t);
-            return value == null ? [] : (Array.isArray(value) ? value : [value]).map(Number);
-          }),
-        ),
-      ]),
-    );
+    const median = (key: string) => {
+      const get = (t: object): unknown => key.split(".").reduce((v, k) => Reflect.get(Object(v), k), t);
+      const values = trials.slice(2).flatMap((t) => [get(t) ?? []].flat().map(Number));
+      return values.sort((a, b) => a - b)[Math.floor(values.length / 2)] ?? null;
+    };
+    const metrics = "wallMs cpuMs.workerAndRuntime cpuMs.mainThreadWithHeartbeat submissionMs latencyMs";
+    const medians = Object.fromEntries(`${metrics} addedLatencyMs`.split(" ").map((k) => [k, median(k)]));
     groups[label] = {
       workloads,
       dimensions: producer?.dimensions,
@@ -391,7 +379,7 @@ export async function measureWorker(
       exceeds50ms: trials.some((t) => t.slice > 50),
     };
   };
-  if (producers) for (const [label, producer] of Object.entries(producers)) await series(label, [], producer);
+  if (ops) for (const [label, producer] of Object.entries(ops)) await series(label, [], producer);
   else {
     await series("cold startup, maximum-policy transfer", [workload("plain")]);
     await series("eight slots, then slot backpressure", [...eight, busy(bmp)]);
@@ -414,22 +402,15 @@ export async function command(cmd: string[], cwd = process.cwd(), environment?: 
   if (r.exitCode !== 0 || r.truncated) throw Error(r.stderr || "Failed command or incomplete report");
   return r.stdout.trim();
 }
-export async function launch(
-  { ref, name }: Job,
-  script = import.meta.path,
-  environment?: (root: string) => Record<string, string>,
-) {
+type Env = (root: string) => Record<string, string>;
+export async function launch({ ref, name }: Job, script = import.meta.path, env?: Env) {
   const root = await fs.mkdtemp(join(tmpdir(), "privacy-boundary-"));
   const result = (async () => {
     const sha = await command(["git", "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]);
     await command(["git", "archive", `--output=${root}/snapshot.tar`, sha, "src", "package.json"]);
     await command(["tar", "-xf", `${root}/snapshot.tar`, "-C", root]);
     await fs.symlink(resolve("node_modules"), join(root, "node_modules"), "dir");
-    const raw = await command(
-      [process.execPath, script, "--worker", root, name, sha],
-      root,
-      environment?.(root),
-    );
+    const raw = await command([process.execPath, script, "--worker", root, name, sha], root, env?.(root));
     return { ref, name, report: JSON.parse(raw) as unknown };
   })();
   return { result, cleanup: () => fs.rm(root, { recursive: true, force: true }) };

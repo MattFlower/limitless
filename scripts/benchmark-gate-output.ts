@@ -56,38 +56,48 @@ export async function worker(root: string, name: string) {
     operations[`${label}/${size}`] = {
       dimensions,
       run: async (current, own) => {
-        checker = current;
-        submissionMs = [];
-        latencyMs = [];
-        parses = 0;
+        [checker, submissionMs, latencyMs, parses] = [current, [], [], 0];
         const start = performance.now(),
-          parse = Bun.XML.parse;
-        Bun.XML.parse = ((...args: unknown[]) => {
-          parses++;
-          return (parse as Fn)(...args);
-        }) as typeof parse;
-        const protect = checker.protectText,
-          emit = EventEmitter.prototype.emit;
+          protect = checker.protectText;
+        // Every implementation resumption (I/O events, scheduled turns, timers, sleeps, XML parses) re-enters
+        // ownership, so work after a yield is owned until the next heartbeat rather than escaping both buckets.
+        const enter = (phase: string, f: Fn) =>
+          function (this: unknown, ...x: unknown[]) {
+            return own(phase, () => f.apply(this, x));
+          };
+        const later =
+          (f: Fn, phase: string): Fn =>
+          (cb, ...x) =>
+            f(enter(phase, cb as Fn), ...x);
+        const sleep =
+          (f: Fn): Fn =>
+          async (...x) =>
+            enter("sleep", (v) => v)(await f(...x));
+        const patches: [object, string, (f: Fn) => Fn][] = [
+          [EventEmitter.prototype, "emit", (f) => enter("emit", f)],
+          [globalThis, "setImmediate", (f) => later(f, "immediate")],
+          [globalThis, "setTimeout", (f) => later(f, "timer")],
+          [Bun, "sleep", sleep],
+          [Bun.XML, "parse", (f) => enter("XML.parse", (...x) => [parses++, f(...x)][1])],
+        ];
+        const restore = patches.map(([o, k, patch]) => {
+          const f = Reflect.get(o, k) as Fn;
+          Reflect.set(o, k, patch(f));
+          return () => Reflect.set(o, k, f);
+        });
         checker.protectText = (i, c) => {
           const start = performance.now(),
             result = own("submission", () => protect(i, c));
           submissionMs.push(performance.now() - start);
-          return result.then((v) =>
-            own("consume", () => {
-              latencyMs.push(performance.now() - start);
-              return v;
-            }),
-          );
-        };
-        EventEmitter.prototype.emit = function (event, ...args) {
-          return own(String(event), () => emit.call(this, event, ...args));
+          return result.then(
+            enter("consume", (v) => [latencyMs.push(performance.now() - start), v][1]),
+          ) as typeof result;
         };
         try {
           return await run();
         } finally {
           elapsed = performance.now() - start;
-          EventEmitter.prototype.emit = emit;
-          Bun.XML.parse = parse;
+          for (const undo of restore) undo();
         }
       },
       check: (v) => ({
@@ -117,13 +127,15 @@ export async function worker(root: string, name: string) {
   return { pid: process.pid, name, unavailable, ...(await bench.measureWorker(root, undefined, operations)) };
 }
 export async function compare(refs: string[], names: string[], invoke = bench.launch) {
-  validate(
-    refs.length === 2 && names.every((n) => Object.hasOwn(registry, n)),
-    "need two refs and known workloads",
-  );
-  const shas = [];
-  for (const ref of refs)
-    shas.push(await bench.command(["git", "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]));
+  const usage = "usage: bun scripts/benchmark-gate-output.ts <baseline-ref> <candidate-ref> [workloads]";
+  if (refs.length !== 2) throw Error(`expected two refs, got ${refs.length}; ${usage}`);
+  const unknown = names.filter((n) => !Object.hasOwn(registry, n));
+  if (unknown.length)
+    throw Error(`unknown workload(s) ${unknown.join(", ")}; known: ${Object.keys(registry).join(", ")}`);
+  const [shas, revParse] = [[] as string[], ["git", "rev-parse", "--verify", "--end-of-options"]];
+  const bad = (ref: string) => () =>
+    Promise.reject(Error(`ref ${JSON.stringify(ref)} does not name a commit`));
+  for (const ref of refs) shas.push(await bench.command([...revParse, `${ref}^{commit}`]).catch(bad(ref)));
   const results = await bench.runRevisions(shas, names, (job) => invoke(job, import.meta.path, environment));
   validateReports(results);
   return {
@@ -136,11 +148,15 @@ export async function compare(refs: string[], names: string[], invoke = bench.la
 }
 if (import.meta.main) {
   const args = process.argv.slice(2);
-  if (args[0] === "--worker") console.log(JSON.stringify(await worker(args[1] ?? "", args[2] ?? "")));
-  else
-    console.log(
-      JSON.stringify(
-        await compare(args.slice(0, 2), args.length > 2 ? args.slice(2) : Object.keys(registry)),
-      ),
-    );
+  try {
+    const result =
+      args[0] === "--worker"
+        ? await worker(args[1] ?? "", args[2] ?? "")
+        : await compare(args.slice(0, 2), args.length > 2 ? args.slice(2) : Object.keys(registry));
+    console.log(JSON.stringify(result));
+  } catch (error) {
+    const where = args[0] === "--worker" ? `worker ${args[2]}` : "benchmark-gate-output";
+    console.error(`${where}: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
 }
