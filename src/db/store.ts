@@ -549,6 +549,7 @@ export class Store {
   }
   readonly db: Database;
   private listeners = new Set<Listener>();
+  // Subscribers and the async work they create belong to the Store's construction context.
   private readonly listenerContext = AsyncLocalStorage.snapshot();
   private pendingPublications: StreamMessage[] | null = null;
   private feedPublished = 0;

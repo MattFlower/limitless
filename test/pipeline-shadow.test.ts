@@ -17,6 +17,7 @@ import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
 import { invokeGuard, RunContext, type RunState } from "../src/pipeline/context.ts";
+import { executeRun } from "../src/pipeline/engine.ts";
 import { shadowReview, shadowSettle } from "../src/pipeline/review-shadow.ts";
 import type { ModelDef, ProviderDef } from "../src/router/catalog.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
@@ -231,6 +232,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
         await sh(["git", "config", "core.fsmonitor", helper], { cwd: spec.cwd });
       return respond(spec);
     });
+    await f.stop();
     let prunes = 0;
     await gitConfinement.run(
       {
@@ -250,7 +252,7 @@ describe("review shadow panel: single reviews decide, the panel only records", (
           profile: "quick",
           models: { implement: ["alpha/m"], review: ["alpha/m"] },
         });
-        expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+        expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
         expect(prunes).toBeGreaterThan(0);
         expect(existsSync(marker)).toBe(false);
         expect(calls.primary.map((s) => s.target.modelId)).toEqual(["alpha/m", "alpha/m"]);

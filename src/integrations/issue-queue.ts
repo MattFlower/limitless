@@ -312,6 +312,7 @@ export function startIssueQueue(
     lifecycle?: IssueLifecycleOptions;
   } = {},
 ): (() => void) & { pollNow: () => void } {
+  // pollNow callers must not lend their run context to the polling loop.
   const context = AsyncLocalStorage.snapshot();
   const q = factory.cfg.githubQueue;
   if (!q?.repos.length || !q.trusted.length) return Object.assign(() => {}, { pollNow: () => {} });

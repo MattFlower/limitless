@@ -356,6 +356,7 @@ export interface PollerOptions {
 
 /** Observes factory PRs with one serial GraphQL query per repository and writes changes to the feed. */
 export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () => void {
+  // Wakeups can come from run scopes even without Store dispatch.
   const context = AsyncLocalStorage.snapshot();
   const { log = console.warn } = opts;
   const client = guardGitHubClient(opts.client ?? ghClient);
