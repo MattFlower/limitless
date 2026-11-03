@@ -825,6 +825,51 @@ test.each([false, true])(
   },
 );
 
+test("a dismissal during the final merge claim read parks the approval instead of merging", async () => {
+  const { entry, head, fake, claims } = await claimLandFixture();
+  store.updateLandEntry(entry.id, { pushedSha: head });
+  reviewObservation(head);
+  github.responses.set("user", () => respond(200, { login: "factory" }));
+  const ready = deferred<void>();
+  const release = deferred<void>();
+  const read = claims.client.read;
+  claims.client.read = async (...args) => {
+    if (store.getLandEntry(entry.id)?.state === "merging") {
+      ready.resolve();
+      await release.promise;
+    }
+    return read(...args);
+  };
+  const push = spyOn(repos, "pushExistingBranch");
+  try {
+    queue({
+      cfg: sharedLandConfig,
+      claims: claims.client,
+      gateExecutor: fake.executor,
+      requiresApproval: new Set([SLUG]),
+    });
+    await ready.promise;
+    reviewObservation(head, "DISMISSED");
+    release.resolve();
+    await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "waiting_approval", 15_000);
+    expect(store.getLandEntry(entry.id)).toMatchObject({
+      pushedSha: head,
+      reason: "Review state changed during the final approval check",
+    });
+    expect(ghCalls("pr merge")).toHaveLength(0);
+    reviewObservation(head);
+    await settle();
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(fake.requests).toHaveLength(0);
+    expect(push).not.toHaveBeenCalled();
+    expect(ghCalls("pr merge")).toHaveLength(1);
+    expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${head}`);
+  } finally {
+    release.resolve();
+    push.mockRestore();
+  }
+});
+
 test("local land ignores an injected claim reader", async () => {
   const { entry, fake, claims } = await claimLandFixture();
   claims.refs.set(prClaimRef, claimResult("held"));

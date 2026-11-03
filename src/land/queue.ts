@@ -1271,8 +1271,22 @@ export class LandQueue {
         this.parkApproval(entry, signal, evidence.seen);
         throw new LandApprovalStopped();
       }
+      const observations = this.store.githubReviewObservationCount(entry.prUrl);
       await this.claimWait(entry, signal);
       this.assertClaim(entry.id);
+      // A review saved during the claim read supersedes the evidence that qualified above.
+      if (
+        observations !== this.store.githubReviewObservationCount(entry.prUrl) ||
+        !this.qualifies({ ...entry, pushedSha: sha }, evidence)
+      ) {
+        this.parkApproval(
+          entry,
+          signal,
+          evidence.seen,
+          "Review state changed during the final approval check",
+        );
+        throw new LandApprovalStopped();
+      }
     };
     const merging = this.owned(entry.id, () => {
       signal.throwIfAborted();
