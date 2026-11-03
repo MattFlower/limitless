@@ -474,12 +474,7 @@ test("source boundaries restrict claim scopes to execution, observer validation 
   const engine = "src/pipeline/engine.ts";
   const observer = "src/integrations/claim-projection.ts";
   const scoped = new Set([execution, engine, observer]);
-  const allowed = new Set([
-    "src/integrations/claim-ref.ts",
-    "src/integrations/leases.ts",
-    "src/db/store.ts",
-    ...scoped,
-  ]);
+  const allowed = new Set(["src/integrations/claim-ref.ts", "src/integrations/leases.ts", ...scoped]);
   const references: string[] = [];
   const binders: string[] = [];
   for await (const path of new Bun.Glob("src/**/*.ts").scan({
