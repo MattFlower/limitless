@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
+import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -252,6 +253,41 @@ test("agent command failures and malformed versions are conservative; injected s
   await expect(f.monitor.refresh()).rejects.toThrow();
 });
 
+test.each(
+  (["claude", "codex"] as const).flatMap((cli) =>
+    (["version", "auth"] as const).flatMap((phase) =>
+      (["timedOut", "cancelled", "idleTimedOut"] as const).map((status) => [cli, phase, status] as const),
+    ),
+  ),
+)("%s %s command with %s invalidates only that CLI", async (cli, phase, status) => {
+  const f = fixture();
+  f.deps.runner = async (args) => ({
+    ...(await f.runner(args)),
+    [status]: args[0] === cli && args.includes("--version") === (phase === "version"),
+  });
+  const { value } = await f.monitor.refresh();
+  expect(value.agents[cli]).toEqual({ version: null, loggedIn: false });
+  const other = cli === "claude" ? "codex" : "claude";
+  expect(value.agents[other]).toEqual({
+    version: other === "claude" ? "1.2.3" : "4.5.6",
+    loggedIn: true,
+  });
+});
+
+test("successful CLI results with false status flags retain both observations", async () => {
+  const f = fixture();
+  f.deps.runner = async (args) => ({
+    ...(await f.runner(args)),
+    timedOut: false,
+    cancelled: false,
+    idleTimedOut: false,
+  });
+  expect((await f.monitor.refresh()).value.agents).toEqual({
+    claude: { version: "1.2.3", loggedIn: true },
+    codex: { version: "4.5.6", loggedIn: true },
+  });
+});
+
 test("configured read policy works outside a run and stable probe directories survive refresh", async () => {
   const f = fixture();
   expect(readPolicyScope.getStore()).toBeUndefined();
@@ -486,6 +522,129 @@ test("stop aborts an unfinished probe and prevents it from storing a result", as
   f.tick();
   expect(f.deps.codex).not.toHaveBeenCalled();
 });
+
+test.each(["agents", "confinement", "edit", "read", "confinedRead", "power"] as const)(
+  "stop during %s prevents later phases even when the dependency succeeds",
+  async (phase) => {
+    const entered = Promise.withResolvers<AbortSignal>();
+    const gate = Promise.withResolvers<void>();
+    const phases: string[] = [];
+    const pending = async (name: string, signal?: AbortSignal) => {
+      phases.push(name);
+      if (name !== phase) return;
+      if (!signal) throw new Error("missing monitor signal");
+      entered.resolve(signal);
+      await gate.promise;
+    };
+    const f = fixture({
+      confinement: {
+        wrap: (cmd) => cmd,
+        verify: async (_roots, opts) => pending("confinement", opts.signal),
+      },
+      codex: async (spec) => {
+        await pending(
+          spec.mode === "edit" ? "edit" : spec.confineReads ? "confinedRead" : "read",
+          spec.signal,
+        );
+        return { ok: true, path: "/fake/codex" };
+      },
+      machineState: async (_platform, signal) => {
+        await pending("power", signal);
+        return { onAC: true, idleSeconds: 0 };
+      },
+    });
+    f.deps.runner = async (args, opts) => {
+      await pending("agents", opts.signal);
+      return f.runner(args);
+    };
+    const original = fs.mkdtempSync;
+    const creation = spyOn(fs, "mkdtempSync").mockImplementation(original);
+    const stop = f.monitor.start();
+    const rejected = f.monitor.refresh().catch((error: unknown) => error);
+    try {
+      const signal = await entered.promise;
+      const before = [...phases];
+      stop();
+      expect(signal.aborted).toBe(true);
+      gate.resolve();
+      expect(await rejected).toBeInstanceOf(Error);
+      expect(phases.filter((name) => name !== "agents")).toEqual(before.filter((name) => name !== "agents"));
+      expect(f.monitor.current(f.deps.clock.sample())).toBeNull();
+      if (phase === "agents") {
+        const created = creation.mock.calls.map(([prefix]) => prefix);
+        expect(created.some((prefix) => prefix.includes("limitless-member-capabilities-"))).toBe(true);
+        expect(created.some((prefix) => prefix.includes("limitless-worker-preflight-"))).toBe(false);
+      }
+    } finally {
+      stop();
+      gate.resolve();
+      await rejected;
+      creation.mockRestore();
+    }
+  },
+);
+
+test.each(["confinement", "edit", "read", "confinedRead", "power"] as const)(
+  "stop between %s completion and continuation prevents starting work with an aborted signal",
+  async (phase) => {
+    const f = fixture();
+    // Exercise microtask boundaries as a successful dependency unwinds into the next phase.
+    for (let delay = 0; delay < 16; delay++) {
+      const entered = Promise.withResolvers<void>();
+      const gate = Promise.withResolvers<void>();
+      const abortedStarts: string[] = [];
+      const probe = async (name: string, signal?: AbortSignal) => {
+        if (signal?.aborted) abortedStarts.push(name);
+        if (name === phase) {
+          entered.resolve();
+          await gate.promise;
+        }
+      };
+      f.deps.confinement = {
+        wrap: (cmd) => cmd,
+        verify: async (_roots, opts) => probe("confinement", opts.signal),
+      };
+      f.deps.codex = async (spec) => {
+        await probe(spec.mode === "edit" ? "edit" : spec.confineReads ? "confinedRead" : "read", spec.signal);
+        return { ok: true, path: "/fake/codex" };
+      };
+      f.deps.machineState = async (_platform, signal) => {
+        await probe("power", signal);
+        return { onAC: true, idleSeconds: 0 };
+      };
+      const monitor = createCapabilityMonitor(f.deps);
+      monitors.push(monitor);
+      const stop = monitor.start();
+      const result = monitor.refresh().catch((error: unknown) => error);
+      try {
+        await entered.promise;
+        const stopped = Promise.withResolvers<boolean>();
+        const scheduleStop = (remaining: number) =>
+          queueMicrotask(() => {
+            if (remaining > 0) scheduleStop(remaining - 1);
+            else {
+              const published = monitor.current(f.deps.clock.sample()) !== null;
+              stop();
+              stopped.resolve(published);
+            }
+          });
+        gate.resolve();
+        scheduleStop(delay);
+        const published = await stopped.promise;
+        const outcome = await result;
+        expect(abortedStarts).toEqual([]);
+        if (!published) {
+          expect(outcome).toBeInstanceOf(Error);
+          expect(monitor.current(f.deps.clock.sample())).toBeNull();
+        }
+      } finally {
+        stop();
+        gate.resolve();
+        await result;
+      }
+    }
+  },
+);
 
 test("stop cancels both default macOS power commands with the monitor signal", async () => {
   const entered = Promise.withResolvers<void>();

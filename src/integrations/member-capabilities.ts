@@ -65,20 +65,24 @@ export interface CapabilityMonitor {
 }
 export async function probeCapabilities(deps: ProbeDeps, signal: AbortSignal): Promise<Capabilities> {
   const { cfg, cwd, scratch, platform = process.platform, machineState: power = machineState } = deps;
-  const safe = async <T>(probe: () => Promise<T>, fallback: T): Promise<T> => {
-    try {
-      return await probe();
-    } catch {
-      signal.throwIfAborted();
-      return fallback;
-    }
-  };
+  // Catch synchronous failures too; callers check cancellation immediately after awaiting.
+  const safe = <T>(probe: () => Promise<T>, fallback: T): Promise<T> =>
+    (async () => probe())().catch(() => fallback);
   signal.throwIfAborted();
-  const agents = Agents.parse(await probeAgents(deps.runner ?? sh, signal, cfg.secrets));
-  for (const agent of Object.values(agents))
-    agent.version = agent.version?.match(/\d+\.\d+\.\d+/)?.[0] ?? null;
+  const failed = new Set<string>();
+  const run: CapabilityRunner = async (args, options) => {
+    const result: Awaited<ReturnType<CapabilityRunner>> = await (deps.runner ?? sh)(args, options);
+    if (!(result.timedOut || result.cancelled || result.idleTimedOut)) return result;
+    failed.add(args[0] ?? "");
+    return { exitCode: null, stdout: "" };
+  };
+  const agents = Agents.parse(await probeAgents(run, signal, cfg.secrets));
+  signal.throwIfAborted();
+  for (const [name, agent] of Object.entries(agents))
+    agent.version = failed.has(name) ? null : (agent.version?.match(/\d+\.\d+\.\d+/)?.[0] ?? null);
   const confinement = deps.confinement ?? platformConfinement(cfg.port, platform);
   const verified = await safe(() => preflight(cfg, confinement, signal).then(() => true), false);
+  signal.throwIfAborted();
   const identity = { modelId: "", provider: "codex", model: "", vendor: "openai" };
   const codex: Capabilities["confinement"]["codex"] = { edit: false, read: false, confinedRead: false };
   for (const key of ["edit", "read", "confinedRead"] as const) {
@@ -100,6 +104,7 @@ export async function probeCapabilities(deps: ProbeDeps, signal: AbortSignal): P
       const verdict = await (deps.codex ?? ((spec) => codexReaderProbe.verify(spec, runProcess)))(spec);
       return verdict.ok && verdict.path !== null;
     }, false);
+    signal.throwIfAborted();
   }
   const state = platform === "darwin" ? await safe(() => power(platform, signal), null) : null;
   signal.throwIfAborted();
