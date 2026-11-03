@@ -1,9 +1,9 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { linkSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { privateStringsDigest } from "../gates/private.ts";
-import type { privacyRegistry } from "./privacy-boundary.ts";
+import { checkPrepared, preparePrivacyPolicy, type privacyRegistry } from "./privacy-boundary.ts";
 import type { createPrivacyChecker } from "./privacy-checker.ts";
 import { consumeBoundaryChunk } from "./privacy-chunks.ts";
 import { redactCredentials, registerCredential } from "./proc.ts";
@@ -17,39 +17,54 @@ type Checker = ReturnType<typeof createPrivacyChecker>;
 type KeyState = { loaded?: boolean; key?: Buffer };
 const defaults = {
   state: {} as KeyState,
-  lstat: lstatSync,
-  readFile: (path: string) => readFileSync(path),
-  link: linkSync,
+  lstat: fs.lstatSync,
+  open: (path: string, flags: number) => fs.openSync(path, flags),
+  fstat: (fd: number) => fs.fstatSync(fd),
+  read: (fd: number, key: Buffer) => fs.readSync(fd, key, 0, 32, 0),
+  close: fs.closeSync,
+  link: fs.linkSync,
   log: console.error,
 };
 const provider = () => defaults.state.key;
+const representations = (key: Buffer) => [
+  key.toString("hex"),
+  key.toString("base64"),
+  key.toString("base64").replace(/=+$/, ""),
+  key.toString("base64url"),
+];
 /** Main-thread only. A failed first load also remains failed until restart. */
 export function provisionProofKey(configDir: string, deps: Partial<typeof defaults> = {}) {
-  const { lstat: inspect, readFile, link, log } = { ...defaults, ...deps };
+  const { lstat: inspect, open, fstat, read, close, link, log } = { ...defaults, ...deps };
   const holder = deps.state ?? defaults.state;
   if (holder.loaded) return;
   holder.loaded = true;
   const path = join(configDir, "privacy-proof.key"),
     temp = `${path}.${randomUUID()}`;
   try {
-    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
     // Create without replacement: a racing loser links nothing and validates the winner's key.
     if (!inspect(path, { throwIfNoEntry: false }))
       try {
-        writeFileSync(temp, randomBytes(32), { flag: "wx", mode: 0o600 });
+        fs.writeFileSync(temp, randomBytes(32), { flag: "wx", mode: 0o600 });
         link(temp, path);
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
       } finally {
-        unlinkSync(temp);
+        fs.unlinkSync(temp);
       }
-    const stat = inspect(path);
-    if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0 || stat.size !== 32)
-      throw new Error("Invalid key");
-    const key = readFile(path);
-    if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error("Invalid key");
-    holder.key = key;
-    registerCredential("PRIVACY_PROOF_KEY", key.toString("hex"), true);
+    // Let descriptor validation reject FIFOs without waiting for a writer.
+    const fd = open(path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try {
+      const stat = fstat(fd);
+      if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0 || stat.size !== 32)
+        throw new Error("Invalid key");
+      const key = Buffer.alloc(32);
+      if (read(fd, key) !== 32) throw new Error("Invalid key");
+      for (const value of representations(key)) registerCredential("PRIVACY_PROOF_KEY", value, true);
+      holder.key = key;
+    } finally {
+      close(fd);
+    }
   } catch {
     holder.key = undefined;
     log(redactCredentials("Privacy proof key unavailable; gate proofs will not verify."));
@@ -85,9 +100,17 @@ export async function checkAndSign(
     if (part.done) break;
     parts.push(part.bytes);
   }
-  const bytes = Buffer.concat(parts),
+  const rendering = Buffer.concat(parts),
+    bytes = !rendering.length && cut?.limit === 0 ? text : rendering,
     binding = [kind, registry.semantics, privateStringsDigest(registry.entries), field];
-  return { kind, mac: mac(key, binding, !bytes.length && cut?.limit === 0 ? text : bytes).toString("hex") };
+  const policy = preparePrivacyPolicy({
+    ready: true,
+    entries: [],
+    credentials: representations(key),
+    generation: registry.generation,
+  });
+  if (!("clean" in checkPrepared(policy, bytes.toString()))) return;
+  return { kind, mac: mac(key, binding, bytes).toString("hex") };
 }
 export function verifier(registry: typeof privacyRegistry, signer = provider) {
   let policy: [string, string] | undefined;
