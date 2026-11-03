@@ -691,10 +691,8 @@ export class RunContext {
     // Keep a round together when draining, even if no check checkpoint exists yet.
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
-    if (this.execution.shared) {
-      await this.requireCapability(this.state.phase);
-      this.checkCancelled();
-    }
+    if (this.execution.shared)
+      await this.requireCapability(this.state.phase).then(() => this.checkCancelled());
     if (!background)
       this.run = this.checkpointer.writeRun(this.run.id, {
         stage: this.parallelChecks && name === "verify" ? "review" : name,
