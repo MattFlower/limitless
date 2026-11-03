@@ -2190,6 +2190,44 @@ test("streamed and final crafted output is validated and redacted at the coordin
   expect(workers.job(id)?.result).toContain("withheld");
 }, 30_000);
 
+test("worker privacy records are stored as MAC-free attestations with fixed attribution", async () => {
+  await listen();
+  const req = await request(),
+    token = await paired();
+  await call("/worker/heartbeat", caps(), token);
+  const id = workers.enqueue(req);
+  await call("/worker/lease", {}, token);
+  const run = await confinementScope.run(fakeConfinement, () =>
+    runLocalGates(req.cwd, req.gates, new AbortController().signal),
+  );
+  const check = run.checks[0];
+  if (!check) throw new Error("Missing check");
+  const claim = { withheld: false, checkedComplete: true, kind: "complete" as const, mac: "f".repeat(64) };
+  Object.assign(check, {
+    textPrivacy: { output: claim, identities: claim },
+    failureAttributionReason: "Ambiguous testcase; secret-token",
+    firstAttempt: { ...check, textPrivacy: { output: claim }, failureAttributionReason: "leak" },
+  });
+  expect(
+    (await call(`/worker/jobs/${id}/events`, { type: "check", phase: "check", result: check }, token)).status,
+  ).toBe(200);
+  expect((await call(`/worker/jobs/${id}/result`, { sha: req.headSha, run }, token)).status).toBe(200);
+  const job = workers.job(id);
+  for (const text of [job?.events, job?.result]) {
+    expect(text).not.toContain("f".repeat(64));
+    expect(text).not.toContain("textPrivacy");
+    expect(text).not.toContain("secret-token");
+    expect(text).not.toContain('"leak"');
+  }
+  const stored = JSON.parse(job?.result ?? "{}").checks[0];
+  const { mac: _mac, ...attested } = claim;
+  expect(stored.remoteAttestation).toEqual({ output: attested, identities: attested });
+  expect(stored.failureAttributionReason).toBe("unrecognized attribution reason");
+  expect(stored.firstAttempt.remoteAttestation).toEqual({ output: attested });
+  expect(stored.firstAttempt.failureAttributionReason).toBe("unrecognized attribution reason");
+  expect(job?.events).toContain("remoteAttestation");
+}, 30_000);
+
 test("cancellation is durable and is returned by both lease and heartbeat replies", async () => {
   await listen();
   const req = await request(),

@@ -3,7 +3,9 @@ import { z } from "zod";
 import { launchFailure } from "../gates/output.ts";
 import type { GateResult } from "../gates/run.ts";
 import { MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../gates/test-coverage.ts";
+import { textPrivacySchema } from "../gates/text-privacy.ts";
 import { CLAUDE_VERSION, CODEX_VERSION } from "../harness/versions.ts";
+import { transferDictionary } from "../pipeline/run-transfer-gates.ts";
 
 export function pairingCode(coordinator: string, worker: string, nonce: string): string {
   const digest = createHash("sha256")
@@ -94,15 +96,17 @@ export const Check: z.ZodType<GateResult> = z.lazy(() =>
       exitCode: z.number().int().nullable(),
       durationMs: z.number().finite().nonnegative(),
       output: z.string(),
+      textPrivacy: textPrivacySchema.optional(),
       failures: z.string().optional(),
       timedOut: z.boolean().optional(),
       confinementError: z.boolean().optional(),
       firstAttempt: Check.optional(),
       targetedRetry: Check.optional(),
+      retryAttempt: Check.optional(),
       failedFiles: z.array(z.string()).optional(),
       failureAttributionComplete: z.boolean().optional(),
       failureAttributionReason: z.string().optional(),
-      failedFileTimes: z.record(z.string(), z.number().finite().nonnegative()).optional(),
+      failedFileTimes: transferDictionary(z.number().finite().nonnegative()).optional(),
       testCoverage: z
         .object({
           passedFiles: z.array(z.string()),

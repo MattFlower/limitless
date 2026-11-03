@@ -1669,7 +1669,9 @@ test.each(ineligibleRetries)("an ineligible land failure blocks without retry: $
   if (row.label === "incomplete evidence") {
     const diagnostics =
       readFileSync(blocked?.logPath ?? "", "utf8") + JSON.stringify(store.listEvents(pr.run.id));
-    expect(diagnostics).toContain("1 unattributed error: [redacted]");
+    // An attribution reason outside the fixed grammar is replaced, never interpolated.
+    expect(diagnostics).toContain("failure attribution incomplete: unrecognized attribution reason");
+    expect(diagnostics).not.toContain("1 unattributed error:");
     expect(diagnostics).not.toContain(credential);
     expect(diagnostics).not.toContain("\\u001b");
   }

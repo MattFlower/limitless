@@ -223,6 +223,7 @@ export interface RunState {
   /** package.json scripts the gates depend on, as they were on the base branch. */
   baselineScripts?: Record<string, string>;
   feedback: string | null;
+  feedbackProof?: import("../util/privacy-proof.ts").PrivacyProof;
   lastGates?: GateComparison[];
   gateEvidence?: GateEvidence;
   coveringTestRuns?: CoveringTestRun[];

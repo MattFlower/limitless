@@ -2613,3 +2613,17 @@ test.skip.each(["%s"])("skipped %s", () => {});
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test.each(["textPrivacy", "remoteAttestation"] as const)(
+  "withheld %s output is not clean gate evidence",
+  (field) => {
+    const evidence = gates(),
+      check = evidence.checks[0];
+    if (!check) throw new Error("Missing test check");
+    expect(resolve(blocked, evidence).criteria[0]?.status).toBe("met");
+    check.result[field] = { output: { withheld: true, reason: "private-match" } };
+    const value = resolve(blocked, evidence).criteria[0];
+    expect(value?.status).toBe("blocked");
+    expect(value?.evidence).toContain("did not all pass cleanly");
+  },
+);
