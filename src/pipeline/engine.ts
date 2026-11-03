@@ -217,7 +217,19 @@ const ROUNDS_PER_IMPLEMENTER = 2;
 class ReaderSetupError extends NeedsHumanError {}
 
 /** Execute (or resume) one run to completion. Never throws. */
-export async function executeRun(
+export async function executeRun(...args: Parameters<typeof executeRunOnce>): Promise<RunStatus> {
+  const [{ store, cfg, capability }, runId] = args;
+  const run = store.getRun(runId);
+  // Admission memoizes shared runs, so every exit forgets them; local runs never touch the gate.
+  const shared = run && sharedRepository(cfg, store.getRepo(run.repoId) ?? { kind: "github" }, run.repoSlug);
+  try {
+    return await executeRunOnce(...args);
+  } finally {
+    if (shared) capability?.forget(runId);
+  }
+}
+
+async function executeRunOnce(
   deps: EngineDeps,
   runId: string,
   signal: AbortSignal,
@@ -271,9 +283,7 @@ export async function executeRun(
           ),
         ),
     );
-  // Only a bound claim can consult the gate; forget its memo however that execution ends.
-  const claimed = () => scoped().finally(() => deps.capability?.forget(runId));
-  const status = await (claim ? claimScope.run([claim.binding], claimed) : scoped()).catch(
+  const status = await (claim ? claimScope.run([claim.binding], scoped) : scoped()).catch(
     (error: unknown) => {
       // Guards can also interrupt a write in failure handling itself.
       const control = selectClaimControl([error]);

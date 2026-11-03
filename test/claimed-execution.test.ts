@@ -820,6 +820,24 @@ test.each(["resume", "prepare", "missing", "throw"])("capability refuses %s befo
   expect(JSON.stringify(f.store.listEvents(run.id))).not.toContain("private probe detail");
 });
 
+// Mutation: forget only after a claim binds, leaking admission memos on early exits.
+test.each(["cancelled", "unbound", "invalid"])("shared %s exit forgets the capability memo", async (exit) => {
+  const { f, run, claim } = await fixture();
+  if (exit === "cancelled")
+    f.store.updateRun(run.id, { status: "cancelled", error: "cancelled by user", finishedAt: 1 });
+  if (exit === "invalid")
+    claim.binding = bindClaim(
+      { windowOpen: () => true },
+      { ...claim.binding.handle, run: "other" },
+      () => false,
+    );
+  const gate = passingGate();
+  const runClaim = exit === "unbound" ? undefined : claim;
+  const status = await executeRun({ ...f.deps, runClaim, capability: gate }, run.id, signal());
+  expect(status).toBe(exit === "cancelled" ? "cancelled" : "queued");
+  expect(gate.forget.mock.calls).toEqual([[run.id]]);
+});
+
 test("restarted capability wait checks before renewing a closed window", async () => {
   const { f, run, claim } = await fixture(true);
   const gate = passingGate();
