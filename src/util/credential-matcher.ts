@@ -300,6 +300,7 @@ export function createCredentialRegistry(onAdd?: (value: string) => void) {
     },
     has: (value: string) => values.has(value),
     values: () => [...values],
+    addMainThreadOnly: (value: string) => onAdd?.(value),
     add: (value: string) => {
       if (value && !values.has(value)) {
         values.add(value);

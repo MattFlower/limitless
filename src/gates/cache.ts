@@ -99,7 +99,7 @@ const SECRET_NAME = /TOKEN|SECRET|PASS|AUTH|CRED|KEY|PRIVATE|SESSION|COOKIE/i;
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
-function stable(value: unknown): unknown {
+export function stable(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === "object")
     return Object.fromEntries(

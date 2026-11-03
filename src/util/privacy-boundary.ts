@@ -10,6 +10,7 @@ import {
   credentialRegistry,
   credentialVariants,
 } from "./credential-matcher.ts";
+import { PRIVACY_CHECKER_SEMANTICS } from "./privacy-semantics.ts";
 import { terminalRedactor } from "./terminal-redaction.ts";
 export const privacyRefusals = [
   "entries-count",
@@ -43,7 +44,7 @@ export const privacyLimits = {
 };
 export function createPrivacyRegistry(
   secrets = createCredentialRegistry(),
-  checker = () => "privacy/1",
+  checker = () => PRIVACY_CHECKER_SEMANTICS,
   requirePolicy = false,
 ) {
   let entries: PrivateStrings = [];
@@ -60,6 +61,9 @@ export function createPrivacyRegistry(
     return Object.freeze({ identity, policy, credentials: secrets.generation, checker: semantics });
   };
   return {
+    get semantics() {
+      return checker();
+    },
     get ready() {
       return ready;
     },

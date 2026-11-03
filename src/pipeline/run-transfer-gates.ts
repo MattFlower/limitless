@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { GateComparison, GateResult, GateRun } from "../gates/run.ts";
+import { textPrivacySchema } from "../gates/text-privacy.ts";
 import * as r from "./run-transfer-rows.ts";
 
 const object = z.strictObject;
@@ -55,6 +56,8 @@ export const transferGateResultSchema: z.ZodType<GateResult> = z.lazy(() =>
     exitCode: z.number().int().nullable(),
     durationMs: duration,
     output: text,
+    textPrivacy: textPrivacySchema.optional(),
+    remoteAttestation: textPrivacySchema.optional(),
     failures: text.optional(),
     timedOut: flag,
     confinementError: flag,

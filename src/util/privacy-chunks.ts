@@ -56,6 +56,7 @@ export function issuePrivacyWorkerChunks(
 export function consumeBoundaryChunk(
   receipt: unknown,
   index: number,
+  registry?: typeof privacyRegistry,
 ): Metadata & { bytes: Uint8Array; done: boolean } {
   const state =
     typeof receipt === "object" && receipt !== null ? receipts.get(receipt as BoundaryChunks) : undefined;
@@ -66,7 +67,8 @@ export function consumeBoundaryChunk(
     policyDigest: "privacy/unavailable",
     reason: "forged",
   };
-  if (!state) return { ...forged, bytes: marker.slice(), done: true };
+  if (!state || (registry && state.registry !== registry))
+    return { ...forged, bytes: marker.slice(), done: true };
   if (!state.registry.ready || !current(state)) {
     if (state.parts) state.parts.length = 0;
     state.parts = undefined;

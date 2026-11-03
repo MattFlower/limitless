@@ -28,8 +28,11 @@ import {
 } from "./output.ts";
 import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
+import type { TextPrivacy } from "./text-privacy.ts";
 
 export interface GateResult {
+  textPrivacy?: TextPrivacy;
+  remoteAttestation?: TextPrivacy;
   /** Factory-authored execution identity; absent on legacy and local results. */
   executor?: { kind: "github-actions"; workflowSha: string; runsOn: string };
   /** Infrastructure stopped this command before a complete execution could be observed. */

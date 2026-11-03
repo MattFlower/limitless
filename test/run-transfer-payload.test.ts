@@ -174,6 +174,7 @@ function complete() {
       sha: oid(67),
       outcome: { sha: oid(68), units: [], summary: "recorded", passed: true },
     },
+    feedbackProof: { kind: "complete", mac: "a".repeat(64) },
     worktreePath: "/local/checkout",
     worktreeAliases: ["/local/alias"],
     baseline: null,
@@ -372,7 +373,7 @@ test("complete payload preserves shape, semantic ordering and pending effects", 
   expect(payload.questions.map((v) => v.ordinal)).toEqual([1, 2]);
   expect(payload.jobs.map((v) => v.id)).toEqual(["a-queued", "z-done"]);
   expect(payload.jobs[0]?.result).toBeNull();
-  for (const key of ["worktreePath", "worktreeAliases", "baseline", "baselineCached"])
+  for (const key of ["worktreePath", "worktreeAliases", "baseline", "baselineCached", "feedbackProof"])
     expect(payload.state).not.toHaveProperty(key);
 });
 
@@ -561,7 +562,7 @@ test.each(["run", "followUp.owner"])("decoding refuses ordinary dependencies on 
   set(payload, `${path}.dependsOn`, ["owner01"]);
   rejects(() => decodeRunPayload(payload, repo, manifest), "unsupported");
 });
-test.each(["worktreePath", "worktreeAliases", "baseline", "baselineCached", "unclassified"])(
+test.each(["worktreePath", "worktreeAliases", "baseline", "baselineCached", "feedbackProof", "unclassified"])(
   "portable state refuses %s",
   (key) => {
     const { payload, manifest } = encoded();

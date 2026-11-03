@@ -483,6 +483,7 @@ export function createPrivacyChecker(options: Options = {}) {
     return result.promise;
   }
   return {
+    registry,
     protectText: (input: TextInput, control: Control = {}) => submit("text", input, control),
     protectData: (input: DataInput, control: Control = {}) => submit("data", input, control),
     async dispose() {

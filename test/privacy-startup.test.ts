@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
@@ -71,5 +71,6 @@ test.each(["daemon", "worker", "eval"])("%s provisions privacy before exposing w
     expect(calls).toEqual(kind === "eval" ? expected : [...expected, "disposed"]);
     store.close();
   }
+  expect(existsSync(join(cfg.paths.configDir, "privacy-proof.key"))).toBe(kind === "daemon");
   rmSync(dir, { recursive: true, force: true });
 });

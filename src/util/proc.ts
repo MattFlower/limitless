@@ -1265,10 +1265,11 @@ export async function sh(
 const credentialNames = new Set<string>();
 export const registeredCredentials = (): readonly string[] => credentialRegistry.values();
 export const credentialRedactionPadding = (): number => Math.max(0, credentialMatcher().maxLength - 1);
-export function registerCredential(name: string, value?: string): void {
+export function registerCredential(name: string, value?: string, mainThreadOnly = false): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
-    if (typeof secret === "string") credentialRegistry.add(secret);
+    if (typeof secret === "string")
+      (mainThreadOnly ? credentialRegistry.addMainThreadOnly : credentialRegistry.add)(secret);
 }
 export function redactCredentials(text: string): string;
 export function redactCredentials(text: string, window?: { start: number; end: number }): string;

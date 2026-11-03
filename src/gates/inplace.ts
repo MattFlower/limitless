@@ -5,6 +5,7 @@ import { canonicalGateCwd, WorkerStore } from "../db/workers.ts";
 import { readPolicyScope } from "../harness/read-policy.ts";
 import { confinementScope, platformConfinement, withCommandScratch } from "../harness/sandbox.ts";
 import { processPrivacy } from "../util/privacy-policy.ts";
+import { provisionProofKey } from "../util/privacy-proof.ts";
 import { processBirthSync, processCleanupStore, redactCredentials } from "../util/proc.ts";
 import { executeGate, type GateRequest } from "./executor.ts";
 import { attachSlotPools } from "./slots.ts";
@@ -19,6 +20,7 @@ export async function runInplaceExecutor(
   let store: Store | undefined;
   try {
     privacy.provision(cfg.paths.configDir, [cfg.paths.repos, cfg.paths.work]);
+    provisionProofKey(cfg.paths.configDir);
     store = new Store(cfg.paths.db);
     await executeInplace(cfg, releaseSha, signal, store);
   } finally {
