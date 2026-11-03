@@ -112,13 +112,14 @@ function commandRead(args: (string | undefined)[] | undefined, credential = fals
     return true;
   if (args[1] === "auth" && args[2] === "token") return !credential;
   if (args[1] !== "api") return false;
-  const flags = args.slice(3);
+  // gh accepts flags on either side of the endpoint, so inspect every token after `api`.
+  const flags = args.slice(2);
   const dangerous = flags.some(
     (a) => a && /^(?:-X|-f|-F|--method(?:=|$)|--input(?:=|$)|--field(?:=|$)|--raw-field(?:=|$))/.test(a),
   );
   if (!dangerous) return true;
-  if (args[2] !== "graphql") return false;
   const queries: string[] = [];
+  const endpoints: string[] = [];
   // Only field flag values supply the operation; templates and other output
   // options do not. Duplicate query fields remain ambiguous, including compact flags.
   for (let i = 0; i < flags.length; i++) {
@@ -134,6 +135,8 @@ function commandRead(args: (string | undefined)[] | undefined, credential = fals
       if (!["GET", "POST"].includes(method[1] || flags[++i] || "")) return false;
     } else if (["--template", "-t", "--jq", "-q", "--header", "-H", "--hostname", "--cache"].includes(flag)) {
       if (++i >= flags.length) return false;
+    } else if (!flag.startsWith("-")) {
+      endpoints.push(flag);
     } else if (
       !/^(?:--(?:template|jq|header|hostname|cache)=|-[tqH].)/.test(flag) &&
       !["--paginate", "--slurp", "--silent", "--include", "-i", "--verbose"].includes(flag)
@@ -142,7 +145,11 @@ function commandRead(args: (string | undefined)[] | undefined, credential = fals
     }
   }
   return (
-    queries.length === 1 && /^\s*query\b/.test(queries[0] ?? "") && !/\bmutation\b/.test(queries[0] ?? "")
+    endpoints.length === 1 &&
+    endpoints[0] === "graphql" &&
+    queries.length === 1 &&
+    /^\s*query\b/.test(queries[0] ?? "") &&
+    !/\bmutation\b/.test(queries[0] ?? "")
   );
 }
 async function include(
@@ -725,6 +732,12 @@ test("read classification keeps uncertain dispatch and excludes only proven read
     ["field", `runGh(['api', 'user', '-f', 'x=y'])`, "runGh"],
     ["typedField", `runGh(['api', 'user', '-F', 'x=1'])`, "runGh"],
     ["input", `runGh(['api', 'user', '--input', '-'])`, "runGh"],
+    ["flagsBeforeEndpoint", `runGh(['api', '-XPOST', 'repos/example/repo/issues'])`, "runGh"],
+    ["methodBeforeEndpoint", `runGh(['api', '--method', 'POST', 'repos/example/repo/issues'])`, "runGh"],
+    ["fieldBeforeEndpoint", `runGh(['api', '-f', 'title=x', 'repos/example/repo/issues'])`, "runGh"],
+    ["queryBeforeEndpoint", `runGh(['api', '-f', 'query=query { viewer { login } }', 'graphql'])`, null],
+    ["mutationBeforeEndpoint", `runGh(['api', '-fquery=mutation { update { id } }', 'graphql'])`, "runGh"],
+    ["queryNonGraphql", `runGh(['api', '-f', 'query=query { x }', 'repos/example/repo/issues'])`, "runGh"],
     ["argsSpread", `runGh(['pr', 'view', ...cmd])`, "runGh"],
     ["gitFetch", `sh(['git', 'fetch', 'origin'])`, null],
     ["gitRemote", `sh(['git', 'ls-remote', 'origin'])`, null],
