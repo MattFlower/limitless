@@ -280,8 +280,10 @@ export function createPrivacyChecker(options: Options = {}) {
     input = { ...input, cut: input.cut && { ...input.cut }, provenance: { ...input.provenance } };
     const result = Promise.withResolvers<c.BoundaryChunks>();
     let stopWaiting: (() => void) | undefined;
+    let terminal = false;
     const end = (reason: Reason) => {
-      if (stopWaiting && !waiting.has(tryAdmit)) return;
+      if (terminal) return;
+      terminal = true;
       stopWaiting?.();
       try {
         generation = b.currentPrivacyGeneration(registry);
@@ -291,29 +293,53 @@ export function createPrivacyChecker(options: Options = {}) {
       result.resolve(issue(failure(reason, generation, input.provenance), generation));
       drain();
     };
+    const eligible = () => {
+      if (terminal || (stopWaiting && !waiting.has(tryAdmit))) return false;
+      if (disposed) end("checker-failed");
+      else if (signal?.aborted) end("checker-cancelled");
+      else if (deadline !== undefined && now() >= deadline) end("checker-timeout");
+      return !terminal;
+    };
+    const size = (snapshot?: Snapshot) =>
+      [
+        payload,
+        String(input.cut?.marker ?? ""),
+        ...(snapshot?.entries.map((e) => e.value) ?? []),
+        ...(snapshot?.credentials ?? []),
+      ].reduce((total, text) => total + 4 + Buffer.byteLength(text), 0);
+    const fits = (size: number) =>
+      pending.size < (options.maxRequests ?? 8) && size + window <= (options.byteLimit ?? 64 << 20) - bytes;
     const tryAdmit = () => {
-      if (deadline !== undefined && now() >= deadline) return end("checker-timeout") ?? true;
+      if (!eligible()) return true;
       if (pending.size >= (options.maxRequests ?? 8)) return false;
-      let snapshot: Snapshot;
       try {
         if (!immediate) registry.refreshPolicy();
-        snapshot = immediate ?? b.capturePrivacySnapshot(registry);
-        generation = snapshot.generation;
+        if (!eligible()) return true;
+        const required = size(immediate) + (immediate ? 0 : registry.wireBytes);
+        if (!eligible()) return true;
+        if (!fits(required)) return false;
+        const snapshot = immediate ?? b.capturePrivacySnapshot(registry);
+        if (!eligible()) return true;
+        const authority = snapshot.generation;
+        const valid = current(authority);
+        if (!eligible()) return true;
         if (!snapshot.ready) return end("unreadable-policy") ?? true;
-        if (!current(generation)) return end("stale-generation") ?? true;
+        if (!valid) return end("stale-generation") ?? true;
+        const capturedSize = size(snapshot);
+        if (!eligible()) return true;
+        if (!fits(capturedSize)) return false;
+        const request = envelope(operation, input, snapshot, limits, window);
+        if (!eligible()) return true;
+        const admittedAt = now();
+        if (!eligible()) return true;
+        if (!fits(request.stream.size)) return false;
+        stopWaiting?.();
+        terminal = true;
+        admit(input, control, request, authority, result, admittedAt);
+        return true;
       } catch {
         return end("unreadable-policy") ?? true;
       }
-      const size = [
-        payload,
-        String(input.cut?.marker ?? ""),
-        ...snapshot.entries.map((e) => e.value),
-        ...snapshot.credentials,
-      ].reduce((total, text) => total + 4 + Buffer.byteLength(text), 0);
-      if (size + window > (options.byteLimit ?? 64 << 20) - bytes) return false;
-      stopWaiting?.();
-      admit(input, control, envelope(operation, input, snapshot, limits, window), generation, result);
-      return true;
     };
     if (!waiting.size && tryAdmit()) return result.promise;
     if (deadline !== undefined && now() >= deadline) return refuse("checker-timeout");
@@ -343,11 +369,12 @@ export function createPrivacyChecker(options: Options = {}) {
     request: ReturnType<typeof envelope>,
     generation: Generation,
     result: ReturnType<typeof Promise.withResolvers<c.BoundaryChunks>>,
+    admittedAt: number,
   ) {
     const { signal } = control;
     const size = request.stream.size;
     const authority = generation;
-    const deadline = Math.min(control.deadline ?? Infinity, now() + (options.deadlineMs ?? 30000));
+    const deadline = Math.min(control.deadline ?? Infinity, admittedAt + (options.deadlineMs ?? 30000));
     const id = ++sequence;
     let staged: ArrayBuffer[] | undefined;
     let timeout: Parameters<typeof clearTimeout>[0];

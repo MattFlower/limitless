@@ -70,6 +70,13 @@ export function createPrivacyRegistry(
     get entries() {
       return copy();
     },
+    // Admission sizing without retaining a policy snapshot or encoded payload.
+    get wireBytes() {
+      return [...entries.map(({ value }) => value), ...secrets.values()].reduce(
+        (total, text) => total + 4 + Buffer.byteLength(text),
+        0,
+      );
+    },
     replacePolicy(value: PrivateStrings) {
       if (!requirePolicy || privateStringsDigest(value) !== privateStringsDigest(entries)) policy++;
       entries = value.map((entry) => ({ ...entry }));

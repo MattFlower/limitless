@@ -1786,24 +1786,162 @@ test("waiting captures the policy generation only when admitted", async () => {
   }
 });
 
-test("a byte-blocked FIFO head prevents smaller requests from overtaking", async () => {
-  const f = fixture({ byteLimit: 2 * charge("a") + W });
+test("a byte-blocked FIFO head captures no snapshot and prevents smaller requests from overtaking", async () => {
+  const f = fixture({ byteLimit: 20 });
+  const snapshot = spyOn(f.registry, "snapshot");
   const segments = spyOn(t, "segments");
   try {
     const a = f.send("a");
     const deadline = f.clock.now() + 1000;
     const b = f.protectText(input("large"), { deadline });
     const c = f.protectText(input("c"), { deadline });
+    expect(snapshot).toHaveBeenCalledTimes(1);
     expect(segments).toHaveBeenCalledTimes(1);
     await withheld(f.send("d"), "checker-busy");
     await f.run(4);
     await a;
+    expect(snapshot).toHaveBeenCalledTimes(3); // A, legacy preflight for d, then B at admission.
+    expect(segments).toHaveBeenCalledTimes(2);
     expect(f.port().sent.every((frame) => frame.id === 1)).toBe(true);
     await f.run();
     expect(read(await b).text).toBe("large");
     expect(read(await c).text).toBe("c");
   } finally {
+    snapshot.mockRestore();
     segments.mockRestore();
+    await f.dispose();
+  }
+});
+
+test("waiting sizes current policy, credentials, cut marker, headers and output before snapshot capture", async () => {
+  const f = fixture({ byteLimit: 40 });
+  const snapshot = spyOn(f.registry, "snapshot");
+  const segments = spyOn(t, "segments");
+  try {
+    const a = f.send("a"); // Nine reserved bytes leave 31 available.
+    f.registry.replacePolicy([{ value: "π", entry: 0 }]);
+    f.registry.addCredential("key");
+    const b = f.protectText(
+      { ...input("large"), cut: { unit: "U", limit: 3, marker: "é" } },
+      { deadline: f.clock.now() + 1000 },
+    ); // 13 input + 2 marker + 6 policy + 7 credential + 4 output = 32.
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(segments).toHaveBeenCalledTimes(1);
+    await f.run();
+    await withheld(a, "stale-generation");
+    expect(read(await b)).toMatchObject({ text: "laré", withheld: false, policyDigest: "privacy/1/1/0" });
+    expect(snapshot).toHaveBeenCalledTimes(2);
+    expect(segments.mock.calls[1]?.[0]).toEqual(["large", "é", "π", "key"]);
+    expect(f.clock.pending).toBe(0);
+  } finally {
+    snapshot.mockRestore();
+    segments.mockRestore();
+    await f.dispose();
+  }
+});
+
+test.each(["text", "data"] as const)(
+  "%s admission discards a waiter aborted inside snapshot capture and advances FIFO",
+  async (operation) => {
+    const f = fixture({ maxRequests: 1, maxWaiting: 2, waitByteLimit: 2 });
+    const controller = new AbortController();
+    const add = spyOn(controller.signal, "addEventListener");
+    const remove = spyOn(controller.signal, "removeEventListener");
+    const snapshot = spyOn(f.registry, "snapshot");
+    const capture = snapshot.getMockImplementation();
+    const segments = spyOn(t, "segments");
+    let resolutions = 0;
+    try {
+      const a = f.send("A");
+      const control = { signal: controller.signal, deadline: f.clock.now() + 1000 };
+      const b = (
+        operation === "text"
+          ? f.protectText(input("B"), control)
+          : f.protectData({ json: "0", provenance: input().provenance }, control)
+      ).then((r) => {
+        resolutions++;
+        return r;
+      });
+      const c = f.protectText(input("C"), { deadline: control.deadline });
+      snapshot.mockImplementationOnce(() => {
+        controller.abort();
+        if (!capture) throw new Error("Missing snapshot implementation");
+        return capture();
+      });
+      await f.run();
+      expect(read(await a).text).toBe("A");
+      await withheld(b, "checker-cancelled");
+      expect(read(await c).text).toBe("C");
+      expect(segments.mock.calls.map(([texts]) => texts[0])).toEqual(["A", "C"]);
+      expect([...new Set(f.port().sent.map((frame) => frame.id))]).toEqual([1, 2]);
+      expect(add).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(f.clock.pending).toBe(0);
+      await f.clock.advance(60000);
+      expect(resolutions).toBe(1);
+      expect(f.clock.pending).toBe(0);
+      const reused = f.send("D");
+      await f.run();
+      expect(read(await reused).text).toBe("D");
+    } finally {
+      snapshot.mockRestore();
+      segments.mockRestore();
+      add.mockRestore();
+      remove.mockRestore();
+      await f.dispose();
+    }
+  },
+);
+
+test("disposal inside admission snapshot capture ends all waiters without leaking resources", async () => {
+  const f = fixture({ maxRequests: 1 });
+  const controllers = [new AbortController(), new AbortController()];
+  const listeners = controllers.map(({ signal }) => ({
+    add: spyOn(signal, "addEventListener"),
+    remove: spyOn(signal, "removeEventListener"),
+  }));
+  const snapshot = spyOn(f.registry, "snapshot");
+  const capture = snapshot.getMockImplementation();
+  const segments = spyOn(t, "segments");
+  let disposal: Promise<void> | undefined;
+  let resolutions = 0;
+  try {
+    const a = f.send("A");
+    const waiters = controllers.map(({ signal }, index) =>
+      f.protectText(input(index ? "C" : "B"), { signal, deadline: f.clock.now() + 1000 }).then((r) => {
+        resolutions++;
+        return r;
+      }),
+    );
+    snapshot.mockImplementationOnce(() => {
+      disposal = f.dispose();
+      if (!capture) throw new Error("Missing snapshot implementation");
+      return capture();
+    });
+    await f.run();
+    expect(disposal).toBeDefined();
+    await disposal;
+    await f.run();
+    expect(read(await a).text).toBe("A");
+    for (const waiter of waiters) await withheld(waiter, "checker-failed");
+    expect(segments.mock.calls.map(([texts]) => texts[0])).toEqual(["A"]);
+    expect(f.ports.flatMap((port) => port.sent).every((frame) => frame.id === 1)).toBe(true);
+    for (const { add, remove } of listeners) {
+      expect(add).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+    }
+    expect(f.clock.pending).toBe(0);
+    for (const controller of controllers) controller.abort();
+    await f.clock.advance(60000);
+    expect(resolutions).toBe(2);
+    expect(f.clock.pending).toBe(0);
+  } finally {
+    snapshot.mockRestore();
+    segments.mockRestore();
+    for (const { add, remove } of listeners) {
+      add.mockRestore();
+      remove.mockRestore();
+    }
     await f.dispose();
   }
 });
