@@ -8,7 +8,7 @@ export const CONTROL_REF_RESPONSE_LIMIT = 1_048_576;
 // (45 frame bytes), and the envelope's version, nonce and authentication tag.
 const maxPayloadBytes = Math.floor((CONTROL_REF_RESPONSE_LIMIT - 4096) / 64) * 45 - 29;
 
-export type ControlKind = "receipt" | "boundary" | "run-index" | "member" | "land-authority";
+export type ControlKind = "receipt" | "boundary" | "run-index" | "member" | "land-authority" | "policy";
 export type ControlKey = Readonly<{ kind: ControlKind; id: string }>;
 export type ControlRefTip = { sha: string; bytes: Uint8Array };
 export type ControlRefRead =
@@ -16,7 +16,7 @@ export type ControlRefRead =
   | { kind: "tip"; tip: ControlRefTip }
   | { kind: "unconfirmed" };
 export interface ControlRefReader {
-  read(key: ControlKey, signal?: AbortSignal): Promise<ControlRefRead>;
+  read(key: ControlKey, signal?: AbortSignal, known?: ControlRefTip): Promise<ControlRefRead>;
 }
 // `unchanged` is an observation; an outstanding dispatched request may still apply later.
 export type ControlRefOutcome =
@@ -30,10 +30,11 @@ export interface ControlRefClient extends ControlRefReader {
     before: string | null,
     bytes: Uint8Array,
     signal?: AbortSignal,
+    known?: ControlRefTip,
   ): Promise<ControlRefOutcome>;
 }
 const keySchema = z.object({
-  kind: z.enum(["receipt", "boundary", "run-index", "member", "land-authority"]),
+  kind: z.enum(["receipt", "boundary", "run-index", "member", "land-authority", "policy"]),
   id: z
     .string()
     .length(64)
@@ -65,7 +66,12 @@ export function createControlRefReader(deps: SharedStoreDeps): ControlRefReader 
 
 export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient {
   const io = createCompanionIO(deps, CONTROL_REF_RESPONSE_LIMIT);
-  async function read(key: ControlKey, signal?: AbortSignal, verify = true): Promise<ControlRefRead> {
+  async function read(
+    key: ControlKey,
+    signal?: AbortSignal,
+    verify = true,
+    known?: ControlRefTip,
+  ): Promise<ControlRefRead> {
     const captured = keySchema.safeParse(key);
     if (!captured.success) fail("invalid");
     const { kind, id } = captured.data;
@@ -81,6 +87,7 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
       if (signal?.aborted) fail("aborted");
       if (head === absent) return { kind: "absent" };
       const { object } = parse(z.object({ ref: z.literal(ref), object: target }), head);
+      if (object.sha === known?.sha) return { kind: "tip", tip: known };
       const commit = parse(commitSchema, await io.call(`git/commits/${object.sha}`, undefined, signal));
       if (commit.sha !== object.sha) fail("corrupt");
       if (commit.message !== "limitless-control: 1" && commit.message !== "limitless-control: 1\n")
@@ -108,8 +115,8 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
     }
   }
   return {
-    read: (key, signal) => read(key, signal),
-    async write(key, before, plaintext, signal) {
+    read: (key, signal, known) => read(key, signal, true, known),
+    async write(key, before, plaintext, signal, known) {
       const captured = keySchema.safeParse(key);
       if (!captured.success || (before !== null && !oid.safeParse(before).success)) fail("invalid");
       if (!(plaintext instanceof Uint8Array) || plaintext.byteLength > maxPayloadBytes) fail("invalid");
@@ -127,7 +134,7 @@ export function createControlRefClient(deps: SharedStoreDeps): ControlRefClient 
       try {
         const repository = await io.repository(signal);
         check();
-        const initial = await read(k, signal, false);
+        const initial = await read(k, signal, false, known);
         check();
         if (initial.kind === "unconfirmed") return { kind: "unconfirmed" };
         observed = initial.kind === "tip" ? initial.tip : null;
