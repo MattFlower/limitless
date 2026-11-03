@@ -75,10 +75,10 @@ export function suspendedBetween(a: ClockSample, b: ClockSample): number {
 }
 
 /** The anchor is sampled immediately before sending the write that created the tip. */
-export function windowOpen(anchor: ClockSample | null, now: ClockSample): boolean {
+export function windowOpen(anchor: ClockSample | null, now: ClockSample, duration = LEASE.windowMs): boolean {
   return (
     anchor !== null &&
-    now.inclusive - anchor.inclusive < LEASE.windowMs &&
+    now.inclusive - anchor.inclusive < duration &&
     suspendedBetween(anchor, now) <= LEASE.suspendToleranceMs
   );
 }

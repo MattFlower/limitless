@@ -205,12 +205,14 @@ const Lease = z.object({
 
 async function machineState(
   platform: string = process.platform,
+  signal?: AbortSignal,
 ): Promise<{ onAC: boolean; idleSeconds: number }> {
   // Linux has no desktop-independent idle time or power source; the coordinator only displays them.
   if (platform === "linux") return { onAC: true, idleSeconds: 0 };
+  const opts = { cwd: process.cwd(), env: agentEnv(), timeoutMs: 5000, signal };
   const [power, idle] = await Promise.all([
-    sh(["/usr/bin/pmset", "-g", "batt"], { cwd: process.cwd(), env: agentEnv(), timeoutMs: 5000 }),
-    sh(["/usr/sbin/ioreg", "-c", "IOHIDSystem"], { cwd: process.cwd(), env: agentEnv(), timeoutMs: 5000 }),
+    sh(["/usr/bin/pmset", "-g", "batt"], opts),
+    sh(["/usr/sbin/ioreg", "-c", "IOHIDSystem"], opts),
   ]);
   const ns = /"HIDIdleTime"\s*=\s*(\d+)/.exec(idle.stdout)?.[1];
   if (!ns) throw new Error("Cannot observe worker idle time");
@@ -1130,6 +1132,8 @@ async function runScopedWorker(
     for (const release of held) release();
   }
 }
+
+export { machineState, verifyWorkerConfinement };
 export async function runWorker(...args: Parameters<typeof runScopedWorker>) {
   const privacy = args[4]?.privacy ?? processPrivacy;
   try {
