@@ -3762,7 +3762,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       .run(f.prUrl, f.sha, f.signature, f.check, f.line, f.image);
   }
 
-  /** One claim per PR head, before the POST; refusals and lost responses retain it. */
+  /** One claim per PR head, before the POST; unknown dispatches and lost responses retain it. */
   claimCiRerun(
     f: CiFailure,
     marker: string,
@@ -3777,6 +3777,15 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       AND NOT EXISTS (SELECT 1 FROM land_entries WHERE pr_url = ? AND pushed_sha = ? AND ci_rerun IS NOT NULL)`)
         .run(marker, JSON.stringify(job), now, f.prUrl, f.sha, f.signature, f.prUrl, f.sha, f.prUrl, f.sha)
         .changes === 1
+    );
+  }
+
+  releaseCiRerun(f: CiFailure): boolean {
+    return (
+      this.db
+        .query(`UPDATE ci_failures SET rerun_claimed = 0, outcome = 'failed', rerun_marker = NULL, rerun_job = NULL, rerun_claimed_at = NULL
+          WHERE pr_url = ? AND sha = ? AND signature = ? AND outcome = 'rerun_requested' AND rerun_marker IS ?`)
+        .run(f.prUrl, f.sha, f.signature, f.rerunMarker).changes === 1
     );
   }
 

@@ -363,6 +363,7 @@ export class WorkerStore {
       if (sweep) this.sweep();
       const w = this.worker(name);
       if (!w || !this.available(w)) return null;
+      if (this.agentCapabilities(w).privateStrings !== "match") return null;
       const c: Capabilities = JSON.parse(this.capabilities(w) ?? "{}");
       const unreported = this.jobs("state='leased' AND worker=?", name).filter((j) => !c.jobs.includes(j.id));
       if (unreported.length >= c.freeSlots) return null;

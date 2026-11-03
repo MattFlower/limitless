@@ -1,13 +1,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { type Config, repoSettings } from "../config.ts";
 import type { GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
 import { ciDecision } from "./ci-classifier.ts";
+import { ClaimWaitError } from "./claim-errors.ts";
 import { claimGuard } from "./claim-guard.ts";
+import { type ObserverAuthority, observerClaimGuard } from "./claim-projection.ts";
 import type { GhRunner } from "./github.ts";
-import { githubIdentity, githubRepo } from "./github-identity.ts";
+import { githubIdentity, githubRepo, githubUrlRepo } from "./github-identity.ts";
 import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
 import { githubToken } from "./github-token.ts";
 
@@ -345,6 +348,8 @@ export function observedPrs(
 }
 
 export interface PollerOptions {
+  cfg?: Pick<Config, "repos">;
+  authority?: ObserverAuthority;
   client?: GitHubClient;
   gh?: GhRunner;
   seconds?: number;
@@ -462,8 +467,14 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     settled ||= snap.state !== (prev?.state ?? "OPEN");
     const mainEpisode = store.getSetting<Record<string, { red: boolean }>>(`ci.main:${pr.repo}`, {});
     if (ciPending || (ciChanged && snap.ci === "SUCCESS" && Object.values(mainEpisode).some((e) => e.red))) {
-      const ciCall = async (repo: string, path: string, body?: unknown, optionalLog = false) => {
-        const res = await call(repo, path, body);
+      const ciCall = async (
+        repo: string,
+        path: string,
+        body?: unknown,
+        optionalLog = false,
+        dispatchGuard?: () => void,
+      ) => {
+        const res = await call(repo, path, body, dispatchGuard);
         const access =
           res &&
           !(optionalLog && res.status === 404) &&
@@ -473,6 +484,21 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
         return res;
       };
       const ready = () => !stopped && now() >= cooldownUntil && now() >= (blocks.get(pr.repo)?.until ?? 0);
+      const cfg = opts.cfg;
+      const rerunGuard =
+        cfg && repoSettings(cfg, pr.repo).shared === true
+          ? () => {
+              const match = /^https:\/\/github\.com\/[^/?#]+\/[^/?#]+\/pull\/([1-9][0-9]*)\/?$/i.exec(pr.url);
+              if (!match || githubUrlRepo(pr.url)?.toLowerCase() !== pr.repo.toLowerCase())
+                throw new ClaimWaitError("unavailable");
+              observerClaimGuard(
+                store,
+                cfg,
+                { pr: { repo: pr.repo, number: Number(match[1]) } },
+                opts.authority,
+              )();
+            }
+          : undefined;
       if (
         (
           await ciDecision(
@@ -487,6 +513,7 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
             undefined,
             undefined,
             now,
+            rerunGuard,
           )
         ).complete
       ) {

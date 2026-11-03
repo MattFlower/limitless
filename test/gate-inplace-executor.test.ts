@@ -6,9 +6,11 @@ import type { Factory } from "../src/app.ts";
 import { restart } from "../src/cli/service.ts";
 import { loadConfig } from "../src/config.ts";
 import { reloadedConfig } from "../src/config-reload.ts";
+import { Store } from "../src/db/store.ts";
 import { WorkerStore } from "../src/db/workers.ts";
 import type { ExecutionEvent, ExecutionHandle, GateRequest } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor } from "../src/gates/executor.ts";
+import { runInplaceExecutor } from "../src/gates/inplace.ts";
 import { gateEnv } from "../src/gates/run.ts";
 import { attachSlotPools, gateSlotScope } from "../src/gates/slots.ts";
 import * as repos from "../src/git/repos.ts";
@@ -1571,3 +1573,63 @@ test("a serving executor fails and stops its leased job before exiting on a rele
     expect(workers.job(id)).toMatchObject({ state: "failed", stopped: 1 });
   });
 });
+
+test.each(["abort", "provision error", "setup error", "loop error"])(
+  "in-place privacy provisioning wraps executor lifetime: %s",
+  async (mode) => {
+    const { f } = await setup();
+    const calls: string[] = [];
+    const controller = new AbortController();
+    const originalLease = WorkerStore.prototype.leaseInplace;
+    const lease = spyOn(WorkerStore.prototype, "leaseInplace").mockImplementation(function (
+      this: WorkerStore,
+      owner,
+    ) {
+      calls.push("lease");
+      controller.abort();
+      if (mode === "loop error") throw new Error("executor loop failed");
+      return originalLease.call(this, owner);
+    });
+    const privacy = {
+      provision(configDir: string, roots: string[]) {
+        expect(configDir).toBe(f.cfg.paths.configDir);
+        expect(roots).toEqual([f.cfg.paths.repos, f.cfg.paths.work]);
+        // Opening the executor Store first would create this file before provisioning.
+        expect(existsSync(db)).toBe(false);
+        calls.push("provision");
+        if (mode === "provision error") throw new Error("provision failed");
+        const store = new Store(db);
+        if (mode === "setup error") store.db.run("DROP TABLE executors");
+        store.close();
+      },
+      async dispose() {
+        calls.push("dispose");
+      },
+    };
+    const db = join(fixture.home, "provisioned-executor.db");
+    try {
+      const execution = runInplaceExecutor(
+        { ...f.cfg, paths: { ...f.cfg.paths, db } },
+        release,
+        controller.signal,
+        privacy,
+      );
+      if (mode === "abort") await execution;
+      else
+        await expect(execution).rejects.toThrow(
+          mode === "loop error"
+            ? "executor loop failed"
+            : mode === "provision error"
+              ? "provision failed"
+              : "no such table: executors",
+        );
+      expect(calls).toEqual(
+        mode === "setup error" || mode === "provision error"
+          ? ["provision", "dispose"]
+          : ["provision", "lease", "dispose"],
+      );
+    } finally {
+      lease.mockRestore();
+    }
+  },
+);

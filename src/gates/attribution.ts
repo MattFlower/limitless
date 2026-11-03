@@ -2,6 +2,8 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
+class AttributionError extends Error {}
+
 export interface AttributedTestCounts {
   tests: number;
   failures: number;
@@ -51,7 +53,7 @@ export function attributedJUnitCounts(
         else if (child.name === "error") counts.errors = 1;
         else if (child.name === "skipped") counts.skipped = 1;
         else if (child.name !== "system-out" && child.name !== "system-err" && child.name !== "properties")
-          throw new Error("Unknown testcase evidence");
+          throw new AttributionError("Unknown testcase evidence");
         if (child.name === "failure" || child.name === "error") {
           const text = child.children.filter((part) => typeof part === "string").join("");
           for (const frame of text.matchAll(/^\s*at (.+?):\d+:\d+\)?\s*$/gm)) {
@@ -68,14 +70,15 @@ export function attributedJUnitCounts(
                   (path) => prefix === path || prefix === `(${path}` || prefix.endsWith(` (${path}`),
                 )
               )
-                throw new Error("Cross-file testcase failure");
+                throw new AttributionError("Cross-file testcase failure");
             }
           }
         }
       }
-      if (counts.failures + counts.errors + counts.skipped > 1) throw new Error("Ambiguous testcase");
+      if (counts.failures + counts.errors + counts.skipped > 1)
+        throw new AttributionError("Ambiguous testcase");
       if (counts.failures + counts.errors > 0 && (!file || !files.has(file)))
-        throw new Error("Unattributed testcase");
+        throw new AttributionError("Unattributed testcase");
     } else {
       for (const child of children) {
         if (child.name === "testsuite" || child.name === "testcase") {
@@ -88,13 +91,13 @@ export function attributedJUnitCounts(
           );
           for (const key of Object.keys(counts) as (keyof AttributedTestCounts)[]) counts[key] += nested[key];
         } else if (child.name !== "system-out" && child.name !== "system-err" && child.name !== "properties")
-          throw new Error("Unknown suite evidence");
+          throw new AttributionError("Unknown suite evidence");
       }
     }
     for (const key of Object.keys(counts) as (keyof AttributedTestCounts)[]) {
       const value = node.attributes[key];
       if (value !== undefined && (!/^\d+$/.test(value) || Number(value) !== counts[key]))
-        throw new Error(
+        throw new AttributionError(
           /^\d+$/.test(value) && Number(value) > counts[key] && (key === "errors" || key === "failures")
             ? `${Number(value) - counts[key]} unattributed ${key.slice(0, -1)}${Number(value) - counts[key] === 1 ? "" : "s"}`
             : "Unmatched JUnit counter",
@@ -106,7 +109,7 @@ export function attributedJUnitCounts(
     const counts = visit(root);
     return onTestcase || counts.failures + counts.errors > 0 ? counts : undefined;
   } catch (error) {
-    onInvalid?.(error instanceof Error ? error.message : "Invalid JUnit evidence");
+    onInvalid?.(error instanceof AttributionError ? error.message : "Invalid JUnit evidence");
     return undefined;
   }
 }
