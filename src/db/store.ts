@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { sep } from "node:path";
 import type { WebAuthnCredential } from "@simplewebauthn/server";
 import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
@@ -56,7 +57,6 @@ import type { JudgeJob, Judgment } from "../evals/judge.ts";
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { githubWait } from "../git/github-wait.ts";
-import { claimScope } from "../integrations/claim-guard.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { PrSnapshot } from "../integrations/github-poller.ts";
 import { leaseMethods } from "../integrations/lease-store.ts";
@@ -549,6 +549,8 @@ export class Store {
   }
   readonly db: Database;
   private listeners = new Set<Listener>();
+  // Subscribers and the async work they create belong to the Store's construction context.
+  private readonly listenerContext = AsyncLocalStorage.snapshot();
   private pendingPublications: StreamMessage[] | null = null;
   private feedPublished = 0;
   private feedPublishing = false;
@@ -903,7 +905,7 @@ export class Store {
     if (msg.kind !== "feed") this.publishFeed();
     for (const l of this.listeners) {
       try {
-        claimScope.exit(() => l(msg));
+        this.listenerContext(l, msg);
       } catch {
         // A broken subscriber must never break the pipeline.
       }
@@ -3760,7 +3762,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       .run(f.prUrl, f.sha, f.signature, f.check, f.line, f.image);
   }
 
-  /** One claim per PR head, before the POST; refusals and lost responses retain it. */
+  /** One claim per PR head, before the POST; unknown dispatches and lost responses retain it. */
   claimCiRerun(
     f: CiFailure,
     marker: string,
@@ -3775,6 +3777,15 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       AND NOT EXISTS (SELECT 1 FROM land_entries WHERE pr_url = ? AND pushed_sha = ? AND ci_rerun IS NOT NULL)`)
         .run(marker, JSON.stringify(job), now, f.prUrl, f.sha, f.signature, f.prUrl, f.sha, f.prUrl, f.sha)
         .changes === 1
+    );
+  }
+
+  releaseCiRerun(f: CiFailure): boolean {
+    return (
+      this.db
+        .query(`UPDATE ci_failures SET rerun_claimed = 0, outcome = 'failed', rerun_marker = NULL, rerun_job = NULL, rerun_claimed_at = NULL
+          WHERE pr_url = ? AND sha = ? AND signature = ? AND outcome = 'rerun_requested' AND rerun_marker IS ?`)
+        .run(f.prUrl, f.sha, f.signature, f.rerunMarker).changes === 1
     );
   }
 

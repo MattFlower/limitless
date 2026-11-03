@@ -1,4 +1,4 @@
-import { type ProcResult, registerCredential, runProcess } from "../util/proc.ts";
+import { type ProcResult, redactCredentials, registerCredential, runProcess } from "../util/proc.ts";
 
 /** Secret output must never enter sh's output-quoting error path. */
 export async function githubToken(signal?: AbortSignal, run = runProcess): Promise<string> {
@@ -11,8 +11,9 @@ export async function githubToken(signal?: AbortSignal, run = runProcess): Promi
       timeoutMs: 30_000,
       signal,
     });
-  } catch {
-    throw new Error("gh auth token failed: process error");
+  } catch (error) {
+    const cause = error instanceof Error ? `${error.name}: ${error.message}` : "Unknown error";
+    throw new Error(`gh auth token failed: process error: ${redactCredentials(cause).slice(0, 200)}`);
   }
   const token = lookup.stdout.trim();
   registerCredential("GH_TOKEN", token);

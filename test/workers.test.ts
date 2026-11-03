@@ -87,6 +87,7 @@ import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { bwrapSkip, fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { PreviousHeartbeat } from "./previous-heartbeat.ts";
+import { resetProcessPrivacy, testPrivacy } from "./privacy-process-support.ts";
 import { test } from "./read-policy-support.ts";
 import {
   captureSetupEnv,
@@ -115,7 +116,8 @@ const capabilityRunner: NonNullable<Parameters<typeof runWorkerClient>[4]>["capa
       : "logged in",
 });
 const runWorker: typeof runWorkerClient = (coordinator, cfg, release, signal, options) =>
-  runWorkerClient(coordinator, cfg, release, signal, { capabilityRunner, ...options });
+  runWorkerClient(coordinator, cfg, release, signal, { capabilityRunner, privacy: testPrivacy, ...options });
+afterEach(resetProcessPrivacy);
 const releaseSha = "f".repeat(40);
 test("strict worker results and check events accept optional bounded skipped-test identities", () => {
   const check = { name: "tests", command: "bun test", ok: true, exitCode: 0, durationMs: 1, output: "" };
