@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import type { Factory } from "../app.ts";
 import type { EpicAttention, Run } from "../core/types.ts";
@@ -311,6 +312,7 @@ export function startIssueQueue(
     lifecycle?: IssueLifecycleOptions;
   } = {},
 ): (() => void) & { pollNow: () => void } {
+  const context = AsyncLocalStorage.snapshot();
   const q = factory.cfg.githubQueue;
   if (!q?.repos.length || !q.trusted.length) return Object.assign(() => {}, { pollNow: () => {} });
   const { gh = runGh, log = console.warn } = opts;
@@ -701,9 +703,11 @@ export function startIssueQueue(
   const schedule = (deadline: number) => {
     nextTickAt = deadline;
     if (!stopped)
-      timer = set(
-        () => (now() < deadline ? schedule(deadline) : void tick()),
-        Math.min(3_600_000, Math.max(0, deadline - now())),
+      timer = context(() =>
+        set(
+          () => (now() < deadline ? schedule(deadline) : void tick()),
+          Math.min(3_600_000, Math.max(0, deadline - now())),
+        ),
       );
   };
   timer = set(() => void tick(), 0);

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { GitHubFeedKind, TrackedPr } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { processConflictTriggers } from "../pipeline/conflict-round.ts";
@@ -355,6 +356,7 @@ export interface PollerOptions {
 
 /** Observes factory PRs with one serial GraphQL query per repository and writes changes to the feed. */
 export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () => void {
+  const context = AsyncLocalStorage.snapshot();
   const { log = console.warn } = opts;
   const client = guardGitHubClient(opts.client ?? ghClient);
   const { now, set, clear } = opts.clock ?? { now: Date.now, set: setTimeout, clear: clearTimeout };
@@ -581,7 +583,10 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
     } catch (e) {
       log(`GitHub poll scheduling failed: ${String(e)}`);
     }
-    timer = stopped || next === Infinity ? undefined : set(() => void tick(), Math.max(0, next - now()));
+    timer =
+      stopped || next === Infinity
+        ? undefined
+        : context(() => set(() => void tick(), Math.max(0, next - now())));
   };
   const tick = async () => {
     if (stopped || running) return;

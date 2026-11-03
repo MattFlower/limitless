@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { sep } from "node:path";
 import type { WebAuthnCredential } from "@simplewebauthn/server";
 import { AUDIT_ALLOWANCES, parseAllow, validateAllow } from "../core/allow.ts";
@@ -56,7 +57,6 @@ import type { JudgeJob, Judgment } from "../evals/judge.ts";
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { githubWait } from "../git/github-wait.ts";
-import { claimScope } from "../integrations/claim-guard.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { PrSnapshot } from "../integrations/github-poller.ts";
 import { leaseMethods } from "../integrations/lease-store.ts";
@@ -549,6 +549,7 @@ export class Store {
   }
   readonly db: Database;
   private listeners = new Set<Listener>();
+  private readonly listenerContext = AsyncLocalStorage.snapshot();
   private pendingPublications: StreamMessage[] | null = null;
   private feedPublished = 0;
   private feedPublishing = false;
@@ -903,7 +904,7 @@ export class Store {
     if (msg.kind !== "feed") this.publishFeed();
     for (const l of this.listeners) {
       try {
-        claimScope.exit(() => l(msg));
+        this.listenerContext(l, msg);
       } catch {
         // A broken subscriber must never break the pipeline.
       }
