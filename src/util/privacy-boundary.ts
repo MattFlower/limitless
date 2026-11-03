@@ -87,6 +87,8 @@ export function createPrivacyRegistry(
       ready = true;
     },
     addCredential: secrets.add,
+    // Credentials the worker never receives; the checker matches them before dispatch.
+    mainThreadCredentials: () => secrets.mainThreadValues(),
     get generation() {
       return generation();
     },

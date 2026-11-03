@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkPublicationText } from "../src/gates/publication.ts";
-import { credentialRegistry } from "../src/util/credential-matcher.ts";
+import { createCredentialRegistry } from "../src/util/credential-matcher.ts";
 import { createPrivacyRegistry, privacyRegistry } from "../src/util/privacy-boundary.ts";
 import { createPrivacyChecker, privacyWorkerEntry, startPrivacyWorker } from "../src/util/privacy-checker.ts";
 import { consumeBoundaryChunk } from "../src/util/privacy-chunks.ts";
@@ -263,7 +263,10 @@ test("main-thread credentials never enter worker snapshots on either admission p
   const f = fixture(),
     hex = f.state.key?.toString("hex");
   if (!hex) throw new Error("Missing key");
-  const registry = createPrivacyRegistry(credentialRegistry);
+  // provisionProofKey registers globally (asserted above); isolate from other files' registrations.
+  const secrets = createCredentialRegistry();
+  secrets.addMainThreadOnly(hex);
+  const registry = createPrivacyRegistry(secrets);
   let chunks = 0,
     leaked = false;
   const checker = createPrivacyChecker({
@@ -295,5 +298,35 @@ test("main-thread credentials never enter worker snapshots on either admission p
     expect(consumeBoundaryChunk(receipt, 0).withheld).toBe(false);
   }
   expect(chunks).toBeGreaterThanOrEqual(2);
+  expect(leaked).toBe(false);
+  // Key-bearing input is withheld on the main thread and never dispatched or signed.
+  const sent = chunks,
+    encoded = Buffer.from(hex).toString("base64");
+  for (const deadline of [undefined, Date.now() + 30_000]) {
+    for (const text of [hex, `log ${hex} tail`, encoded]) {
+      const receipt = await checker.protectText({ text, provenance: { kind: "complete" } }, { deadline });
+      expect(consumeBoundaryChunk(receipt, 0)).toMatchObject({ withheld: true, reason: "private-match" });
+      const proof = await p.checkAndSign({
+        checker,
+        signer: f.signer,
+        kind: "complete",
+        field: "output",
+        text,
+        deadline,
+      });
+      expect(proof).toBeUndefined();
+    }
+    const marked = await checker.protectText(
+      { text: "safe text", cut: { limit: 1, unit: "U", marker: hex }, provenance: { kind: "complete" } },
+      { deadline },
+    );
+    expect(consumeBoundaryChunk(marked, 0).withheld).toBe(true);
+    const data = await checker.protectData(
+      { json: JSON.stringify({ hex }), provenance: { kind: "complete" } },
+      { deadline },
+    );
+    expect(consumeBoundaryChunk(data, 0).withheld).toBe(true);
+  }
+  expect(chunks).toBe(sent);
   expect(leaked).toBe(false);
 });

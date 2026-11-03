@@ -301,6 +301,7 @@ export function createCredentialRegistry(onAdd?: (value: string) => void) {
     },
     has: (value: string) => values.has(value),
     values: (worker = false) => [...values].filter((value) => !worker || !mainThreadOnly.has(value)),
+    mainThreadValues: () => [...mainThreadOnly],
     addMainThreadOnly(value: string): void {
       mainThreadOnly.add(value);
       this.add(value);

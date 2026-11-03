@@ -210,6 +210,13 @@ export function createPrivacyChecker(options: Options = {}) {
   let running: Promise<void> | undefined;
   const issue = (result: Projection, generation?: Generation, parts?: ArrayBuffer[], text?: string) =>
     c.issuePrivacyWorkerChunks(parts, result, generation, registry, text);
+  // Main-thread-only credentials never reach the worker, so input carrying them is withheld unsent.
+  const local = (generation: Generation, texts: string[]) => {
+    const credentials = registry.mainThreadCredentials();
+    if (!credentials.length) return true;
+    const policy = b.preparePrivacyPolicy({ ready: true, entries: [], credentials, generation });
+    return texts.every((text) => "clean" in b.checkPrepared(policy, text));
+  };
   const current = (generation: Generation) => {
     try {
       return same(generation, b.currentPrivacyGeneration(registry));
@@ -333,6 +340,8 @@ export function createPrivacyChecker(options: Options = {}) {
         const admittedAt = now();
         if (!eligible()) return true;
         if (!fits(request.stream.size)) return false;
+        if (!local(snapshot.generation, [payload, String(input.cut?.marker ?? "")]))
+          return end("private-match") ?? true;
         stopWaiting?.();
         terminal = true;
         admit(input, control, request, authority, result, admittedAt);
