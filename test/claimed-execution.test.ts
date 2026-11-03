@@ -877,24 +877,33 @@ test("capability loss leaves checkpoint and cancellation probes available", asyn
   expect(gate.capableNow).not.toHaveBeenCalled();
 });
 
-test("cancellation during an awaited capability refusal wins", async () => {
-  const { f, run, claim } = await fixture();
-  const gate = passingGate();
-  const entered = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<Awaited<ReturnType<CapabilityGate["canContinue"]>>>();
-  gate.canContinue.mockImplementation(() => {
-    entered.resolve();
-    return release.promise;
-  });
-  const controller = new AbortController();
-  const work = executeRun({ ...f.deps, runClaim: claim, capability: gate }, run.id, controller.signal);
-  await entered.promise;
-  controller.abort();
-  release.resolve(["os"]);
-  expect(await work).toBe("cancelled");
-  expect(f.store.getRunState<RunState>(run.id)?.githubWait).toBeUndefined();
-  expect(claim.update).not.toHaveBeenCalled();
-});
+test.each([true, false])(
+  "cancellation during an awaited capability refusal wins, lease open=%s",
+  async (open) => {
+    const { f, run, claim } = await fixture();
+    if (!open) claim.close();
+    f.store.setRunState(run.id, {
+      ...initialRunState(run),
+      githubWait: { reason: "claim:capability", since: 1, nextAttemptAt: 2 },
+    });
+    const gate = passingGate();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<Awaited<ReturnType<CapabilityGate["canContinue"]>>>();
+    gate.canContinue.mockImplementation(() => {
+      entered.resolve();
+      return release.promise;
+    });
+    const controller = new AbortController();
+    const work = executeRun({ ...f.deps, runClaim: claim, capability: gate }, run.id, controller.signal);
+    await entered.promise;
+    controller.abort();
+    release.resolve(["os"]);
+    expect(await work).toBe("cancelled");
+    expect(f.store.getRun(run.id)).toMatchObject({ status: "cancelled", finishedAt: expect.any(Number) });
+    expect(f.store.getRunState<RunState>(run.id)?.githubWait).toBeUndefined();
+    expect(claim.update).not.toHaveBeenCalled();
+  },
+);
 
 test("capability claim-control errors keep their identity", async () => {
   const { f, run, claim } = await fixture();
