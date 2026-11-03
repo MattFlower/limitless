@@ -1,5 +1,6 @@
 import type { Server } from "bun";
 import type { Factory } from "../app.ts";
+import type { ObserverAuthority } from "./claim-projection.ts";
 import { type DefectServiceDeps, startDefectService } from "./defect-service.ts";
 import { mountDiscord } from "./discord.ts";
 import { type GhRunner, githubWebhook, runGh } from "./github.ts";
@@ -21,6 +22,7 @@ export interface IntegrationDeps extends DefectServiceDeps {
   prClient?: GitHubPrClient;
   github?: GitHubClient;
   issueClock?: IssueQueueClock;
+  authority?: ObserverAuthority;
 }
 
 /** Wire trigger integrations (GitHub webhooks, Discord, MCP) into the daemon. */
@@ -66,7 +68,11 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
     cleanups.push(stopPoller);
     const queue = factory.cfg.githubQueue;
     const issueQueueEnabled = !!queue?.repos.length && !!queue.trusted.length;
-    const issueQueue = startIssueQueue(factory, { gh: deps.gh, clock: deps.issueClock });
+    const issueQueue = startIssueQueue(factory, {
+      gh: deps.gh,
+      clock: deps.issueClock,
+      lifecycle: { authority: deps.authority },
+    });
     cleanups.push(issueQueue);
     cleanups.push(() => factory.land.stop());
     // The land queue resumes whatever the last daemon left in flight, and waits for new requests.

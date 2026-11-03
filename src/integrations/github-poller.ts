@@ -4,6 +4,7 @@ import { processConflictTriggers } from "../pipeline/conflict-round.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
 import { ciDecision } from "./ci-classifier.ts";
+import { claimGuard } from "./claim-guard.ts";
 import type { GhRunner } from "./github.ts";
 import { githubIdentity, githubRepo } from "./github-identity.ts";
 import { type GitHubPrClient, type GitHubPrState, reconcileMergedRuns } from "./github-notifier.ts";
@@ -16,18 +17,23 @@ export type GitHubResponse = {
   /** Explicitly refused rerun POST, with the poller's request cooldown (never permission to retry). */
   rerunRetryAt?: number;
 };
-/** One authenticated API call: POST when `body` is given, else GET (logs return text). */
+/** One authenticated API call: POST when `body` is given, else GET (logs return text).
+ * Implementations call dispatchGuard synchronously after their last await, immediately before
+ * sending, and send nothing if it throws. */
 export type GitHubClient = (
   path: string,
   body?: unknown,
   signal?: AbortSignal,
   repo?: string,
+  dispatchGuard?: () => void,
 ) => Promise<GitHubResponse>;
 
 /** Repository identity; owner OAuth tokens are read per request so gh login refreshes apply. */
-export const ghClient: GitHubClient = async (path, body, signal, repo) => {
+export const ghClient: GitHubClient = async (path, body, signal, repo, dispatchGuard) => {
   const identity = await githubIdentity(repo ?? githubRepo([path]));
   const token = identity.kind === "app" ? identity.token : await githubToken(signal);
+  dispatchGuard?.();
+  claimGuard();
   const res = await fetch(`https://api.github.com/${path}`, {
     headers: {
       authorization: `bearer ${token}`,
@@ -48,6 +54,14 @@ export const ghClient: GitHubClient = async (path, body, signal, repo) => {
           : await res.json().catch(() => null),
   };
 };
+
+export const guardGitHubClient =
+  (client: GitHubClient): GitHubClient =>
+  (path, body, signal, repo, supplied) =>
+    client(path, body, signal, repo, () => {
+      supplied?.();
+      claimGuard();
+    });
 
 export const OBSERVE_QUERY = `query($ids: [ID!]!, $after: String) { nodes(ids: $ids) { ... on PullRequest {
   id url headRefOid headRefName isCrossRepository headRepository { nameWithOwner } state isDraft mergeable mergeStateStatus updatedAt mergedAt mergedBy { login }
@@ -341,7 +355,8 @@ export interface PollerOptions {
 
 /** Observes factory PRs with one serial GraphQL query per repository and writes changes to the feed. */
 export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () => void {
-  const { client = ghClient, log = console.warn } = opts;
+  const { log = console.warn } = opts;
+  const client = guardGitHubClient(opts.client ?? ghClient);
   const { now, set, clear } = opts.clock ?? { now: Date.now, set: setTimeout, clear: clearTimeout };
   const normal = Math.max(15, opts.seconds ?? 45) * 1000;
   const observedAt = new Map<string, number>();
@@ -352,9 +367,14 @@ export function startGitHubPoller(store: Store, opts: PollerOptions = {}): () =>
   let [retryAt, crashes, first] = [0, 0, ""];
   let timer: ReturnType<typeof setTimeout> | undefined;
   /** Null during a rate-limit (or access-block) cooldown, which every request honours. */
-  const call = async (repo: string, path: string, body?: unknown): Promise<GitHubResponse | null> => {
+  const call = async (
+    repo: string,
+    path: string,
+    body?: unknown,
+    dispatchGuard?: () => void,
+  ): Promise<GitHubResponse | null> => {
     if (stopped || now() < cooldownUntil || now() < (blocks.get(repo)?.until ?? 0)) return null;
-    const res = await client(path, body, abort.signal, repo);
+    const res = await client(path, body, abort.signal, repo, dispatchGuard);
     if (stopped) return null;
     const until = limitedUntil(res, now());
     const access = until === null && accessProblem(res, repo);

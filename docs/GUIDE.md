@@ -285,6 +285,9 @@ state alone never authorizes work. Missing authority queues the run before start
 bookkeeping or stages begin. No production acquisition or admission is enabled here;
 complete lifecycle fencing and admission remain prerequisites for shared operation.
 
+In shared repositories, lifecycle comments and labels wait for the run’s held claim with an open window.
+Shared mode requires the managed lifecycle; the legacy notifier posts nothing there.
+
 Claim waits preserve the current phase, rejection evidence and publication checkpoints.
 They queue resumable work with a next-attempt time, even outside delivery, and are not
 bounded by the ordinary GitHub outage budget. Renewal and a current guard must succeed

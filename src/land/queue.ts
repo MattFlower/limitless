@@ -49,6 +49,7 @@ import {
 import {
   type GitHubClient,
   ghClient,
+  guardGitHubClient,
   normalizePr,
   OBSERVE_QUERY,
   type PrSnapshot,
@@ -620,8 +621,8 @@ export class LandQueue {
 
   /** Fresh direct evidence at claim and immediately before merge; saved evidence only while parked. */
   private async approvalEvidence(entry: LandEntry, signal: AbortSignal, saved = false) {
-    const client: GitHubClient = (path, body, signal) =>
-      (this.deps.github ?? ghClient)(path, body, signal, entry.repo);
+    const client: GitHubClient = (path, body, signal, _repo, guard) =>
+      guardGitHubClient(this.deps.github ?? ghClient)(path, body, signal, entry.repo, guard);
     try {
       const factory = await githubIdentity(entry.repo);
       const identity =
@@ -1098,7 +1099,8 @@ export class LandQueue {
             this.store,
             pr,
             snap,
-            (_repo, path, body) => (this.deps.github ?? ghClient)(path, body, inspectionSignal, entry.repo),
+            (_repo, path, body) =>
+              guardGitHubClient(this.deps.github ?? ghClient)(path, body, inspectionSignal, entry.repo),
             this.deps.ciReruns !== false && !rerun,
             current,
             current,

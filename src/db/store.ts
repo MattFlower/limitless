@@ -56,6 +56,7 @@ import type { JudgeJob, Judgment } from "../evals/judge.ts";
 import { type FeedQuery, limitFeedPage, MAX_FEED_ITEMS, mcpRequestedBy, validateFeedQuery } from "../feed.ts";
 import { redactGateOutput } from "../gates/output.ts";
 import { githubWait } from "../git/github-wait.ts";
+import { claimScope } from "../integrations/claim-guard.ts";
 import { quotedJson } from "../integrations/github.ts";
 import type { PrSnapshot } from "../integrations/github-poller.ts";
 import { leaseMethods } from "../integrations/lease-store.ts";
@@ -902,7 +903,7 @@ export class Store {
     if (msg.kind !== "feed") this.publishFeed();
     for (const l of this.listeners) {
       try {
-        l(msg);
+        claimScope.exit(() => l(msg));
       } catch {
         // A broken subscriber must never break the pipeline.
       }
