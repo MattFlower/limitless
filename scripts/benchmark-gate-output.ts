@@ -29,15 +29,12 @@ export async function worker(root: string, name: string) {
   const a = Object.assign({}, ...modules) as API,
     env = environment(root),
     cwd = join(root, "fixture");
-  await fs.mkdir(env.LIMITLESS_CONFIG_DIR);
-  await fs.mkdir(cwd);
+  await Promise.all([env.LIMITLESS_CONFIG_DIR, cwd].map((d) => fs.mkdir(d)));
   await fs.writeFile(join(cwd, "sample.test.ts"), "");
   const fixture = bench.workload("plain"),
     key = Buffer.alloc(32, 17);
-  await fs.writeFile(
-    join(env.LIMITLESS_CONFIG_DIR, "private-strings.txt"),
-    fixture.entries.map((e) => e.value).join("\n"),
-  );
+  const strings = fixture.entries.map((e) => e.value).join("\n");
+  await fs.writeFile(join(env.LIMITLESS_CONFIG_DIR, "private-strings.txt"), strings);
   await fs.writeFile(join(env.LIMITLESS_CONFIG_DIR, "privacy-proof.key"), key, { mode: 0o600 });
   (a.privacyRegistry as Checker["registry"]).replacePolicy(fixture.entries);
   fixture.credentials.forEach((s, i) => void (a.registerCredential as Fn)(`BENCHMARK_${i}`, s));
@@ -58,8 +55,6 @@ export async function worker(root: string, name: string) {
         [checker, submissionMs, latencyMs, parses] = [current, [], [], 0];
         const start = performance.now(),
           protect = checker.protectText;
-        // Entries only label phases: measureWorker owns every CPU-busy heartbeat gap of a producer trial, however
-        // the implementation resumed (file I/O, imported or captured timers), so no resumption escapes both buckets.
         const enter = (phase: string, f: Fn) =>
           function (this: unknown, ...x: unknown[]) {
             return own(phase, () => f.apply(this, x));
@@ -118,7 +113,8 @@ export async function compare(refs: string[], names: string[], invoke = bench.la
   const bad = (ref: string) => () =>
     Promise.reject(Error(`ref ${JSON.stringify(ref)} does not name a commit`));
   for (const ref of refs) shas.push(await bench.command([...revParse, `${ref}^{commit}`]).catch(bad(ref)));
-  const results = await bench.runRevisions(shas, names, (job) => invoke(job, import.meta.path, environment));
+  const script = ["--preload", join(import.meta.dir, "benchmark-resumptions.ts"), import.meta.path];
+  const results = await bench.runRevisions(shas, names, (job) => invoke(job, script, environment));
   validateReports(results);
   return {
     units:

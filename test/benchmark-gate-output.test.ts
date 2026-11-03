@@ -4,11 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compare, environment, operation, registry, validate } from "../scripts/benchmark-gate-output.ts";
 import { launch, measureWorker } from "../scripts/benchmark-privacy-boundary.ts";
+import { trackResumptions } from "../scripts/benchmark-resumptions.ts";
 import { readCoveringJUnit, readJUnit, readJUnitSkips } from "../src/gates/junit.ts";
 import { processBirthSync } from "../src/util/proc.ts";
 import { describe, junitReport } from "./benchmark-gate-output-support.ts";
 
 const pause = () => new Promise<void>((done) => setImmediate(done));
+const raw = setImmediate;
+const wait = () => new Promise<void>((done) => raw(done)); // Unhooked: invisible to resumption tracking.
 async function temporary<T>(fn: (root: string) => Promise<T>) {
   const root = await fs.mkdtemp(join(tmpdir(), "producer-test-"));
   try {
@@ -35,52 +38,64 @@ type Group = {
   median: number;
 };
 
-test("entries and continuations merge until a heartbeat, excluding worker waits and idle", async () => {
+test("entries, continuations and hooked resumptions merge until a heartbeat; unowned gap time is idle", async () => {
   await temporary(async (root) => {
     await fakeRevision(root);
-    let [clock, cpu] = [0, 0];
+    let clock = 0;
     const runtime = {
       now: () => clock,
-      cpu: () => cpu,
-      pause,
+      pause: wait,
       gc: () => {},
       memory: () => ({ heap: 0, peakRSS: 0 }),
       platform: ["deterministic"],
     };
-    const result = await measureWorker(root, runtime, {
-      merged: {
-        dimensions: {},
-        run: async (_checker, own) => {
-          own("first", () => {
-            clock += 2;
-          });
-          await Promise.resolve();
-          own("second", () => {
-            clock += 3;
-          });
-          await pause();
-          clock += 100; // A worker's waiting time: no implementation entry and an idle main thread.
-          await pause();
-          [clock, cpu] = [clock + 40, cpu + 30]; // Resumed implementation work with no entry: CPU-busy.
-          await pause();
-          own("after-worker", () => {
-            clock += 7;
-          });
-          return true;
+    const restore = trackResumptions();
+    try {
+      const result = await measureWorker(root, runtime, {
+        merged: {
+          dimensions: {},
+          run: async (_checker, own) => {
+            own("first", () => {
+              clock += 2;
+            });
+            await Promise.resolve();
+            own("second", () => {
+              clock += 3;
+            });
+            await wait();
+            clock += 100; // A worker's waiting time: no implementation entry or hooked resumption.
+            await wait();
+            await pause(); // A hooked resumption that then stalls without using CPU (no CPU clock exists here).
+            clock += 40;
+            await wait();
+            clock += 30; // Unowned time before an entry in the same heartbeat gap stays idle.
+            own("late", () => {
+              clock += 40;
+            });
+            await wait();
+            own("after-worker", () => {
+              clock += 7;
+            });
+            return true;
+          },
+          check: (v) => ({ outcome: validate(v) }),
         },
-        check: (v) => ({ outcome: validate(v) }),
-      },
-    });
-    const group = result.groups.merged as Group;
-    expect(group.raw).toHaveLength(7);
-    for (const trial of group.raw) {
-      expect(trial.turns.map((t) => t[1])).toEqual([5, 40, 7]);
-      expect(trial.turns[0]?.[3]).toContain("first,second");
-      expect(trial.turns[1]?.[3]).toBe("resumed");
-      expect(trial.turns[2]?.[3]).toContain("after-worker");
-      expect(trial.idle.map((gap) => gap[1])).toEqual([100]);
-      expect(trial.slice).toBe(40);
+      });
+      const group = result.groups.merged as Group;
+      expect(group.raw).toHaveLength(7);
+      for (const trial of group.raw) {
+        expect(trial.turns.map((t) => t[1])).toEqual([5, 40, 40, 7]);
+        expect(trial.turns[0]?.[3]).toContain("first,second");
+        expect(trial.turns[1]?.[3]).toBe("resumed");
+        expect(trial.turns[2]?.[3]).toBe("late");
+        expect(trial.turns[3]?.[3]).toContain("after-worker");
+        expect(trial.idle.map((gap) => gap[1])).toEqual([100, 30]);
+        expect(trial.slice).toBe(40);
+      }
+    } finally {
+      restore();
     }
+    expect(setImmediate).toBe(raw);
     const { count } = await import(join(root, "src/util/privacy-checker.ts"));
     expect(count()).toBe(7);
   });
@@ -95,7 +110,6 @@ test("64 microtask rounds restart at re-entry; warmup maxima and measured median
       root,
       {
         now: () => clock,
-        cpu: () => 0,
         pause,
         gc: () => {},
         memory: () => ({ heap: 0, peakRSS: 0 }),
@@ -273,7 +287,7 @@ test("bad CLI arguments fail before launching a worker", async () => {
   expect(failed.stderr.toString().trim()).toStartWith("benchmark-gate-output: unknown workload(s) bogus;");
 });
 
-test("implementation work resumed by file I/O, imported or captured timers and sleeps is owned through worker()", async () => {
+test("low-CPU stalls after file I/O, imported, captured or global timer resumptions are owned in a CLI worker", async () => {
   await temporary(async (root) => {
     await fakeRevision(root);
     await fs.mkdir(join(root, "src/gates"));
@@ -281,49 +295,51 @@ test("implementation work resumed by file I/O, imported or captured timers and s
       join(root, "src/util/privacy-boundary.ts"),
       "export const privacyRegistry={replacePolicy(){}}; export function registerCredential(){}",
     );
-    // Scheduling APIs are imported or captured at module initialization, before any benchmark wrapper exists, and
-    // each resumption does synchronous work before (or without) touching an instrumented API.
+    // Scheduling and I/O APIs are imported or captured at module initialization; each resumption then blocks
+    // synchronously without CPU before (or without) touching an instrumented API.
     await fs.writeFile(
       join(root, "src/gates/junit.ts"),
-      `import { promises as fs } from 'node:fs';
+      `import { readFile } from 'node:fs/promises';
       import { setImmediate as later } from 'node:timers/promises';
-      const captured=setImmediate;
-      const cpu=()=>{const u=process.threadCpuUsage();return (u.user+u.system)/1000;};
-      const busy=(n)=>{const t=cpu();while(cpu()-t<n);};
+      import { setImmediate as soon } from 'node:timers';
+      const captured=setImmediate, stall=()=>Bun.sleepSync(20);
       export async function readJUnit(){
-        await later(); busy(40);
-        await new Promise((r)=>captured(r)); busy(40);
-        await new Promise((r)=>setTimeout(r,1)); busy(40);
-        await Bun.sleep(1); busy(40);
-        await fs.readFile(import.meta.path); busy(40);
-        await Bun.file(import.meta.path).text(); busy(40);
+        await later(); stall();
+        await new Promise((r)=>soon(r)); stall();
+        await new Promise((r)=>captured(r)); stall();
+        await new Promise((r)=>setTimeout(r,1)); stall();
+        await Bun.sleep(1); stall();
+        await readFile(import.meta.path); stall();
+        await Bun.file(import.meta.path).text(); stall();
         const root=Bun.XML.parse('<a/>',{compact:false}); // The wrapper must forward the readers' options.
         return root.name==='a'?{failedFiles:['sample.test.ts']}:root;
       }`,
     );
-    const { registry: workloads, worker } = await import("../scripts/benchmark-gate-output.ts");
-    const check = (v: unknown) => validate(JSON.stringify(v) === '{"failedFiles":["sample.test.ts"]}');
-    workloads.yielding = ({ a }) => [["readJUnit", 1, () => (a.readJUnit as () => unknown)(), check]];
-    try {
-      const report = await worker(root, "yielding");
-      const group = report.groups["readJUnit/1"] as { raw: (Group["raw"][number] & { parses: number })[] };
+    const script = join(process.cwd(), "scripts/benchmark-gate-output.ts");
+    const preload = join(process.cwd(), "scripts/benchmark-resumptions.ts");
+    const run = Bun.spawnSync([process.execPath, "--preload", preload, script, "--worker", root, "junit"], {
+      env: environment(root),
+      stderr: "pipe",
+    });
+    expect(run.stderr.toString()).toBe("");
+    const report = JSON.parse(run.stdout.toString());
+    const groups = Object.entries(report.groups as Record<string, Group>);
+    expect(groups.map(([label]) => label)).toEqual(
+      [1, 4, 16].map((n) => `readJUnit:readJUnit/${n * 1048576}`),
+    );
+    for (const [, group] of groups) {
       expect(group.raw).toHaveLength(7);
-      for (const trial of group.raw) {
-        const owned = trial.turns.filter((t) => t[1] >= 39);
-        expect(owned).toHaveLength(6);
+      for (const trial of group.raw as (Group["raw"][number] & { parses: number })[]) {
+        const owned = trial.turns.filter((t) => t[1] >= 19);
+        expect(owned).toHaveLength(7);
         for (const turn of owned) expect(turn[3]).toContain("resumed");
-        expect(owned[5]?.[3]).toContain("XML.parse");
-        expect(trial.slice).toBeGreaterThanOrEqual(40);
-        expect(trial.idle.filter((gap) => (gap[1] ?? 0) >= 39)).toEqual([]);
+        expect(owned[6]?.[3]).toContain("XML.parse");
+        expect(trial.idle.filter((gap) => (gap[1] ?? 0) >= 19)).toEqual([]);
         expect(trial.parses).toBe(1);
       }
-      expect(setImmediate.name).toBe("setImmediate");
-      expect(Bun.XML.parse.name).toBe("parse");
-    } finally {
-      delete workloads.yielding;
     }
   });
-});
+}, 60_000);
 
 test("missing proof APIs remain unavailable at every identity boundary", async () => {
   await temporary(async (root) => {

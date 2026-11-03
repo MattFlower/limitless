@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { privacyLimits as L } from "../src/util/privacy-boundary.ts";
 import { agentEnv, runProcess } from "../src/util/proc.ts";
+import { resumptions } from "./benchmark-resumptions.ts";
 
 type Projection = Partial<ReturnType<typeof import("../src/util/privacy-boundary.ts").consumeBoundaryText>>;
 const fill = (n: number, c = ".", k = c.length) => c.repeat(Math.floor(n / k)) + ".".repeat(n % k);
@@ -144,7 +145,7 @@ export async function runRevisions<T>(refs: string[], names: string[], run: (j: 
 }
 const runtime = {
   now: () => performance.now(),
-  pause: () => new Promise<void>((done) => setImmediate(done)),
+  pause: () => new Promise<void>((done) => resumptions.setImmediate(done)),
   memory: () => ({ heap: process.memoryUsage().heapUsed, peakRSS: process.resourceUsage().maxRSS }),
   gc: () => Bun.gc(true),
   platform: [Bun.version, process.platform, release(), arch()],
@@ -272,10 +273,8 @@ export type ProducerOperation = {
   check: (value: unknown) => Record<string, unknown>;
   dimensions: object;
 };
-type Clocks = typeof runtime & { cpu?: () => number }; // cpu: main-thread ms
 type Ops = Record<string, ProducerOperation>;
-export async function measureWorker(root: string, r: Clocks = runtime, ops?: Ops) {
-  const mainMs = r.cpu ?? (() => ms(process.threadCpuUsage()));
+export async function measureWorker(root: string, r = runtime, ops?: Ops) {
   const load = (p: string) => import(join(root, `src/util/privacy-${p}.ts`));
   const [b, k, c] = await Promise.all(["boundary", "checker", "chunks"].map(load));
   const policy = workload(ops ? "plain" : "preparation");
@@ -322,20 +321,16 @@ export async function measureWorker(root: string, r: Clocks = runtime, ops?: Ops
       });
       const turns: [number, number, number, string][] = [];
       const [idle, pending] = [[] as number[][], [] as unknown[]];
-      let [beating, last, heartbeat, spent] = [true, r.now(), 0, mainMs()];
-      const beat = (now = r.now(), used = producer ? mainMs() : 0) => {
-        // Only implementation code and this heartbeat run on the main thread in a producer trial, so a gap the main
-        // thread spent mostly on CPU is owned however the code resumed (I/O, captured or imported timers).
-        if (producer && now - last > 2 && used - spent >= (now - last) / 2)
-          open = { start: last, end: now, phases: new Set([...(open?.phases ?? []), "resumed"]) };
-        if (open)
-          turns.push([open.start - start, open.end - open.start, now - last, [...open.phases].join()]);
-        else if (now - last > 2) idle.push([now - start, now - last]);
-        [open, last, heartbeat, spent] = [undefined, now, heartbeat + 1, used];
-        if (beating) setImmediate(beat);
+      let [beating, last, heartbeat] = [true, r.now(), 0];
+      const beat = (now = r.now(), owned = open ? open.end - open.start : 0) => {
+        if (open) turns.push([open.start - start, owned, now - last, [...open.phases].join()]);
+        if (now - last - owned > 2) idle.push([now - start, now - last - owned]); // Unowned gap time, beside turns too.
+        [open, last, heartbeat] = [undefined, now, heartbeat + 1];
+        if (beating) resumptions.setImmediate(beat);
       };
       const [cpu, main, start] = [process.cpuUsage(), process.threadCpuUsage(), r.now()];
-      setImmediate(beat);
+      resumptions.own = producer && own; // Preloaded hooks own producer resumptions (scripts/benchmark-resumptions.ts).
+      resumptions.setImmediate(beat);
       let value: unknown;
       try {
         if (producer) value = await own(label, () => producer.run(checker, own));
@@ -353,6 +348,7 @@ export async function measureWorker(root: string, r: Clocks = runtime, ops?: Ops
         } finally {
           beating = false;
           await r.pause().then(() => beat());
+          resumptions.own = undefined;
         }
       }
       const results = (await Promise.all(pending)) as Awaited<ReturnType<typeof consume>>[];
@@ -376,14 +372,12 @@ export async function measureWorker(root: string, r: Clocks = runtime, ops?: Ops
     };
     const metrics = "wallMs cpuMs.workerAndRuntime cpuMs.mainThreadWithHeartbeat submissionMs latencyMs";
     const medians = Object.fromEntries(`${metrics} addedLatencyMs`.split(" ").map((k) => [k, median(k)]));
-    groups[label] = {
-      workloads,
-      dimensions: producer?.dimensions,
-      status: "available",
-      medians,
-      ...summarizeTrials(trials),
-      exceeds50ms: trials.some((t) => t.slice > 50),
-    };
+    const [dimensions, status, exceeds50ms] = [
+      producer?.dimensions,
+      "available",
+      trials.some((t) => t.slice > 50),
+    ];
+    groups[label] = { workloads, dimensions, status, medians, ...summarizeTrials(trials), exceeds50ms };
   };
   if (ops) for (const [label, producer] of Object.entries(ops)) await series(label, [], producer);
   else {
@@ -391,7 +385,7 @@ export async function measureWorker(root: string, r: Clocks = runtime, ops?: Ops
     await series("eight slots, then slot backpressure", [...eight, busy(bmp)]);
     await series("byte backpressure (64 MiB pending)", [bmp, bmp, busy(bmp)]);
   }
-  const resumed = ops ? " or producer gap >2 ms at >=50% main-thread CPU (resumed)" : "";
+  const resumed = ops ? " (producer resumptions owned via preloaded hooks); idle: unowned gap ms >2" : "";
   const method = `slice: wall ms per daemon turn${resumed}; worker CPU: cpuUsage minus main threadCpuUsage`;
   const size = { entries: policy.entries.length, credentials: policy.credentials.length };
   return { platform: r.platform, method, policy: size, groups, decision: decideC21c(raw) };
@@ -410,14 +404,15 @@ export async function command(cmd: string[], cwd = process.cwd(), environment?: 
   return r.stdout.trim();
 }
 type Env = (root: string) => Record<string, string>;
-export async function launch({ ref, name }: Job, script = import.meta.path, env?: Env) {
+export async function launch({ ref, name }: Job, script: string | string[] = import.meta.path, env?: Env) {
   const root = await fs.mkdtemp(join(tmpdir(), "privacy-boundary-"));
   const result = (async () => {
     const sha = await command(["git", "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]);
     await command(["git", "archive", `--output=${root}/snapshot.tar`, sha, "src", "package.json"]);
     await command(["tar", "-xf", `${root}/snapshot.tar`, "-C", root]);
     await fs.symlink(resolve("node_modules"), join(root, "node_modules"), "dir");
-    const raw = await command([process.execPath, script, "--worker", root, name, sha], root, env?.(root));
+    const cmd = [process.execPath, ...[script].flat(), "--worker", root, name, sha];
+    const raw = await command(cmd, root, env?.(root));
     return { ref, name, report: JSON.parse(raw) as unknown };
   })();
   return { result, cleanup: () => fs.rm(root, { recursive: true, force: true }) };
