@@ -31,7 +31,10 @@ import * as privateReads from "../src/util/private-reads.ts";
 import { privateReadPaths, protectPrivateFile } from "../src/util/private-reads.ts";
 import * as proc from "../src/util/proc.ts";
 import { pollerHarness } from "./github-poller-support.ts";
+import { resetProcessPrivacy } from "./privacy-process-support.ts";
 import { setupFixture } from "./setup-support.ts";
+
+afterEach(resetProcessPrivacy);
 
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const pem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();

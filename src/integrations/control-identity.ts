@@ -19,7 +19,7 @@ export function createControlNamer(dataKey: Uint8Array): ControlNamer {
   return {
     derive(kind, components) {
       try {
-        if (!["receipt", "boundary", "run-index", "member", "land-authority"].includes(kind))
+        if (!["receipt", "boundary", "run-index", "member", "land-authority", "policy"].includes(kind))
           throw new Error();
         const captured = snapshotJson(components);
         if (!Array.isArray(captured) || captured.some((part) => typeof part !== "string")) throw new Error();
