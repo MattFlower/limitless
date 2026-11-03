@@ -58,6 +58,8 @@ export async function mountIntegrations(factory: Factory, deps: IntegrationDeps 
     const seconds = factory.cfg.githubPollSeconds;
     const stopPoller = factory.cfg.githubPoll
       ? startGitHubPoller(factory.store, {
+          cfg: factory.cfg,
+          authority: deps.authority,
           client: deps.github,
           gh: deps.gh,
           seconds,

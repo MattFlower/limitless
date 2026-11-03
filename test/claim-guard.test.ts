@@ -482,6 +482,7 @@ test("source boundaries restrict claim scopes to execution, observer validation 
     ...scoped,
   ]);
   const references: string[] = [];
+  const binders: string[] = [];
   for await (const path of new Bun.Glob("src/**/*.ts").scan({
     cwd: new URL("..", import.meta.url).pathname,
   })) {
@@ -495,8 +496,12 @@ test("source boundaries restrict claim scopes to execution, observer validation 
       continue;
     }
     expect(source).not.toMatch(/\bbindClaim\b/);
+    if (/\bbindRunClaim\b/.test(source)) {
+      expect(scoped.has(path)).toBe(true);
+      binders.push(path);
+    }
     if (path !== execution && path !== engine) {
-      expect(source).not.toMatch(/\b(?:bindRunClaim|renewRunClaim)\b/);
+      expect(source).not.toMatch(/\brenewRunClaim\b/);
       if (path !== observer) expect(source).not.toMatch(/claimScope\.run\b|\bvalidateRunClaim\b/);
       const runtime =
         path === "src/pipeline/context.ts"
@@ -527,6 +532,7 @@ test("source boundaries restrict claim scopes to execution, observer validation 
     }
   }
   expect(references.sort()).toEqual([...allowed].sort());
+  expect(binders.sort()).toEqual([...scoped].sort());
 });
 
 test("claim rejection selection preserves identity, priority and input-order ties", () => {

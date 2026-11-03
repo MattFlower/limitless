@@ -4,6 +4,8 @@ import type { Store } from "../db/store.ts";
 import { credentialRedactionPadding, redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
 import { CiEvidenceHeadMoved, unrelatedCiTests } from "./ci-test-evidence.ts";
+import { ClaimControlError } from "./claim-errors.ts";
+import { ClaimObserverSuppressed } from "./claim-projection.ts";
 import type { GitHubResponse, PrSnapshot } from "./github-poller.ts";
 
 const bad = new Set(["failure", "error", "timed_out", "startup_failure", "action_required", "cancelled"]);
@@ -45,6 +47,7 @@ type Call = (
   path: string,
   body?: unknown,
   optionalLog?: boolean,
+  dispatchGuard?: () => void,
 ) => Promise<GitHubResponse | null>;
 const publication = (text: string, from: number, to: number) => {
   if (to <= from) return "";
@@ -145,7 +148,16 @@ async function inspectCiInner(
   approvedSha?: string,
   writeGuard: () => boolean = () => true,
   now: () => number = Date.now,
+  rerunGuard?: () => void,
 ): Promise<boolean | "head_moved"> {
+  const rerunAllowed = () => {
+    try {
+      rerunGuard?.();
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const allowed = () => {
     if (!writeGuard()) throw new CiWriteDenied();
   };
@@ -288,7 +300,25 @@ async function inspectCiInner(
     });
   const requestRerun = async (f: CiFailure, job: number, excerpt: string) => {
     allowed();
-    const res = await call(pr.repo, `${root}/actions/jobs/${job}/rerun`, {});
+    const dispatchGuard = rerunGuard
+      ? () => {
+          try {
+            rerunGuard();
+          } catch (error) {
+            store.releaseCiRerun(f);
+            throw error;
+          }
+        }
+      : undefined;
+    const args = [pr.repo, `${root}/actions/jobs/${job}/rerun`, {}] as const;
+    const res = await (dispatchGuard ? call(...args, undefined, dispatchGuard) : call(...args)).catch(
+      (error: unknown) => {
+        if (error instanceof ClaimControlError || error instanceof ClaimObserverSuppressed)
+          return "deferred" as const;
+        throw error;
+      },
+    );
+    if (res === "deferred") return res;
     allowed();
     if (res?.rerunRetryAt !== undefined) {
       reject(f, excerpt);
@@ -560,6 +590,10 @@ async function inspectCiInner(
         if (remote.head.sha !== snap.headRefOid) return false;
         if (remote.state !== "open" || !current()) continue;
         if (!ready()) return false;
+        if (!rerunAllowed()) {
+          paused = true;
+          continue;
+        }
         if (
           write(() => {
             const claimed = store.claimCiRerun(
@@ -578,7 +612,8 @@ async function inspectCiInner(
             return claimed;
           })
         ) {
-          await requestRerun({ ...f, rerunMarker: marker }, job.id, excerpt);
+          if ((await requestRerun({ ...f, rerunMarker: marker }, job.id, excerpt)) === "deferred")
+            paused = true;
           continue;
         }
         // Another Store/daemon may win the atomic claim while this inspection awaits the head read.
@@ -612,6 +647,7 @@ export function ciDecision(
   approvedSha?: string,
   writeGuard: () => boolean = () => true,
   now: () => number = Date.now,
+  rerunGuard?: () => void,
 ): Promise<CiDecision> {
   let active = inspections.get(store);
   if (!active) {
@@ -640,6 +676,7 @@ export function ciDecision(
       approvedSha,
       writeGuard,
       now,
+      rerunGuard,
     ).catch((error: unknown) => {
       if (error instanceof CiWriteDenied || !writeGuard()) {
         denied = true;
