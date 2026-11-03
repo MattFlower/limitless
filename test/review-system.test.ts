@@ -1,4 +1,4 @@
-import { expect, mock, test } from "bun:test";
+import { afterEach, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,9 @@ import {
 } from "../src/pipeline/review-system.ts";
 import { MODELS, type ModelDef, PROVIDERS } from "../src/router/catalog.ts";
 import { enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
+import { resetProcessPrivacy } from "./privacy-process-support.ts";
+
+afterEach(resetProcessPrivacy);
 
 const system = (over: Record<string, unknown> = {}) => ({
   name: "with-report",

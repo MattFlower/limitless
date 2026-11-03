@@ -14,7 +14,7 @@ test.each(["daemon", "worker", "eval"])("%s provisions privacy before exposing w
   const cfg = loadConfig({ home: join(dir, "data"), configDir: join(dir, "config"), raw: {}, port: 0 });
   mkdirSync(join(cfg.paths.home, "worker"), { recursive: true });
   for (const name of ["token", "coordinator-fingerprint"])
-    writeFileSync(join(cfg.paths.home, "worker", name), "x");
+    writeFileSync(join(cfg.paths.home, "worker", name), "privacy-startup-test-credential");
   for (const failed of [false, true]) {
     const calls: string[] = [];
     const exposed = <T>(name: string, value?: T) => {
