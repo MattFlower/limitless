@@ -47,7 +47,7 @@ test.each(["non-zero exit", "timeout", "signal", "empty output", "process error"
     );
     const realProcess = proc.runProcess;
     const lookup = spyOn(proc, "runProcess").mockImplementation((opts) => {
-      if (failure === "process error") throw new Error(`${token} ${diagnostic}`);
+      if (failure === "process error") throw new Error("ENOENT missing executable");
       return realProcess(opts).then((result) => {
         if (failure === "timeout") return { ...result, timedOut: true };
         if (failure === "signal") return { ...result, exitCode: null, signal: "SIGTERM" };
@@ -60,7 +60,7 @@ test.each(["non-zero exit", "timeout", "signal", "empty output", "process error"
     const h = pollerHarness();
     let stop = () => {};
     try {
-      const message = `gh auth token failed: ${failure}`;
+      const message = `gh auth token failed: ${failure}${failure === "process error" ? ": Error: ENOENT missing executable" : ""}`;
       const error = await ghClient("user").catch((error: unknown) => error);
       expect(error).toBeInstanceOf(Error);
       expect(String(error)).toBe(`Error: ${message}`);
@@ -127,4 +127,28 @@ test.each(["cancelled", "truncated output"])("shared token lookup safely rejects
     }),
   ).rejects.toThrow(`gh auth token failed: ${failure}`);
   expect(proc.redactCredentials(token)).toBe("[redacted]");
+});
+
+test.each([0, 180])("token exception diagnostics redact before truncation (padding: %s)", async (padding) => {
+  const credential = `fake-token-${randomUUID()}`;
+  proc.registerCredential("TOKEN_ERROR_TEST", credential);
+  const error = new Error(`${"x".repeat(padding)}${credential} ENOENT`);
+  error.name = `Lookup-${credential}`;
+  for (const key of ["stdout", "stderr", "stack", "cause"])
+    Object.defineProperty(error, key, {
+      get() {
+        throw new Error("must not read process output or nested errors");
+      },
+    });
+  const result = await githubToken(undefined, async () => {
+    throw error;
+  }).catch((e: unknown) => e);
+  expect(result).toBeInstanceOf(Error);
+  const message = (result as Error).message;
+  const prefix = "gh auth token failed: process error: ";
+  expect(message).toBe(
+    `${prefix}${`Lookup-[redacted]: ${"x".repeat(padding)}[redacted] ENOENT`.slice(0, 200)}`,
+  );
+  expect(message).not.toContain(credential);
+  expect(message.length).toBeLessThanOrEqual(prefix.length + 200);
 });

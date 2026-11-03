@@ -38,6 +38,7 @@ import { type ReadPolicyOptions, readPolicyScope } from "../harness/read-policy.
 import { type ConfinementBackend, confinementScope } from "../harness/sandbox.ts";
 import { ciDecision, headMoved } from "../integrations/ci-classifier.ts";
 import { rethrowClaimControl } from "../integrations/claim-errors.ts";
+import type { ClaimClient } from "../integrations/claim-ref.ts";
 import { type GhRunner, runGh } from "../integrations/github.ts";
 import { githubIdentity, githubUrlRepo } from "../integrations/github-identity.ts";
 import {
@@ -59,8 +60,10 @@ import { processConflictTriggers } from "../pipeline/conflict-round.ts";
 import type { RunState } from "../pipeline/context.ts";
 import { observeGateFailures } from "../pipeline/gate-execution.ts";
 import { checkDiscreetCommits, hasFactoryMark } from "../pipeline/markers.ts";
+import { claimKey, claimRef } from "../pipeline/portable.ts";
 import { renderReportArtifacts, verifiedFailureState } from "../pipeline/report.ts";
 import { stripReportManifest } from "../pipeline/report-privacy.ts";
+import { sharedRepository } from "../pipeline/run-claim.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
 
@@ -69,6 +72,7 @@ export class LandBlocked extends Error {}
 class LandConflict extends LandBlocked {}
 class LandApprovalStopped extends Error {}
 class LandClaimLost extends Error {}
+class LandClaimWait extends Error {}
 
 /** What one observation says about the PR the entry is landing. */
 export interface LandObservation {
@@ -126,6 +130,7 @@ export interface LandDeps {
   client?: LandPrClient;
   gh?: GhRunner;
   github?: GitHubClient;
+  claims?: Pick<ClaimClient, "read">;
   ciReruns?: boolean;
   clock?: LandClock;
   /** How often CI is looked at while a land waits; 15s, like a delivered PR's poll. */
@@ -450,6 +455,15 @@ export class LandQueue {
     } catch (error) {
       // A cancel or a shutdown aborts on purpose: the entry keeps its state for the next start.
       if (controller.signal.aborted || error instanceof LandClaimLost) return;
+      if (error instanceof LandClaimWait) {
+        this.owned(entry.id, () => {
+          const current = this.store.getLandEntry(entry.id);
+          if (!current || !this.isActive(current) || current.reason === error.message) return;
+          this.store.updateLandEntry(entry.id, { reason: error.message });
+          this.log(`[land] ${entry.id}: ${error.message}`);
+        });
+        return;
+      }
       clear(heartbeat);
       const blocked = this.store.transaction(() => {
         if (!this.store.ownsLandClaim(entry.id, this.owner)) return false;
@@ -468,12 +482,45 @@ export class LandQueue {
 
   // ---- the land itself -----------------------------------------------------
 
+  private async claimWait(entry: LandEntry, signal: AbortSignal): Promise<void> {
+    const cfg = this.deps.cfg ?? { repos: {} };
+    if (!repoSettings(cfg, entry.repo).shared) return;
+    const unavailable = "land waits for the run's claim (unavailable)";
+    try {
+      const repo = this.store.getRepoBySlug(entry.repo);
+      if (!repo) throw new LandClaimWait(unavailable);
+      if (!sharedRepository(cfg, repo, entry.repo)) return;
+      if (!entry.runId) throw new LandClaimWait("land waits for the run's claim (no local run)");
+      const run = this.store.getRun(entry.runId);
+      if (!run || !this.deps.claims) throw new LandClaimWait(unavailable);
+      const key = claimKey(run, this.store);
+      if ("none" in key) throw new LandClaimWait(unavailable);
+      const prRef = claimRef({ kind: "pr", repo: entry.repo, number: Number(entry.prUrl.split("/").pop()) });
+      for (const ref of new Set([prRef, claimRef(key)])) {
+        const read = await this.deps.claims.read(entry.repo, ref, signal);
+        signal.throwIfAborted();
+        if (read.kind === "absent") continue;
+        if (read.kind !== "tip" || read.tip.record === "malformed") throw new LandClaimWait(unavailable);
+        if (read.tip.record.state === "held")
+          throw new LandClaimWait(
+            `land waits for the run's claim (held by member ${read.tip.record.holder})`,
+          );
+        if (read.tip.record.state !== "released") throw new LandClaimWait(unavailable);
+      }
+    } catch (error) {
+      signal.throwIfAborted();
+      if (error instanceof LandClaimWait) throw error;
+      throw new LandClaimWait(unavailable);
+    }
+  }
+
   /**
    * One checkout for a first attempt and for a resume. `pushed_sha` is recorded before publication:
    * confirm it against the current PR head before skipping preparation. A confirmed push resumes
    * with only CI and the merge left, including a crash before the `waiting_ci` update.
    */
   private async land(entry: LandEntry, signal: AbortSignal): Promise<void> {
+    await this.claimWait(entry, signal);
     const { repo, run } = this.context(entry);
     // Claims reset merging to checking; any recorded push may have merged before a restart.
     if (entry.pushedSha) {
@@ -991,13 +1038,33 @@ export class LandQueue {
     signal: AbortSignal,
   ): Promise<void> {
     const remote = await remoteBranchSha(repo, cwd, entry.headBranch, signal);
+    await this.claimWait(entry, signal);
     this.owned(entry.id, () => {
       signal.throwIfAborted();
       if (remote !== entry.approvedSha) throw new LandBlocked("head moved after approval");
       this.store.updateLandEntry(entry.id, { pushedSha: head });
     });
-    await pushExistingBranch(repo, cwd, entry.headBranch, entry.approvedSha, signal, undefined, head, () =>
-      this.assertClaim(entry.id),
+    await pushExistingBranch(
+      repo,
+      cwd,
+      entry.headBranch,
+      entry.approvedSha,
+      signal,
+      undefined,
+      head,
+      () => this.assertClaim(entry.id),
+      async () => {
+        try {
+          await this.claimWait(entry, signal);
+        } catch (error) {
+          this.owned(entry.id, () => {
+            const current = this.store.getLandEntry(entry.id);
+            if (current?.state === "checking" && current.pushedSha === head)
+              this.store.updateLandEntry(entry.id, { pushedSha: null });
+          });
+          throw error;
+        }
+      },
     );
   }
 
@@ -1176,7 +1243,15 @@ export class LandQueue {
     using _span = { [Symbol.dispose]: beginActivity("land.merge") };
     const guard = async () => {
       this.assertClaim(entry.id);
-      if (!this.deps.requiresApproval?.has(entry.repo.toLowerCase())) return;
+      const shared = sharedRepository(this.deps.cfg ?? { repos: {} }, repo, entry.repo);
+      if (!this.deps.requiresApproval?.has(entry.repo.toLowerCase())) {
+        if (shared) {
+          await this.claimWait(entry, signal);
+          signal.throwIfAborted();
+          this.assertClaim(entry.id);
+        }
+        return;
+      }
       let evidence: Awaited<ReturnType<LandQueue["approvalEvidence"]>>;
       let reads = 0;
       do {
@@ -1206,6 +1281,16 @@ export class LandQueue {
       }
       if (!this.qualifies({ ...entry, pushedSha: sha }, evidence)) {
         this.parkApproval(entry, signal, evidence.seen);
+        throw new LandApprovalStopped();
+      }
+      if (!shared) return;
+      await this.claimWait(entry, signal);
+      signal.throwIfAborted();
+      this.assertClaim(entry.id);
+      // Only current review evidence can revoke approval while the claim read is pending.
+      const seen = this.store.githubReview(entry.prUrl);
+      if (!this.qualifies({ ...entry, pushedSha: sha }, { seen, login: evidence.login })) {
+        this.parkApproval(entry, signal, seen, "Review state changed during the final approval check");
         throw new LandApprovalStopped();
       }
     };

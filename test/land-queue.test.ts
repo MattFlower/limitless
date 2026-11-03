@@ -28,12 +28,14 @@ import * as repos from "../src/git/repos.ts";
 import { ensureCache } from "../src/git/repos.ts";
 import { confinementScope, observerRoots } from "../src/harness/sandbox.ts";
 import { ClaimLostError } from "../src/integrations/claim-errors.ts";
+import type { ClaimClient, ClaimRead } from "../src/integrations/claim-ref.ts";
 import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import { configureGitHubIdentity } from "../src/integrations/github-identity.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type GitHubClient, normalizePr, startGitHubPoller } from "../src/integrations/github-poller.ts";
-import { LandBlocked, type LandPrClient, LandQueue } from "../src/land/queue.ts";
+import { LandBlocked, type LandDeps, type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
+import * as gateExecution from "../src/pipeline/gate-execution.ts";
 import { markReport, reportStructure, reportText } from "../src/pipeline/report-privacy.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import * as proc from "../src/util/proc.ts";
@@ -194,7 +196,12 @@ const approve = (n: number, head: string) => {
 };
 
 /** A succeeded run that delivered `branch` as PR `n`, with the poller's observation of its head. */
-function delivered(n: number, branch: string, requestedBy?: string): { run: Run; prUrl: string } {
+function delivered(
+  n: number,
+  branch: string,
+  requestedBy?: string,
+  sourceRef?: Run["sourceRef"],
+): { run: Run; prUrl: string } {
   const repo = store.upsertRepo({
     slug: SLUG,
     kind: "github",
@@ -203,7 +210,12 @@ function delivered(n: number, branch: string, requestedBy?: string): { run: Run;
     defaultBranch: "main",
     mergePolicy: "pr",
   });
-  const run = store.createRun(repo, { repo: SLUG, prompt: `pr ${n}`, requestedBy });
+  const run = store.createRun(repo, {
+    repo: SLUG,
+    prompt: `pr ${n}`,
+    requestedBy,
+    sourceRef: sourceRef ?? undefined,
+  });
   runs.set(n, run);
   store.updateRun(run.id, {
     prUrl: url(n),
@@ -299,7 +311,8 @@ function roundRun(ownerId: string, prUrl: string, head: string, db = store): Run
 
 function queue(
   opts: {
-    cfg?: import("../src/config.ts").Config;
+    cfg?: LandDeps["cfg"];
+    claims?: Pick<ClaimClient, "read">;
     polling?: boolean;
     requiresApproval?: ReadonlySet<string>;
     client?: LandPrClient;
@@ -481,6 +494,620 @@ function fakeLandGates(
   };
   return { executor, requests };
 }
+
+const sharedLandConfig = {
+  repos: { [SLUG]: { shared: true, discreet: false, branchPrefix: "change/", landRequiresApproval: false } },
+};
+const prClaimRef = "refs/limitless/claims/pr-1";
+const unavailableClaim = "land waits for the run's claim (unavailable)";
+const heldClaim = "land waits for the run's claim (held by member m-0123456789abcdef)";
+function claimResult(state: "held" | "released", kind: "pr" | "issue" = "pr"): ClaimRead {
+  return {
+    kind: "tip",
+    tip: {
+      sha: "a".repeat(40),
+      committedAt: new Date(0).toISOString(),
+      record: {
+        kind,
+        number: kind === "pr" ? 1 : 12,
+        state,
+        holder: "m-0123456789abcdef",
+        run: "run123",
+        generation: 1,
+        status: "succeeded",
+      },
+    },
+  };
+}
+function landClaims() {
+  const refs = new Map<string, ClaimRead>();
+  const reads: string[] = [];
+  const client: Pick<ClaimClient, "read"> = {
+    async read(repo, ref, signal) {
+      expect(repo).toBe(SLUG);
+      expect(signal).toBeInstanceOf(AbortSignal);
+      reads.push(ref);
+      return refs.get(ref) ?? { kind: "absent" };
+    },
+  };
+  return { refs, reads, client };
+}
+async function claimLandFixture(sourceRef?: Run["sourceRef"], noRun = false) {
+  const pr = delivered(1, "pr-1", undefined, sourceRef);
+  const head = await pushBranch("pr-1", "one.txt", "one\n");
+  observe(1, head, "SUCCESS");
+  approve(1, head);
+  const entry = store.createLandEntry({
+    runId: noRun ? null : pr.run.id,
+    repo: SLUG,
+    prUrl: url(1),
+    baseBranch: "main",
+    headBranch: "pr-1",
+    approvedSha: head,
+  });
+  const fake = fakeLandGates((req) => retryRun(req));
+  return { pr, head, entry, fake, claims: landClaims() };
+}
+async function claimParked(entry: LandEntry, reason: string) {
+  await waitWithoutClock(
+    () => store.getLandEntry(entry.id)?.reason === reason && clock.pending === 1,
+    15_000,
+  );
+}
+
+test.each(["pr", "issue", "same"])(
+  "shared land waits at start for %s claim and reclaims after release",
+  async (kind) => {
+    const sourceRef: Run["sourceRef"] =
+      kind === "pr"
+        ? null
+        : kind === "issue"
+          ? { kind: "issue", repo: SLUG, number: 12 }
+          : { kind: "pull_request", repo: SLUG, number: 1 };
+    const { entry, fake, claims } = await claimLandFixture(sourceRef);
+    await advanceBase();
+    const ref = kind === "issue" ? "refs/limitless/claims/12" : prClaimRef;
+    claims.refs.set(ref, claimResult("held", kind === "issue" ? "issue" : "pr"));
+    const approval = store.approvalFor(entry.prUrl);
+    const checkout = spyOn(repos, "addDetachedWorktree");
+    const push = spyOn(repos, "pushExistingBranch");
+    try {
+      queue({ cfg: sharedLandConfig, claims: claims.client, gateExecutor: fake.executor });
+      await claimParked(entry, heldClaim);
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", attempts: 1, pushedSha: null });
+      await clock.advance(30_000);
+      await waitWithoutClock(() => store.getLandEntry(entry.id)?.attempts === 2 && clock.pending === 1);
+      expect(claims.reads).toEqual(kind === "issue" ? [prClaimRef, ref, prClaimRef, ref] : [ref, ref]);
+      expect(checkout).not.toHaveBeenCalled();
+      expect(fake.requests).toHaveLength(0);
+      expect(push).not.toHaveBeenCalled();
+      expect(ghCalls("pr merge")).toHaveLength(0);
+      expect(store.approvalFor(entry.prUrl)).toEqual(approval);
+      expect(landLog.filter((s) => s.includes(heldClaim))).toHaveLength(1);
+      claims.refs.set(ref, claimResult("released", kind === "issue" ? "issue" : "pr"));
+      await clock.advance(30_000);
+      await settle();
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", attempts: 3 });
+      expect(fake.requests).toHaveLength(1);
+      if (kind === "same") expect(claims.reads).toEqual(Array(6).fill(prClaimRef));
+      expect(push).toHaveBeenCalledTimes(1);
+      expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${await remoteHead("pr-1")}`);
+    } finally {
+      checkout.mockRestore();
+      push.mockRestore();
+    }
+  },
+);
+
+test.each(["no run", "missing run", "key", "store", "unconfirmed", "malformed", "error", "client"])(
+  "shared land quietly waits for unavailable authority: %s",
+  async (mode) => {
+    const { entry, fake, claims, pr } = await claimLandFixture(undefined, mode === "no run");
+    const getRun = store.getRun.bind(store);
+    const lookup = spyOn(store, "getRun").mockImplementation((id) => {
+      if (id === pr.run.id) {
+        if (mode === "missing run") return null;
+        if (mode === "store") throw new Error("cannot read authority");
+        if (mode === "key")
+          return { ...pr.run, sourceRef: { kind: "pull_request", repo: "other/repo", number: 1 } };
+      }
+      return getRun(id);
+    });
+    if (mode === "unconfirmed") claims.refs.set(prClaimRef, { kind: "unconfirmed", error: "unavailable" });
+    if (mode === "malformed")
+      claims.refs.set(prClaimRef, {
+        kind: "tip",
+        tip: { sha: "b".repeat(40), committedAt: "", record: "malformed" },
+      });
+    if (mode === "error")
+      claims.client.read = async () => {
+        throw new Error("offline");
+      };
+    try {
+      queue({
+        cfg: sharedLandConfig,
+        claims: mode === "client" ? undefined : claims.client,
+        gateExecutor: fake.executor,
+      });
+      await claimParked(
+        entry,
+        mode === "no run" ? "land waits for the run's claim (no local run)" : unavailableClaim,
+      );
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "checking", pushedSha: null, attempts: 1 });
+      expect(store.approvalFor(entry.prUrl)?.sha).toBe(entry.approvedSha);
+      expect(fake.requests).toHaveLength(0);
+      expect(ghCalls("pr merge")).toHaveLength(0);
+    } finally {
+      lookup.mockRestore();
+    }
+  },
+);
+
+test("shared waiting land restarts and re-reads released claims", async () => {
+  const { entry, claims, fake } = await claimLandFixture();
+  claims.refs.set(prClaimRef, { kind: "unconfirmed", error: "offline" });
+  const opts = { cfg: sharedLandConfig, claims: claims.client, gateExecutor: fake.executor };
+  const first = queue(opts);
+  await claimParked(entry, unavailableClaim);
+  await first.stop();
+  claims.refs.set(prClaimRef, claimResult("released"));
+  queue(opts);
+  await clock.advance(30_000);
+  await settle();
+  expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", attempts: 2 });
+  expect(fake.requests).toHaveLength(1);
+  expect(ghCalls("pr merge")).toHaveLength(1);
+});
+
+test.each(["remoteBranchSha", "internal ls-remote"])(
+  "shared land rechecks after %s and retries an unpushed commit",
+  async (boundary) => {
+    const { entry, head, fake, claims } = await claimLandFixture();
+    await advanceBase();
+    const ready = deferred<void>();
+    const release = deferred<void>();
+    const original = proc.sh;
+    let lookups = 0;
+    let pushes = 0;
+    const observations = spyOn(gateExecution, "observeGateFailures");
+    const updates = spyOn(store, "updateLandEntry");
+    const transport = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+      const result = await original(cmd, opts);
+      if (cmd[0] === "git" && cmd.includes("push")) pushes++;
+      if (
+        cmd[0] === "git" &&
+        cmd.includes("ls-remote") &&
+        ++lookups === (boundary === "remoteBranchSha" ? 1 : 2)
+      ) {
+        ready.resolve();
+        await release.promise;
+      }
+      return result;
+    });
+    try {
+      queue({ cfg: sharedLandConfig, claims: claims.client, gateExecutor: fake.executor });
+      await ready.promise;
+      expect(store.getLandEntry(entry.id)?.pushedSha === null).toBe(boundary === "remoteBranchSha");
+      claims.refs.set(prClaimRef, claimResult("held"));
+      release.resolve();
+      await claimParked(entry, heldClaim);
+      expect(store.getLandEntry(entry.id)?.pushedSha).toBeNull();
+      if (boundary === "remoteBranchSha")
+        expect(updates.mock.calls.some(([, patch]) => !!patch.pushedSha)).toBe(false);
+      expect(await remoteHead("pr-1")).toBe(head);
+      expect(pushes).toBe(0);
+      expect(fake.requests).toHaveLength(1);
+      expect(store.githubPrData(entry.prUrl)).not.toContain(fake.requests[0]?.headSha ?? "missing");
+      claims.refs.set(prClaimRef, claimResult("released"));
+      await clock.advance(30_000);
+      await settle();
+      expect(fake.requests).toHaveLength(2);
+      expect(fake.requests.map((r) => r.cwd)).toEqual(
+        [1, 2].map((attempt) => join(paths.work, `land-${entry.id}-${attempt}`)),
+      );
+      expect(observations.mock.calls.map(([, identity]) => identity.handle_id)).toEqual(
+        [1, 2].map((n) => `${entry.id}:${n}`),
+      );
+      expect(pushes).toBe(1);
+      const pushed = await remoteHead("pr-1");
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "landed", pushedSha: pushed });
+      expect(store.githubPrData(entry.prUrl)).toContain(pushed);
+      expect(ghCalls("pr merge")).toHaveLength(1);
+    } finally {
+      release.resolve();
+      transport.mockRestore();
+      observations.mockRestore();
+      updates.mockRestore();
+    }
+  },
+);
+
+test.each([false, true])(
+  "shared land checks the final merge boundary after approval awaits (required: %s)",
+  async (required) => {
+    const { entry, head, fake, claims } = await claimLandFixture();
+    store.updateLandEntry(entry.id, { pushedSha: head });
+    reviewObservation(head);
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    const ready = deferred<void>();
+    const release = deferred<void>();
+    let reads = 0;
+    const client: GitHubClient = async (path, body, signal) => {
+      const response = await github.client(path, body, signal);
+      if (path === "graphql" && ++reads === 2) {
+        ready.resolve();
+        await release.promise;
+      }
+      return response;
+    };
+    const merge = repos.mergePullRequest;
+    const hook = spyOn(repos, "mergePullRequest").mockImplementation(async (...args) => {
+      if (!required) {
+        ready.resolve();
+        await release.promise;
+      }
+      return merge(...args);
+    });
+    const push = spyOn(repos, "pushExistingBranch");
+    const approval = store.approvalFor(entry.prUrl);
+    try {
+      queue({
+        cfg: sharedLandConfig,
+        claims: claims.client,
+        gateExecutor: fake.executor,
+        github: client,
+        requiresApproval: required ? new Set([SLUG]) : undefined,
+      });
+      await ready.promise;
+      claims.refs.set(prClaimRef, claimResult("held"));
+      release.resolve();
+      await claimParked(entry, heldClaim);
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "merging", pushedSha: head });
+      expect(store.approvalFor(entry.prUrl)).toEqual(approval);
+      expect(ghCalls("pr merge")).toHaveLength(0);
+      claims.refs.set(prClaimRef, claimResult("released"));
+      await clock.advance(30_000);
+      await settle();
+      expect(fake.requests).toHaveLength(0);
+      expect(push).not.toHaveBeenCalled();
+      expect(ghCalls("pr merge")).toHaveLength(1);
+      expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${head}`);
+    } finally {
+      release.resolve();
+      hook.mockRestore();
+      push.mockRestore();
+    }
+  },
+);
+
+test.each([false, true])(
+  "shared land loses ownership during the final merge claim read (approval required: %s)",
+  async (required) => {
+    const { entry, head, fake, claims } = await claimLandFixture();
+    store.updateLandEntry(entry.id, { pushedSha: head });
+    reviewObservation(head);
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    const ready = deferred<void>();
+    const release = deferred<void>();
+    const read = claims.client.read;
+    claims.client.read = async (...args) => {
+      if (store.getLandEntry(entry.id)?.state === "merging") {
+        ready.resolve();
+        await release.promise;
+      }
+      return read(...args);
+    };
+    const push = spyOn(repos, "pushExistingBranch");
+    const q = queue({
+      cfg: sharedLandConfig,
+      claims: claims.client,
+      gateExecutor: fake.executor,
+      requiresApproval: required ? new Set([SLUG]) : undefined,
+    });
+    try {
+      await ready.promise;
+      expect(store.getLandEntry(entry.id)).toMatchObject({ state: "merging", pushedSha: head });
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      const before = claimSnapshot(entry);
+      const approval = store.approvalFor(entry.prUrl);
+      release.resolve();
+      await waitWithoutClock(() => clock.pending === 1, 15_000);
+      expect(ghCalls("pr merge")).toHaveLength(0);
+      expect(claimSnapshot(entry)).toEqual(before);
+      expect(store.approvalFor(entry.prUrl)).toEqual(approval);
+      expect(fake.requests).toHaveLength(0);
+      expect(push).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await q.stop();
+      push.mockRestore();
+    }
+  },
+);
+
+test.each(["DISMISSED", "CHANGES_REQUESTED"])(
+  "a %s review during the final merge claim read parks the approval instead of merging",
+  async (state) => {
+    const { entry, head, fake, claims } = await claimLandFixture();
+    store.updateLandEntry(entry.id, { pushedSha: head });
+    reviewObservation(head);
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    const ready = deferred<void>();
+    const release = deferred<void>();
+    const read = claims.client.read;
+    claims.client.read = async (...args) => {
+      if (store.getLandEntry(entry.id)?.state === "merging") {
+        ready.resolve();
+        await release.promise;
+      }
+      return read(...args);
+    };
+    const push = spyOn(repos, "pushExistingBranch");
+    try {
+      queue({
+        cfg: sharedLandConfig,
+        claims: claims.client,
+        gateExecutor: fake.executor,
+        requiresApproval: new Set([SLUG]),
+      });
+      await ready.promise;
+      reviewObservation(head, state);
+      release.resolve();
+      await waitWithoutClock(() => store.getLandEntry(entry.id)?.state === "waiting_approval", 15_000);
+      expect(store.getLandEntry(entry.id)).toMatchObject({
+        pushedSha: head,
+        reason: "Review state changed during the final approval check",
+      });
+      expect(ghCalls("pr merge")).toHaveLength(0);
+      reviewObservation(head);
+      await settle();
+      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+      expect(fake.requests).toHaveLength(0);
+      expect(push).not.toHaveBeenCalled();
+      expect(ghCalls("pr merge")).toHaveLength(1);
+      expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${head}`);
+    } finally {
+      release.resolve();
+      push.mockRestore();
+    }
+  },
+);
+
+test.each(["identical snapshot", "discarded older observation", "unchanged poll"])(
+  "a shared final claim read allows a qualifying approval after %s",
+  async (observation) => {
+    const { entry, head, fake, claims } = await claimLandFixture();
+    store.updateLandEntry(entry.id, { pushedSha: head });
+    reviewObservation(head);
+    const older = store.githubReview(entry.prUrl);
+    if (!older) throw new Error("missing review");
+    github.responses.set("user", () => respond(200, { login: "factory" }));
+    const ready = deferred<void>();
+    const release = deferred<void>();
+    const read = claims.client.read;
+    claims.client.read = async (...args) => {
+      if (store.getLandEntry(entry.id)?.state === "merging") {
+        ready.resolve();
+        await release.promise;
+      }
+      return read(...args);
+    };
+    const push = spyOn(repos, "pushExistingBranch");
+    let stop: (() => void) | undefined;
+    try {
+      queue({
+        cfg: sharedLandConfig,
+        claims: claims.client,
+        gateExecutor: fake.executor,
+        requiresApproval: new Set([SLUG]),
+      });
+      await ready.promise;
+      const qualifying = store.githubReview(entry.prUrl);
+      if (!qualifying) throw new Error("missing final approval");
+      const observations = store.githubReviewObservationCount(entry.prUrl);
+      if (observation === "identical snapshot") store.saveGithubReview(entry.prUrl, qualifying);
+      else if (observation === "discarded older observation") {
+        // This older request's completion is counted, but cannot replace the newer approval.
+        store.saveGithubReview(entry.prUrl, { ...older, reviewEvidence: [] });
+        expect(store.githubReview(entry.prUrl)).toEqual(qualifying);
+      } else {
+        stop = approvalPoller();
+        await clock.advance(0);
+        await waitWithoutClock(() => store.githubReviewObservationCount(entry.prUrl) > observations, 15_000);
+        expect(store.githubReview(entry.prUrl)?.requestSeq).toBeGreaterThan(qualifying.requestSeq ?? 0);
+        stop();
+      }
+      expect(store.githubReviewObservationCount(entry.prUrl)).toBeGreaterThan(observations);
+      release.resolve();
+      await waitFor(() => ["landed", "waiting_approval"].includes(store.getLandEntry(entry.id)?.state ?? ""));
+      expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+      expect(ghCalls("pr merge")).toHaveLength(1);
+      expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${head}`);
+      expect(fake.requests).toHaveLength(0);
+      expect(push).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      stop?.();
+      push.mockRestore();
+    }
+  },
+);
+
+test("a qualifying local approval race keeps the pre-claim merge scheduling", async () => {
+  const { entry, head, fake, claims } = await claimLandFixture();
+  store.updateLandEntry(entry.id, { pushedSha: head });
+  reviewObservation(head);
+  github.responses.set("user", () => respond(200, { login: "factory" }));
+  const save = store.saveGithubReview.bind(store);
+  const review = store.githubReview.bind(store);
+  let finalEvidenceSaved = false;
+  let raced = false;
+  const saving = spyOn(store, "saveGithubReview").mockImplementation((...args) => {
+    save(...args);
+    if (store.getLandEntry(entry.id)?.state === "merging") finalEvidenceSaved = true;
+  });
+  const reading = spyOn(store, "githubReview").mockImplementation((...args) => {
+    const seen = review(...args);
+    if (finalEvidenceSaved && !raced) {
+      raced = true;
+      // The final qualifies() read schedules a routine observation for the next microtask.
+      // A local merge must not yield for a claim check and then park on that observation.
+      queueMicrotask(() => reviewObservation(head));
+    }
+    return seen;
+  });
+  try {
+    queue({ claims: claims.client, requiresApproval: new Set([SLUG]), gateExecutor: fake.executor });
+    await waitWithoutClock(
+      () => ["landed", "waiting_approval"].includes(store.getLandEntry(entry.id)?.state ?? ""),
+      15_000,
+    );
+    expect(raced).toBe(true);
+    expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+    expect(claims.reads).toHaveLength(0);
+    expect(ghCalls("pr merge")).toHaveLength(1);
+    expect(ghCalls("pr merge")[0]).toContain(`--match-head-commit ${head}`);
+  } finally {
+    saving.mockRestore();
+    reading.mockRestore();
+  }
+});
+
+test("local land ignores an injected claim reader", async () => {
+  const { entry, fake, claims } = await claimLandFixture();
+  claims.refs.set(prClaimRef, claimResult("held"));
+  queue({ claims: claims.client, gateExecutor: fake.executor });
+  await settle();
+  expect(claims.reads).toHaveLength(0);
+  expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+});
+
+test.each(["stop", "cancel", "steal"])(
+  "late shared claim read preserves records after %s",
+  async (action) => {
+    const { entry, head, fake, claims } = await claimLandFixture();
+    store.updateLandEntry(entry.id, { reason: "prior reason", pushedSha: head });
+    const ready = deferred<void>();
+    const release = deferred<void>();
+    claims.client.read = async () => {
+      ready.resolve();
+      await release.promise;
+      return claimResult("held");
+    };
+    const q = queue({ cfg: sharedLandConfig, claims: claims.client, gateExecutor: fake.executor });
+    await ready.promise;
+    const stopped = action === "stop" ? q.stop() : undefined;
+    if (action === "cancel") q.cancel(entry.id);
+    if (action === "steal")
+      expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+    const before = store.getLandEntry(entry.id);
+    release.resolve();
+    if (stopped) await stopped;
+    else await waitWithoutClock(() => clock.pending === 1);
+    expect(store.getLandEntry(entry.id)).toEqual(before);
+    expect(fake.requests).toHaveLength(0);
+    expect(ghCalls("pr merge")).toHaveLength(0);
+  },
+);
+
+test.each(["stop", "steal", "cancel", "changed checkpoint"])(
+  "refused pre-push cleanup respects %s",
+  async (action) => {
+    const { entry, fake, claims } = await claimLandFixture();
+    await advanceBase();
+    const ready = deferred<void>();
+    const release = deferred<void>();
+    const read = claims.client.read;
+    const mergeBase = spyOn(gitMerge, "completeMerge");
+    const ciHeads: string[] = [];
+    const execute = proc.sh;
+    let pushes = 0;
+    const transport = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+      const result = await execute(cmd, opts);
+      if (cmd[0] === "git" && cmd.includes("push")) pushes++;
+      return result;
+    });
+    const push = repos.pushExistingBranch;
+    const boundary = spyOn(repos, "pushExistingBranch").mockImplementation(async (...args) => {
+      claims.client.read = async () => {
+        ready.resolve();
+        await release.promise;
+        return claimResult("held");
+      };
+      return push(...args);
+    });
+    const opts = {
+      cfg: sharedLandConfig,
+      claims: claims.client,
+      gateExecutor: fake.executor,
+      client: async (url: string, signal?: AbortSignal) => {
+        const view = await getGitHubPr(url, signal);
+        if (view?.headRefOid && store.getLandEntry(entry.id)?.state === "waiting_ci")
+          ciHeads.push(view.headRefOid);
+        return view ? { ...view, ci: ci()?.ci ?? "PENDING" } : null;
+      },
+    };
+    const q = queue(opts);
+    try {
+      await ready.promise;
+      const stopped = action === "stop" ? q.stop() : undefined;
+      if (action === "steal")
+        expect(store.claimLandEntry(SLUG, 30_000, "new-owner", clock.now() + 31_000)?.id).toBe(entry.id);
+      if (action === "cancel") q.cancel(entry.id);
+      if (action === "changed checkpoint") store.updateLandEntry(entry.id, { pushedSha: entry.approvedSha });
+      const before = store.getLandEntry(entry.id);
+      if (!before) throw new Error("missing land entry");
+      claims.refs.set(prClaimRef, claimResult("held"));
+      release.resolve();
+      if (stopped) await stopped;
+      else await waitWithoutClock(() => clock.pending === 1, 15_000);
+      expect(store.getLandEntry(entry.id)).toEqual(
+        action === "stop"
+          ? { ...before, pushedSha: null, updatedAt: expect.any(Number) }
+          : action === "changed checkpoint"
+            ? { ...before, reason: heldClaim, updatedAt: expect.any(Number) }
+            : before,
+      );
+      expect(await remoteHead("pr-1")).toBe(entry.approvedSha);
+      expect(pushes).toBe(0);
+      expect(ghCalls("pr merge")).toHaveLength(0);
+      if (action === "stop") {
+        expect(fake.requests).toHaveLength(1);
+        expect(mergeBase).toHaveBeenCalledTimes(1);
+        boundary.mockRestore();
+        claims.client.read = read;
+        claims.refs.clear();
+        ci = () => null;
+        const base = await remoteHead("main");
+        await clock.advance(30_000);
+        queue(opts);
+        await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
+        const pushed = store.getLandEntry(entry.id)?.pushedSha;
+        if (!pushed) throw new Error("missing pushed checkpoint");
+        expect(pushed).not.toBe(entry.approvedSha);
+        expect(await remoteHead("pr-1")).toBe(pushed);
+        expect(fake.requests).toHaveLength(2);
+        expect(mergeBase).toHaveBeenCalledTimes(2);
+        expect(mergeBase.mock.calls.map(([, head, mergedBase]) => [head, mergedBase])).toEqual([
+          [entry.approvedSha, base],
+          [entry.approvedSha, base],
+        ]);
+        expect(pushes).toBe(1);
+        expect(ghCalls("pr merge")).toHaveLength(0);
+        await waitWithoutClock(() => ciHeads.includes(pushed), 15_000);
+        ci = () => ({ ci: "SUCCESS" });
+        await settle();
+        expect(store.getLandEntry(entry.id)?.state).toBe("landed");
+        expect(pushes).toBe(1);
+      }
+    } finally {
+      release.resolve();
+      boundary.mockRestore();
+      transport.mockRestore();
+      mergeBase.mockRestore();
+    }
+  },
+);
 
 test.each(["targeted", "skipped", "mixed", "failure"])("land docs-only selection: %s", async (mode) => {
   mkdirSync(join(seed, "test"));

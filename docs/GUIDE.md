@@ -97,6 +97,8 @@ The script checks before Git inspection or checks, immediately before push, and 
 final merge dispatch. Configuration becoming shared, missing or invalid stops that dispatch.
 
 Shared PRs remain open until the shared landing path ships; existing local landing paths do not grant shared landing authority.
+Shared-repository lands wait for the run and PR claims to be clear; they also wait when there is
+no local run or claim client.
 
 A few more details:
 
