@@ -1808,6 +1808,7 @@ export async function pushExistingBranch(
   budget?: GitHubBudget,
   sha = "HEAD",
   guard?: () => void,
+  beforePush?: () => Promise<void>,
 ): Promise<void> {
   const url = repo.url;
   if (repo.kind !== "github" || !url) throw new Error("existing PR delivery requires a GitHub repo");
@@ -1824,6 +1825,7 @@ export async function pushExistingBranch(
       signal,
     });
     if (ancestor.exitCode !== 0) throw new Error("run result is not a descendant of the PR head");
+    if (beforePush) await beforePush();
     await remoteSh(
       [...BRANCH_PUSH, `--force-with-lease=${ref}:${baseSha}`, url, `${head}:${ref}`],
       { cwd: transport, timeoutMs: 300_000, signal, budget },
