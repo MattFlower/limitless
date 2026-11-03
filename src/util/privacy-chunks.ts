@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { consumeBoundaryText } from "./privacy-boundary.ts";
 import { currentPrivacyGeneration, privacyRegistry } from "./privacy-boundary.ts";
 
@@ -7,7 +6,6 @@ export type BoundaryChunks = { readonly [chunksBrand]: true };
 type Metadata = Omit<ReturnType<typeof consumeBoundaryText>, "text">;
 type Generation = ReturnType<typeof currentPrivacyGeneration>;
 type Evidence = {
-  inputDigest?: string;
   parts: ArrayBuffer[] | undefined;
   metadata: Metadata;
   generation: Generation | undefined;
@@ -39,10 +37,8 @@ export function issuePrivacyWorkerChunks(
   { truncated, checkedComplete, withheld, policyDigest, reason }: Metadata,
   generation: Generation | undefined,
   registry = privacyRegistry,
-  text?: string,
 ): BoundaryChunks {
   const state: Evidence = {
-    inputDigest: text === undefined ? undefined : createHash("sha256").update(text).digest("hex"),
     parts: parts ?? [marker.buffer],
     metadata: { truncated, checkedComplete, withheld, policyDigest, reason },
     generation,
@@ -60,8 +56,6 @@ export function issuePrivacyWorkerChunks(
 export function consumeBoundaryChunk(
   receipt: unknown,
   index: number,
-  registry?: typeof privacyRegistry,
-  text?: string,
 ): Metadata & { bytes: Uint8Array; done: boolean } {
   const state =
     typeof receipt === "object" && receipt !== null ? receipts.get(receipt as BoundaryChunks) : undefined;
@@ -72,12 +66,7 @@ export function consumeBoundaryChunk(
     policyDigest: "privacy/unavailable",
     reason: "forged",
   };
-  if (
-    !state ||
-    (registry && state.registry !== registry) ||
-    (text !== undefined && state.inputDigest !== createHash("sha256").update(text).digest("hex"))
-  )
-    return { ...forged, bytes: marker.slice(), done: true };
+  if (!state) return { ...forged, bytes: marker.slice(), done: true };
   if (!state.registry.ready || !current(state)) {
     if (state.parts) state.parts.length = 0;
     state.parts = undefined;

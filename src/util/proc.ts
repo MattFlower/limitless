@@ -1268,10 +1268,7 @@ export const credentialRedactionPadding = (): number => Math.max(0, credentialMa
 export function registerCredential(name: string, value?: string, mainThreadOnly = false): void {
   credentialNames.add(name);
   for (const secret of [value, process.env[name]])
-    if (typeof secret === "string") {
-      if (mainThreadOnly) credentialRegistry.addMainThreadOnly(secret);
-      else credentialRegistry.add(secret);
-    }
+    if (typeof secret === "string") credentialRegistry[mainThreadOnly ? "addMainThreadOnly" : "add"](secret);
 }
 export function redactCredentials(text: string): string;
 export function redactCredentials(text: string, window?: { start: number; end: number }): string;

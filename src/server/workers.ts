@@ -6,6 +6,7 @@ import type { Paths } from "../config.ts";
 import { type AgentJobRequest, PairingLimitError, type WorkerStore } from "../db/workers.ts";
 import type { GateRequest } from "../gates/executor.ts";
 import { loadPrivateStrings, privateStringsDigest } from "../gates/private.ts";
+import { remoteGateData } from "../gates/text-privacy.ts";
 import { worktreeGit } from "../git/command.ts";
 import { cachePath, iterationRefs, withRepoLock } from "../git/repos.ts";
 import { AgentEvents, AgentFailure, AgentResultReport } from "../workers/agent-protocol.ts";
@@ -312,8 +313,16 @@ export async function startWorkerListener(
         workers.fail(id, typeof invalid === "string" ? invalid : "Invalid gate result or requested checks");
         return json({ error: "Invalid gate result" }, 400);
       }
-      if (action === "events" && event.success) workers.event(id, event.data);
-      else if (result.success) workers.complete(id, result.data.run);
+      if (action === "events" && event.success)
+        workers.event(id, { ...event.data, result: remoteGateData(event.data.result) });
+      else if (result.success) {
+        const run = result.data.run;
+        workers.complete(id, {
+          ...run,
+          setup: run.setup.map(remoteGateData),
+          checks: run.checks.map(remoteGateData),
+        });
+      }
       return json({ ok: true });
     } catch (error) {
       return json(

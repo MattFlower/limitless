@@ -103,7 +103,7 @@ test("one fresh snapshot serves all fields until the next verifier", async () =>
     refresh.mockRestore();
   }
 });
-test("no key, forged receipt, stale receipt and wrong registry cannot sign", async () => {
+test("no key, forged receipt, stale receipt and withheld text cannot sign", async () => {
   const f = fixture();
   expect(await f.sign("safe", { signer: () => undefined })).toBeUndefined();
   expect(await f.sign("safe", { signer: undefined })).toBeUndefined();
@@ -113,10 +113,10 @@ test("no key, forged receipt, stale receipt and wrong registry cannot sign", asy
   expect(await f.sign("safe", { checker })).toBeUndefined();
   checker.protectText = async () => ({}) as typeof receipt;
   expect(await f.sign("safe", { checker })).toBeUndefined();
-  const valid = await f.checker.protectText({ text: "safe", provenance: { kind: "complete" } });
-  expect(
-    await f.sign("safe", { checker: { registry: createPrivacyRegistry(), protectText: async () => valid } }),
-  ).toBeUndefined();
+  expect(await f.sign("private-value", { cut: { limit: 0, unit: "U", marker: "" } })).toBeDefined();
+  writeFileSync(join(f.dir, "private-strings.txt"), "private-value\n");
+  expect(await f.sign("private-value")).toBeUndefined();
+  expect(await f.sign("private-value", { cut: { limit: 0, unit: "U", marker: "" } })).toBeUndefined();
   expect(Object.keys(p).sort()).toEqual(
     ["PRIVACY_CHECKER_SEMANTICS", "checkAndSign", "provisionProofKey", "verifier"].sort(),
   );
@@ -219,23 +219,6 @@ test("first startup provisions a missing config directory", () => {
   expect(stat.mode & 0o077).toBe(0);
 });
 
-test("verdict-only receipts cannot be replayed to sign unchecked input", async () => {
-  const f = fixture();
-  f.registry.refreshPolicy = () => {};
-  f.registry.replacePolicy([{ value: "forbidden-value", entry: 0 }]);
-  const cut = { limit: 0, unit: "U" as const, marker: "" };
-  const receipt = await f.checker.protectText({
-    text: "safe",
-    cut,
-    terminal: true,
-    provenance: { kind: "complete" },
-  });
-  const checker = { registry: f.registry, protectText: async () => receipt };
-  expect(await f.sign("forbidden-value", { checker, cut })).toBeUndefined();
-  const proof = await f.sign("safe", { checker, cut });
-  expect(p.verifier(f.registry, f.signer).verify(proof, "output", "safe")).toBe(true);
-});
-
 test("main-thread credentials never enter worker snapshots on either admission path", async () => {
   const f = fixture(),
     hex = f.state.key?.toString("hex");
@@ -269,7 +252,7 @@ test("main-thread credentials never enter worker snapshots on either admission p
       { text: "safe", provenance: { kind: "complete" } },
       { deadline },
     );
-    expect(consumeBoundaryChunk(receipt, 0, registry).withheld).toBe(false);
+    expect(consumeBoundaryChunk(receipt, 0).withheld).toBe(false);
   }
   expect(chunks).toBeGreaterThanOrEqual(2);
   expect(leaked).toBe(false);

@@ -43,3 +43,33 @@ export function gateIdentities(r: GateResult): string {
         : 0;
   return size(values) > IDENTITY_CAP ? "identity-cap" : JSON.stringify(stable(values));
 }
+const ATTRIBUTION_PARTS = new Set([
+  ...["Unknown testcase evidence", "Cross-file testcase failure", "Ambiguous testcase"],
+  ...["Unattributed testcase", "Unknown suite evidence", "Unmatched JUnit counter", "Invalid JUnit evidence"],
+  "runner reported an error, bail, or invalid/duplicate summary",
+  "runner summary missing or inconsistent with JUnit",
+  "unrecognized attribution reason",
+]);
+/** Release only whole, fixed attribution parts joined by "; "; anything else becomes fixed text. */
+export const attributionReason = (value: unknown): string =>
+  typeof value === "string" &&
+  value
+    .split("; ")
+    .every((part) => ATTRIBUTION_PARTS.has(part) || /^\d+ unattributed (?:failure|error)s?$/.test(part))
+    ? value
+    : "unrecognized attribution reason";
+const claim = ({ mac: _mac, ...field }: TextPrivacy["output"]) => field;
+/** Worker text-privacy records are claims, never proofs: keep them as MAC-free attestations. */
+export function remoteGateData(r: GateResult): GateResult {
+  const { textPrivacy, ...out } = r;
+  if (textPrivacy)
+    out.remoteAttestation = {
+      output: claim(textPrivacy.output),
+      ...(textPrivacy.identities ? { identities: claim(textPrivacy.identities) } : {}),
+    };
+  if (out.failureAttributionReason !== undefined)
+    out.failureAttributionReason = attributionReason(out.failureAttributionReason);
+  for (const key of ["firstAttempt", "targetedRetry", "retryAttempt"] as const)
+    if (out[key]) out[key] = remoteGateData(out[key]);
+  return out;
+}

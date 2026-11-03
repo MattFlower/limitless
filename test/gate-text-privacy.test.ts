@@ -1,9 +1,11 @@
 import { expect, spyOn, test } from "bun:test";
 import type { GateResult } from "../src/gates/run.ts";
 import {
+  attributionReason,
   fieldPrivacySchema,
   gateIdentities,
   IDENTITY_CAP,
+  remoteGateData,
   textPrivacySchema,
   withheldText,
 } from "../src/gates/text-privacy.ts";
@@ -130,4 +132,77 @@ test("oversized identities are refused before serialization", () => {
     output: "",
   };
   expect(gateIdentities(empty)).not.toBe("identity-cap");
+});
+
+test("attribution grammar accepts whole fixed parts and counted forms only", () => {
+  const fixed = [
+    "Unknown testcase evidence",
+    "Cross-file testcase failure",
+    "Ambiguous testcase",
+    "Unattributed testcase",
+    "Unknown suite evidence",
+    "Unmatched JUnit counter",
+    "Invalid JUnit evidence",
+    "runner reported an error, bail, or invalid/duplicate summary",
+    "runner summary missing or inconsistent with JUnit",
+    "unrecognized attribution reason",
+  ];
+  const counted = [
+    "1 unattributed failure",
+    "3 unattributed errors",
+    "2 unattributed failures",
+    "1 unattributed error",
+  ];
+  for (const reason of [...fixed, ...counted, fixed.join("; "), `${counted[0]}; ${fixed[2]}`])
+    expect(attributionReason(reason)).toBe(reason);
+  for (const reason of [
+    "leak",
+    "",
+    "Ambiguous testcase; secret-token",
+    "Ambiguous testcase secret-token",
+    "prefix Ambiguous testcase",
+    "Ambiguous testcase;Unattributed testcase",
+    "Ambiguous testcase;  Unattributed testcase",
+    "Ambiguous testcase; ",
+    "; Ambiguous testcase",
+    "Ambiguous testcase\n",
+    "1 unattributed error: secret",
+    "x1 unattributed error",
+    "1 unattributed warnings",
+    "ambiguous testcase",
+    undefined,
+    42,
+  ])
+    expect(attributionReason(reason)).toBe("unrecognized attribution reason");
+});
+test("worker ingress keeps claims as MAC-free attestations, recursively, and fixes reasons", () => {
+  const claim = { withheld: false, checkedComplete: true, kind: "complete" as const, mac: "b".repeat(64) },
+    attested = { withheld: false, checkedComplete: true, kind: "complete" as const };
+  const worker: GateResult = {
+    ...result(),
+    textPrivacy: { output: claim, identities: { withheld: true, reason: "identity-cap" } },
+    failureAttributionReason: "Ambiguous testcase; secret-token",
+  };
+  const nested = { ...worker, failureAttributionReason: "2 unattributed errors" };
+  const stored = remoteGateData({
+    ...worker,
+    firstAttempt: nested,
+    targetedRetry: nested,
+    retryAttempt: worker,
+  });
+  expect(JSON.stringify(stored)).not.toContain("b".repeat(64));
+  for (const item of [stored, stored.firstAttempt, stored.targetedRetry, stored.retryAttempt]) {
+    expect(item).not.toHaveProperty("textPrivacy");
+    expect(item?.remoteAttestation).toEqual({
+      output: attested,
+      identities: { withheld: true, reason: "identity-cap" },
+    });
+  }
+  expect(stored.failureAttributionReason).toBe("unrecognized attribution reason");
+  expect(stored.retryAttempt?.failureAttributionReason).toBe("unrecognized attribution reason");
+  expect(stored.firstAttempt?.failureAttributionReason).toBe("2 unattributed errors");
+  expect(remoteGateData({ ...result(), textPrivacy: undefined })).not.toHaveProperty(
+    "failureAttributionReason",
+  );
+  expect(worker.textPrivacy?.output.mac).toBe("b".repeat(64));
 });

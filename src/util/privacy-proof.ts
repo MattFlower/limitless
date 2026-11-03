@@ -10,12 +10,9 @@ import { redactCredentials, registerCredential } from "./proc.ts";
 
 export { PRIVACY_CHECKER_SEMANTICS } from "./privacy-boundary.ts";
 
-const proofSchema = z.object({
-  kind: z.enum(["complete", "attested:lan", "attested:github-actions", "rendering"]),
-  mac: z.string().regex(/^[a-f0-9]{64}(?![\s\S])/),
-  withheld: z.literal(false).optional(),
-});
-export type PrivacyProof = Pick<z.infer<typeof proofSchema>, "kind" | "mac">;
+const kinds = z.enum(["complete", "attested:lan", "attested:github-actions", "rendering"]);
+const proofSchema = z.object({ kind: kinds, mac: z.string().regex(/^[a-f0-9]{64}(?![\s\S])/) });
+export type PrivacyProof = z.infer<typeof proofSchema>;
 type Checker = ReturnType<typeof createPrivacyChecker>;
 type KeyState = { loaded?: boolean; key?: Buffer };
 const defaults = {
@@ -36,18 +33,16 @@ export function provisionProofKey(configDir: string, deps: Partial<typeof defaul
     temp = `${path}.${randomUUID()}`;
   try {
     mkdirSync(configDir, { recursive: true, mode: 0o700 });
-    if (!inspect(path, { throwIfNoEntry: false })) {
+    // Create without replacement: a racing loser links nothing and validates the winner's key.
+    if (!inspect(path, { throwIfNoEntry: false }))
       try {
         writeFileSync(temp, randomBytes(32), { flag: "wx", mode: 0o600 });
-        try {
-          link(temp, path);
-        } catch (error) {
-          if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
-        }
+        link(temp, path);
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
       } finally {
         unlinkSync(temp);
       }
-    }
     const stat = inspect(path);
     if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0 || stat.size !== 32)
       throw new Error("Invalid key");
@@ -57,7 +52,7 @@ export function provisionProofKey(configDir: string, deps: Partial<typeof defaul
     registerCredential("PRIVACY_PROOF_KEY", key.toString("hex"), true);
   } catch {
     holder.key = undefined;
-    (log ?? console.error)(redactCredentials("Privacy proof key unavailable; gate proofs will not verify."));
+    log(redactCredentials("Privacy proof key unavailable; gate proofs will not verify."));
   }
 }
 const hash = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
@@ -79,12 +74,12 @@ export async function checkAndSign(
     { text, cut, terminal: true, provenance: { kind: "complete" } },
     { signal, deadline },
   );
-  const registry = checker.registry;
-  const key = signer();
+  const { registry } = checker,
+    key = signer();
   if (!key) return;
   const parts: Uint8Array[] = [];
   for (let index = 0; ; index++) {
-    const part = consumeBoundaryChunk(receipt, index, registry, cut?.limit === 0 ? text : undefined);
+    const part = consumeBoundaryChunk(receipt, index);
     if (part.withheld || !part.checkedComplete) return;
     if (part.done) break;
     parts.push(part.bytes);

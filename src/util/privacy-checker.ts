@@ -208,8 +208,8 @@ export function createPrivacyChecker(options: Options = {}) {
   let active: Finish | undefined;
   let retiring = Promise.resolve();
   let running: Promise<void> | undefined;
-  const issue = (result: Projection, generation?: Generation, parts?: ArrayBuffer[], text?: string) =>
-    c.issuePrivacyWorkerChunks(parts, result, generation, registry, text);
+  const issue = (result: Projection, generation?: Generation, parts?: ArrayBuffer[]) =>
+    c.issuePrivacyWorkerChunks(parts, result, generation, registry);
   const current = (generation: Generation) => {
     try {
       return same(generation, b.currentPrivacyGeneration(registry));
@@ -396,7 +396,6 @@ export function createPrivacyChecker(options: Options = {}) {
           typeof value === "string" ? failure(value, authority, input.provenance) : value,
           authority,
           typeof value === "string" ? undefined : staged,
-          input.cut?.limit === 0 ? input.text : undefined,
         ),
       );
       staged = undefined;

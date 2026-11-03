@@ -1508,11 +1508,20 @@ test("targeted retry diagnostics never interpolate unparsed attribution", () => 
         { setup: [], checks: [], source: ".limitless.toml", protectedPaths: [] },
         ".",
       ),
-    ).toBe("failure attribution incomplete: missing or inconsistent whole-stream/JUnit evidence");
+    ).toBe("failure attribution incomplete: unrecognized attribution reason");
+  for (const reason of ["1 unattributed error", "Ambiguous testcase; 2 unattributed failures"])
+    expect(
+      targetedRetrySkipReason(
+        undefined,
+        { ...result, failureAttributionReason: reason },
+        { setup: [], checks: [], source: ".limitless.toml", protectedPaths: [] },
+        ".",
+      ),
+    ).toBe(`failure attribution incomplete: ${reason}`);
   expect(
     targetedRetrySkipReason(
       undefined,
-      { ...result, failureAttributionReason: "1 unattributed error" },
+      result,
       { setup: [], checks: [], source: ".limitless.toml", protectedPaths: [] },
       ".",
     ),
