@@ -1707,6 +1707,7 @@ automatic CI fix or rerun. A red default branch suppresses a fix for the same fa
 repair that base failure first. CI repair is confined to the change's scope, not environment
 problems or unrelated tests. At most **2 CI fix rounds** start since the latest non-CI round or
 approval (both boundaries apply); after that, `ci.fix_cap_reached` asks for a person or agent.
+In shared repositories, poller CI reruns require the PR's `pr-<n>` claim.
 
 A pending CI trigger waits while a land entry is active, without consuming lookup retries.
 Conversely, land request and final merge refuse any round in flight, so **active land and CI
