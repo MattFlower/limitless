@@ -112,40 +112,57 @@ function commandRead(args: (string | undefined)[] | undefined, credential = fals
     return true;
   if (args[1] === "auth" && args[2] === "token") return !credential;
   if (args[1] !== "api") return false;
-  // gh accepts flags on either side of the endpoint, so inspect every token after `api`.
-  const flags = args.slice(2);
-  const dangerous = flags.some(
-    (a) => a && /^(?:-X|-f|-F|--method(?:=|$)|--input(?:=|$)|--field(?:=|$)|--raw-field(?:=|$))/.test(a),
-  );
-  if (!dangerous) return true;
+  // Inspect both sides of the endpoint. Only explicitly supported options can
+  // prove a read; gh also accepts short-option clusters that may supply a body.
   const queries: string[] = [];
   const endpoints: string[] = [];
-  // Only field flag values supply the operation; templates and other output
-  // options do not. Duplicate query fields remain ambiguous, including compact flags.
-  for (let i = 0; i < flags.length; i++) {
-    const flag = flags[i] ?? "";
-    const field = flag.match(/^(?:-[fF]|--(?:raw-)?field(?:=|$))(.*)$/);
-    const method = flag.match(/^(?:-X|--method(?:=|$))(.*)$/);
-    if (field) {
-      const value = field[1] || flags[++i] || "";
-      const assignment = value.match(/^([^=@[\]]+)=(.*)$/s);
-      if (!assignment) return false;
-      if (assignment[1] === "query") queries.push(assignment[2] ?? "");
-    } else if (method) {
-      if (!["GET", "POST"].includes(method[1] || flags[++i] || "")) return false;
-    } else if (["--template", "-t", "--jq", "-q", "--header", "-H", "--hostname", "--cache"].includes(flag)) {
-      if (++i >= flags.length) return false;
-    } else if (!flag.startsWith("-")) {
+  let explicitMethod: string | undefined;
+  for (let i = 2; i < args.length; i++) {
+    const flag = args[i] ?? "";
+    if (!flag.startsWith("-")) {
       endpoints.push(flag);
-    } else if (
-      !/^(?:--(?:template|jq|header|hostname|cache)=|-[tqH].)/.test(flag) &&
-      !["--paginate", "--slurp", "--silent", "--include", "-i", "--verbose"].includes(flag)
-    ) {
+      continue;
+    }
+    const option = flag.match(/^(--[a-z-]+)(?:=(.*))?$|^(-[qHtXfF])(.*)$/s);
+    const name = option?.[1] ?? option?.[3] ?? flag;
+    let value = option?.[2] ?? (option?.[4] || undefined);
+    if (["--paginate", "--slurp", "--silent", "--include", "-i", "--verbose"].includes(name)) {
+      if (value !== undefined) return false;
+      continue;
+    }
+    if (
+      ![
+        "--jq",
+        "-q",
+        "--template",
+        "-t",
+        "--header",
+        "-H",
+        "--hostname",
+        "--cache",
+        "--method",
+        "-X",
+        "--field",
+        "-F",
+        "--raw-field",
+        "-f",
+      ].includes(name)
+    )
       return false;
+    if (value === undefined) value = args[++i];
+    if (!value || value.startsWith("-")) return false;
+    if (["--method", "-X"].includes(name)) {
+      if (explicitMethod || !["GET", "POST"].includes(value)) return false;
+      explicitMethod = value;
+    } else if (["--field", "-F", "--raw-field", "-f"].includes(name)) {
+      // Only one literal query field is supported, with no other payload.
+      if (!value.startsWith("query=")) return false;
+      queries.push(value.slice("query=".length));
     }
   }
+  if (endpoints.length !== 1 || !endpoints[0]) return false;
+  if (!queries.length) return explicitMethod === undefined;
   return (
-    endpoints.length === 1 &&
     endpoints[0] === "graphql" &&
     queries.length === 1 &&
     /^\s*query\b/.test(queries[0] ?? "") &&
@@ -154,11 +171,11 @@ function commandRead(args: (string | undefined)[] | undefined, credential = fals
 }
 async function include(
   root: string,
-  call: ts.CallExpression,
+  args: readonly ts.Node[] | null,
   file: string,
   checker: Checker,
 ): Promise<boolean> {
-  const args = call.arguments;
+  if (!args) return true;
   if (root === "fetch" && nonGitHub(args[0])) return false;
   if (args.some(ts.isSpreadElement)) return true;
   if (root === "fetch") return !(await fetchRead(args, checker));
@@ -236,14 +253,16 @@ async function analyze(
     const globalFetch = await checker.resolveName("fetch", SymbolFlags.Value);
     if (!globalFetch) throw new Error("Missing global fetch");
     rootIds.set(globalFetch.id, "fetch");
-    const symbolCache = new Map<number, Promise<string | undefined>>();
-    const typeCache = new Map<number, Promise<string | undefined>>();
+    type Transport = { root: string; bound: readonly ts.Node[] | null };
+    const symbolCache = new Map<number, Promise<Transport | undefined>>();
+    const typeCache = new Map<number, Promise<Transport | undefined>>();
     async function fromSymbol(
       s: CompilerSymbol | undefined,
       seen = new Set<number>(),
-    ): Promise<string | undefined> {
+    ): Promise<Transport | undefined> {
       if (!s || seen.has(s.id)) return undefined;
-      if (rootIds.has(s.id)) return rootIds.get(s.id);
+      const root = rootIds.get(s.id);
+      if (root) return { root, bound: [] };
       if (symbolCache.has(s.id)) return symbolCache.get(s.id);
       const next = new Set([...seen, s.id]);
       const work = async () => {
@@ -253,7 +272,7 @@ async function analyze(
           if (d && ts.isFunctionTypeNode(d) && ts.isTypeAliasDeclaration(d.parent)) {
             const owner = await checker.getSymbolAtLocation(d.parent.name);
             const root = owner && rootIds.get(owner.id);
-            if (root) return root;
+            if (root) return { root, bound: [] };
           }
           if (d && ts.isShorthandPropertyAssignment(d)) {
             const root = await fromSymbol(await checker.getShorthandAssignmentValueSymbol(d), next);
@@ -264,11 +283,18 @@ async function analyze(
             (ts.isVariableDeclaration(d) ||
               ts.isParameterDeclaration(d) ||
               ts.isBindingElement(d) ||
-              ts.isPropertyAssignment(d)) &&
+              ts.isPropertyAssignment(d) ||
+              ts.isPropertyDeclaration(d)) &&
             d.initializer
           ) {
             const n = unwrap(d.initializer);
-            if (ts.isIdentifier(n) || ts.isPropertyAccessExpression(n) || ts.isBinaryExpression(n)) {
+            if (
+              ts.isIdentifier(n) ||
+              ts.isPropertyAccessExpression(n) ||
+              ts.isBinaryExpression(n) ||
+              ts.isConditionalExpression(n) ||
+              ts.isCallExpression(n)
+            ) {
               const root = await fromExpression(n, next);
               if (root) return root;
             }
@@ -280,7 +306,7 @@ async function analyze(
       symbolCache.set(s.id, result);
       return result;
     }
-    async function fromType(t: Type | undefined): Promise<string | undefined> {
+    async function fromType(t: Type | undefined): Promise<Transport | undefined> {
       if (!t) return undefined;
       if (typeCache.has(t.id)) return typeCache.get(t.id);
       const work = async () => {
@@ -298,8 +324,29 @@ async function analyze(
       typeCache.set(t.id, result);
       return result;
     }
-    async function fromExpression(node: ts.Node, seen = new Set<number>()): Promise<string | undefined> {
+    async function fromExpression(
+      node: ts.Node,
+      seen = new Set<number>(),
+      resolved?: { symbol: CompilerSymbol | undefined; type: Type | undefined },
+    ): Promise<Transport | undefined> {
       const n = unwrap(node);
+      // Resolution supplied for a parenthesized node does not describe its contents.
+      if (n !== node) resolved = undefined;
+      if (ts.isCallExpression(n)) {
+        const method = await indirect(n.expression);
+        if (method?.name === "bind") {
+          const receiver = await fromExpression(method.receiver, seen);
+          if (receiver)
+            return {
+              root: receiver.root,
+              bound: prepend(
+                receiver.bound,
+                n.arguments.some(ts.isSpreadElement) ? null : n.arguments.slice(1),
+              ),
+            };
+        }
+        return fromType(resolved ? resolved.type : await checker.getTypeAtLocation(n));
+      }
       if (
         ts.isBinaryExpression(n) &&
         [
@@ -308,13 +355,64 @@ async function analyze(
           ts.SyntaxKind.AmpersandAmpersandToken,
         ].includes(n.operatorToken.kind)
       )
-        return (await fromExpression(n.left, seen)) ?? (await fromExpression(n.right, seen));
-      if (ts.isConditionalExpression(n))
-        return (await fromExpression(n.whenTrue, seen)) ?? (await fromExpression(n.whenFalse, seen));
+        return alternatives(n.left, n.right, seen);
+      if (ts.isConditionalExpression(n)) return alternatives(n.whenTrue, n.whenFalse, seen);
       return (
-        (await fromSymbol(await checker.getSymbolAtLocation(n), seen)) ??
-        (seen.size ? undefined : await fromType(await checker.getTypeAtLocation(n)))
+        (await fromSymbol(resolved ? resolved.symbol : await checker.getSymbolAtLocation(n), seen)) ??
+        (await fromType(resolved ? resolved.type : await checker.getTypeAtLocation(n)))
       );
+    }
+    async function alternatives(left: ts.Node, right: ts.Node, seen: Set<number>) {
+      const a = await fromExpression(left, seen);
+      const b = await fromExpression(right, seen);
+      if (!a || !b) return a ?? b;
+      // Branches may capture different arguments even when their callable types match.
+      return { root: a.root, bound: a.bound?.length === 0 && b.bound?.length === 0 ? [] : null };
+    }
+    const methodCache = new Map<number, Promise<boolean>>();
+    async function indirect(node: ts.Node) {
+      const n = unwrap(node);
+      if (!ts.isPropertyAccessExpression(n) && !ts.isElementAccessExpression(n)) return undefined;
+      const member = ts.isElementAccessExpression(n) ? text(n.argumentExpression) : undefined;
+      const receiverType = member ? await checker.getTypeAtLocation(n.expression) : undefined;
+      const symbol =
+        member && receiverType
+          ? await checker.getPropertyOfType(receiverType, member)
+          : await checker.getSymbolAtLocation(n);
+      if (!symbol || !["call", "apply", "bind"].includes(symbol.name)) return undefined;
+      // Confirm Function.prototype membership, rather than matching arbitrary methods.
+      let intrinsic = methodCache.get(symbol.id);
+      if (!intrinsic) {
+        intrinsic = (async () => {
+          for (const handle of symbol.declarations) {
+            const d = await handle.resolve();
+            if (
+              d &&
+              ts.isInterfaceDeclaration(d.parent) &&
+              ["Function", "CallableFunction"].includes(d.parent.name.text) &&
+              /(?:^|[/\\])lib\.es5\.d\.ts$/.test(d.getSourceFile().fileName)
+            )
+              return true;
+          }
+          return false;
+        })();
+        methodCache.set(symbol.id, intrinsic);
+      }
+      return (await intrinsic) ? { name: symbol.name, receiver: n.expression } : undefined;
+    }
+    function prepend(prefix: readonly ts.Node[] | null, args: readonly ts.Node[] | null) {
+      return prefix && args ? [...prefix, ...args] : null;
+    }
+    async function ownerName(name: ts.DeclarationName | undefined): Promise<string | undefined> {
+      if (!name) return undefined;
+      if (ts.isIdentifier(name) || ts.isPrivateIdentifier(name) || ts.isNumericLiteral(name))
+        return name.text;
+      if (!ts.isComputedPropertyName(name)) return text(name);
+      const type = await checker.getTypeAtLocation(name.expression);
+      if (type?.isStringLiteralType() || type?.isNumberLiteralType()) return String(type.value);
+      // Without a constant value or semantic property name, use a stable bucket.
+      const symbol = await checker.getSymbolAtLocation(name);
+      return symbol && !symbol.name.startsWith("__") ? symbol.name : "<computed>";
     }
     const sites = new Map<string, Site>();
     for (const name of (await program.getSourceFileNames()).slice().sort()) {
@@ -323,11 +421,14 @@ async function analyze(
       const source = await program.getSourceFile(name);
       if (!source) throw new Error(`Missing program source ${name}`);
       const calls: { call: ts.CallExpression; fn: string }[] = [];
-      const ordinals = new Map<string, number>();
-      const usedNames = new Map<string, number>();
-      const walk = (n: ts.Node, scope: string) => {
-        if (ts.isClassDeclaration(n) && n.name)
-          scope = scope === "<module>" ? n.name.text : `${scope}/${n.name.text}`;
+      const walk = async (n: ts.Node, scope: string): Promise<void> => {
+        const nest = (label: string) => (scope === "<module>" ? label : `${scope}/${label}`);
+        if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) {
+          const label = await ownerName(
+            n.name ?? (ts.isVariableDeclaration(n.parent) ? n.parent.name : undefined),
+          );
+          if (label) scope = nest(label);
+        }
         if (
           ts.isFunctionLikeDeclaration(n) &&
           !ts.isCallSignatureDeclaration(n) &&
@@ -338,30 +439,37 @@ async function analyze(
             (ts.isVariableDeclaration(n.parent) || ts.isPropertyAssignment(n.parent)
               ? n.parent.name
               : undefined);
-          const ordinal = (ordinals.get(scope) ?? 0) + 1;
-          ordinals.set(scope, ordinal);
-          let label = bound?.getText() ?? `anonymous#${ordinal}`;
-          const nameKey = `${scope}/${label}`;
-          const duplicate = (usedNames.get(nameKey) ?? 0) + 1;
-          usedNames.set(nameKey, duplicate);
-          if (duplicate > 1) label += `#${duplicate}`;
-          scope = scope === "<module>" ? label : `${scope}/${label}`;
+          const label = ts.isConstructorDeclaration(n) ? "constructor" : await ownerName(bound);
+          if (label) scope = nest(label);
         }
         if (ts.isCallExpression(n)) calls.push({ call: n, fn: scope });
-        for (const c of children(n)) walk(c, scope);
+        for (const c of children(n)) await walk(c, scope);
       };
-      walk(source, "<module>");
+      await walk(source, "<module>");
       if (!calls.length) continue;
       const nodes = calls.map((c) => c.call.expression);
       const symbols = await checker.getSymbolAtLocation(nodes);
       const types = await checker.getTypeAtLocation(nodes);
       for (const [i, { call, fn }] of calls.entries()) {
-        const root =
-          (await fromSymbol(symbols[i])) ??
-          (await fromType(types[i])) ??
-          (await fromExpression(call.expression));
-        if (!root || !(await include(root, call, file, checker))) continue;
-        const site = { file, fn, root, count: 0 };
+        const method = await indirect(call.expression);
+        // Binding captures arguments but executes no transport.
+        if (method?.name === "bind") continue;
+        const target = method
+          ? await fromExpression(method.receiver)
+          : await fromExpression(call.expression, new Set(), { symbol: symbols[i], type: types[i] });
+        if (!target) continue;
+        let args: readonly ts.Node[] | null = call.arguments;
+        if (method?.name === "call") args = args.some(ts.isSpreadElement) ? null : args.slice(1);
+        if (method?.name === "apply") {
+          const applied = args?.[1] && unwrap(args[1]);
+          args =
+            !args?.some(ts.isSpreadElement) && applied && ts.isArrayLiteralExpression(applied)
+              ? applied.elements
+              : null;
+        }
+        args = prepend(target.bound, args);
+        if (!(await include(target.root, args, file, checker))) continue;
+        const site = { file, fn, root: target.root, count: 0 };
         const id = key(site);
         const existing = sites.get(id) ?? site;
         existing.count++;
@@ -429,7 +537,7 @@ function compare(actual: Site[], expected: Entry[]) {
 // file | enclosing function | canonical root | count | category | owner | reason
 const manifest: Entry[] = `
 src/cli/deploy-wait.ts | localDeployClient/request | fetch | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
-src/cli/gate-slot.ts | localLeaseClient/anonymous#1 | fetch | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
+src/cli/gate-slot.ts | localLeaseClient | fetch | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/cli/local.ts | manageLocal/run | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/cli/main.ts | api | fetch | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/cli/service.ts | ensureRelease | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
@@ -438,48 +546,47 @@ src/cli/service.ts | serviceControl/run | sh | 1 | exempt | not-github | Local c
 src/cli/setup.ts | setupDeps/fetch | fetch | 1 | exempt | credential | Setup identity verification plus model and daemon probes
 src/cli/setup.ts | setupDeps/run | sh | 1 | exempt | credential | Setup GitHub authentication and environment checks
 src/gates/github-actions.ts | githubActionsExecutor/api | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
-src/gates/github-actions.ts | githubActionsExecutor/attach/anonymous#6 | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
-src/gates/github-actions.ts | githubActionsExecutor/attach/anonymous#6/poll | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
+src/gates/github-actions.ts | githubActionsExecutor/attach | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
+src/gates/github-actions.ts | githubActionsExecutor/attach/poll | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
+src/gc.ts | collectGarbage | cacheGit | 5 | exempt | not-github | Local worktree metadata cleanup; no remote commands
 src/git/command.ts | recordWorktree | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/git/command.ts | refusePopulatedRepositories | sh | 2 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/git/command.ts | runGit | sh | 1 | helper |  | categorized at callers
 src/git/command.ts | runGit/run | sh | 2 | helper |  | categorized at callers
-src/git/confinement.ts | bwrapGit/wrap/anonymous#2 | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
-src/git/confinement.ts | gitSh/anonymous#1 | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
+src/git/confinement.ts | bwrapGit/wrap | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
+src/git/confinement.ts | gitSh | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/git/confinement.ts | seatbeltGit/wrap/check | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/git/hardening.ts | list | sh | 2 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/git/repos.ts | addDetachedWorktree | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
+src/git/repos.ts | createPullRequest | githubSh | 1 | helper |  | categorized at callers
 src/git/repos.ts | createPullRequest | remoteSh | 1 | helper |  | categorized at callers
-src/git/repos.ts | createPullRequest/anonymous#2 | githubSh | 1 | helper |  | categorized at callers
 src/git/repos.ts | createPullRequest/find | githubSh | 1 | helper |  | categorized at callers
-src/git/repos.ts | createWorktree/anonymous#1 | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | createWorktree/anonymous#1 | remoteSh | 1 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | createWorktree/anonymous#1/anonymous#3 | runGh | 1 | read |  | Repository observation, clone/fetch or local cache administration
+src/git/repos.ts | createWorktree | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
+src/git/repos.ts | createWorktree | remoteSh | 1 | read |  | Repository observation, clone/fetch or local cache administration
+src/git/repos.ts | createWorktree | runGh | 1 | read |  | Repository observation, clone/fetch or local cache administration
 src/git/repos.ts | deliveryPublicationRange | remoteSh | 2 | read |  | Repository observation, clone/fetch or local cache administration
 src/git/repos.ts | disableAutoMerge | githubSh | 1 | helper |  | categorized at callers
 src/git/repos.ts | exportGateSnapshot | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | fetchBase/anonymous#1 | remoteSh | 1 | read |  | Repository observation, clone/fetch or local cache administration
+src/git/repos.ts | fetchBase | remoteSh | 1 | read |  | Repository observation, clone/fetch or local cache administration
 src/git/repos.ts | findPullRequest | githubSh | 1 | read |  | Repository observation, clone/fetch or local cache administration
 src/git/repos.ts | lookupIdentityPr | githubSh | 2 | read |  | Repository observation, clone/fetch or local cache administration
 src/git/repos.ts | mergePullRequest/landed | githubSh | 1 | helper |  | categorized at callers
-src/git/repos.ts | mergePullRequest/merge/anonymous#1 | githubSh | 2 | helper |  | categorized at callers
-src/git/repos.ts | pinnedTree/anonymous#1 | sh | 1 | exempt | local | Local eval repository fetch, snapshot or push
-src/git/repos.ts | probePushAccess | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | probePushAccess/anonymous#2 | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
+src/git/repos.ts | mergePullRequest/merge | githubSh | 2 | helper |  | categorized at callers
+src/git/repos.ts | pinnedTree | sh | 1 | exempt | local | Local eval repository fetch, snapshot or push
+src/git/repos.ts | probePushAccess | cacheGit | 2 | read |  | Repository observation, clone/fetch or local cache administration
 src/git/repos.ts | probePushAccess/probe | remoteSh | 1 | read |  | Dry-run permission probe never updates the remote ref
-src/git/repos.ts | pushBranch/anonymous#2 | remoteSh | 1 | helper |  | categorized at callers
-src/git/repos.ts | pushExistingBranch/anonymous#1 | remoteSh | 2 | helper |  | categorized at callers
+src/git/repos.ts | pushBranch | remoteSh | 1 | helper |  | categorized at callers
+src/git/repos.ts | pushExistingBranch | remoteSh | 2 | helper |  | categorized at callers
 src/git/repos.ts | pushSnapshot | sh | 1 | exempt | local | Local eval repository fetch, snapshot or push
 src/git/repos.ts | pushSnapshot/commit | sh | 1 | exempt | local | Local eval repository fetch, snapshot or push
 src/git/repos.ts | refreshCache | cacheGit | 9 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | remoteBranchSha/anonymous#1 | remoteSh | 1 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | remoteSh/anonymous#2 | cacheGit | 1 | helper |  | categorized at callers
-src/git/repos.ts | remoteSh/anonymous#2 | githubSh | 1 | helper |  | categorized at callers
+src/git/repos.ts | removeWorktree | cacheGit | 1 | exempt | not-github | Local worktree metadata cleanup; no remote commands
+src/git/repos.ts | remoteBranchSha | remoteSh | 1 | read |  | Repository observation, clone/fetch or local cache administration
+src/git/repos.ts | remoteSh | cacheGit | 1 | helper |  | categorized at callers
+src/git/repos.ts | remoteSh | githubSh | 1 | helper |  | categorized at callers
 src/git/repos.ts | resolveRepo | remoteSh | 1 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | stagePinnedEvalRepo/anonymous#2 | sh | 2 | exempt | local | Local eval repository fetch, snapshot or push
-src/git/repos.ts | withTransportRepo | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | withTransportRepo/anonymous#1 | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
-src/git/repos.ts | withTransportRepo/anonymous#1/anonymous#1 | cacheGit | 1 | read |  | Repository observation, clone/fetch or local cache administration
+src/git/repos.ts | stagePinnedEvalRepo | sh | 2 | exempt | local | Local eval repository fetch, snapshot or push
+src/git/repos.ts | withTransportRepo | cacheGit | 3 | read |  | Repository observation, clone/fetch or local cache administration
 src/harness/browser-mcp.ts | provisionBrowserMcp/recordRuntime | runProcess | 1 | exempt | not-github | Local harness process or model endpoint; no GitHub transport
 src/harness/browser-mcp.ts | provisionBrowserMcp/run | runProcess | 1 | exempt | not-github | Local harness process or model endpoint; no GitHub transport
 src/harness/claude.ts | runClaude | runProcess | 1 | exempt | not-github | Local harness process or model endpoint; no GitHub transport
@@ -505,33 +612,33 @@ src/integrations/github-identity.ts | createGitHubIdentity/request | fetch | 1 |
 src/integrations/github-identity.ts | githubSh | sh | 1 | helper |  | categorized at callers
 src/integrations/github-notifier.ts | getGitHubCiRuns | runGh | 1 | read |  | PR state or workflow-run observation with variable identifiers
 src/integrations/github-notifier.ts | getGitHubPr | githubSh | 1 | read |  | PR state or workflow-run observation with variable identifiers
-src/integrations/github-notifier.ts | startGitHubNotifier/anonymous#4 | runGh | 1 | observer |  | Terminal lifecycle observer guard; shared mode disables legacy notifier
+src/integrations/github-notifier.ts | startGitHubNotifier | runGh | 1 | observer |  | Terminal lifecycle observer guard; shared mode disables legacy notifier
 src/integrations/github-poller.ts | ghClient | fetch | 1 | transport |  | Authenticated GitHub client transport checks claimGuard
-src/integrations/github-poller.ts | guardGitHubClient/anonymous#1 | ghClient | 1 | helper |  | categorized at callers
+src/integrations/github-poller.ts | guardGitHubClient | ghClient | 1 | helper |  | categorized at callers
 src/integrations/github-poller.ts | startGitHubPoller/call | ghClient | 1 | helper |  | categorized at callers
 src/integrations/github-poller.ts | startGitHubPoller/observe | pollerCall | 1 | read |  | Observation GraphQL query over POST
 src/integrations/github-poller.ts | startGitHubPoller/record | ciDecision | 1 | observer |  | C08b observer authority guards CI reruns
 src/integrations/github-poller.ts | startGitHubPoller/record/ciCall | pollerCall | 1 | helper |  | categorized at callers
 src/integrations/github-token.ts | githubToken | runProcess | 1 | exempt | credential | Raw auth token lookup retained despite the literal-read rule
-src/integrations/github.ts | githubWebhook/anonymous#1 | runGh | 1 | read |  | Dependabot observation GraphQL query over POST
+src/integrations/github.ts | githubWebhook | runGh | 1 | read |  | Dependabot observation GraphQL query over POST
 src/integrations/github.ts | runGh | githubSh | 1 | helper |  | categorized at callers
 src/integrations/issue-lifecycle.ts | reconcileIssueLifecycle/call | runGh | 1 | observer |  | C08a lifecycle authority guards terminal issue reporting
 src/integrations/issue-queue.ts | startIssueQueue/query | runGh | 1 | read |  | Issue discovery GraphQL query over POST
 src/integrations/issue-queue.ts | startIssueQueue/tick | reconcileIssueLifecycle | 1 | observer |  | C08a lifecycle authority guards terminal issue reporting
 src/integrations/mcp.ts | httpBackend/api | fetch | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/integrations/member-capabilities.ts | probeCapabilities/run | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
-src/integrations/shared-store.ts | createCompanionIO/call/anonymous#1/anonymous#1 | fetch | 1 | helper |  | categorized at callers
+src/integrations/shared-store.ts | createCompanionIO/call | fetch | 1 | helper |  | categorized at callers
 src/integrations/shared-store.ts | createCompanionIO/repository | companionCall | 1 | read |  | Companion repository metadata GraphQL query over POST
 src/integrations/shared-store.ts | createSharedStore | createCompanionIO | 1 | helper |  | categorized at callers
-src/integrations/shared-store.ts | createSharedStore/put/anonymous#1 | companionCall | 4 | exempt | C11 | D10 shared-store writes guarded by C11 callers
+src/integrations/shared-store.ts | createSharedStore/put | companionCall | 4 | exempt | C11 | D10 shared-store writes guarded by C11 callers
 src/land/deploy-process.ts | deployProcess | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/land/deploy-process.ts | launchctlJob | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/land/queue.ts | LandQueue/approvalEvidence | ghClient | 1 | read |  | Approval-evidence GraphQL query over POST
 src/land/queue.ts | LandQueue/approvalEvidence/client | ghClient | 1 | helper |  | categorized at callers
 src/land/queue.ts | LandQueue/awaitCi | ciDecision | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
-src/land/queue.ts | LandQueue/awaitCi/anonymous#12 | ghClient | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
+src/land/queue.ts | LandQueue/awaitCi | ghClient | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
 src/land/queue.ts | LandQueue/checkout | cacheGit | 1 | read |  | Base fetch or base-branch PR observation
-src/land/queue.ts | LandQueue/land/anonymous#1 | runGh | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
+src/land/queue.ts | LandQueue/land | runGh | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
 src/land/queue.ts | LandQueue/merge | disableAutoMerge | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
 src/land/queue.ts | LandQueue/merge | mergePullRequest | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
 src/land/queue.ts | LandQueue/pushApproved | pushExistingBranch | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
@@ -542,20 +649,20 @@ src/pipeline/engine.ts | deliver/deliverStage | createPullRequest | 1 | run-scop
 src/pipeline/engine.ts | deliver/deliverStage | mergePullRequest | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/engine.ts | deliver/deliverStage | pushBranch | 2 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/engine.ts | deliver/deliverStage | pushExistingBranch | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
-src/pipeline/engine.ts | deliver/deliverStage | runGh | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
-src/pipeline/engine.ts | deliver/deliverStage/anonymous#5 | runGh | 3 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
-src/pipeline/engine.ts | deliver/deliverStage/gh/anonymous#1 | runGh | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
-src/pipeline/engine.ts | deliverReviewRound/anonymous#2 | pushExistingBranch | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
-src/pipeline/engine.ts | deliverReviewRound/anonymous#2 | runGh | 4 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
+src/pipeline/engine.ts | deliver/deliverStage | runGh | 4 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
+src/pipeline/engine.ts | deliver/deliverStage/gh | runGh | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
+src/pipeline/engine.ts | deliverReviewRound | pushExistingBranch | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
+src/pipeline/engine.ts | deliverReviewRound | runGh | 4 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/engine.ts | deliverVerifiedDraft | createPullRequest | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/engine.ts | deliverVerifiedDraft | pushBranch | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/review-round.ts | readPrHead | runGh | 1 | read |  | Review head observation
-src/pipeline/review-round.ts | submitReview/anonymous#1 | runGh | 1 | exempt | C16 | Review submission authority belongs to C16
-src/pipeline/run-object-quarantine.ts | createRunObjectValidator/anonymous#1/git | cacheGit | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
-src/pipeline/run-object-quarantine.ts | createRunObjectValidator/anonymous#1/readObject | runProcess | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
+src/pipeline/review-round.ts | submitReview | runGh | 1 | exempt | C16 | Review submission authority belongs to C16
+src/pipeline/run-object-export.ts | createRunObjectExporter/git | cacheGit | 1 | exempt | not-github | Local committed-object bundle export; no remote commands
+src/pipeline/run-object-quarantine.ts | createRunObjectValidator/git | cacheGit | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
+src/pipeline/run-object-quarantine.ts | createRunObjectValidator/readObject | runProcess | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/pipeline/shadow-report.ts | ghPrHistory/json | runGh | 1 | read |  | Read-only GitHub history or issue metadata query
 src/pipeline/shadow-report.ts | ghPrHistory/view | runGh | 2 | read |  | Read-only GitHub history or issue metadata query
-src/server/http.ts | createHttpRoutes/anonymous#50 | runGh | 1 | read |  | Read-only GitHub history or issue metadata query
+src/server/http.ts | createHttpRoutes | runGh | 1 | read |  | Read-only GitHub history or issue metadata query
 src/util/proc.ts | sh | runProcess | 1 | helper |  | categorized at callers
 src/workers/publication.ts | publishAgentChanges | cacheGit | 1 | exempt | C23 | Worker publication authority belongs to C23
 src/workers/update.ts | updateWorker/run | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
@@ -672,12 +779,10 @@ runGh(['issue', 'comment']); fetch('url'); const req = {method: 'POST'}; req.met
         ["callers.ts", "first", "pushExistingBranch"],
         ["callers.ts", "second", "pushExistingBranch"],
         ["anonymous.ts", "<module>", "ghClient"],
-        ["anonymous.ts", "anonymous#1", "ghClient"],
-        ["anonymous.ts", "anonymous#2", "ghClient"],
       ];
       expect(found).toEqual(
         expected
-          .map(([file, fn, root]) => ({ file, fn, root, count: 1 }))
+          .map(([file, fn, root]) => ({ file, fn, root, count: file === "anonymous.ts" ? 3 : 1 }))
           .sort((a, b) => key(a).localeCompare(key(b))),
       );
     },
@@ -690,6 +795,36 @@ test("read classification keeps uncertain dispatch and excludes only proven read
     ["prList", `runGh(['pr', 'list'])`, null],
     ["repoView", `sh(['gh', 'repo', 'view', 'owner/repo'])`, null],
     ["auth", `sh(['gh', 'auth', 'token'])`, null],
+    ["clusterIF", `runGh(['api', 'repos/example/repo/issues', '-if', 'title=hello'])`, "runGh"],
+    ["clusterFI", `runGh(['api', 'repos/example/repo/issues', '-fi', 'title=hello'])`, "runGh"],
+    ["compactPayload", `runGh(['api', 'user', '-Ffoo=bar'])`, "runGh"],
+    ["unknownOption", `runGh(['api', 'user', '--future-option'])`, "runGh"],
+    ["missingOption", `runGh(['api', 'user', '--jq'])`, "runGh"],
+    ["missingEndpoint", `runGh(['api', '--paginate'])`, "runGh"],
+    ["missingValueBeforeEndpoint", `runGh(['api', '--jq', '--paginate', 'user'])`, "runGh"],
+    [
+      "readOptions",
+      `runGh(['api', 'user', '--jq', '.login', '--paginate', '-H', 'Accept: application/json'])`,
+      null,
+    ],
+    [
+      "readOptionsBeforeEndpoint",
+      `runGh(['api', '-q', '.login', '--header', 'Accept: application/json', '--paginate', 'user'])`,
+      null,
+    ],
+    ["compactReadOptions", `runGh(['api', '--jq=.login', '-HAccept: application/json', 'user'])`, null],
+    ["variableReadOption", `runGh(['api', 'user', '--jq', part])`, "runGh"],
+    [
+      "duplicateQuery",
+      `runGh(['api', 'graphql', '-fquery=query { viewer { login } }', '-fquery=query { viewer { id } }'])`,
+      "runGh",
+    ],
+    [
+      "queryPayload",
+      `runGh(['api', 'graphql', '-fquery=query { viewer { login } }', '-fowner=example'])`,
+      "runGh",
+    ],
+    ["queryExplicitPost", `runGh(['api', '-XPOST', 'graphql', '-fquery=query { viewer { login } }'])`, null],
     ["api", `runGh(['api', 'user'])`, null],
     ["query", `runGh(['api', 'graphql', '-f', 'query=query { viewer { login } }'])`, null],
     ["compactQuery", `runGh(['api', 'graphql', '-fquery=query { viewer { login } }'])`, null],
@@ -727,6 +862,7 @@ test("read classification keeps uncertain dispatch and excludes only proven read
       "runGh",
     ],
     ["variableQuery", `runGh(['api', 'graphql', '-f', part])`, "runGh"],
+    ["explicitGet", `runGh(['api', 'user', '-X', 'GET'])`, "runGh"],
     ["post", `runGh(['api', 'user', '-X', 'POST'])`, "runGh"],
     ["method", `runGh(['api', 'user', '--method', method])`, "runGh"],
     ["field", `runGh(['api', 'user', '-f', 'x=y'])`, "runGh"],
@@ -797,6 +933,159 @@ test("read classification keeps uncertain dispatch and excludes only proven read
       );
     },
   );
+}, 30_000);
+
+test("call, apply and bound invocations preserve roots and effective arguments", async () => {
+  const cases: [string, string, string | null][] = [
+    ["called", `runGh.call(undefined, ['issue', 'comment', '1'])`, "runGh"],
+    ["applied", `runGh.apply(undefined, [['issue', 'comment', '1']])`, "runGh"],
+    ["fetchCalled", `fetch.call(globalThis, 'https://api.github.com/path', {method: 'POST'})`, "fetch"],
+    ["partial", `const write = client.bind(undefined, '/path'); write(body)`, "ghClient"],
+    ["immediate", `client.bind(undefined, '/path', body)()`, "ghClient"],
+    ["bracketCalled", `runGh['call'](undefined, ['issue', 'comment', '1'])`, "runGh"],
+    ["bracketApplied", `runGh['apply'](undefined, [['issue', 'comment', '1']])`, "runGh"],
+    ["bracketBound", `const write = client['bind'](undefined, '/path'); write(body)`, "ghClient"],
+    [
+      "conditionalImmediate",
+      `(Math.random() ? client : client.bind(undefined, '/path', body, undefined, undefined, undefined))('/other')`,
+      "ghClient",
+    ],
+    ["typedCalled", `const gh: GhRunner = runGh; gh.call(undefined, ['issue', 'comment'])`, "runGh"],
+    [
+      "typedBound",
+      `const gh: GitHubClient = client; const write = gh.bind(undefined, '/path'); write(body)`,
+      "ghClient",
+    ],
+    [
+      "aliasedBound",
+      `const first = client.bind(undefined, '/path'); const second = first; second(body)`,
+      "ghClient",
+    ],
+    ["parenthesizedBound", `const write = client.bind(undefined, '/path'); (write)(body)`, "ghClient"],
+    ["parenthesizedClient", `(client)('/path', body)`, "ghClient"],
+    ["rebound", `const first = client.bind(undefined, '/path'); first.bind(undefined, body)()`, "ghClient"],
+    ["boundCalled", `const write = client.bind(undefined, '/path'); write.call(undefined, body)`, "ghClient"],
+    [
+      "boundApplied",
+      `const write = client.bind(undefined, '/path'); write.apply(undefined, [body])`,
+      "ghClient",
+    ],
+    [
+      "uncertainApplied",
+      `const args: Parameters<typeof client> = ['/path', body]; client.apply(undefined, args)`,
+      "ghClient",
+    ],
+    [
+      "spreadApplied",
+      `const args: [string, unknown] = ['/path', body]; client.apply(undefined, [...args])`,
+      "ghClient",
+    ],
+    [
+      "uncertainBound",
+      `const write = Math.random() ? client.bind(undefined, '/path') : client.bind(undefined, '/path', body); write()`,
+      "ghClient",
+    ],
+    [
+      "uncertainAppliedRead",
+      `const args: Parameters<typeof client> = ['/path']; client.apply(undefined, args)`,
+      "ghClient",
+    ],
+    [
+      "spreadBound",
+      `const args: Parameters<typeof client> = ['/path', body]; client.bind(undefined, ...args)()`,
+      "ghClient",
+    ],
+    ["calledRead", `runGh.call(undefined, ['api', 'user', '-q', '.login'])`, null],
+    ["bracketCalledRead", `runGh['call'](undefined, ['api', 'user'])`, null],
+    ["bracketAppliedRead", `runGh['apply'](undefined, [['pr', 'view', '1']])`, null],
+    ["bracketBoundRead", `client['bind'](undefined, '/path')()`, null],
+    ["appliedRead", `runGh.apply(undefined, [['pr', 'view', '1']])`, null],
+    ["fetchCalledRead", `fetch.call(globalThis, 'https://api.github.com/path', {method: 'GET'})`, null],
+    ["boundRead", `const read = client.bind(undefined, '/path'); read()`, null],
+    ["immediateRead", `runGh.bind(undefined, ['api', 'user'])()`, null],
+    ["boundFetchRead", `fetch.bind(globalThis, 'https://api.github.com/path')({method: 'GET'})`, null],
+    ["bindOnly", `client.bind(undefined, '/path', body)`, null],
+    [
+      "unrelated",
+      `const obj = {call() {}, apply() {}, bind() { return () => {}; }}; obj.call(); obj.apply(); obj.bind()(); obj['call'](); obj['apply'](); obj['bind']()()`,
+      null,
+    ],
+  ];
+  await fixture(
+    {
+      "indirect.ts":
+        imports +
+        cases.map(([fn, source]) => `export function ${fn}() { ${source}; }`).join("\n") +
+        `export function parameterBound(gh: GitHubClient) { const write = gh.bind(undefined, '/path'); write(body); }
+        export function defaultBound(gh: GhRunner, write = gh.bind(undefined, ['issue', 'comment'])) { write(); }
+        export class Sender {
+          write = client.bind(undefined, '/path');
+          send() { this.write(body); }
+        }`,
+    },
+    async (config, dir) => {
+      const api = new API({ cwd: dir });
+      try {
+        const snapshot = await api.updateSnapshot({ openProjects: [config] });
+        const project = snapshot.getProject(config);
+        if (!project) throw new Error("Missing fixture project");
+        expect(await project.program.getSemanticDiagnostics(join(dir, "indirect.ts"))).toEqual([]);
+      } finally {
+        await api.close();
+      }
+      expect(await analyze(config, dir, synthetic)).toEqual(
+        [
+          ...cases,
+          ["parameterBound", "", "ghClient"],
+          ["defaultBound", "", "runGh"],
+          ["Sender/send", "", "ghClient"],
+        ]
+          .flatMap(([fn, , root]) => (root ? [{ file: "indirect.ts", fn, root, count: 1 }] : []))
+          .sort((a, b) => key(a).localeCompare(key(b))),
+      );
+    },
+  );
+}, 30_000);
+
+test("caller identities survive unrelated closures, comments and constant renames", async () => {
+  const source = (constant: string, comment = "", extra = "", second = "") => `${imports}
+const ${constant} = 'send';
+export class Sender {
+  [${comment} ${constant}]() {
+    ${extra}
+    [1].map(() => client('/path', body));
+    ${second}
+  }
+}
+`;
+  const variants = [
+    source("key"),
+    source("key", "", "[2].map(() => 0);"),
+    source("key", "/* unrelated comment */"),
+    source("renamed"),
+    source("key", "", "", "[2].map(() => client('/other', body));"),
+  ];
+  const results: Site[][] = [];
+  await fixture({ "stable.ts": variants[0] ?? "" }, async (config, dir) => {
+    for (const variant of variants) {
+      await writeFile(join(dir, "stable.ts"), variant);
+      results.push(await analyze(config, dir, synthetic));
+    }
+  });
+  const site = { file: "stable.ts", fn: "Sender/send", root: "ghClient", count: 1 };
+  const baseline = [site];
+  for (const result of results.slice(0, 4)) expect(result).toEqual(baseline);
+  expect(results[4]).toEqual([{ ...site, count: 2 }]);
+  expect(() =>
+    compare(
+      results[4] ?? [],
+      baseline.map((s) => ({
+        ...s,
+        category: "helper",
+        reason: "categorized at callers",
+      })),
+    ),
+  ).toThrow("stable.ts | Sender/send | ghClient: expected 1, actual 2 (count)");
 }, 30_000);
 
 test("manifest comparator independently rejects unknown, changed and stale sites", () => {
