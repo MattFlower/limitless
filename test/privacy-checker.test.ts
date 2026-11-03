@@ -19,6 +19,7 @@ import {
 import * as c from "../src/util/privacy-chunks.ts";
 import { provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
 import * as t from "../src/util/privacy-transport.ts";
+import { resetProcessPrivacy } from "./privacy-process-support.ts";
 import { privacyTexts } from "./privacy-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -1614,16 +1615,33 @@ test("process checker is lazy and shared, refuses until provisioned, keeps equiv
   const dir = mkdtempSync(join(tmpdir(), "privacy-checker-"));
   const f = fixture(),
     port = new Port();
-  const previous = b.privacyRegistry.snapshot(),
-    refresh = b.privacyRegistry.refreshPolicy;
   try {
     await disposePrivacyChecker();
-    b.privacyRegistry.failPolicy();
+    writeFileSync(join(dir, "private-strings.txt"), "previous-policy");
+    provisionPrivacyPolicy(dir, []);
+    expect(b.privacyRegistry.ready).toBe(true);
+    expect(b.privacyRegistry.entries).toHaveLength(1);
+    // Other files retain credentials; exercise policy lifecycle without resetting those registrations.
+    const limits = {
+      credentials: Math.max(b.privacyLimits.credentials, b.privacyRegistry.snapshot().credentials.length),
+    };
+    const previousPort = new Port();
+    const previous = getPrivacyChecker({ workerFactory: () => previousPort, schedule, limits });
+    const warm = previous.protectText(input());
+    await f.run();
+    expect(read(await warm)).toMatchObject({ withheld: false });
+    await resetProcessPrivacy();
+    expect(previousPort.terminated).toBe(1);
+    b.privacyRegistry.refreshPolicy();
+    expect(b.privacyRegistry.ready).toBe(false);
+    expect(b.privacyRegistry.entries).toEqual([]);
     const workerFactory = mock(() => port);
-    const checker = getPrivacyChecker({ workerFactory, schedule });
+    const checker = getPrivacyChecker({ workerFactory, schedule, limits });
+    expect(checker).not.toBe(previous);
     expect(getPrivacyChecker()).toBe(checker);
     await withheld(checker.protectText(input()), "unreadable-policy");
     expect(workerFactory).toHaveBeenCalledTimes(0);
+    writeFileSync(join(dir, "private-strings.txt"), "");
     provisionPrivacyPolicy(dir, []);
     const pending = checker.protectText(input());
     await f.clock.flush();
@@ -1641,10 +1659,7 @@ test("process checker is lazy and shared, refuses until provisioned, keeps equiv
     expect(port.terminated).toBe(1);
   } finally {
     await f.dispose();
-    await disposePrivacyChecker();
-    b.privacyRegistry.refreshPolicy = refresh;
-    b.privacyRegistry.replacePolicy(previous.entries);
-    if (!previous.ready) b.privacyRegistry.failPolicy();
+    await resetProcessPrivacy();
     rmSync(dir, { recursive: true, force: true });
   }
 });
