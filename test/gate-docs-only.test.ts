@@ -124,6 +124,7 @@ ${snapshot ? '[limits]\nslotted_commands = ["bun test"]\nagent_full_suite = "gat
       idleTimedOut: false,
       truncated: false,
       stdout: "passed",
+      capture: { provenance: { kind: "complete" }, stdout: `${opts.cmd[4]}\npassed`, stderr: "" },
       stderr: "",
       durationMs: slowFailure ? 65_000 : slow ? 1000 : 1,
     };

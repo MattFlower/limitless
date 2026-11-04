@@ -78,8 +78,7 @@ export async function prepareEvalGates(
 export async function prepareImplement(item: ImplementCase, cwd: string, signal: AbortSignal) {
   const { gates, baseline } = await prepareEvalGates(item, cwd, signal);
   if (!baseline.setupOk) throw new Error("baseline gate setup failed");
-  if (baseline.checks.some((check) => check.output.startsWith("[timed out]")))
-    throw new Error("baseline gate check timed out");
+  if (baseline.checks.some((check) => check.timedOut)) throw new Error("baseline gate check timed out");
   // A check already failing on the snapshot can never block (still_failing), so gates would
   // stop grading anything; a repository whose checks read evals/ can't use snapshot mode.
   const failing = item.snapshot ? baseline.checks.find((check) => !check.ok) : undefined;

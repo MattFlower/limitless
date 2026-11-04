@@ -1296,7 +1296,7 @@ test("a passing LAN land retry that rewrites tracked files remains blocked", asy
   expect(store.failureObservations()[0]?.finalized_at).toBeNumber();
   const log = readFileSync(completed?.logPath ?? "", "utf8");
   expect(log).toContain("Retry rejected:");
-  expect(log).toContain('tracked files changed: ["README.md"]');
+  expect(log).toContain("tracked checkout cleanliness was not confirmed");
   expect(log).toContain("initial test failure");
   expect(ghCalls("pr merge")).toEqual([]);
   expect(ghCalls("git push")).toEqual([]);
@@ -1412,6 +1412,7 @@ test.each(["pass", "cancel", "stop"])("local targeted land retry keeps its slot 
       truncated: false,
       stdout: "output",
       stderr: "",
+      capture: { provenance: { kind: "complete" }, stdout: `${opts.cmd[4]}\noutput`, stderr: "" },
       durationMs: 1,
     };
   });
@@ -1709,6 +1710,7 @@ test("a completed attributed test timeout with a redacted command lands after on
       idleTimedOut: false,
       truncated: false,
       stdout: output,
+      capture: { provenance: { kind: "complete" }, stdout: `${opts.cmd[4]}\n${output}`, stderr: "" },
       stderr: "",
       durationMs: failed ? 954000 : 1,
     };
@@ -2810,7 +2812,7 @@ test("red CI on the pushed commit blocks the entry with the failing check names"
 test.each([
   ["(fail) identifier", "(fail) identifier"],
   ["\u001b[31m✗ colored identifier\u001b[0m", "✗ colored identifier"],
-])("a failing land check keeps its identity after a long diagnostic: %s", async (result, identity) => {
+])("a failing land check logs the checked tail without early excerpts: %s", async (result, identity) => {
   const credential = "synthetic-land-gate-credential-409";
   registerCredential("LAND_GATE_TEST_TOKEN", credential);
   writeFileSync(
@@ -2839,13 +2841,13 @@ test.each([
   expect(blocked?.reason).toMatch(/^lint failed \(/);
   expect(blocked?.reason).not.toContain("secret in output");
   const log = readFileSync(blocked?.logPath ?? "", "utf8");
-  expect(log).toContain("error: values differ\nExpected: 1\nReceived: 2");
-  expect(log).toContain(identity);
-  expect(log).toContain("left out");
+  expect(log).not.toContain("error: values differ");
+  expect(log).not.toContain(identity);
+  expect(log).not.toContain("left out");
+  expect(log).toContain("skipped summary");
   expect(log).toContain("credential: [redacted]");
   expect(log).not.toContain(credential);
-  expect(log.indexOf(identity)).toBeLessThan(log.indexOf("skipped summary"));
-  expect(log.indexOf("error:")).toBeLessThan(log.indexOf("skipped summary"));
+
   expect(ghCalls("pr merge")).toEqual([]);
 });
 

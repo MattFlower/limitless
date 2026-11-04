@@ -110,6 +110,11 @@ export function postMergeWorkerFixture(
       idleTimedOut: false,
       truncated: false,
       stdout: lines.join("\n"),
+      capture: {
+        provenance: { kind: "complete" },
+        stdout: `${opts.cmd[4]}\n${lines.join("\n")}`,
+        stderr: "",
+      },
       stderr: "",
       durationMs: 1,
     };

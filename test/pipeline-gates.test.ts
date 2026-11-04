@@ -175,10 +175,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
       }
       if (scenario === "dirty") {
         expect(check?.coordinatorConfirmation?.reason).toContain("Retry rejected:");
-        expect(check?.coordinatorConfirmation?.reason).toContain('tracked files changed: ["greeting.txt"]');
+        expect(check?.coordinatorConfirmation?.reason).toBe(
+          "Retry rejected: tracked checkout cleanliness was not confirmed",
+        );
         expect(check?.result.targetedRetry).toMatchObject({ ok: true, exitCode: 0 });
         expect(check?.result.firstAttempt?.ok).toBe(false);
-        expect(f.store.getRun(run.id)?.error).toContain("tracked files changed");
+        expect(f.store.getRun(run.id)?.error).toContain("tracked checkout cleanliness was not confirmed");
         expect(f.store.getRun(run.id)?.headSha).toBe(approved);
       } else if (scenario === "pass" || scenario === "fail") {
         expect(checkpoints.length).toBeGreaterThan(1);
@@ -451,6 +453,13 @@ describe("pipeline (fake agents, real git + gates)", () => {
         });
         opts.signal?.throwIfAborted();
       }
+      const stdout = timeout
+        ? `${scenario === "unflagged" ? "[timed out] from nested tool\n" : ""}RUN slow acceptance test\nfarewell.txt:12\n`
+        : fail
+          ? scenario === "retry-lint"
+            ? "transient lint error"
+            : "farewell.txt:12: lint error"
+          : "passed";
       return {
         exitCode: timeout || fail ? 1 : 0,
         signal: null,
@@ -458,13 +467,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         timedOut: timeout && scenario !== "unflagged",
         idleTimedOut: false,
         truncated: false,
-        stdout: timeout
-          ? `${scenario === "unflagged" ? "[timed out] from nested tool\n" : ""}RUN slow acceptance test\nfarewell.txt:12\n`
-          : fail
-            ? scenario === "retry-lint"
-              ? "transient lint error"
-              : "farewell.txt:12: lint error"
-            : "passed",
+        stdout,
+        capture: { provenance: { kind: "complete" }, stdout: `${opts.cmd[4]}\n${stdout}`, stderr: "" },
         stderr: "",
         durationMs: timeout ? (opts.timeoutMs ?? 900_000) : 1,
       };
@@ -570,14 +574,17 @@ describe("pipeline (fake agents, real git + gates)", () => {
               retryAttempt: { ok: true, executionProvenance: { trackedClean: false } },
             },
           });
-          expect(evidence[0]?.result.output).toContain("RUN slow acceptance test");
-          expect(evidence[0]?.result.output).toContain('tracked files changed: ["greeting.txt"]');
+          expect(evidence[0]?.result.output).toContain("[withheld: capture-incomplete; timed out]");
+          expect(evidence[0]?.result.output).toContain(
+            "Retry rejected: tracked checkout cleanliness was not confirmed",
+          );
           expect(prompts[1]).toContain("Retry rejected:");
-          expect(prompts[1]).toContain("greeting.txt");
+          expect(prompts[1]).toContain("tracked checkout cleanliness was not confirmed");
         }
         if (scenario === "twice") {
           expect(prompts[1]).toContain("Check `test` timed out after 37 s twice");
-          expect(prompts[1]).toContain("the last test running was slow acceptance test");
+          expect(prompts[1]).toContain("[withheld: capture-incomplete; timed out]");
+          expect(prompts[1]).not.toContain("RUN slow acceptance test");
           expect(prompts[1]).not.toContain("now FAILS");
           expect(calls).toBe(4);
         }
@@ -777,6 +784,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
           ? ["sandbox_apply:", "Operation not permitted"].join(" ")
           : "";
       opts.onRawChunk?.(stderr, "stderr");
+      const stdout =
+        fail && scenario === "slow changed file"
+          ? "farewell.txt:12: failure"
+          : timeout || fail
+            ? "[timed out] from nested tool"
+            : "passed";
       return {
         exitCode: timeout ? null : fail ? 1 : 0,
         signal: null,
@@ -784,12 +797,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         timedOut: timeout,
         idleTimedOut: false,
         truncated: false,
-        stdout:
-          fail && scenario === "slow changed file"
-            ? "farewell.txt:12: failure"
-            : timeout || fail
-              ? "[timed out] from nested tool"
-              : "passed",
+        stdout,
+        capture: { provenance: { kind: "complete" }, stdout: `${opts.cmd[4]}\n${stdout}`, stderr: stderr },
         stderr,
         durationMs:
           command === "fake-test" &&
@@ -881,7 +890,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
           result: { ok: recovered, firstAttempt: { ok: false, durationMs: 400_000 } },
         });
         if (scenario === "slow dirty")
-          expect(evidence[0]?.result.output).toContain('tracked files changed: ["greeting.txt"]');
+          expect(evidence[0]?.result.output).toContain(
+            "Retry rejected: tracked checkout cleanliness was not confirmed",
+          );
         if (targeted) {
           expect(evidence[0]?.result.targetedRetry).toMatchObject({
             ok: true,
@@ -943,7 +954,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
               blocking: true,
               result: { ok: false, timedOut: true, retryAttempt: { ok: true } },
             });
-            expect(evidence[0]?.result.output).toContain('tracked files changed: ["greeting.txt"]');
+            expect(evidence[0]?.result.output).toContain(
+              "Retry rejected: tracked checkout cleanliness was not confirmed",
+            );
           }
           expect(reason).toContain("post-merge gate timed out");
           expect(reason).not.toContain("regressed");
@@ -1062,12 +1075,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
       baseline?.output,
       baseline?.firstAttempt?.ok,
       baseline?.firstAttempt?.output,
-    ]).toEqual([false, "attempt 2", false, "attempt 1"]);
+    ]).toEqual([false, "attempt 2\n", false, "attempt 1\n"]);
     // Both failed attempts stay in the artifact.
     const artifact = JSON.parse(f.store.getArtifact(run.id, "baseline-gates.json") ?? "{}");
     expect([artifact.checks?.[0]?.output, artifact.checks?.[0]?.firstAttempt?.output]).toEqual([
-      "attempt 2",
-      "attempt 1",
+      "attempt 2\n",
+      "attempt 1\n",
     ]);
     expect([state?.lastGates?.[0]?.verdict, state?.lastGates?.[0]?.blocking]).toEqual([
       "still_failing",

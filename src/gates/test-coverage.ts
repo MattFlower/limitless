@@ -19,6 +19,7 @@ export interface TestCoverage {
 
 /** Bun's file headers and result rows, captured before the process output tail is truncated. */
 export class BunTestCoverage {
+  overflow = false;
   private current: string | undefined;
   private files = new Map<string, { passed: boolean; skipped: boolean; failed: boolean }>();
   private passed: number | undefined;
@@ -58,10 +59,23 @@ export class BunTestCoverage {
     else if (skippedSummary) this.skipSummary = Number(skippedSummary[1]);
     const file = /^(.+\.(?:test|spec)\.[cm]?[jt]sx?):$/.exec(line)?.[1];
     if (file) {
+      this.current = undefined;
+      if (file.length > MAX_TEST_IDENTITY_LENGTH) {
+        this.overflow = true;
+        return;
+      }
       this.current =
         isAbsolute(file) && this.cwd
           ? relative(this.canonical(this.cwd), this.canonical(file))
           : file.replace(/^\.\//, "");
+      if (
+        this.current.length > MAX_TEST_IDENTITY_LENGTH ||
+        (this.files.size >= 2000 && !this.files.has(this.current))
+      ) {
+        this.overflow = true;
+        this.current = undefined;
+        return;
+      }
       if (!this.files.has(this.current))
         this.files.set(this.current, { passed: false, skipped: false, failed: false });
     }
@@ -82,7 +96,9 @@ export class BunTestCoverage {
       skippedFiles: skippedTests
         ? [...new Set(skippedTests.map((skip) => skip.file))]
         : [...this.files].filter(([, value]) => value.skipped).map(([file]) => file),
-      ...(this.sawFailure || (hasSkips && !skippedTests) ? { skippedTestsIncomplete: true } : {}),
+      ...(this.overflow || this.sawFailure || (hasSkips && !skippedTests)
+        ? { skippedTestsIncomplete: true }
+        : {}),
       ...(skippedTests ? { skippedTests } : {}),
       ...(this.passed !== undefined && this.failed !== undefined
         ? { summary: { passed: this.passed, failed: Math.max(this.failed, Number(this.sawFailure)) } }

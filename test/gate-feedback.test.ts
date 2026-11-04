@@ -93,9 +93,11 @@ test.each([
         ),
       );
       const result = gates.checks[0];
-      if (!result?.failures) throw new Error("missing failure excerpt");
-      for (const text of [result.output, result.failures]) {
-        if (!padding || text === result.output) expect(text).toContain("[redacted]");
+      if (!result) throw new Error("missing gate result");
+      expect(result.failures).toBeUndefined();
+      const marker = secret.length > 16384 ? "[withheld: unreadable-policy]" : "[redacted]";
+      for (const text of [result.output]) {
+        expect(text).toContain(marker);
         expect(text).not.toContain(diagnostic);
         for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
           expect(text).not.toContain(fragment.slice(0, 12));
@@ -113,8 +115,8 @@ test.each([
       factory.store.putArtifact(run.id, "gates.json", "gates", JSON.stringify(gates));
       factory.store.addEvent({ runId: run.id, type: "gate", message: "gates", data: gates });
       const stored = JSON.stringify(factory.store.listEvents(run.id));
-      expect(stored).toContain("[redacted]");
-      expect(stored).toContain("assertion");
+      expect(stored).toContain(marker);
+      if (secret.length <= 16384) expect(stored).toContain("assertion");
       expect(stored).not.toContain(secret);
       expect(stored).not.toContain(JSON.stringify(diagnostic).slice(1, -1));
       const routes = createHttpRoutes(factory);
@@ -146,7 +148,7 @@ test.each([
           implementerReport: "",
         }),
       ]) {
-        expect(text).toContain("[redacted]");
+        expect(text).toContain(marker);
         expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
         for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
           expect(text).not.toContain(fragment.slice(0, 12));
@@ -345,7 +347,7 @@ test("legacy gate results are redacted at checkpoints, HTTP and SSE reads withou
   }
 });
 
-test("gate feedback and review receive redacted early diagnostics and tails", async () => {
+test("gate feedback and review receive the checked tail without early excerpts", async () => {
   const gates = compareGates(null, await credentialGate());
   const messages = [
     formatGateFeedback(gates),
@@ -360,8 +362,9 @@ test("gate feedback and review receive redacted early diagnostics and tails", as
     }),
   ];
   for (const message of messages) {
-    expect(message).toContain("error: credential [redacted]");
-    expect(message).toContain("(fail) assertion");
+    expect(message).toContain("[redacted]");
+    expect(message).not.toContain("error: credential");
+    expect(message).not.toContain("(fail) assertion");
     expect(message).not.toContain(gateCredential);
   }
 });
