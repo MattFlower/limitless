@@ -485,8 +485,13 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
       },
       (_original, reason) => rejections.push(reason),
     );
-    expect(rejected.output).toBe(withheldText("retry-rejected"));
-    expect(rejected.textPrivacy?.output).toEqual({ withheld: true, reason: "retry-rejected" });
+    expect(rejected.output).toBe(
+      `${r.output}\n\nRetry rejected: execution SHA executed does not match checked commit checked`,
+    );
+    // The original proof doesn't cover the composition, so renderers withhold it.
+    expect(
+      verifier(f.registry, f.signer).verify(rejected.textPrivacy?.output, "output", rejected.output),
+    ).toBe(false);
     expect(rejected.failures).toBeUndefined();
     expect(rejected.firstAttempt).toBe(r);
     expect(
@@ -506,7 +511,7 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
   }
 });
 
-test("retry setup failure withholds composition containing a private command", async () => {
+test("retry setup failure composes protected output, never the private setup command", async () => {
   const f = fixture(["private-case"]);
   const original = await f.gate("original diagnostic");
   const setup = await f.gate("setup diagnostic", "", { run: "bun emit.ts; : private-case; exit 1" });
@@ -520,8 +525,11 @@ test("retry setup failure withholds composition containing a private command", a
     async () => ({ setupOk: false, setup: [setup], checks: [] }),
   );
   const r = results.get(original);
-  expect(r?.output).toBe(withheldText("retry-setup-failed"));
-  expect(r?.textPrivacy?.output).toEqual({ withheld: true, reason: "retry-setup-failed" });
+  expect(r?.output).toBe(`${original.output}\n\nRetry setup failed:\n\n${setup.output}`);
+  expect(r?.output).not.toContain("private-case");
+  expect(verifier(f.registry, f.signer).verify(r?.textPrivacy?.output, "output", r?.output ?? "")).toBe(
+    false,
+  );
   expect(r?.failures).toBeUndefined();
   expect(r?.firstAttempt).toBe(original);
   expect(

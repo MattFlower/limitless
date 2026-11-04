@@ -4,7 +4,6 @@ import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import type { GateComparison } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
-import { withheldText } from "../src/gates/text-privacy.ts";
 import { ciSignature } from "../src/integrations/ci-classifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
@@ -575,8 +574,12 @@ describe("pipeline (fake agents, real git + gates)", () => {
               retryAttempt: { ok: true, executionProvenance: { trackedClean: false } },
             },
           });
-          expect(evidence[0]?.result.output).toBe(withheldText("retry-rejected"));
-          expect(prompts[1]).toContain(withheldText("retry-rejected"));
+          expect(evidence[0]?.result.output).toContain("[withheld: capture-incomplete; timed out]");
+          expect(evidence[0]?.result.output).toContain(
+            "Retry rejected: tracked checkout cleanliness was not confirmed",
+          );
+          expect(prompts[1]).toContain("Retry rejected:");
+          expect(prompts[1]).toContain("tracked checkout cleanliness was not confirmed");
         }
         if (scenario === "twice") {
           expect(prompts[1]).toContain("Check `test` timed out after 37 s twice");
@@ -887,7 +890,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
           result: { ok: recovered, firstAttempt: { ok: false, durationMs: 400_000 } },
         });
         if (scenario === "slow dirty")
-          expect(evidence[0]?.result.output).toBe(withheldText("retry-rejected"));
+          expect(evidence[0]?.result.output).toContain(
+            "Retry rejected: tracked checkout cleanliness was not confirmed",
+          );
         if (targeted) {
           expect(evidence[0]?.result.targetedRetry).toMatchObject({
             ok: true,
@@ -949,7 +954,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
               blocking: true,
               result: { ok: false, timedOut: true, retryAttempt: { ok: true } },
             });
-            expect(evidence[0]?.result.output).toBe(withheldText("retry-rejected"));
+            expect(evidence[0]?.result.output).toContain(
+              "Retry rejected: tracked checkout cleanliness was not confirmed",
+            );
           }
           expect(reason).toContain("post-merge gate timed out");
           expect(reason).not.toContain("regressed");
