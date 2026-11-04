@@ -13,6 +13,7 @@ import { type GateRequest, localExecutor } from "../src/gates/executor.ts";
 import { lanExecutor } from "../src/gates/lan.ts";
 import { resolveRepo } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
+import { bindClaim, dispatchGuard } from "../src/integrations/claim-guard.ts";
 import { configureGitHubIdentity } from "../src/integrations/github-identity.ts";
 import { type AcceptanceState, acceptanceEngine, acceptanceRunRequest } from "../src/pipeline/acceptance.ts";
 import { fileFollowUps } from "../src/pipeline/acceptance-follow-ups.ts";
@@ -1870,4 +1871,91 @@ test("concurrent runs past the limit label and comment on the epic once", async 
   expect(gh.labels).toEqual(["limitless:needs-you"]);
   expect(gh.comments).toHaveLength(1);
   expect(gh.created).toHaveLength(6);
+});
+
+test.each(["create", "limit"])(
+  "a capability refusal releases the acceptance %s reservation for resume",
+  async (kind) => {
+    const t = await setup({ parent: gapParent, ticket: gapTicket });
+    const gh = fakeGitHub(t);
+    if (kind === "limit") {
+      await exhaustPasses(t);
+      t.next();
+      await t.restart();
+    }
+    const binding = bindClaim(
+      { windowOpen: () => true },
+      {
+        repo: t.run.repoSlug,
+        ref: "refs/limitless/claims/9",
+        run: t.run.id,
+        member: "m",
+        generation: 1,
+      },
+      () => false,
+    );
+    t.f.cfg.repos = {
+      "test/repo": { shared: true, discreet: false, branchPrefix: "change/", landRequiresApproval: false },
+    };
+    t.f.deps.runClaim = { binding, leases: { update: async () => "applied" } };
+    let capable = true;
+    t.f.deps.capability = {
+      admit: async () => [],
+      canContinue: async () => [],
+      capableNow: () => capable,
+      forget: () => {},
+    };
+    // The fake transport composes the same final dispatch guard before recording a request.
+    gh.intercept = (args) => {
+      if (
+        (kind === "create" && args.some((a) => a.includes("createIssue"))) ||
+        (kind === "limit" && args[1] === "repos/test/repo/issues/1/comments" && args.includes("POST"))
+      )
+        capable = false;
+      dispatchGuard();
+    };
+    t.reply(() => ({ structured: gapOutput() }));
+    expect(await t.execute()).toBe("queued");
+    expect(t.state()?.githubWait?.reason).toBe("claim:capability");
+    if (kind === "create") {
+      expect(gh.created).toHaveLength(0);
+      expect(
+        JSON.parse(gh.passes()[0]?.items ?? "[]").every((h: { state: string }) => h.state === "pending"),
+      ).toBe(true);
+    } else {
+      expect(gh.comments).toHaveLength(0);
+      expect(t.f.store.db.query("SELECT comment FROM acceptance_epic_limits").get()).toEqual({
+        comment: "pending",
+      });
+    }
+    capable = true;
+    gh.intercept = () => dispatchGuard();
+    expect(await t.execute()).toBe("needs_human");
+    if (kind === "create") {
+      expect(gh.created).toHaveLength(3);
+      expect(
+        JSON.parse(gh.passes()[0]?.items ?? "[]").every((h: { state: string }) => h.state === "filed"),
+      ).toBe(true);
+    } else expect(gh.comments).toHaveLength(1);
+    // A repeated execution adopts the completed publication rather than re-sending it.
+    expect(await t.execute()).toBe("needs_human");
+    expect(kind === "create" ? gh.created.length : gh.comments.length).toBe(kind === "create" ? 3 : 1);
+  },
+);
+
+test("releaseAcceptanceLimit normalizes the repo and only releases requested comments", () => {
+  const store = new Store(":memory:");
+  try {
+    expect(store.claimAcceptanceLimit("Owner/Repo", 1, "run")).toBe("claimed");
+    store.finishAcceptanceLimit("owner/repo", 2, "run");
+    store.releaseAcceptanceLimit("OWNER/REPO", 1);
+    store.releaseAcceptanceLimit("OWNER/REPO", 2);
+    store.releaseAcceptanceLimit("owner/repo", 3);
+    expect(store.db.query("SELECT epic, comment FROM acceptance_epic_limits ORDER BY epic").all()).toEqual([
+      { epic: 1, comment: "pending" },
+      { epic: 2, comment: "done" },
+    ]);
+  } finally {
+    store.close();
+  }
 });

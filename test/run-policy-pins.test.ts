@@ -80,6 +80,12 @@ async function fixture(
     return { files: { "farewell.txt": "goodbye\n" } };
   });
   await f.stop();
+  f.deps.capability = {
+    admit: async () => [],
+    canContinue: async () => [],
+    capableNow: () => true,
+    forget: () => {},
+  };
   registerGithub(f, bare);
   f.cfg.repos = {
     "test/repo": { shared, discreet: false, branchPrefix: "change/", landRequiresApproval: false },

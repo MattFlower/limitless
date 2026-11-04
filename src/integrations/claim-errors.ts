@@ -1,4 +1,4 @@
-export type ClaimWaitReason = "cancelled" | "lease" | "unavailable" | "policy";
+export type ClaimWaitReason = "cancelled" | "lease" | "unavailable" | "policy" | "capability";
 
 export abstract class ClaimControlError extends Error {
   protected constructor(message: string) {
