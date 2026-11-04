@@ -436,6 +436,20 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
   }
 });
 
+test("JUnit reports parse up to the measured 256 KiB cap and fall back above it", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "junit-cap-"));
+  try {
+    writeFileSync(join(cwd, "a.test.ts"), "");
+    const xml =
+      '<testsuite tests="1" failures="1"><testcase file="a.test.ts" name="x"><failure/></testcase></testsuite>';
+    const sized = (bytes: number) => xml + " ".repeat(bytes - xml.length);
+    expect(junit.parseJUnit(sized(256 * 1024), cwd)?.failedFiles).toEqual(["a.test.ts"]);
+    expect(junit.parseJUnit(sized(256 * 1024 + 1), cwd)).toBeUndefined();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 const retrySeed = seeded(async (cwd) => {
   await sh(["git", "init", "-q"], { cwd });
   writeFileSync(

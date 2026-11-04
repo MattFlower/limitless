@@ -93,15 +93,6 @@ export async function checkAndSign(
   const { registry } = checker,
     key = signer(),
     bound = { registry, input: cut?.limit === 0 ? hash(text) : undefined };
-  // A verdict-only proof or claim covers the original, which credential redaction never rendered.
-  if (cut?.limit === 0) {
-    const original = checkPrepared(preparePrivacyPolicy({ ...registry.snapshot(), entries: [] }), text);
-    if (!("clean" in original)) {
-      input.onRefusal?.("refused" in original ? original.refused : "private-match");
-      return;
-    }
-  }
-  if (!key) return;
   const parts: Uint8Array[] = [];
   for (let index = 0; ; index++) {
     const part = consumeBoundaryChunk(receipt, index, bound);
@@ -112,8 +103,14 @@ export async function checkAndSign(
     if (part.done) break;
     parts.push(part.bytes);
   }
-  const rendering = Buffer.concat(parts),
-    bytes = !rendering.length && cut?.limit === 0 ? text : rendering,
+  const rendering = Buffer.concat(parts);
+  // The checker marks a verdict-only receipt whose original credential redaction would change.
+  if (cut?.limit === 0 && rendering.length) {
+    input.onRefusal?.("private-match");
+    return;
+  }
+  if (!key) return;
+  const bytes = cut?.limit === 0 ? text : rendering,
     binding = [kind, registry.semantics, privateStringsDigest(registry.entries), field];
   const policy = preparePrivacyPolicy({
     ready: true,

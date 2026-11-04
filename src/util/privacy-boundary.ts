@@ -483,7 +483,10 @@ function protectTextPrepared(
       ? terminalRedactor(() => policy.matcher).push(text, true)
       : policy.matcher.redact(text);
     if (terminal || rendered !== text) state = inspect(state, rendered);
-    return issue(select(state, cut));
+    state = select(state, cut);
+    // A verdict-only receipt covers its original only when rendering leaves the original unchanged.
+    if (cut?.limit === 0 && rendered !== text && !state.withheld) state = inspect(state, "[redacted]");
+    return issue(state);
   } catch {
     return issue(withheld(state, "nonconvergent"));
   }

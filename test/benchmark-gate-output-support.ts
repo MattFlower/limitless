@@ -188,6 +188,8 @@ export const registry: Record<string, (c: Context) => Promise<Job[]> | Job[]> = 
           kind: "complete",
           field: "identities",
           text: bytes,
+          // Identities are verdict-only, so the zero-length cut path is the one measured.
+          cut: { limit: 0, unit: "U", marker: "" },
           signer: () => key,
         }));
       const outcome = over || !identity ? "raw-command; identities-refused-or-unavailable" : "identity-proof";

@@ -78,6 +78,15 @@ test("terminal credentials use the actual matcher and controls are stripped", ()
     "private-match",
   );
 });
+test("verdict-only receipts mark originals that credential redaction would change", () => {
+  const f = fixture([], ["synthetic-token"]),
+    cut = { limit: 0, unit: "U" as const, marker: "" };
+  const changed = consume(f.protect(" synthetic-token ", { cut, terminal: true }));
+  expect([changed.withheld, changed.text]).toEqual([false, "[redacted]"]);
+  expect(consume(f.protect(" clean text ", { cut, terminal: true })).text).toBe("");
+  // Non-terminal credential hits never render, so they are withheld outright.
+  expect(consume(f.protect(" synthetic-token ", { cut })).withheld).toBe(true);
+});
 test("unchecked provenance and copied identities have no authority", () => {
   const f = fixture();
   const value = f.protect("clean");
