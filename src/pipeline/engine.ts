@@ -2986,8 +2986,10 @@ async function checkPublication(
 ) {
   const cwd = ctx.state.worktreePath as string;
   if (pr) await checkWorkflowPublication(ctx, pr.sha);
+  let step = "private-string policy loading";
   try {
     const entries = privateEntries(ctx, cwd);
+    step = "publication text inspection";
     if (repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet) {
       if (hasFactoryMark(body, ctx.run.id, ctx.deps.cfg.uiUrl))
         throw new DiscreetError(`Discreet mode blocked factory marks in ${location}`);
@@ -3000,6 +3002,7 @@ async function checkPublication(
     const branch =
       pr.branch ?? reviewRound(ctx)?.grant.owner.branch ?? ctx.run.deliveryBranch ?? ctx.run.branch;
     checkPublicationText(branch ?? "", "Branch name", entries);
+    step = "publication-range inspection";
     if (!branch || !ctx.run.baseSha) throw new Error("Missing publication branch or base");
     const range = await deliveryPublicationRange(
       ctx.repo,
@@ -3013,6 +3016,7 @@ async function checkPublication(
         ? { runId: ctx.run.id, published: !!ctx.run.prUrl || !!ctx.run.deliveryBranch || !!reviewRound(ctx) }
         : undefined,
     );
+    step = "discreet commit inspection";
     if (repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet)
       await checkDiscreetCommits(
         cwd,
@@ -3021,7 +3025,9 @@ async function checkPublication(
         ctx.run.id,
         ctx.deps.cfg.uiUrl,
       );
+    step = "private-string range inspection";
     await checkPrivateRange(cwd, range, entries);
+    step = "diff inspection";
     const findings = auditDiff(await diffSince(cwd, ctx.run.baseSha as string, undefined, false, entries), {
       configDir: ctx.deps.cfg.paths.configDir,
       taskClass: ctx.run.taskClass,
@@ -3041,7 +3047,7 @@ async function checkPublication(
     const reason =
       error instanceof PrivateError || error instanceof DiscreetError
         ? error.message
-        : "Private-string check blocked";
+        : `Private-string check could not run: ${step} failed`;
     throw new NeedsHumanError(reason);
   }
 }

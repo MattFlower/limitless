@@ -1,11 +1,79 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { setupCommand, setupDeps } from "../src/cli/setup.ts";
 import { loadConfig } from "../src/config.ts";
 import { tomlValue } from "../src/router/config-catalog.ts";
 import { customProvider } from "./provider-config-support.ts";
-import { setupFixture } from "./setup-support.ts";
+import { packagedRelease, setupFixture } from "./setup-support.ts";
+
+test("packaged init becomes ready at its build SHA and retains generated configuration", async () => {
+  const f = setupFixture(undefined, { release: packagedRelease, execPath: "/example/bin/limitless" });
+  try {
+    f.state.daemon = false;
+    expect(existsSync(f.d.appDir)).toBe(false);
+    expect(await setupCommand("init", { yes: true, json: true }, f.d)).toBe(0);
+    expect(Bun.TOML.parse(readFileSync(f.file, "utf8"))).toMatchObject({ github: { merge: "pr" } });
+    expect(f.effects).toEqual(["service", "mcp"]);
+    const result = JSON.parse(f.output[0] ?? "");
+    expect(result).toMatchObject({
+      ok: true,
+      service: "started",
+      smoke: [{ name: "live", status: "skip", durationMs: 0 }],
+    });
+    expect(result.smoke[0].reason).toContain("requires a source installation");
+    expect(JSON.parse(readFileSync(f.smokeFile, "utf8"))).toEqual(result.smoke);
+    const hook = JSON.parse(result.sessionStart.split("acknowledging:\n")[1]);
+    expect(hook.hooks.SessionStart[0].hooks[0].command).toBe(
+      "'/example/bin/limitless' digest --consumer claude",
+    );
+  } finally {
+    f.close();
+  }
+});
+
+for (const text of [undefined, "[server]\nport = 7444\n"])
+  for (const outcome of ["mismatch", "empty", "unhealthy", "unavailable", "empty expected"])
+    test(`packaged readiness restores ${text === undefined ? "absent" : "existing"} config: ${outcome}`, async () => {
+      const f = setupFixture(text, { release: packagedRelease });
+      try {
+        f.state.daemon = false;
+        f.d.install = async () => {
+          expect(existsSync(f.file)).toBe(true);
+          expect(readFileSync(f.file, "utf8")).not.toBe(text);
+          f.state.daemon = outcome !== "unavailable";
+          f.state.healthy = outcome !== "unhealthy";
+          f.state.sha =
+            outcome === "mismatch"
+              ? "b".repeat(40)
+              : outcome === "empty" || outcome === "empty expected"
+                ? ""
+                : packagedRelease.sha;
+        };
+        if (outcome === "empty expected") f.d.release = { ...packagedRelease, sha: "" };
+        expect(await setupCommand("init", { yes: true, json: true }, f.d)).toBe(1);
+        expect(JSON.parse(f.output[0] ?? "")).toMatchObject({
+          ok: false,
+          failedStep: "readiness",
+          error: expect.stringContaining("daemon did not become healthy"),
+        });
+        expect(f.effects).toEqual(Array(30).fill("wait"));
+        expect(f.requests.filter((r) => r.url.endsWith("/api/health"))).toHaveLength(31);
+        expect(existsSync(f.file)).toBe(text !== undefined);
+        if (text !== undefined) expect(readFileSync(f.file, "utf8")).toBe(text);
+        expect(f.d.config.raw).toEqual(text === undefined ? {} : { server: { port: 7444 } });
+      } finally {
+        f.close();
+      }
+    });
 
 test("empty --yes --json setup detects providers, writes validated config, starts service and saves smoke", async () => {
   const f = setupFixture();
@@ -324,6 +392,72 @@ test("production MCP adapter invokes registration once per vendor and preserves 
     expect(readdirSync(userHome).sort()).toEqual([".claude.json", ".codex", "unrelated.txt"]);
     expect(readdirSync(join(userHome, ".codex"))).toEqual(["config.toml"]);
     expect(f.snapshot()).toEqual(before);
+  } finally {
+    f.close();
+  }
+});
+test("packaged service and MCP adapters use the stable opt executable and retain existing registrations", async () => {
+  const f = setupFixture();
+  try {
+    const prefix = join(f.root, "brew prefix 'quoted'");
+    const cellar = join(prefix, "Cellar/limitless/2.0.0");
+    mkdirSync(join(cellar, "bin"), { recursive: true });
+    mkdirSync(join(prefix, "opt"));
+    const execPath = join(cellar, "bin/limitless");
+    writeFileSync(execPath, "fake executable");
+    symlinkSync(cellar, join(prefix, "opt/limitless"), "dir");
+    const stable = join(prefix, "opt/limitless/bin/limitless");
+    writeFileSync(join(f.root, "SKILL.md"), "embedded skill");
+    const d = setupDeps({
+      configDir: f.configDir,
+      home: f.home,
+      userHome: join(f.root, "user"),
+      appDir: f.d.appDir,
+      release: { ...packagedRelease, root: f.root },
+      execPath,
+    });
+    d.url = "http://daemon.invalid:7499";
+    const calls: string[][] = [];
+    const registrations = new Set<string>();
+    d.run = async (args) => {
+      calls.push(args);
+      const cli = args[0] ?? "";
+      if (args[2] === "get") return { exitCode: registrations.has(cli) ? 0 : 1, stdout: "", stderr: "" };
+      if (args[2] === "add") registrations.add(cli);
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    await d.install();
+    await d.mcp(true);
+    await d.mcp(true);
+    const add = (cli: string) => [
+      cli,
+      "mcp",
+      "add",
+      "limitless",
+      "--env",
+      `LIMITLESS_URL=${d.url}`,
+      ...(cli === "claude" ? ["--scope", "user"] : []),
+      "--",
+      stable,
+      "mcp",
+    ];
+    expect(calls).toEqual([
+      [stable, "service", "install"],
+      ["claude", "mcp", "get", "limitless"],
+      ["claude", "--version"],
+      add("claude"),
+      ["codex", "mcp", "get", "limitless"],
+      ["codex", "--version"],
+      add("codex"),
+      ["claude", "mcp", "get", "limitless"],
+      ["codex", "mcp", "get", "limitless"],
+    ]);
+    const before = f.snapshot();
+    const manual = await d.mcp(false);
+    expect(manual).toContain(JSON.stringify(stable));
+    expect(manual).toContain(d.url);
+    expect(f.snapshot()).toEqual(before);
+    expect(calls).toHaveLength(9);
   } finally {
     f.close();
   }

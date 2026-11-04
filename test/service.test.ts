@@ -10,8 +10,73 @@ import {
 } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { inspectService, installationUnits, installedUnits, stableExecutable } from "../src/cli/service.ts";
+import {
+  inspectService,
+  installationUnits,
+  installedUnits,
+  stableExecutable,
+  status,
+} from "../src/cli/service.ts";
 import { inspectionCases, inspectionResult } from "./service-inspection-support.ts";
+
+test.each([false, true])(
+  "packaged status uses embedded identity with unrelated git entry: %s",
+  async (git) => {
+    const dir = mkdtempSync(join(tmpdir(), "packaged-status-"));
+    const agents = join(dir, "agents");
+    const binary = join(dir, "limitless");
+    const calls: string[][] = [],
+      logs: string[] = [];
+    let healthCalls = 0;
+    try {
+      mkdirSync(agents);
+      writeFileSync(binary, "");
+      writeFileSync(join(agents, "daemon.plist"), "converted by fake plutil");
+      if (git) writeFileSync(join(dir, ".git"), "gitdir: unrelated");
+      await status(7400, {
+        release: { kind: "packaged", version: "1.2.3", sha: "b".repeat(40), bun: Bun.version },
+        agentsDir: agents,
+        releaseDir: dir,
+        lockPath: join(dir, "deploy.lock"),
+        execPath: binary,
+        log: (text) => logs.push(text),
+        command: async (args) => {
+          calls.push(args);
+          if (args[0] === "plutil")
+            return {
+              exitCode: 0,
+              stderr: "",
+              stdout: JSON.stringify({
+                Label: "custom.daemon",
+                ProgramArguments: [binary, "serve"],
+              }),
+            };
+          if (args[0] !== "launchctl") throw new Error("unexpected command");
+          return { exitCode: 0, stderr: "", stdout: "state = running" };
+        },
+        client: {
+          health: async () => {
+            healthCalls++;
+            throw new Error("offline");
+          },
+          admin: async () => {
+            throw new Error("unexpected admin");
+          },
+          run: async () => {
+            throw new Error("unexpected run");
+          },
+        },
+      });
+      expect(logs).toContain(`release: 1.2.3 ${"b".repeat(40)}`);
+      expect(logs).toContain("health: unreachable");
+      expect(logs.some((line) => line.includes("custom.daemon: loaded"))).toBe(true);
+      expect(healthCalls).toBe(1);
+      expect(calls.map((args) => args[0])).toEqual(["plutil", "launchctl"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
 
 for (const domain of ["gui", "user"] as const)
   for (const scenario of inspectionCases) {
