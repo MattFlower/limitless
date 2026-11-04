@@ -92,10 +92,10 @@ export function leaseMethods(store: Store) {
       store.db.transaction(() => rows("WHERE confirmed_state='held' ORDER BY repo,ref")).immediate(),
   };
 }
-type Deps = { client: ClaimClient; store: Store; signal?: AbortSignal };
+type Deps = { client: ClaimClient; store: Store; signal?: AbortSignal; observe?: boolean };
 type Settlement = "applied" | "replayed" | "dropped" | "superseded" | "pending";
 export async function reconcileLeaseIntent(
-  { client, store, signal }: Deps,
+  { client, store, signal, observe = false }: Deps,
   repo: string,
   ref: string,
 ): Promise<Settlement | "none"> {
@@ -117,6 +117,7 @@ export async function reconcileLeaseIntent(
       store.dropLeaseIntent(repo, ref);
       return "dropped";
     }
+    if (observe) return "pending"; // an observer never replays the unapplied release
     const result = await client.write(repo, ref, read.tip, intent.record, {
       signal,
       onCommit: (sha) => store.setLeaseIntentCommit(repo, ref, sha),

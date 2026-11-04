@@ -1,6 +1,7 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { setImmediate } from "node:timers/promises";
+import { TERMINAL_STATUSES } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { bindClaim, claimGuard, claimScope, type ScopedClaim } from "../src/integrations/claim-guard.ts";
@@ -206,7 +207,7 @@ test.each(["create", "takeover"])(
 );
 
 test.each([
-  ["same run", "run-a", "succeeded", "held"],
+  ["same run", "run-a", "succeeded", "refused"],
   ["fresh lineage", "run-b", "succeeded", "held"],
   ["needs human", "run-b", "needs_human", "refused"],
 ] as const)("released tip: %s", async (_name, run, status, expected) => {
@@ -302,7 +303,7 @@ test("obsolete handles reject update, release and window checks before all reque
   const claim = f.bind(manager, h1);
   const delayed = () => claimScope.run([claim], claimGuard);
   expect(Object.isFrozen(h1)).toBe(true);
-  expect(await manager.release(h1, { checkpoint })).toBe("released");
+  expect(await manager.release(h1, {})).toBe("released");
   const h2 = held(await f.acquire(manager)).handle;
   expect(h2.generation).toBe(2);
   await Promise.resolve();
@@ -434,7 +435,7 @@ test.each(["absent", "released"] as const)(
   "same-holder moved acquisition from a %s tip retries without loss",
   async (start) => {
     const f = fixture();
-    if (start === "released") f.confirmed({ ...record, state: "released", status: "succeeded" });
+    if (start === "released") f.confirmed({ ...record, state: "released", status: "waiting_input" });
     const manager = await f.create();
     f.start(manager, false);
     let moved = false;
@@ -654,7 +655,7 @@ test("own expired acquisition with takeover advances the generation and inherits
   expect(f.lost).toHaveBeenCalledTimes(1);
 });
 
-test("release uses the same expiry guard and preserves checkpoint unless patched", async () => {
+test("release uses the same expiry guard and preserves checkpoint", async () => {
   for (const expired of [false, true]) {
     const f = fixture();
     const manager = await f.create();
@@ -1217,6 +1218,177 @@ test.each(["renewable", "unusable", "expired"] as const)(
     expect(f.lost).toHaveBeenCalledTimes(mode === "expired" ? 1 : 0);
   },
 );
+
+test("queued updates check expect inside the mutex", async () => {
+  const f = fixture(),
+    manager = await f.create();
+  const h = held(await f.acquire(manager, false, { ...want, checkpoint })).handle;
+  const next = `ckpt1:${"c".repeat(32)}:${"d".repeat(64)}`;
+  f.gh.requests = [];
+  const results = await Promise.all([
+    manager.update(h, { checkpoint: next }, { expect: { checkpoint } }),
+    manager.update(h, { status: "failed" }, { expect: { checkpoint } }),
+  ]);
+  expect(results).toEqual(["applied", "mismatch"]);
+  expect(f.tip()).toMatchObject({ checkpoint: next, status: "running" });
+  expect(f.row()?.intent).toBeNull();
+  expect(f.gh.calls("update")).toHaveLength(1);
+});
+
+test.each(["moved", "beforeSend"] as const)("expect rechecks after %s retry", async (mode) => {
+  const f = fixture(),
+    manager = await f.create();
+  const h = held(await f.acquire(manager, false, { ...want, checkpoint })).handle;
+  const next = `ckpt1:${"c".repeat(32)}:${"d".repeat(64)}`;
+  f.gh.requests = [];
+  let landed = false;
+  f.gh.fault = (r) => {
+    if (!landed && r.step === (mode === "moved" ? "update" : "commit")) {
+      landed = true;
+      f.gh.seed({ ...f.tip(), checkpoint: next });
+      if (mode === "beforeSend") f.advance(LEASE.windowMs);
+    }
+  };
+  expect(await manager.update(h, { status: "failed" }, { expect: { checkpoint } })).toBe("mismatch");
+  expect(f.tip()).toMatchObject({ checkpoint: next, status: "running" });
+  expect(f.row()?.intent).toBeNull();
+  expect(f.gh.calls("commit")).toHaveLength(1);
+  expect(f.gh.calls("update")).toHaveLength(mode === "moved" ? 1 : 0);
+});
+
+test("release reconciles an ambiguous update and keeps its landed pointer", async () => {
+  const f = fixture(),
+    manager = await f.create();
+  const h = held(await f.acquire(manager)).handle;
+  let unreadable = false;
+  f.gh.fault = (r) => {
+    if (r.step === "update") {
+      f.gh.apply(r);
+      unreadable = true;
+      throw new Error("Lost response");
+    }
+    if (r.step === "ref" && unreadable) throw new Error("Unreadable");
+  };
+  expect(await manager.update(h, { checkpoint })).toBe("wait");
+  expect(f.tip().checkpoint).toBe(checkpoint);
+  f.gh.fault = undefined;
+  const injected = { checkpoint: `ckpt1:${"c".repeat(32)}:${"d".repeat(64)}` };
+  expect(await manager.release(h, injected as { status?: "failed" })).toBe("released");
+  expect(f.tip()).toMatchObject({ checkpoint, state: "released" });
+  expect(f.row()?.intent).toBeNull();
+  // @ts-expect-error Release accepts status only.
+  expect(await manager.release(h, { checkpoint })).toBe("obsolete");
+});
+
+test.each([...TERMINAL_STATUSES])("acquire refuses same-run terminal %s in every state", async (status) => {
+  for (const state of ["held", "released"] as const) {
+    const f = fixture();
+    const tip = f.confirmed({ ...record, status, state, holder: state === "held" ? other : member });
+    const manager = await f.create(),
+      before = f.raw();
+    const remote = f.gh.commits.get(tip.sha)?.message;
+    f.gh.requests = [];
+    expect(await f.acquire(manager, true, { ...want, status: "queued" })).toEqual({
+      kind: "refused",
+      reason: "terminal",
+      tip,
+    });
+    expect(f.gh.refs.get(f.gh.key(repo, ref))).toBe(tip.sha);
+    expect(f.gh.commits.get(tip.sha)?.message).toBe(remote);
+    expect(f.raw()).toEqual(before);
+    expect(f.row()?.intent).toBeNull();
+    expect(f.gh.calls("commit")).toHaveLength(0);
+    expect(f.gh.calls("update")).toHaveLength(0);
+  }
+});
+
+test.each([
+  ["failed", "released"],
+  ["succeeded", "held"],
+] as const)(
+  "acquire rechecks terminal %s/%s after a same-holder moved confirmation",
+  async (status, state) => {
+    const f = fixture();
+    const manager = await f.create();
+    let moved = false,
+      reads = 0;
+    let terminal: ClaimTip | undefined;
+    let before = f.raw();
+    f.gh.fault = (r) => {
+      if (r.step === "update" && !moved) {
+        moved = true;
+        const sent = parseRecord(f.gh.commits.get(f.gh.update(r).afterOid)?.message ?? "", ref);
+        if (sent === "malformed") throw new Error("Malformed attempt");
+        f.gh.seed({ ...sent, status: "waiting_input" });
+      }
+      // The first read confirms the moved held record; the retry then sees its terminal successor.
+      if (r.step === "ref" && moved && ++reads === 2) {
+        terminal = f.gh.seed({ ...f.tip(), status, state });
+        before = f.raw();
+      }
+    };
+    const result = await f.acquire(manager, true, { ...want, status: "queued" });
+    expect(terminal).toBeDefined();
+    expect(result).toEqual({ kind: "refused", reason: "terminal", tip: terminal });
+    expect(f.gh.refs.get(f.gh.key(repo, ref))).toBe(terminal?.sha);
+    expect(f.tip()).toMatchObject({ generation: 1, status, state });
+    expect(f.raw()).toEqual(before);
+    expect(f.row()?.intent ?? null).toBeNull();
+    expect(f.gh.calls("commit")).toHaveLength(1);
+    expect(f.gh.calls("update")).toHaveLength(1);
+  },
+);
+
+test("settle is canonical, reconciles pending intents and sends no claim write", async () => {
+  const f = fixture(),
+    manager = await f.create();
+  const h = held(await f.acquire(manager)).handle;
+  const before = f.row()?.confirmed?.tip ?? "";
+  f.store.beginLeaseIntent(repo, ref, h.run, {
+    op: "update",
+    before,
+    record: { ...f.tip(), checkpoint },
+    commit: null,
+  });
+  f.gh.requests = [];
+  f.gh.fault = (r) => {
+    if (r.step === "ref") throw new Error("Unreadable");
+  };
+  expect(await manager.settle("Owner/Project", ref)).toBe("pending");
+  expect(f.row()?.intent).not.toBeNull();
+  f.gh.fault = undefined;
+  expect(await manager.settle(repo, ref)).toBe("settled");
+  expect(await manager.settle(repo, ref)).toBe("settled");
+  expect(f.row()?.intent).toBeNull();
+  expect(f.gh.calls("commit")).toHaveLength(0);
+  expect(f.gh.calls("update")).toHaveLength(0);
+});
+
+test("settle leaves an unapplied release pending without replaying it", async () => {
+  const f = fixture(),
+    manager = await f.create();
+  const h = held(await f.acquire(manager)).handle;
+  const before = f.gh.refs.get(f.gh.key(repo, ref));
+  f.store.beginLeaseIntent(repo, ref, h.run, {
+    op: "release",
+    before: f.row()?.confirmed?.tip ?? "",
+    record: { ...f.tip(), state: "released" },
+    commit: null,
+  });
+  f.gh.requests = [];
+  expect(await manager.settle(repo, ref)).toBe("pending");
+  expect(await manager.settle(repo, ref)).toBe("pending");
+  expect(f.gh.calls("commit")).toHaveLength(0);
+  expect(f.gh.calls("update")).toHaveLength(0);
+  expect(f.gh.refs.get(f.gh.key(repo, ref))).toBe(before);
+  expect(f.tip().state).toBe("held");
+  expect(f.row()).toMatchObject({ confirmed: { state: "held" }, intent: { op: "release" } });
+  // A writing caller still replays the journaled release.
+  expect(await manager.update(h, {})).toBe("obsolete");
+  expect(f.gh.calls("update")).toHaveLength(1);
+  expect(f.tip().state).toBe("released");
+  expect(f.row()).toMatchObject({ confirmed: { state: "released" }, intent: null });
+});
 
 test("capability wait permits one in-flight renewal, then only the other run renews", async () => {
   const f = fixture();
