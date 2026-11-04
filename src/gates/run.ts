@@ -9,7 +9,6 @@ import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { type DocsSelection, quoteRetryFiles, singleBunTest } from "./docs.ts";
 import { executeGate, type GateRunner, gateProvenance } from "./executor.ts";
-import { FailureExcerpts } from "./failures.ts";
 import {
   type CoveringTestEvidence,
   type FailedTestFiles,
@@ -24,11 +23,11 @@ import {
   launchFailureScan,
   redactGateData,
   redactGateOutput,
-  redactGateStreams,
 } from "./output.ts";
+import { protectGateOutput } from "./output-privacy.ts";
 import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
-import { attributionReason, type TextPrivacy } from "./text-privacy.ts";
+import { attributionReason, gateIdentities, type TextPrivacy } from "./text-privacy.ts";
 
 export interface GateResult {
   textPrivacy?: TextPrivacy;
@@ -136,7 +135,6 @@ export interface GateHooks {
   onWait?: (slots: number) => void;
 }
 
-const OUTPUT_TAIL = 6_000;
 export const confinementFailed = (r?: GateResult): boolean =>
   !!r &&
   ((r.confinementError ?? launchFailure(r.output)) ||
@@ -162,13 +160,12 @@ async function runOne(
 ): Promise<GateResult> {
   const launch = launchFailureScan();
   const coverage = new BunTestCoverage(cwd);
-  const excerpts = new FailureExcerpts();
+  let overflow = false;
   const evidence = new RunnerFailureEvidence();
   const observe = (line: string) => {
     evidence.observe(line);
     coverage.observe(line);
-    line = redactGateOutput(line);
-    excerpts.observe(line);
+    if (line.length === 65536 + " [truncated]".length && line.endsWith(" [truncated]")) overflow = true;
   };
   const scratch = invocationScratch.getStore();
   if (!scratch) throw new Error("Missing gate command scratch");
@@ -190,39 +187,41 @@ async function runOne(
     signal,
     timeoutMs: (cmd.timeoutSec ?? 900) * 1000,
     redactOutput: true,
+    captureComplete: true,
+    maxLineLength: 65536,
     onRawChunk: launch.observe,
     onStarted,
     onStdoutLine: observe,
     onStderrLine: observe,
   });
-  const output = redactGateStreams(res.stdout, res.stderr);
-  const combined = `${output.stdout}\n${output.stderr}`.trim();
+  await new Promise(setImmediate);
   const skipReport = readJUnitSkips(report, cwd);
   const testCoverage = coverage.result(skipReport, evidence.agrees(skipReport?.counts));
   const confinementError = launch.failed();
   const ok = !confinementError && res.exitCode === 0 && !res.timedOut && !res.cancelled;
-  const failures = ok ? undefined : excerpts.result();
+  await new Promise(setImmediate);
   const { attributedCounts, failureAttributionReason, ...failedFiles } = readJUnit(report, cwd) ?? {};
-  return {
+  const coveringResults: CoveringTestEvidence[] = [];
+  for (const test of covering) {
+    await new Promise(setImmediate);
+    coveringResults.push(readCoveringJUnit(report, cwd, test, reportBaseline, existed));
+  }
+  const result: GateResult = {
     name: cmd.name,
     command: cmd.run,
     ...(args
       ? { executedCommand: `${cmd.run} ${args.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}` }
       : {}),
-    ...(cmd.coveringTest
-      ? { coveringTest: readCoveringJUnit(report, cwd, cmd.coveringTest, reportBaseline, existed) }
-      : {}),
+    ...(cmd.coveringTest ? { coveringTest: coveringResults[0] } : {}),
     ...(cmd.coveringTests
       ? {
-          coveringTests: covering.map((test) =>
-            readCoveringJUnit(report, cwd, test, reportBaseline, existed),
-          ),
+          coveringTests: coveringResults,
         }
       : {}),
     ok,
     exitCode: res.exitCode,
     durationMs: res.durationMs,
-    output: (res.timedOut ? "[timed out]\n" : "") + combined.slice(-OUTPUT_TAIL),
+    output: "",
     ...failedFiles,
     failureAttributionComplete: evidence.agrees(attributedCounts),
     failureAttributionReason:
@@ -231,7 +230,6 @@ async function runOne(
           "; ",
         ),
       ) || undefined,
-    ...(failures ? { failures } : {}),
     ...(res.timedOut ? { timedOut: true } : {}),
     // Both true and false record that the raw scan, rather than normalized output, is authoritative.
     confinementError,
@@ -242,6 +240,15 @@ async function runOne(
       ? { testCoverage }
       : {}),
   };
+  const identities = gateIdentities(result);
+  if (overflow || coverage.overflow || identities === "identity-cap") {
+    result.testCoverage = { ...testCoverage, skippedTestsIncomplete: true };
+    result.failureAttributionComplete = false;
+  }
+  return Object.assign(
+    result,
+    await protectGateOutput(res, identities, { signal, deadline: Date.now() + 120_000 }),
+  );
 }
 
 /** Run setup and checks inside one machine-wide gate slot. */
@@ -404,9 +411,7 @@ export function validateRetry(
           ? "tracked checkout cleanliness was not confirmed"
           : undefined;
   if (!reason) return result;
-  const diagnostic = redactGateOutput(
-    `Retry rejected: ${reason}${provenanceError ? `; ${provenanceError}` : ""}`,
-  );
+  const diagnostic = `Retry rejected: ${reason}`;
   onReject?.(original, diagnostic);
   return {
     ...original,

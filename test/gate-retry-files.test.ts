@@ -242,11 +242,11 @@ test.each(["targeted only", "targeted", "full"])(
             trackedClean: false,
             provenanceError: `tracked files changed: ["${credential}.txt"]`,
           },
-          reason: "[redacted].txt",
+          reason: "cleanliness was not confirmed",
         },
         {
           provenance: { trackedClean: false, provenanceError: "execution provenance could not be confirmed" },
-          reason: "could not be confirmed",
+          reason: "missing execution SHA",
         },
         { provenance: { sha: "a".repeat(40), trackedClean: true }, reason: "does not match checked commit" },
         { provenance: { sha: f.sha, trackedClean: true } },
@@ -325,7 +325,9 @@ test.each(["tracked", "untracked"])("standalone regression retry writing %s file
       result: { ok: kind === "untracked", firstAttempt: original },
     });
     if (kind === "tracked")
-      expect(comparison?.result.output).toContain('tracked files changed: ["tracked.txt"]');
+      expect(comparison?.result.output).toContain(
+        "Retry rejected: tracked checkout cleanliness was not confirmed",
+      );
   } finally {
     f.close();
   }
@@ -348,7 +350,7 @@ test.each([false, true])("local retries preserve setup output (executor: %s)", a
       const first = await runGates(f.cwd, cfg, signal);
       const failure = first.checks[1];
       if (!failure) throw new Error("Missing test result");
-      expect(failure).toMatchObject({ ok: false, output: "transient" });
+      expect(failure).toMatchObject({ ok: false, output: "transient\n" });
       const original = { ...failure, failedFiles: ["test/a.test.ts"] };
       const retries = await retryFailures(
         [{ check, original }],
@@ -1331,7 +1333,8 @@ test("real Bun JUnit capture keeps failing files, console excerpts and coverage"
       ),
     );
     expect(gates.checks[0]?.failedFiles).toEqual(["test/b.test.ts"]);
-    expect(gates.checks[0]?.failures).toContain("(fail) fails");
+    expect(gates.checks[0]?.failures).toBeUndefined();
+    expect(gates.checks[0]?.output).toContain("(fail) fails");
     expect(gates.checks[0]?.testCoverage?.summary).toBeTruthy();
     expect(gates.checks[0]?.failureAttributionComplete).toBe(true);
   } finally {

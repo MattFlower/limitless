@@ -471,7 +471,7 @@ function protectTextPrepared(
     if ("refused" in policy) return issue(withheld(state, "unreadable-policy"));
     const reason = admit(state, text);
     if (reason) return issue(withheld(state, reason));
-    state = inspect(state, text);
+    state = inspect(state, text, terminal);
     if (state.withheld) return issue(state);
     state.checkedComplete = true;
     if (terminal) {
@@ -482,7 +482,7 @@ function protectTextPrepared(
     const rendered = terminal
       ? terminalRedactor(() => policy.matcher).push(text, true)
       : policy.matcher.redact(text);
-    if (rendered !== text) state = inspect(state, rendered);
+    if (terminal || rendered !== text) state = inspect(state, rendered);
     return issue(select(state, cut));
   } catch {
     return issue(withheld(state, "nonconvergent"));

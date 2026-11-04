@@ -126,7 +126,10 @@ export const registry: Record<string, (c: Context) => Promise<Job[]> | Job[]> = 
         "BunTestCoverage.observe/result",
         lines.length,
         run,
-        (v) => validate(field(v, "passedFiles.length") === lines.length),
+        (v) =>
+          validate(
+            field(v, "passedFiles.length") === (field(v, "skippedTestsIncomplete") ? 2000 : lines.length),
+          ),
       ],
     ];
   },

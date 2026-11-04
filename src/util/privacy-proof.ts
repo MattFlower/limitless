@@ -80,6 +80,7 @@ export async function checkAndSign(
     Parameters<Checker["protectText"]>[1] & {
       checker: Pick<Checker, "protectText" | "registry">;
       signer?: typeof provider;
+      onRefusal?: (reason: string) => void;
       kind: PrivacyProof["kind"];
       field: string;
     },
@@ -96,7 +97,10 @@ export async function checkAndSign(
   const parts: Uint8Array[] = [];
   for (let index = 0; ; index++) {
     const part = consumeBoundaryChunk(receipt, index, bound);
-    if (part.withheld || !part.checkedComplete) return;
+    if (part.withheld || !part.checkedComplete) {
+      input.onRefusal?.(part.reason ?? "checker-failed");
+      return;
+    }
     if (part.done) break;
     parts.push(part.bytes);
   }
@@ -109,7 +113,10 @@ export async function checkAndSign(
     credentials: representations(key),
     generation: registry.generation,
   });
-  if (!("clean" in checkPrepared(policy, bytes.toString()))) return;
+  if (!("clean" in checkPrepared(policy, bytes.toString()))) {
+    input.onRefusal?.("checker-failed");
+    return;
+  }
   return { kind, mac: mac(key, binding, bytes).toString("hex") };
 }
 export function verifier(registry: typeof privacyRegistry, signer = provider) {
