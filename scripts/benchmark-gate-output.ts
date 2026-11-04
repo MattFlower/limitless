@@ -1,9 +1,10 @@
-/** Synthetic producers; checker-refusals and worker-ingress are deferred to slice 2f. */
+/** Synthetic producer and consumer workloads; no owner configuration or external services. */
 import { existsSync, promises as fs } from "node:fs";
 import { join } from "node:path";
 import {
   type API,
   type Checker,
+  consumerCounters,
   describe,
   environment,
   type Fn,
@@ -11,7 +12,11 @@ import {
   validate,
   validateReports,
 } from "../test/benchmark-gate-output-support.ts";
+import { consumerRegistry } from "./benchmark-gate-consumers.ts";
 import * as bench from "./benchmark-privacy-boundary.ts";
+
+const defaultWorkloads = Object.keys(registry);
+Object.assign(registry, consumerRegistry);
 
 export { environment, operation, registry, validate } from "../test/benchmark-gate-output-support.ts";
 
@@ -20,7 +25,7 @@ const field = (v: unknown, path: string): unknown =>
 export async function worker(root: string, name: string) {
   validate(Object.hasOwn(registry, name), "unknown workload");
   const paths =
-    "util/proc util/privacy-boundary util/privacy-checker util/privacy-chunks util/privacy-proof gates/text-privacy gates/run gates/junit gates/test-coverage harness/sandbox harness/read-policy".split(
+    "util/proc util/privacy-boundary util/privacy-checker util/privacy-chunks util/privacy-proof util/privacy-policy gates/text-privacy gates/output gates/run gates/junit gates/test-coverage harness/sandbox harness/read-policy pipeline/context pipeline/prompts pipeline/report server/http".split(
       " ",
     );
   const modules = await Promise.all(
@@ -42,7 +47,7 @@ export async function worker(root: string, name: string) {
   const jobs = await registry[name]?.({ a, cwd, env, checker: () => checker, key });
   const operations: Record<string, bench.ProducerOperation> = {},
     unavailable: object[] = [];
-  for (const [label, size, run, check] of jobs ?? []) {
+  for (const [label, size, run, check, prepare] of jobs ?? []) {
     const dimensions = describe(name, label, size, a);
     if (!run) {
       unavailable.push({ dimensions, status: "unavailable" });
@@ -51,6 +56,10 @@ export async function worker(root: string, name: string) {
     let submissionMs: number[], latencyMs: number[], parses: number, elapsed: number;
     operations[`${label}/${size}`] = {
       dimensions,
+      prepare: async (current) => {
+        checker = current;
+        await prepare?.();
+      },
       run: async (current, own) => {
         [checker, submissionMs, latencyMs, parses] = [current, [], [], 0];
         const start = performance.now(),
@@ -78,6 +87,7 @@ export async function worker(root: string, name: string) {
         }
       },
       check: (v) => ({
+        counters: consumerCounters(name, v),
         outcome:
           name === "junit" && !parses
             ? validate(
@@ -103,7 +113,7 @@ export async function worker(root: string, name: string) {
   }
   return { pid: process.pid, name, unavailable, ...(await bench.measureWorker(root, undefined, operations)) };
 }
-export async function compare(refs: string[], names: string[], invoke = bench.launch) {
+export async function compare(refs: string[], names = defaultWorkloads, invoke = bench.launch) {
   const usage = "usage: bun scripts/benchmark-gate-output.ts <baseline-ref> <candidate-ref> [workloads]";
   if (refs.length !== 2) throw Error(`expected two refs, got ${refs.length}; ${usage}`);
   const unknown = names.filter((n) => !Object.hasOwn(registry, n));
@@ -130,7 +140,7 @@ if (import.meta.main) {
     const result =
       args[0] === "--worker"
         ? await worker(args[1] ?? "", args[2] ?? "")
-        : await compare(args.slice(0, 2), args.length > 2 ? args.slice(2) : Object.keys(registry));
+        : await compare(args.slice(0, 2), args.length > 2 ? args.slice(2) : undefined);
     console.log(JSON.stringify(result));
   } catch (error) {
     const where = args[0] === "--worker" ? `worker ${args[2]}` : "benchmark-gate-output";

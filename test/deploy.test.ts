@@ -138,6 +138,29 @@ function setup() {
   };
 }
 
+test("packaged deploy refuses before locking or calling dependencies, including refs and options", async () => {
+  for (const options of [{}, { now: true, executor: true, maxWaitMs: -1 }]) {
+    const f = setup();
+    const fail = () => {
+      f.calls.push("dependency");
+      throw new Error("unexpected deployment dependency");
+    };
+    await expect(
+      deploy(7400, "feature", true, {
+        ...f.opts,
+        ...options,
+        release: { kind: "packaged", version: "1.2.3", sha: "a".repeat(40), bun: Bun.version },
+        leaseClient: fail,
+      }),
+    ).rejects.toThrow(
+      "packaged mode. Upgrade with brew upgrade limitless, then run limitless service install",
+    );
+    expect(f.calls).toEqual([]);
+    expect(f.timeouts).toEqual([]);
+    expect(existsSync(f.opts.lockPath)).toBe(false);
+  }
+});
+
 test("deploy gates, drains, refreshes stages and restarts once after completion", async () => {
   const f = setup();
   const intListeners = process.listenerCount("SIGINT");

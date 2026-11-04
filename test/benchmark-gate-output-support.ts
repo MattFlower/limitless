@@ -7,7 +7,7 @@ import type { ProducerOperation } from "../scripts/benchmark-privacy-boundary.ts
 export type Fn = (...args: unknown[]) => unknown;
 export type API = Record<string, unknown>;
 export type Checker = Parameters<ProducerOperation["run"]>[0];
-type Job = [string, number, (() => unknown) | undefined, (v: unknown) => string];
+export type Job = [string, number, (() => unknown) | undefined, (v: unknown) => string, (() => unknown)?];
 const Mi = 1048576,
   hash = (s: string) => createHash("sha256").update(s).digest("hex");
 export function validate(ok: unknown, label = "processed") {
@@ -18,8 +18,182 @@ export function operation(a: API, name: string, equivalent?: Fn) {
   const run = typeof a[name] === "function" ? (a[name] as Fn) : equivalent;
   return { path: run === equivalent ? (equivalent ? "baseline-equivalent" : "unavailable") : name, run };
 }
-const field = (v: unknown, path: string): unknown =>
+export const field = (v: unknown, path: string): unknown =>
   path.split(".").reduce((o, k) => Reflect.get(Object(o), k), v);
+export function consumerState(cap: number) {
+  return {
+    flow: "build",
+    lastGates: Array.from({ length: 50 }, (_, i) => ({
+      name: `synthetic-${i}-gate`,
+      verdict: "regressed",
+      blocking: true,
+      result: {
+        name: `synthetic-${i}-gate`,
+        command: ".".repeat(cap),
+        output: "consumer-output-".padEnd(6000, "."),
+        ok: false,
+        exitCode: 1,
+        durationMs: 1,
+        textPrivacy: undefined as
+          | { output: Record<string, unknown>; identities: Record<string, unknown> }
+          | undefined,
+      },
+    })),
+  };
+}
+export function projectionOutcome(
+  value: unknown,
+  state: ReturnType<typeof consumerState>,
+  released: boolean,
+  mode: string,
+) {
+  validate(typeof value === "string", "serialized projection");
+  const gates = field(JSON.parse(String(value)), "lastGates");
+  validate(Array.isArray(gates) && gates.length === 50, "50 projected gates");
+  for (const [i, g] of (gates as unknown[]).entries()) {
+    const original = state.lastGates[i]?.result;
+    validate(
+      field(g, "name") === original?.name && typeof field(g, "result.output") === "string",
+      "projection shape",
+    );
+    for (const key of ["command", "output"] as const)
+      validate(
+        released
+          ? field(g, `result.${key}`) === original?.[key]
+          : field(g, `result.${key}`) === undefined ||
+              /^\[withheld: [a-z-]{1,40}\]$/.test(String(field(g, `result.${key}`))),
+        "projection release class",
+      );
+    if (mode === "outward") validate(field(g, "result.failures") === undefined, "outward failures omitted");
+  }
+  return released ? "50 released baseline/proven results" : "50 withheld results";
+}
+export function consumerCounters(name: string, value: unknown) {
+  if (name === "event-drain")
+    return {
+      count: 50000,
+      gates: 5000,
+      pages: field(value, "pages"),
+      unsubscribed: field(value, "unsubscribed"),
+    };
+  if (name === "events") return { sinkEvents: value };
+  if (name === "render-prompts") return { renderedResults: 50 };
+  return undefined;
+}
+/** Decode and validate retained SSE bytes only after the measured consumer turns have ended. */
+export function drainOutcome(value: unknown) {
+  const chunks = field(value, "chunks");
+  validate(Array.isArray(chunks) && chunks.every((c) => c instanceof Uint8Array), "SSE chunks");
+  const frames = Buffer.concat(chunks as Uint8Array[])
+    .toString()
+    .split("\n\n");
+  validate(frames.pop() === "", "complete SSE frames");
+  let count = 0,
+    gates = 0;
+  for (const frame of frames) {
+    if (frame.startsWith(":")) continue;
+    const data = frame.split("\n").find((s) => s.startsWith("data: "));
+    validate(data, "SSE data frame");
+    const msg = JSON.parse(String(data).slice(6));
+    validate(
+      msg.kind === "event" &&
+        msg.event.id === ++count &&
+        msg.event.message === `event-${count - 1}` &&
+        msg.event.type === ((count - 1) % 10 ? "log" : "gate"),
+      "SSE order",
+    );
+    if (msg.event.type === "gate") gates++;
+  }
+  return validate(
+    count === 50000 &&
+      gates === 5000 &&
+      Number(field(value, "pages")) > 0 &&
+      field(value, "unsubscribed") === 1,
+    "50000 ordered events; 5000 gate events; stream closed",
+  );
+}
+const invoke = (c: Context, name: string, ...args: unknown[]) => (c.a[name] as Fn)(...args);
+const fixtureSnapshot = (c: Context) =>
+  invoke(c, "verifier", c.checker().registry, () => c.key) as { verify: Fn };
+export const consumerSign = (c: Context, text: string, field: string) =>
+  invoke(c, "checkAndSign", { checker: c.checker(), kind: "rendering", field, text, signer: () => c.key });
+/** Fixture reset and proof creation are deliberately outside the measured consumer turn. */
+export async function projectFixture(c: Context, name: string, state: ReturnType<typeof consumerState>) {
+  const results = state.lastGates.map((g) => g.result);
+  const file = join(c.env.LIMITLESS_CONFIG_DIR, "private-strings.txt"),
+    original = await fs.readFile(file, "utf8");
+  const prepare = async () => {
+    await fs.writeFile(file, original);
+    invoke(c, "provisionPrivacyPolicy", c.env.LIMITLESS_CONFIG_DIR, [], { registry: c.checker().registry });
+    if (name === "project-proven" || name === "project-after-edit") {
+      const output = await consumerSign(c, results[0]?.output ?? "", "output");
+      const identities = await consumerSign(c, String(invoke(c, "gateIdentities", results[0])), "identities");
+      for (const r of results)
+        r.textPrivacy = {
+          output: { ...Object(output), withheld: false },
+          identities: { ...Object(identities), withheld: false },
+        };
+    } else if (name === "project-refused") {
+      for (const r of results)
+        r.textPrivacy = {
+          output: { withheld: true, reason: "checker-failed" },
+          identities: { withheld: true, reason: "checker-failed" },
+        };
+    }
+    const expected = name === "project-proven" || name === "project-after-edit";
+    const v = fixtureSnapshot(c);
+    for (const r of results)
+      validate(
+        v.verify(r.textPrivacy?.output, "output", r.output) === expected &&
+          v.verify(r.textPrivacy?.identities, "identities", invoke(c, "gateIdentities", r)) === expected,
+        "fixture proof class",
+      );
+    if (name === "project-after-edit") await fs.writeFile(file, `${original}\nconsumer-policy-edit\n`);
+  };
+  return prepare;
+}
+export function renderInputs(state: ReturnType<typeof consumerState>): [string, unknown][] {
+  const gates = state.lastGates;
+  const inputs: [string, unknown][] = [
+    ["formatGateFeedback", gates],
+    [
+      "reviewPrompt",
+      {
+        prompt: "synthetic",
+        spec: null,
+        baseSha: "synthetic",
+        stat: "",
+        gates,
+        audit: [],
+        implementerReport: "",
+      },
+    ],
+    [
+      "renderReport",
+      {
+        success: false,
+        runId: "synthetic",
+        prompt: "synthetic",
+        state,
+        invocations: [],
+        totals: { costUsd: 0, costEquivUsd: 0 },
+        runUrl: "http://localhost",
+      },
+    ],
+  ];
+  return inputs;
+}
+export function eventBacklog(length = 50000, withGates = true) {
+  const result = consumerState(16).lastGates[0]?.result;
+  return Array.from({ length }, (_, i) => ({
+    id: i + 1,
+    runId: "synthetic",
+    type: !withGates || i % 10 ? "log" : "gate",
+    level: "info",
+    message: `event-${i}`,
+    data: !withGates || i % 10 ? { n: i } : { result },
+  }));
+}
 export const environment = (root: string) => ({
   PATH: process.env.PATH ?? "",
   LANG: "C.UTF-8",
@@ -31,7 +205,7 @@ export const environment = (root: string) => ({
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_NOSYSTEM: "1",
 });
-type Context = {
+export type Context = {
   a: API;
   cwd: string;
   env: ReturnType<typeof environment>;
@@ -261,13 +435,35 @@ export function describe(name: string, label: string, size: number, api: API) {
   const cap = api.IDENTITY_CAP;
   const identities = typeof cap === "number" && size <= cap && typeof api.gateIdentities === "function";
   return {
+    implementation: label.includes("baseline-equivalent")
+      ? label
+      : label.includes("unavailable")
+        ? "unavailable"
+        : "revision-local production",
+    proofClass: name.startsWith("project-") ? name.slice(8) : undefined,
+    productionProjection: name.startsWith("project-")
+      ? typeof api.projectGateDiagnostics === "function"
+        ? "available"
+        : "unavailable"
+      : undefined,
+    results: name.startsWith("project-") || name === "render-prompts" ? 50 : undefined,
+    outputUnits: name.startsWith("project-") ? 6000 : undefined,
+    identitiesAtCap: name.startsWith("project-") ? (api.IDENTITY_CAP ?? 65536) : undefined,
+    gateEvents: name === "event-drain" ? 5000 : undefined,
     size,
     label,
-    sizeUnit: ["identities", "long-line", "scanner-overflow"].includes(name)
-      ? "U"
-      : name === "scanner-files"
-        ? "headers"
-        : "bytes",
+    sizeUnit:
+      name.startsWith("project-") || name === "render-prompts"
+        ? "results"
+        : name === "events" || name === "event-drain"
+          ? "events"
+          : name === "land-log"
+            ? "entries"
+            : ["identities", "long-line", "scanner-overflow"].includes(name)
+              ? "U"
+              : name === "scanner-files"
+                ? "headers"
+                : "bytes",
     lines: name === "scanner-overflow" ? 2000 : name === "long-line" ? 1 : undefined,
     identityCap: name === "identities" ? (cap ?? null) : undefined,
     identityCoverage: name === "identities" ? identities : undefined,
