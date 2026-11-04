@@ -1,4 +1,5 @@
 import type { SQLQueryBindings } from "bun:sqlite";
+import { isDeepStrictEqual } from "node:util";
 import type { Store } from "./store.ts";
 export type CheckpointEntry = {
   generation: number;
@@ -26,6 +27,7 @@ const clear = assignments("pending", "NULL");
 const entry = (prefix: string) =>
   `CASE WHEN ${prefix}_pointer IS NOT NULL THEN json_object(${fields.map((f) => `'${f}',${f === "commits" ? `json(${prefix}_${f})` : `${prefix}_${f}`}`).join(",")}) END AS ${prefix}`;
 export function checkpointMethods(store: Store) {
+  const pending = new Map<string, Promise<unknown>>();
   const read = (runId: string): CheckpointRecord | null => {
     const r = store.db
       .query<Stored, [string]>(
@@ -53,6 +55,14 @@ export function checkpointMethods(store: Store) {
       .query("INSERT OR IGNORE INTO shared_checkpoints (run_id,updated_at) VALUES (?,?)")
       .run(runId, Date.now());
   return {
+    // Publishers wrap journal/publish/confirm together; settleCheckpoint takes this same, non-reentrant scope.
+    async coordinateCheckpoint<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+      const work = (pending.get(runId) ?? Promise.resolve()).catch(() => {}).then(fn);
+      pending.set(runId, work);
+      return work.finally(() => {
+        if (pending.get(runId) === work) pending.delete(runId);
+      });
+    },
     checkpointRecord: tx(read),
     journalCheckpoint: tx((runId, e: CheckpointEntry) => {
       if (read(runId)?.pending) throw new Error("Checkpoint already pending");
@@ -65,12 +75,16 @@ export function checkpointMethods(store: Store) {
         JSON.stringify([...e.commits].sort()),
       ]);
     }),
-    confirmCheckpoint: tx((runId, pointer: string) => {
-      if (read(runId)?.pending?.pointer !== pointer) return false;
+    confirmCheckpoint: tx((runId, pointer: string, expected: CheckpointRecord | null) => {
+      if (expected?.pending?.pointer !== pointer || !isDeepStrictEqual(read(runId), expected)) return false;
       update(runId, `${fields.map((f) => `committed_${f}=pending_${f}`).join(",")},${clear}`);
       return true;
     }),
-    dropPendingCheckpoint: tx((runId) => update(runId, clear)),
+    dropPendingCheckpoint: tx((runId, expected: CheckpointRecord | null) => {
+      if (!expected?.pending || !isDeepStrictEqual(read(runId), expected)) return false;
+      update(runId, clear);
+      return true;
+    }),
     markRunIndexed: tx((runId) => {
       ensure(runId);
       update(runId, "indexed=1");

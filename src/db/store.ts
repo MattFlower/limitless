@@ -536,6 +536,7 @@ function buildUpdate(patch: object, columns: Record<string, string>): { sets: st
 export class Store {
   private readonly checkpoints = checkpointMethods(this);
   readonly checkpointRecord = this.checkpoints.checkpointRecord;
+  readonly coordinateCheckpoint = this.checkpoints.coordinateCheckpoint;
   readonly journalCheckpoint = this.checkpoints.journalCheckpoint;
   readonly confirmCheckpoint = this.checkpoints.confirmCheckpoint;
   readonly dropPendingCheckpoint = this.checkpoints.dropPendingCheckpoint;

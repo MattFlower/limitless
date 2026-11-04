@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { CheckpointRecord } from "../db/shared-checkpoints.ts";
 import type { Store } from "../db/store.ts";
 import type { ClaimClient, ClaimTip } from "../integrations/claim-ref.ts";
@@ -25,23 +26,23 @@ export async function settleCheckpoint(
   handle: LeaseHandle,
 ): Promise<{ settlement: Settlement; tip: ClaimTip | null }> {
   const { leases, claims, store } = deps;
-  if ((await leases.settle(handle.repo, handle.ref)) === "pending") return { settlement: "wait", tip: null };
-  const read = await claims.read(handle.repo, handle.ref);
-  if (read.kind === "unconfirmed") return { settlement: "wait", tip: null };
-  const tip = read.kind === "tip" ? read.tip : null,
-    r = tip?.record;
-  if (
-    !r ||
-    r === "malformed" ||
-    r.holder !== handle.member ||
-    r.run !== handle.run ||
-    r.generation !== handle.generation
-  )
-    return { settlement: "blocked", tip };
-  const ledger = store.checkpointRecord(handle.run),
-    settlement = classify(r.checkpoint ?? null, ledger);
-  if (settlement === "promote" && ledger?.pending)
-    store.confirmCheckpoint(handle.run, ledger.pending.pointer);
-  if (settlement === "drop-pending") store.dropPendingCheckpoint(handle.run);
-  return { settlement, tip };
+  return store.coordinateCheckpoint(handle.run, async () => {
+    for (;;) {
+      if ((await leases.settle(handle.repo, handle.ref)) === "pending")
+        return { settlement: "wait", tip: null };
+      const row = store.checkpointRecord(handle.run);
+      const read = await claims.read(handle.repo, handle.ref);
+      if (read.kind === "unconfirmed") return { settlement: "wait", tip: null };
+      if (!isDeepStrictEqual(row, store.checkpointRecord(handle.run))) continue;
+      const tip = read.kind === "tip" ? read.tip : null,
+        r = tip?.record;
+      if (!r || r === "malformed") return { settlement: "blocked", tip };
+      if (r.holder !== handle.member || r.run !== handle.run || r.generation !== handle.generation)
+        return { settlement: "blocked", tip };
+      const settlement = classify(r.checkpoint ?? null, row);
+      if (settlement === "promote" && !store.confirmCheckpoint(handle.run, r.checkpoint ?? "", row)) continue;
+      if (settlement === "drop-pending" && !store.dropPendingCheckpoint(handle.run, row)) continue;
+      return { settlement, tip };
+    }
+  });
 }

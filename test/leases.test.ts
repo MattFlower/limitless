@@ -1271,7 +1271,8 @@ test("release reconciles an ambiguous update and keeps its landed pointer", asyn
   expect(await manager.update(h, { checkpoint })).toBe("wait");
   expect(f.tip().checkpoint).toBe(checkpoint);
   f.gh.fault = undefined;
-  expect(await manager.release(h, {})).toBe("released");
+  const injected = { checkpoint: `ckpt1:${"c".repeat(32)}:${"d".repeat(64)}` };
+  expect(await manager.release(h, injected as { status?: "failed" })).toBe("released");
   expect(f.tip()).toMatchObject({ checkpoint, state: "released" });
   expect(f.row()?.intent).toBeNull();
   // @ts-expect-error Release accepts status only.

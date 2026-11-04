@@ -1,7 +1,8 @@
-import { expect, mock, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
 import type { CheckpointEntry, CheckpointRecord } from "../src/db/shared-checkpoints.ts";
 import { Store } from "../src/db/store.ts";
 import type { ClaimRecord } from "../src/integrations/claim-ref.ts";
+import type { GhRunner } from "../src/integrations/github.ts";
 import { createLeaseManager, type LeaseHandle } from "../src/integrations/leases.ts";
 import {
   classify,
@@ -96,7 +97,7 @@ test.each(["promote", "drop-pending"] as const)(
       });
       store.confirmLease(handle.repo, handle.ref, { generation: 1, state: "held", tip: tip.sha });
       store.journalCheckpoint(handle.run, entry(a));
-      store.confirmCheckpoint(handle.run, a);
+      store.confirmCheckpoint(handle.run, a, store.checkpointRecord(handle.run));
       store.journalCheckpoint(handle.run, entry(b, 1));
       const after = { ...record, checkpoint: b };
       store.beginLeaseIntent(handle.repo, handle.ref, handle.run, {
@@ -145,3 +146,148 @@ test.each(["promote", "drop-pending"] as const)(
     }
   },
 );
+
+async function fixture() {
+  const store = new Store(":memory:"),
+    gh = new GitHub(),
+    sample = () => ({ inclusive: 1000, exclusive: 1000 }),
+    claims = gh.client(sample());
+  const timeGh: GhRunner = async (args, _signal, _stdin, target) => {
+    await Promise.resolve();
+    expect(args).toEqual(["api", "--include", "rate_limit"]);
+    expect(target).toBe("owner/project");
+    return `HTTP/2 200 OK\r\nDate: ${new Date(gh.clock).toUTCString()}\r\n\r\n{}`;
+  };
+  const leases = await createLeaseManager({
+    store,
+    client: claims,
+    member: "m-0123456789abcdef",
+    clock: { sample },
+    gh: timeGh,
+  });
+  const acquired = await leases.acquire(
+    "owner/project",
+    "refs/limitless/claims/12",
+    { kind: "issue", number: 12, run: "run", status: "running", checkpoint: a },
+    { takeover: false },
+  );
+  if (acquired.kind !== "held") throw new Error(`Expected held, got ${acquired.kind}`);
+  store.journalCheckpoint("run", entry(a));
+  store.confirmCheckpoint("run", a, store.checkpointRecord("run"));
+  return { store, gh, claims, leases, handle: acquired.handle };
+}
+
+test("settlement serializes a paused remote A observation against journal/publish of B", async () => {
+  const f = await fixture();
+  const observed = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  try {
+    const read = async () => {
+      const result = await f.claims.read(f.handle.repo, f.handle.ref);
+      observed.resolve();
+      await resume.promise;
+      return result;
+    };
+    const settling = settleCheckpoint({ ...f, claims: { read } }, f.handle);
+    await observed.promise;
+    let publishing = false;
+    const published = f.store.coordinateCheckpoint("run", async () => {
+      publishing = true;
+      f.store.journalCheckpoint("run", entry(b, 1));
+      return f.leases.update(f.handle, { checkpoint: b }, { expect: { checkpoint: a } });
+    });
+    expect(await f.store.coordinateCheckpoint("another-run", async () => "independent")).toBe("independent");
+    const overlapped = publishing;
+    resume.resolve();
+    const result = await settling;
+    expect(await published).toBe("applied");
+    expect(overlapped).toBe(false);
+    expect(result.settlement).toBe("current");
+    expect(await f.claims.read(f.handle.repo, f.handle.ref)).toMatchObject({
+      kind: "tip",
+      tip: { record: { checkpoint: b } },
+    });
+    expect(f.store.checkpointRecord("run")).toMatchObject({ committed: entry(a), pending: entry(b, 1) });
+    expect((await settleCheckpoint(f, f.handle)).settlement).toBe("promote");
+    expect(f.store.checkpointRecord("run")).toMatchObject({ committed: entry(b, 1), pending: null });
+  } finally {
+    resume.resolve();
+    f.store.close();
+  }
+});
+
+test.each(["during-read", "before-transition"] as const)(
+  "settlement reobserves after ledger changes %s",
+  async (when) => {
+    const f = await fixture();
+    try {
+      f.store.journalCheckpoint("run", entry(b, 1));
+      if (when === "before-transition")
+        expect(await f.leases.update(f.handle, { checkpoint: b })).toBe("applied");
+      const replacePending = () => {
+        f.store.dropPendingCheckpoint("run", f.store.checkpointRecord("run"));
+        f.store.journalCheckpoint("run", { ...entry(b, 1), generation: 2 });
+      };
+      if (when === "before-transition") {
+        const confirm = f.store.confirmCheckpoint;
+        spyOn(f.store, "confirmCheckpoint").mockImplementationOnce((...args) => {
+          replacePending();
+          return confirm(...args);
+        });
+      }
+      let reads = 0;
+      const read = mock(async () => {
+        const result = await f.claims.read(f.handle.repo, f.handle.ref);
+        if (++reads === 1 && when === "during-read") {
+          replacePending();
+          expect(await f.leases.update(f.handle, { checkpoint: b })).toBe("applied");
+        }
+        return result;
+      });
+      expect((await settleCheckpoint({ ...f, claims: { read } }, f.handle)).settlement).toBe("promote");
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(f.store.checkpointRecord("run")).toMatchObject({
+        committed: { ...entry(b, 1), generation: 2 },
+        pending: null,
+      });
+    } finally {
+      f.store.close();
+    }
+  },
+);
+
+test("checkpoint coordination releases a rejected scope and supports journal/publish/confirm", async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  try {
+    const failing = f.store.coordinateCheckpoint("run", async () => {
+      entered.resolve();
+      await resume.promise;
+      throw new Error("Publication interrupted");
+    });
+    const rejected = failing.catch((error: unknown) => error);
+    await entered.promise;
+    let following = false;
+    const queued = f.store.coordinateCheckpoint("run", async () => {
+      following = true;
+      f.store.journalCheckpoint("run", entry(b, 1));
+      const expected = f.store.checkpointRecord("run");
+      expect(await f.leases.settle(f.handle.repo, f.handle.ref)).toBe("settled");
+      expect(await f.leases.update(f.handle, { checkpoint: b }, { expect: { checkpoint: a } })).toBe(
+        "applied",
+      );
+      return f.store.confirmCheckpoint("run", b, expected);
+    });
+    await f.store.coordinateCheckpoint("another-run", async () => {});
+    const overlapped = following;
+    resume.resolve();
+    expect(await rejected).toEqual(new Error("Publication interrupted"));
+    expect(await queued).toBe(true);
+    expect(overlapped).toBe(false);
+    expect((await settleCheckpoint(f, f.handle)).settlement).toBe("current");
+  } finally {
+    resume.resolve();
+    f.store.close();
+  }
+});
