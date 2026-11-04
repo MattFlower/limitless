@@ -273,7 +273,7 @@ for (const resumeFails of [false, true]) {
     expect(f.calls.some((call) => call.startsWith("launchctl") && call.includes("custom.executor"))).toBe(
       false,
     );
-    expect(f.logs).toContain("custom.daemon: loaded");
+    expect(f.logs).toContain("custom.daemon: loaded (daemon, source)");
     expect(existsSync(f.opts.lockPath)).toBe(false);
   });
 }
@@ -301,7 +301,7 @@ for (const failure of ["old boot", "wrong SHA", "missing SHA", "unreachable"]) {
     expect(f.calls.some((call) => call.startsWith("launchctl") && call.includes("custom.executor"))).toBe(
       false,
     );
-    expect(f.logs).toContain("custom.daemon: loaded");
+    expect(f.logs).toContain("custom.daemon: loaded (daemon, source)");
     expect(f.logs).toContain("release: release subject");
     expect(f.logs).toContain(`health: ${failure === "unreachable" ? "unreachable" : "ok"}`);
     expect(f.clock.now()).toBe(45_000);
