@@ -48,18 +48,18 @@ export function createCheckpointCommitter(
       if (settlement === "wait") throw new ClaimWaitError("lease");
       if (settlement === "blocked") throw blocked();
       const base = store.checkpointRecord(runId);
+      // Another publication journaled after settlement released the lock: settle it first.
+      if (base?.pending) continue;
       let candidate: Candidate | undefined;
       try {
         const run = store.getRun(runId);
         if (!run) throw new CandidateRefused("missing");
         candidate = await buildCandidate(deps, run, handle, guard, signal);
       } catch (error) {
-        if (
-          error instanceof ClaimWaitError &&
-          error.reason === "unavailable" &&
-          !isDeepStrictEqual(base, store.checkpointRecord(runId))
-        )
-          continue;
+        const raced =
+          error instanceof CandidateRefused ||
+          (error instanceof ClaimWaitError && error.reason === "unavailable");
+        if (raced && !isDeepStrictEqual(base, store.checkpointRecord(runId))) continue;
         if (!(error instanceof CandidateRefused)) throw error;
         if (!patch) throw new NeedsHumanError(`Shared checkpoint refused: ${error.code}`);
       }

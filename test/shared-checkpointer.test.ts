@@ -369,6 +369,40 @@ test.each(["during-build", "before-journal"])(
   },
 );
 
+test("a publication journaled after settlement re-settles instead of refusing", async () => {
+  const f = await fixture(),
+    other = createCheckpointCommitter(f.deps),
+    entered = deferred<void>(),
+    release = deferred<void>(),
+    coordinate = f.store.coordinateCheckpoint.bind(f.store);
+  let held = false,
+    calls = 0,
+    racing: Promise<unknown> | undefined;
+  f.gh.fault = async (r) => {
+    if (r.step !== "update" || held) return;
+    held = true;
+    entered.resolve();
+    await release.promise;
+  };
+  spyOn(f.store, "coordinateCheckpoint").mockImplementation(async (id, fn) => {
+    if (++calls === 1) {
+      // This commit's settlement finishes; the other committer journals and is mid-update before it resumes.
+      const result = await coordinate(id, fn);
+      racing = other.commit(f.run.id, f.claim, f.signal);
+      await entered.promise;
+      expect(f.store.checkpointRecord(f.run.id)?.pending?.sequence).toBe(1);
+      return result;
+    }
+    if (calls === 4) release.resolve(); // this commit's re-settlement
+    return coordinate(id, fn);
+  });
+  expect(await f.commit()).toBe("committed");
+  expect(await racing).toBe("committed");
+  expect(manifest(f).sequence).toBe(2);
+  expect(manifest(f).previous).not.toBeNull();
+  expect((await record(f)).checkpoint).toBe(f.store.checkpointRecord(f.run.id)?.committed?.pointer);
+});
+
 test.each(["removed", "fenced"])("fenced confirmation re-settles a %s ledger", async (kind) => {
   const f = await fixture(),
     confirm = f.store.confirmCheckpoint;
