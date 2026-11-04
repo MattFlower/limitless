@@ -1300,6 +1300,43 @@ test.each([...TERMINAL_STATUSES])("acquire refuses same-run terminal %s in every
   }
 });
 
+test.each([
+  ["failed", "released"],
+  ["succeeded", "held"],
+] as const)(
+  "acquire rechecks terminal %s/%s after a same-holder moved confirmation",
+  async (status, state) => {
+    const f = fixture();
+    const manager = await f.create();
+    let moved = false,
+      reads = 0;
+    let terminal: ClaimTip | undefined;
+    let before = f.raw();
+    f.gh.fault = (r) => {
+      if (r.step === "update" && !moved) {
+        moved = true;
+        const sent = parseRecord(f.gh.commits.get(f.gh.update(r).afterOid)?.message ?? "", ref);
+        if (sent === "malformed") throw new Error("Malformed attempt");
+        f.gh.seed({ ...sent, status: "waiting_input" });
+      }
+      // The first read confirms the moved held record; the retry then sees its terminal successor.
+      if (r.step === "ref" && moved && ++reads === 2) {
+        terminal = f.gh.seed({ ...f.tip(), status, state });
+        before = f.raw();
+      }
+    };
+    const result = await f.acquire(manager, true, { ...want, status: "queued" });
+    expect(terminal).toBeDefined();
+    expect(result).toEqual({ kind: "refused", reason: "terminal", tip: terminal });
+    expect(f.gh.refs.get(f.gh.key(repo, ref))).toBe(terminal?.sha);
+    expect(f.tip()).toMatchObject({ generation: 1, status, state });
+    expect(f.raw()).toEqual(before);
+    expect(f.row()?.intent ?? null).toBeNull();
+    expect(f.gh.calls("commit")).toHaveLength(1);
+    expect(f.gh.calls("update")).toHaveLength(1);
+  },
+);
+
 test("settle is canonical, reconciles pending intents and sends no claim write", async () => {
   const f = fixture(),
     manager = await f.create();

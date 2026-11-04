@@ -125,7 +125,7 @@ export async function createLeaseManager(deps: {
         const tip = read.kind === "tip" ? read.tip : null;
         if (tip?.record === "malformed") return { kind: "refused", reason: "malformed", tip };
         const r = tip?.record;
-        if (!h && r?.generation !== mine && r?.run === want.run && TERMINAL_STATUSES.includes(r.status))
+        if (!h && r?.run === want.run && TERMINAL_STATUSES.includes(r.status))
           return { kind: "refused", reason: "terminal", tip: tip ?? undefined };
         let confirmed = row?.runId === want.run ? row.confirmed : null;
         if (mine) confirmed = { generation: mine, tip: "", state: "held" };
