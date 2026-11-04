@@ -153,6 +153,11 @@ test("original whitespace and escaped overlaps are checked before credential red
   expect(JSON.stringify(r)).not.toContain(host);
   const clean = fixture([], credential);
   expect((await clean.gate(` ${credential} \n`)).output).toBe(" [redacted] \n");
+  for (const sign of [clean.signer, () => undefined]) {
+    const r = await clean.gate("ok\n", "", { run: `bun emit.ts '${credential}'` }, sign);
+    expect(r.textPrivacy?.identities).toEqual({ withheld: true, reason: "private-match" });
+    expect(r.textPrivacy?.output).toMatchObject({ withheld: false, checkedComplete: true });
+  }
   const escaped = fixture([host], "host.exam");
   expect((await escaped.gate("host.exam\\u0070le")).output).toBe(withheldText("private-match"));
 });
@@ -351,6 +356,10 @@ test.each(["line", "files", "path", "identities"])(
     );
     if (kind === "identities")
       expect(r.textPrivacy?.identities).toEqual({ withheld: true, reason: "identity-cap" });
+    else
+      expect(
+        verifier(f.registry, f.signer).verify(r.textPrivacy?.identities, "identities", gateIdentities(r)),
+      ).toBe(true);
   },
 );
 

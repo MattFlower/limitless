@@ -93,6 +93,14 @@ export async function checkAndSign(
   const { registry } = checker,
     key = signer(),
     bound = { registry, input: cut?.limit === 0 ? hash(text) : undefined };
+  // A verdict-only proof or claim covers the original, which credential redaction never rendered.
+  if (cut?.limit === 0) {
+    const original = checkPrepared(preparePrivacyPolicy({ ...registry.snapshot(), entries: [] }), text);
+    if (!("clean" in original)) {
+      input.onRefusal?.("refused" in original ? original.refused : "private-match");
+      return;
+    }
+  }
   if (!key) return;
   const parts: Uint8Array[] = [];
   for (let index = 0; ; index++) {

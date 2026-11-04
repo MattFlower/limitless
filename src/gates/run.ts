@@ -240,11 +240,14 @@ async function runOne(
       ? { testCoverage }
       : {}),
   };
-  const identities = gateIdentities(result);
-  if (overflow || coverage.overflow || identities === "identity-cap") {
+  const incomplete = () => {
     result.testCoverage = { ...testCoverage, skippedTestsIncomplete: true };
     result.failureAttributionComplete = false;
-  }
+  };
+  // Proved identities are the final result's: overflow metadata is applied before materializing them.
+  if (overflow || coverage.overflow) incomplete();
+  const identities = gateIdentities(result);
+  if (identities === "identity-cap") incomplete();
   return Object.assign(
     result,
     await protectGateOutput(res, identities, { signal, deadline: Date.now() + 120_000 }),
