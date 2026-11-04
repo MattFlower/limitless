@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { expect, spyOn } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
@@ -12,6 +12,7 @@ import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
+import { test } from "./read-policy-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
 let home: string;
@@ -331,6 +332,11 @@ afterAll(async () => {
     }
     if (succeeds) {
       const gate = state?.gateEvidence;
+      expect(gate?.checks[0]?.result.textPrivacy?.output).toMatchObject({
+        withheld: false,
+        checkedComplete: true,
+        kind: "complete",
+      });
       expect(result?.status).toBe("met");
       expect(gate?.sha).toMatch(/^[a-f0-9]{40}$/);
       expect(result?.evidence).toContain(

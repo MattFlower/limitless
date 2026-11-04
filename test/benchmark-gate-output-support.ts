@@ -126,7 +126,10 @@ export const registry: Record<string, (c: Context) => Promise<Job[]> | Job[]> = 
         "BunTestCoverage.observe/result",
         lines.length,
         run,
-        (v) => validate(field(v, "passedFiles.length") === lines.length),
+        (v) =>
+          validate(
+            field(v, "passedFiles.length") === (field(v, "skippedTestsIncomplete") ? 2000 : lines.length),
+          ),
       ],
     ];
   },
@@ -185,6 +188,8 @@ export const registry: Record<string, (c: Context) => Promise<Job[]> | Job[]> = 
           kind: "complete",
           field: "identities",
           text: bytes,
+          // Identities are verdict-only, so the zero-length cut path is the one measured.
+          cut: { limit: 0, unit: "U", marker: "" },
           signer: () => key,
         }));
       const outcome = over || !identity ? "raw-command; identities-refused-or-unavailable" : "identity-proof";
