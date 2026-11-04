@@ -86,6 +86,7 @@ import { certificate, fingerprint, workerRequest } from "../src/workers/tls.ts";
 import { updateWorker, WorkerUpdateError } from "../src/workers/update.ts";
 import { attemptBudget, credentialBearing, validRun } from "../src/workers/validation.ts";
 import { bwrapSkip, fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
+import { remoteFixture } from "./gate-remote-support.ts";
 import { PreviousHeartbeat } from "./previous-heartbeat.ts";
 import { resetProcessPrivacy, testPrivacy } from "./privacy-process-support.ts";
 import { test } from "./read-policy-support.ts";
@@ -1374,21 +1375,26 @@ test.each([
     const ctx = new RunContext(factory.deps, run, repo, AbortSignal.timeout(120_000));
     ctx.state.gatesConfig = req.gates;
     const worker = await loop();
+    const privacy = remoteFixture();
     const stage = kind === "baseline" ? "prepare" : "gates";
     try {
-      const first = await runGateExecution(
-        ctx,
-        stage,
-        kind === "baseline" ? "baseline" : "initial",
-        req.cwd,
-        req.gates,
+      const first = await privacy.scoped(() =>
+        runGateExecution(ctx, stage, kind === "baseline" ? "baseline" : "initial", req.cwd, req.gates),
       );
       expect(first.checks[0]).toMatchObject({ ok: false, exitCode: 1 });
       expect(first.checks[0]?.output).toContain("transient");
       expect(existsSync(join(req.cwd, "node_modules", "ready"))).toBe(false);
       if (targeted && first.checks[0]) first.checks[0].failedFiles = ["tracked"];
       const retry: GateRunner = (gates, options) =>
-        runGateExecution(ctx, stage, `${kind}-retry${options?.targeted ? "-targeted" : ""}`, req.cwd, gates);
+        privacy.scoped(() =>
+          runGateExecution(
+            ctx,
+            stage,
+            `${kind}-retry${options?.targeted ? "-targeted" : ""}`,
+            req.cwd,
+            gates,
+          ),
+        );
       if (kind === "baseline") {
         const retried = await retryBaselineFailures(
           first,
@@ -1424,6 +1430,7 @@ test.each([
         expect(JSON.parse(job.request).gates.setup).toEqual(req.gates.setup);
       }
     } finally {
+      await privacy.checker.dispose();
       await worker.stop();
       await factory.stop();
     }

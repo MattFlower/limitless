@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -34,7 +34,9 @@ import {
   resumeGateExecution,
   runGateExecution,
 } from "../src/pipeline/gate-execution.ts";
+import { verifier } from "../src/util/privacy-proof.ts";
 import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
+import { remoteFixture } from "./gate-remote-support.ts";
 import { seeded } from "./seeded.ts";
 
 const seed = seeded(async (cwd) => {
@@ -49,7 +51,9 @@ const seed = seeded(async (cwd) => {
 });
 let cwd: string;
 let req: GateRequest;
+let privacy: ReturnType<typeof remoteFixture>;
 beforeEach(async () => {
+  privacy = remoteFixture();
   cwd = mkdtempSync(join(tmpdir(), "actions-gates-"));
   const { value } = await seed(cwd);
   req = {
@@ -65,7 +69,10 @@ beforeEach(async () => {
     },
   };
 });
-afterEach(() => rmSync(cwd, { recursive: true, force: true }));
+afterEach(async () => {
+  await privacy.checker.dispose();
+  rmSync(cwd, { recursive: true, force: true });
+});
 const signal = () => new AbortController().signal;
 const token = "a".repeat(32);
 const framed = (index = 0, exit = 0, ms = 123, timeout = false) =>
@@ -179,7 +186,7 @@ function fixture() {
   };
   const executor = () => githubActionsExecutor(deps);
   const run = (s = signal(), handle?: ExecutionHandle) =>
-    executeGate(req, s, {}, executor(), handle, persist);
+    privacy.scoped(() => executeGate(req, s, {}, executor(), handle, persist));
   const stored = async (progress: Partial<ActionsProgress> = {}) => {
     const handle = await executor().start(req, signal());
     if (!handle.githubActions) throw new Error("Missing fixture progress");
@@ -229,7 +236,8 @@ test("dispatch uses trusted per-handle branches and maps pass, failure and timeo
     [false, 2, 234, false],
     [false, 137, 345, true],
   ]);
-  expect(run.checks[1]?.failures).toContain("(fail) expected excerpt");
+  expect(run.checks[1]?.failures).toBeUndefined();
+  expect(run.checks[1]?.output).toContain("(fail) expected excerpt");
   expect(run.checks[1]?.output).not.toContain("checkout-only");
   expect(run.checks[1]?.output).not.toContain("bun-only");
   const p = f.saved[0]?.githubActions;
@@ -496,6 +504,7 @@ test("redaction covers a credential crossing the setup output tail boundary befo
   const f = fixture();
   const credential = "synthetic-boundary-credential-for-actions-output";
   registerCredential("ACTIONS_SETUP_BOUNDARY", credential);
+  privacy.credentials.add(credential);
   f.state.logs.set(
     1,
     log(
@@ -504,13 +513,16 @@ test("redaction covers a credential crossing the setup output tail boundary befo
     ),
   );
   const result = await f.run();
-  // The factory-authored provenance label "github-actions" shares a window with the credential.
-  const serialized = JSON.stringify(result, (key, value) => (key === "executor" ? undefined : value));
+  // Factory-authored executor and proof kinds share a window with the credential.
+  const serialized = JSON.stringify(result, (key, value) =>
+    ["executor", "kind"].includes(key) ? undefined : value,
+  );
   for (let i = 0; i + 8 <= credential.length; i++)
     expect(serialized).not.toContain(credential.slice(i, i + 8));
   expect(result.checks[0]?.output).not.toContain("setup-only");
   expect(result.checks[0]?.output).not.toContain("checkout-only");
-  expect(result.checks[0]?.failures).toContain("assertion diagnostics\n(fail) check-only");
+  expect(result.checks[0]?.failures).toBeUndefined();
+  expect(result.checks[0]?.output).toContain("assertion diagnostics\n(fail) check-only");
 });
 
 test("run and job polls send conditional requests and accept unchanged responses", async () => {
@@ -1763,10 +1775,12 @@ async function withPrivateString<T>(fn: () => Promise<T>): Promise<T> {
   mkdirSync(dir, { recursive: true });
   const file = join(dir, "private-strings.txt");
   writeFileSync(file, `${secret}\n`);
+  privacy.policy([secret]);
   try {
     return await fn();
   } finally {
     rmSync(file, { force: true });
+    privacy.policy([]);
   }
 }
 async function commit(files: Record<string, string>, message = "change", env: Record<string, string> = {}) {
@@ -1838,7 +1852,7 @@ test("protected text in a job log never reaches results or checkpoints", async (
   f.state.logs.set(1, log(framed(), `failed near ${secret} using ${credential}\n${framed(0, 1)}`));
   const run = await withPrivateString(() => f.run());
   expect(run.checks[0]).toMatchObject({ ok: false, exitCode: 1 });
-  expect(run.checks[0]?.output).toContain("failed near");
+  expect(run.checks[0]?.textPrivacy?.output).toEqual({ withheld: true, reason: "private-match" });
   const persisted = JSON.stringify([run, f.saved]);
   expect(persisted).not.toContain(secret);
   expect(persisted).not.toContain(credential);
@@ -2167,5 +2181,76 @@ test("retained attempt replay waits for the active retry's cleanup", async () =>
     expect(f.remote.size).toBe(0);
   } finally {
     store.close();
+  }
+});
+
+test.each(["outside", "before-tail", "overlap", "over-cap"])(
+  "whole Actions log refuses private or oversized input before %s transforms",
+  async (scenario) => {
+    const f = fixture(),
+      secret = "remote-hidden-entry";
+    privacy.policy([secret]);
+    if (scenario === "overlap") registerCredential("REMOTE_ACTIONS_OVERLAP", `prefix-${secret}-suffix`);
+    const raw =
+      scenario === "outside"
+        ? `${secret}\n${log()}`
+        : scenario === "before-tail"
+          ? log(framed(), `${secret}\n${"x".repeat(6100)}\n${framed()}`)
+          : scenario === "overlap"
+            ? log(framed(), `prefix-${secret}-suffix\n${framed()}`)
+            : `${"x".repeat(8_388_609)}\n${log()}`;
+    f.state.logs.set(1, raw);
+    const run = await f.run();
+    expect(run.checks[0]?.ok).toBe(true);
+    for (const r of [...run.setup, ...run.checks]) {
+      expect(r.textPrivacy?.output).toEqual({
+        withheld: true,
+        reason: scenario === "over-cap" ? "input-length" : "private-match",
+      });
+      expect(r.output).toStartWith("[withheld:");
+      expect(r.failures).toBeUndefined();
+    }
+    const persisted = JSON.stringify([run, f.saved]);
+    expect(persisted).not.toContain(secret);
+    expect(persisted).not.toContain(raw);
+  },
+);
+
+test("Actions signs credential renderings and identities while keeping raw framing out of checkpoints", async () => {
+  const credential = "actions-render-credential";
+  await privacy.checker.dispose();
+  privacy = remoteFixture([], credential);
+  const f = fixture(),
+    outside = "RAW-OUTSIDE-SECTION";
+  f.state.logs.set(1, `${outside}\n${log(framed(), `before ${credential} after\n${framed(0, 7)}`)}`);
+  const run = await f.run(),
+    r = run.checks[0];
+  expect(r?.ok).toBe(false);
+  expect(r?.exitCode).toBe(7);
+  expect(r?.output).toContain("before [redacted] after");
+  expect(r?.textPrivacy?.output.kind).toBe("attested:github-actions");
+  expect(
+    verifier(privacy.registry, privacy.signer).verify(r?.textPrivacy?.output, "output", r?.output ?? ""),
+  ).toBe(true);
+  expect(r?.textPrivacy?.identities?.kind).toBe("attested:github-actions");
+  const persisted = JSON.stringify([run, f.saved]);
+  expect(persisted).not.toContain(credential);
+  expect(persisted).not.toContain(outside);
+  expect(r?.failures).toBeUndefined();
+});
+
+test("Actions withholds a section if the whole-log receipt becomes stale during checking", async () => {
+  const f = fixture(),
+    original = privacy.checker.protectText;
+  let calls = 0;
+  spyOn(privacy.checker, "protectText").mockImplementation(async (...args) => {
+    const receipt = await original(...args);
+    if (++calls === 2) privacy.policy(["new-entry"]);
+    return receipt;
+  });
+  const run = await f.run();
+  for (const r of [...run.setup, ...run.checks]) {
+    expect(r.textPrivacy?.output.mac).toBeUndefined();
+    expect(r.output).toStartWith("[withheld:");
   }
 });

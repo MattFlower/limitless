@@ -249,6 +249,10 @@ export class WorkerStore {
       return { privateStrings: "unknown" as const, agents: undefined };
     }
   }
+  privateStringsMatch(name: string) {
+    const worker = this.worker(name);
+    return !!worker && this.agentCapabilities(worker).privateStrings === "match";
+  }
   list() {
     return this.store.db
       .query<WorkerRow, [number]>(
