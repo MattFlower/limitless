@@ -5,6 +5,7 @@ import type { Factory } from "../src/app.ts";
 import { WorkerStore } from "../src/db/workers.ts";
 import { type GateExecutor, type GateRequest, gateProvenance, localExecutor } from "../src/gates/executor.ts";
 import { lanExecutor } from "../src/gates/lan.ts";
+import { redactGateOutput } from "../src/gates/output.ts";
 import type { GateComparison } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { applyGateEvidence } from "../src/pipeline/gate-evidence.ts";
@@ -12,6 +13,7 @@ import type { Verify } from "../src/pipeline/schemas.ts";
 import { agentEnv, registerCredential, sh } from "../src/util/proc.ts";
 import { GateRunSchema } from "../src/workers/protocol.ts";
 import { approve, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
+import { provenResult } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
 
 const fixture: { home: string; repoDir: string; factory: Factory | null } = {
@@ -303,14 +305,14 @@ test.each([
             return {
               setupOk: false,
               setup: [
-                {
+                await provenResult({
                   name: "setup",
                   command: "echo setup",
                   ok: false,
                   exitCode: 9,
                   durationMs: 1,
                   output: "setup failed",
-                },
+                }),
               ],
               checks: [],
             };
@@ -658,15 +660,19 @@ test.each([
                   treeHash: (await sh(["git", "rev-parse", "HEAD^{tree}"], { cwd: req.cwd })).stdout.trim(),
                 }
               : {}),
-            checks: run.checks.map((r) => ({
-              ...r,
-              ok: !failed,
-              exitCode: failed ? 3 : 0,
-              output: failed ? `tail ${secret}` : "pass on retry",
-              failures: failed ? `failure excerpt ${secret}` : undefined,
-              failedFiles: ["sample.test.ts"],
-              failedFileTimes: { "sample.test.ts": 1 },
-            })),
+            checks: await Promise.all(
+              run.checks.map((r) =>
+                provenResult({
+                  ...r,
+                  ok: !failed,
+                  exitCode: failed ? 3 : 0,
+                  output: failed ? redactGateOutput(`tail ${secret}`) : "pass on retry",
+                  failures: failed ? `failure excerpt ${secret}` : undefined,
+                  failedFiles: ["sample.test.ts"],
+                  failedFileTimes: { "sample.test.ts": 1 },
+                }),
+              ),
+            ),
           };
         }),
       };
@@ -693,8 +699,11 @@ test.each([
       });
       expect(result.exitCode).toBe(flaky && !rejected ? 0 : 3);
       expect(result.stdout).not.toContain(secret);
-      expect(result.stdout).toContain(flaky && !rejected ? "pass on retry" : "failure excerpt [redacted]");
-      if (rejected) expect(result.stdout).toContain("Retry rejected:");
+      expect(result.stdout).toContain(
+        rejected ? "[withheld: unproven]" : flaky ? "pass on retry" : "tail [redacted]",
+      );
+      expect(result.stdout).not.toContain("failure excerpt");
+      if (rejected) expect(result.stdout).not.toContain("Retry rejected:");
       const stored = f.store.db.query("SELECT * FROM agent_gate_executions").all();
       expect(stored).toHaveLength(invalid ? 0 : 1);
       if (invalid) {
@@ -746,5 +755,8 @@ test.each([
   expect(testCheck?.firstAttempt?.ok).toBe(false);
   expect(roundZeroTests).toBe(0);
   expect(calls).toBe(flaky ? 3 : 2);
-  if (!flaky) expect(feedback).toContain("failure excerpt [redacted]");
+  if (!flaky) {
+    expect(feedback).toContain("tail [redacted]");
+    expect(feedback).not.toContain("failure excerpt");
+  }
 });

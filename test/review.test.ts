@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { gradeReview } from "../src/evals/graders/review.ts";
 import { type AgentResult, emptyUsage } from "../src/harness/types.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
@@ -33,6 +33,7 @@ import {
 } from "../src/pipeline/schemas.ts";
 import { reviewCase } from "./evals-reading-support.ts";
 import { deferred } from "./evals-support.ts";
+import { provenResult } from "./privacy-support.ts";
 import { attributionEvidence, findingEvidence } from "./review-support.ts";
 
 const finding = (severity: Review["findings"][number]["severity"], security = false) => ({
@@ -246,6 +247,12 @@ describe("review prompt", () => {
     audit: [],
     implementerReport: "IMPLEMENTER_CLAIMS_ALL_GOOD",
   };
+
+  beforeEach(async () => {
+    input.gates = await Promise.all(
+      input.gates.map(async (gate) => ({ ...gate, result: await provenResult(gate.result) })),
+    );
+  });
 
   test("spec-mandated extras may be flagged as unnecessary scope", () => {
     expect(reviewPrompt(input)).toContain(
