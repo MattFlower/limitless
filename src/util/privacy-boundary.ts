@@ -471,7 +471,7 @@ function protectTextPrepared(
     if ("refused" in policy) return issue(withheld(state, "unreadable-policy"));
     const reason = admit(state, text);
     if (reason) return issue(withheld(state, reason));
-    state = inspect(state, text);
+    state = inspect(state, text, terminal);
     if (state.withheld) return issue(state);
     state.checkedComplete = true;
     if (terminal) {
@@ -482,8 +482,11 @@ function protectTextPrepared(
     const rendered = terminal
       ? terminalRedactor(() => policy.matcher).push(text, true)
       : policy.matcher.redact(text);
-    if (rendered !== text) state = inspect(state, rendered);
-    return issue(select(state, cut));
+    if (terminal || rendered !== text) state = inspect(state, rendered);
+    state = select(state, cut);
+    // A verdict-only receipt covers its original only when rendering leaves the original unchanged.
+    if (cut?.limit === 0 && rendered !== text && !state.withheld) state = inspect(state, "[redacted]");
+    return issue(state);
   } catch {
     return issue(withheld(state, "nonconvergent"));
   }

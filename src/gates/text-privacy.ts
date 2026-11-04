@@ -31,15 +31,21 @@ export function gateIdentities(r: GateResult): string {
       (k) => r[k],
     ),
     ...(["passedFiles", "skippedFiles", "skippedTests"] as const).map((k) => r.testCoverage?.[k]),
-    Object.keys(r.failedFileTimes ?? {}).sort(),
+    r.failedFileTimes,
   ];
-  const size = (value: unknown): number =>
-    typeof value === "string"
-      ? value.length
-      : value && typeof value === "object"
-        ? Object.values(value).reduce<number>((n, v) => n + size(v), 0)
-        : 0;
-  return size(values) > IDENTITY_CAP ? "identity-cap" : JSON.stringify(stable(values));
+  let units = 0;
+  const withinCap = (value: unknown): boolean => {
+    if (typeof value === "string") units += Math.max(1, value.length);
+    else if (value && typeof value === "object")
+      for (const key in value) {
+        if (value === r.failedFileTimes) units += key.length;
+        if (units > IDENTITY_CAP || !withinCap(Reflect.get(value, key))) return false;
+      }
+    return units <= IDENTITY_CAP;
+  };
+  if (!withinCap(values)) return "identity-cap";
+  values[values.length - 1] = Object.keys(r.failedFileTimes ?? {}).sort();
+  return JSON.stringify(stable(values));
 }
 const ATTRIBUTION_PARTS = new Set([
   ...["Unknown testcase evidence", "Cross-file testcase failure", "Ambiguous testcase"],

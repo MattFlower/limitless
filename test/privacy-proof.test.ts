@@ -126,6 +126,21 @@ test("no key, forged receipt, stale receipt and withheld text cannot sign", asyn
     ["PRIVACY_CHECKER_SEMANTICS", "checkAndSign", "provisionProofKey", "verifier"].sort(),
   );
 });
+test("verdict-only proofs and claims refuse originals that credential redaction would change", async () => {
+  const secrets = createCredentialRegistry();
+  secrets.add("cred-value-1234");
+  const f = fixture(secrets),
+    cut = { limit: 0, unit: "U" as const, marker: "" },
+    refusals: string[] = [];
+  const onRefusal = (reason: string) => refusals.push(reason);
+  expect(await f.sign(" cred-value-1234 ", { cut, onRefusal })).toBeUndefined();
+  expect(await f.sign(" cred-value-1234 ", { cut, onRefusal, signer: () => undefined })).toBeUndefined();
+  expect(refusals).toEqual(["private-match", "private-match"]);
+  const rendered = await f.sign(" cred-value-1234 ", { onRefusal });
+  expect(p.verifier(f.registry, f.signer).verify(rendered, "output", " [redacted] ")).toBe(true);
+  expect(await f.sign("clean identity", { cut, onRefusal })).toBeDefined();
+  expect(refusals).toHaveLength(2);
+});
 test("receipts cannot be replayed against other input or another registry", async () => {
   const f = fixture(),
     cut = { limit: 0, unit: "U" as const, marker: "" },

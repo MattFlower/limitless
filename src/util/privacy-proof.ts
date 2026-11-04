@@ -80,6 +80,7 @@ export async function checkAndSign(
     Parameters<Checker["protectText"]>[1] & {
       checker: Pick<Checker, "protectText" | "registry">;
       signer?: typeof provider;
+      onRefusal?: (reason: string) => void;
       kind: PrivacyProof["kind"];
       field: string;
     },
@@ -92,16 +93,24 @@ export async function checkAndSign(
   const { registry } = checker,
     key = signer(),
     bound = { registry, input: cut?.limit === 0 ? hash(text) : undefined };
-  if (!key) return;
   const parts: Uint8Array[] = [];
   for (let index = 0; ; index++) {
     const part = consumeBoundaryChunk(receipt, index, bound);
-    if (part.withheld || !part.checkedComplete) return;
+    if (part.withheld || !part.checkedComplete) {
+      input.onRefusal?.(part.reason ?? "checker-failed");
+      return;
+    }
     if (part.done) break;
     parts.push(part.bytes);
   }
-  const rendering = Buffer.concat(parts),
-    bytes = !rendering.length && cut?.limit === 0 ? text : rendering,
+  const rendering = Buffer.concat(parts);
+  // The checker marks a verdict-only receipt whose original credential redaction would change.
+  if (cut?.limit === 0 && rendering.length) {
+    input.onRefusal?.("private-match");
+    return;
+  }
+  if (!key) return;
+  const bytes = cut?.limit === 0 ? text : rendering,
     binding = [kind, registry.semantics, privateStringsDigest(registry.entries), field];
   const policy = preparePrivacyPolicy({
     ready: true,
@@ -109,7 +118,10 @@ export async function checkAndSign(
     credentials: representations(key),
     generation: registry.generation,
   });
-  if (!("clean" in checkPrepared(policy, bytes.toString()))) return;
+  if (!("clean" in checkPrepared(policy, bytes.toString()))) {
+    input.onRefusal?.("checker-failed");
+    return;
+  }
   return { kind, mac: mac(key, binding, bytes).toString("hex") };
 }
 export function verifier(registry: typeof privacyRegistry, signer = provider) {

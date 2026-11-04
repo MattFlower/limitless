@@ -1,7 +1,12 @@
-import { test as bunTest } from "bun:test";
+import { test as bunTest, spyOn } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gatePrivacyScope } from "../src/gates/text-privacy.ts";
 import { configureReadPolicy, readPolicyScope } from "../src/harness/read-policy.ts";
+import { credentialRegistry } from "../src/util/credential-matcher.ts";
+import { createPrivacyRegistry, privacyLimits } from "../src/util/privacy-boundary.ts";
+import { createPrivacyChecker } from "../src/util/privacy-checker.ts";
+import { provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
 
 export const testReadPolicy = configureReadPolicy(undefined, join(tmpdir(), "test-factory-config"));
 
@@ -16,8 +21,39 @@ function scoped<T extends (...args: never[]) => unknown>(runner: T): T {
         typeof callback === "function"
           ? [
               name,
-              (...values: unknown[]) =>
-                readPolicyScope.run(testReadPolicy, () => Reflect.apply(callback, undefined, values)),
+              async (...values: unknown[]) => {
+                // Match daemon startup without retaining oversized credentials from earlier test fixtures.
+                const previous = new Set(credentialRegistry.values()),
+                  added = new Set<string>();
+                const add = credentialRegistry.add;
+                const registration = spyOn(credentialRegistry, "add").mockImplementation((value) => {
+                  added.add(value);
+                  add(value);
+                });
+                const registry = createPrivacyRegistry({
+                  ...credentialRegistry,
+                  values: (worker) =>
+                    credentialRegistry
+                      .values(worker)
+                      .filter(
+                        (v) => v.length <= privacyLimits.originalLength || !previous.has(v) || added.has(v),
+                      ),
+                });
+                provisionPrivacyPolicy(
+                  process.env.LIMITLESS_CONFIG_DIR ?? join(tmpdir(), "test-factory-config"),
+                  [],
+                  { registry },
+                );
+                const checker = createPrivacyChecker({ registry });
+                try {
+                  return await gatePrivacyScope.run({ checker, registry }, () =>
+                    readPolicyScope.run(testReadPolicy, () => Reflect.apply(callback, undefined, values)),
+                  );
+                } finally {
+                  registration.mockRestore();
+                  await checker.dispose();
+                }
+              },
               ...rest,
             ]
           : args,

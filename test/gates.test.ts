@@ -170,11 +170,9 @@ describe("runGates / compareGates", () => {
         new AbortController().signal,
       );
       expect(run.checks[0]?.output).toBe(
-        "error: [redacted]\n(fail) stdout assertion\n\n(fail) stderr [redacted]\n^ this test timed out after 100ms.",
+        "error: [redacted]\n(fail) stdout assertion\n\n(fail) stderr [redacted]\n^ this test timed out after 100ms.\n",
       );
-      expect(run.checks[0]?.failures).toContain(
-        "(fail) stderr [redacted]\n^ this test timed out after 100ms.",
-      );
+      expect(run.checks[0]?.failures).toBeUndefined();
       expect(JSON.stringify(run)).not.toContain(secret);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -182,7 +180,7 @@ describe("runGates / compareGates", () => {
   });
 
   test.each(["stdout", "stderr"])(
-    "the untruncated %s stream keeps its failure diagnostics",
+    "the untruncated %s stream contributes only to the checked rendering",
     async (stream) => {
       const secret = "synthetic-per-stream-cut-credential-421";
       proc.registerCredential("PER_STREAM_CUT_TEST_TOKEN", secret);
@@ -207,9 +205,9 @@ describe("runGates / compareGates", () => {
           },
           new AbortController().signal,
         );
-        // The stdout tail can itself fall outside the combined tail, but its early excerpt must survive.
+        // The checked rendering retains stdout when the combined stream fits.
         if (stream === "stdout") expect(run.checks[0]?.output).toContain(diagnostic.trim());
-        expect(run.checks[0]?.failures).toContain(diagnostic.trim());
+        expect(run.checks[0]?.failures).toBeUndefined();
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -240,7 +238,8 @@ describe("runGates / compareGates", () => {
         new AbortController().signal,
       );
       for (const result of run.checks) {
-        expect(result.failures).toContain("error: [redacted]");
+        expect(result.failures).toBeUndefined();
+        expect(result.output).toBe("[withheld: unreadable-policy]");
         expect(result.output.length).toBeLessThanOrEqual(6_000);
         const text = JSON.stringify(result);
         for (const value of [secret, encoded]) {
@@ -283,8 +282,8 @@ describe("runGates / compareGates", () => {
       }
       expect(run.checks).toHaveLength(6);
       expect(run.checks[2]?.output).toContain("[redacted]");
-      expect(run.checks[4]?.failures).toContain("[redacted]");
-      expect(run.checks[4]?.failures).toContain("left out");
+      expect(run.checks[4]?.failures).toBeUndefined();
+      expect(run.checks[4]?.output).toContain("[redacted]");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -350,11 +349,11 @@ describe("runGates / compareGates", () => {
         expect(result.output).toContain("[redacted]");
         expect(result.output).not.toContain(credential.slice(-20));
       }
-      expect(run.checks[0]?.failures).toContain("error: credential [redacted]");
+      expect(run.checks[0]?.failures).toBeUndefined();
       expect(observed).toHaveLength(3);
       const retried = await retryBaselineFailures(run, dir, cfg, signal);
       expect(retried.checks[0]?.firstAttempt).toBe(run.checks[0]);
-      expect(retried.checks[0]?.failures).toContain("error: credential [redacted]");
+      expect(retried.checks[0]?.failures).toBeUndefined();
       const failed = run.checks[0];
       if (!failed) throw new Error("missing check result");
       const regression = await retryRegressions(
@@ -364,7 +363,7 @@ describe("runGates / compareGates", () => {
         [],
         signal,
       );
-      expect(regression[0]?.result.failures).toContain("error: credential [redacted]");
+      expect(regression[0]?.result.failures).toBeUndefined();
       for (const text of [...observed, JSON.stringify(retried), JSON.stringify(regression)]) {
         expect(text).not.toContain(credential);
         expect(text).not.toContain(credential.slice(-20));
@@ -416,7 +415,7 @@ describe("runGates / compareGates", () => {
         },
         new AbortController().signal,
       );
-      expect(run.checks[0]?.failures).toContain("[redacted]");
+      expect(run.checks[0]?.failures).toBeUndefined();
       expect(JSON.stringify(run)).not.toContain(credential);
       expect(JSON.stringify(run)).not.toContain(credential.slice(0, 12));
     } finally {
@@ -447,8 +446,8 @@ describe("runGates / compareGates", () => {
         },
         new AbortController().signal,
       );
-      expect(run.checks[0]?.output).toBe("error: [redacted]\n(fail) colored assertion");
-      expect(run.checks[0]?.failures).toBe("error: [redacted]\n(fail) colored assertion");
+      expect(run.checks[0]?.output).toBe("error: [redacted]\n(fail) colored assertion\n");
+      expect(run.checks[0]?.failures).toBeUndefined();
       const repo = store.upsertRepo({
         slug: "test/repo",
         kind: "github",
@@ -494,7 +493,7 @@ describe("runGates / compareGates", () => {
         new AbortController().signal,
       );
       expect(run.checks[0]?.ok).toBe(true);
-      expect(run.checks[0]?.output).toBe(`${expected}\nunset\n${expected}`);
+      expect(run.checks[0]?.output).toBe(`${expected}\nunset\n${expected}\n`);
     } finally {
       if (previous === undefined) delete process.env.LIMITLESS_TEST_WORKERS;
       else process.env.LIMITLESS_TEST_WORKERS = previous;
@@ -504,7 +503,7 @@ describe("runGates / compareGates", () => {
     }
   });
 
-  test("retains early failure diagnostics in the result and its existing artifact", async () => {
+  test("keeps the checked tail and omits early failure excerpts in stored artifacts", async () => {
     const output =
       "sample.test.ts:\n(pass) earlier\nerror: values differ\nExpected: 1\nReceived: 2\n(fail) assertion\n" +
       "skipped summary\n".repeat(7_000);
@@ -525,12 +524,10 @@ describe("runGates / compareGates", () => {
         new AbortController().signal,
       );
       expect(run.checks[0]?.ok).toBe(false);
-      expect(run.checks[0]?.output).toBe(output.trim().slice(-6_000));
+      expect(run.checks[0]?.output).toBe(output.slice(-6_000));
       expect(run.checks[0]?.output).not.toContain("error:");
-      expect(run.checks[0]?.failures).toContain("error: values differ\nExpected: 1\nReceived: 2");
-      expect(formatGateFeedback(compareGates(null, run))).toContain(
-        "error: values differ\nExpected: 1\nReceived: 2",
-      );
+      expect(run.checks[0]?.failures).toBeUndefined();
+      expect(formatGateFeedback(compareGates(null, run))).not.toContain("error: values differ");
       expect(run.checks[1]?.ok).toBe(true);
       expect(run.checks[1]).not.toHaveProperty("failures");
       const repo = store.upsertRepo({
@@ -544,8 +541,8 @@ describe("runGates / compareGates", () => {
       const savedRun = store.createRun(repo, { repo: repo.slug, prompt: "test" });
       store.putArtifact(savedRun.id, "gates.json", "gates", JSON.stringify(run));
       const saved = JSON.parse(store.getArtifact(savedRun.id, "gates.json") ?? "null") as GateRun;
-      expect(saved.checks[0]?.output).toBe(output.trim().slice(-6_000));
-      expect(saved.checks[0]?.failures).toContain("Expected: 1\nReceived: 2");
+      expect(saved.checks[0]?.output).toBe(output.slice(-6_000));
+      expect(saved.checks[0]?.failures).toBeUndefined();
       expect(store.listArtifacts(savedRun.id)).toHaveLength(1);
     } finally {
       store.close();
@@ -1158,7 +1155,7 @@ describe("gate slots and flaky retry", () => {
     const [c] = run.checks;
     // The failed re-run is the result; the first failure is kept alongside it.
     expect([c?.ok, c?.firstAttempt?.ok, runs]).toEqual([false, false, 2]);
-    expect([c?.output, c?.firstAttempt?.output]).toEqual(["attempt 2", "attempt 1"]);
+    expect([c?.output, c?.firstAttempt?.output]).toEqual(["attempt 2\n", "attempt 1\n"]);
     expect(compareGates(run, await runGates(dir, config("exit 1"), signal))[0]).toMatchObject({
       verdict: "still_failing",
       blocking: false,
@@ -2320,7 +2317,7 @@ test.each(["baseline", "regression"])("standalone %s retries own scratch per che
               signal,
             )
           ).map((c) => c.result);
-    expect(checks.map((r) => r.output)).toEqual(["false", "false"]);
+    expect(checks.map((r) => r.output)).toEqual(["false\n", "false\n"]);
     expect(checks.every((r) => r.ok)).toBe(true);
   } finally {
     rmSync(cwd, { recursive: true, force: true });

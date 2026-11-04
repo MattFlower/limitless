@@ -211,7 +211,8 @@ test.each([
     });
     expect(comparisons[0]?.result.output).toContain(original.output);
     expect(comparisons[0]?.result.output).toContain("Retry rejected:");
-    if (evidence === "dirty") expect(comparisons[0]?.result.output).toContain('["[redacted].txt"]');
+    if (evidence === "dirty")
+      expect(comparisons[0]?.result.output).toContain("tracked checkout cleanliness was not confirmed");
     expect(JSON.stringify(comparisons)).not.toContain(credential);
     const again = restore();
     const saved = again.state.postMergeGates?.result?.comparison;
@@ -464,7 +465,7 @@ test("a passing baseline retry that rewrites a tracked credential path retains t
     const retried = await retryBaselineFailures(original, cwd, cfg, signal);
     expect(retried.checks[0]).toMatchObject({ ok: false, exitCode: 1, firstAttempt: { ok: false } });
     expect(retried.checks[0]?.output).toContain("baseline-failure");
-    expect(retried.checks[0]?.output).toContain('tracked files changed: ["[redacted].txt"]');
+    expect(retried.checks[0]?.output).toContain("tracked checkout cleanliness was not confirmed");
     expect(retried.checks[0]?.output).not.toContain(credential);
     expect(compareGates(original, retried)[0]).toMatchObject({ verdict: "still_failing", blocking: false });
     expect(confinementFailed(retried.checks[0])).toBe(false);
@@ -502,7 +503,7 @@ test.each(["clean", "missing SHA", "missing cleanliness", "dirty", "mismatched S
     });
     if (scenario !== "clean") expect(retried.checks[0]?.output).toContain("Retry rejected:");
     if (scenario === "dirty")
-      expect(retried.checks[0]?.output).toContain('tracked files changed: ["remote.txt"]');
+      expect(retried.checks[0]?.output).toContain("tracked checkout cleanliness was not confirmed");
   },
 );
 
@@ -711,7 +712,7 @@ test.each([false, true])("setup-dependent retries remain flaky after restart (%s
   ).toMatchObject({
     verdict: "flaky",
     blocking: false,
-    firstAttempt: { output: "transient" },
+    firstAttempt: { output: "transient\n" },
   });
   expect(finished.store.getRunState<RunState>(run.id)?.round).toBe(0);
 });

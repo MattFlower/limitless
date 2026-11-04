@@ -381,7 +381,16 @@ export async function runSandboxed(
       `Write confinement payload did not start: ${result.stderr || result.exitCode}`,
     );
   }
-  return { ...result, stdout: result.stdout.replace(`${token}\n`, "") };
+  const prefix = `${token}\n`;
+  const capture = result.capture;
+  if (capture?.provenance.kind === "complete" && "stdout" in capture)
+    result.capture = capture.stdout.startsWith(prefix)
+      ? { ...capture, stdout: capture.stdout.slice(prefix.length) }
+      : { provenance: { kind: "legacy-unknown" } };
+  return {
+    ...result,
+    stdout: result.stdout.startsWith(prefix) ? result.stdout.slice(prefix.length) : result.stdout,
+  };
 }
 
 /**
