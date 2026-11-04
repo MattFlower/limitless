@@ -257,6 +257,51 @@ test.each(["pending", "none"])("construction: refuses %s before any transfer or 
   expect(f.remote.calls).toHaveLength(0);
 });
 
+test("construction: stored state advances during objects retrieval without splitting the snapshot", async () => {
+  const f = fixture();
+  f.commit(await f.build());
+  const entered = deferred<void>(),
+    release = deferred<void>(),
+    direct = f.remote.client();
+  f.gets.mockImplementation(async (...args) => {
+    if (args[1] === "objects") {
+      entered.resolve();
+      await release.promise;
+    }
+    return direct.get(...args);
+  });
+  const building = f.build();
+  try {
+    await entered.promise;
+    f.store.setRunState(f.run.id, { ...f.state(), phase: "deliver", round: 3 });
+    f.store.db
+      .query("UPDATE runs SET base_sha=?, head_sha=? WHERE id=?")
+      .run("c".repeat(40), "d".repeat(40), f.run.id);
+    release.resolve();
+    const c = await building,
+      m = manifestOf(c),
+      input = new Map<string, Uint8Array>();
+    expect(m).toMatchObject({
+      phase: "deliver",
+      round: 3,
+      baseSha: "c".repeat(40),
+      headSha: "d".repeat(40),
+    });
+    for (const ref of receiptDescriptors(m)) {
+      const role = ref.key === m.blobs.state.key ? "state" : "role" in ref ? String(ref.role) : "objects";
+      input.set(ref.key, await direct.get(f.run.id, role, ref));
+    }
+    await f.deps.transfer.importRun({ manifest: c.manifest, blobs: input }, f.controller.signal);
+    expect(readOfflineProjection(f.offline.db, f.run.id)).toMatchObject({
+      state: { phase: "deliver", round: 3 },
+      run: { baseSha: "c".repeat(40), headSha: "d".repeat(40) },
+    });
+  } finally {
+    release.resolve();
+    await building.catch(() => {});
+  }
+});
+
 test.each([false, true])("read-back: every get blocks resolution, reused=%s", async (reused) => {
   const f = fixture();
   if (reused) {
@@ -363,6 +408,23 @@ test.each(["digest", "artifact", "manifest"])("read-back: verification catches %
     });
   await expect(f.build()).rejects.toMatchObject(unavailable);
   expect(f.puts.mock.calls.some((c) => c[1] === "manifest")).toBe(fault === "manifest");
+});
+
+test("read-back: state with valid hashes but inconsistent manifest metadata refuses before manifest upload", async () => {
+  const f = fixture(),
+    original = f.deps.transfer.exportRun;
+  spyOn(f.deps.transfer, "exportRun").mockImplementation(async (...args) => {
+    const c = await original(...args),
+      m = manifestOf({ ...c, pointer: "", sequence: 1, commits: [] }),
+      bytes = encodeTransferJson({ ...c.payload, state: { ...c.payload.state, round: 3 } }),
+      blobs = new Map(c.blobs);
+    blobs.set(m.blobs.state.key, bytes);
+    m.blobs.state.digest = transferHash(bytes);
+    m.blobs.state.size = bytes.length;
+    return { ...c, blobs, manifest: formatManifest(m) };
+  });
+  await expect(f.build()).rejects.toMatchObject(unavailable);
+  expect(f.puts.mock.calls.some((c) => c[1] === "manifest")).toBe(false);
 });
 
 test("dedupe: unchanged objects/artifacts, one changed artifact and offline import", async () => {

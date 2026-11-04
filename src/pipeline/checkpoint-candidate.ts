@@ -13,6 +13,7 @@ import type { createRunTransfer } from "./run-transfer.ts";
 import { decodeRunArtifacts } from "./run-transfer-artifacts.ts";
 import { RunTransferError, type RunTransferErrorCode } from "./run-transfer-errors.ts";
 import { transferHash, verifyReceiptPayload } from "./run-transfer-integrity.ts";
+import { decodeRunPayload } from "./run-transfer-schema.ts";
 
 export type Candidate = { pointer: string; manifest: string; sequence: number; commits: string[] };
 export class CandidateRefused extends Error {
@@ -123,10 +124,7 @@ export async function buildCandidate(
       generation: handle.generation,
       sequence: (committed?.sequence ?? 0) + 1,
       previous: previous?.digest ?? null,
-      baseSha: current.baseSha,
-      headSha: current.headSha,
-      phase: state.phase,
-      round: state.round,
+      // Snapshot-dependent fields come from export, which may capture after the reuse read.
       createdBy: deps.member,
       effects: [],
       blobs: {
@@ -156,7 +154,9 @@ export async function buildCandidate(
     }
     const final = readManifest(manifest);
     try {
-      decodeRunArtifacts(final, readBack, verifyReceiptPayload(final, readBack));
+      const payload = verifyReceiptPayload(final, readBack);
+      decodeRunPayload(payload, repo, final);
+      decodeRunArtifacts(final, readBack, payload);
     } catch (error) {
       unavailable(error);
     }
