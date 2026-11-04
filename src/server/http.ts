@@ -13,7 +13,7 @@ import { computeProviderStatistics, computeStats } from "../db/stats.ts";
 import { IssueClaimed } from "../db/store.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
-import { redactGateData, redactGateOutput } from "../gates/output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
 import { ensureCache, fetchBase, resolveRepo } from "../git/repos.ts";
 import { type GhRunner, GITHUB_PREFACES, quotedJson, runGh } from "../integrations/github.ts";
@@ -66,16 +66,18 @@ export interface HttpExtras {
   ui?: Record<string, Blob>;
 }
 
-const serialize = (data: unknown) => JSON.stringify(redactGateData(data));
+const serialize = (data: unknown) => JSON.stringify(projectGateDiagnostics(data, { mode: "outward" }));
 const json = (data: unknown, status = 200) =>
   new Response(serialize(data), { status, headers: { "content-type": "application/json" } });
 
-function redactGateArtifact(content: string): string {
+function redactGateArtifact(content: string, kind = ""): string {
+  let data: unknown;
   try {
-    return serialize(JSON.parse(content));
+    data = JSON.parse(content);
   } catch {
-    return redactGateOutput(content);
+    return kind === "gates" ? "[withheld: unproven]" : redactGateOutput(content);
   }
+  return serialize(data);
 }
 
 const error = (message: string, status = 400) => json({ error: message }, status);
@@ -724,14 +726,14 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       );
     }),
     "/api/runs/:id/artifacts/:name": handle((req) => {
-      const content = store.getArtifact(req.params.id as string, req.params.name as string);
-      return content === null
+      const artifact = store.getArtifactRecord(req.params.id as string, req.params.name as string);
+      return artifact === null
         ? error("not found", 404)
-        : new Response(redactGateArtifact(content), {
+        : new Response(redactGateArtifact(artifact.content, artifact.kind), {
             headers: { "content-type": "text/plain; charset=utf-8" },
           });
     }),
-    "/api/runs/:id/stream": handle((req, server) => {
+    "/api/runs/:id/stream": handle(async (req, server) => {
       const runId = req.params.id as string;
       const after = Number(new URL(req.url).searchParams.get("after") ?? 0);
       const backlog: StreamMessage[] = [];
@@ -741,6 +743,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         const last = page.at(-1);
         if (!last || page.length < 2000) break;
         cursor = last.id;
+        await new Promise<void>((resolve) => setImmediate(resolve));
       }
       return sse(
         req,

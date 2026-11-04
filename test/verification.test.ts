@@ -25,6 +25,7 @@ import {
 import { blockedOnly, normalizeVerify, preDeliveryVerifyArtifact } from "../src/pipeline/verification.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { credentialGate, gateCredential } from "./gate-output-support.ts";
+import { provenResult } from "./privacy-support.ts";
 
 const spec: Spec = {
   summary: "test",
@@ -610,8 +611,13 @@ test("verifier leaves gate citations to the engine instead of rerunning whole su
     holdout,
     baseSha: "abc",
     checks: [
-      { name: "lint", verdict: "pass", blocking: false, result: result("lint", true) },
-      { name: "test", verdict: "still_failing", blocking: false, result: result("test", false) },
+      { name: "lint", verdict: "pass", blocking: false, result: await provenResult(result("lint", true)) },
+      {
+        name: "test",
+        verdict: "still_failing",
+        blocking: false,
+        result: await provenResult(result("test", false)),
+      },
       ...compareGates(null, await credentialGate()),
     ],
   });

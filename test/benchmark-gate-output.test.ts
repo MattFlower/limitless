@@ -627,7 +627,7 @@ test("consumer fixtures distinguish genuine, absent, refused and freshly invalid
         const jobs = await registry[name]?.(c);
         expect(jobs).toHaveLength(2);
         for (const job of jobs ?? []) {
-          expect(job[0]).toContain("baseline-equivalent");
+          expect(job[0]).toContain("projectGateDiagnostics");
           for (let trial = 0; trial < (name === "project-after-edit" ? 7 : 1); trial++) {
             observations.length = 0;
             await job[4]?.();
@@ -637,11 +637,11 @@ test("consumer fixtures distinguish genuine, absent, refused and freshly invalid
             ).toBe(true);
             observations.length = 0;
             const value = await job[2]?.();
-            expect(job[3](value)).toContain("50 released");
+            expect(job[3](value)).toContain(name === "project-proven" ? "50 released" : "50 withheld");
             expect(observations).toHaveLength(name === "project-after-edit" ? 50 : 0);
             expect(observations.every((v) => v === false)).toBe(true);
             if (name === "project-refused") expect(String(value)).toContain('"withheld":true');
-            if (name === "project-unproven") expect(String(value)).not.toContain('"textPrivacy"');
+            if (name === "project-unproven") expect(String(value)).toContain('"reason":"unproven"');
             expect(() => job[3](JSON.stringify({ lastGates: [] }))).toThrow("50 projected gates");
             const corrupt = JSON.parse(String(value));
             corrupt.lastGates[0].result.output = "wrong bytes";

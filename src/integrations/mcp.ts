@@ -20,7 +20,7 @@ import {
   validateFeedQuery,
   waitForFeed,
 } from "../feed.ts";
-import { redactGateData, redactGateOutput } from "../gates/output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
@@ -513,7 +513,9 @@ export function createMcpServer(backend: McpBackend): Server {
     try {
       const tool = tools.find((tool) => tool.name === params.name);
       if (!tool) throw new Error(`Unknown tool: ${params.name}`);
-      const result = redactGateData(await tool.execute(params.arguments ?? {}, signal, privacy));
+      const result = projectGateDiagnostics(await tool.execute(params.arguments ?? {}, signal, privacy), {
+        mode: "outward",
+      });
       const output = privacy
         ? privateOutputData(result, privacy)
         : params.name === "limitless_status"
