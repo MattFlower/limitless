@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { isTransient } from "../git/repos.ts";
+import { PACKAGED_UPGRADE, type Release, release } from "../release.ts";
 import { CommandError, redactCredentials, sh } from "../util/proc.ts";
 
 export class WorkerUpdateError extends Error {
@@ -16,12 +17,15 @@ export class WorkerUpdateError extends Error {
 export async function updateWorker(
   target: string,
   options: {
+    release?: Release;
     cwd?: string;
     command?: typeof sh;
     exec?: ((file: string, args: string[], env: NodeJS.ProcessEnv) => void) | null;
     signal?: AbortSignal;
   } = {},
 ) {
+  if ((options.release ?? release).kind === "packaged")
+    throw new WorkerUpdateError(`Packaged workers cannot self-update. ${PACKAGED_UPGRADE}`);
   const command = options.command ?? sh;
   const cwd = options.cwd ?? join(import.meta.dir, "../..");
   let stage = "validate";

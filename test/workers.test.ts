@@ -4021,6 +4021,97 @@ test("pre-deadline leases gain one durable deadline without extending it on late
   expect(resumed.job(id)?.attempt_deadline_at).toBe(expected);
 }, 30_000);
 
+test("packaged updater refuses directly without commands or process replacement", async () => {
+  const calls: string[] = [];
+  const error = await updateWorker("invalid-target", {
+    release: { kind: "packaged", version: "1.2.3", sha: releaseSha, bun: Bun.version },
+    command: async () => {
+      calls.push("command");
+      throw new Error("unexpected command");
+    },
+    exec: () => {
+      calls.push("exec");
+    },
+  }).catch((error: unknown) => error);
+  expect(error).toBeInstanceOf(WorkerUpdateError);
+  if (!(error instanceof WorkerUpdateError)) throw new Error("Missing update refusal");
+  expect(error.retryable).toBe(false);
+  expect(error.message).toContain("Packaged workers cannot self-update");
+  expect(error.message).toContain("brew upgrade limitless");
+  expect(error.message).toContain("limitless service install");
+  expect(calls).toEqual([]);
+});
+
+test.each(["a".repeat(40), undefined])(
+  "packaged worker heartbeats through coordinator release %s and recovers on match",
+  async (initial) => {
+    await listen();
+    let advertised: string | undefined = initial,
+      beats = 0,
+      leases = 0;
+    const warnings: string[] = [],
+      updates: string[] = [];
+    const gate = workers.enqueue({
+      repo: "test/repo",
+      cwd: home,
+      baseSha: releaseSha,
+      headSha: releaseSha,
+      gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+    });
+    const leased: string[] = [];
+    const clock = waitClock();
+    const worker = await loop({
+      release: { kind: "packaged", version: "1.2.3", sha: releaseSha, bun: Bun.version },
+      fenceTimer: clock.timer,
+      async request(...args) {
+        if (args[1] === "/worker/lease") leases++;
+        const reply = await workerRequest(...args);
+        if (args[1] === "/worker/lease") {
+          const body = reply.json() as { job: { id: string } | null };
+          if (body.job) {
+            leased.push(body.job.id);
+            workers.cancel(body.job.id);
+          }
+          return { ...reply, json: () => ({ job: null, agentJob: null }) };
+        }
+        if (args[1] !== "/worker/heartbeat") return reply;
+        beats++;
+        const body = args[2] as Capabilities;
+        if (body.updateWarning) warnings.push(body.updateWarning);
+        return {
+          ...reply,
+          json: () => ({ cancelled: [], ...(advertised ? { releaseSha: advertised } : {}) }),
+        };
+      },
+      update: {
+        command: async () => {
+          updates.push("command");
+          throw new Error("unexpected update");
+        },
+        exec: () => {
+          updates.push("exec");
+        },
+      },
+    });
+    try {
+      await until(() => beats >= 4);
+      expect(leases).toBe(0);
+      expect(workers.job(gate)?.state).toBe("queued");
+      expect(warnings.length).toBeGreaterThanOrEqual(2);
+      expect(warnings.at(-1)).toContain("matching coordinator release");
+      expect(warnings.at(-1)).toContain("Self-update is unavailable");
+      expect(warnings.at(-1)).toContain("brew upgrade limitless");
+      expect(warnings.at(-1)).toContain("limitless service install");
+      advertised = releaseSha;
+      await until(() => leased.includes(gate) && workers.list()[0]?.setupWarning === undefined);
+      expect(workers.list()[0]?.capabilities?.freeSlots).toBeGreaterThan(0);
+      expect(updates).toEqual([]);
+    } finally {
+      await worker.stop();
+    }
+  },
+);
+
 test("a release change drains reporting and cleanup and rejects an in-flight lease before re-exec", async () => {
   await listen();
   const req = await request(true);
@@ -4940,6 +5031,48 @@ const agentResult = (parentSha = releaseSha) => ({
   branch: "change/example",
 });
 const agentPath = (id: string, action: string) => `/worker/agent-jobs/${id}/${action}`;
+test.each(["sha", "bun", "unavailable", "matching"])(
+  "packaged worker parity preserves gate and agent eligibility: %s",
+  async (kind) => {
+    const info = { kind: "packaged", version: "1.2.3", sha: releaseSha, bun: Bun.version } as const;
+    workers = new WorkerStore(store, kind === "unavailable" ? undefined : info.sha, { poll: 0 });
+    await listen();
+    const token = await paired();
+    await call(
+      "/worker/heartbeat",
+      {
+        ...caps(),
+        releaseSha: kind === "sha" ? "a".repeat(40) : info.sha,
+        bunVersion: kind === "bun" ? "different" : info.bun,
+      },
+      token,
+    );
+    const gate = workers.enqueue({
+      repo: "test/repo",
+      cwd: home,
+      baseSha: releaseSha,
+      headSha: releaseSha,
+      gates: { setup: [], checks: [], source: "none", protectedPaths: [] },
+    });
+    const agent = enqueueAgent();
+    if (kind === "matching") {
+      expect((await call("/worker/lease", {}, token)).json()).toMatchObject({
+        job: { id: gate },
+        agentJob: null,
+      });
+      workers.cancel(gate);
+      expect((await call("/worker/lease", {}, token)).json()).toMatchObject({
+        job: null,
+        agentJob: { id: agent },
+      });
+    } else {
+      expect((await call("/worker/lease", {}, token)).json()).toEqual({ job: null, agentJob: null });
+      expect(workers.job(gate)?.state).toBe("queued");
+      expect(workers.agentJob(agent)?.state).toBe("queued");
+    }
+  },
+);
+
 const batches = (id: string) => workers.listAgentJobEvents(id);
 
 // Streaming requests exercise the byte limit and authorization across body-reading awaits.

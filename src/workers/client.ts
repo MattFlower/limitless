@@ -22,6 +22,7 @@ import { type ConfinementBackend, confinementScope, platformConfinement } from "
 import { removeScratch, restoreDirectoryPermissions, writeRoots } from "../harness/scratch.ts";
 import type { AgentEvent, AgentSpec, Harness } from "../harness/types.ts";
 import { prepareReaderCheckout, runToolAgent } from "../pipeline/agent-executor.ts";
+import { PACKAGED_UPGRADE, type Release, release as runtimeRelease } from "../release.ts";
 import { processPrivacy } from "../util/privacy-policy.ts";
 import { protectPrivateFile } from "../util/private-reads.ts";
 import {
@@ -259,6 +260,7 @@ async function runScopedWorker(
   releaseSha: string,
   signal: AbortSignal,
   options: {
+    release?: Release;
     privacy?: typeof processPrivacy;
     capabilityRunner?: CapabilityRunner;
     probeAgents?: typeof probeAgents;
@@ -278,6 +280,9 @@ async function runScopedWorker(
     updateRetry?: { initialMs?: number; maxMs?: number; deadlineMs?: number; now?: () => number };
   } = {},
 ) {
+  const info = options.release ?? runtimeRelease;
+  const packaged = info.kind === "packaged";
+  if (info.kind === "packaged") releaseSha = info.sha;
   const platform = options.platform ?? process.platform;
   if (!["darwin", "linux"].includes(platform) && !options.confinement)
     throw new Error("Workers require macOS Seatbelt or Linux bubblewrap and Landlock");
@@ -534,12 +539,20 @@ async function runScopedWorker(
       updating = false,
       restorationFailed = false;
     const now = options.updateRetry?.now ?? Date.now;
-    const updateBlocked = () => update !== undefined || updating || restorationFailed;
+    const updateBlocked = () =>
+      (packaged && observedRelease !== releaseSha) || update !== undefined || updating || restorationFailed;
     const observeRelease = (target: string | undefined) => {
       if (releaseObserved && target !== observedRelease) optionalFields = true;
       releaseObserved = true;
       observedRelease = target;
-      supportsUpdates = target !== undefined;
+      supportsUpdates = packaged || target !== undefined;
+      if (packaged) {
+        updateWarning =
+          target === releaseSha
+            ? undefined
+            : `Packaged worker requires a matching coordinator release (${target ?? "unavailable"}; worker ${releaseSha}). Self-update is unavailable. ${PACKAGED_UPGRADE}`;
+        return;
+      }
       if (target === undefined || target === update?.target) return;
       update?.controller.abort();
       update =
@@ -602,7 +615,7 @@ async function runScopedWorker(
         state = await (options.machineState ?? (() => machineState(platform)))();
       const body: Capabilities = {
         releaseSha,
-        bunVersion: Bun.version,
+        bunVersion: info.bun,
         os: platform === "linux" ? "linux" : "darwin",
         osVersion: release(),
         cpuCount: cpus().length,
@@ -1035,6 +1048,7 @@ async function runScopedWorker(
               try {
                 await updateWorker(episode.target, {
                   ...options.update,
+                  release: info,
                   signal: AbortSignal.any([
                     combined,
                     episode.controller.signal,
