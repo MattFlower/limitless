@@ -725,12 +725,8 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       );
     }),
     "/api/runs/:id/artifacts/:name": handle((req) => {
-      if (
-        store
-          .listArtifacts(req.params.id as string)
-          .some((a) => a.name === req.params.name && a.kind === "screenshot")
-      )
-        return error("not found", 404);
+      const row = store.listArtifacts(req.params.id as string).find((a) => a.name === req.params.name);
+      if (row?.kind === "screenshot") return error("not found", 404);
       const content = store.getArtifact(req.params.id as string, req.params.name as string);
       return content === null
         ? error("not found", 404)

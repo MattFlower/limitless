@@ -25,8 +25,10 @@ import { collectVerifierCaptures, forgetBrowserOutputs } from "../src/harness/ve
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { getChange } from "../src/integrations/mcp-change.ts";
 import { RunContext } from "../src/pipeline/context.ts";
+import { formatVerifyFeedback } from "../src/pipeline/prompts.ts";
 import { renderReportArtifacts } from "../src/pipeline/report.ts";
 import { encodeRunArtifacts, readTransferArtifacts } from "../src/pipeline/run-transfer-artifacts.ts";
+import { SpecSchema, VerifySchema } from "../src/pipeline/schemas.ts";
 import { sh } from "../src/util/proc.ts";
 import { browserSpec, fakeBrowserCache } from "./browser-mcp-support.ts";
 import { changeFixture, connect, fixture as factoryFixture, resultValue } from "./mcp-support.ts";
@@ -257,13 +259,44 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
         );
         output = server?.args[(server?.args.indexOf("--output-dir") ?? -1) + 1] ?? "";
         if (!output) throw new Error("No registered output");
-        writeFileSync(join(output, "private-viewport.png"), png);
+        writeFileSync(join(output, "fail"), png);
       }
-      return { text: "verified interactions" };
+      if (prompts.length > 1) return { text: "verified interactions" };
+      const evidence = `See private-viewport.png, private-customer-viewport.png, private capture.dat, ${output}, screenshot-1-0.png and /api/runs/${run.id}/screenshots/screenshot-1-0.png`;
+      return {
+        text: evidence,
+        structured: {
+          overall: "fail",
+          notes: evidence,
+          criteria: [{ id: "AC-1", status: "unmet", evidence, publicSummary: evidence }],
+        },
+        events: [
+          {
+            type: "tool_call",
+            id: "shot-a",
+            name: "mcp__playwright__browser_take_screenshot",
+            input: { filename: "private-customer-viewport.png", type: "png" },
+          },
+          {
+            type: "tool_result",
+            id: "shot-a",
+            output: `Saved ${output}/private-customer-viewport.png ${png.toString("base64")}`,
+            isError: false,
+          },
+          {
+            type: "tool_call",
+            id: "shot-b",
+            name: "playwright.browser_take_screenshot",
+            input: { filename: "private capture.dat", type: "png" },
+          },
+          { type: "tool_result", id: "shot-b", output: "Correlated opaque image response", isError: true },
+        ],
+      };
     });
     const ctx = new RunContext(f.factory.deps, run, repo, new AbortController().signal);
     ctx.state.slottedCommands = [];
     const stage = f.factory.store.startStage(run.id, "verify", 0);
+    let feedback = "Verify UI";
     const invoke = () =>
       ctx.invoke({
         role: "verify",
@@ -272,9 +305,24 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
         complexity: "small",
         constraints: { only: "fake/m" },
         cwd: f.repo,
-        prompt: "Verify UI",
+        prompt: feedback,
       });
-    await invoke();
+    const first = await invoke();
+    const verified = VerifySchema.parse(first.result.structured);
+    ctx.state.spec = SpecSchema.parse({
+      summary: "UI",
+      assumptions: [],
+      requirements: [],
+      out_of_scope: [],
+      blocking_questions: [],
+      acceptance_criteria: [{ id: "AC-1", criterion: "Works", how_to_verify: "Interact" }],
+    });
+    ctx.state.lastVerify = { ...verified, modelId: "fake/m" };
+    ctx.artifact("verify-0.json", "verify", JSON.stringify(verified));
+    feedback = formatVerifyFeedback(verified, ctx.state.spec);
+    expect(verified.criteria[0]?.status).toBe("unmet");
+    expect(verified.overall).toBe("fail");
+    expect(first.result.status).toBe("ok");
     const captures = f.factory.store.listArtifacts(run.id).filter((a) => a.kind === "screenshot");
     expect(captures).toHaveLength(1);
     expect(existsSync(scratch)).toBe(false);
@@ -304,6 +352,8 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
     expect(change).toMatchObject({ available: true });
     for (const text of [
       JSON.stringify(report),
+      f.factory.store.getArtifact(run.id, "verify-0.json") ?? "",
+      JSON.stringify(f.factory.store.listEvents(run.id)),
       JSON.stringify(change),
       JSON.stringify(detail),
       exported.map((b) => Buffer.from(b.bytes).toString()).join(""),
@@ -315,6 +365,9 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
         "/screenshots/",
         output,
         "private-viewport.png",
+        "private-customer-viewport.png",
+        "private capture.dat",
+        "Correlated opaque image response",
       ])
         expect(text).not.toContain(forbidden);
     }
