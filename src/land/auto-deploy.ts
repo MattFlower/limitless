@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Store } from "../db/store.ts";
+import { PACKAGED_UPGRADE, type Release, release } from "../release.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { completedDeployResult, type DeployJobStatus } from "./deploy-process.ts";
 
@@ -18,6 +19,7 @@ type DeployState = {
   pendingRemoval?: string[];
 };
 export interface AutoDeployDeps {
+  release?: Release;
   store: Store;
   afterLand: "off" | "when_idle";
   activeRunIds: () => readonly string[];
@@ -45,6 +47,11 @@ export class AutoDeploy {
 
   start(): void {
     if (this.deps.afterLand === "off" || this.stopped || this.interval !== undefined) return;
+    if ((this.deps.release ?? release).kind === "packaged") {
+      this.stopped = true;
+      this.deps.log(`Automatic deploy is unavailable in packaged mode. ${PACKAGED_UPGRADE}`);
+      return;
+    }
     this.interval = this.deps.timer.set(() => void this.tick(), 15_000);
     void this.tick();
   }
@@ -57,6 +64,7 @@ export class AutoDeploy {
   }
 
   async tick(): Promise<void> {
+    if ((this.deps.release ?? release).kind === "packaged") return;
     if (this.deps.afterLand === "off" || this.running || this.stopped) return;
     this.running = true;
     let pending: { completion: Promise<void> } | undefined;

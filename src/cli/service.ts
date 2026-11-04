@@ -15,7 +15,7 @@ import { homedir, userInfo } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { extractFailures } from "../gates/failures.ts";
 import { redactGateStreams } from "../gates/output.ts";
-import { type Release, release } from "../release.ts";
+import { PACKAGED_UPGRADE, type Release, release } from "../release.ts";
 import { sh } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import {
@@ -839,6 +839,7 @@ export async function deploy(
   ref = "origin/main",
   smoke = false,
   opts: {
+    release?: Release;
     executor?: boolean;
     leaseClient?: LeaseClient;
     lifecycle?: (run: typeof sh, race: <T>(work: Promise<T>) => Promise<T>) => Promise<void>;
@@ -855,6 +856,8 @@ export async function deploy(
     exit?: (code: number) => void;
   } = {},
 ): Promise<void> {
+  if ((opts.release ?? release).kind === "packaged" && !opts.lifecycle)
+    throw new Error(`Deploy is unavailable in packaged mode. ${PACKAGED_UPGRADE}`);
   const dir = opts.releaseDir ?? appDir;
   const command = opts.command ?? sh;
   const maxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
@@ -863,7 +866,7 @@ export async function deploy(
   const clock = opts.clock ?? deployClock;
   const restart = () => kickstart(opts);
   const log = opts.log ?? console.log;
-  const { run, race, interruption, signal, release } = serviceControl(opts, "deploy");
+  const { run, race, interruption, signal, release: unlock } = serviceControl(opts, "deploy");
   const lease = { client: opts.leaseClient ?? localLeaseClient(port), signal };
   const executor = executorControl({ ...opts, command: run });
   let intent: ExecutorIntent | undefined;
@@ -985,7 +988,7 @@ export async function deploy(
       { cause: error },
     );
   } finally {
-    release();
+    unlock();
   }
 }
 
@@ -1000,7 +1003,9 @@ export async function status(port: number, opts: ServiceOptions = {}, includeExe
       `${label}: ${result.state === "unknown" ? `unknown: ${result.reason}` : result.state === "loaded" ? "loaded" : "not loaded"} (${kind}${installKind ? `, ${installKind}` : ""})`,
     );
   }
-  if (existsSync(join(dir, ".git"))) {
+  const info = opts.release ?? release;
+  if (info.kind === "packaged") log(`release: ${info.version} ${info.sha}`);
+  else if (existsSync(join(dir, ".git"))) {
     // This release repository is written only by the user/deployer, never by an agent.
     const head = (await command(["git", "log", "-1", "--format=%h %s"], { cwd: dir })).stdout.trim();
     log(`release: ${head}`);
