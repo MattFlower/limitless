@@ -5,7 +5,7 @@ import { type Config, loadConfig } from "./config.ts";
 import { type ConfigReload, reloadedConfig } from "./config-reload.ts";
 import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { TERMINAL_STATUSES } from "./core/types.ts";
-import { type GitHubComment, Store } from "./db/store.ts";
+import { type GitHubComment, IssueClaimed, Store } from "./db/store.ts";
 import { WorkerStore } from "./db/workers.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
@@ -405,13 +405,22 @@ export class Factory {
       chat
         ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
         : this.store.createRun(repo, req, verifiedGitHubWebhook, admission, comment);
-    const run = sharedRepository(this.cfg, repo, repo.slug)
+    const result = sharedRepository(this.cfg, repo, repo.slug)
       ? this.store.transaction(() => {
-          const run = create();
+          let run: Run;
+          try {
+            run = create();
+          } catch (error) {
+            // An existing-claim refusal commits its comment record; an invalid pin rolls back the run.
+            if (error instanceof IssueClaimed) return error;
+            throw error;
+          }
           ensureAdmissionPin(this.store, this.cfg, run, repo);
           return run;
         })
       : create();
+    if (result instanceof IssueClaimed) throw result;
+    const run = result;
     this.store.addEvent({
       runId: run.id,
       type: "log",

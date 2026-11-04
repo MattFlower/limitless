@@ -1,7 +1,7 @@
 import { expect, mock, spyOn } from "bun:test";
 import type { Factory } from "../src/app.ts";
 import { exportPolicySelection } from "../src/db/portable-policies.ts";
-import { Store } from "../src/db/store.ts";
+import { IssueClaimed, Store } from "../src/db/store.ts";
 import { ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { bindClaim, claimScope } from "../src/integrations/claim-guard.ts";
 import { initialRunState, localCheckpointer, RunContext, type RunState } from "../src/pipeline/context.ts";
@@ -320,6 +320,23 @@ test("admission allowlists policy and rolls back a credential-bearing request", 
   expect(
     f.store.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM run_policy_selections").get()?.n,
   ).toBe(2);
+});
+
+test("shared admission keeps the refusal record of an existing issue claim", async () => {
+  const { f, repo } = await fixture();
+  const req = {
+    repo: repo.slug,
+    prompt: "Work",
+    sourceRef: { kind: "issue" as const, repo: repo.slug, number: 12 },
+  };
+  const claimed = await f.createRun(req);
+  const comment = { repo: repo.slug, id: 42 };
+  await expect(f.createRun(req, false, undefined, true, undefined, comment)).rejects.toBeInstanceOf(
+    IssueClaimed,
+  );
+  expect(f.store.githubCommentProcessed(comment)).toBe(true);
+  expect(f.store.listRuns().filter((r) => r.repoSlug === repo.slug)).toHaveLength(2);
+  expect(exportPolicySelection(f.store, claimed.id).version).toBe(1);
 });
 
 test("chat admission pins atomically with proposal consumption", async () => {
