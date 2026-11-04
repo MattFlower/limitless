@@ -24,9 +24,15 @@ mock.module("node:os", () => ({ ...nativeOs, homedir: () => home }));
 const requestedScenario = process.argv[2] ?? "migration";
 const sequential = requestedScenario.startsWith("sequence");
 const executorRecovery = requestedScenario.startsWith("executor-recovery");
-let scenario = sequential || executorRecovery ? "bootstrap" : requestedScenario;
+const crossKind = requestedScenario.startsWith("cross-");
+let scenario = crossKind
+  ? requestedScenario.replace(/^cross-(source|packaged)-/, "")
+  : sequential || executorRecovery
+    ? "bootstrap"
+    : requestedScenario;
 const kind = process.argv[3] ?? "daemon";
-const packaged = requestedScenario.startsWith("packaged-");
+const packaged = /^(cross-)?packaged-/.test(requestedScenario);
+const unitPackaged = crossKind ? !packaged : packaged;
 const destinationPreflight = requestedScenario.endsWith("-inspection-collision");
 const programCase = requestedScenario.split("-program-")[1];
 const agents = packaged ? join(home, "isolated-agents") : join(home, "Library", "LaunchAgents");
@@ -82,12 +88,14 @@ function parse(content: string) {
 }
 const args =
   kind === "daemon" || kind === "executor"
-    ? [
-        "/different/bin/bun",
-        ...(scenario === "bun-run" ? ["run"] : []),
-        join(plistApp, "src", "cli", "main.ts"),
-        kind === "executor" ? "executor" : "serve",
-      ]
+    ? crossKind && unitPackaged
+      ? [join(home, "bin", "limitless"), kind === "executor" ? "executor" : "serve"]
+      : [
+          "/different/bin/bun",
+          ...(scenario === "bun-run" ? ["run"] : []),
+          join(plistApp, "src", "cli", "main.ts"),
+          kind === "executor" ? "executor" : "serve",
+        ]
     : kind === "mtplx"
       ? [join(home, ".mtplx", "bin", "mtplx"), "serve", "--model", "old-model"]
       : [
@@ -110,7 +118,7 @@ const marker = ["marked", "contradictory"].includes(scenario)
   ? `<key>LimitlessService</key><string>${scenario === "contradictory" ? (kind === "daemon" ? "tunnel" : "daemon") : kind}</string>`
   : "";
 const old = `<plist><dict>${marker}<key>Label</key><string>${oldLabel}</string><key>WorkingDirectory</key><string>${xmlEscape(plistApp)}</string><key>ProgramArguments</key><array>${args.map((a) => `<string>${xmlEscape(a)}</string>`).join("")}</array></dict></plist>`;
-if (!packaged && !programCase && scenario !== "fresh" && !scenario.startsWith("recover")) {
+if ((!packaged || crossKind) && !programCase && scenario !== "fresh" && !scenario.startsWith("recover")) {
   writeFileSync(oldPath, old);
   if (scenario !== "unloaded") loaded.add(oldLabel);
 }
@@ -124,8 +132,18 @@ if (scenario === "persist-failure") {
 }
 if (scenario === "collision") loaded.add(neutral);
 if (scenario === "path-collision") writeFileSync(join(agents, `${neutral}.plist`), unrelated);
-if (scenario === "duplicate")
-  writeFileSync(join(agents, "duplicate.plist"), old.replace(oldLabel, "another.daemon"));
+if (scenario === "duplicate") {
+  const duplicateArgs = unitPackaged
+    ? ["/different/bin/bun", join(app, "src", "cli", "main.ts"), kind === "executor" ? "executor" : "serve"]
+    : [join(home, "bin", "limitless"), kind === "executor" ? "executor" : "serve"];
+  const duplicate = crossKind
+    ? old.replace(
+        /<array>.*?<\/array>/s,
+        `<array>${duplicateArgs.map((arg) => `<string>${xmlEscape(arg)}</string>`).join("")}</array>`,
+      )
+    : old;
+  writeFileSync(join(agents, "duplicate.plist"), duplicate.replace(oldLabel, "another.daemon"));
+}
 let time = 0;
 let draining = false;
 let stopping = "";
@@ -258,7 +276,7 @@ const command: typeof sh = async (argv) => {
       return ok("", 1, "old bootstrap failed");
     }
     if (disabled.has(data.Label ?? "")) return ok("", 1, "label disabled");
-    if (packaged && data.Label === neutral) {
+    if (packaged && !crossKind && data.Label === neutral) {
       packagedHealthReads = 0;
       if (failBootstrap) {
         failBootstrap = false;
@@ -356,7 +374,7 @@ const client: DeployClient = {
   },
   async health() {
     if (draining && time >= 5000) drainCompleted = true;
-    if (packaged) {
+    if (packaged && !crossKind) {
       const sha = !draining && (failHealth || packagedHealthReads++ === 0) ? "b".repeat(40) : "a".repeat(40);
       calls.push(`health ${draining ? "draining" : sha}`);
       return { ok: true, uptimeMs: 1, sha, draining, active: [] };
@@ -380,7 +398,7 @@ const client: DeployClient = {
     return {
       ok: true,
       uptimeMs: 1,
-      sha: "current",
+      sha: crossKind && packaged ? "a".repeat(40) : "current",
       draining,
       active: draining && (scenario === "timeout" || time < 5000) ? ["active-run"] : [],
     };
@@ -403,7 +421,7 @@ let tunnelJournal = "";
 let daemonOld = "";
 let firstCalls: string[] = [];
 let discovered: string[] = [];
-let discoveredUnits: { label: string; path: string; kind: string }[] = [];
+let discoveredUnits: Awaited<ReturnType<typeof service.installedUnits>> = [];
 let original = "";
 let stable = "";
 let executable = "";
@@ -416,11 +434,11 @@ const agentFiles = () =>
   Object.fromEntries(readdirSync(agents).map((name) => [name, readFileSync(join(agents, name), "utf8")]));
 try {
   if (programCase) {
-    executable = join(home, "bin", kind === "tunnel" ? "cloudflared" : packaged ? "limitless" : "bun");
+    executable = join(home, "bin", kind === "tunnel" ? "cloudflared" : unitPackaged ? "limitless" : "bun");
     mkdirSync(join(executable, ".."), { recursive: true });
     writeFileSync(executable, "executable");
     const unitArgs =
-      packaged && ["daemon", "executor"].includes(kind)
+      unitPackaged && ["daemon", "executor"].includes(kind)
         ? [executable, kind === "executor" ? "executor" : "serve"]
         : [...args];
     if (kind !== "mtplx") unitArgs[0] = executable;
@@ -443,7 +461,7 @@ try {
                   ? join(home, "missing-executable")
                   : other,
           )}</string>`;
-    const directory = packaged ? join(home, ".limitless") : app;
+    const directory = unitPackaged ? join(home, ".limitless") : app;
     mkdirSync(directory, { recursive: true });
     original = `<plist><dict>${programCase === "marker" ? "<key>LimitlessService</key><string>daemon</string>" : ""}<key>Label</key><string>${oldLabel}</string>${program}<key>WorkingDirectory</key><string>${xmlEscape(directory)}</string><key>ProgramArguments</key><array>${unitArgs.map((arg) => `<string>${xmlEscape(arg)}</string>`).join("")}</array></dict></plist>`;
     const path = join(agents, programCase === "collision" ? `${neutral}.plist` : `${kind}-original.plist`);
@@ -456,7 +474,7 @@ try {
       client,
       clock,
       agentsDir: agents,
-      execPath: executable,
+      execPath: crossKind ? join(home, "caller", packaged ? "limitless" : "bun") : executable,
       release: packaged
         ? { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version }
         : { kind: "source" as const, root: app, version: "1.0", bun: Bun.version },
@@ -464,6 +482,40 @@ try {
     discoveredUnits = await service.installedUnits(options);
     discovered = discoveredUnits.map((unit) => unit.kind);
     if (programCase === "collision") await service.install(0, options);
+  } else if (crossKind) {
+    executable = join(home, "bin", "limitless");
+    mkdirSync(join(executable, ".."), { recursive: true });
+    writeFileSync(executable, "binary");
+    const options = {
+      command,
+      client,
+      clock,
+      agentsDir: agents,
+      execPath: packaged ? executable : process.execPath,
+      release: packaged
+        ? { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version }
+        : { kind: "source" as const, root: app, version: "1.0", bun: Bun.version },
+      executor: scenario !== "unselected",
+    };
+    if (scenario.startsWith("recover")) {
+      await service.install(0, options);
+    } else if (["status", "inspection-status", "status-filtered"].includes(scenario)) {
+      discoveredUnits = await service.installedUnits(options);
+      await service.status(0, options, scenario !== "status-filtered");
+    } else {
+      // Exercise daemon drain and executor reconciliation together, with both old units opposite-kind.
+      const otherKind = kind === "daemon" ? "executor" : "daemon";
+      const other = old
+        .replaceAll(oldLabel, `arbitrary.installed.${otherKind}`)
+        .replace(
+          `<string>${kind === "daemon" ? "serve" : "executor"}</string>`,
+          `<string>${otherKind === "daemon" ? "serve" : "executor"}</string>`,
+        );
+      writeFileSync(join(agents, `${otherKind}-original.plist`), other);
+      loaded.add(`arbitrary.installed.${otherKind}`);
+      await service.install(0, options);
+      discoveredUnits = await service.installedUnits(options);
+    }
   } else if (destinationPreflight) {
     executable = join(home, "bin", "limitless");
     const options = {
