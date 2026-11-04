@@ -407,6 +407,25 @@ test("dashboard renders resolved list/filter and open needs-human count and rate
     expect(renderToString(() => withFixture(waiting))).toContain(
       "waiting for prerequisite-one, prerequisite-two to merge",
     );
+    for (const reason of ["claim:capability", "unavailable"]) {
+      const html = renderToString(() =>
+        RunsTable({
+          runs: [
+            { ...waiting, status: "queued", githubWait: { reason, since: 1, nextAttemptAt: 2, deadline: 3 } },
+          ],
+        }),
+      );
+      if (reason === "claim:capability") {
+        expect(html).toContain("waiting for a capable member since");
+        expect(html).toContain("next check");
+        expect(html).not.toContain("gives up");
+        expect(html).not.toContain("waiting for GitHub");
+      } else {
+        expect(html).toContain("waiting for GitHub since");
+        expect(html).toContain("next try");
+        expect(html).toContain("gives up");
+      }
+    }
     const blocked: Run = {
       ...waiting,
       status: "needs_human",

@@ -39,9 +39,10 @@ import { selectHarness } from "../harness/select.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
-import { ClaimControlError } from "../integrations/claim-errors.ts";
+import { ClaimControlError, ClaimWaitError } from "../integrations/claim-errors.ts";
 import { claimGuard } from "../integrations/claim-guard.ts";
 import type { GhRunner } from "../integrations/github.ts";
+import type { CapabilityGate, CapabilityRefusal } from "../integrations/member-eligibility.ts";
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
@@ -61,6 +62,7 @@ import { consumeGateExecution } from "./gate-execution.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { RunClaim } from "./run-claim.ts";
+import { requirePinnedPolicy } from "./run-policy-pins.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 import type { SizeReport } from "./size.ts";
@@ -85,6 +87,7 @@ export function localCheckpointer(store: Store): Checkpointer {
 
 export interface EngineDeps {
   runClaim?: RunClaim;
+  capability?: CapabilityGate;
   loadSource?: () => number;
   checkpointer?: Checkpointer;
   gateExecutor?: GateExecutor;
@@ -630,6 +633,39 @@ export class RunContext {
     if (this.signal.aborted) throw new CancelledError();
   }
 
+  async requireCapability(phase: Phase): Promise<void> {
+    if (!this.execution.shared) return;
+    let refused: CapabilityRefusal[] = ["stale"];
+    let control: ClaimControlError | undefined;
+    const { run, state, repo } = this;
+    const saved = state.implementer;
+    const implementer = saved && {
+      ref: { modelId: saved.targetId ?? saved.modelId, effort: saved.effort ?? null },
+      policyRevision: saved.policyRevision,
+    };
+    const task = { runId: run.id, phase, models: run.models, implementer, repo };
+    try {
+      refused = (await this.deps.capability?.canContinue(task, this.signal)) ?? refused;
+    } catch (error) {
+      if (error instanceof ClaimControlError) control = error;
+    }
+    if (this.termination) throw this.termination;
+    if (this.signal.aborted) throw new CancelledError();
+    if (control) throw control;
+    if (!refused.length) return;
+    this.log("Waiting for a capable member", "warn", { codes: refused });
+    throw new ClaimWaitError("capability");
+  }
+
+  requireCapabilityNow(): void {
+    if (!this.execution.shared) return;
+    if (this.termination) throw this.termination;
+    if (this.signal.aborted) throw new CancelledError();
+    if (this.execution.claim?.binding.capable?.()) return;
+    this.log("Waiting for a capable member", "warn", { codes: ["stale"] });
+    throw new ClaimWaitError("capability");
+  }
+
   /** Run a stage with bookkeeping; the callback returns a one-line summary. */
   async stage<T>(
     name: StageName,
@@ -663,6 +699,12 @@ export class RunContext {
     // Keep a round together when draining, even if no check checkpoint exists yet.
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
+    if (this.execution.shared) {
+      await this.requireCapability(this.state.phase);
+      this.requireCapabilityNow();
+      this.checkCancelled();
+      requirePinnedPolicy(this.deps.cfg, this.store, this.run, this.repo);
+    }
     if (!background)
       this.run = this.checkpointer.writeRun(this.run.id, {
         stage: this.parallelChecks && name === "verify" ? "review" : name,

@@ -3,7 +3,7 @@ import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs
 import { z } from "zod";
 import type { Config } from "../config.ts";
 import { redactCredentials, registerCredential, sh } from "../util/proc.ts";
-import { claimGuard } from "./claim-guard.ts";
+import { dispatchGuard } from "./claim-guard.ts";
 
 export type GitHubIdentity = { kind: "owner" } | { kind: "app"; token: string; botLogin: string };
 export class GitHubIdentityError extends Error {}
@@ -176,7 +176,7 @@ export async function githubSh(cmd: string[], opts: Parameters<typeof sh>[1], re
     ...opts,
     dispatchGuard: () => {
       suppliedGuard?.();
-      claimGuard();
+      dispatchGuard();
     },
   };
   const identity = await githubIdentity(repo ?? references[0]);

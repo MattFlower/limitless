@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AcceptancePass } from "../db/store.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
+import { ClaimControlError, rethrowClaimControl } from "../integrations/claim-errors.ts";
 import { runGh } from "../integrations/github.ts";
 import { githubIdentity } from "../integrations/github-identity.ts";
 import { lifecycleManaged } from "../integrations/issue-lifecycle.ts";
@@ -107,6 +108,7 @@ async function guarded<T>(ctx: RunContext, reason: (failure: string) => string, 
   try {
     return await fn();
   } catch (err) {
+    rethrowClaimControl(err);
     const interrupted = [NeedsHumanError, CancelledError, SimulatedTermination, InjectedFault].some(
       (type) => err instanceof type,
     );
@@ -183,7 +185,12 @@ export async function fileFollowUps(
         }
         const comment = posted ? "done" : ctx.store.claimAcceptanceLimit(repo, epic, ctx.run.id);
         if (!posted && comment === "claimed") {
-          await api([`repos/${repo}/issues/${epic}/comments`, "-X", "POST", "-f", `body=${body}`]);
+          try {
+            await api([`repos/${repo}/issues/${epic}/comments`, "-X", "POST", "-f", `body=${body}`]);
+          } catch (error) {
+            if (error instanceof ClaimControlError) ctx.store.releaseAcceptanceLimit(repo, epic);
+            throw error;
+          }
           posted = true;
         }
         if (posted) ctx.store.finishAcceptanceLimit(repo, epic, ctx.run.id);
@@ -303,7 +310,12 @@ export async function fileFollowUps(
       if (!move(item, ["pending"], { state: "requested" })) continue;
       const args = ["-f", `repo=${listing.id}`, "-f", `parent=${listing.epic.id}`, "-f", `title=${title}`];
       const created = Created.parse(
-        await api(["graphql", "-f", `query=${CREATE}`, ...args, "-f", `body=${body}`]),
+        await api(["graphql", "-f", `query=${CREATE}`, ...args, "-f", `body=${body}`]).catch(
+          (error: unknown) => {
+            if (error instanceof ClaimControlError) move(item, ["requested"], { state: "pending" });
+            throw error;
+          },
+        ),
       ).data.createIssue.issue;
       move(item, ["requested"], { state: "filed", issue: created.number });
       ids.set(created.number, created.id);

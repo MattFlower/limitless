@@ -3,7 +3,7 @@ import type { Store } from "../db/store.ts";
 import { githubWait } from "../git/github-wait.ts";
 import { ClaimLostError, type ClaimWaitError } from "../integrations/claim-errors.ts";
 import { finalizeRecordedCancellation } from "./cancellation.ts";
-import { localCheckpointer, type RunState } from "./context.ts";
+import { initialRunState, localCheckpointer, type RunState } from "./context.ts";
 
 /** Stop this execution locally, without publishing a shared cancellation or checkpoint. */
 export function mapClaimInterruption(
@@ -24,7 +24,7 @@ export function mapClaimInterruption(
     if (finalizeRecordedCancellation(store, runId, localCheckpointer(store))) return;
     const run = store.getRun(runId);
     if (!run || TERMINAL_STATUSES.includes(run.status)) return;
-    const state = store.getRunState<Partial<RunState>>(runId) ?? {};
+    const state = store.getRunState<Partial<RunState>>(runId) ?? initialRunState(run);
     state.githubWait = lost
       ? undefined
       : {

@@ -47,8 +47,9 @@ export const RunsTable: Component<{ runs: Run[] }> = (props) => {
                   <Show when={run.status === "queued" && run.githubWait}>
                     {(wait) => (
                       <div class="text-dim">
-                        waiting for GitHub since {formatDateTime(wait().since)}; next try{" "}
-                        {formatDateTime(wait().nextAttemptAt)}; gives up {formatDateTime(wait().deadline)}
+                        {wait().reason === "claim:capability"
+                          ? `waiting for a capable member since ${formatDateTime(wait().since)}; next check ${formatDateTime(wait().nextAttemptAt)}`
+                          : `waiting for GitHub since ${formatDateTime(wait().since)}; next try ${formatDateTime(wait().nextAttemptAt)}; gives up ${formatDateTime(wait().deadline)}`}
                       </div>
                     )}
                   </Show>

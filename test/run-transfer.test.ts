@@ -774,3 +774,78 @@ test("isolation construction does no IO, rejects database aliases and leaves pro
   expect(api.target.db.query("SELECT * FROM agent_jobs").all()).toEqual([]);
   expect(api.target.db.query("SELECT * FROM run_transfer_receipts").all()).toHaveLength(1);
 });
+
+test.each(["reuse", "commits", "digest", "size"] as const)(
+  "bundle construction %s always validates",
+  async (mode) => {
+    const f = source(),
+      api = facade(f);
+    const first = await api.exportRun(f.runId, repository, signal());
+    const m = parseManifest(first.manifest);
+    if (typeof m !== "object" || !("runId" in m)) throw new Error("Invalid fixture manifest");
+    const objects = m.blobs.objects[0];
+    if (!objects) throw new Error("Missing objects");
+    const bytes = first.blobs.get(objects.key);
+    if (!bytes) throw new Error("Missing bundle");
+    const reuse = { commits: [...first.payload.commits].reverse(), objects: { ...objects }, bytes };
+    if (mode === "commits") reuse.commits = ["f".repeat(40)];
+    if (mode === "digest") reuse.objects.digest = "0".repeat(64);
+    if (mode === "size") reuse.objects.size++;
+    const exported = spyOn(api.deps.objects, "export"),
+      validated = spyOn(api.deps.objects, "validate");
+    exported.mockClear();
+    validated.mockClear();
+    const second = await api.exportRun(f.runId, repository, signal(), reuse);
+    expect(exported).toHaveBeenCalledTimes(mode === "reuse" ? 0 : 1);
+    expect(validated).toHaveBeenCalledTimes(1);
+    if (mode === "reuse") {
+      const manifest = parseManifest(second.manifest);
+      if (typeof manifest !== "object" || !("runId" in manifest)) throw new Error("Invalid fixture manifest");
+      expect(manifest.blobs.objects).toEqual([objects]);
+      expect(second.blobs.get(objects.key)).toEqual(bytes);
+    }
+  },
+);
+
+test("without an offline target export works and import conflicts without writes", async () => {
+  const f = source(),
+    api = facade(f);
+  const { offline: _offline, ...deps } = api.deps;
+  const transfer = createRunTransfer(deps);
+  const c = await transfer.exportRun(f.runId, repository, signal());
+  const before = snapshot(f.s);
+  await rejected(transfer.importRun(c, signal()), "conflict");
+  expect(snapshot(f.s)).toEqual(before);
+});
+
+test("reused bytes are reinspected after a credential is registered", async () => {
+  const f = source(),
+    api = facade(f);
+  api.deps.objects.validate = mock(async (input, inspect) => {
+    await inspect({
+      ...reader,
+      async read() {
+        return input.bytes;
+      },
+    });
+  });
+  const first = await api.exportRun(f.runId, repository, signal());
+  const m = parseManifest(first.manifest);
+  if (typeof m !== "object" || !("runId" in m)) throw new Error("Invalid fixture manifest");
+  const objects = m.blobs.objects[0],
+    exported = spyOn(api.deps.objects, "export");
+  if (!objects) throw new Error("Missing objects");
+  const bytes = first.blobs.get(objects.key);
+  if (!bytes) throw new Error("Missing bytes");
+  const credential = `refs/limitless-run-objects/${f.runId}/${sha}`;
+  expect(new TextDecoder().decode(bytes)).toContain(credential);
+  exported.mockClear();
+  (api.deps.objects.validate as ReturnType<typeof mock>).mockClear();
+  registerCredential("REUSED_BUNDLE_TEST", credential);
+  await rejected(
+    api.exportRun(f.runId, repository, signal(), { commits: first.payload.commits, objects, bytes }),
+    "invalid",
+  );
+  expect(exported).not.toHaveBeenCalled();
+  expect(api.deps.objects.validate).toHaveBeenCalledTimes(1);
+});

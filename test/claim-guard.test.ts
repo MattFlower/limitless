@@ -12,6 +12,7 @@ import {
   bindClaim,
   claimGuard,
   claimScope,
+  dispatchGuard,
   hasClaimScope,
   type ScopedClaim,
 } from "../src/integrations/claim-guard.ts";
@@ -516,6 +517,7 @@ test("source boundaries restrict claim scopes to execution, observer validation 
         "src/integrations/github-poller.ts",
         "src/git/repos.ts",
         "src/pipeline/context.ts",
+        "src/pipeline/run-policy-pins.ts",
         observer,
         execution,
         engine,
@@ -550,4 +552,48 @@ test("claim rejection selection preserves identity, priority and input-order tie
   expect(selectClaimControl([ordinary, null, undefined])).toBeUndefined();
   expect(selectClaimControl([wait, new ClaimWaitError("cancelled")])).toBe(wait);
   expect(selectClaimControl([loss, new ClaimLostError()])).toBe(loss);
+});
+
+test("dispatch capability composes every scope after plain claim checks", () => {
+  expect(dispatchGuard).not.toThrow();
+  for (const result of [false, undefined, 1, "true"]) {
+    const capable = mock(() => result as boolean);
+    const binding = { ...stub(), capable };
+    claimScope.run([binding], () => {
+      expect(claimGuard).not.toThrow();
+      wait(dispatchGuard, "capability");
+    });
+    expect(capable).toHaveBeenCalledTimes(1);
+  }
+  const capable = mock(() => true);
+  claimScope.run([stub(), { ...stub(), capable }], () => expect(dispatchGuard).not.toThrow());
+  claimScope.run(
+    [
+      { ...stub(), capable },
+      { ...stub(), capable: () => false },
+    ],
+    () => wait(dispatchGuard, "capability"),
+  );
+  capable.mockClear();
+  claimScope.run([{ ...stub(() => false), capable }], () => wait(dispatchGuard, "lease"));
+  expect(capable).not.toHaveBeenCalled();
+});
+
+test("dispatch preserves claim-control identity and hides ordinary capability failures", () => {
+  for (const error of [
+    new ClaimLostError(),
+    new ClaimWaitError("lease"),
+    new CustomControl(),
+    new Error("probe detail"),
+  ]) {
+    const binding = {
+      ...stub(),
+      capable: () => {
+        throw error;
+      },
+    };
+    const result = caught(() => claimScope.run([binding], dispatchGuard));
+    if (error instanceof ClaimControlError) expect(result).toBe(error);
+    else expect(result).toEqual(new ClaimWaitError("capability"));
+  }
 });

@@ -1,3 +1,4 @@
+import { type RunStatus, TERMINAL_STATUSES } from "../core/types.ts";
 import { ISSUE_CLAIM_STATUSES, type Store } from "../db/store.ts";
 import { type ClockSource, LEASE, windowOpen } from "../util/claim-clock.ts";
 import { claimScope } from "./claim-guard.ts";
@@ -18,10 +19,11 @@ export type LeaseHandle = Readonly<
 export type LeaseWant = Pick<ClaimRecord, "kind" | "number" | "run" | "status" | "checkpoint">;
 export type AcquireResult =
   | { kind: "held"; handle: LeaseHandle; tip: ClaimTip }
-  | { kind: "refused"; reason: "live" | "malformed"; tip?: ClaimTip }
+  | { kind: "refused"; reason: "live" | "malformed" | "terminal"; tip?: ClaimTip }
   | { kind: "superseded"; tip: ClaimTip }
   | { kind: "wait"; reason: string };
 type Patch = Partial<Pick<ClaimRecord, "status" | "checkpoint">>;
+type Expect = { expect?: { checkpoint: string | null } };
 type Hooks = { active(h: LeaseHandle): boolean; onLost(h: LeaseHandle, tip: ClaimTip | null): void };
 export interface LeaseManager {
   acquire(
@@ -31,8 +33,13 @@ export interface LeaseManager {
     opts: { takeover: boolean },
     signal?: AbortSignal,
   ): Promise<AcquireResult>;
-  update(h: LeaseHandle, patch: Patch): Promise<"applied" | "wait" | "lost" | "obsolete">;
-  release(h: LeaseHandle, patch?: Patch): Promise<"released" | "wait" | "lost" | "obsolete">;
+  update(
+    h: LeaseHandle,
+    patch: Patch,
+    opts?: Expect,
+  ): Promise<"applied" | "wait" | "lost" | "obsolete" | "mismatch">;
+  release(h: LeaseHandle, patch?: { status?: RunStatus }): Promise<"released" | "wait" | "lost" | "obsolete">;
+  settle(repo: string, ref: string): Promise<"settled" | "pending">;
   windowOpen(h: LeaseHandle): boolean;
   start(hooks: Hooks): () => void;
 }
@@ -84,9 +91,9 @@ export async function createLeaseManager(deps: {
     if (!current(h) || a?.tip !== store.leaseRow(h.repo, h.ref)?.confirmed?.tip) return false;
     return windowOpen(a?.anchor ?? null, clock.sample());
   }
-  async function reconcile(repo: string, ref: string, signal?: AbortSignal) {
+  async function reconcile(repo: string, ref: string, signal?: AbortSignal, observe = false) {
     const row = store.leaseRow(repo, ref);
-    const result = await reconcileLeaseIntent({ client, store, signal }, repo, ref);
+    const result = await reconcileLeaseIntent({ client, store, signal, observe }, repo, ref);
     if (result === "superseded") lose(row, null);
     if (result === "dropped" && !store.leaseRow(repo, ref)?.confirmed) store.forgetLease(repo, ref);
     return result;
@@ -98,8 +105,8 @@ export async function createLeaseManager(deps: {
     ref: string,
     want: LeaseWant,
     takeover: boolean,
-    options: { h?: LeaseHandle; patch?: Patch; release?: boolean; signal?: AbortSignal } = {},
-  ): Promise<AcquireResult | "obsolete" | "lost"> {
+    options: { h?: LeaseHandle; patch?: Patch; release?: boolean; signal?: AbortSignal } & Expect = {},
+  ): Promise<AcquireResult | "obsolete" | "lost" | "mismatch"> {
     const { h, patch = {}, release = false, signal } = options;
     const revocation = anchors.get(key(repo, ref))?.revocation;
     return locked(repo, ref, async () => {
@@ -118,6 +125,8 @@ export async function createLeaseManager(deps: {
         const tip = read.kind === "tip" ? read.tip : null;
         if (tip?.record === "malformed") return { kind: "refused", reason: "malformed", tip };
         const r = tip?.record;
+        if (!h && r?.run === want.run && TERMINAL_STATUSES.includes(r.status))
+          return { kind: "refused", reason: "terminal", tip: tip ?? undefined };
         let confirmed = row?.runId === want.run ? row.confirmed : null;
         if (mine) confirmed = { generation: mine, tip: "", state: "held" };
         const owns = (v: ClaimRecord) => v.holder === member && v.run === want.run;
@@ -134,6 +143,7 @@ export async function createLeaseManager(deps: {
         if (r && r.run !== want.run && (r.state === "held" || ISSUE_CLAIM_STATUSES.includes(r.status)))
           return { ...refused, tip: tip ?? undefined };
         let same = !!own && r?.state === "held" && confirmed?.state === "held";
+        if (options.expect && (r?.checkpoint ?? null) !== options.expect.checkpoint) return "mismatch";
         const anchor = anchors.get(key(repo, ref));
         const a = anchor?.tip === tip?.sha ? (anchor?.anchor ?? null) : null;
         let sample: GithubTimeSample | null = null;
@@ -214,11 +224,11 @@ export async function createLeaseManager(deps: {
       return wait;
     });
   }
-  async function mutate(h: LeaseHandle, patch: Patch, release = false) {
+  async function mutate(h: LeaseHandle, patch: Patch, release = false, opts?: Expect) {
     if (release && current(h))
       anchors.set(key(h.repo, h.ref), { tip: "", anchor: null, revocation: Symbol() });
     const want: LeaseWant = { kind: "run", run: h.run, status: "running" };
-    const result = await operate(canonicalRepo(h.repo), h.ref, want, false, { h, patch, release });
+    const result = await operate(canonicalRepo(h.repo), h.ref, want, false, { h, patch, release, ...opts });
     if (typeof result === "string") return result;
     if (result.kind === "superseded") return "lost";
     return result.kind === "held" ? "applied" : "wait";
@@ -228,10 +238,16 @@ export async function createLeaseManager(deps: {
       const result = await operate(canonicalRepo(repo), ref, want, opts.takeover, { signal });
       return typeof result === "string" ? refused : result;
     },
-    update: (h, patch) => mutate(h, patch),
+    update: (h, patch, opts) => mutate(h, patch, false, opts),
     async release(h, patch = {}) {
-      const result = await mutate(h, patch, true);
-      return result === "applied" ? "released" : result;
+      const result = await mutate(h, patch.status === undefined ? {} : { status: patch.status }, true);
+      return result === "applied" ? "released" : result === "mismatch" ? "wait" : result;
+    },
+    async settle(repo, ref) {
+      repo = canonicalRepo(repo);
+      return locked(repo, ref, async () =>
+        (await reconcile(repo, ref, undefined, true)) === "pending" ? "pending" : "settled",
+      );
     },
     windowOpen: open,
     start(next) {
@@ -257,6 +273,7 @@ export async function createLeaseManager(deps: {
     acquire: (...args) => claimScope.exit(() => manager.acquire(...args)),
     update: (...args) => claimScope.exit(() => manager.update(...args)),
     release: (...args) => claimScope.exit(() => manager.release(...args)),
+    settle: (...args) => claimScope.exit(() => manager.settle(...args)),
     start: (...args) => claimScope.exit(() => manager.start(...args)),
   };
 }

@@ -181,6 +181,7 @@ import { savedReviewSample, saveReviewSample } from "./review-samples.ts";
 import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import { bindRunClaim, type RunClaim, renewRunClaim, sharedRepository } from "./run-claim.ts";
+import { pinPolicy, requirePinnedPolicy } from "./run-policy-pins.ts";
 import { implementerView } from "./run-transfer-roles.ts";
 import {
   type Holdout,
@@ -217,7 +218,18 @@ const ROUNDS_PER_IMPLEMENTER = 2;
 class ReaderSetupError extends NeedsHumanError {}
 
 /** Execute (or resume) one run to completion. Never throws. */
-export async function executeRun(
+export async function executeRun(...args: Parameters<typeof executeRunOnce>): Promise<RunStatus> {
+  const [{ store, cfg, capability }, runId] = args;
+  const run = store.getRun(runId);
+  const shared = run && sharedRepository(cfg, store.getRepo(run.repoId) ?? { kind: "github" }, run.repoSlug);
+  try {
+    return await executeRunOnce(...args);
+  } finally {
+    if (shared) capability?.forget(runId);
+  }
+}
+
+async function executeRunOnce(
   deps: EngineDeps,
   runId: string,
   signal: AbortSignal,
@@ -233,13 +245,24 @@ export async function executeRun(
     checkpointer.writeRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const shared = sharedRepository(deps.cfg, repo, run.repoSlug);
+  const configuredShared = sharedRepository(deps.cfg, repo, run.repoSlug);
+  const shared =
+    configuredShared ||
+    !!deps.store.db.query("SELECT 1 FROM run_policy_selections WHERE run_id = ?").get(runId);
+  if (shared && !configuredShared) {
+    checkpointer.writeRun(runId, {
+      status: "needs_human",
+      error: "shared run policy changed",
+      finishedAt: Date.now(),
+    });
+    return "needs_human";
+  }
   let claim: RunClaim | undefined;
   let error: unknown;
   if (shared) {
     try {
       const authority = deps.runClaim;
-      claim = bindRunClaim(run, deps.store, authority);
+      claim = bindRunClaim(run, deps.store, authority, deps.capability);
     } catch (caught) {
       error = selectClaimControl([caught]) ?? new ClaimWaitError("unavailable");
     }
@@ -287,7 +310,8 @@ export async function executeRun(
   return status;
 }
 
-function executionInterruption(ctx: RunContext, error: unknown) {
+function executionInterruption(ctx: RunContext, error: unknown, signal: AbortSignal) {
+  if (ctx.execution.shared && (error instanceof CancelledError || signal.aborted)) return;
   let probe: unknown;
   try {
     if (ctx.execution.shared) claimGuard();
@@ -332,8 +356,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (ctx.execution.shared) {
       await recoverScopedProcesses();
       if (!ctx.execution.claim) throw ctx.execution.error ?? new ClaimWaitError("unavailable");
+      await ctx.requireCapability(ctx.state.phase);
+      ctx.requireCapabilityNow();
       await renewRunClaim(ctx.execution.claim);
       claimGuard();
+      requirePinnedPolicy(deps.cfg, ctx.store, run, ctx.repo);
     }
     if (ctx.execution.shared) startRun(ctx);
     if (!ctx.execution.shared) await recoverScopedProcesses();
@@ -418,7 +445,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log("Run succeeded");
     return "succeeded";
   } catch (e) {
-    const control = executionInterruption(ctx, e);
+    const control = executionInterruption(ctx, e, signal);
     if (control) {
       mapClaimInterruption(deps.store, runId, control);
       return deps.store.getRun(runId)?.status ?? "failed";
@@ -467,7 +494,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
       const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
       if (!shutdown) clearGitHubWait(ctx.state);
-      ctx.checkpointer.writeRun(
+      // Terminal local cancellation reporting does not require an open lease window.
+      (ctx.execution.shared && !shutdown ? localCheckpointer(deps.store) : ctx.checkpointer).writeRun(
         runId,
         {
           status,
@@ -578,7 +606,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         );
         if (ctx.execution.shared) claimGuard();
       } catch (err) {
-        const control = executionInterruption(ctx, err);
+        const control = executionInterruption(ctx, err, signal);
         if (control) {
           mapClaimInterruption(deps.store, runId, control);
           return deps.store.getRun(runId)?.status ?? "failed";
@@ -615,7 +643,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         await deliver(ctx, false);
         if (ctx.execution.shared) claimGuard();
       } catch (err) {
-        const control = executionInterruption(ctx, err);
+        const control = executionInterruption(ctx, err, signal);
         if (control) {
           mapClaimInterruption(deps.store, runId, control);
           return deps.store.getRun(runId)?.status ?? "failed";
@@ -794,6 +822,8 @@ async function prepare(ctx: RunContext): Promise<void> {
           `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
         ),
       );
+      if (ctx.execution.shared)
+        pinPolicy(ctx.store, ctx.run.id, ctx.state, { kind: "prepared", trustedBase: trustedSha });
       await ctx.save();
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
@@ -1552,7 +1582,8 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           mode: "edit",
           complexity: ctx.complexity,
           constraints,
-          ...(!merge &&
+          ...(!ctx.execution.shared &&
+          !merge &&
           !reviewRound(ctx) &&
           !ctx.run.deliveryBranch &&
           !ctx.run.prUrl &&
@@ -2121,6 +2152,8 @@ async function oneRound(
       ({ system, panelReview, panelRules } = reviewSettings());
       if (ctx.state.reviewMode === undefined) {
         ctx.state.reviewMode = system.mode;
+        if (ctx.execution.shared)
+          pinPolicy(ctx.store, ctx.run.id, ctx.state, { kind: "review-finalized", mode: system.mode });
         await ctx.save();
       }
       const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
@@ -3672,6 +3705,8 @@ async function mergeForDelivery(
     await readFileAt(cwd, fetched, "package.json"),
     gateScriptNames(ctx.state.gatesConfig as GateConfig),
   );
+  if (ctx.execution.shared)
+    pinPolicy(ctx.store, ctx.run.id, ctx.state, { kind: "scripts-refreshed", scriptSource: fetched });
   if (!ctx.state.pendingRebaseSha) {
     ctx.state.pendingRebaseSha = fetched;
     ctx.state.postMergeGates = undefined;
