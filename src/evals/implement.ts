@@ -233,7 +233,7 @@ export async function gradeImplement(
       ...prepared.baseline.checks,
       ...after.setup,
       ...after.checks,
-    ].some((g) => g.output.startsWith("[timed out]"));
+    ].some((g) => g.timedOut);
     if (gateTimeout) evidence.reason = "timeout";
     injectHiddenFiles(checkout, files);
     const grading = checkout;
