@@ -30,6 +30,8 @@ import { type AcceptanceSnapshot, resolveIntent } from "./pipeline/acceptance.ts
 import type { EngineDeps, RunState } from "./pipeline/context.ts";
 import { lanAgentExecutor } from "./pipeline/lan-agent.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
+import { sharedRepository } from "./pipeline/run-claim.ts";
+import { ensureAdmissionPin } from "./pipeline/run-policy-pins.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
 import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
@@ -399,9 +401,17 @@ export class Factory {
         ),
       };
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
-    const run = chat
-      ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
-      : this.store.createRun(repo, req, verifiedGitHubWebhook, admission, comment);
+    const create = () =>
+      chat
+        ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
+        : this.store.createRun(repo, req, verifiedGitHubWebhook, admission, comment);
+    const run = sharedRepository(this.cfg, repo, repo.slug)
+      ? this.store.transaction(() => {
+          const run = create();
+          ensureAdmissionPin(this.store, this.cfg, run, repo);
+          return run;
+        })
+      : create();
     this.store.addEvent({
       runId: run.id,
       type: "log",

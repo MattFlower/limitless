@@ -80,7 +80,7 @@ function authority(run: Run) {
   };
 }
 const signal = () => new AbortController().signal;
-async function fixture(publication = false) {
+async function fixture(publication = false, mergePolicy: "auto" | "pr" = "pr") {
   const bare = publication ? await githubFixture() : "unused";
   const f = start((s) =>
     roleOf(s) === "triage"
@@ -92,6 +92,9 @@ async function fixture(publication = false) {
   await f.stop();
   registerGithub(f, bare);
   shared(f);
+  const repo = f.store.getRepoBySlug("test/repo");
+  if (!repo) throw new Error("Missing repo");
+  f.store.upsertRepo({ ...repo, mergePolicy });
   const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
   return { f, run, claim: authority(run) };
 }
@@ -296,11 +299,8 @@ test.each(["prepare", "triage", "deliver"] as const)(
 test.each([false, true])(
   "auto delivery captures shared=%s and preserves older local resume",
   async (claimed) => {
-    const { f, run, claim } = await fixture(true);
+    const { f, run, claim } = await fixture(true, "auto");
     shared(f, claimed);
-    const repo = f.store.getRepo(run.repoId);
-    if (!repo) throw new Error("Missing repo");
-    f.store.upsertRepo({ ...repo, mergePolicy: "auto" });
     const merge = spyOn(repos, "mergePullRequest").mockResolvedValue("merged");
     restores.push(() => merge.mockRestore());
     const deps = { ...f.deps, faults: { "stage:deliver:before": { action: "kill" as const } } };
@@ -312,10 +312,13 @@ test.each([false, true])(
         checkpoints.push(label);
       },
     };
-    claim.update.mockImplementation(async () => {
+    const create = repos.createPullRequest;
+    const publication = spyOn(repos, "createPullRequest").mockImplementation(async (...args) => {
+      const url = await create(...args);
       shared(f, false);
-      return "applied";
+      return url;
     });
+    restores.push(() => publication.mockRestore());
     const resume = { ...f.deps, faults: undefined, checkpointer };
     if (!claimed)
       Object.defineProperty(resume, "runClaim", {
