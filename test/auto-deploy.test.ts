@@ -80,6 +80,39 @@ function fixture(overrides: Partial<AutoDeployDeps> = {}) {
   };
 }
 let pr = 0;
+test.each(["when_idle", "off"] as const)(
+  "packaged auto-deploy startup stays inactive (%s)",
+  async (afterLand) => {
+    const work: string[] = [];
+    const record = (name: string) => {
+      work.push(name);
+      throw new Error(`unexpected automatic work: ${name}`);
+    };
+    const f = fixture({
+      afterLand,
+      release: { kind: "packaged", version: "1.2.3", sha: BOOT, bun: Bun.version },
+      selfRepo: async () => record("repo"),
+      mainSha: async () => record("main"),
+      deploy: async () => record("deploy"),
+      jobStatus: async () => record("status"),
+      cleanup: async () => record("cleanup"),
+      timer: { set: () => record("timer"), clear: () => record("clear") },
+    });
+    f.module.start();
+    land(f.store);
+    await f.module.tick();
+    f.module.start();
+    await f.timer();
+    expect(work).toEqual([]);
+    expect(f.logs).toHaveLength(afterLand === "off" ? 0 : 1);
+    if (afterLand !== "off") {
+      expect(f.logs[0]).toContain("packaged mode");
+      expect(f.logs[0]).toContain("brew upgrade limitless");
+      expect(f.logs[0]).toContain("limitless service install");
+    }
+  },
+);
+
 function entry(store: Store, repo = "test/self", baseBranch = "main") {
   return store.createLandEntry({
     runId: null,
