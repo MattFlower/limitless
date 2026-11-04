@@ -2,7 +2,8 @@ import { expect, mock, spyOn } from "bun:test";
 import type { Factory } from "../src/app.ts";
 import { exportPolicySelection } from "../src/db/portable-policies.ts";
 import { Store } from "../src/db/store.ts";
-import { bindClaim } from "../src/integrations/claim-guard.ts";
+import { ClaimWaitError } from "../src/integrations/claim-errors.ts";
+import { bindClaim, claimScope } from "../src/integrations/claim-guard.ts";
 import { initialRunState, localCheckpointer, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import type { RunClaim } from "../src/pipeline/run-claim.ts";
@@ -115,6 +116,30 @@ function capture(store: Store, runId: string) {
     },
   }));
 }
+
+test("policy transitions require an open claim before writing", async () => {
+  const { f, run, deps } = await fixture();
+  const state: RunState = {
+    ...initialRunState(run),
+    gatesConfig: { setup: [], checks: [], source: "none", protectedPaths: [] },
+  };
+  const step: PinStep = { kind: "prepared", trustedBase: "a".repeat(40) };
+  let open = false;
+  if (!deps.runClaim) throw new Error("missing claim");
+  const binding = bindClaim({ windowOpen: () => open }, deps.runClaim.binding.handle, () => false);
+  const before = f.store.getRunState<RunState>(run.id);
+  claimScope.run([binding], () => {
+    expect(() => pinPolicy(f.store, run.id, state, step)).toThrow(new ClaimWaitError("lease"));
+    expect(f.store.getRunState<RunState>(run.id)).toEqual(before);
+    expect(exportPolicySelection(f.store, run.id).history.map((v) => v.kind)).toEqual(["provisional"]);
+    open = true;
+    expect(pinPolicy(f.store, run.id, state, step).version).toBe(2);
+  });
+  expect(exportPolicySelection(f.store, run.id).history.map((v) => v.kind)).toEqual([
+    "provisional",
+    "prepared",
+  ]);
+});
 
 test.each(["single", "panel"] as const)("every shared save exports in %s mode", async (mode) => {
   const { f, run, deps } = await fixture(true, mode, "off", true);

@@ -516,6 +516,7 @@ test("source boundaries restrict claim scopes to execution, observer validation 
         "src/integrations/github-poller.ts",
         "src/git/repos.ts",
         "src/pipeline/context.ts",
+        "src/pipeline/run-policy-pins.ts",
         observer,
         execution,
         engine,
