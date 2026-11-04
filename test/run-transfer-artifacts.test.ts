@@ -257,6 +257,25 @@ test("catalogue roles, timestamps, baseline exclusion and retained bytes survive
   expect(await reopened.exportRun(f.runId, repository, signal)).toEqual(c);
 });
 
+test("run transfer exports and imports a run while omitting local screenshot rows", async () => {
+  const f = setup(),
+    api = facade(f.s);
+  const name = "screenshot-721-0.png",
+    content = Buffer.from("local viewport pixels").toString("base64");
+  f.s.putArtifact(f.runId, name, "screenshot", content);
+  const exported = await api.exportRun(f.runId, repository, signal);
+  for (const text of [
+    exported.manifest,
+    ...Array.from(exported.blobs.values(), (bytes) => new TextDecoder().decode(bytes)),
+  ]) {
+    expect(text).not.toContain(name);
+    expect(text).not.toContain(content);
+    expect(text).not.toContain("/screenshots/");
+  }
+  await api.importRun(exported, signal);
+  expect(api.target.listArtifacts(f.runId).some((row) => row.kind === "screenshot")).toBe(false);
+});
+
 test.each(["holdout-scenarios.json", "report.md", "report-sources.json", "verify-1.json", "spec.md"])(
   "role tampering is rejected before object IO: %s",
   async (name) => {
@@ -306,6 +325,7 @@ test("envelopes reject foreign, duplicate, baseline, malformed and unresolved ar
   for (const fields of [
     { runId: "other01" },
     { name: "baseline-gates.json", kind: "gates" },
+    { name: "screenshot-1-0.png", kind: "screenshot" },
     { version: 2 },
     { extra: true },
     { createdAt: -1 },

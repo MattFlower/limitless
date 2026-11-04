@@ -95,7 +95,16 @@ const feedPageSchema = z.object({
 const feedArgsSchema = FeedQuerySchema.omit({ limit: true }).extend({
   wait: z.number().min(0).max(45).default(0),
 });
-const detailSchema = z.object({ run: runSchema, questions: z.array(questionSchema) }).passthrough();
+const detailSchema = z
+  .object({
+    run: runSchema,
+    questions: z.array(questionSchema),
+    artifacts: z
+      .array(z.object({ kind: z.string() }).passthrough())
+      .optional()
+      .transform((rows) => rows?.filter((row) => row.kind !== "screenshot")),
+  })
+  .passthrough();
 const roundsSchema = z.object({
   rounds: z.array(z.object({ deliveredSha: z.string().nullable().optional() })),
 });

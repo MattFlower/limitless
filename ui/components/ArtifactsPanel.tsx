@@ -278,10 +278,11 @@ export const ArtifactsPanel: Component<{ runId: string; artifacts: ArtifactMeta[
   const [active, setActive] = createSignal<string | null>(props.artifacts[0]?.name ?? null);
   const [cache, setCache] = createSignal<Record<string, string>>({});
   const [loading, setLoading] = createSignal(false);
+  const screenshot = () => props.artifacts.find((a) => a.name === active())?.kind === "screenshot";
 
   createEffect(() => {
     const name = active();
-    if (!name || cache()[name] !== undefined) return;
+    if (!name || screenshot() || cache()[name] !== undefined) return;
     setLoading(true);
     getArtifact(props.runId, name)
       .then((text) => setCache((c) => ({ ...c, [name]: text })))
@@ -314,10 +315,16 @@ export const ArtifactsPanel: Component<{ runId: string; artifacts: ArtifactMeta[
           No artifacts yet.
         </div>
       </Show>
-      <Show when={active() && cache()[active() as string] !== undefined}>
+      <Show when={screenshot()}>
+        <img
+          src={`/api/runs/${encodeURIComponent(props.runId)}/screenshots/${encodeURIComponent(active() ?? "")}`}
+          alt="Verifier viewport screenshot"
+        />
+      </Show>
+      <Show when={!screenshot() && active() && cache()[active() as string] !== undefined}>
         {renderContentEl(active() as string, cache()[active() as string] as string)}
       </Show>
-      <Show when={active() && cache()[active() as string] === undefined && loading()}>
+      <Show when={!screenshot() && active() && cache()[active() as string] === undefined && loading()}>
         <div class="centered-hint">
           <span class="spinner" /> &nbsp;loading {active()}…
         </div>

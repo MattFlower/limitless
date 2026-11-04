@@ -13,6 +13,7 @@ import { computeProviderStatistics, computeStats } from "../db/stats.ts";
 import { IssueClaimed } from "../db/store.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
+import { isInertMedia } from "../gates/media.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
 import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
 import { ensureCache, fetchBase, resolveRepo } from "../git/repos.ts";
@@ -724,6 +725,12 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       );
     }),
     "/api/runs/:id/artifacts/:name": handle((req) => {
+      if (
+        store
+          .listArtifacts(req.params.id as string)
+          .some((a) => a.name === req.params.name && a.kind === "screenshot")
+      )
+        return error("not found", 404);
       const content = store.getArtifact(req.params.id as string, req.params.name as string);
       return content === null
         ? error("not found", 404)
@@ -731,6 +738,28 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
             headers: { "content-type": "text/plain; charset=utf-8" },
           });
     }),
+    "/api/runs/:id/screenshots/:name": handle((req) => {
+      const id = req.params.id as string,
+        name = req.params.name as string;
+      if (!store.listArtifacts(id).some((a) => a.name === name && a.kind === "screenshot"))
+        return error("not found", 404);
+      const content = store.getArtifact(id, name);
+      if (!content || content.length > 4 * Math.ceil((5 * 1024 * 1024) / 3)) return error("not found", 404);
+      const bytes = Buffer.from(content, "base64");
+      if (
+        bytes.length > 5 * 1024 * 1024 ||
+        bytes.toString("base64") !== content ||
+        !isInertMedia("x.png", bytes)
+      )
+        return error("not found", 404);
+      return new Response(bytes, {
+        headers: {
+          "Content-Type": "image/png",
+          "X-Content-Type-Options": "nosniff",
+          "Cache-Control": "no-store",
+        },
+      });
+    }, true),
     "/api/runs/:id/stream": handle((req, server) => {
       const runId = req.params.id as string;
       const after = Number(new URL(req.url).searchParams.get("after") ?? 0);

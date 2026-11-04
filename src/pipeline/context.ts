@@ -39,6 +39,7 @@ import { selectHarness } from "../harness/select.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
+import { collectVerifierCaptures } from "../harness/verifier-captures.ts";
 import { ClaimControlError, ClaimWaitError } from "../integrations/claim-errors.ts";
 import { claimGuard } from "../integrations/claim-guard.ts";
 import type { GhRunner } from "../integrations/github.ts";
@@ -1163,6 +1164,7 @@ export class RunContext {
                 this.state.gatesConfig?.checks.some((c) => c.name === "test")
                 ? (signal) => runAgentGate(this, spec.cwd, signal)
                 : undefined,
+              (scratch) => collectVerifierCaptures(scratch, store, this.run.id, invocation.id, spec.onEvent),
             );
           };
           result = await agentExecutor.run(

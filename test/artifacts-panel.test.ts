@@ -39,9 +39,28 @@ test("verification artifact renders blocked evidence and legacy statuses", async
     expect(build.success).toBe(true);
     const output = build.outputs[0];
     if (!output) throw new Error("No artifact build output");
-    const { VerifyArtifact } = (await import(
+    const { VerifyArtifact, ArtifactsPanel } = (await import(
       output.path
     )) as typeof import("../ui/components/ArtifactsPanel.tsx");
+    const panel = renderToString(() =>
+      ArtifactsPanel({
+        runId: "run-1",
+        artifacts: [
+          { name: "screenshot-42-0.png", kind: "screenshot", size: 100, createdAt: 0 },
+          { name: "verify-0.json", kind: "verify", size: 50, createdAt: 0 },
+        ],
+      }),
+    );
+    expect(panel).toContain("<img");
+    expect(panel).toContain('src="/api/runs/run-1/screenshots/screenshot-42-0.png"');
+    expect(panel).toContain("verify-0.json");
+    const textPanel = renderToString(() =>
+      ArtifactsPanel({
+        runId: "run-1",
+        artifacts: [{ name: "verify-0.json", kind: "verify", size: 50, createdAt: 0 }],
+      }),
+    );
+    expect(textPanel).not.toContain("<img");
     const criteria = (["met", "unmet", "unclear", "blocked", "blocked"] as const).map((status, i) => ({
       id: i === 4 ? "H-1" : `AC-${i + 1}`,
       status,

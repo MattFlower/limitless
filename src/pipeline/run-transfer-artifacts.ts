@@ -70,6 +70,7 @@ export function encodeRunArtifacts(
   invocations: ReadonlyMap<number, number>,
 ) {
   return rows.flatMap((row) => {
+    if (row.kind === "screenshot") return [];
     const tag = role(row, "unsupported");
     if (row.name === "baseline-gates.json") return [];
     const safe = mapSample(
