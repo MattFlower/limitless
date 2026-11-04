@@ -302,6 +302,50 @@ test("construction: stored state advances during objects retrieval without split
   }
 });
 
+test.each([
+  ["reuse", "pending"],
+  ["reuse", "committed"],
+  ["state-put", "pending"],
+  ["state-put", "committed"],
+  ["manifest-get", "pending"],
+  ["manifest-get", "committed"],
+])("construction: ledger change during %s to %s refuses the candidate", async (site, kind) => {
+  const f = fixture();
+  f.commit(await f.build());
+  f.advance();
+  const successor = await f.build(),
+    entered = deferred<void>(),
+    release = deferred<void>(),
+    direct = f.remote.client();
+  const pause = async () => {
+    entered.resolve();
+    await release.promise;
+  };
+  if (site === "state-put")
+    f.puts.mockImplementation(async (...args) => {
+      if (args[1] === "state") await pause();
+      return direct.put(...args);
+    });
+  else
+    f.gets.mockImplementation(async (...args) => {
+      if (args[1] === (site === "reuse" ? "objects" : "manifest")) await pause();
+      return direct.get(...args);
+    });
+  const building = f.build();
+  try {
+    await entered.promise;
+    if (kind === "committed") f.commit(successor);
+    else f.store.journalCheckpoint(f.run.id, { ...successor, generation: f.handle.generation });
+    const changed = f.store.checkpointRecord(f.run.id);
+    release.resolve();
+    await expect(building).rejects.toMatchObject(unavailable);
+    expect(f.store.checkpointRecord(f.run.id)).toEqual(changed);
+  } finally {
+    release.resolve();
+    await building.catch(() => {});
+  }
+});
+
 test.each([false, true])("read-back: every get blocks resolution, reused=%s", async (reused) => {
   const f = fixture();
   if (reused) {
@@ -587,6 +631,39 @@ test.each(["export", "get", "put", "guard"])(
     await expect(f.build()).rejects.toBe(error);
   },
 );
+
+test.each([
+  ["get", "guard"],
+  ["put", "guard"],
+  ["get", "storage"],
+  ["put", "storage"],
+])("error-mapping: deferred %s rejection preserves %s claim-control identity", async (site, source) => {
+  const f = fixture(),
+    entered = deferred<void>(),
+    rejection = deferred<never>(),
+    lost = new ClaimLostError(),
+    storageError = source === "storage" ? new ClaimWaitError("lease") : new SharedStoreError("unavailable");
+  const fail = () => {
+    entered.resolve();
+    return rejection.promise;
+  };
+  if (site === "get") f.gets.mockImplementation(fail);
+  else f.puts.mockImplementation(fail);
+  const building = f.build();
+  try {
+    await entered.promise;
+    const writes = f.puts.mock.calls.length;
+    f.guard.mockImplementation(() => {
+      throw lost;
+    });
+    rejection.reject(storageError);
+    await expect(building).rejects.toBe(source === "storage" ? storageError : lost);
+    expect(f.puts.mock.calls).toHaveLength(writes);
+  } finally {
+    rejection.reject(storageError);
+    await building.catch(() => {});
+  }
+});
 
 test.each(["export", "reuse", "payload-put", "payload-get", "manifest-put", "manifest-get"])(
   "error-mapping: stale guard and cancellation after deferred %s",

@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import type { Paths } from "../config.ts";
 import type { Run } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
@@ -60,6 +61,8 @@ export async function buildCandidate(
     try {
       result = await action();
     } catch (error) {
+      rethrowClaimControl(error);
+      check();
       return unavailable(error);
     }
     check();
@@ -169,6 +172,7 @@ export async function buildCandidate(
     );
     if (!Buffer.from(retained).equals(bytes)) throw new ClaimWaitError("unavailable");
     check();
+    if (!isDeepStrictEqual(ledger, store.checkpointRecord(run.id))) throw new ClaimWaitError("unavailable");
     return {
       pointer: formatPointer(manifestKey, digest),
       manifest,
