@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import type { RepoSettings } from "../config.ts";
 import { worktreeGit } from "../git/command.ts";
 import { checkPrivatePublication } from "../git/repos.ts";
+import { rethrowClaimControl } from "../integrations/claim-errors.ts";
 import type { GhRunner } from "../integrations/github.ts";
 import { consumeBoundaryChunk } from "../util/privacy-chunks.ts";
 import { CommandError } from "../util/proc.ts";
@@ -94,7 +95,9 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
   const jobLog: GhRunner = async (...args) => {
     try {
       return (await deps.gh(...args)) ?? "";
-    } catch {
+    } catch (error) {
+      rethrowClaimControl(error);
+      args[1]?.throwIfAborted();
       throw new Error("GitHub Actions log retrieval failed");
     }
   };
@@ -271,6 +274,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
       const checkpoint = () => persist(handle);
       const checks = req.gates.checks.filter((c) => !req.checks || req.checks.includes(c.name));
       const setup = req.gates.setup.map((run) => ({ name: run, run, timeoutSec: 900 }));
+      let failure: unknown;
       const result = (async (): Promise<GateRun> => {
         const etags = new Map<string, { etag?: string; data: unknown }>();
         p.deadline ??=
@@ -485,6 +489,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
         }
       })()
         .catch(async (error: unknown) => {
+          failure = error;
+          rethrowClaimControl(error);
           if (gateShutdown(controller.signal)) throw error;
           const aborted = controller.signal.aborted;
           const kind = error instanceof PrivateError ? "refused" : aborted ? "cancelled" : "operational";
@@ -503,6 +509,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
             await discard(handle, controller.signal);
             await checkpoint();
           } catch (error) {
+            rethrowClaimControl(failure);
+            rethrowClaimControl(error);
             p.cleanupFailed = true;
             await checkpoint();
             if (!p.interrupted) throw new GateBlockedError("cleanup", String(error), p.cwd);

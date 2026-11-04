@@ -28,6 +28,8 @@ import {
   retryRegressions,
   validateRetry,
 } from "../src/gates/run.ts";
+import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
+import { bindClaim, claimScope, dispatchGuard } from "../src/integrations/claim-guard.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { type EngineDeps, RunContext, type RunState } from "../src/pipeline/context.ts";
 import {
@@ -1053,32 +1055,81 @@ test.each(["CommandError", "no exit code", "synchronous"])(
   },
 );
 
+test.each(["loss", "wait"].flatMap((kind) => ["direct", "dispatch guard"].map((via) => ({ kind, via }))))(
+  "log retrieval preserves claim $kind from $via through cleanup",
+  async ({ kind, via }) => {
+    const f = fixture();
+    let blocked = false;
+    const claim = bindClaim(
+      { windowOpen: () => !blocked },
+      { repo: req.repo, ref: "refs/limitless/claims/1", run: "run-1", member: "m", generation: 1 },
+      () => false,
+    );
+    const original = kind === "loss" ? new ClaimLostError() : new ClaimWaitError("lease");
+    let caught: unknown;
+    let refusals = 0;
+    const gh = f.deps.gh;
+    f.deps.gh = async (...args) => {
+      if (args[0][0] === "run") {
+        blocked = true;
+        if (kind === "loss") claim.onLost(claim.handle, null);
+        if (via === "direct") throw original;
+      }
+      if (via === "dispatch guard") {
+        try {
+          dispatchGuard();
+        } catch (error) {
+          caught ??= error;
+          refusals++;
+          throw error;
+        }
+      }
+      return (await gh(...args)) ?? "";
+    };
+    const error: unknown = await claimScope.run([claim], () => f.run()).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(kind === "loss" ? ClaimLostError : ClaimWaitError);
+    expect(error).toBe(via === "direct" ? original : caught);
+    if (via === "dispatch guard") expect(refusals).toBeGreaterThan(1);
+    expect(f.saved.at(-1)?.githubActions?.interrupted).toBeUndefined();
+    expect(f.saved.at(-1)?.githubActions?.diagnostic).toBeUndefined();
+  },
+);
+
 test.each(["cancel", "shutdown"])("log retrieval failure preserves %s cleanup semantics", async (reason) => {
   const f = fixture(),
     controller = new AbortController();
   const canary = `partial-${crypto.randomUUID()}`;
-  const gh = f.deps.gh;
+  const gh = f.deps.gh,
+    cancellation = new Error(reason);
   f.deps.gh = async (...args) => {
     if (args[0][0] === "run") {
-      controller.abort(new Error(reason));
+      controller.abort(cancellation);
       throw new CommandError(canary, null, log(framed(), canary), canary, false);
     }
     return (await gh(...args)) ?? "";
   };
   const error: unknown = await f.run(controller.signal).catch((e: unknown) => e);
   expect(error).toBeInstanceOf(Error);
-  expect(String(error)).toContain("GitHub Actions log retrieval failed");
+  expect(String(error)).toContain(reason);
+  expect(String(error)).not.toContain("GitHub Actions log retrieval failed");
   const progress = f.saved.at(-1)?.githubActions;
   if (reason === "cancel") {
     expect(error).toBeInstanceOf(GateBlockedError);
     expect(progress?.interrupted).toBe("cancelled");
     expect(f.remote.size).toBe(0);
   } else {
-    expect(error).not.toBeInstanceOf(GateBlockedError);
+    expect(error).toBe(cancellation);
     expect(progress?.interrupted).toBeUndefined();
     expect(f.remote.size).toBe(2);
   }
   expect(JSON.stringify([f.saved, inspect(error, { showHidden: true, depth: null })])).not.toContain(canary);
+  if (reason === "shutdown") {
+    const resumed = await f.run(signal(), f.saved.at(-1)).catch((e: unknown) => e);
+    expect(resumed).toBeInstanceOf(GateBlockedError);
+    expect(f.remote.size).toBe(0);
+    expect(published(f)).toEqual({ pushes: 1, dispatches: 1 });
+    expect(JSON.stringify(f.saved)).not.toContain(canary);
+  }
 });
 
 test.each(["visible", "never visible"])(

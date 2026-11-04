@@ -2599,19 +2599,21 @@ test.skipIf(platformSkip !== null)(
   `worker gates cannot read their token, pin or coordinator TLS key (${platformSkip})`,
   async () => {
     const server = await listen(),
-      req = await request(true);
-    const worker = await loop({ confinement: undefined, platform: process.platform });
-    const files = [
-      server.tls.keyPath,
-      ...["token", "coordinator-fingerprint"].map((name) => join(worker.remote.paths.home, "worker", name)),
-    ];
-    req.gates.checks = files.map((file, i) => ({ name: `private-${i}`, run: `cat '${file}'` }));
+      req = await request(true),
+      privacy = remoteFixture();
+    let worker: Awaited<ReturnType<typeof loop>> | undefined;
     try {
-      const run = await executeGate(
-        req,
-        AbortSignal.timeout(30_000),
-        {},
-        gateExecutorFor("lan", workers, [req.repo]),
+      worker = await gatePrivacyScope.run({ ...privacy.scope, signer: undefined }, () =>
+        loop({ confinement: undefined, platform: process.platform }),
+      );
+      const workerHome = worker.remote.paths.home;
+      const files = [
+        server.tls.keyPath,
+        ...["token", "coordinator-fingerprint"].map((name) => join(workerHome, "worker", name)),
+      ];
+      req.gates.checks = files.map((file, i) => ({ name: `private-${i}`, run: `cat '${file}'` }));
+      const run = await privacy.scoped(() =>
+        executeGate(req, AbortSignal.timeout(30_000), {}, gateExecutorFor("lan", workers, [req.repo])),
       );
       expect(run.setupOk).toBe(true);
       expect(run.checks).toHaveLength(files.length);
@@ -2623,7 +2625,11 @@ test.skipIf(platformSkip !== null)(
       }
       expect(workers.jobs("1=1")[0]).toMatchObject({ state: "done", attempt: 1, worker: "loop-runner" });
     } finally {
-      await worker.stop();
+      try {
+        await worker?.stop();
+      } finally {
+        await privacy.checker.dispose();
+      }
     }
   },
   60_000,
