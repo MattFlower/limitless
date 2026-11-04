@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import type { GateCommand, GateConfig } from "../src/gates/detect.ts";
 import * as junit from "../src/gates/junit.ts";
 import { protectGateOutput } from "../src/gates/output-privacy.ts";
+import { privateStringsDigest } from "../src/gates/private.ts";
 import { retryFailures, runGates, targetedRetrySkipReason, validateRetry } from "../src/gates/run.ts";
 import { BunTestCoverage, MAX_TEST_IDENTITY_LENGTH } from "../src/gates/test-coverage.ts";
 import * as identityModule from "../src/gates/text-privacy.ts";
@@ -132,7 +133,12 @@ test("real gates sign exact untrimmed rendering and identities; workers make MAC
   expect(verify(r.textPrivacy?.output, "output", `${r.output}!`)).toBe(false);
   expect(verify(r.textPrivacy?.identities, "identities", gateIdentities(r))).toBe(true);
   const unsigned = await f.gate(" safe ", "", {}, () => undefined);
-  expect(unsigned.textPrivacy?.output).toEqual({ withheld: false, checkedComplete: true, kind: "complete" });
+  expect(unsigned.textPrivacy?.output).toEqual({
+    withheld: false,
+    checkedComplete: true,
+    kind: "complete",
+    entriesDigest: privateStringsDigest(f.registry.entries),
+  });
   expect(unsigned.textPrivacy?.identities?.mac).toBeUndefined();
 });
 
