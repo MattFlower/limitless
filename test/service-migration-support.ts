@@ -22,9 +22,11 @@ if (!home) throw new Error("missing isolated test home");
 const nativeOs = { ...os };
 mock.module("node:os", () => ({ ...nativeOs, homedir: () => home }));
 const requestedScenario = process.argv[2] ?? "migration";
-const sequential = requestedScenario.startsWith("sequence");
-const executorRecovery = requestedScenario.startsWith("executor-recovery");
-let scenario = sequential || executorRecovery ? "bootstrap" : requestedScenario;
+const crossCaller = requestedScenario.match(/^cross-(source|packaged)-/)?.[1];
+const baseScenario = requestedScenario.replace(/^cross-(source|packaged)-/, "");
+const sequential = baseScenario.startsWith("sequence");
+const executorRecovery = baseScenario.startsWith("executor-recovery");
+let scenario = sequential || executorRecovery ? "bootstrap" : baseScenario;
 const kind = process.argv[3] ?? "daemon";
 const packaged = requestedScenario.startsWith("packaged-");
 const destinationPreflight = requestedScenario.endsWith("-inspection-collision");
@@ -58,6 +60,18 @@ const oldPath = join(agents, `${kind}-original.plist`);
 const neutral = `dev.limitless.${kind}`;
 const xmlEscape = (value: string) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;");
 const decode = (value: string) => value.replaceAll("&lt;", "<").replaceAll("&amp;", "&");
+const packagedBinary = join(home, "brew", "Cellar", "limitless", "1.0", "bin", "limitless");
+const packagedStable = join(home, "brew", "opt", "limitless", "bin", "limitless");
+const packagedCommand = join(home, "brew", "bin", "limitless");
+if (crossCaller) {
+  mkdirSync(join(packagedBinary, ".."), { recursive: true });
+  writeFileSync(packagedBinary, "binary");
+  mkdirSync(join(home, "brew", "opt"), { recursive: true });
+  if (!existsSync(packagedStable))
+    symlinkSync(join(packagedBinary, "..", ".."), join(home, "brew", "opt", "limitless"));
+  mkdirSync(join(packagedCommand, ".."), { recursive: true });
+  if (!existsSync(packagedCommand)) symlinkSync(packagedBinary, packagedCommand);
+}
 function parse(content: string) {
   const value = (key: string) => {
     const matched = content.match(new RegExp(`<key>${key}</key>\\s*<string>(.*?)</string>`, "s"));
@@ -80,7 +94,7 @@ function parse(content: string) {
     ].map((match) => decode(match[1] ?? "")),
   };
 }
-const args =
+const sourceArgs =
   kind === "daemon" || kind === "executor"
     ? [
         "/different/bin/bun",
@@ -97,6 +111,13 @@ const args =
           join(home, ".cloudflared", "limitless.yml"),
           "run",
         ];
+const args =
+  crossCaller === "source" ? [packagedStable, kind === "executor" ? "executor" : "serve"] : sourceArgs;
+if (crossCaller && scenario === "arbitrary-binary") {
+  args[0] = join(home, "other", "limitless");
+  mkdirSync(join(args[0], ".."), { recursive: true });
+  writeFileSync(args[0], "unrelated binary");
+}
 if (scenario === "displaced") args.splice(1, 0, "/other/program.ts", "--");
 if (scenario === "trailing") args.push("--extra");
 if (scenario === "aux-path-alias") {
@@ -125,7 +146,17 @@ if (scenario === "persist-failure") {
 if (scenario === "collision") loaded.add(neutral);
 if (scenario === "path-collision") writeFileSync(join(agents, `${neutral}.plist`), unrelated);
 if (scenario === "duplicate")
-  writeFileSync(join(agents, "duplicate.plist"), old.replace(oldLabel, "another.daemon"));
+  writeFileSync(
+    join(agents, "duplicate.plist"),
+    crossCaller
+      ? old
+          .replace(oldLabel, "another.agent")
+          .replace(
+            /<array>.*?<\/array>/s,
+            `<array>${(crossCaller === "source" ? sourceArgs : [packagedStable, kind === "executor" ? "executor" : "serve"]).map((arg) => `<string>${xmlEscape(arg)}</string>`).join("")}</array>`,
+          )
+      : old.replace(oldLabel, "another.daemon"),
+  );
 let time = 0;
 let draining = false;
 let stopping = "";
@@ -186,7 +217,7 @@ const command: typeof sh = async (argv) => {
   if (argv[0] !== "launchctl") {
     if (scenario === "stop-after-recovery" && argv[1] === "fetch") throw new Error("stopped after recovery");
     if (argv[0] === "bun" && argv[1] === "install") recoveryCleaned = !journals()?.length;
-    return ok(argv[1] === "rev-parse" ? "current" : "");
+    return ok(argv[1] === "rev-parse" ? (crossCaller === "packaged" ? "a".repeat(40) : "current") : "");
   }
   const label = argv.at(-1)?.split("/").at(-1) ?? "";
   if (argv[1] === "print") {
@@ -197,7 +228,8 @@ const command: typeof sh = async (argv) => {
         label === neutral &&
         !calls.includes(`bootout ${oldLabel}`)) ||
         (scenario.startsWith("inspection-post-drain") && label === oldLabel && drainCompleted) ||
-        (["inspection-status", "inspection-uninstall"].includes(scenario) && label === oldLabel) ||
+        (["inspection-status", "status-filtered", "inspection-uninstall"].includes(scenario) &&
+          label === oldLabel) ||
         (scenario === "inspection-old" && label === oldLabel && !inspectionInjected) ||
         (recoveryInspection && recoveryFailure && label === oldLabel && !inspectionInjected) ||
         (scenario === "inspection-reconcile" && label === neutral && !existsSync(oldPath)) ||
@@ -380,7 +412,7 @@ const client: DeployClient = {
     return {
       ok: true,
       uptimeMs: 1,
-      sha: "current",
+      sha: crossCaller === "packaged" ? "a".repeat(40) : "current",
       draining,
       active: draining && (scenario === "timeout" || time < 5000) ? ["active-run"] : [],
     };
@@ -393,10 +425,31 @@ const client: DeployClient = {
 const nativeProc = { ...proc };
 mock.module("../src/util/proc.ts", () => ({ ...nativeProc, sh: command }));
 spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ ok: true }));
+const nativeWhich = Bun.which;
+spyOn(Bun, "which").mockImplementation((name, options) =>
+  name === "limitless"
+    ? scenario === "discovery-path"
+      ? packagedCommand
+      : null
+    : nativeWhich(name, options),
+);
 if (scenario.startsWith("recover") && existsSync(join(home, "loaded.json"))) {
   for (const label of JSON.parse(readFileSync(join(home, "loaded.json"), "utf8"))) loaded.add(label);
 }
 const service = await import("../src/cli/service.ts");
+const crossOptions = crossCaller
+  ? {
+      agentsDir: agents,
+      execPath: crossCaller === "packaged" ? packagedBinary : process.execPath,
+      packagedExecPath: ["discovery-path", "discovery-unavailable"].includes(scenario)
+        ? undefined
+        : packagedBinary,
+      release:
+        crossCaller === "packaged"
+          ? { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version }
+          : { kind: "source" as const, root: app, version: "1.0", bun: Bun.version },
+    }
+  : {};
 let error = "";
 let firstError = "";
 let tunnelJournal = "";
@@ -416,11 +469,15 @@ const agentFiles = () =>
   Object.fromEntries(readdirSync(agents).map((name) => [name, readFileSync(join(agents, name), "utf8")]));
 try {
   if (programCase) {
-    executable = join(home, "bin", kind === "tunnel" ? "cloudflared" : packaged ? "limitless" : "bun");
+    const unitPackaged = crossCaller ? crossCaller === "source" : packaged;
+    executable =
+      crossCaller && unitPackaged
+        ? packagedStable
+        : join(home, "bin", kind === "tunnel" ? "cloudflared" : unitPackaged ? "limitless" : "bun");
     mkdirSync(join(executable, ".."), { recursive: true });
     writeFileSync(executable, "executable");
     const unitArgs =
-      packaged && ["daemon", "executor"].includes(kind)
+      unitPackaged && ["daemon", "executor"].includes(kind)
         ? [executable, kind === "executor" ? "executor" : "serve"]
         : [...args];
     if (kind !== "mtplx") unitArgs[0] = executable;
@@ -460,10 +517,42 @@ try {
       release: packaged
         ? { kind: "packaged" as const, sha: "a".repeat(40), version: "1.0", bun: Bun.version }
         : { kind: "source" as const, root: app, version: "1.0", bun: Bun.version },
+      ...crossOptions,
     };
     discoveredUnits = await service.installedUnits(options);
     discovered = discoveredUnits.map((unit) => unit.kind);
     if (programCase === "collision") await service.install(0, options);
+  } else if (crossCaller && !executorRecovery) {
+    const options = {
+      command,
+      client,
+      clock,
+      ...crossOptions,
+      executor: kind === "executor" && scenario !== "unselected",
+    };
+    stable = packagedStable;
+    executable = packagedBinary;
+    if (scenario.startsWith("recover")) await service.install(0, options);
+    else {
+      if (kind === "executor" && scenario === "migration") {
+        writeFileSync(
+          join(agents, "daemon-original.plist"),
+          old
+            .replaceAll(oldLabel, "arbitrary.installed.daemon")
+            .replace("<string>executor</string>", "<string>serve</string>"),
+        );
+        loaded.add("arbitrary.installed.daemon");
+      }
+      if (["inspection-status", "status-filtered"].includes(scenario))
+        await service.status(0, options, scenario !== "status-filtered");
+      else if (
+        scenario.startsWith("discovery") ||
+        ["arbitrary-binary", "other-install", "contradictory", "trailing"].includes(scenario)
+      ) {
+        discoveredUnits = await service.installedUnits(options);
+        discovered = discoveredUnits.map((unit) => unit.kind);
+      } else await service.install(0, options);
+    }
   } else if (destinationPreflight) {
     executable = join(home, "bin", "limitless");
     const options = {
@@ -563,7 +652,7 @@ try {
     await service.install(0, { command, client, clock, executor: true });
   } else if (executorRecovery) {
     disabled.add(oldLabel);
-    await service.install(0, { command, client, clock, executor: true }).catch((e) => {
+    await service.install(0, { command, client, clock, executor: true, ...crossOptions }).catch((e) => {
       firstError = String(e);
     });
     firstCalls = calls.splice(0);
@@ -571,13 +660,15 @@ try {
       scenario = requestedScenario.endsWith("stuck") ? "stuck" : "stop-after-recovery";
       if (scenario === "stuck") loaded.add(oldLabel);
       const error = String(
-        await service.deploy(0, undefined, false, { command, client, clock, executor: true }).catch((e) => e),
+        await service
+          .deploy(0, undefined, false, { command, client, clock, executor: true, ...crossOptions })
+          .catch((e) => e),
       );
       recoveries.push({ error, phase: record()?.phase, retained: existsSync(journal) });
     }
     if (!requestedScenario.endsWith("stuck")) {
       scenario = "migration";
-      await service.deploy(0, undefined, false, { command, client, clock, executor: true });
+      await service.deploy(0, undefined, false, { command, client, clock, executor: true, ...crossOptions });
     }
   } else if (["status", "inspection-status"].includes(scenario)) await service.status(0, { command });
   else if (["uninstall", "inspection-uninstall"].includes(scenario)) await service.uninstall({ command });

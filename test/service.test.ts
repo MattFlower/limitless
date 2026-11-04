@@ -114,7 +114,7 @@ type MigrationResult = {
   firstCalls: string[];
   recoveries: { error: string; phase: string; retained: boolean }[];
   discovered: string[];
-  discoveredUnits: { label: string; path: string; kind: string }[];
+  discoveredUnits: { label: string; path: string; kind: string; installationKind?: string }[];
   intent: boolean;
   original: string;
   stable: string;
@@ -323,7 +323,20 @@ for (const failure of ["bootstrap", "health"]) {
   });
 }
 
-for (const scenario of ["source", "extra", "invalid"]) {
+test("packaged installation migrates an existing source daemon", async () => {
+  const { result: r } = await migration("packaged-source");
+  expect(r.error).toBe("");
+  expect(r.calls.slice(0, 4)).toEqual([
+    "drain",
+    "health draining",
+    "bootout dev.limitless.daemon",
+    "bootstrap dev.limitless.daemon",
+  ]);
+  expect(r.parsedUnits["dev.limitless.daemon.plist"]?.ProgramArguments).toEqual([r.stable, "serve"]);
+  expect(r.journals).toEqual([]);
+});
+
+for (const scenario of ["extra", "invalid"]) {
   test(`packaged install preserves a loaded ${scenario} unit without draining or stopping`, async () => {
     const { result: r } = await migration(`packaged-${scenario}`);
     expect(r.error).toContain(scenario === "invalid" ? "stable executable" : "unrelated agent");
@@ -1240,6 +1253,7 @@ for (const mode of ["source", "packaged"]) {
       {
         label: "arbitrary.installed.executor",
         kind: "executor",
+        installationKind: mode,
         path: join(
           migrationDirs.at(-1) ?? "",
           mode === "packaged" ? "isolated-agents" : "Library/LaunchAgents",
@@ -1281,3 +1295,226 @@ for (const mode of ["source", "packaged"])
       expect(r.error).toBe(scenario === "duplicate" ? "Error: multiple installed executor agents" : "");
     });
   }
+
+for (const caller of ["source", "packaged"]) {
+  const installed = caller === "source" ? "packaged" : "source";
+  for (const role of ["daemon", "executor"]) {
+    for (const program of ["absent", "symlink", "mismatch", "invalid", "unresolvable"]) {
+      test(`${caller} caller discovers ${installed} ${role} with ${program} Program`, async () => {
+        const { result: r } = await migration(`cross-${caller}-program-${program}`, role);
+        expect(r.error).toBe("");
+        expect(r.discoveredUnits).toEqual(
+          ["absent", "symlink"].includes(program)
+            ? [
+                {
+                  label: `arbitrary.installed.${role}`,
+                  path: join(migrationDirs.at(-1) ?? "", "Library/LaunchAgents", `${role}-original.plist`),
+                  kind: role,
+                  installationKind: installed,
+                },
+              ]
+            : [],
+        );
+        expect(r.calls).toEqual([]);
+      });
+    }
+
+    test(`${caller} install migrates the ${installed} ${role} through its journal`, async () => {
+      const { result: r } = await migration(`cross-${caller}-migration`, role);
+      expect(r.error).toBe("");
+      expect(r.backupBeforeStop).toBe(true);
+      expect(r.calls.indexOf("drain")).toBeLessThan(r.calls.indexOf("bootout arbitrary.installed.daemon"));
+      expect(r.calls.indexOf("bootout arbitrary.installed.daemon")).toBeLessThan(
+        r.calls.indexOf("bootstrap dev.limitless.daemon"),
+      );
+      expect(r.calls).toContain("health fresh");
+      const args = r.parsedUnits[`dev.limitless.${role}.plist`]?.ProgramArguments;
+      expect(args).toEqual(
+        caller === "packaged"
+          ? [r.stable, role === "daemon" ? "serve" : "executor"]
+          : [
+              join(migrationDirs.at(-1) ?? "", ".bun/bin/bun"),
+              join(migrationDirs.at(-1) ?? "", "app & release/src/cli/main.ts"),
+              role === "daemon" ? "serve" : "executor",
+            ],
+      );
+      expect(r.loaded).toContain(`dev.limitless.${role}`);
+      expect(r.loaded).not.toContain(`arbitrary.installed.${role}`);
+      if (role === "executor") {
+        expect(r.calls.indexOf("bootout arbitrary.installed.executor")).toBeLessThan(
+          r.calls.indexOf("disable arbitrary.installed.executor"),
+        );
+        expect(r.calls.indexOf("disable arbitrary.installed.executor")).toBeLessThan(
+          r.calls.indexOf("enable dev.limitless.executor"),
+        );
+        expect(r.calls.indexOf("enable dev.limitless.executor")).toBeLessThan(
+          r.calls.indexOf("bootstrap dev.limitless.executor"),
+        );
+      }
+      expect(r.journals).toEqual([]);
+      expect(r.lock).toBe(false);
+    });
+
+    test(`${caller} install restores a ${installed} ${role} after bootstrap failure`, async () => {
+      const { result: r } = await migration(`cross-${caller}-bootstrap`, role);
+      expect(r.error).toContain("replacement bootstrap failed");
+      expect(r.files[`${role}-original.plist`]).toBe(r.old);
+      expect(r.files[`dev.limitless.${role}.plist`]).toBeUndefined();
+      expect(r.backup).toBe(r.old);
+      expect(r.phase).toBe("restored");
+      expect(r.loaded.includes(`arbitrary.installed.${role}`)).toBe(role === "daemon");
+      if (role === "executor") {
+        expect(r.disabled).toContain("arbitrary.installed.executor");
+        expect(r.calls).not.toContain("bootstrap arbitrary.installed.executor");
+      }
+      expect(r.lock).toBe(false);
+    });
+
+    for (const scenario of ["duplicate", "collision", "path-collision"]) {
+      test(`${caller} refuses ${scenario} before modifying a ${installed} ${role}`, async () => {
+        const { result: r } = await migration(`cross-${caller}-${scenario}`, role);
+        expect(r.error).toContain(
+          scenario === "duplicate"
+            ? `multiple installed ${role} agents`
+            : scenario === "collision"
+              ? "unrecognized agent"
+              : "unrelated agent",
+        );
+        expect(r.files[`${role}-original.plist`]).toBe(r.old);
+        expect(r.loaded).toContain(`arbitrary.installed.${role}`);
+        expect(r.calls).toEqual([]);
+        expect(r.disabled).toEqual([]);
+        expect(r.journals).toEqual([]);
+      });
+    }
+
+    for (const inspection of ["loaded", "absent", "permission"]) {
+      test(`${caller} status identifies ${installed} ${role}: ${inspection}`, async () => {
+        const { result: r, stdout } = await migration(
+          `cross-${caller}-inspection-status`,
+          role,
+          undefined,
+          inspection,
+        );
+        expect(r.error).toBe("");
+        expect(stdout).toContain(
+          `arbitrary.installed.${role}: ${inspection === "loaded" ? "loaded" : inspection === "absent" ? "not loaded" : "unknown:"}`,
+        );
+        expect(stdout).toContain(`(${role}, ${installed})`);
+        expect(r.calls).toEqual(["health fresh"]);
+        expect(r.commands.filter((args) => args[0] === "launchctl" && args[1] !== "print")).toEqual([]);
+      });
+    }
+  }
+
+  test(`${caller} status excludes the ${installed} executor when requested`, async () => {
+    const { result: r, stdout } = await migration(`cross-${caller}-status-filtered`, "executor");
+    expect(r.error).toBe("");
+    expect(stdout).not.toContain("arbitrary.installed.executor:");
+    expect(r.commands.filter((args) => args[0] === "launchctl")).toEqual([]);
+  });
+
+  test(`${caller} health failure restores the ${installed} daemon and recovery can retry`, async () => {
+    const { result: failed } = await migration(`cross-${caller}-wrong-sha`);
+    expect(failed.error).toContain(`expected ${caller === "source" ? "current" : "a".repeat(40)}`);
+    expect(failed.files["daemon-original.plist"]).toBe(failed.old);
+    expect(failed.loaded).toContain("arbitrary.installed.daemon");
+    expect(failed.phase).toBe("restored");
+    const { result: recovered } = await migration(
+      `cross-${caller}-recover-install`,
+      "daemon",
+      migrationDirs.at(-1),
+    );
+    expect(recovered.error).toBe("");
+    expect(recovered.journals).toEqual([]);
+    expect(recovered.loaded).toContain("dev.limitless.daemon");
+  });
+
+  test(`${caller} recovery retains the ${installed} executor backup until reconciliation`, async () => {
+    const { result: r } = await migration(`cross-${caller}-executor-recovery`, "executor");
+    expect(r.error).toBe("");
+    expect(r.firstError).toContain("replacement bootstrap failed");
+    expect(r.firstCalls).not.toContain("bootstrap arbitrary.installed.executor");
+    for (const recovery of r.recoveries) {
+      expect(recovery.phase).toBe("restored");
+      expect(recovery.retained).toBe(true);
+      expect(recovery.error).toContain("stopped after recovery");
+    }
+    expect(r.recoveries).toHaveLength(2);
+    expect(r.state).toBe(false);
+    expect(r.loaded).toContain("arbitrary.installed.executor");
+    expect(r.disabled).not.toContain("arbitrary.installed.executor");
+  });
+
+  test(`${caller} install removes an unselected ${installed} executor after disabling it`, async () => {
+    const { result: r } = await migration(`cross-${caller}-unselected`, "executor");
+    expect(r.error).toBe("");
+    expect(r.calls.slice(-2)).toEqual([
+      "bootout arbitrary.installed.executor",
+      "disable arbitrary.installed.executor",
+    ]);
+    expect(r.files["executor-original.plist"]).toBeUndefined();
+    expect(r.loaded).not.toContain("arbitrary.installed.executor");
+    expect(r.disabled).toContain("arbitrary.installed.executor");
+  });
+
+  test(`${caller} recovers an interrupted migration of the ${installed} daemon from disk`, async () => {
+    const { dir, original } = await interrupted(`cross-${caller}-signal`, "SIGKILL");
+    const { result: r } = await migration(`cross-${caller}-recover-install`, "daemon", dir);
+    expect(r.error).toContain("Recovered previous agent arbitrary.installed.daemon");
+    expect(r.files["daemon-original.plist"]).toBe(original);
+    expect(r.loaded).toContain("arbitrary.installed.daemon");
+    expect(r.backup).toBe(original);
+    expect(r.phase).toBe("restored");
+    const { result: retry } = await migration(`cross-${caller}-recover-install`, "daemon", dir);
+    expect(retry.error).toBe("");
+    expect(retry.journals).toEqual([]);
+  });
+
+  test(`${caller} resumes the original ${installed} daemon when stopping fails`, async () => {
+    const { result: r } = await migration(`cross-${caller}-bootout`);
+    expect(r.error).toContain("bootout denied");
+    expect(r.calls.at(-1)).toBe("resume");
+    expect(r.files["daemon-original.plist"]).toBe(r.old);
+    expect(r.loaded).toContain("arbitrary.installed.daemon");
+    expect(r.draining).toBe(false);
+    expect(r.backup).toBe(r.old);
+  });
+}
+
+test("packaged caller recognizes a canonical source alias with trailing arguments", async () => {
+  const { result: alias } = await migration("cross-packaged-discovery-symlink-reverse");
+  expect(alias.discoveredUnits[0]?.installationKind).toBe("source");
+  const { result: trailing } = await migration("cross-packaged-trailing");
+  expect(trailing.discovered).toEqual(["daemon"]);
+});
+
+test("source discovery establishes the packaged executable from PATH independently of Bun", async () => {
+  const { result: found } = await migration("cross-source-discovery-path");
+  expect(found.error).toBe("");
+  expect(found.discoveredUnits[0]?.installationKind).toBe("packaged");
+  const { result: unavailable } = await migration("cross-source-discovery-unavailable");
+  expect(unavailable.error).toBe("");
+  expect(unavailable.discovered).toEqual([]);
+});
+
+for (const [caller, scenario] of [
+  ["source", "arbitrary-binary"],
+  ["source", "trailing"],
+  ["packaged", "other-install"],
+  ["source", "contradictory"],
+  ["packaged", "contradictory"],
+]) {
+  test(`${caller} discovery excludes cross-kind ${scenario}`, async () => {
+    const { result: r } = await migration(`cross-${caller}-${scenario}`);
+    expect(r.error).toBe("");
+    expect(r.discovered).toEqual([]);
+    expect(r.calls).toEqual([]);
+  });
+}
+
+test("status includes an auxiliary unit's existing role", async () => {
+  const { result: r, stdout } = await migration("status", "mtplx");
+  expect(r.error).toBe("");
+  expect(stdout).toContain("arbitrary.installed.mtplx: loaded (mtplx)");
+});

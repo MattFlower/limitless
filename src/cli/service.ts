@@ -180,6 +180,7 @@ type Migration = Record<"label" | "path" | "target" | "phase" | "backup", string
 type ServiceOptions = NonNullable<Parameters<typeof deploy>[3]> & {
   release?: Release;
   execPath?: string;
+  packagedExecPath?: string;
 };
 
 export function stableExecutable(execPath = process.execPath): string {
@@ -196,10 +197,20 @@ export function stableExecutable(execPath = process.execPath): string {
 export async function installedUnits(opts: ServiceOptions = {}) {
   const dir = opts.agentsDir ?? agentsDir;
   const packaged = (opts.release ?? release).kind === "packaged";
-  const executablePath = packaged ? stableExecutable(opts.execPath) : "";
+  const packagedPath = packaged
+    ? (opts.execPath ?? process.execPath)
+    : (opts.packagedExecPath ?? Bun.which("limitless"));
+  const executablePath = packagedPath
+    ? stableExecutable(packaged ? packagedPath : realpathSync(packagedPath))
+    : undefined;
   const workingDirectory = packaged ? join(home, ".limitless") : (opts.releaseDir ?? appDir);
   const entry = join(opts.releaseDir ?? appDir, "src", "cli", "main.ts");
-  const units = [] as { label: string; path: string; kind: string }[];
+  const units: {
+    label: string;
+    path: string;
+    kind: string;
+    installationKind?: "source" | "packaged";
+  }[] = [];
   const run = opts.command ?? sh;
   const options = { cwd: home, allowFail: true };
   const config = join(home, ".cloudflared", "limitless.yml");
@@ -216,25 +227,26 @@ export async function installedUnits(opts: ServiceOptions = {}) {
     const is = (at: number, ...parts: string[]) =>
       parts.every((part, i) => (part.startsWith("/") ? samePath(args[at + i], part) : args[at + i] === part));
     let kind = "";
-    if (
-      packaged
-        ? args.length === 2 && args[0] === executablePath && args[1] === "serve"
-        : executable === "bun" && is(1, entry, "serve")
-    )
-      kind = "daemon";
-    else if (
-      packaged
-        ? args.length === 2 && args[0] === executablePath && args[1] === "executor"
-        : executable === "bun" && is(1, entry, "executor")
-    )
-      kind = "executor";
-    else if (samePath(data.WorkingDirectory, workingDirectory)) {
+    let installationKind: "source" | "packaged" | undefined;
+    for (const [role, argument] of [
+      ["daemon", "serve"],
+      ["executor", "executor"],
+    ] as const) {
+      if (executable === "bun" && is(1, entry, argument)) {
+        kind = role;
+        installationKind = "source";
+      } else if (executablePath && args.length === 2 && args[0] === executablePath && args[1] === argument) {
+        kind = role;
+        installationKind = "packaged";
+      }
+    }
+    if (!kind && samePath(data.WorkingDirectory, workingDirectory)) {
       if (is(0, join(home, ".mtplx", "bin", "mtplx"), "serve")) kind = "mtplx";
       if (executable === "cloudflared" && is(1, "tunnel", "--config", config, "run")) kind = "tunnel";
     }
     if (kind && (data.LimitlessService === undefined || data.LimitlessService === kind)) {
       if (units.some((unit) => unit.kind === kind)) throw new Error(`multiple installed ${kind} agents`);
-      units.push({ label: data.Label, path, kind });
+      units.push({ label: data.Label, path, kind, ...(installationKind && { installationKind }) });
     }
   }
   return units;
@@ -983,11 +995,11 @@ export async function status(port: number, opts: ServiceOptions = {}, includeExe
   const command = opts.command ?? sh,
     log = opts.log ?? console.log;
   const dir = opts.releaseDir ?? appDir;
-  for (const { label, kind } of await installedUnits(opts)) {
+  for (const { label, kind, installationKind } of await installedUnits(opts)) {
     if (!includeExecutor && kind === "executor") continue;
     const result = await inspectService(label, command);
     log(
-      `${label}: ${result.state === "unknown" ? `unknown: ${result.reason}` : result.state === "loaded" ? "loaded" : "not loaded"}`,
+      `${label}: ${result.state === "unknown" ? `unknown: ${result.reason}` : result.state === "loaded" ? "loaded" : "not loaded"} (${kind}${installationKind ? `, ${installationKind}` : ""})`,
     );
   }
   if (existsSync(join(dir, ".git"))) {
