@@ -7,6 +7,7 @@ import * as junit from "../src/gates/junit.ts";
 import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import { retryFailures, runGates, targetedRetrySkipReason, validateRetry } from "../src/gates/run.ts";
 import { BunTestCoverage, MAX_TEST_IDENTITY_LENGTH } from "../src/gates/test-coverage.ts";
+import * as identityModule from "../src/gates/text-privacy.ts";
 import { gateIdentities, gatePrivacyScope, IDENTITY_CAP, withheldText } from "../src/gates/text-privacy.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { coveringTestCommand } from "../src/pipeline/covering-tests.ts";
@@ -287,6 +288,58 @@ test("capture cap and raw confinement scan remain independent of privacy withhol
   expect(r.failures).toBeUndefined();
 });
 
+test.each([true, false])("capture overflow invalidates evidence on a passing=%s report", async (ok) => {
+  const f = fixture(),
+    old = privacyLimits.inputUnits;
+  writeFileSync(join(f.cwd, "a.test.ts"), "");
+  const xml = `<testsuite tests="1" failures="${ok ? 0 : 1}" errors="0" skipped="0"><testcase file="a.test.ts" name="case">${ok ? "" : "<failure/>"}</testcase></testsuite>`;
+  const output = `a.test.ts:\n(${ok ? "pass" : "fail"}) case\n${"padding\n".repeat(100)}${ok ? 1 : 0} pass\n${ok ? 0 : 1} fail\nRan 1 test across 1 file.`;
+  writeFileSync(
+    join(f.cwd, "emit.ts"),
+    `import {writeFileSync} from "node:fs";writeFileSync(process.env.LIMITLESS_GATE_REPORT, ${JSON.stringify(xml)});console.log(${JSON.stringify(output)});process.exitCode=${ok ? 0 : 1};`,
+  );
+  try {
+    privacyLimits.inputUnits = 400;
+    const run = await f.scoped(() =>
+      confinementScope.run(fakeConfinement, () =>
+        runGates(f.cwd, config([{ name: "test", run: "bun emit.ts" }]), new AbortController().signal),
+      ),
+    );
+    const r = run.checks[0];
+    if (!r) throw Error("Missing gate result");
+    expect(r.ok).toBe(ok);
+    expect(r.output).toBe(withheldText("capture-cap"));
+    expect(r.testCoverage?.skippedTestsIncomplete).toBe(true);
+    expect(r.failureAttributionComplete).toBe(false);
+    expect(targetedRetrySkipReason(undefined, r, config([]), f.cwd)).toStartWith(
+      ok ? "no nonzero exit status" : "failure attribution incomplete",
+    );
+    expect(
+      verifier(f.registry, f.signer).verify(r.textPrivacy?.identities, "identities", gateIdentities(r)),
+    ).toBe(true);
+  } finally {
+    privacyLimits.inputUnits = old;
+  }
+});
+
+test("identity construction exceptions return fixed unsigned output and identities", async () => {
+  const f = fixture();
+  const spy = spyOn(identityModule, "gateIdentities").mockImplementation(() => {
+    throw Error("PRIVATE-IDENTITY-DETAIL");
+  });
+  try {
+    const r = await f.gate("safe captured diagnostic");
+    expect(r.output).toBe(withheldText("checker-failed"));
+    expect(r.textPrivacy).toEqual({
+      output: { withheld: true, reason: "checker-failed" },
+      identities: { withheld: true, reason: "checker-failed" },
+    });
+    expect(r.failures).toBeUndefined();
+  } finally {
+    spy.mockRestore();
+  }
+});
+
 test("only the exact startup prefix is removed; earlier stdout invalidates the capture", async () => {
   const f = fixture(),
     later = "limitless-started-00000000-0000-0000-0000-000000000000\n";
@@ -420,20 +473,67 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
     });
     expect(calls).toHaveLength(4);
     expect(new Set(calls).size).toBe(4);
-    const rejected = validateRetry({ ...r, ok: true }, r, "checked", {
-      sha: "executed",
-      trackedClean: true,
-      provenanceError: "SECRET-GIT-TEXT",
-    });
-    expect(rejected.output).toBe(
-      `${r.output}\n\nRetry rejected: execution SHA executed does not match checked commit checked`,
+    const rejections: string[] = [];
+    const rejected = validateRetry(
+      { ...r, ok: true },
+      r,
+      "checked",
+      {
+        sha: "executed",
+        trackedClean: true,
+        provenanceError: "SECRET-GIT-TEXT",
+      },
+      (_original, reason) => rejections.push(reason),
     );
+    expect(rejected.output).toBe(withheldText("retry-rejected"));
+    expect(rejected.textPrivacy?.output).toEqual({ withheld: true, reason: "retry-rejected" });
+    expect(rejected.failures).toBeUndefined();
+    expect(rejected.firstAttempt).toBe(r);
+    expect(
+      verifier(f.registry, f.signer).verify(rejected.firstAttempt?.textPrivacy?.output, "output", r.output),
+    ).toBe(true);
+    expect(
+      verifier(f.registry, f.signer).verify(rejected.retryAttempt?.textPrivacy?.output, "output", r.output),
+    ).toBe(true);
+    expect(rejections).toEqual([
+      "Retry rejected: execution SHA executed does not match checked commit checked",
+    ]);
     expect(rejected.output).not.toContain("SECRET-GIT-TEXT");
     expect(rejected.retryAttempt?.executionProvenance?.provenanceError).toBe("SECRET-GIT-TEXT");
   } finally {
     running = false;
     for (const spy of spies) spy.mockRestore();
   }
+});
+
+test("retry setup failure withholds composition containing a private command", async () => {
+  const f = fixture(["private-case"]);
+  const original = await f.gate("original diagnostic");
+  const setup = await f.gate("setup diagnostic", "", { run: "bun emit.ts; : private-case; exit 1" });
+  expect(setup.textPrivacy?.identities).toEqual({ withheld: true, reason: "private-match" });
+  const results = await retryFailures(
+    [{ check: { name: original.name, run: original.command }, original }],
+    f.cwd,
+    config([]),
+    new AbortController().signal,
+    undefined,
+    async () => ({ setupOk: false, setup: [setup], checks: [] }),
+  );
+  const r = results.get(original);
+  expect(r?.output).toBe(withheldText("retry-setup-failed"));
+  expect(r?.textPrivacy?.output).toEqual({ withheld: true, reason: "retry-setup-failed" });
+  expect(r?.failures).toBeUndefined();
+  expect(r?.firstAttempt).toBe(original);
+  expect(
+    verifier(f.registry, f.signer).verify(r?.firstAttempt?.textPrivacy?.output, "output", original.output),
+  ).toBe(true);
+});
+
+test("command-only private identity is protected", async () => {
+  const f = fixture(["private-command"]);
+  const r = await f.gate("safe", "", { run: "bun emit.ts; : private-command; exit 1" });
+  expect(r.output).toBe("safe");
+  expect(r.textPrivacy?.identities).toEqual({ withheld: true, reason: "private-match" });
 });
 
 test("JUnit reports parse up to the measured 256 KiB cap and fall back above it", () => {

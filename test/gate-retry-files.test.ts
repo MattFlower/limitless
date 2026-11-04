@@ -17,6 +17,7 @@ import {
   targetedRetrySkipReason,
 } from "../src/gates/run.ts";
 import { agentTestSlots, gateSlots } from "../src/gates/slots.ts";
+import { withheldText } from "../src/gates/text-privacy.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
@@ -285,9 +286,8 @@ test.each(["targeted only", "targeted", "full"])(
           branch === "full" || (!reason && branch === "targeted") ? [true, false] : [true],
         );
         if (reason) {
-          expect(result?.output).toContain(reason);
-          expect(result?.failures).toContain(reason);
-          expect(result?.failures).toContain("original assertion");
+          expect(result?.output).toBe(withheldText("retry-rejected"));
+          expect(result?.failures).toBe(original.failures);
           expect(skipped[0]).toContain(reason);
           expect(result?.confinementError).toBe(false);
         } else expect(skipped).toEqual([]);
@@ -324,10 +324,7 @@ test.each(["tracked", "untracked"])("standalone regression retry writing %s file
       blocking: kind === "tracked",
       result: { ok: kind === "untracked", firstAttempt: original },
     });
-    if (kind === "tracked")
-      expect(comparison?.result.output).toContain(
-        "Retry rejected: tracked checkout cleanliness was not confirmed",
-      );
+    if (kind === "tracked") expect(comparison?.result.output).toBe(withheldText("retry-rejected"));
   } finally {
     f.close();
   }
@@ -375,7 +372,7 @@ test.each([false, true])("local retries preserve setup output (executor: %s)", a
 });
 
 test.each(["targeted", "full", "targeted only"])(
-  "a failed %s retry setup preserves the original failure and setup evidence",
+  "a failed %s retry setup preserves the original failure and withholds composed output",
   async (kind) => {
     const f = await retryFixture();
     try {
@@ -404,9 +401,8 @@ test.each(["targeted", "full", "targeted only"])(
       expect(calls).toBe(1);
       const result = results.get(original);
       expect(result).toMatchObject({ ok: false, command: original.command, firstAttempt: original });
-      expect(result?.output).toContain("failed\n\nRetry setup failed:");
-      expect(result?.output).toContain(`$ ${cfg.setup[0]}`);
-      expect(result?.output).toContain("dependency install failed");
+      expect(result?.output).toBe(withheldText("retry-setup-failed"));
+      expect(result?.textPrivacy?.output).toEqual({ withheld: true, reason: "retry-setup-failed" });
     } finally {
       f.close();
     }

@@ -8,14 +8,16 @@ import { gatePrivacyScope, type TextPrivacy, withheldText } from "./text-privacy
 /** Only complete captures enter the checker; process tails are never evidence. */
 export async function protectGateOutput(
   res: ProcResult,
-  identities: string,
+  identities: string | (() => string),
   control: { signal?: AbortSignal; deadline: number },
 ): Promise<{ output: string; textPrivacy: TextPrivacy }> {
   const withheld = (reason: string): TextPrivacy["output"] => ({ withheld: true, reason });
   let output = "",
     field = withheld("checker-failed"),
-    identityField = withheld(identities === "identity-cap" ? "identity-cap" : "checker-failed");
+    identityField = withheld("checker-failed");
   try {
+    identities = typeof identities === "function" ? identities() : identities;
+    if (identities === "identity-cap") identityField = withheld("identity-cap");
     const scope = gatePrivacyScope.getStore(),
       checker = scope?.checker ?? getPrivacyChecker(),
       registry = scope?.registry ?? checker.registry;

@@ -1412,6 +1412,7 @@ test.each(["pass", "cancel", "stop"])("local targeted land retry keeps its slot 
       truncated: false,
       stdout: "output",
       stderr: "",
+      capture: { provenance: { kind: "complete" }, stdout: `${opts.cmd[4]}\noutput`, stderr: "" },
       durationMs: 1,
     };
   });

@@ -27,7 +27,7 @@ import {
 import { protectGateOutput } from "./output-privacy.ts";
 import { acquireGateSlot, type GatePriority } from "./slots.ts";
 import { BunTestCoverage, type TestCoverage } from "./test-coverage.ts";
-import { attributionReason, gateIdentities, type TextPrivacy } from "./text-privacy.ts";
+import { attributionReason, gateIdentities, type TextPrivacy, withheldText } from "./text-privacy.ts";
 
 export interface GateResult {
   textPrivacy?: TextPrivacy;
@@ -245,9 +245,12 @@ async function runOne(
     result.failureAttributionComplete = false;
   };
   // Proved identities are the final result's: overflow metadata is applied before materializing them.
-  if (overflow || coverage.overflow) incomplete();
-  const identities = gateIdentities(result);
-  if (identities === "identity-cap") incomplete();
+  if (overflow || coverage.overflow || res.capture?.provenance.kind !== "complete") incomplete();
+  const identities = () => {
+    const text = gateIdentities(result);
+    if (text === "identity-cap") incomplete();
+    return text;
+  };
   return Object.assign(
     result,
     await protectGateOutput(res, identities, { signal, deadline: Date.now() + 120_000 }),
@@ -386,7 +389,8 @@ function retrySetupFailure(original: GateResult, run: GateRun): GateResult {
   return {
     ...original,
     firstAttempt: original,
-    output: `${original.output}\n\nRetry setup failed:\n$ ${failed?.command ?? "setup"}\n${failed?.failures ?? ""}\n${failed?.output ?? "No setup result"}`,
+    output: withheldText("retry-setup-failed"),
+    textPrivacy: { ...original.textPrivacy, output: { withheld: true, reason: "retry-setup-failed" } },
     confinementError: confinementFailed(original) || confinementFailed(failed),
   };
 }
@@ -421,8 +425,8 @@ export function validateRetry(
     firstAttempt: original,
     retryAttempt: result,
     confinementError: confinementFailed(original),
-    output: `${original.output}\n\n${diagnostic}`,
-    ...(original.failures ? { failures: `${original.failures}\n\n${diagnostic}` } : {}),
+    output: withheldText("retry-rejected"),
+    textPrivacy: { ...original.textPrivacy, output: { withheld: true, reason: "retry-rejected" } },
   };
 }
 
