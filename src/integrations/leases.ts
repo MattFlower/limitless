@@ -91,9 +91,9 @@ export async function createLeaseManager(deps: {
     if (!current(h) || a?.tip !== store.leaseRow(h.repo, h.ref)?.confirmed?.tip) return false;
     return windowOpen(a?.anchor ?? null, clock.sample());
   }
-  async function reconcile(repo: string, ref: string, signal?: AbortSignal) {
+  async function reconcile(repo: string, ref: string, signal?: AbortSignal, observe = false) {
     const row = store.leaseRow(repo, ref);
-    const result = await reconcileLeaseIntent({ client, store, signal }, repo, ref);
+    const result = await reconcileLeaseIntent({ client, store, signal, observe }, repo, ref);
     if (result === "superseded") lose(row, null);
     if (result === "dropped" && !store.leaseRow(repo, ref)?.confirmed) store.forgetLease(repo, ref);
     return result;
@@ -246,7 +246,7 @@ export async function createLeaseManager(deps: {
     async settle(repo, ref) {
       repo = canonicalRepo(repo);
       return locked(repo, ref, async () =>
-        (await reconcile(repo, ref)) === "pending" ? "pending" : "settled",
+        (await reconcile(repo, ref, undefined, true)) === "pending" ? "pending" : "settled",
       );
     },
     windowOpen: open,

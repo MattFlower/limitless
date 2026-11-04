@@ -1361,3 +1361,29 @@ test("settle is canonical, reconciles pending intents and sends no claim write",
   expect(f.gh.calls("commit")).toHaveLength(0);
   expect(f.gh.calls("update")).toHaveLength(0);
 });
+
+test("settle leaves an unapplied release pending without replaying it", async () => {
+  const f = fixture(),
+    manager = await f.create();
+  const h = held(await f.acquire(manager)).handle;
+  const before = f.gh.refs.get(f.gh.key(repo, ref));
+  f.store.beginLeaseIntent(repo, ref, h.run, {
+    op: "release",
+    before: f.row()?.confirmed?.tip ?? "",
+    record: { ...f.tip(), state: "released" },
+    commit: null,
+  });
+  f.gh.requests = [];
+  expect(await manager.settle(repo, ref)).toBe("pending");
+  expect(await manager.settle(repo, ref)).toBe("pending");
+  expect(f.gh.calls("commit")).toHaveLength(0);
+  expect(f.gh.calls("update")).toHaveLength(0);
+  expect(f.gh.refs.get(f.gh.key(repo, ref))).toBe(before);
+  expect(f.tip().state).toBe("held");
+  expect(f.row()).toMatchObject({ confirmed: { state: "held" }, intent: { op: "release" } });
+  // A writing caller still replays the journaled release.
+  expect(await manager.update(h, {})).toBe("obsolete");
+  expect(f.gh.calls("update")).toHaveLength(1);
+  expect(f.tip().state).toBe("released");
+  expect(f.row()).toMatchObject({ confirmed: { state: "released" }, intent: null });
+});
