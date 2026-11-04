@@ -15,6 +15,7 @@ import {
 import { consumerRegistry } from "./benchmark-gate-consumers.ts";
 import * as bench from "./benchmark-privacy-boundary.ts";
 
+const defaultWorkloads = Object.keys(registry);
 Object.assign(registry, consumerRegistry);
 
 export { environment, operation, registry, validate } from "../test/benchmark-gate-output-support.ts";
@@ -112,7 +113,7 @@ export async function worker(root: string, name: string) {
   }
   return { pid: process.pid, name, unavailable, ...(await bench.measureWorker(root, undefined, operations)) };
 }
-export async function compare(refs: string[], names: string[], invoke = bench.launch) {
+export async function compare(refs: string[], names = defaultWorkloads, invoke = bench.launch) {
   const usage = "usage: bun scripts/benchmark-gate-output.ts <baseline-ref> <candidate-ref> [workloads]";
   if (refs.length !== 2) throw Error(`expected two refs, got ${refs.length}; ${usage}`);
   const unknown = names.filter((n) => !Object.hasOwn(registry, n));
@@ -139,7 +140,7 @@ if (import.meta.main) {
     const result =
       args[0] === "--worker"
         ? await worker(args[1] ?? "", args[2] ?? "")
-        : await compare(args.slice(0, 2), args.length > 2 ? args.slice(2) : Object.keys(registry));
+        : await compare(args.slice(0, 2), args.length > 2 ? args.slice(2) : undefined);
     console.log(JSON.stringify(result));
   } catch (error) {
     const where = args[0] === "--worker" ? `worker ${args[2]}` : "benchmark-gate-output";

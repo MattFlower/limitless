@@ -69,10 +69,48 @@ export function projectionOutcome(
   return released ? "50 released baseline/proven results" : "50 withheld results";
 }
 export function consumerCounters(name: string, value: unknown) {
-  if (name === "event-drain") return value;
+  if (name === "event-drain")
+    return {
+      count: 50000,
+      gates: 5000,
+      pages: field(value, "pages"),
+      unsubscribed: field(value, "unsubscribed"),
+    };
   if (name === "events") return { sinkEvents: value };
   if (name === "render-prompts") return { renderedResults: 50 };
   return undefined;
+}
+/** Decode and validate retained SSE bytes only after the measured consumer turns have ended. */
+export function drainOutcome(value: unknown) {
+  const chunks = field(value, "chunks");
+  validate(Array.isArray(chunks) && chunks.every((c) => c instanceof Uint8Array), "SSE chunks");
+  const frames = Buffer.concat(chunks as Uint8Array[])
+    .toString()
+    .split("\n\n");
+  validate(frames.pop() === "", "complete SSE frames");
+  let count = 0,
+    gates = 0;
+  for (const frame of frames) {
+    if (frame.startsWith(":")) continue;
+    const data = frame.split("\n").find((s) => s.startsWith("data: "));
+    validate(data, "SSE data frame");
+    const msg = JSON.parse(String(data).slice(6));
+    validate(
+      msg.kind === "event" &&
+        msg.event.id === ++count &&
+        msg.event.message === `event-${count - 1}` &&
+        msg.event.type === ((count - 1) % 10 ? "log" : "gate"),
+      "SSE order",
+    );
+    if (msg.event.type === "gate") gates++;
+  }
+  return validate(
+    count === 50000 &&
+      gates === 5000 &&
+      Number(field(value, "pages")) > 0 &&
+      field(value, "unsubscribed") === 1,
+    "50000 ordered events; 5000 gate events; stream closed",
+  );
 }
 const invoke = (c: Context, name: string, ...args: unknown[]) => (c.a[name] as Fn)(...args);
 const fixtureSnapshot = (c: Context) =>
