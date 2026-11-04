@@ -77,6 +77,7 @@ const TRANSIENT = [
   /unable to access .*(Failed to connect|timed out|Recv failure|returned error: (5\d\d|429))/i,
   /could not resolve host/i,
   /ssh: connect to host .*(timed out|refused|unreachable)/i,
+  /(?:^|\s)git@github\.com: Permission denied \(publickey\)/,
   /kex_exchange_identification: |connection (reset|closed) by /i,
   /i\/o timeout|TLS handshake timeout/i,
   /(early|unexpected) EOF|": EOF\b/i,
