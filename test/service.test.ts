@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import { inspectService, installationUnits, stableExecutable } from "../src/cli/service.ts";
+import { inspectService, installationUnits, installedUnits, stableExecutable } from "../src/cli/service.ts";
 import { inspectionCases, inspectionResult } from "./service-inspection-support.ts";
 
 for (const domain of ["gui", "user"] as const)
@@ -114,7 +114,7 @@ type MigrationResult = {
   firstCalls: string[];
   recoveries: { error: string; phase: string; retained: boolean }[];
   discovered: string[];
-  discoveredUnits: { label: string; path: string; kind: string }[];
+  discoveredUnits: Awaited<ReturnType<typeof installedUnits>>;
   intent: boolean;
   original: string;
   stable: string;
@@ -247,6 +247,284 @@ test("packaged stable executable preserves a local bin path", () => {
   expect(stableExecutable(executable)).toBe(executable);
 });
 
+test("cross-kind discovery preserves canonical source ownership and exact packaged signatures", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "limitless-discovery-"));
+  migrationDirs.push(dir);
+  const entry = join(dir, "src/cli/main.ts");
+  const binary = join(dir, "Cellar/limitless/1/bin/limitless");
+  const stable = join(dir, "opt/limitless/bin/limitless");
+  const agents = join(dir, "agents");
+  for (const file of [entry, binary]) {
+    mkdirSync(join(file, ".."), { recursive: true });
+    writeFileSync(file, "");
+  }
+  mkdirSync(join(dir, "opt"));
+  symlinkSync(join(dir, "Cellar/limitless/1"), join(dir, "opt/limitless"));
+  const alias = join(dir, "entry-alias.ts");
+  symlinkSync(entry, alias);
+  const bunAlias = join(dir, "impostor/limitless");
+  mkdirSync(join(bunAlias, ".."));
+  symlinkSync(process.execPath, bunAlias);
+  // Aliases named limitless that resolve to an unrelated program, another Bun, or nothing at all.
+  const otherBun = join(dir, "other-bun/bin/bun");
+  mkdirSync(join(otherBun, ".."), { recursive: true });
+  writeFileSync(otherBun, "");
+  const aliases = ["/bin/echo", otherBun, join(dir, "missing/limitless")].map((target, i) => {
+    const link = join(dir, `alias-${i}/limitless`);
+    mkdirSync(join(link, ".."));
+    symlinkSync(target, link);
+    return link;
+  });
+  mkdirSync(agents);
+  const path = join(agents, "legacy.plist");
+  writeFileSync(path, "converted by injected plutil");
+  const cases: { caller: "source" | "packaged"; args: string[]; expected?: string; marker?: string }[] = [
+    { caller: "source", args: [binary, "serve"], expected: "daemon" },
+    { caller: "source", args: [stable, "executor"], expected: "executor" },
+    { caller: "source", args: [bunAlias, "serve"] },
+    ...aliases.map((alias) => ({ caller: "source" as const, args: [alias, "serve"] })),
+    { caller: "source", args: [process.execPath, "serve"] },
+    { caller: "source", args: ["limitless", "serve"] },
+    { caller: "source", args: [join(dir, "other-program"), "serve"] },
+    { caller: "source", args: [binary, "executor", "--extra"] },
+    { caller: "source", args: [binary, "serve"], marker: "executor" },
+    { caller: "packaged", args: [process.execPath, alias, "serve", "--extra"], expected: "daemon" },
+    { caller: "packaged", args: [process.execPath, entry, "executor"], expected: "executor" },
+    { caller: "packaged", args: [process.execPath, join(dir, "unrelated/main.ts"), "serve"] },
+    { caller: "packaged", args: [process.execPath, "run", entry, "serve"] },
+    { caller: "packaged", args: [process.execPath, entry, "serve"], marker: "executor" },
+    { caller: "packaged", args: [binary, "serve"] },
+  ];
+  for (const { caller, args, expected, marker } of cases) {
+    const units = await installedUnits({
+      agentsDir: agents,
+      releaseDir: dir,
+      execPath: caller === "source" ? process.execPath : binary,
+      release:
+        caller === "source"
+          ? { kind: "source", root: dir, version: "1", bun: Bun.version }
+          : { kind: "packaged", sha: "a".repeat(40), version: "1", bun: Bun.version },
+      command: async () => ({
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify({
+          Label: "custom.unit",
+          ProgramArguments: args,
+          LimitlessService: marker,
+        }),
+      }),
+    });
+    expect({ args, units }).toEqual({
+      args,
+      units: expected
+        ? [
+            {
+              label: "custom.unit",
+              path,
+              kind: expected,
+              installKind: caller === "source" ? "packaged" : "source",
+            },
+          ]
+        : [],
+    });
+  }
+});
+
+for (const caller of ["source", "packaged"] as const) {
+  const installed = caller === "source" ? "packaged" : "source";
+  for (const role of ["daemon", "executor"]) {
+    test(`${caller} discovers an opposite-kind ${role} with its own metadata`, async () => {
+      const { result: r } = await migration(`cross-${caller}-program-absent`, role);
+      expect(r.error).toBe("");
+      expect(r.discoveredUnits).toEqual([
+        {
+          label: `arbitrary.installed.${role}`,
+          path: join(
+            migrationDirs.at(-1) ?? "",
+            caller === "packaged" ? "isolated-agents" : "Library/LaunchAgents",
+            `${role}-original.plist`,
+          ),
+          kind: role,
+          installKind: installed,
+        },
+      ]);
+    });
+  }
+  for (const program of ["equal", "symlink", "mismatch", "invalid", "unresolvable"])
+    test(`${caller} checks an opposite-kind daemon's ${program} Program`, async () => {
+      const { result: r } = await migration(`cross-${caller}-program-${program}`);
+      expect(r.error).toBe("");
+      expect(r.discovered).toEqual(["equal", "symlink"].includes(program) ? ["daemon"] : []);
+      expect(r.calls).toEqual([]);
+    });
+
+  test(`${caller} migrates opposite-kind daemon and executor through the journal`, async () => {
+    const { result: r } = await migration(`cross-${caller}-migration`);
+    expect(r.error).toBe("");
+    expect(r.backupBeforeStop).toBe(true);
+    expect(r.calls).toEqual([
+      "drain",
+      "health draining",
+      "active stage",
+      "health draining",
+      "bootout arbitrary.installed.daemon",
+      "bootstrap dev.limitless.daemon",
+      "health fresh",
+      "bootout arbitrary.installed.executor",
+      "disable arbitrary.installed.executor",
+      "enable dev.limitless.executor",
+      "bootstrap dev.limitless.executor",
+      "enable dev.limitless.executor",
+    ]);
+    for (const role of ["daemon", "executor"]) {
+      expect(r.files[`${role}-original.plist`]).toBeUndefined();
+      const action = role === "daemon" ? "serve" : "executor";
+      expect(r.parsedUnits[`dev.limitless.${role}.plist`]?.ProgramArguments).toEqual(
+        caller === "packaged"
+          ? [r.executable, action]
+          : [
+              join(migrationDirs.at(-1) ?? "", ".bun/bin/bun"),
+              join(migrationDirs.at(-1) ?? "", "app & release/src/cli/main.ts"),
+              action,
+            ],
+      );
+    }
+    expect(r.loaded.sort()).toEqual(["dev.limitless.daemon", "dev.limitless.executor", "other.program"]);
+    expect(r.discoveredUnits.map((unit) => unit.installKind)).toEqual([caller, caller]);
+    expect(r.journals).toEqual([]);
+    expect(r.lock).toBe(false);
+  });
+
+  for (const failure of ["bootstrap", "wrong-sha"])
+    test(`${caller} restores an opposite-kind daemon after ${failure} and retries from disk`, async () => {
+      const { result: r } = await migration(`cross-${caller}-${failure}`);
+      expect(r.error).toContain(
+        failure === "bootstrap"
+          ? "replacement bootstrap failed"
+          : `expected ${caller === "packaged" ? "a".repeat(40) : "current"}`,
+      );
+      expect(r.files["daemon-original.plist"]).toBe(r.old);
+      expect(r.files["dev.limitless.daemon.plist"]).toBeUndefined();
+      expect(r.loaded).toContain("arbitrary.installed.daemon");
+      expect(r.backup).toBe(r.old);
+      expect(r.phase).toBe("restored");
+      if (failure === "bootstrap") {
+        const dir = migrationDirs.at(-1) ?? "";
+        const journal = join(dir, ".limitless/service-backup/dev.limitless.daemon.json");
+        const state = JSON.parse(readFileSync(journal, "utf8"));
+        // Recreate process loss after the old plist was removed, using the durable backup alone.
+        writeFileSync(journal, JSON.stringify({ ...state, phase: "replacing" }));
+        rmSync(state.old.path);
+        writeFileSync(
+          join(dir, "loaded.json"),
+          JSON.stringify(r.loaded.filter((label) => label !== state.old.label)),
+        );
+        const { result: restored } = await migration(`cross-${caller}-recover-install`, "daemon", dir);
+        expect(restored.error).toContain("Recovered previous agent arbitrary.installed.daemon");
+        expect(restored.files["daemon-original.plist"]).toBe(r.old);
+        expect(restored.loaded).toContain("arbitrary.installed.daemon");
+        expect(restored.phase).toBe("restored");
+      }
+      const { result: recovered } = await migration(
+        `cross-${caller}-recover-install`,
+        "daemon",
+        migrationDirs.at(-1),
+      );
+      expect(recovered.error).toBe("");
+      expect(recovered.journals).toEqual([]);
+      expect(recovered.loaded).toContain("dev.limitless.daemon");
+    });
+
+  test(`${caller} safely rolls back an opposite-kind executor replacement`, async () => {
+    const { result: r } = await migration(`cross-${caller}-bootstrap`, "executor");
+    expect(r.error).toContain("replacement bootstrap failed");
+    expect(r.files["executor-original.plist"]).toBe(r.old);
+    expect(r.files["dev.limitless.executor.plist"]).toBeUndefined();
+    expect(r.loaded).not.toContain("arbitrary.installed.executor");
+    expect(r.disabled).toContain("arbitrary.installed.executor");
+    expect(r.phase).toBe("restored");
+    expect(r.backup).toBe(r.old);
+    const dir = migrationDirs.at(-1) ?? "";
+    const journal = join(dir, ".limitless/service-backup/dev.limitless.executor.json");
+    const state = JSON.parse(readFileSync(journal, "utf8"));
+    writeFileSync(journal, JSON.stringify({ ...state, phase: "replacing" }));
+    rmSync(state.old.path);
+    const { result: recovered } = await migration(
+      `cross-${caller}-recover-install`,
+      "executor",
+      migrationDirs.at(-1),
+    );
+    expect(recovered.error).toBe("");
+    expect(recovered.loaded).toContain("dev.limitless.executor");
+    expect(recovered.journals).toEqual([]);
+  });
+
+  for (const scenario of ["duplicate", "path-collision", "collision"])
+    test(`${caller} preflights opposite-kind ${scenario} before migration`, async () => {
+      const { result: r } = await migration(`cross-${caller}-${scenario}`);
+      expect(r.error).toContain(
+        scenario === "duplicate"
+          ? "multiple installed daemon"
+          : scenario === "path-collision"
+            ? "unrelated agent"
+            : "unrecognized agent",
+      );
+      expect(r.files["daemon-original.plist"]).toBe(r.old);
+      expect(r.loaded).toContain("arbitrary.installed.daemon");
+      expect(r.calls).toEqual([]);
+      expect(r.journals).toEqual([]);
+    });
+
+  test(`${caller} refuses unknown destination inspection before cross-kind migration`, async () => {
+    const { result: r } = await migration(
+      `cross-${caller}-inspection-collision`,
+      "daemon",
+      undefined,
+      "permission",
+    );
+    expect(r.error).toContain("launchctl print");
+    expect(r.files["daemon-original.plist"]).toBe(r.old);
+    expect(r.loaded).toContain("arbitrary.installed.daemon");
+    expect(r.calls).toEqual([]);
+    expect(r.journals).toEqual([]);
+  });
+
+  test(`${caller} removes an unselected opposite-kind executor after daemon migration`, async () => {
+    const { result: r } = await migration(`cross-${caller}-unselected`);
+    expect(r.error).toBe("");
+    expect(r.calls.slice(-2)).toEqual([
+      "bootout arbitrary.installed.executor",
+      "disable arbitrary.installed.executor",
+    ]);
+    expect(r.files["executor-original.plist"]).toBeUndefined();
+    expect(r.loaded).not.toContain("dev.limitless.executor");
+  });
+
+  for (const [role, inspection] of [
+    ["daemon", "loaded"],
+    ["executor", "absent"],
+    ["executor", "permission"],
+  ])
+    test(`${caller} status identifies opposite-kind ${role} (${inspection})`, async () => {
+      const { stdout, result: r } = await migration(
+        `cross-${caller}-inspection-status`,
+        role,
+        undefined,
+        inspection,
+      );
+      const state = inspection === "loaded" ? "loaded" : inspection === "absent" ? "not loaded" : "unknown:";
+      expect(stdout).toContain(`arbitrary.installed.${role}: ${state}`);
+      expect(stdout).toContain(`(${role}, ${installed})`);
+      if (inspection === "permission") expect(stdout).toContain("Operation not permitted");
+      expect(r.calls).toEqual(["health fresh"]);
+    });
+  test(`${caller} status can exclude an opposite-kind executor`, async () => {
+    const { stdout, result: r } = await migration(`cross-${caller}-status-filtered`, "executor");
+    expect(stdout).not.toContain("arbitrary.installed.executor:");
+    expect(r.commands.some((args) => args[0] === "launchctl")).toBe(false);
+  });
+}
+
 test("packaged fresh install uses stable arguments, data home, explicit environment and build SHA", async () => {
   const { result: r } = await migration("packaged-fresh");
   expect(r.error).toBe("");
@@ -323,7 +601,20 @@ for (const failure of ["bootstrap", "health"]) {
   });
 }
 
-for (const scenario of ["source", "extra", "invalid"]) {
+test("packaged install migrates a recognized source daemon at the destination", async () => {
+  const { result: r } = await migration("packaged-source");
+  expect(r.error).toBe("");
+  expect(r.calls.slice(0, 4)).toEqual([
+    "drain",
+    "health draining",
+    "bootout dev.limitless.daemon",
+    "bootstrap dev.limitless.daemon",
+  ]);
+  expect(r.parsedUnits["dev.limitless.daemon.plist"]?.ProgramArguments).toEqual([r.stable, "serve"]);
+  expect(r.journals).toEqual([]);
+});
+
+for (const scenario of ["extra", "invalid"]) {
   test(`packaged install preserves a loaded ${scenario} unit without draining or stopping`, async () => {
     const { result: r } = await migration(`packaged-${scenario}`);
     expect(r.error).toContain(scenario === "invalid" ? "stable executable" : "unrelated agent");
@@ -1231,7 +1522,7 @@ for (const stuck of [false, true]) {
     }
   });
 }
-for (const mode of ["source", "packaged"]) {
+for (const mode of ["source", "packaged"] as const) {
   test(`${mode} executor discovery returns its actual label and path`, async () => {
     const { result: r } = await migration(`${mode}-program-absent`, "executor");
     expect(r.error).toBe("");
@@ -1240,6 +1531,7 @@ for (const mode of ["source", "packaged"]) {
       {
         label: "arbitrary.installed.executor",
         kind: "executor",
+        installKind: mode,
         path: join(
           migrationDirs.at(-1) ?? "",
           mode === "packaged" ? "isolated-agents" : "Library/LaunchAgents",
