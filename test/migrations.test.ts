@@ -1104,3 +1104,47 @@ test("after the review-round migration the previous release still opens the data
     reopened.close();
   });
 });
+
+test("checkpoint ledger is additive and previous-release writes survive rollback", () => {
+  temporary((directory, path) => {
+    const before = join(directory, "before");
+    cpSync(MIGRATION_DIR, before, {
+      recursive: true,
+      filter: (src) => !src.endsWith("-shared-checkpoints.sql"),
+    });
+    let store = new Store(path, before);
+    store.setSetting("sentinel", "preserved");
+    store.close();
+    store = new Store(path);
+    expect(store.getSetting("sentinel", "")).toBe("preserved");
+    store.journalCheckpoint("run", {
+      generation: 1,
+      sequence: 0,
+      pointer: "checkpoint",
+      manifest: "opaque",
+      commits: [],
+    });
+    const row = store.checkpointRecord("run");
+    store.close();
+    store = new Store(path, before);
+    store.setSetting("rollback", "written");
+    const repo = store.upsertRepo({
+      slug: "owner/project",
+      kind: "github",
+      url: null,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "previous release" });
+    store.close();
+    store = new Store(path);
+    try {
+      expect(store.checkpointRecord("run")).toEqual(row);
+      expect(store.getSetting("rollback", "")).toBe("written");
+      expect(store.getRun(run.id)?.prompt).toBe("previous release");
+    } finally {
+      store.close();
+    }
+  });
+});

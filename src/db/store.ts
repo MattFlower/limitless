@@ -69,6 +69,7 @@ import { activity } from "../util/stall.ts";
 import { FailureObservations, type ObservationFilter } from "./failure-observations.ts";
 import { MIGRATION_DIR, runMigrations } from "./migration-runner.ts";
 import type { OwnerDiagnostic } from "./owner-diagnostics.ts";
+import { checkpointMethods } from "./shared-checkpoints.ts";
 import { timeStatements } from "./timing.ts";
 
 type RoundObservation = {
@@ -533,6 +534,14 @@ function buildUpdate(patch: object, columns: Record<string, string>): { sets: st
 }
 
 export class Store {
+  private readonly checkpoints = checkpointMethods(this);
+  readonly checkpointRecord = this.checkpoints.checkpointRecord;
+  readonly journalCheckpoint = this.checkpoints.journalCheckpoint;
+  readonly confirmCheckpoint = this.checkpoints.confirmCheckpoint;
+  readonly dropPendingCheckpoint = this.checkpoints.dropPendingCheckpoint;
+  readonly markRunIndexed = this.checkpoints.markRunIndexed;
+  readonly setTerminalIntent = this.checkpoints.setTerminalIntent;
+  readonly clearTerminalIntent = this.checkpoints.clearTerminalIntent;
   private readonly leases = leaseMethods(this);
   readonly leaseRow = this.leases.leaseRow;
   readonly beginLeaseIntent = this.leases.beginLeaseIntent;
