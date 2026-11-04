@@ -30,7 +30,7 @@ export interface RunTransferCandidate extends OfflineTransferMaterial {
 }
 export interface RunTransferDependencies {
   source: Store;
-  offline: { store: Store; ownership: "exclusive-offline" };
+  offline?: { store: Store; ownership: "exclusive-offline" };
   manifestContext: Parameters<typeof captureRunTransferSnapshot>[2];
   key: () => string;
   objects: RunObjectIO;
@@ -106,7 +106,12 @@ export function createRunTransfer(deps: RunTransferDependencies) {
     digest: transferHash(new TextEncoder().encode(material.manifest)),
   });
   return {
-    exportRun(runId: string, repository: RunObjectExportInput["repository"], signal: AbortSignal) {
+    exportRun(
+      runId: string,
+      repository: RunObjectExportInput["repository"],
+      signal: AbortSignal,
+      reuse?: { commits: readonly string[]; objects: BlobRef; bytes: Uint8Array },
+    ) {
       return guarded(signal, () =>
         serializeTransfer(transferDatabaseIdentity(deps.source.db), runId, signal, async () => {
           if (deps.source.db.query("SELECT run_id FROM run_projections WHERE run_id = ?").get(runId)) {
@@ -132,8 +137,7 @@ export function createRunTransfer(deps: RunTransferDependencies) {
           const p = captured.payload,
             m = captured.context.manifest;
           const blobs = new Map<string, Uint8Array>();
-          const blob = (bytes: Uint8Array): BlobRef => {
-            const key = deps.key();
+          const blob = (bytes: Uint8Array, key = deps.key()): BlobRef => {
             if (!/^[a-f0-9]{32}$/i.test(key) || blobs.has(key)) throw new RunTransferError("invalid");
             blobs.set(key, new Uint8Array(bytes));
             return { key, digest: transferHash(bytes), size: bytes.byteLength };
@@ -143,17 +147,25 @@ export function createRunTransfer(deps: RunTransferDependencies) {
             ({ role, bytes }) => ({ ...blob(bytes), role }),
           );
           const expected = objectInput(p, m, new Uint8Array());
-          const bundle = await deps.objects.export(
-            {
-              repository: { ...repository },
-              runScope: m.runId,
-              commits: expected.requiredCommits,
-              objectFormat: expected.objectFormat,
-            },
-            signal,
-          );
+          const reused =
+            reuse &&
+            p.commits.length > 0 &&
+            JSON.stringify([...p.commits].sort()) === JSON.stringify([...reuse.commits].sort()) &&
+            reuse.bytes.byteLength === reuse.objects.size &&
+            transferHash(reuse.bytes) === reuse.objects.digest;
+          const bundle = reused
+            ? { bytes: reuse.bytes }
+            : await deps.objects.export(
+                {
+                  repository: { ...repository },
+                  runScope: m.runId,
+                  commits: expected.requiredCommits,
+                  objectFormat: expected.objectFormat,
+                },
+                signal,
+              );
           if (!!bundle !== !!p.commits.length) throw new RunTransferError("incomplete");
-          const objects = bundle ? [blob(bundle.bytes)] : [];
+          const objects = bundle ? [blob(bundle.bytes, reused ? reuse.objects.key : undefined)] : [];
           const final = { ...m, schema: 3 as const, blobs: { state, objects, artifacts } };
           const text = formatManifest(final);
           const validated = payload(final, blobs);
@@ -165,6 +177,8 @@ export function createRunTransfer(deps: RunTransferDependencies) {
     },
     importRun(input: RunTransferInput, signal: AbortSignal) {
       return guarded(signal, async () => {
+        const offline = deps.offline;
+        if (!offline) throw new RunTransferError("conflict");
         const text = input.manifest;
         const blobs = new Map(
           [...input.blobs].map(([key, bytes]) => {
@@ -179,13 +193,13 @@ export function createRunTransfer(deps: RunTransferDependencies) {
         decodeRunArtifacts(m, blobs, p);
         receiptManifest(text, transferHash(new TextEncoder().encode(text)), p.run.id);
         const source = transferDatabaseIdentity(deps.source.db),
-          target = transferDatabaseIdentity(deps.offline.store.db);
-        if (deps.offline.ownership !== "exclusive-offline" || source === target)
+          target = transferDatabaseIdentity(offline.store.db);
+        if (offline.ownership !== "exclusive-offline" || source === target)
           throw new RunTransferError("conflict");
         return serializeTransfer(target, m.runId, signal, async () => {
           await validateObjects(p, m, blobs, signal);
           signal.throwIfAborted();
-          return commitOfflineTransfer(deps.offline.store.db, { manifest: text, payload: p, blobs });
+          return commitOfflineTransfer(offline.store.db, { manifest: text, payload: p, blobs });
         });
       });
     },
