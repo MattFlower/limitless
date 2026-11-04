@@ -518,7 +518,7 @@ test("wrapper writes are synchronous, unlabelled/unregistered saves are local, l
     writeRun = spyOn(local, "writeRun");
   const commit = spyOn(f.committer, "commit"),
     wrapper = sharedCheckpointer(local, f.committer, (id) =>
-      id === f.run.id ? { binding: f.binding, signal: f.signal } : undefined,
+      id === f.run.id ? { binding: f.claim, signal: f.signal } : undefined,
     );
   const state = initialRunState(f.run),
     patch = { status: "running" as const };
@@ -537,8 +537,13 @@ test("wrapper writes are synchronous, unlabelled/unregistered saves are local, l
     saving = wrapper.checkpoint(f.run.id, "label");
   await hold.entered;
   expect(f.store.checkpointRecord(f.run.id)).toBeNull();
+  const queued = wrapper.checkpoint(f.run.id, "next"),
+    coalesced = wrapper.checkpoint(f.run.id, "latest");
   hold.release();
   expect(await saving).toBeUndefined();
+  const first = f.store.checkpointRecord(f.run.id)?.committed?.pointer;
+  await Promise.all([queued, coalesced]);
+  expect(manifest(f)).toMatchObject({ sequence: 2, previous: parsePointer(first ?? "")?.digest });
   f.suspend();
   await expect(wrapper.checkpoint(f.run.id, "label")).rejects.toMatchObject({ reason: "lease" });
 });

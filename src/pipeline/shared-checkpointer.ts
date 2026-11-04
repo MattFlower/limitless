@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import type { RunStatus } from "../core/types.ts";
 import { ClaimLostError, ClaimWaitError } from "../integrations/claim-errors.ts";
-import { claimGuard, claimScope, type ScopedClaim } from "../integrations/claim-guard.ts";
+import type { ScopedClaim } from "../integrations/claim-guard.ts";
 import type { ClaimClient } from "../integrations/claim-ref.ts";
 import type { LeaseManager } from "../integrations/leases.ts";
 import {
@@ -16,7 +16,8 @@ import { type Checkpointer, NeedsHumanError } from "./context.ts";
 type CommitClaim = Pick<ScopedClaim, "handle" | "onLost"> & { guard(): void };
 type Patch = { status: RunStatus };
 type Result = "committed" | "unchanged";
-export type ClaimContext = { binding: ScopedClaim; signal: AbortSignal };
+// Execution supplies a guard bound to its claim scope; checkpointing never creates authority.
+export type ClaimContext = { binding: CommitClaim; signal: AbortSignal };
 const blocked = () =>
   Object.assign(new ClaimWaitError("checkpoint"), {
     cause: new Error("Shared checkpoint does not match the local ledger"),
@@ -129,19 +130,7 @@ export function sharedCheckpointer(
       if (label === undefined) return;
       const claim = claims(runId);
       if (!claim) return;
-      return claimScope.run([claim.binding], () =>
-        committer
-          .commit(
-            runId,
-            {
-              handle: claim.binding.handle,
-              guard: claimGuard,
-              onLost: (handle, tip) => claim.binding.onLost(handle, tip),
-            },
-            claim.signal,
-          )
-          .then(() => {}),
-      );
+      return committer.commit(runId, claim.binding, claim.signal).then(() => {});
     },
   };
 }
