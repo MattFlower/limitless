@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { existsSync, promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -383,6 +383,29 @@ test("bad CLI arguments fail before launching a worker", async () => {
   expect(failed.stderr.toString().trim()).toStartWith("benchmark-gate-output: unknown workload(s) bogus;");
 });
 
+test("implicit workload selection keeps the original producer defaults", async () => {
+  const names: string[] = [];
+  const invoke: typeof launch = async ({ ref, name }) => {
+    names.push(name);
+    return {
+      result: Promise.resolve({ ref, name, report: { pid: 1, groups: {}, unavailable: [{}] } }),
+      cleanup: async () => {},
+    };
+  };
+  await compare(["HEAD", "HEAD"], undefined, invoke);
+  const producers = [
+    "gate-5mib",
+    "gate-cap",
+    "long-line",
+    "scanner-overflow",
+    "scanner-files",
+    "junit",
+    "identities",
+  ];
+  expect(names).toEqual([...producers, ...producers]);
+  expect(registry["event-drain"]).toBeFunction();
+});
+
 test("low-CPU stalls after file I/O, imported, captured or global timer resumptions are owned in a CLI worker", async () => {
   await temporary(async (root) => {
     await fakeRevision(root);
@@ -555,5 +578,243 @@ test("cap validation rejects corrupt bytes even when metadata claims complete co
         bytes: Buffer.alloc(8 * 1048576, "-"),
       }),
     ).toThrow("Invalid workload result");
+  });
+});
+
+async function consumerContext(
+  root: string,
+  run: (c: import("./benchmark-gate-output-support.ts").Context) => Promise<void>,
+) {
+  const boundary = await import("../src/util/privacy-boundary.ts");
+  const proof = await import("../src/util/privacy-proof.ts");
+  const policy = await import("../src/util/privacy-policy.ts");
+  const identities = await import("../src/gates/text-privacy.ts");
+  const output = await import("../src/gates/output.ts");
+  const { createPrivacyChecker } = await import("../src/util/privacy-checker.ts");
+  const env = environment(root);
+  await fs.mkdir(env.LIMITLESS_CONFIG_DIR);
+  await fs.writeFile(join(env.LIMITLESS_CONFIG_DIR, "private-strings.txt"), "synthetic-policy-value\n");
+  const checker = createPrivacyChecker({ registry: boundary.createPrivacyRegistry() });
+  try {
+    await run({
+      a: { ...proof, ...policy, ...identities, ...output },
+      cwd: root,
+      env,
+      checker: () => checker,
+      key: Buffer.alloc(32, 17),
+    });
+  } finally {
+    await checker.dispose();
+  }
+}
+
+test("consumer fixtures distinguish genuine, absent, refused and freshly invalidated proofs on every trial", async () => {
+  await temporary((root) =>
+    consumerContext(root, async (c) => {
+      const verify = c.a.verifier as typeof import("../src/util/privacy-proof.ts").verifier;
+      const observations: boolean[] = [];
+      c.a.verifier = (...args: Parameters<typeof verify>) => {
+        const v = verify(...args);
+        return {
+          verify: (...input: Parameters<typeof v.verify>) => {
+            const valid = v.verify(...input);
+            observations.push(valid);
+            return valid;
+          },
+        };
+      };
+      for (const name of ["project-proven", "project-unproven", "project-refused", "project-after-edit"]) {
+        const jobs = await registry[name]?.(c);
+        expect(jobs).toHaveLength(2);
+        for (const job of jobs ?? []) {
+          expect(job[0]).toContain("baseline-equivalent");
+          for (let trial = 0; trial < (name === "project-after-edit" ? 7 : 1); trial++) {
+            observations.length = 0;
+            await job[4]?.();
+            expect(observations).toHaveLength(100);
+            expect(
+              observations.every((v) => v === (name === "project-proven" || name === "project-after-edit")),
+            ).toBe(true);
+            observations.length = 0;
+            const value = await job[2]?.();
+            expect(job[3](value)).toContain("50 released");
+            expect(observations).toHaveLength(name === "project-after-edit" ? 50 : 0);
+            expect(observations.every((v) => v === false)).toBe(true);
+            if (name === "project-refused") expect(String(value)).toContain('"withheld":true');
+            if (name === "project-unproven") expect(String(value)).not.toContain('"textPrivacy"');
+            expect(() => job[3](JSON.stringify({ lastGates: [] }))).toThrow("50 projected gates");
+            const corrupt = JSON.parse(String(value));
+            corrupt.lastGates[0].result.output = "wrong bytes";
+            expect(() => job[3](JSON.stringify(corrupt))).toThrow("projection release class");
+          }
+        }
+      }
+      c.a.checkAndSign = async () => ({ kind: "rendering", mac: "0".repeat(64) });
+      const broken = await registry["project-proven"]?.(c);
+      await expect(broken?.[0]?.[4]?.()).rejects.toThrow("fixture proof class");
+    }),
+  );
+});
+
+test("consumer adapters select revision exports, reject leaking or malformed projections and mark missing APIs unavailable", async () => {
+  await temporary((root) =>
+    consumerContext(root, async (c) => {
+      const modes: unknown[] = [];
+      c.a.projectGateDiagnostics = (r: unknown, options: { mode: string }) => {
+        modes.push(options.mode);
+        return r;
+      };
+      const proven = await registry["project-proven"]?.(c);
+      for (const job of proven ?? []) {
+        await job[4]?.();
+        expect(job[3](await job[2]?.())).toContain("50 released");
+        expect(job[0]).toContain("projectGateDiagnostics");
+      }
+      expect(modes.filter((m) => m === "outward")).toHaveLength(50);
+      expect(modes.filter((m) => m === "durable")).toHaveLength(50);
+      for (const name of ["project-unproven", "project-refused", "project-after-edit"]) {
+        const job = (await registry[name]?.(c))?.[0];
+        await job?.[4]?.();
+        expect(() => job?.[3](job[2]?.())).toThrow("projection release class");
+      }
+      c.a.projectGateDiagnostics = () => undefined;
+      const malformed = (await registry["project-proven"]?.(c))?.[0];
+      await malformed?.[4]?.();
+      expect(() => malformed?.[3](malformed[2]?.())).toThrow("projection shape");
+      for (const name of [
+        "project-proven",
+        "project-unproven",
+        "project-refused",
+        "project-after-edit",
+        "events",
+        "event-drain",
+        "feedback-sign",
+        "render-prompts",
+        "land-log",
+      ]) {
+        const jobs = await registry[name]?.({ ...c, a: {} });
+        expect(jobs?.length).toBeGreaterThan(0);
+        expect(jobs?.every((job) => job[2] === undefined)).toBe(true);
+      }
+    }),
+  );
+});
+
+test("SSE consumption retains split and bundled frames and validates only after measurement", async () => {
+  await temporary(async (root) => {
+    const c: import("./benchmark-gate-output-support.ts").Context = {
+      cwd: root,
+      env: environment(root),
+      key: Buffer.alloc(32),
+      checker: () => {
+        throw Error("not needed");
+      },
+      a: {
+        createHttpRoutes: (factory: {
+          store: {
+            listEvents: (id: string, options: { after: number; limit: number }) => unknown[];
+            subscribe: () => () => void;
+          };
+        }) => ({
+          "/api/runs/:id/stream": (req: Request) =>
+            new Response(
+              new ReadableStream({
+                start(controller) {
+                  const events = factory.store.listEvents("synthetic", { after: 0, limit: 50000 });
+                  const bytes = Buffer.from(
+                    ": connected\n\n" +
+                      events.map((event) => `data: ${JSON.stringify({ kind: "event", event })}\n\n`).join(""),
+                  );
+                  // Split the connected frame's delimiter and bundle all event frames in the last chunk.
+                  for (const chunk of [bytes.subarray(0, 12), bytes.subarray(12, 13), bytes.subarray(13)])
+                    controller.enqueue(chunk);
+                  const unsubscribe = factory.store.subscribe();
+                  req.signal.addEventListener(
+                    "abort",
+                    () => {
+                      unsubscribe();
+                      controller.close();
+                    },
+                    { once: true },
+                  );
+                },
+              }),
+              { headers: { "content-type": "text/event-stream" } },
+            ),
+        }),
+      },
+    };
+    const job = (await registry["event-drain"]?.(c))?.[0];
+    expect(job?.[2]).toBeFunction();
+    const parse = spyOn(JSON, "parse");
+    try {
+      const value = await job?.[2]?.();
+      expect(parse).not.toHaveBeenCalled();
+      expect(job?.[3](value)).toBe("50000 ordered events; 5000 gate events; stream closed");
+      expect(parse).toHaveBeenCalledTimes(50000);
+      expect(() => job?.[3]({ ...Object(value), unsubscribed: 0 })).toThrow("stream closed");
+      const bad = Buffer.from('data: {"kind":"event","event":{"id":2}}\n\n');
+      expect(() => job?.[3]({ ...Object(value), chunks: [bad] })).toThrow("SSE order");
+      expect(() => job?.[3]({ ...Object(value), chunks: [bad.subarray(0, -1)] })).toThrow(
+        "complete SSE frames",
+      );
+    } finally {
+      parse.mockRestore();
+    }
+  });
+});
+
+test("preparation owns no measured turns, runs seven times and disposes on preparation failure", async () => {
+  await temporary(async (root) => {
+    await fakeRevision(root);
+    await fs.writeFile(
+      join(root, "src/util/privacy-checker.ts"),
+      "let disposed=0; export const count=()=>disposed; export const createPrivacyChecker=({registry,schedule})=>({registry,touch:()=>new Promise(done=>schedule(done)),async dispose(){disposed++}});",
+    );
+    let prepared = 0,
+      measured = 0,
+      clock = 0;
+    const runtime = {
+      now: () => clock,
+      pause: wait,
+      gc: () => {},
+      memory: () => ({ heap: 0, peakRSS: 0 }),
+      platform: [],
+    };
+    const result = await measureWorker(root, runtime, {
+      prepared: {
+        dimensions: {},
+        prepare: async (checker) => {
+          await (checker as unknown as { touch: () => Promise<void> }).touch();
+          clock += 100;
+          prepared++;
+          expect(measured).toBe(prepared - 1);
+        },
+        run: () => {
+          clock += 3;
+          return ++measured;
+        },
+        check: (v) => ({ outcome: validate(v === measured) }),
+      },
+    });
+    expect(prepared).toBe(7);
+    expect(measured).toBe(7);
+    expect((result.groups.prepared as Group).raw.map((t) => t.slice)).toEqual([3, 3, 3, 3, 3, 3, 3]);
+    await expect(
+      measureWorker(root, undefined, {
+        failure: {
+          dimensions: {},
+          prepare: () => {
+            throw Error("fixture failure");
+          },
+          run: () => {
+            throw Error("must not run");
+          },
+          check: () => ({}),
+        },
+      }),
+    ).rejects.toThrow("fixture failure");
+    const { count } = await import(join(root, "src/util/privacy-checker.ts"));
+    expect(count()).toBe(8);
   });
 });

@@ -14,6 +14,8 @@ declare const LIMITLESS_BUILD_PACKAGED: boolean;
 // The release build defines this true; callers guard source-only imports with it so Bun drops them.
 export const PACKAGED_BUILD = typeof LIMITLESS_BUILD_PACKAGED !== "undefined" && LIMITLESS_BUILD_PACKAGED;
 
+export const PACKAGED_UPGRADE = "Upgrade with brew upgrade limitless, then run limitless service install.";
+
 type BuildIdentity = { version?: string; sha?: string };
 export type Release = { version: string; bun: string } & (
   | { kind: "source"; root: string }

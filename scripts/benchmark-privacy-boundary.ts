@@ -269,6 +269,7 @@ type Checker = ReturnType<typeof import("../src/util/privacy-checker.ts").create
  * code to 64 microtask rounds after its latest entry; entries join one slice until a setImmediate heartbeat proves
  * a real yield, so continuations count and awaiting the worker does not (see docs/privacy-boundaries.md). */
 export type ProducerOperation = {
+  prepare?: (checker: Checker) => unknown;
   run: (checker: Checker, own: <T>(phase: string, fn: () => T) => T) => unknown;
   check: (value: unknown) => Record<string, unknown>;
   dimensions: object;
@@ -319,6 +320,13 @@ export async function measureWorker(root: string, r = runtime, ops?: Ops) {
         schedule: (f: () => void) => setImmediate(() => own("turn", f)),
         setTimeout: (f: () => void, n: number) => setTimeout(() => own("timer", f), n),
       });
+      try {
+        await producer?.prepare?.(checker);
+        [open, hops] = [undefined, 0];
+      } catch (error) {
+        await checker.dispose();
+        throw error;
+      }
       const turns: [number, number, number, string][] = [];
       const [idle, pending] = [[] as number[][], [] as unknown[]];
       let [beating, last, heartbeat] = [true, r.now(), 0];
