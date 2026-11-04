@@ -736,9 +736,11 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/runs/:id/stream": handle(async (req, server) => {
       const runId = req.params.id as string;
       const after = Number(new URL(req.url).searchParams.get("after") ?? 0);
-      // Subscribe before the first yield: live messages are buffered while the backlog drains.
-      let deliver: ((msg: StreamMessage) => void) | undefined;
-      const buffered: StreamMessage[] = [];
+      // Subscribe before the first yield; messages buffered meanwhile follow the backlog, minus events it read.
+      const backlog: StreamMessage[] = [],
+        buffered: StreamMessage[] = [];
+      let deliver = (msg: StreamMessage): void => void buffered.push(msg),
+        cursor = after;
       const unsubscribe = store.subscribe((msg: StreamMessage) => {
         const id =
           msg.kind === "run"
@@ -754,35 +756,26 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
                     : msg.kind === "feed"
                       ? msg.item.runId
                       : null;
-        if (id === runId) deliver ? deliver(msg) : buffered.push(msg);
+        if (id === runId) deliver(msg);
       });
       try {
-        const backlog: StreamMessage[] = [];
-        for (let cursor = after; ; ) {
-          const page = store.listEvents(runId, { after: cursor, limit: 2000 });
+        for (let page = store.listEvents(runId, { after, limit: 2000 }); page.length; ) {
           for (const event of page) backlog.push({ kind: "event", event });
-          const last = page.at(-1);
-          if (last) cursor = last.id;
-          if (!last || page.length < 2000) {
-            // Events already read from the store are dropped; everything else keeps its order.
-            backlog.push(...buffered.filter((msg) => msg.kind !== "event" || msg.event.id > cursor));
-            break;
-          }
+          cursor = page.at(-1)?.id ?? cursor;
+          if (page.length < 2000) break;
           await new Promise<void>((resolve) => setImmediate(resolve));
+          page = store.listEvents(runId, { after: cursor, limit: 2000 });
         }
-        return sse(
-          req,
-          server,
-          (send) => {
-            deliver = send;
-            return unsubscribe;
-          },
-          { backlog, alive: live(req) },
-        );
       } catch (err) {
         unsubscribe();
         throw err;
       }
+      backlog.push(...buffered.filter((msg) => msg.kind !== "event" || msg.event.id > cursor));
+      const attach = (send: typeof deliver) => {
+        deliver = send;
+        return unsubscribe;
+      };
+      return sse(req, server, attach, { backlog, alive: live(req) });
     }),
     "/api/stream": handle((req, server) =>
       sse(

@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
-import type { createPrivacyChecker } from "../util/privacy-checker.ts";
+import { type createPrivacyChecker, privacyReasons } from "../util/privacy-checker.ts";
 import { stable } from "./cache.ts";
 import type { GateResult } from "./run.ts";
 
@@ -19,8 +19,12 @@ export const textPrivacySchema = z.strictObject({
   identities: fieldPrivacySchema.optional(),
 });
 export type TextPrivacy = z.infer<typeof textPrivacySchema>;
+const WITHHELD_REASONS = new Set<unknown>([
+  ...privacyReasons,
+  ..."capture-cap capture-incomplete identity-cap unproven credential-changed event-size".split(" "),
+]);
 export const withheldText = (reason: unknown, timedOut = false) =>
-  `[withheld: ${typeof reason === "string" && /^[a-z-]{1,40}$/.exec(reason)?.[0] === reason ? reason : "unproven"}${timedOut ? "; timed out" : ""}]`;
+  `[withheld: ${WITHHELD_REASONS.has(reason) ? reason : "unproven"}${timedOut ? "; timed out" : ""}]`;
 type Checker = ReturnType<typeof createPrivacyChecker>;
 type Scope = { checker: Checker; registry: Checker["registry"]; signer?: () => Buffer | undefined };
 export const gatePrivacyScope = new AsyncLocalStorage<Scope>();

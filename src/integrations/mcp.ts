@@ -513,9 +513,8 @@ export function createMcpServer(backend: McpBackend): Server {
     try {
       const tool = tools.find((tool) => tool.name === params.name);
       if (!tool) throw new Error(`Unknown tool: ${params.name}`);
-      const result = projectGateDiagnostics(await tool.execute(params.arguments ?? {}, signal, privacy), {
-        mode: "outward",
-      });
+      const raw = await tool.execute(params.arguments ?? {}, signal, privacy);
+      const result = projectGateDiagnostics(raw, { mode: "outward" });
       const output = privacy
         ? privateOutputData(result, privacy)
         : params.name === "limitless_status"

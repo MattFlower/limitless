@@ -643,3 +643,72 @@ test("a parseable artifact cannot fall back to raw text when projection fails", 
     signer.mockRestore();
   }
 });
+
+test("identity proofs exempt only the members they cover", async () => {
+  const credential = "IDENTITY_EXTRA_CREDENTIAL_642",
+    base: GateResult = {
+      name: "test",
+      command: "true",
+      ok: true,
+      exitCode: 0,
+      durationMs: 1,
+      output: "safe",
+    };
+  const timed = await provenResult({ ...base, failedFileTimes: { "a.test.ts": 1 } });
+  const extra = await provenResult({
+    ...base,
+    testCoverage: { passedFiles: ["a.test.ts"], skippedFiles: [] },
+  });
+  registerCredential("IDENTITY_EXTRA_TEST", credential);
+  // failedFileTimes values are outside the identity digest: a changed value withholds the set.
+  Reflect.set(timed.failedFileTimes ?? {}, "a.test.ts", credential);
+  // testCoverage members outside the digest are projected normally, including nested results.
+  Reflect.set(extra.testCoverage ?? {}, "extra", { ...result(), credential });
+  for (const mode of ["durable", "outward"] as const) {
+    const out = project(timed, { mode });
+    expect(JSON.stringify(out)).not.toContain(credential);
+    expect(out.command).toBe(withheldText("unproven"));
+    expect(out.textPrivacy?.identities).toEqual({ withheld: true, reason: "unproven" });
+    const released = project(extra, { mode });
+    expect(released.command).toBe("true");
+    expect(released.testCoverage?.passedFiles).toEqual(["a.test.ts"]);
+    const bytes = JSON.stringify(released);
+    expect(bytes).not.toContain(credential);
+    expect(bytes).not.toContain(sentinel);
+    expect(Reflect.get(released.testCoverage ?? {}, "extra")).toMatchObject({
+      output: withheldText("unproven"),
+      command: withheldText("unproven"),
+      credential: "[redacted]",
+    });
+  }
+});
+
+test("a whole-value short credential in one identity withholds the set as credential-changed", async () => {
+  const short = "zQ7",
+    r = await provenResult({ ...result("safe"), command: short });
+  registerCredential("IDENTITY_SHORT_TEST", short);
+  for (const mode of ["durable", "outward"] as const) {
+    const out = project(r, { mode });
+    expect(out.command).toBe(withheldText("credential-changed"));
+    expect(out.textPrivacy?.identities).toEqual({ withheld: true, reason: "credential-changed" });
+    expect(out.output).toBe("safe");
+  }
+});
+
+test("unsigned withheld reasons outside the fixed vocabulary render as unproven", () => {
+  const reason = "secret-host-probe";
+  registerCredential("REASON_TEST", reason);
+  const r = {
+    ...result(),
+    textPrivacy: { output: { withheld: true, reason }, identities: { withheld: true, reason } },
+  };
+  for (const mode of ["durable", "outward"] as const) {
+    const out = project(r, { mode });
+    expect(JSON.stringify(out)).not.toContain(reason);
+    expect(out.output).toBe(withheldText("unproven"));
+    expect(out.textPrivacy).toEqual({
+      output: { withheld: true, reason: "unproven" },
+      identities: { withheld: true, reason: "unproven" },
+    });
+  }
+});
