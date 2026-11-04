@@ -548,6 +548,7 @@ src/cli/setup.ts | setupDeps/run | sh | 1 | exempt | credential | Setup GitHub a
 src/gates/github-actions.ts | githubActionsExecutor/api | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
 src/gates/github-actions.ts | githubActionsExecutor/attach | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
 src/gates/github-actions.ts | githubActionsExecutor/attach/poll | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
+src/gates/github-actions.ts | githubActionsExecutor/jobLog | runGh | 1 | exempt | unwired | No src caller constructs githubActionsExecutor
 src/gc.ts | collectGarbage | cacheGit | 5 | exempt | not-github | Local worktree metadata cleanup; no remote commands
 src/git/command.ts | recordWorktree | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/git/command.ts | refusePopulatedRepositories | sh | 2 | exempt | not-github | Local command or daemon request; no GitHub transport

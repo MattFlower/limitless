@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inspect } from "node:util";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import {
@@ -919,7 +920,7 @@ test("failed cleanup keeps the durable handle so a restart retries it", async ()
   }
 });
 
-test.each(["malformed evidence", "protected diagnostic"])(
+test.each(["malformed evidence", "protected diagnostic", "partial log"])(
   "original rejection survives cleanup failure and restart: %s",
   async (failure) => {
     const f = fixture();
@@ -927,9 +928,14 @@ test.each(["malformed evidence", "protected diagnostic"])(
     registerCredential("ACTIONS_REJECTION_TEST", credential);
     f.state.logs.set(1, log(framed(), `near ${secret} ${credential}\nLIMITLESS:${token}:bad`));
     const gh = f.deps.gh;
-    if (failure === "protected diagnostic")
+    if (failure !== "malformed evidence")
       f.deps.gh = async (...args) => {
-        if (args[0][0] === "run") throw new Error(`Malformed gate record near ${secret} ${credential}`);
+        if (args[0][0] === "run") {
+          const message = `Malformed gate record near ${secret} ${credential}`;
+          throw failure === "partial log"
+            ? new CommandError(message, 1, log(framed(), message), message, false)
+            : new Error(message);
+        }
         return (await gh(...args)) ?? "";
       };
     const remove = f.deps.delete;
@@ -946,7 +952,9 @@ test.each(["malformed evidence", "protected diagnostic"])(
         expect(first).toBeInstanceOf(GateBlockedError);
         if (!(first instanceof GateBlockedError)) throw new Error("Expected blocked execution");
         expect(first.classification).toBe("operational");
-        expect(first.message).toContain("Malformed gate record");
+        expect(first.message).toContain(
+          failure === "malformed evidence" ? "Malformed gate record" : "GitHub Actions log retrieval failed",
+        );
         expect(first.message).not.toContain("lease rejected");
         const pending = store.getRunState<RunState>(ctx.run.id)?.gateExecution;
         expect(pending?.handle.githubActions).toMatchObject({
@@ -985,6 +993,93 @@ test.each(["malformed evidence", "protected diagnostic"])(
     }
   },
 );
+
+test.each(["CommandError", "no exit code", "synchronous"])(
+  "log retrieval %s discards partial private output before every checkpoint",
+  async (variant) => {
+    const f = fixture();
+    const { ctx, store } = await context(f);
+    const canaries = Array.from({ length: 3 }, () => `partial-${crypto.randomUUID()}`);
+    privacy.policy(canaries);
+    const raw = log(framed(), `${canaries[1]}\n${framed()}`);
+    const original =
+      variant === "CommandError"
+        ? new CommandError(`retrieval ${canaries[0]}\n${raw}`, 23, raw, canaries[2] ?? "", false)
+        : new Error(`retrieval ${canaries[0]}`);
+    const gh = f.deps.gh;
+    f.deps.gh = (...args): Promise<string> => {
+      if (args[0][0] === "run") {
+        if (variant === "synchronous") throw original;
+        return Promise.reject(original);
+      }
+      return gh(...args).then((value) => value ?? "");
+    };
+    const checkpoints: string[] = [];
+    const write = store.setRunState.bind(store);
+    spyOn(store, "setRunState").mockImplementation((id, state) => {
+      checkpoints.push(JSON.stringify(state));
+      write(id, state);
+    });
+    try {
+      const error: unknown = await runGateExecution(ctx, "gates", "initial", cwd, req.gates).catch(
+        (e: unknown) => e,
+      );
+      expect(error).toBeInstanceOf(GateBlockedError);
+      if (!(error instanceof GateBlockedError)) throw Error("Expected retrieval rejection");
+      expect(error.classification).toBe("operational");
+      expect(error.message).toBe(
+        "GitHub Actions gate blocked (operational): Error: GitHub Actions log retrieval failed",
+      );
+      expect(error).not.toBe(original);
+      expect(Object.hasOwn(error, "cause")).toBe(false);
+      expect(checkpoints.length).toBeGreaterThan(0);
+      expect(store.getRunState<RunState>(ctx.run.id)?.gateExecution?.handle.githubActions).toMatchObject({
+        interrupted: "operational",
+        diagnostic: error.message,
+      });
+      const serialized = JSON.stringify([
+        checkpoints,
+        f.saved,
+        store.getRunState(ctx.run.id),
+        store.listEvents(ctx.run.id),
+        inspect(error, { showHidden: true, depth: null }),
+      ]);
+      for (const canary of canaries) expect(serialized).not.toContain(canary);
+      expect(serialized).not.toContain(raw);
+      expect(f.remote.size).toBe(0);
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.each(["cancel", "shutdown"])("log retrieval failure preserves %s cleanup semantics", async (reason) => {
+  const f = fixture(),
+    controller = new AbortController();
+  const canary = `partial-${crypto.randomUUID()}`;
+  const gh = f.deps.gh;
+  f.deps.gh = async (...args) => {
+    if (args[0][0] === "run") {
+      controller.abort(new Error(reason));
+      throw new CommandError(canary, null, log(framed(), canary), canary, false);
+    }
+    return (await gh(...args)) ?? "";
+  };
+  const error: unknown = await f.run(controller.signal).catch((e: unknown) => e);
+  expect(error).toBeInstanceOf(Error);
+  expect(String(error)).toContain("GitHub Actions log retrieval failed");
+  const progress = f.saved.at(-1)?.githubActions;
+  if (reason === "cancel") {
+    expect(error).toBeInstanceOf(GateBlockedError);
+    expect(progress?.interrupted).toBe("cancelled");
+    expect(f.remote.size).toBe(0);
+  } else {
+    expect(error).not.toBeInstanceOf(GateBlockedError);
+    expect(progress?.interrupted).toBeUndefined();
+    expect(f.remote.size).toBe(2);
+  }
+  expect(JSON.stringify([f.saved, inspect(error, { showHidden: true, depth: null })])).not.toContain(canary);
+});
 
 test.each(["visible", "never visible"])(
   "lost POST response: %s run uses one POST and bounded discovery",

@@ -91,6 +91,13 @@ const commit = async (cwd: string, sha: string, signal: AbortSignal) => {
 };
 
 export function githubActionsExecutor(deps: Dependencies): GateExecutor {
+  const jobLog: GhRunner = async (...args) => {
+    try {
+      return (await deps.gh(...args)) ?? "";
+    } catch {
+      throw new Error("GitHub Actions log retrieval failed");
+    }
+  };
   /** Authorization is read live; private repositories also need paid minutes, discreet ones refuse. */
   const admit = (repo: string, visibility: unknown, signal: AbortSignal) => {
     signal.throwIfAborted();
@@ -418,7 +425,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
                 job.conclusion ?? "",
               )
                 ? ""
-                : await deps.gh(
+                : await jobLog(
                     ["run", "view", "--repo", p.repo, "--job", String(job.id), "--log"],
                     controller.signal,
                     undefined,

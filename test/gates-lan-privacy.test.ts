@@ -1,12 +1,13 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { Store } from "../src/db/store.ts";
-import { WorkerStore } from "../src/db/workers.ts";
+import { type StoredGateEvent, WorkerStore } from "../src/db/workers.ts";
 import type { ExecutionEvent, GateRequest } from "../src/gates/executor.ts";
 import { lanExecutor } from "../src/gates/lan.ts";
 import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import type { GateRun } from "../src/gates/run.ts";
 import { gateIdentities } from "../src/gates/text-privacy.ts";
 import { verifier } from "../src/util/privacy-proof.ts";
+import { Heartbeat } from "../src/workers/protocol.ts";
 import { remoteFixture } from "./gate-remote-support.ts";
 
 const resources: { store: Store; privacy: ReturnType<typeof remoteFixture> }[] = [];
@@ -63,8 +64,23 @@ test("LAN setup/check events, final results and retained attempts are rechecked"
   const f = await fixture(),
     r = f.privacy.result();
   const retained = { ...r, firstAttempt: r, targetedRetry: r, retryAttempt: r };
-  f.workers.event(f.handle.id, { type: "check", phase: "setup", result: retained });
+  f.workers.event(f.handle.id, {
+    type: "check",
+    phase: "setup",
+    result: retained,
+    worker: "spoofed",
+    attempt: 99,
+  });
   f.workers.event(f.handle.id, { type: "check", phase: "check", result: retained });
+  const job = f.workers.job(f.handle.id);
+  const stored: StoredGateEvent[] = JSON.parse(job?.events ?? "[]");
+  expect(stored).toHaveLength(2);
+  for (const event of stored) {
+    expect(event.worker).toBe("runner");
+    expect(event.attempt).toBe(1);
+    expect(event.worker).toBe(job?.worker);
+    expect(event.attempt).toBe(job?.attempt);
+  }
   const execution = f.attach(),
     events: ExecutionEvent[] = [];
   const streamed = Promise.withResolvers<void>();
@@ -100,6 +116,80 @@ test("LAN setup/check events, final results and retained attempts are rechecked"
     }
   }
 });
+
+test("LAN retained events cannot use a replacement worker's matching parity", async () => {
+  const f = await fixture(),
+    r = f.privacy.result();
+  f.workers.event(f.handle.id, { type: "check", phase: "check", result: r });
+  const a = f.workers.worker("runner");
+  if (!a) throw Error("Missing worker");
+  const capabilities = Heartbeat.parse(JSON.parse(a.capabilities ?? "null"));
+  f.workers.fail(f.handle.id, "worker disconnected");
+  const pair = f.workers.pair("replacement", "c".repeat(64), "d".repeat(64));
+  f.workers.approve(pair.code);
+  const b = f.workers.worker("replacement");
+  if (!b) throw Error("Missing replacement");
+  f.workers.heartbeat(b, capabilities, "match");
+  expect(f.workers.lease(b.name)?.id).toBe(f.handle.id);
+  f.workers.heartbeat(a, capabilities, "differs");
+  expect(f.workers.privateStringsMatch(a.name)).toBe(false);
+  f.workers.event(f.handle.id, { type: "check", phase: "check", result: r });
+  const stored: StoredGateEvent[] = JSON.parse(f.workers.job(f.handle.id)?.events ?? "[]");
+  expect(stored.filter((e) => e.type === "check").map((e) => [e.worker, e.attempt])).toEqual([
+    ["runner", 1],
+    ["replacement", 2],
+  ]);
+  f.workers.complete(f.handle.id, f.empty);
+  const execution = f.attach(),
+    events: ExecutionEvent[] = [];
+  for await (const event of execution.events) events.push(event);
+  await execution.result;
+  const checks = events.filter((e) => e.type === "check");
+  expect(checks).toHaveLength(2);
+  expect(checks[0]?.result.textPrivacy).toBeUndefined();
+  const current = checks[1]?.result;
+  expect(current?.textPrivacy?.output.kind).toBe("attested:lan");
+  expect(
+    verifier(f.privacy.registry, f.privacy.signer).verify(
+      current?.textPrivacy?.output,
+      "output",
+      current?.output ?? "",
+    ),
+  ).toBe(true);
+});
+
+test.each(["legacy", "missing worker", "missing attempt", "worker", "attempt", "unassigned"])(
+  "LAN events with %s producer metadata stay retained and unproven",
+  async (scenario) => {
+    const f = await fixture(),
+      r = f.privacy.result();
+    f.workers.event(f.handle.id, { type: "check", phase: "check", result: r });
+    const stored: StoredGateEvent[] = JSON.parse(f.workers.job(f.handle.id)?.events ?? "[]");
+    const event = stored[0];
+    if (!event) throw Error("Missing event");
+    // A matching event first populates the memo with identical text.
+    stored.push({ ...event });
+    if (scenario === "legacy" || scenario === "missing worker") delete event.worker;
+    if (scenario === "legacy" || scenario === "missing attempt") delete event.attempt;
+    if (scenario === "worker") event.worker = "other";
+    if (scenario === "attempt") event.attempt = 2;
+    if (scenario === "unassigned") {
+      event.worker = null;
+      f.store.db.query("UPDATE gate_jobs SET worker=NULL WHERE id=?").run(f.handle.id);
+    }
+    stored.reverse();
+    f.store.db.query("UPDATE gate_jobs SET events=? WHERE id=?").run(JSON.stringify(stored), f.handle.id);
+    f.workers.complete(f.handle.id, f.empty);
+    const execution = f.attach(),
+      events: ExecutionEvent[] = [];
+    for await (const event of execution.events) events.push(event);
+    await execution.result;
+    expect(events).toHaveLength(2);
+    const invalid = events[1];
+    expect(invalid?.type === "check" ? invalid.result.textPrivacy : "missing").toBeUndefined();
+    expect(JSON.parse(f.workers.job(f.handle.id)?.events ?? "[]")).toEqual(stored);
+  },
+);
 
 test.each(["setup", "infrastructure"])(
   "LAN resume preserves signed local %s fallback diagnostics",

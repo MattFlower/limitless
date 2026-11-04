@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { canonicalGateCwd, type WorkerStore } from "../db/workers.ts";
+import { canonicalGateCwd, type StoredGateEvent, type WorkerStore } from "../db/workers.ts";
 import { checkoutCommitted } from "../git/repos.ts";
 import {
   type Execution,
@@ -133,7 +133,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
           workers.sweep();
           const job = workers.job(handle.id);
           if (!job) throw new Error("LAN gate job disappeared");
-          const stored: ExecutionEvent[] = JSON.parse(job.events);
+          const stored: StoredGateEvent[] = JSON.parse(job.events);
           const valid = () => {
             const current = workers.job(handle.id);
             return (
@@ -155,8 +155,9 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
           };
           const pending: ExecutionEvent[] = [];
           for (const event of stored.slice(index)) {
+            const sameLease = job.worker && event.worker === job.worker && event.attempt === job.attempt;
             pending.push(
-              !inplace && event.type === "check" && !event.result.textPrivacy
+              !inplace && event.type === "check" && !event.result.textPrivacy && sameLease
                 ? { ...event, result: await recheckRemote(event.result, "attested:lan", control) }
                 : event,
             );

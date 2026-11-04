@@ -82,6 +82,7 @@ export interface JobRow {
   created_at: number;
   updated_at: number;
 }
+export type StoredGateEvent = ExecutionEvent & { attempt?: number; worker?: string | null };
 
 /** Persisted session inputs; runtime callbacks and confinement are supplied by a later dispatcher. */
 export interface AgentJobRequest
@@ -661,11 +662,11 @@ export class WorkerStore {
     const j = this.job(id);
     return j?.state === "leased" && j.worker === name ? j : null;
   }
-  event(id: string, event: ExecutionEvent) {
+  event(id: string, event: StoredGateEvent) {
     const j = this.job(id);
     if (!j || !["queued", "leased", "failed"].includes(j.state)) return;
-    const events: ExecutionEvent[] = JSON.parse(j.events);
-    events.push(this.sanitize(event));
+    const events: StoredGateEvent[] = JSON.parse(j.events);
+    events.push({ ...this.sanitize(event), attempt: j.attempt, worker: j.worker });
     this.store.db.query("UPDATE gate_jobs SET events=? WHERE id=?").run(JSON.stringify(events), id);
     if (event.type === "status" && j.run_id)
       this.store.addEvent({
