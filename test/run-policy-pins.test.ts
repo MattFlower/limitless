@@ -1,6 +1,9 @@
 import { expect, mock, spyOn } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
-import { exportPolicySelection } from "../src/db/portable-policies.ts";
+import { repoSettings } from "../src/config.ts";
+import { exportPolicySelection, recordProvisionalPolicy } from "../src/db/portable-policies.ts";
 import { IssueClaimed, Store } from "../src/db/store.ts";
 import { ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { bindClaim, claimScope } from "../src/integrations/claim-guard.ts";
@@ -17,6 +20,7 @@ import { captureRunTransferSnapshot } from "../src/pipeline/run-transfer-snapsho
 import { registerCredential } from "../src/util/proc.ts";
 import { approve, pipelineSetup, roleOf, triage } from "./pipeline-support.ts";
 import { test } from "./read-policy-support.ts";
+import { seal } from "./run-transfer-policy-support.ts";
 
 let home: string;
 let repoDir: string;
@@ -48,6 +52,7 @@ async function fixture(
   shadow: "off" | "panel" = "off",
   merge = false,
   legacy = false,
+  config?: string,
 ) {
   const bare = await githubFixture();
   if (merge) {
@@ -59,6 +64,10 @@ async function fixture(
     await advanceBase(bare, "package.json", JSON.stringify({ scripts: { smoke: "echo original" } }));
   }
   let advance = merge;
+  if (config !== undefined) {
+    mkdirSync(join(home, "cfg"), { recursive: true });
+    writeFileSync(join(home, "cfg", "config.toml"), config);
+  }
   const f = start(async (s) => {
     if (roleOf(s) === "triage") return { structured: triage({ suggested_profile: "quick" }) };
     if (roleOf(s) === "review") {
@@ -215,7 +224,7 @@ test.each(["prepared", "review-finalized", "scripts-refreshed"] as const)(
   },
 );
 
-test.each(["maxRounds", "reviewRosters", "branchPrefix", "repository"] as const)(
+test.each(["maxRounds", "reviewRosters", "branchPrefix", "repository", "shared"] as const)(
   "live %s drift blocks the next stage without a stage row",
   async (field) => {
     const { f, run, deps, repo } = await fixture();
@@ -236,8 +245,8 @@ test.each(["maxRounds", "reviewRosters", "branchPrefix", "repository"] as const)
               repos: {
                 "test/repo": {
                   discreet: false,
-                  shared: true,
-                  branchPrefix: "other/",
+                  shared: field !== "shared",
+                  branchPrefix: field === "shared" ? "change/" : "other/",
                   landRequiresApproval: false,
                 },
               },
@@ -276,11 +285,153 @@ test.each(["resume", "stage"] as const)(
   },
 );
 
+test.each([false, true])(
+  "pinned shared restart refuses shared disabled with authority=%s",
+  async (authority) => {
+    const { f, run, deps } = await fixture();
+    expect(
+      await executeRun({ ...deps, faults: { "stage:prepare:after": { action: "kill" } } }, run.id, signal()),
+    ).toBe("running");
+    expect(f.store.getRun(run.id)?.startedAt).not.toBeNull();
+    const stages = f.store.listStages(run.id);
+    const calls = f.store.listInvocations(run.id);
+    const reopened = new Store(f.cfg.paths.db);
+    try {
+      const cfg = {
+        ...deps.cfg,
+        repos: { "test/repo": { ...repoSettings(deps.cfg, "test/repo"), shared: false } },
+      };
+      expect(
+        await executeRun(
+          { ...deps, cfg, store: reopened, runClaim: authority ? deps.runClaim : undefined },
+          run.id,
+          signal(),
+        ),
+      ).toBe("needs_human");
+      expect(reopened.getRun(run.id)?.error).toBe("shared run policy changed");
+      expect(reopened.listStages(run.id)).toEqual(stages);
+      expect(reopened.listInvocations(run.id)).toEqual(calls);
+    } finally {
+      reopened.close();
+    }
+  },
+);
+
+const reloadText = (samples: 1 | 2, workers = "", limits = "", review = "") =>
+  `[review]\nsamples = ${samples}\n${review}\n[review.rosters]\nquick = [{ prompt = "standard" }]\n[workers]\n${workers}\n[limits]\n${limits}\n`;
+
+function reload(f: Factory, text: string) {
+  writeFileSync(join(f.cfg.paths.configDir, "config.toml"), text);
+  return f.reloadConfig();
+}
+
+for (const before of [1, 2] as const) {
+  test.each(["stage", "resume"] as const)(`reviewSamples ${before} reload blocks at %s`, async (boundary) => {
+    const { f, run, deps } = await fixture(true, "single", "off", false, false, reloadText(before));
+    expect(exportPolicySelection(f.store, run.id).history[0]?.engine.reviewSamples).toBe(before);
+    const change = () => {
+      expect(reload(f, reloadText(before === 1 ? 2 : 1)).applied).toContain("review.samples");
+      deps.cfg = f.deps.cfg;
+    };
+    deps.faults = {
+      "stage:prepare:after": {
+        action: boundary === "resume" ? "kill" : "continue",
+        onHit: boundary === "stage" ? change : undefined,
+      },
+    };
+    if (boundary === "resume") {
+      expect(await executeRun(deps, run.id, signal())).toBe("running");
+      change();
+      deps.faults = undefined;
+    }
+    expect(await executeRun(deps, run.id, signal())).toBe("needs_human");
+    expect(f.store.getRun(run.id)?.error).toBe("shared run policy changed");
+    expect(f.store.listStages(run.id).map((stage) => stage.name)).toEqual(["prepare"]);
+    expect(f.store.listInvocations(run.id)).toHaveLength(0);
+  });
+}
+
+test.each([
+  { name: "worker roles", workers: 'agents = ["review"]', limits: "", drift: true },
+  { name: "worker eligibility", workers: 'repos = ["test/repo"]', limits: "", drift: true },
+  { name: "unrelated worker repos", workers: 'repos = ["other/repo"]', limits: "", drift: false },
+  {
+    name: "concurrency",
+    workers: "",
+    limits: "max_concurrent_runs = 3\nmax_concurrent_gates = 2",
+    drift: false,
+  },
+])("reload $name has drift=$drift", async ({ workers, limits, drift }) => {
+  const { f, run, deps } = await fixture(true, "single", "off", false, false, reloadText(1));
+  expect(exportPolicySelection(f.store, run.id).history[0]?.engine.workers).toEqual({
+    agents: [],
+    repoEligible: false,
+  });
+  deps.faults = {
+    "stage:prepare:after": {
+      action: "continue",
+      onHit: () => {
+        expect(reload(f, reloadText(1, workers, limits)).applied.length).toBeGreaterThan(0);
+        deps.cfg = f.deps.cfg;
+      },
+    },
+  };
+  expect(await executeRun(deps, run.id, signal())).toBe(drift ? "needs_human" : "succeeded");
+  if (drift) {
+    expect(f.store.getRun(run.id)?.error).toBe("shared run policy changed");
+    expect(f.store.listStages(run.id).map((stage) => stage.name)).toEqual(["prepare"]);
+    expect(f.store.listInvocations(run.id)).toHaveLength(0);
+  }
+});
+
+test("shadow downgrade with definite drift refuses instead of waiting", async () => {
+  const { f, run, deps } = await fixture(true, "single", "panel");
+  deps.cfg = { ...deps.cfg, reviewShadow: "off", reviewSamples: 2 };
+  expect(await executeRun(deps, run.id, signal())).toBe("needs_human");
+  expect(f.store.getRun(run.id)?.error).toBe("shared run policy changed");
+  expect(f.store.listStages(run.id)).toHaveLength(0);
+});
+
+test.each(["reviewSamples", "workers"] as const)(
+  "historical pin missing %s remains immutable but cannot execute",
+  async (field) => {
+    const { f, run, repo, deps } = await fixture(true, "single", "off", false, true);
+    const historical = admissionPolicy(f.cfg, repo, {}, run.id);
+    delete historical.engine[field];
+    const record = seal(historical);
+    recordProvisionalPolicy(f.store, {
+      runId: run.id,
+      record,
+      expected: null,
+      expectedState: null,
+      state: initialRunState(run),
+    });
+    f.store.updateRun(run.id, { startedAt: 1 });
+    const selection = exportPolicySelection(f.store, run.id);
+    expect(selection.history).toEqual([record]);
+    expect(await executeRun(deps, run.id, signal())).toBe("needs_human");
+    expect(f.store.getRun(run.id)?.error).toBe("shared run policy changed");
+    expect(f.store.listStages(run.id)).toHaveLength(0);
+    expect(exportPolicySelection(f.store, run.id)).toEqual(selection);
+  },
+);
+
+test("an admission pin still requires authority when shared remains enabled", async () => {
+  const { f, run, deps } = await fixture();
+  const selection = exportPolicySelection(f.store, run.id);
+  expect(await executeRun({ ...deps, runClaim: undefined }, run.id, signal())).toBe("queued");
+  expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:unavailable");
+  expect(f.store.getRun(run.id)?.startedAt).toBeNull();
+  expect(f.store.listStages(run.id)).toHaveLength(0);
+  expect(exportPolicySelection(f.store, run.id)).toEqual(selection);
+});
+
 test("admission allowlists policy and rolls back a credential-bearing request", async () => {
   const { f, repo, run } = await fixture();
   f.cfg.raw.privateCanary = "raw-canary";
   f.cfg.raw.providers = [{ id: "provider-canary", endpoint: "endpoint-canary" }];
   f.cfg.secrets.privateCanary = "secrets-canary";
+  f.cfg.workers = { ...f.cfg.workers, listen: "listener-canary", repos: ["unrelated/repo-canary"] };
   f.deps.cfg = { ...f.cfg, reviewShadow: "off" };
   f.cfg.reviewShadow = "panel";
   const next = await f.createRun({ repo: repo.slug, prompt: "Canaries", profile: "quick" });
@@ -293,16 +444,25 @@ test("admission allowlists policy and rolls back a credential-bearing request", 
     "reviewImplementerReport",
     "reviewMode",
     "reviewRosters",
+    "reviewSamples",
     "reviewShadow",
     "reviewShadowGraceSeconds",
     "reviewTrustedReviewers",
     "triageDecisionConfidence",
     "waitBudgetS",
+    "workers",
   ]);
   const json = f.store.db
     .query<{ record_json: string }, []>("SELECT record_json FROM run_policy_versions")
     .all();
-  for (const canary of ["raw-canary", "provider-canary", "endpoint-canary", "secrets-canary"])
+  for (const canary of [
+    "raw-canary",
+    "provider-canary",
+    "endpoint-canary",
+    "secrets-canary",
+    "listener-canary",
+    "unrelated/repo-canary",
+  ])
     expect(JSON.stringify(json)).not.toContain(canary);
   expect(admissionPolicy(f.cfg, repo, {}, run.id)).toEqual(admissionPolicy(f.cfg, repo, {}, run.id));
   const credential = "policy-test-credential-value";

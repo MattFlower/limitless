@@ -80,7 +80,7 @@ function authority(run: Run) {
   };
 }
 const signal = () => new AbortController().signal;
-async function fixture(publication = false, mergePolicy: "auto" | "pr" = "pr") {
+async function fixture(publication = false, mergePolicy: "auto" | "pr" = "pr", enabled = true) {
   const bare = publication ? await githubFixture() : "unused";
   const f = start((s) =>
     roleOf(s) === "triage"
@@ -91,7 +91,7 @@ async function fixture(publication = false, mergePolicy: "auto" | "pr" = "pr") {
   );
   await f.stop();
   registerGithub(f, bare);
-  shared(f);
+  shared(f, enabled);
   const repo = f.store.getRepoBySlug("test/repo");
   if (!repo) throw new Error("Missing repo");
   f.store.upsertRepo({ ...repo, mergePolicy });
@@ -299,8 +299,7 @@ test.each(["prepare", "triage", "deliver"] as const)(
 test.each([false, true])(
   "auto delivery captures shared=%s and preserves older local resume",
   async (claimed) => {
-    const { f, run, claim } = await fixture(true, "auto");
-    shared(f, claimed);
+    const { f, run, claim } = await fixture(true, "auto", claimed);
     const merge = spyOn(repos, "mergePullRequest").mockResolvedValue("merged");
     restores.push(() => merge.mockRestore());
     const deps = { ...f.deps, faults: { "stage:deliver:before": { action: "kill" as const } } };
@@ -700,8 +699,7 @@ test.each(["cancelled", "needs_human"] as const)(
 
 // Mutation: move local startup back into the main failure handler.
 test.each([false, true])("local startup write failure propagates, aborted=%s", async (aborted) => {
-  const { f, run } = await fixture();
-  shared(f, false);
+  const { f, run } = await fixture(false, "pr", false);
   const controller = new AbortController();
   if (aborted) controller.abort();
   const failure = new Error("startup write failed");
@@ -759,8 +757,7 @@ test("claim change during failure handling returns through the final boundary", 
 
 // Mutation: move local startup bookkeeping after process recovery.
 test("local execution retains startup ordering before owned-process recovery", async () => {
-  const { f, run } = await fixture();
-  shared(f, false);
+  const { f, run } = await fixture(false, "pr", false);
   const entered = Promise.withResolvers<void>();
   const resume = Promise.withResolvers<void>();
   const recovery = spyOn(proc, "recoverScopedProcesses").mockImplementation(async () => {

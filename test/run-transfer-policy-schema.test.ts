@@ -127,6 +127,24 @@ test("shadow grace preserves finite non-negative fractions without coercion", ()
     ).toBe(false);
 });
 
+test("review samples accept only numeric 1 or 2 and historical coverage stays absent", () => {
+  const { provisional } = policyFixture();
+  for (const value of [1, 2] as const) {
+    const record = seal({ ...provisional, engine: { ...provisional.engine, reviewSamples: value } });
+    expect(parseTransferPolicyRecord(record).engine.reviewSamples).toBe(value);
+  }
+  for (const value of [0, 3, 1.5, "1", "2", true, null, Number.NaN, Number.POSITIVE_INFINITY])
+    expect(
+      transferAdmissionPolicySchema.safeParse({ ...provisional.engine, reviewSamples: value }).success,
+    ).toBe(false);
+  const historical = JSON.stringify(provisional);
+  const parsed = parseTransferPolicyRecord(JSON.parse(historical));
+  expect(parsed.engine).not.toHaveProperty("reviewSamples");
+  expect(parsed.engine).not.toHaveProperty("workers");
+  expect(parsed).toEqual(provisional);
+  expect(parsed.recordId).toBe(provisional.recordId);
+});
+
 test("credential-bearing commands and identities reject unchanged with fixed diagnostics", () => {
   const credential = ["synthetic", "policy", "credential", "12345678"].join("-");
   registerCredential("TEST_PORTABLE_POLICY", credential);

@@ -234,7 +234,18 @@ export async function executeRun(
     checkpointer.writeRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const shared = sharedRepository(deps.cfg, repo, run.repoSlug);
+  const configuredShared = sharedRepository(deps.cfg, repo, run.repoSlug);
+  const shared =
+    configuredShared ||
+    !!deps.store.db.query("SELECT 1 FROM run_policy_selections WHERE run_id = ?").get(runId);
+  if (shared && !configuredShared) {
+    checkpointer.writeRun(runId, {
+      status: "needs_human",
+      error: "shared run policy changed",
+      finishedAt: Date.now(),
+    });
+    return "needs_human";
+  }
   let claim: RunClaim | undefined;
   let error: unknown;
   if (shared) {

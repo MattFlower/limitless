@@ -52,7 +52,15 @@ export function admissionPolicy(
       Object.entries(repoSettings(cfg, repo.slug)).filter(([, v]) => v !== undefined),
     ),
     engine: Object.fromEntries(
-      Object.keys(transferAdmissionPolicySchema.shape).map((key) => [key, Reflect.get(cfg, key)]),
+      Object.keys(transferAdmissionPolicySchema.shape).map((key) => [
+        key,
+        key === "workers"
+          ? {
+              agents: [...new Set(cfg.workers.agents)].sort(),
+              repoEligible: cfg.workers.repos.includes(repo.slug),
+            }
+          : Reflect.get(cfg, key),
+      ]),
     ),
   });
 }
