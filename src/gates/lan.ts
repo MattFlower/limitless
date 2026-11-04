@@ -156,7 +156,7 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
           const pending: ExecutionEvent[] = [];
           for (const event of stored.slice(index)) {
             pending.push(
-              !inplace && event.type === "check"
+              !inplace && event.type === "check" && !event.result.textPrivacy
                 ? { ...event, result: await recheckRemote(event.result, "attested:lan", control) }
                 : event,
             );
@@ -179,7 +179,9 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
               for (const group of [run.setup, run.checks])
                 for (let i = 0; i < group.length; i++) {
                   const item = group[i];
-                  if (item) group[i] = await recheckRemote(item, "attested:lan", control);
+                  // Worker ingress removes textPrivacy; local fallback records retain it.
+                  if (item && !item.textPrivacy)
+                    group[i] = await recheckRemote(item, "attested:lan", control);
                   if (!valid()) break;
                 }
               if (!valid()) {

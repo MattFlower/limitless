@@ -26,6 +26,7 @@ import { Store } from "../src/db/store.ts";
 import { type AgentJobRequest, tokenHash, WorkerStore } from "../src/db/workers.ts";
 import { agentTestLease } from "../src/gates/agent-tests.ts";
 import {
+  type ExecutionEvent,
   type ExecutionHandle,
   executeGate,
   type GateRequest,
@@ -44,6 +45,7 @@ import {
   runLocalGates,
 } from "../src/gates/run.ts";
 import { acquireGateSlot, gateSlotScope, gateSlots } from "../src/gates/slots.ts";
+import { gateIdentities, gatePrivacyScope } from "../src/gates/text-privacy.ts";
 import * as gitCommand from "../src/git/command.ts";
 import { worktreeGit } from "../src/git/command.ts";
 import { withRepoLock } from "../src/git/repos.ts";
@@ -60,6 +62,7 @@ import { runGateExecution } from "../src/pipeline/gate-execution.ts";
 import { createApiToken } from "../src/server/api-token.ts";
 import { startHttp } from "../src/server/http.ts";
 import { startWorkerListener } from "../src/server/workers.ts";
+import { verifier } from "../src/util/privacy-proof.ts";
 import { privateReadPaths } from "../src/util/private-reads.ts";
 import * as proc from "../src/util/proc.ts";
 import {
@@ -1198,18 +1201,23 @@ test("a worker runs real checks from the exact bundle head and returns the local
     firstCheck.name = "pass\x1b[31m";
     firstCheck.run = "cat tracked; git rev-parse HEAD";
   }
-  const worker = await loop({
-    confinement: {
-      ...fakeConfinement,
-      async verify(_roots, opts) {
-        writeFileSync(join(opts.cwd, "output-credential"), secret);
+  const privacy = remoteFixture();
+  const worker = await gatePrivacyScope.run({ ...privacy.scope, signer: undefined }, () =>
+    loop({
+      confinement: {
+        ...fakeConfinement,
+        async verify(_roots, opts) {
+          writeFileSync(join(opts.cwd, "output-credential"), secret);
+        },
       },
-    },
-  });
+    }),
+  );
   const signal = AbortSignal.timeout(150_000);
   const acquisition = spyOn(gateSlots, "acquire");
   try {
-    const run = await executeGate(req, signal, {}, gateExecutorFor("lan", workers, [req.repo]));
+    const run = await privacy.scoped(() =>
+      executeGate(req, signal, {}, gateExecutorFor("lan", workers, [req.repo])),
+    );
     expect(acquisition.mock.calls[0]?.[4]).toBe("start");
     expect(acquisition).toHaveBeenCalledTimes(1);
     expect(workers.list()[0]?.setupWarning).toBeUndefined();
@@ -1223,16 +1231,33 @@ test("a worker runs real checks from the exact bundle head and returns the local
     expect(workerCleanupRecords(worker.remote)).toEqual([]);
     expect(run.checks[0]?.output).toContain("gate bytes");
     expect(run.checks[0]?.output).toContain(req.headSha);
+    for (const result of [...run.setup, ...run.checks]) {
+      expect(result.textPrivacy?.output.kind).toBe("attested:lan");
+      expect(
+        verifier(privacy.registry, privacy.signer).verify(
+          result.textPrivacy?.output,
+          "output",
+          result.output,
+        ),
+      ).toBe(true);
+      expect(result.failures).toBeUndefined();
+    }
     const jobs = workers.jobs("1=1");
     expect(jobs).toHaveLength(1);
     expect(jobs[0]).toMatchObject({ state: "done", attempt: 1, worker: "loop-runner", failure_reason: null });
     expect(jobs[0]?.result).not.toContain(secret);
     expect(jobs[0]?.events).not.toContain(secret);
     expect(jobs[0]?.events).toContain("withheld");
+    for (const stored of [jobs[0]?.result, jobs[0]?.events]) {
+      expect(stored).toContain("remoteAttestation");
+      expect(stored).not.toContain("textPrivacy");
+      expect(stored).not.toContain('"mac"');
+    }
     for (const name of ["token", "coordinator-fingerprint"])
       expect(statSync(join(worker.remote.paths.home, "worker", name)).mode & 0o777).toBe(0o600);
   } finally {
     await worker.stop();
+    await privacy.checker.dispose();
     acquisition.mockRestore();
   }
 }, 180_000);
@@ -7898,13 +7923,17 @@ describe("outer", () => {
       },
     ],
   };
-  const worker = await loop();
+  const privacy = remoteFixture(),
+    streamed: ExecutionEvent[] = [];
+  const worker = await gatePrivacyScope.run({ ...privacy.scope, signer: undefined }, () => loop());
   try {
-    const run = await executeGate(
-      req,
-      AbortSignal.timeout(30_000),
-      {},
-      gateExecutorFor("lan", workers, [req.repo]),
+    const run = await privacy.scoped(() =>
+      executeGate(
+        req,
+        AbortSignal.timeout(30_000),
+        { onResult: (result, phase) => streamed.push({ type: "check", result, phase }) },
+        gateExecutorFor("lan", workers, [req.repo]),
+      ),
     );
     expect(validRun(req, run)).toBe(true);
     expect(run.sha).toBe(req.headSha);
@@ -7918,8 +7947,47 @@ describe("outer", () => {
       { file: "x.test.ts", name: "outer absent", reason: "name matched no tests" },
     ];
     expect(run.checks[0]?.coveringTests).toEqual(evidence);
-    const events = JSON.parse(workers.jobs("1=1")[0]?.events ?? "[]");
-    expect(events).toContainEqual({ type: "check", phase: "check", result: run.checks[0] });
+    const job = workers.jobs("1=1")[0];
+    const stored: ExecutionEvent[] = JSON.parse(job?.events ?? "[]");
+    const storedCheck = stored.find((event) => event.type === "check" && event.phase === "check");
+    if (storedCheck?.type !== "check") throw new Error("Missing stored check");
+    const returned = run.checks[0];
+    if (!returned) throw new Error("Missing returned check");
+    const {
+      textPrivacy: _privacy,
+      remoteAttestation: _claim,
+      output: _output,
+      failures: _failures,
+      ...execution
+    } = returned;
+    const {
+      remoteAttestation,
+      output: _storedOutput,
+      failures: _storedFailures,
+      ...storedExecution
+    } = storedCheck.result;
+    expect(storedExecution).toEqual(execution);
+    expect(remoteAttestation?.output).toMatchObject({
+      withheld: false,
+      checkedComplete: true,
+      entriesDigest: privateStringsDigest([]),
+    });
+    for (const text of [job?.events, job?.result]) {
+      expect(text).not.toContain("textPrivacy");
+      expect(text).not.toContain('"mac"');
+    }
+    expect(streamed).toContainEqual({ type: "check", phase: "check", result: returned });
+    for (const result of [
+      run.checks[0],
+      ...streamed.flatMap((event) => (event.type === "check" ? [event.result] : [])),
+    ]) {
+      if (!result) throw new Error("Missing returned check");
+      expect(result.textPrivacy?.output.kind).toBe("attested:lan");
+      const v = verifier(privacy.registry, privacy.signer);
+      expect(v.verify(result.textPrivacy?.output, "output", result.output)).toBe(true);
+      expect(v.verify(result.textPrivacy?.identities, "identities", gateIdentities(result))).toBe(true);
+      expect(result.failures).toBeUndefined();
+    }
     expect(run.checks[0]?.executedCommand).toContain("--reporter=junit");
     expect(run.checks[0]?.command).toBe(req.gates.checks[0]?.run);
     expect(workers.jobs("1=1")).toMatchObject([
@@ -7927,6 +7995,7 @@ describe("outer", () => {
     ]);
   } finally {
     await worker.stop();
+    await privacy.checker.dispose();
   }
 }, 45_000);
 

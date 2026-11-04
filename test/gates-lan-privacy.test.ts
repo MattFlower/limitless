@@ -3,7 +3,9 @@ import { Store } from "../src/db/store.ts";
 import { WorkerStore } from "../src/db/workers.ts";
 import type { ExecutionEvent, GateRequest } from "../src/gates/executor.ts";
 import { lanExecutor } from "../src/gates/lan.ts";
+import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import type { GateRun } from "../src/gates/run.ts";
+import { gateIdentities } from "../src/gates/text-privacy.ts";
 import { verifier } from "../src/util/privacy-proof.ts";
 import { remoteFixture } from "./gate-remote-support.ts";
 
@@ -98,6 +100,83 @@ test("LAN setup/check events, final results and retained attempts are rechecked"
     }
   }
 });
+
+test.each(["setup", "infrastructure"])(
+  "LAN resume preserves signed local %s fallback diagnostics",
+  async (kind) => {
+    const f = await fixture(),
+      remote = f.privacy.result();
+    f.workers.event(f.handle.id, { type: "check", phase: "setup", result: remote });
+    if (kind === "setup") {
+      f.workers.complete(f.handle.id, { setupOk: false, setup: [{ ...remote, ok: false }], checks: [] });
+      expect(f.workers.fallbackSetup(f.handle.id, remote.command)).toBe(true);
+    } else {
+      f.workers.fail(f.handle.id, "worker disconnected");
+      f.workers.fail(f.handle.id, "no replacement worker");
+    }
+    const protectedOutput = await f.privacy.scoped(() =>
+      protectGateOutput(
+        {
+          stdout: "local fallback diagnostic",
+          stderr: "",
+          exitCode: 1,
+          signal: null,
+          cancelled: false,
+          timedOut: false,
+          idleTimedOut: false,
+          truncated: false,
+          durationMs: 1,
+          capture: { provenance: { kind: "complete" }, stdout: "local fallback diagnostic", stderr: "" },
+        },
+        gateIdentities(remote),
+        { deadline: Date.now() + 120_000 },
+      ),
+    );
+    const { remoteAttestation: _claim, ...local } = {
+      ...remote,
+      ...protectedOutput,
+      failures: "local failure detail",
+    };
+    const retained = { ...local, firstAttempt: local, targetedRetry: local, retryAttempt: local };
+    const run = { setupOk: true, setup: [retained], checks: [retained] };
+    for (const phase of ["setup", "check"] as const)
+      f.workers.event(f.handle.id, { type: "check", phase, result: retained });
+    expect(f.workers.complete(f.handle.id, run, true)).toBe(true);
+    const stored = f.workers.job(f.handle.id);
+    const execution = f.privacy.scoped(() =>
+      lanExecutor(new WorkerStore(f.store, "f".repeat(40), { tick: 1 }), []).attach(
+        f.handle,
+        f.controller.signal,
+      ),
+    );
+    const events: ExecutionEvent[] = [];
+    const drain = (async () => {
+      for await (const event of execution.events) events.push(event);
+    })();
+    const resumed = await execution.result;
+    await drain;
+    expect(resumed).toEqual(JSON.parse(stored?.result ?? "null"));
+    const checks = events.filter((event) => event.type === "check");
+    expect(checks).toHaveLength(3);
+    expect(checks[0]?.result.textPrivacy?.output.kind).not.toBe("complete");
+    expect(checks.slice(1)).toEqual(
+      JSON.parse(stored?.events ?? "[]")
+        .filter((event: ExecutionEvent) => event.type === "check")
+        .slice(1),
+    );
+    for (const result of [resumed.checks[0], ...checks.slice(1).map((event) => event.result)]) {
+      expect(result?.output).toBe("local fallback diagnostic");
+      expect(result?.failures).toBe("local failure detail");
+      expect(
+        verifier(f.privacy.registry, f.privacy.signer).verify(
+          result?.textPrivacy?.output,
+          "output",
+          result?.output ?? "",
+        ),
+      ).toBe(true);
+    }
+  },
+);
 
 test.each(["event", "final"])(
   "LAN %s checks discard candidates if state, worker or attempt changes",
