@@ -7,15 +7,27 @@ import type { GitHubAccessProblem } from "../core/types.ts";
 import { createGitHubIdentity } from "../integrations/github-identity.ts";
 import { githubDoctor } from "../integrations/github-poller.ts";
 import { installIntegrations, repositoryRoot, sessionStartInstructions } from "../integrations/install.ts";
+import { type Release, release, resolveReleaseBootSha } from "../release.ts";
 import { resolveCatalog } from "../router/config-catalog.ts";
 import { redactCredentials, sh } from "../util/proc.ts";
 import { loggedIn as cliLoggedIn, loginArgs } from "../workers/capabilities.ts";
 import { apiTokenHeaders } from "./api-token.ts";
+import { stableExecutable } from "./service.ts";
 import { patchSetupConfig } from "./setup-config.ts";
+
+declare const LIMITLESS_BUILD_PACKAGED: boolean;
 export type Check = { id: string; status: "ok" | "warn" | "fail"; message: string; fix?: string };
 type CommandResult = { exitCode: number | null; stdout: string; stderr: string };
 type SmokeRow = { name: string; status: "pass" | "fail" | "skip"; reason?: string; durationMs: number };
 type Health = { ok: boolean; sha: string };
+const smokeSkip = (): SmokeRow[] => [
+  { name: "live", status: "skip", reason: "Live smoke requires a source installation", durationMs: 0 },
+];
+const expectedSha = (d: SetupDeps) =>
+  resolveReleaseBootSha(async () => {
+    const result = await d.run(["git", "rev-parse", "HEAD"], d.appDir).catch(() => null);
+    return result?.exitCode === 0 ? result.stdout.trim() : undefined;
+  }, d.release);
 type ModelList = { data?: { id: string; type?: string }[] };
 export type SetupDeps = ReturnType<typeof setupDeps>;
 async function get(d: SetupDeps, url: string, token?: string, local = false) {
@@ -202,17 +214,21 @@ export async function doctor(d: SetupDeps, checkIdentity = true): Promise<Check[
   }
   const health = await get(d, `${d.url}/api/health`);
   const body = health?.ok ? ((await health.json().catch(() => null)) as Health) : null;
-  const sha = await d.run(["git", "rev-parse", "HEAD"], d.appDir).catch(() => null);
-  const healthy = body?.ok === true && sha?.exitCode === 0 && !!body.sha && body.sha === sha.stdout.trim();
+  const sha = await expectedSha(d);
+  const healthy = body?.ok === true && !!sha && body.sha === sha;
   if (health?.ok) fixes.daemon = "limitless deploy";
   const daemonMessage = health?.ok ? "version differs or cannot be verified" : "unreachable";
   add("daemon", healthy ? "ok" : "warn", healthy ? "healthy at installed sha" : daemonMessage);
-  const rows = (await d.readJson(join(d.config.paths.home, "smoke-last.json"))) as SmokeRow[] | null;
-  const smokeOk =
-    Array.isArray(rows) && rows.length > 0 && rows.every((r) => r && ["pass", "skip"].includes(r.status));
-  const failed = Array.isArray(rows) ? rows.filter((r) => r?.status === "fail").map((r) => r.name) : [];
-  const smokeMessage = smokeOk ? "last smoke passed" : `missing or failed smoke: ${failed.join(", ")}`;
-  add("smoke", smokeOk ? "ok" : "warn", smokeMessage);
+  if (d.release.kind === "packaged") {
+    add("smoke", "ok", "Live smoke skipped: requires a source installation");
+  } else {
+    const rows = (await d.readJson(join(d.config.paths.home, "smoke-last.json"))) as SmokeRow[] | null;
+    const smokeOk =
+      Array.isArray(rows) && rows.length > 0 && rows.every((r) => r && ["pass", "skip"].includes(r.status));
+    const failed = Array.isArray(rows) ? rows.filter((r) => r?.status === "fail").map((r) => r.name) : [];
+    const smokeMessage = smokeOk ? "last smoke passed" : `missing or failed smoke: ${failed.join(", ")}`;
+    add("smoke", smokeOk ? "ok" : "warn", smokeMessage);
+  }
   try {
     const response = health?.ok ? await get(d, `${d.url}/api/github/access`, undefined, true) : null;
     const problems = response?.ok ? ((await response.json()) as GitHubAccessProblem[]) : null;
@@ -404,12 +420,12 @@ async function runSetup(
     await d.install();
     service = "started";
     transaction.failedStep = "readiness";
-    const sha = await d.run(["git", "rev-parse", "HEAD"], d.appDir);
+    const sha = await expectedSha(d);
     let ready = false;
     for (let i = 0; i < 30 && !ready; i++) {
       const response = await get(d, `${d.url}/api/health`);
       const body = response?.ok ? await response.json().catch(() => null) : null;
-      ready = body?.ok === true && sha.exitCode === 0 && body.sha === sha.stdout.trim();
+      ready = body?.ok === true && !!sha && body.sha === sha;
       if (!ready) await d.sleep();
     }
     if (!ready) throw new Error("daemon did not become healthy; run limitless service install");
@@ -430,7 +446,7 @@ async function runSetup(
     service,
     smoke,
     mcp,
-    sessionStart: sessionStartInstructions(d.appDir),
+    sessionStart: sessionStartInstructions(d.appDir, d.executable),
     discreet,
     warnings: transaction.warnings,
   };
@@ -442,16 +458,31 @@ async function runSetup(
   }
   return 0;
 }
-type SetupPaths = Partial<{ configDir: string; home: string; appDir: string; userHome: string }>;
+type SetupPaths = Partial<{
+  configDir: string;
+  home: string;
+  appDir: string;
+  userHome: string;
+  release: Release;
+  execPath: string;
+}>;
 export function setupDeps(options: SetupPaths = {}) {
   const config = loadConfig({ ...options, readOnly: true }),
     appDir = options.appDir ?? process.env.LIMITLESS_APP_DIR ?? join(homedir(), ".limitless/app");
   const main = join(repositoryRoot, "src/cli/main.ts");
-  const run = (args: string[], cwd = repositoryRoot, timeoutMs = 10000): Promise<CommandResult> =>
+  const info = options.release ?? release;
+  const executable = info.kind === "packaged" ? stableExecutable(options.execPath) : undefined;
+  const run = (
+    args: string[],
+    cwd = info.kind === "packaged" ? process.cwd() : repositoryRoot,
+    timeoutMs = 10000,
+  ): Promise<CommandResult> =>
     sh(args, { cwd, allowFail: true, timeoutMs, env: { ...process.env, LIMITLESS_PORT: `${config.port}` } });
   const d = {
     config,
     appDir,
+    release: info,
+    executable,
     url: process.env.LIMITLESS_URL ?? `http://127.0.0.1:${config.port}`,
     tty: !!process.stdin.isTTY,
     run,
@@ -477,20 +508,35 @@ export function setupDeps(options: SetupPaths = {}) {
     },
     ask: async (q: string, fallback: string) => prompt(`${q} [${fallback}]:`)?.trim() || fallback,
     install: async (): Promise<void> => {
-      const result = await d.run(["bun", main, "service", "install"], repositoryRoot, 900000);
+      const result = await d.run(
+        [...(executable ? [executable] : ["bun", main]), "service", "install"],
+        info.kind === "packaged" ? process.cwd() : repositoryRoot,
+        900000,
+      );
       if (result.exitCode !== 0)
         throw new Error("service installation failed; run limitless service install");
     },
     sleep: () => Bun.sleep(1000),
     smoke: async (): Promise<SmokeRow[]> => {
-      const rows: SmokeRow[] = [];
-      await (await import("../../scripts/smoke.ts")).main(() => {}, { onRow: (row) => rows.push(row) });
-      return rows;
+      if (d.release.kind === "packaged") return smokeSkip();
+      // Bun only drops the source import with an in-module build define.
+      if (typeof LIMITLESS_BUILD_PACKAGED === "undefined" || !LIMITLESS_BUILD_PACKAGED) {
+        const rows: SmokeRow[] = [];
+        await (await import("../../scripts/smoke.ts")).main(() => {}, { onRow: (row) => rows.push(row) });
+        return rows;
+      }
+      return smokeSkip();
     },
     mcp: async (write: boolean): Promise<string> => {
       if (!write) {
         const lines: string[] = [];
-        installIntegrations({ home: options.userHome, print: (s) => lines.push(s) });
+        installIntegrations({
+          home: options.userHome,
+          release: info,
+          executable,
+          url: d.url,
+          print: (s) => lines.push(s),
+        });
         return lines.join("\n");
       }
       for (const cli of ["claude", "codex"]) {
@@ -498,7 +544,7 @@ export function setupDeps(options: SetupPaths = {}) {
         if ((await d.run([cli, "--version"])).exitCode !== 0) continue;
         const scope = cli === "claude" ? ["--scope", "user"] : [];
         const args = ["mcp", "add", "limitless", "--env", `LIMITLESS_URL=${d.url}`, ...scope];
-        const command = ["bun", join(appDir, "src/cli/main.ts"), "mcp"];
+        const command = [...(executable ? [executable] : ["bun", join(appDir, "src/cli/main.ts")]), "mcp"];
         const result = await d.run([cli, ...args, "--", ...command]);
         if (result.exitCode !== 0) throw new Error(`MCP ${cli} failed; run limitless integrations install`);
       }
