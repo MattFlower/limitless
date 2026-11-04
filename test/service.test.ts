@@ -265,6 +265,16 @@ test("cross-kind discovery preserves canonical source ownership and exact packag
   const bunAlias = join(dir, "impostor/limitless");
   mkdirSync(join(bunAlias, ".."));
   symlinkSync(process.execPath, bunAlias);
+  // Aliases named limitless that resolve to an unrelated program, another Bun, or nothing at all.
+  const otherBun = join(dir, "other-bun/bin/bun");
+  mkdirSync(join(otherBun, ".."), { recursive: true });
+  writeFileSync(otherBun, "");
+  const aliases = ["/bin/echo", otherBun, join(dir, "missing/limitless")].map((target, i) => {
+    const link = join(dir, `alias-${i}/limitless`);
+    mkdirSync(join(link, ".."));
+    symlinkSync(target, link);
+    return link;
+  });
   mkdirSync(agents);
   const path = join(agents, "legacy.plist");
   writeFileSync(path, "converted by injected plutil");
@@ -272,6 +282,7 @@ test("cross-kind discovery preserves canonical source ownership and exact packag
     { caller: "source", args: [binary, "serve"], expected: "daemon" },
     { caller: "source", args: [stable, "executor"], expected: "executor" },
     { caller: "source", args: [bunAlias, "serve"] },
+    ...aliases.map((alias) => ({ caller: "source" as const, args: [alias, "serve"] })),
     { caller: "source", args: [process.execPath, "serve"] },
     { caller: "source", args: ["limitless", "serve"] },
     { caller: "source", args: [join(dir, "other-program"), "serve"] },

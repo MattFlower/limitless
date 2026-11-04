@@ -7,6 +7,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -174,6 +175,15 @@ function samePath(a: unknown, b: string): boolean {
     return false;
   }
 }
+/** A packaged launch path must resolve to a regular file still named `limitless`, not an alias to another program. */
+function resolvesToLimitless(path: string): boolean {
+  try {
+    const target = realpathSync(path);
+    return basename(target) === "limitless" && statSync(target).isFile();
+  } catch {
+    return false;
+  }
+}
 type Migration = Record<"label" | "path" | "target" | "phase" | "backup", string> & {
   old: { label: string; path: string; kind?: string };
 };
@@ -223,6 +233,7 @@ export async function installedUnits(opts: ServiceOptions = {}) {
         : typeof args[0] === "string" &&
           isAbsolute(args[0]) &&
           executable === "limitless" &&
+          resolvesToLimitless(args[0]) &&
           !samePath(args[0], opts.execPath ?? process.execPath));
     const action = source ? args[2] : binary ? args[1] : undefined;
     let kind = action === "serve" ? "daemon" : action === "executor" ? "executor" : "";
