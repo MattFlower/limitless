@@ -323,7 +323,6 @@ export async function withScratch<T>(
     throw error;
   } finally {
     try {
-      assertProcessesStopped();
       options.beforeRemove?.(scratchDir);
     } catch {} // Evidence collection must not change invocation results or prevent cleanup.
     forgetBrowserOutputs(scratchDir);

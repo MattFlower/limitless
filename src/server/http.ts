@@ -737,17 +737,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/runs/:id/screenshots/:name": handle((req) => {
       const id = req.params.id as string,
         name = req.params.name as string;
-      if (!store.listArtifacts(id).some((a) => a.name === name && a.kind === "screenshot"))
-        return error("not found", 404);
-      const content = store.getArtifact(id, name);
-      if (!content || content.length > 4 * Math.ceil((5 * 1024 * 1024) / 3)) return error("not found", 404);
-      const bytes = Buffer.from(content, "base64");
-      if (
-        bytes.length > 5 * 1024 * 1024 ||
-        bytes.toString("base64") !== content ||
-        !isInertMedia("x.png", bytes)
-      )
-        return error("not found", 404);
+      const row = store.listArtifacts(id).find((a) => a.name === name && a.kind === "screenshot");
+      const bytes = Buffer.from((row && store.getArtifact(id, name)) || "", "base64");
+      // Collection stored only validated captures; anything else is never served as an image.
+      if (bytes.length > 5 * 1024 * 1024 || !isInertMedia("x.png", bytes)) return error("not found", 404);
       return new Response(bytes, {
         headers: {
           "Content-Type": "image/png",

@@ -1045,7 +1045,9 @@ export class RunContext {
         }
         dispatched = true;
       };
-      const screenshots = opts.role === "verify" || this.previewUrl ? screenshotPrivacy() : undefined;
+      // Browser verifier events stay held until their screenshot locators are known.
+      const screenshots =
+        opts.role === "verify" && this.previewUrl && !noTools ? screenshotPrivacy() : undefined;
       let result: AgentResult;
       let needsHuman: NeedsHumanError | undefined;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
@@ -1086,9 +1088,7 @@ export class RunContext {
           privateSession: opts.privateOutput || opts.privateSession,
           // The private log sits in the shared temporary directory while a parallel implementer
           // runs as the same user, so it never holds the private text itself.
-          redactOutput: opts.privateOutput
-            ? withholdText
-            : (text) => screenshots?.text(redact?.(text) ?? text) ?? redact?.(text) ?? text,
+          redactOutput: opts.privateOutput ? withholdText : redact,
           signal: callSignal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
@@ -1109,7 +1109,8 @@ export class RunContext {
                   this.onAgentEvent(invocation.id, { ...ev, id: String(Bun.hash(ev.id)) }, opts.role);
               }
             : (ev) => {
-                this.onAgentEvent(invocation.id, screenshots?.event(ev) ?? ev, opts.role, redact);
+                if (screenshots) screenshots.hold(ev);
+                else this.onAgentEvent(invocation.id, ev, opts.role, redact);
               },
         };
         const faultContext = {
@@ -1167,15 +1168,16 @@ export class RunContext {
                 this.state.gatesConfig?.checks.some((c) => c.name === "test")
                 ? (signal) => runAgentGate(this, spec.cwd, signal)
                 : undefined,
-              (scratch) =>
-                collectVerifierCaptures(
-                  scratch,
-                  store,
-                  this.run.id,
-                  invocation.id,
-                  spec.onEvent,
-                  screenshots,
-                ),
+              screenshots &&
+                ((scratch) =>
+                  collectVerifierCaptures(
+                    scratch,
+                    store,
+                    this.run.id,
+                    invocation.id,
+                    spec.onEvent,
+                    screenshots,
+                  )),
             );
           };
           result = await agentExecutor.run(
@@ -1228,6 +1230,8 @@ export class RunContext {
         };
       } finally {
         try {
+          for (const ev of screenshots?.drain() ?? [])
+            this.onAgentEvent(invocation.id, ev, opts.role, redact);
           if (!dispatched && revision.aborted && opts.role === "implement") {
             this.state.implementer = previousImplementer;
             this.checkpointer.writeState(this.run.id, this.state);

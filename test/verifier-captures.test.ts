@@ -246,7 +246,8 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
     await fakeBrowserCache(cache);
     let scratch = "",
       output = "";
-    const prompts: string[] = [];
+    const prompts: string[] = [],
+      live: string[] = [];
     f.factory.deps.harnesses.fake = fakeHarness((spec) => {
       prompts.push(spec.prompt);
       if (prompts.length === 1) {
@@ -262,13 +263,25 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
         writeFileSync(join(output, "fail"), png);
       }
       if (prompts.length > 1) return { text: "verified interactions" };
-      const evidence = `See private-viewport.png, private-customer-viewport.png, private capture.dat, ${output}, screenshot-1-0.png and /api/runs/${run.id}/screenshots/screenshot-1-0.png`;
+      // Locators named before the screenshot call are neither live nor exported.
+      spec.onEvent({ type: "text", text: "I will save the viewport to private capture.dat" });
+      live.push(JSON.stringify(f.factory.store.listEvents(run.id)));
+      const evidence = `See private-customer-viewport.png, private capture.dat, ${output}, screenshot-1-0.png and /api/runs/${run.id}/screenshots/screenshot-1-0.png`;
       return {
         text: evidence,
         structured: {
           overall: "fail",
           notes: evidence,
-          criteria: [{ id: "AC-1", status: "unmet", evidence, publicSummary: evidence }],
+          criteria: [
+            {
+              id: "AC-1",
+              status: "unmet",
+              evidence,
+              publicSummary: evidence,
+              test_outcome_only: true,
+              covering_tests: [{ file: "test/media.test.ts", name: "rejects malformed input.png" }],
+            },
+          ],
         },
         events: [
           {
@@ -290,11 +303,13 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
             input: { filename: "private capture.dat", type: "png" },
           },
           { type: "tool_result", id: "shot-b", output: "Correlated opaque image response", isError: true },
+          { type: "text", text: `Screenshots are stored in ${output}` },
         ],
       };
     });
     const ctx = new RunContext(f.factory.deps, run, repo, new AbortController().signal);
     ctx.state.slottedCommands = [];
+    ctx.previewUrl = "http://127.0.0.1:43210";
     const stage = f.factory.store.startStage(run.id, "verify", 0);
     let feedback = "Verify UI";
     const invoke = () =>
@@ -321,6 +336,14 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
     ctx.artifact("verify-0.json", "verify", JSON.stringify(verified));
     feedback = formatVerifyFeedback(verified, ctx.state.spec);
     expect(verified.criteria[0]?.status).toBe("unmet");
+    // Exact covering-test identities survive screenshot filtering, even when they mention a PNG.
+    expect(verified.criteria[0]?.covering_tests).toEqual([
+      { file: "test/media.test.ts", name: "rejects malformed input.png" },
+    ]);
+    expect(live.join("")).not.toContain("private capture.dat");
+    const events = JSON.stringify(f.factory.store.listEvents(run.id));
+    expect(events).toContain("I will save the viewport to [screenshot]");
+    expect(events).toContain("Screenshots are stored in [screenshot]");
     expect(verified.overall).toBe("fail");
     expect(first.result.status).toBe("ok");
     const captures = f.factory.store.listArtifacts(run.id).filter((a) => a.kind === "screenshot");
@@ -364,7 +387,6 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
         captures[0]?.name ?? "missing-capture",
         "/screenshots/",
         output,
-        "private-viewport.png",
         "private-customer-viewport.png",
         "private capture.dat",
         "Correlated opaque image response",
