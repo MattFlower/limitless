@@ -287,6 +287,24 @@ test("a refusing gate performs no remote writes", async () => {
   expect(f.clock.pending.size).toBe(0);
 });
 
+test("admission rechecks the lease window after upload before selecting a pointer", async () => {
+  const f = await fixture(),
+    put = f.blobs.put,
+    update = spyOn(f.rt.leases, "update"),
+    mutate = spyOn(f.control, "mutate");
+  spyOn(f.blobs, "put").mockImplementationOnce(async (...args) => {
+    const result = await put(...args);
+    spyOn(f.rt.leases, "windowOpen").mockReturnValue(false);
+    return result;
+  });
+  await expect(f.admit()).rejects.toMatchObject({ reason: "lease" });
+  expect(update).not.toHaveBeenCalled();
+  expect(mutate).not.toHaveBeenCalled();
+  expect((await tip(f)).checkpoint).toBeUndefined();
+  expect(f.store.checkpointRecord(f.run.id)?.committed).toBeFalsy();
+  expect(f.store.getRun(f.run.id)?.status).toBe("queued");
+});
+
 test.each(["terminal", "live", "wait", "superseded"])(
   "acquisition %s maps to claim control without uploading",
   async (outcome) => {

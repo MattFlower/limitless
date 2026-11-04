@@ -6,7 +6,6 @@ import type { Store } from "../db/store.ts";
 import { cacheGit } from "../git/command.ts";
 import { cachePath, ensureCache } from "../git/repos.ts";
 import { ClaimLostError, ClaimWaitError, rethrowClaimControl } from "../integrations/claim-errors.ts";
-import { bindClaim, claimGuard, claimScope } from "../integrations/claim-guard.ts";
 import type { ClaimClient } from "../integrations/claim-ref.ts";
 import type { ControlNamer } from "../integrations/control-identity.ts";
 import { canonicalJson } from "../integrations/control-json.ts";
@@ -18,16 +17,15 @@ import type { SharedStore } from "../integrations/shared-store.ts";
 import { settleCheckpoint } from "./checkpoint-settlement.ts";
 import { type Checkpointer, NeedsHumanError, type RunState } from "./context.ts";
 import { claimKey, claimRef } from "./portable.ts";
-import { sharedRepository } from "./run-claim.ts";
 import { ensureAdmissionPin } from "./run-policy-pins.ts";
 import type { createCheckpointCommitter } from "./shared-checkpointer.ts";
+import { sharedRepository } from "./shared-repository.ts";
 
 export type SharedRuntime = Readonly<{
   member: string;
   leases: LeaseManager;
   claims: Pick<ClaimClient, "read">;
   blobs: SharedStore;
-  // The control store's actor callback must identify this member.
   control: Pick<ControlStore, "mutate">;
   namer: ControlNamer;
   committer: ReturnType<typeof createCheckpointCommitter>;
@@ -95,13 +93,12 @@ export async function admitRun(
               ? rt.refreshCache(repo, signal)
               : ensureCache(cfg.paths, repo, signal).then(() => {}),
           );
-          const commits = new Set([
+          for (const sha of new Set([
             current.baseSha,
             current.headSha,
             current.sourceRef.baseSha,
             current.sourceRef.headSha,
-          ]);
-          for (const sha of commits) {
+          ])) {
             if (sha == null) continue;
             if (typeof sha !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha))
               throw new ClaimWaitError("unavailable");
@@ -153,16 +150,17 @@ export async function admitRun(
         if (settlement === "wait") throw new ClaimWaitError("lease");
         if (settlement === "blocked") throw new ClaimWaitError("checkpoint");
         if (!store.checkpointRecord(run.id)?.committed) {
-          const binding = bindClaim(rt.leases, handle, () => false);
           await step(() =>
             rt.committer.commit(
               run.id,
               {
                 handle,
-                onLost: binding.onLost,
+                onLost() {
+                  throw new ClaimLostError();
+                },
                 guard: () => {
                   check();
-                  claimScope.run([binding], claimGuard);
+                  if (!rt.leases.windowOpen(handle)) throw new ClaimWaitError("lease");
                 },
               },
               signal,
@@ -186,15 +184,13 @@ export async function admitRun(
             ),
           );
           if (
-            result.kind !== "applied" &&
-            !(
-              result.kind === "unchanged" &&
+            result.kind === "applied" ||
+            (result.kind === "unchanged" &&
               result.reason === "precondition" &&
-              equal(result.tip?.manifest.value ?? null)
-            )
+              equal(result.tip?.manifest.value ?? null))
           )
-            throw new ClaimWaitError("unavailable");
-          store.markRunIndexed(run.id);
+            store.markRunIndexed(run.id);
+          else throw new ClaimWaitError("unavailable");
         }
         return handle;
       });
