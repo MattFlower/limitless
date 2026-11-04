@@ -2417,6 +2417,7 @@ test("Factory stop waits for its active health probe before database replacement
 
 const ghError = (stderr: string, timedOut = false) => new CommandError("gh failed", 1, "", stderr, timedOut);
 const bad502 = "HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)";
+const githubPublickey = "git@github.com: Permission denied (publickey).";
 const ghCalls = (pr: string, prefix: string) =>
   readFileSync(`${pr}.calls`, "utf8")
     .split("\n")
@@ -2502,6 +2503,47 @@ test("GitHub retries SSH temporary DNS failures", async () => {
     }),
   ).toBe("pushed");
   expect(calls).toBe(2);
+});
+
+test("GitHub retries only structured SSH publickey refusals through recovery or exhaustion", async () => {
+  const refusal = ghError(`${githubPublickey}\nfatal: Could not read from remote repository.`);
+  expect(isTransient(refusal)).toBe(true);
+  let calls = 0;
+  expect(
+    await withGitHubRetry(async () => {
+      if (++calls === 1) throw refusal;
+      return "fetched";
+    }),
+  ).toBe("fetched");
+  expect(calls).toBe(2);
+  calls = 0;
+  await expect(
+    withGitHubRetry(async () => {
+      calls++;
+      throw refusal;
+    }),
+  ).rejects.toBeInstanceOf(GitHubUnavailableError);
+  expect(calls).toBe(githubRetry.attempts);
+  for (const error of [
+    ghError("git@example.com: Permission denied (publickey)."),
+    ghError("git@github.com.example.com: Permission denied (publickey)."),
+    ghError("git@othergithub.com: Permission denied (publickey)."),
+    ghError("othergit@github.com: Permission denied (publickey)."),
+    ghError("git@github.com: Permission denied (password)."),
+    ghError("fatal: Permission denied"),
+    new CommandError("git failed", 128, githubPublickey, "fatal: denied", false),
+    new Error(githubPublickey),
+  ]) {
+    expect(isTransient(error)).toBe(false);
+    let calls = 0;
+    await expect(
+      withGitHubRetry(async () => {
+        calls++;
+        throw error;
+      }),
+    ).rejects.toBe(error);
+    expect(calls).toBe(1);
+  }
 });
 
 test("the budget bounds retries and waits, never a call's first attempt or a healthy slow call", async () => {
@@ -3160,28 +3202,62 @@ test.each(["cause", "cancel recorded during failure"])("GitHub outage: %s", asyn
   }
 });
 
-test("GitHub outage in publication check parks instead of reporting a private-string block", async () => {
+test.each(["Could not resolve host: example.invalid", githubPublickey])(
+  "GitHub outage in publication check parks instead of reporting a private-string block: %s",
+  async (diagnostic) => {
+    const { f, r, pr, restore } = await deliveryFaultFixture();
+    const realSh = proc.sh;
+    let attempts = 0;
+    const command = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+      if (cmd.includes("ls-remote")) {
+        attempts++;
+        throw new CommandError(diagnostic, 128, "", diagnostic, false);
+      }
+      return realSh(cmd, opts);
+    });
+    try {
+      expect(await executeRun(f.deps, r.id, new AbortController().signal)).toBe("queued");
+      expect(attempts).toBe(githubRetry.attempts);
+      expect(f.store.getRun(r.id)?.status).toBe("queued");
+      expect(f.store.getRun(r.id)?.githubWait?.reason).toContain(diagnostic);
+      expect(f.store.getRunState<RunState>(r.id)?.githubWait).toBeDefined();
+      expect(f.store.getRunState<RunState>(r.id)?.needsHumanReason).toBeUndefined();
+      expect(f.store.getRun(r.id)?.githubWait?.reason).not.toContain("Private-string check blocked");
+      expect(ghCalls(pr, "pr create")).toEqual([]);
+    } finally {
+      command.mockRestore();
+      await restore();
+    }
+  },
+);
+
+test("publication-range fetch failure reports a fixed operational reason without command text", async () => {
   const { f, r, pr, restore } = await deliveryFaultFixture();
+  const sentinel = `private-${crypto.randomUUID()}.example`;
+  const remoteHead = "a".repeat(40);
   const realSh = proc.sh;
-  let attempts = 0;
+  let fetches = 0;
   const command = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
-    if (cmd.includes("ls-remote")) {
-      attempts++;
-      throw new CommandError(
-        "Could not resolve host: example.invalid",
-        128,
-        "",
-        "Could not resolve host: example.invalid",
-        false,
-      );
+    if (cmd.includes("ls-remote"))
+      return { stdout: `${remoteHead}\t${cmd.at(-1)}\n`, stderr: "", exitCode: 0 };
+    if (cmd.includes("fetch") && cmd.at(-1) === remoteHead) {
+      fetches++;
+      throw new CommandError(sentinel, 128, sentinel, sentinel, false);
     }
     return realSh(cmd, opts);
   });
   try {
-    expect(await executeRun(f.deps, r.id, new AbortController().signal)).toBe("queued");
-    expect(attempts).toBe(githubRetry.attempts);
-    expect(f.store.getRun(r.id)?.githubWait?.reason).toContain("Could not resolve host");
-    expect(f.store.getRun(r.id)?.githubWait?.reason).not.toContain("Private-string check blocked");
+    expect(await executeRun(f.deps, r.id, new AbortController().signal)).toBe("needs_human");
+    expect(fetches).toBeGreaterThan(0);
+    const reason = "Private-string check could not run: publication-range inspection failed";
+    const run = f.store.getRun(r.id);
+    const state = f.store.getRunState<RunState>(r.id);
+    expect(run?.error).toStartWith(reason);
+    expect(state?.needsHumanReason).toBe(reason);
+    for (const text of [run?.error, state?.needsHumanReason]) {
+      expect(text).not.toContain("Private-string check blocked");
+      expect(text).not.toContain(sentinel);
+    }
     expect(ghCalls(pr, "pr create")).toEqual([]);
   } finally {
     command.mockRestore();

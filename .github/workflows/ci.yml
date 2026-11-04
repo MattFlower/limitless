@@ -8,7 +8,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -19,7 +19,8 @@ jobs:
       - run: |
           export LIMITLESS_CI_TEST_LOG="/proc/$$/fd/2"
           export LIMITLESS_CI_JUNIT="$RUNNER_TEMP/bun-test-junit.xml"
-          bash scripts/ci-check.sh 20m bun run check
+          # Healthy runs take 12-20 minutes; a 20-minute cap failed about a third of them (2026-11-04).
+          bash scripts/ci-check.sh 30m bun run check
       # The factory reads this report from PR and main runs to tell unrelated test failures apart (#994).
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

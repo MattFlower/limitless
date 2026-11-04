@@ -17,7 +17,14 @@ import { assertReadOnlyCommand } from "./setup-commands.ts";
 
 export { assertReadOnlyCommand } from "./setup-commands.ts";
 
-export function setupFixture(text?: string) {
+export const packagedRelease = {
+  kind: "packaged",
+  version: "2.0.0",
+  sha: "a".repeat(40),
+  bun: "test",
+} as const;
+
+export function setupFixture(text?: string, options: Parameters<typeof setupDeps>[0] = {}) {
   const root = mkdtempSync(join(tmpdir(), "limitless-setup-")),
     configDir = join(root, "config"),
     home = join(root, "data");
@@ -29,13 +36,28 @@ export function setupFixture(text?: string) {
     commands: string[] = [],
     effects: string[] = [],
     requests: { url: string; method: string }[] = [];
-  const state = { daemon: true, sha: "installed", auth: true, local: true, mcp: false };
-  const d = setupDeps({ configDir, home, userHome: join(root, "user"), appDir: join(root, "app") });
+  const state = {
+    daemon: true,
+    healthy: true,
+    sha: options.release?.kind === "packaged" ? options.release.sha : "installed",
+    auth: true,
+    local: true,
+    mcp: false,
+  };
+  const d = setupDeps({
+    ...options,
+    configDir,
+    home,
+    userHome: join(root, "user"),
+    appDir: join(root, "app"),
+  });
   d.url = "http://daemon.invalid";
   d.tty = false;
   d.print = (s) => output.push(s);
   d.run = async (args) => {
     commands.push(args.join(" "));
+    if (d.release.kind === "packaged" && args.includes("rev-parse"))
+      throw new Error("Packaged SHA must not invoke Git");
     assertReadOnlyCommand(args);
     return {
       exitCode: args.join(" ") === "gh auth status" && !state.auth ? 1 : 0,
@@ -52,7 +74,7 @@ export function setupFixture(text?: string) {
     requests.push({ url, method: init?.method ?? "GET" });
     if (url.endsWith("/api/health")) {
       if (!state.daemon) throw new Error("unreachable");
-      return Response.json({ ok: true, sha: state.sha });
+      return Response.json({ ok: state.healthy, sha: state.sha });
     }
     if (url.endsWith("/api/github/access")) return Response.json([]);
     if (url === "http://127.0.0.1:1234/v1/models" && state.local)
@@ -62,15 +84,16 @@ export function setupFixture(text?: string) {
   d.install = async () => {
     effects.push("service");
     state.daemon = true;
-    state.sha = "installed";
+    state.sha = d.release.kind === "packaged" ? d.release.sha : "installed";
   };
   d.sleep = async () => {
     effects.push("wait");
   };
-  d.smoke = async () => {
-    effects.push("smoke");
-    return [{ name: "live", status: "pass", durationMs: 1 }];
-  };
+  if (d.release.kind === "source")
+    d.smoke = async () => {
+      effects.push("smoke");
+      return [{ name: "live", status: "pass", durationMs: 1 }];
+    };
   d.ask = async () => {
     throw new Error("unexpected prompt");
   };
@@ -115,6 +138,8 @@ export function setupFixture(text?: string) {
       rmSync(root, { recursive: true, force: true });
       // Doctor catches failed commands; assert here so forbidden calls cannot be swallowed.
       for (const command of commands) expect(() => assertReadOnlyCommand(command.split(" "))).not.toThrow();
+      if (d.release.kind === "packaged")
+        expect(commands.filter((command) => command.includes("rev-parse"))).toEqual([]);
     },
   };
 }

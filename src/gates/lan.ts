@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { canonicalGateCwd, type WorkerStore } from "../db/workers.ts";
+import { canonicalGateCwd, type StoredGateEvent, type WorkerStore } from "../db/workers.ts";
 import { checkoutCommitted } from "../git/repos.ts";
 import {
   type Execution,
@@ -12,6 +12,7 @@ import {
   gateShutdown,
   localExecutor,
 } from "./executor.ts";
+import { type RemoteMemo, recheckRemote } from "./remote-privacy.ts";
 import type { GateRun } from "./run.ts";
 import { bindGateSlotScope, releaseGateSlotScope } from "./slots.ts";
 
@@ -125,13 +126,48 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
       const result = (async (): Promise<GateRun> => {
         await released;
         let index = 0;
+        const memo: RemoteMemo = new Map();
+        let deadline: number | undefined;
         for (;;) {
           controller.signal.throwIfAborted();
           workers.sweep();
           const job = workers.job(handle.id);
           if (!job) throw new Error("LAN gate job disappeared");
-          const stored: ExecutionEvent[] = JSON.parse(job.events);
-          events.push(...stored.slice(index));
+          const stored: StoredGateEvent[] = JSON.parse(job.events);
+          const valid = () => {
+            const current = workers.job(handle.id);
+            return (
+              !controller.signal.aborted &&
+              current?.state === job.state &&
+              current.worker === job.worker &&
+              current.attempt === job.attempt
+            );
+          };
+          const control = {
+            signal: controller.signal,
+            get deadline() {
+              deadline ??= Math.min(Date.now() + 120_000, job.attempt_deadline_at ?? Infinity);
+              return deadline;
+            },
+            memo,
+            valid,
+            parity: () => !!job.worker && workers.privateStringsMatch(job.worker),
+          };
+          const pending: ExecutionEvent[] = [];
+          for (const event of stored.slice(index)) {
+            const sameLease = job.worker && event.worker === job.worker && event.attempt === job.attempt;
+            pending.push(
+              !inplace && event.type === "check" && !event.result.textPrivacy && sameLease
+                ? { ...event, result: await recheckRemote(event.result, "attested:lan", control) }
+                : event,
+            );
+            if (!valid()) break;
+          }
+          if (!valid()) {
+            memo.clear();
+            continue;
+          }
+          events.push(...pending);
           index = stored.length;
           if (job.state === "cancelled") throw new Error("LAN gate job cancelled");
           if (job.state === "done" && job.result) {
@@ -140,6 +176,20 @@ export function lanExecutor(workers: WorkerStore, repos: readonly string[], inpl
             if (!inplace && !run.setupOk && failed && workers.fallbackSetup(handle.id, failed.command))
               continue;
             if (inplace && run.setupOk) hooks?.onLocalSetup?.();
+            if (!inplace) {
+              for (const group of [run.setup, run.checks])
+                for (let i = 0; i < group.length; i++) {
+                  const item = group[i];
+                  // Worker ingress removes textPrivacy; local fallback records retain it.
+                  if (item && !item.textPrivacy)
+                    group[i] = await recheckRemote(item, "attested:lan", control);
+                  if (!valid()) break;
+                }
+              if (!valid()) {
+                memo.clear();
+                continue;
+              }
+            }
             return run;
           }
           if (job.state === "failed") {
