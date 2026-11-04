@@ -12,14 +12,16 @@ const later = (f: Fn) =>
   function (this: unknown, cb: unknown, ...a: unknown[]) {
     return f.call(this, typeof cb === "function" ? dispatch(cb as Fn) : cb, ...a);
   };
-const settle = (f: Fn) =>
+const settle = (f: Fn, map = (v: unknown) => v) =>
   function (this: unknown, ...a: unknown[]) {
-    const [p, back] = [f.apply(this, a), (v: unknown) => resume(() => v)];
-    return p instanceof Promise ? p.then(back, (e) => back(Promise.reject(e))) : p;
+    const [p, back] = [f.apply(this, a), (v: unknown) => resume(() => map(v))];
+    return p instanceof Promise ? p.then(back, (e) => resume(() => Promise.reject(e))) : p;
   };
 export function trackResumptions() {
   const undo: (() => void)[] = [];
-  const patch = (o: object, wrap: (f: Fn) => Fn, keys: string[]) => {
+  let active = true;
+  const handles = new WeakSet<object>();
+  const patch = (o: object, wrap: (f: Fn) => Fn, keys: PropertyKey[]) => {
     for (const k of keys.filter((k) => typeof Reflect.get(o, k) === "function")) {
       const [f, g] = [Reflect.get(o, k), wrap(Reflect.get(o, k))];
       for (const p of Reflect.ownKeys(f).filter((p) => p !== "prototype"))
@@ -31,10 +33,24 @@ export function trackResumptions() {
   for (const o of [globalThis, require("node:timers")])
     patch(o, later, ["setTimeout", "setInterval", "setImmediate"]);
   patch(require("node:timers/promises"), settle, ["setTimeout", "setImmediate"]);
-  patch(require("node:fs/promises"), settle, Object.keys(require("node:fs/promises")));
+  const opened = (h: unknown) => {
+    // Hook both instance methods (close on Node) and the shared FileHandle prototype before returning it.
+    for (const o of [h as object, Object.getPrototypeOf(h)]) {
+      if (!active || handles.has(o)) continue;
+      handles.add(o);
+      const keys = Reflect.ownKeys(o).filter((k) => k !== "constructor");
+      patch(o, settle, keys);
+    }
+    return h;
+  };
+  const io = require("node:fs/promises");
+  patch(io, (f) => settle(f, f === io.open ? opened : undefined), Object.keys(io));
   patch(Bun, settle, ["sleep"]);
   patch(Blob.prototype, settle, ["text", "arrayBuffer", "json", "bytes"]);
   patch(require("node:events").EventEmitter.prototype, dispatch, ["emit"]);
-  return () => undo.reverse().forEach((f) => void f());
+  return () => {
+    active = false;
+    undo.reverse().forEach((f) => void f());
+  };
 }
 if (process.argv[2] === "--worker" && Bun.main.endsWith("/benchmark-gate-output.ts")) trackResumptions();

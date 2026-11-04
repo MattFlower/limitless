@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compare, environment, operation, registry, validate } from "../scripts/benchmark-gate-output.ts";
 import { launch, measureWorker } from "../scripts/benchmark-privacy-boundary.ts";
-import { trackResumptions } from "../scripts/benchmark-resumptions.ts";
+import { resumptions, trackResumptions } from "../scripts/benchmark-resumptions.ts";
 import { readCoveringJUnit, readJUnit, readJUnitSkips } from "../src/gates/junit.ts";
 import { processBirthSync } from "../src/util/proc.ts";
 import { describe, junitReport } from "./benchmark-gate-output-support.ts";
@@ -154,6 +154,101 @@ test("64 microtask rounds restart at re-entry; warmup maxima and measured median
   });
 });
 
+test("FileHandle open, reads, metadata and rejections own continuations and restore methods", async () => {
+  await temporary(async (root) => {
+    const file = join(root, "input");
+    await fs.writeFile(file, "synthetic bytes");
+    const originalOpen = fs.open;
+    const before = await fs.open(file, "r+");
+    const prototype = Object.getPrototypeOf(before);
+    const descriptors = Object.getOwnPropertyDescriptors(prototype);
+    const restore = trackResumptions();
+    let owned = false;
+    resumptions.own = (_phase, fn) => {
+      owned = true;
+      return fn();
+    };
+    const check = async <T>(name: string, run: () => Promise<T>) => {
+      await wait();
+      owned = false;
+      const value = await run();
+      expect(owned, `FileHandle.${name} must own before its awaiting continuation`).toBe(true);
+      return value;
+    };
+    let handle: typeof before | undefined;
+    try {
+      handle = await check("open", () => fs.open(file, "r+"));
+      const h = handle;
+      const read = h.read;
+      const second = await fs.open(file);
+      expect(h.read).toBe(read); // Re-encountering the prototype must not wrap it twice.
+      await second.close();
+      const buffer = Buffer.alloc(9);
+      expect(await check("read", () => h.read(buffer, 0, 9, 0))).toEqual({ bytesRead: 9, buffer });
+      expect(buffer.toString()).toBe("synthetic");
+      const buffers = [Buffer.alloc(4), Buffer.alloc(5)];
+      expect(await check("readv", () => h.readv(buffers, 0))).toEqual({ bytesRead: 9, buffers });
+      expect(Buffer.concat(buffers).toString()).toBe("synthetic");
+      expect(await check("readFile", () => h.readFile("utf8"))).toBe("synthetic bytes");
+      expect((await check("stat", () => h.stat())).size).toBe(15);
+      expect(await check("fs.readFile(handle)", () => fs.readFile(before, "utf8"))).toBe("synthetic bytes");
+      const failure = Object.assign(Error("synthetic I/O rejection"), { code: "EIO" });
+      // The original operation returns this exact error; wrapping must neither replace nor swallow it.
+      const failed = await check("rejected open", () => fs.open(join(root, "missing")).catch((e) => e));
+      expect(failed.code).toBe("ENOENT");
+      expect(await check("close", () => h.close())).toBeUndefined();
+      const closed = await check("rejected read", () => h.readFile("utf8").catch((e) => e));
+      expect(closed).toBeInstanceOf(Error);
+      expect(closed.code).toBe("EBADF");
+      // A method installed before tracking is also passed through with its receiver and error intact.
+      restore();
+      const originalRead = prototype.readFile;
+      prototype.readFile = function () {
+        expect(this).toBe(before);
+        return Promise.reject(failure);
+      };
+      const remove = trackResumptions();
+      try {
+        const trigger = await fs.open(file);
+        await trigger.close();
+        expect(await check("exact rejection", () => before.readFile().catch((e) => e))).toBe(failure);
+      } finally {
+        remove();
+        prototype.readFile = originalRead;
+      }
+    } finally {
+      restore();
+      resumptions.own = undefined;
+      await handle?.close();
+      await before.close();
+    }
+    expect(fs.open).toBe(originalOpen);
+    expect(Object.getOwnPropertyDescriptors(prototype)).toEqual(descriptors);
+  });
+});
+
+test("FileHandle open pending during removal cannot reinstall hooks", async () => {
+  await temporary(async (root) => {
+    const file = join(root, "pending");
+    await fs.writeFile(file, "");
+    const originalOpen = fs.open;
+    const before = await originalOpen(file);
+    const prototype = Object.getPrototypeOf(before);
+    const descriptors = Object.getOwnPropertyDescriptors(prototype);
+    await before.close();
+    const restore = trackResumptions();
+    const pending = fs.open(file);
+    restore();
+    const handle = await pending;
+    try {
+      expect(Object.getOwnPropertyDescriptors(prototype)).toEqual(descriptors);
+      expect(fs.open).toBe(originalOpen);
+    } finally {
+      await handle.close();
+    }
+  });
+});
+
 test("revision adapters use local exports, label the baseline process path and reject bad results", async () => {
   await temporary(async (root) => {
     const modules = [
@@ -208,6 +303,7 @@ test("producer failure disposes its checker and lets the harness return a reject
   });
 });
 
+// Four fresh workers import the revision and archive src; allow startup contention on a two-core CI runner.
 test("local worker policy and key stay in scratch; snapshots and owned workers close on success and failure", async () => {
   await temporary(async (root) => {
     const probe = join(root, "worker-probe.ts");
@@ -266,7 +362,7 @@ test("local worker policy and key stay in scratch; snapshots and owned workers c
     expect(roots).toHaveLength(4); // Sequential orchestration awaits/cleans every handle, even on failure.
     expect(roots.every((path) => !existsSync(path))).toBe(true);
   });
-});
+}, 30_000);
 
 test("bad CLI arguments fail before launching a worker", async () => {
   const invoke: typeof launch = () => {
@@ -299,18 +395,35 @@ test("low-CPU stalls after file I/O, imported, captured or global timer resumpti
     // synchronously without CPU before (or without) touching an instrumented API.
     await fs.writeFile(
       join(root, "src/gates/junit.ts"),
-      `import { readFile } from 'node:fs/promises';
+      `import { readFile, open } from 'node:fs/promises';
       import { setImmediate as later } from 'node:timers/promises';
       import { setImmediate as soon } from 'node:timers';
+      import { resumptions } from ${JSON.stringify(join(process.cwd(), "scripts/benchmark-resumptions.ts"))};
       const captured=setImmediate, stall=()=>Bun.sleepSync(20);
+      // Label only actual ownership entries: a missing hook cannot gain ownership from this observer.
+      let owner, kind;
+      Object.defineProperty(resumptions,'own',{configurable:true,get:()=>owner,set:f=>{
+        owner=f&&((phase,run)=>f(phase==='resumed'&&kind?'resumed:'+kind:phase,run));
+      }});
+      async function step(name,run){
+        await new Promise(r=>resumptions.setImmediate(r));
+        kind=name;
+        const value=await run(); stall();
+        kind=undefined;
+        return value;
+      }
       export async function readJUnit(){
-        await later(); stall();
-        await new Promise((r)=>soon(r)); stall();
-        await new Promise((r)=>captured(r)); stall();
-        await new Promise((r)=>setTimeout(r,1)); stall();
-        await Bun.sleep(1); stall();
-        await readFile(import.meta.path); stall();
-        await Bun.file(import.meta.path).text(); stall();
+        await step('imported promise timer',()=>later());
+        await step('imported callback timer',()=>new Promise(r=>soon(r)));
+        await step('captured global timer',()=>new Promise(r=>captured(r)));
+        await step('global timeout',()=>new Promise(r=>setTimeout(r,1)));
+        await step('Bun.sleep',()=>Bun.sleep(1));
+        await step('fs.promises.readFile',()=>readFile(import.meta.path));
+        await step('Bun.file().text',()=>Bun.file(import.meta.path).text());
+        const handle=await step('FileHandle.open',()=>open(import.meta.path));
+        try {
+          await step('FileHandle.readFile',()=>handle.readFile());
+        } finally { await step('FileHandle.close',()=>handle.close()); }
         const root=Bun.XML.parse('<a/>',{compact:false}); // The wrapper must forward the readers' options.
         return root.name==='a'?{failedFiles:['sample.test.ts']}:root;
       }`,
@@ -327,13 +440,31 @@ test("low-CPU stalls after file I/O, imported, captured or global timer resumpti
     expect(groups.map(([label]) => label)).toEqual(
       [1, 4, 16].map((n) => `readJUnit:readJUnit/${n * 1048576}`),
     );
-    for (const [, group] of groups) {
+    const kinds = [
+      "imported promise timer",
+      "imported callback timer",
+      "captured global timer",
+      "global timeout",
+      "Bun.sleep",
+      "fs.promises.readFile",
+      "Bun.file().text",
+      "FileHandle.open",
+      "FileHandle.readFile",
+      "FileHandle.close",
+    ];
+    for (const [label, group] of groups) {
       expect(group.raw).toHaveLength(7);
-      for (const trial of group.raw as (Group["raw"][number] & { parses: number })[]) {
+      expect(group.raw.map((trial) => trial.warmup)).toEqual([true, true, false, false, false, false, false]);
+      for (const [index, trial] of (group.raw as (Group["raw"][number] & { parses: number })[]).entries()) {
         const owned = trial.turns.filter((t) => t[1] >= 19);
-        expect(owned).toHaveLength(7);
-        for (const turn of owned) expect(turn[3]).toContain("resumed");
-        expect(owned[6]?.[3]).toContain("XML.parse");
+        for (const kind of kinds) {
+          expect(
+            owned.filter((turn) => turn[3].split(",").includes(`resumed:${kind}`)),
+            `${label}, trial ${index}: ${kind} stall must be owned`,
+          ).toHaveLength(1);
+        }
+        expect(owned).toHaveLength(kinds.length);
+        expect(owned.at(-1)?.[3]).toContain("XML.parse");
         expect(trial.idle.filter((gap) => (gap[1] ?? 0) >= 19)).toEqual([]);
         expect(trial.parses).toBe(1);
       }
