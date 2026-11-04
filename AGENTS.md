@@ -132,6 +132,9 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
     real-Seatbelt tests that your gates skip. Name the ones your change affects in your report so
     the reviewer runs them unconfined (#1098: two rounds passed their gates while a real-Seatbelt
     read-policy test still failed).
+  - A Seatbelt read deny doesn't hide a path from existence checks: Bun's `existsSync` uses
+    `access(2)`, which the deny doesn't block, while `statSync` and `readFileSync` fail with
+    `EPERM`. Prove a path is hidden with an actual read (#1131).
 - **The home is read-denied for gates.** A gate reads only its checkout, scratch, trusted Git paths
   and toolchains (#492). Inside one, `realpath` on the home fails although `lstat` reports it.
   - A test that runs a confined command must keep everything that command reads inside the
@@ -176,6 +179,9 @@ Read [ARCHITECTURE §6](docs/ARCHITECTURE.md#6-isolation--git) before changing a
   with a clear reason, and never fall back silently to an unconfined or unchecked path. Never
   weaken a boundary to get a test through (#393 moved readers to an allow-default sandbox). Make
   sure the closed path triggers only on the failure it guards against, not on ordinary conditions.
+  A policy or registry that loads at startup distinguishes "not loaded yet" from "loaded and
+  empty" and refuses until it has loaded; an empty default checks nothing (#1135: the production
+  privacy registry would have passed every check with an empty private-strings policy).
 
 ## Privacy
 - A command whose stdout is a secret must never reach an error path that quotes output; `redactCredentials` only covers registered values.
@@ -241,6 +247,14 @@ finish.
   extension, name or a text pattern (#312: normalization after the check; #341: trimming spaces
   where git trims only CR/LF; #382: media judged by extension; #385: any "timed out after" text
   counted as transient).
+- **Validated input is the parsed output.** Zod objects drop unknown keys unless they are strict.
+  Code that validates a payload and then keeps or forwards the original must reject keys the
+  parser stripped, at every nesting level, or keep the parsed value instead (#1083, #1105).
+- **Bound untrusted compressed input before you expand it.** Git packs and bundles, archives and
+  compressed artifacts declare or reveal their expanded sizes; check them against a limit before
+  reading, and never buffer a whole body twice (#1129: a 98 KB bundle buffered 96 MiB). For many
+  items, stream through one batch process (`git cat-file --batch`) rather than one spawn per item,
+  which costs about 11 ms each on a loaded machine.
 - **Retries and fallbacks are bounded and honest.** Retry only transient failures, keep one retry
   layer with one deadline, and make sure every pending state ends. A successful retry keeps the
   original failure and its classification (a gate that passes on retry is `flaky`, not a clean
@@ -266,6 +280,11 @@ finish.
   unbound (an unset claim scope, a disabled option) adds no await, barrier or ordering change to
   the paths it guards; compare behavior and timing with the feature off before and after (#1062:
   an unconditional await in invocation cleanup turned `ok` into `cancelled`).
+- **Async context follows whoever armed the callback.** A timer, subscriber or poll loop that a
+  run's code starts or wakes inherits that run's `AsyncLocalStorage` scopes (claim, process scope)
+  and keeps them after the run ends. A long-lived object captures `AsyncLocalStorage.snapshot()`
+  when it is created and runs its callbacks in that snapshot (#1162: once the waking run's scope
+  died, every GitHub poll failed).
 - **GitHub spells a bot's login two ways.** GraphQL returns an App's `login` without the `[bot]`
   suffix that REST and webhook payloads include. Match App authors by `__typename === "Bot"` and
   the login with `[bot]` removed (as `src/integrations/defect-publication.ts` does), and build test

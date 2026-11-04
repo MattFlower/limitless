@@ -73,6 +73,10 @@ and extend the closest case when it already exercises that behavior.
   exact assertions where the command's structure is the behavior under test, and inject the
   relevant configuration explicitly. Reproduce a CI-only git failure with `GIT_CONFIG_SYSTEM`
   pointing at a file that defines a fake lfs filter.
+  Tests that force an interleaving passed every macOS gate and then failed on Linux CI when they
+  depended on the core count, on runtime internals (patching `fs/promises` file handles) or on when
+  another SQLite connection sees a commit (#1175, #1183). Seed such values explicitly, assert after
+  a bounded poll rather than at a fixed point, and name any platform assumption in the test.
 - **Platform-specific tests skip with a reason.** Real Seatbelt tests use
   `test.skipIf(seatbeltSkip !== null)` and put `seatbeltSkip` (`confinement.ts`) in the title: they
   skip on other platforms and inside confined gates (factory and land-queue checks), and run on
