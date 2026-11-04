@@ -181,6 +181,7 @@ import { savedReviewSample, saveReviewSample } from "./review-samples.ts";
 import { type ShadowDeps, shadowReview } from "./review-shadow.ts";
 import { configuredReviewSystem, readReviewLenses } from "./review-system.ts";
 import { bindRunClaim, type RunClaim, renewRunClaim, sharedRepository } from "./run-claim.ts";
+import { pinPolicy, requirePinnedPolicy } from "./run-policy-pins.ts";
 import { implementerView } from "./run-transfer-roles.ts";
 import {
   type Holdout,
@@ -244,7 +245,18 @@ async function executeRunOnce(
     checkpointer.writeRun(runId, { status: "failed", error: "repo not found", finishedAt: Date.now() });
     return "failed";
   }
-  const shared = sharedRepository(deps.cfg, repo, run.repoSlug);
+  const configuredShared = sharedRepository(deps.cfg, repo, run.repoSlug);
+  const shared =
+    configuredShared ||
+    !!deps.store.db.query("SELECT 1 FROM run_policy_selections WHERE run_id = ?").get(runId);
+  if (shared && !configuredShared) {
+    checkpointer.writeRun(runId, {
+      status: "needs_human",
+      error: "shared run policy changed",
+      finishedAt: Date.now(),
+    });
+    return "needs_human";
+  }
   let claim: RunClaim | undefined;
   let error: unknown;
   if (shared) {
@@ -348,6 +360,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       ctx.requireCapabilityNow();
       await renewRunClaim(ctx.execution.claim);
       claimGuard();
+      requirePinnedPolicy(deps.cfg, ctx.store, run, ctx.repo);
     }
     if (ctx.execution.shared) startRun(ctx);
     if (!ctx.execution.shared) await recoverScopedProcesses();
@@ -809,6 +822,8 @@ async function prepare(ctx: RunContext): Promise<void> {
           `Gates (${gates.source}): ${[...gates.setup, ...gates.checks.map((c) => c.run)].join(" | ") || "none"}`,
         ),
       );
+      if (ctx.execution.shared)
+        pinPolicy(ctx.store, ctx.run.id, ctx.state, { kind: "prepared", trustedBase: trustedSha });
       await ctx.save();
       const { onWait } = gateEvents(ctx);
       const hasGates = gates.setup.length > 0 || gates.checks.length > 0;
@@ -2137,6 +2152,8 @@ async function oneRound(
       ({ system, panelReview, panelRules } = reviewSettings());
       if (ctx.state.reviewMode === undefined) {
         ctx.state.reviewMode = system.mode;
+        if (ctx.execution.shared)
+          pinPolicy(ctx.store, ctx.run.id, ctx.state, { kind: "review-finalized", mode: system.mode });
         await ctx.save();
       }
       const fixSha = panelReview && panelReview > 1 ? priorReview?.sha : undefined;
@@ -3688,6 +3705,8 @@ async function mergeForDelivery(
     await readFileAt(cwd, fetched, "package.json"),
     gateScriptNames(ctx.state.gatesConfig as GateConfig),
   );
+  if (ctx.execution.shared)
+    pinPolicy(ctx.store, ctx.run.id, ctx.state, { kind: "scripts-refreshed", scriptSource: fetched });
   if (!ctx.state.pendingRebaseSha) {
     ctx.state.pendingRebaseSha = fetched;
     ctx.state.postMergeGates = undefined;

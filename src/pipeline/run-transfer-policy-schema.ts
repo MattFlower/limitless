@@ -34,6 +34,12 @@ export const transferAdmissionPolicySchema = object({
   dependabotRouting: r.oneOf("free_first policy"),
   triageDecisionConfidence: z.number().min(0).max(1),
   reviewMode: mode,
+  // Optional only for inspecting immutable historical records; execution requires coverage.
+  reviewSamples: z.union([z.literal(1), z.literal(2)]).optional(),
+  workers: object({
+    agents: z.array(r.oneOf("triage spec plan plan_review holdout implement review verify summarize chat")),
+    repoEligible: z.boolean(),
+  }).optional(),
   reviewShadow: r.oneOf("off panel"),
   reviewShadowGraceSeconds: z.number().finite().nonnegative(),
   reviewImplementerReport: r.oneOf("include omit"),

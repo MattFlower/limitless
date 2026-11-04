@@ -102,7 +102,12 @@ function passingGate() {
   };
 }
 const signal = () => new AbortController().signal;
-async function fixture(publication = false) {
+async function fixture(
+  publication = false,
+  mergePolicy: "auto" | "pr" = "pr",
+  enabled = true,
+  configure?: (f: Factory) => void,
+) {
   const bare = publication ? await githubFixture() : "unused";
   const f = start((s) =>
     roleOf(s) === "triage"
@@ -114,7 +119,11 @@ async function fixture(publication = false) {
   await f.stop();
   f.deps.capability = passingGate();
   registerGithub(f, bare);
-  shared(f);
+  shared(f, enabled);
+  configure?.(f);
+  const repo = f.store.getRepoBySlug("test/repo");
+  if (!repo) throw new Error("Missing repo");
+  f.store.upsertRepo({ ...repo, mergePolicy });
   const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
   return { f, run, claim: authority(run) };
 }
@@ -319,11 +328,7 @@ test.each(["prepare", "triage", "deliver"] as const)(
 test.each([false, true])(
   "auto delivery captures shared=%s and preserves older local resume",
   async (claimed) => {
-    const { f, run, claim } = await fixture(true);
-    shared(f, claimed);
-    const repo = f.store.getRepo(run.repoId);
-    if (!repo) throw new Error("Missing repo");
-    f.store.upsertRepo({ ...repo, mergePolicy: "auto" });
+    const { f, run, claim } = await fixture(true, "auto", claimed);
     const merge = spyOn(repos, "mergePullRequest").mockResolvedValue("merged");
     restores.push(() => merge.mockRestore());
     const deps = { ...f.deps, faults: { "stage:deliver:before": { action: "kill" as const } } };
@@ -335,10 +340,13 @@ test.each([false, true])(
         checkpoints.push(label);
       },
     };
-    claim.update.mockImplementation(async () => {
+    const create = repos.createPullRequest;
+    const publication = spyOn(repos, "createPullRequest").mockImplementation(async (...args) => {
+      const url = await create(...args);
       shared(f, false);
-      return "applied";
+      return url;
     });
+    restores.push(() => publication.mockRestore());
     const resume = { ...f.deps, faults: undefined, checkpointer };
     if (!claimed)
       Object.defineProperty(resume, "runClaim", {
@@ -736,8 +744,7 @@ test.each(["cancelled", "needs_human"] as const)(
 
 // Mutation: move local startup back into the main failure handler.
 test.each([false, true])("local startup write failure propagates, aborted=%s", async (aborted) => {
-  const { f, run } = await fixture();
-  shared(f, false);
+  const { f, run } = await fixture(false, "pr", false);
   const controller = new AbortController();
   if (aborted) controller.abort();
   const failure = new Error("startup write failed");
@@ -795,8 +802,7 @@ test("claim change during failure handling returns through the final boundary", 
 
 // Mutation: move local startup bookkeeping after process recovery.
 test("local execution retains startup ordering before owned-process recovery", async () => {
-  const { f, run } = await fixture();
-  shared(f, false);
+  const { f, run } = await fixture(false, "pr", false);
   const entered = Promise.withResolvers<void>();
   const resume = Promise.withResolvers<void>();
   const recovery = spyOn(proc, "recoverScopedProcesses").mockImplementation(async () => {
@@ -1124,8 +1130,7 @@ test.each(["clone", "fetch"])(
 );
 
 test("local completion never calls an injected refusing capability gate", async () => {
-  const { f, run } = await fixture(true);
-  shared(f, false);
+  const { f, run } = await fixture(true, "pr", false);
   const gate = passingGate();
   gate.canContinue.mockResolvedValue(["os"]);
   gate.capableNow.mockReturnValue(false);
@@ -1209,9 +1214,10 @@ esac
 );
 
 test("shared implement keeps LAN publication local and pushes only in deliver", async () => {
-  const { f, run, claim } = await fixture(true);
-  f.cfg.workers.agents = ["implement"];
-  f.cfg.workers.repos = ["test/repo"];
+  const { f, run, claim } = await fixture(true, "pr", true, (f) => {
+    f.cfg.workers.agents = ["implement"];
+    f.cfg.workers.repos = ["test/repo"];
+  });
   const lan = lanAgentExecutor(f.workers, f.cfg);
   const calls: AgentCall[] = [];
   f.deps.agentExecutor = {

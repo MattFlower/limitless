@@ -5,7 +5,7 @@ import { type Config, loadConfig } from "./config.ts";
 import { type ConfigReload, reloadedConfig } from "./config-reload.ts";
 import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { TERMINAL_STATUSES } from "./core/types.ts";
-import { type GitHubComment, Store } from "./db/store.ts";
+import { type GitHubComment, IssueClaimed, Store } from "./db/store.ts";
 import { WorkerStore } from "./db/workers.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
@@ -30,6 +30,8 @@ import { type AcceptanceSnapshot, resolveIntent } from "./pipeline/acceptance.ts
 import type { EngineDeps, RunState } from "./pipeline/context.ts";
 import { lanAgentExecutor } from "./pipeline/lan-agent.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
+import { sharedRepository } from "./pipeline/run-claim.ts";
+import { ensureAdmissionPin } from "./pipeline/run-policy-pins.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
 import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
@@ -399,9 +401,26 @@ export class Factory {
         ),
       };
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
-    const run = chat
-      ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
-      : this.store.createRun(repo, req, verifiedGitHubWebhook, admission, comment);
+    const create = () =>
+      chat
+        ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
+        : this.store.createRun(repo, req, verifiedGitHubWebhook, admission, comment);
+    const result = sharedRepository(this.cfg, repo, repo.slug)
+      ? this.store.transaction(() => {
+          let run: Run;
+          try {
+            run = create();
+          } catch (error) {
+            // An existing-claim refusal commits its comment record; an invalid pin rolls back the run.
+            if (error instanceof IssueClaimed) return error;
+            throw error;
+          }
+          ensureAdmissionPin(this.store, this.cfg, run, repo);
+          return run;
+        })
+      : create();
+    if (result instanceof IssueClaimed) throw result;
+    const run = result;
     this.store.addEvent({
       runId: run.id,
       type: "log",

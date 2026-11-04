@@ -62,6 +62,7 @@ import { consumeGateExecution } from "./gate-execution.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { RunClaim } from "./run-claim.ts";
+import { requirePinnedPolicy } from "./run-policy-pins.ts";
 import type { Holdout, Review, ReviewScope, Spec, Triage, Verify } from "./schemas.ts";
 import { renderSpec } from "./schemas.ts";
 import type { SizeReport } from "./size.ts";
@@ -702,6 +703,7 @@ export class RunContext {
       await this.requireCapability(this.state.phase);
       this.requireCapabilityNow();
       this.checkCancelled();
+      requirePinnedPolicy(this.deps.cfg, this.store, this.run, this.repo);
     }
     if (!background)
       this.run = this.checkpointer.writeRun(this.run.id, {
