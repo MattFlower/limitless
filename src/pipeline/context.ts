@@ -637,12 +637,10 @@ export class RunContext {
     let refused: CapabilityRefusal[] = ["stale"];
     let control: ClaimControlError | undefined;
     const { run, state, repo } = this;
-    const implementer = state.implementer && {
-      ref: {
-        modelId: state.implementer.targetId ?? state.implementer.modelId,
-        effort: state.implementer.effort ?? null,
-      },
-      policyRevision: state.implementer.policyRevision,
+    const saved = state.implementer;
+    const implementer = saved && {
+      ref: { modelId: saved.targetId ?? saved.modelId, effort: saved.effort ?? null },
+      policyRevision: saved.policyRevision,
     };
     const task = { runId: run.id, phase, models: run.models, implementer, repo };
     try {
@@ -655,6 +653,15 @@ export class RunContext {
     if (control) throw control;
     if (!refused.length) return;
     this.log("Waiting for a capable member", "warn", { codes: refused });
+    throw new ClaimWaitError("capability");
+  }
+
+  requireCapabilityNow(): void {
+    if (!this.execution.shared) return;
+    if (this.termination) throw this.termination;
+    if (this.signal.aborted) throw new CancelledError();
+    if (this.execution.claim?.binding.capable?.()) return;
+    this.log("Waiting for a capable member", "warn", { codes: ["stale"] });
     throw new ClaimWaitError("capability");
   }
 
@@ -691,8 +698,11 @@ export class RunContext {
     // Keep a round together when draining, even if no check checkpoint exists yet.
     if (parkOnDrain && !UNPARKABLE.has(name) && this.foregroundStageDepth === 0 && this.isDraining())
       throw new ParkedError();
-    if (this.execution.shared)
-      await this.requireCapability(this.state.phase).then(() => this.checkCancelled());
+    if (this.execution.shared) {
+      await this.requireCapability(this.state.phase);
+      this.requireCapabilityNow();
+      this.checkCancelled();
+    }
     if (!background)
       this.run = this.checkpointer.writeRun(this.run.id, {
         stage: this.parallelChecks && name === "verify" ? "review" : name,

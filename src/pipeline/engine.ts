@@ -220,7 +220,6 @@ class ReaderSetupError extends NeedsHumanError {}
 export async function executeRun(...args: Parameters<typeof executeRunOnce>): Promise<RunStatus> {
   const [{ store, cfg, capability }, runId] = args;
   const run = store.getRun(runId);
-  // Admission memoizes shared runs, so every exit forgets them; local runs never touch the gate.
   const shared = run && sharedRepository(cfg, store.getRepo(run.repoId) ?? { kind: "github" }, run.repoSlug);
   try {
     return await executeRunOnce(...args);
@@ -299,7 +298,8 @@ async function executeRunOnce(
   return status;
 }
 
-function executionInterruption(ctx: RunContext, error: unknown) {
+function executionInterruption(ctx: RunContext, error: unknown, signal: AbortSignal) {
+  if (ctx.execution.shared && (error instanceof CancelledError || signal.aborted)) return;
   let probe: unknown;
   try {
     if (ctx.execution.shared) claimGuard();
@@ -339,16 +339,15 @@ function startRun(ctx: RunContext): void {
 async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
   const { deps, run } = ctx;
   const runId = run.id;
-  let claimRenewed = false;
   if (!ctx.execution.shared) startRun(ctx);
   try {
     if (ctx.execution.shared) {
       await recoverScopedProcesses();
       if (!ctx.execution.claim) throw ctx.execution.error ?? new ClaimWaitError("unavailable");
       await ctx.requireCapability(ctx.state.phase);
+      ctx.requireCapabilityNow();
       await renewRunClaim(ctx.execution.claim);
       claimGuard();
-      claimRenewed = true;
     }
     if (ctx.execution.shared) startRun(ctx);
     if (!ctx.execution.shared) await recoverScopedProcesses();
@@ -433,8 +432,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log("Run succeeded");
     return "succeeded";
   } catch (e) {
-    const cancelledBeforeRenewal = ctx.execution.shared && !claimRenewed && e instanceof CancelledError;
-    const control = cancelledBeforeRenewal ? undefined : executionInterruption(ctx, e);
+    const control = executionInterruption(ctx, e, signal);
     if (control) {
       mapClaimInterruption(deps.store, runId, control);
       return deps.store.getRun(runId)?.status ?? "failed";
@@ -483,9 +481,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
       const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
       if (!shutdown) clearGitHubWait(ctx.state);
-      // Before renewal only the local cancellation record may bypass the closed lease window.
-      const checkpointer = cancelledBeforeRenewal ? localCheckpointer(deps.store) : ctx.checkpointer;
-      checkpointer.writeRun(
+      // Terminal local cancellation reporting does not require an open lease window.
+      (ctx.execution.shared && !shutdown ? localCheckpointer(deps.store) : ctx.checkpointer).writeRun(
         runId,
         {
           status,
@@ -596,7 +593,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         );
         if (ctx.execution.shared) claimGuard();
       } catch (err) {
-        const control = executionInterruption(ctx, err);
+        const control = executionInterruption(ctx, err, signal);
         if (control) {
           mapClaimInterruption(deps.store, runId, control);
           return deps.store.getRun(runId)?.status ?? "failed";
@@ -633,7 +630,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         await deliver(ctx, false);
         if (ctx.execution.shared) claimGuard();
       } catch (err) {
-        const control = executionInterruption(ctx, err);
+        const control = executionInterruption(ctx, err, signal);
         if (control) {
           mapClaimInterruption(deps.store, runId, control);
           return deps.store.getRun(runId)?.status ?? "failed";

@@ -16,9 +16,16 @@ import * as identity from "../src/integrations/github-identity.ts";
 import { startGitHubNotifier } from "../src/integrations/github-notifier.ts";
 import { reconcileIssueLifecycle } from "../src/integrations/issue-lifecycle.ts";
 import type { Capabilities } from "../src/integrations/member-capabilities.ts";
+import { CAPABILITY_FRESH_MS } from "../src/integrations/member-capabilities.ts";
 import { type CapabilityGate, createCapabilityGate } from "../src/integrations/member-eligibility.ts";
 import type { AgentCall } from "../src/pipeline/agent-executor.ts";
-import { initialRunState, localCheckpointer, RunContext, type RunState } from "../src/pipeline/context.ts";
+import {
+  CancelledError,
+  initialRunState,
+  localCheckpointer,
+  RunContext,
+  type RunState,
+} from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
 import { bindRunClaim, type RunClaim } from "../src/pipeline/run-claim.ts";
@@ -356,56 +363,71 @@ test.each([false, true])(
 );
 
 // Mutations: restore either original nested draft catch.
-test.each([false, true].flatMap((verified) => [false, true].map((lost) => ({ verified, lost }))))(
-  "nested draft maps interruption %o",
-  async ({ verified, lost }) => {
-    const { f, run, claim } = await fixture(true);
-    const first = {
-      ...f.deps,
-      runClaim: claim,
-      faults: { "stage:deliver:before": { action: "kill" as const } },
-    };
-    expect(await executeRun(first, run.id, signal())).toBe("running");
-    const state = f.store.getRunState<RunState>(run.id);
-    if (!state) throw new Error("Missing delivery state");
-    if (!verified) {
-      state.lastVerifiedSha = undefined;
-      state.phase = "loop";
+test.each(
+  [false, true].flatMap((verified) =>
+    ["wait", "lost", "cancelled", "cancelled-wait"].map((kind) => ({ verified, kind })),
+  ),
+)("nested draft maps interruption %o", async ({ verified, kind }) => {
+  const lost = kind === "lost";
+  const cancelled = kind.startsWith("cancelled");
+  const controller = new AbortController();
+  const { f, run, claim } = await fixture(true);
+  const first = {
+    ...f.deps,
+    runClaim: claim,
+    faults: { "stage:deliver:before": { action: "kill" as const } },
+  };
+  expect(await executeRun(first, run.id, signal())).toBe("running");
+  const state = f.store.getRunState<RunState>(run.id);
+  if (!state) throw new Error("Missing delivery state");
+  if (!verified) {
+    state.lastVerifiedSha = undefined;
+    state.phase = "loop";
+  }
+  state.needsHumanReason = "report unfinished work";
+  f.store.setRunState(run.id, state);
+  const create = spyOn(repos, "createPullRequest").mockImplementation(async () => {
+    if (cancelled) {
+      claim.close();
+      controller.abort();
+      throw kind === "cancelled-wait" ? new ClaimWaitError("capability") : new CancelledError();
     }
-    state.needsHumanReason = "report unfinished work";
-    f.store.setRunState(run.id, state);
-    const create = spyOn(repos, "createPullRequest").mockImplementation(async () => {
-      // A running record from an interrupted sibling must be closed without a model result.
-      f.store.createInvocation({
-        runId: run.id,
-        stageId: null,
-        role: "implement",
-        harness: "fake",
-        provider: "alpha",
-        model: "m",
-        modelId: "alpha/m",
-      });
-      if (lost) {
-        claim.binding.onLost(claim.binding.handle, null);
-        throw new ClaimLostError();
-      }
-      throw new ClaimWaitError("lease");
+    // A running record from an interrupted sibling must be closed without a model result.
+    f.store.createInvocation({
+      runId: run.id,
+      stageId: null,
+      role: "implement",
+      harness: "fake",
+      provider: "alpha",
+      model: "m",
+      modelId: "alpha/m",
     });
-    restores.push(() => create.mockRestore());
-    expect(await executeRun({ ...f.deps, runClaim: claim }, run.id, signal())).toBe(
-      lost ? "cancelled" : "queued",
-    );
-    expect(create).toHaveBeenCalledTimes(1);
-    expect(f.store.listEvents(run.id).some((e) => /^Could not open .*draft PR:/.test(e.message))).toBe(false);
-    expect(f.store.getRun(run.id)).toMatchObject({ error: lost ? "superseded: claim lost" : null });
-    expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe(lost ? undefined : "claim:lease");
-    expect(f.store.listInvocations(run.id).at(-1)).toMatchObject({
-      status: "cancelled",
-      error: `interrupted: claim ${lost ? "lost" : "wait"}`,
-      outputTokens: 0,
-    });
-  },
-);
+    if (lost) {
+      claim.binding.onLost(claim.binding.handle, null);
+      throw new ClaimLostError();
+    }
+    throw new ClaimWaitError("lease");
+  });
+  restores.push(() => create.mockRestore());
+  expect(await executeRun({ ...f.deps, runClaim: claim }, run.id, controller.signal)).toBe(
+    kind === "wait" ? "queued" : "cancelled",
+  );
+  expect(create).toHaveBeenCalledTimes(1);
+  expect(f.store.listEvents(run.id).some((e) => /^Could not open .*draft PR:/.test(e.message))).toBe(false);
+  expect(f.store.getRun(run.id)).toMatchObject({ error: lost ? "superseded: claim lost" : null });
+  expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe(
+    kind === "wait" ? "claim:lease" : undefined,
+  );
+  if (cancelled) {
+    expect(f.store.getRun(run.id)).toMatchObject({ status: "cancelled", finishedAt: expect.any(Number) });
+    return;
+  }
+  expect(f.store.listInvocations(run.id).at(-1)).toMatchObject({
+    status: "cancelled",
+    error: `interrupted: claim ${lost ? "lost" : "wait"}`,
+    outputTokens: 0,
+  });
+});
 
 // Mutations: write provisional terminal rejection, allow stale writes after a terminal decision,
 // finalize failed cleanup, or leave failed or shut-down cleanup running after the execution exits.
@@ -840,15 +862,19 @@ test.each(["cancelled", "unbound", "invalid"])("shared %s exit forgets the capab
 
 test("restarted capability wait checks before renewing a closed window", async () => {
   const { f, run, claim } = await fixture(true);
-  const gate = passingGate();
-  gate.canContinue.mockResolvedValue(["login"]);
+  const { gate } = continuationGate(f);
+  const check = spyOn(gate, "canContinue").mockResolvedValueOnce(["login"]);
+  const forget = spyOn(gate, "forget");
+  restores.push(
+    () => check.mockRestore(),
+    () => forget.mockRestore(),
+  );
   claim.close();
   const deps = { ...f.deps, runClaim: claim, capability: gate };
   expect(await executeRun(deps, run.id, signal())).toBe("queued");
   expect(claim.update).not.toHaveBeenCalled();
   const reopened = new Store(f.cfg.paths.db);
   try {
-    gate.canContinue.mockResolvedValue([]);
     claim.update.mockImplementation(async () => {
       claim.open();
       return "applied";
@@ -858,7 +884,7 @@ test("restarted capability wait checks before renewing a closed window", async (
     expect(status).toBe("succeeded");
     expect(claim.update).toHaveBeenCalledTimes(1);
     expect(reopened.listStages(run.id).some((s) => s.name === "implement")).toBe(true);
-    expect(gate.forget).toHaveBeenCalledTimes(2);
+    expect(forget).toHaveBeenCalledTimes(2);
   } finally {
     reopened.close();
   }
@@ -937,6 +963,165 @@ test("capability claim-control errors keep their identity", async () => {
     expect(await ctx.requireCapability("prepare").catch((e: unknown) => e)).toBe(error);
   }
 });
+
+test.each([false, true].flatMap((recorded) => [false, true].map((settled) => ({ recorded, settled }))))(
+  "post-renewal cancellation persists after lease closure: %o",
+  async ({ recorded, settled }) => {
+    const { f, run, claim } = await fixture(true);
+    const gate = passingGate();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<Awaited<ReturnType<CapabilityGate["canContinue"]>>>();
+    const controller = new AbortController();
+    gate.canContinue.mockImplementation((task) => {
+      if (task.phase !== "loop") return Promise.resolve([]);
+      entered.resolve();
+      return release.promise.then((refused) => {
+        // Cancel after requireCapability throws its refusal, before the consuming catch runs.
+        if (settled)
+          queueMicrotask(() =>
+            queueMicrotask(() => {
+              claim.close();
+              controller.abort();
+            }),
+          );
+        return refused;
+      });
+    });
+    const local = localCheckpointer(f.store);
+    const checkpointer = {
+      ...local,
+      writeRun: (...args: Parameters<typeof local.writeRun>) => {
+        claimGuard();
+        return local.writeRun(...args);
+      },
+      writeState: (...args: Parameters<typeof local.writeState>) => {
+        claimGuard();
+        local.writeState(...args);
+      },
+    };
+    const work = executeRun(
+      { ...f.deps, runClaim: claim, capability: gate, checkpointer },
+      run.id,
+      controller.signal,
+    );
+    await entered.promise;
+    expect(claim.update).toHaveBeenCalledTimes(1);
+    const stages = f.store.listStages(run.id);
+    const invocations = f.store.listInvocations(run.id);
+    const state = f.store.getRunState<RunState>(run.id);
+    if (!state) throw new Error("missing state");
+    state.githubWait = { reason: "claim:capability", since: 1, nextAttemptAt: 2 };
+    f.store.updateRun(run.id, recorded ? { error: "cancelled by owner" } : {}, state);
+    if (!settled) {
+      claim.close();
+      controller.abort();
+    }
+    release.resolve(["os"]);
+    expect(await work).toBe("cancelled");
+    const reopened = new Store(f.cfg.paths.db);
+    try {
+      expect(reopened.getRun(run.id)).toMatchObject({
+        status: "cancelled",
+        error: recorded ? "cancelled by owner" : null,
+        finishedAt: expect.any(Number),
+      });
+      expect(reopened.getRunState<RunState>(run.id)?.githubWait).toBeUndefined();
+      expect(reopened.listStages(run.id)).toEqual(stages);
+      expect(reopened.listInvocations(run.id)).toEqual(invocations);
+      expect(stages.map((stage) => stage.name)).toEqual(["prepare", "triage"]);
+    } finally {
+      reopened.close();
+    }
+  },
+);
+
+test.each(
+  ["resume", "stage"].flatMap((boundary) =>
+    ["replacement", "expiry"].map((change) => ({ boundary, change })),
+  ),
+)("capability consumption revalidates the real gate: %o", async ({ boundary, change }) => {
+  const { f, run, claim } = await fixture();
+  const probes = continuationGate(f);
+  let checks = 0;
+  const targeted = () => ++checks === (boundary === "resume" ? 1 : 2);
+  if (boundary === "resume") {
+    claim.close();
+    claim.update.mockImplementation(async () => {
+      claim.open();
+      return "applied";
+    });
+  }
+  if (change === "replacement") {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    probes.monitor.access.mockImplementation(async () => {
+      if (targeted()) {
+        entered.resolve();
+        await release.promise;
+      }
+      return { at: { ...probes.now }, value: true };
+    });
+    const work = executeRun({ ...f.deps, runClaim: claim, capability: probes.gate }, run.id, signal());
+    await entered.promise;
+    probes.mismatch();
+    release.resolve();
+    expect(await work).toBe("queued");
+  } else {
+    const require = RunContext.prototype.requireCapability;
+    const settle = spyOn(RunContext.prototype, "requireCapability").mockImplementation(async function (
+      this: RunContext,
+      phase,
+    ) {
+      await require.call(this, phase);
+      if (targeted()) queueMicrotask(probes.expire);
+    });
+    restores.push(() => settle.mockRestore());
+    expect(await executeRun({ ...f.deps, runClaim: claim, capability: probes.gate }, run.id, signal())).toBe(
+      "queued",
+    );
+  }
+  expect(claim.update).toHaveBeenCalledTimes(boundary === "resume" ? 0 : 1);
+  expect(f.store.listStages(run.id)).toHaveLength(0);
+  expect(f.store.listInvocations(run.id)).toHaveLength(0);
+  expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:capability");
+});
+
+test.each(["clone", "fetch"])(
+  "prepare capability loss refuses remote cache %s at dispatch",
+  async (command) => {
+    const { f, run, claim } = await fixture(true);
+    const repo = f.store.getRepo(run.repoId);
+    if (!repo) throw new Error("missing repo");
+    if (command === "fetch") await repos.ensureCache(f.cfg.paths, repo);
+    const gate = passingGate();
+    let capable = true;
+    gate.capableNow.mockImplementation(() => capable);
+    const remote: string[] = [];
+    const spawnReal = subprocess.spawn;
+    const recorder = spyOn(subprocess, "spawn").mockImplementation(((
+      bin: string,
+      args: readonly string[],
+      opts: subprocess.SpawnOptions,
+    ) => {
+      for (const op of ["clone", "fetch"]) if (args.includes(op)) remote.push(op);
+      return spawnReal(bin, args, opts);
+    }) as typeof subprocess.spawn);
+    const process = proc.runProcess;
+    const boundary = spyOn(proc, "runProcess").mockImplementation(async (opts) => {
+      if (opts.cmd.includes(command)) capable = false;
+      return process(opts);
+    });
+    restores.push(
+      () => recorder.mockRestore(),
+      () => boundary.mockRestore(),
+    );
+    expect(await executeRun({ ...f.deps, runClaim: claim, capability: gate }, run.id, signal())).toBe(
+      "queued",
+    );
+    expect(remote).toEqual([]);
+    expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:capability");
+  },
+);
 
 test("local completion never calls an injected refusing capability gate", async () => {
   const { f, run } = await fixture(true);
@@ -1054,8 +1239,7 @@ test("shared implement keeps LAN publication local and pushes only in deliver", 
   expect(pushes).toEqual(["deliver"]);
 });
 
-test.each(["darwin", "linux"] as const)("real continuation gate with expired advert on %s", async (os) => {
-  const { f, run, claim } = await fixture(true);
+function continuationGate(f: Factory, os: Capabilities["os"] = "darwin") {
   const now = { inclusive: 181_000, exclusive: 181_000 };
   const caps: Capabilities = {
     protocol: 1,
@@ -1074,16 +1258,17 @@ test.each(["darwin", "linux"] as const)("real continuation gate with expired adv
     power: "ac",
     draining: false,
   };
-  const snapshot = { at: now, value: caps };
+  let snapshot = { at: { ...now }, value: caps };
   const advertAt = { inclusive: 1_000, exclusive: 1_000 };
   const advertiser = { fresh: mock((time: typeof now) => windowOpen(advertAt, time, 180_000)) };
+  const monitor = {
+    current: () => (windowOpen(snapshot.at, now, CAPABILITY_FRESH_MS) ? snapshot : null),
+    refresh: async () => snapshot,
+    access: mock(async () => ({ at: { ...now }, value: true })),
+    start: () => () => {},
+  };
   const gate = createCapabilityGate({
-    monitor: {
-      current: () => snapshot,
-      refresh: async () => snapshot,
-      access: async () => ({ at: now, value: true }),
-      start: () => () => {},
-    },
+    monitor,
     advertiser,
     router: f.deps.router,
     tracker: f.deps.tracker,
@@ -1092,6 +1277,24 @@ test.each(["darwin", "linux"] as const)("real continuation gate with expired adv
     freeSlots: () => 1,
     draining: () => false,
   });
+  return {
+    gate,
+    now,
+    monitor,
+    advertiser,
+    mismatch: () => {
+      snapshot = { at: { ...now }, value: { ...caps, privateStrings: { parity: "differs", policy: null } } };
+    },
+    expire: () => {
+      now.inclusive += CAPABILITY_FRESH_MS + 1;
+      now.exclusive += CAPABILITY_FRESH_MS + 1;
+    },
+  };
+}
+
+test.each(["darwin", "linux"] as const)("real continuation gate with expired advert on %s", async (os) => {
+  const { f, run, claim } = await fixture(true);
+  const { gate, advertiser } = continuationGate(f, os);
   expect(await executeRun({ ...f.deps, runClaim: claim, capability: gate }, run.id, signal())).toBe(
     os === "darwin" ? "succeeded" : "queued",
   );

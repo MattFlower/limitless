@@ -1696,11 +1696,9 @@ export class Store {
   }
 
   releaseAcceptanceLimit(repo: string, epic: number): void {
-    this.db
-      .query(
-        "UPDATE acceptance_epic_limits SET comment = 'pending' WHERE repo = ? AND epic = ? AND comment = 'requested'",
-      )
-      .run(repo.toLowerCase(), epic);
+    const sql = `UPDATE acceptance_epic_limits SET comment = 'pending'
+      WHERE repo = ? AND epic = ? AND comment = 'requested'`;
+    this.db.query(sql).run(repo.toLowerCase(), epic);
   }
 
   latestIssueRun(repo: string, number: number): Run | null {

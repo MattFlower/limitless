@@ -305,11 +305,8 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
           signal,
         });
       } else {
-        await cacheGit(["git", "clone", "--bare", repo.url as string, tmp], {
-          cwd: paths.repos,
-          timeoutMs: 600_000,
-          signal,
-        });
+        const opts = { cwd: paths.repos, timeoutMs: 600_000, signal };
+        await cacheGit(["git", "clone", "--bare", repo.url as string, tmp], opts, claimDispatchGuard);
       }
       await cacheGit(["git", "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], {
         cwd: tmp,
@@ -328,11 +325,9 @@ async function refreshCache(paths: Paths, repo: Repo, signal?: AbortSignal): Pro
   await cacheGit(["git", "config", "remote.origin.pushurl", NO_PUSH], { cwd: cache });
   // Local clones mirror the source's tags, including deleted and moved ones.
   const tags = repo.kind === "local" ? ["--prune-tags", "--force"] : [];
-  await cacheGit(["git", "fetch", "origin", "--prune", ...tags], {
-    cwd: cache,
-    timeoutMs: 300_000,
-    signal,
-  });
+  const opts = { cwd: cache, timeoutMs: 300_000, signal };
+  const guard = repo.kind === "github" ? claimDispatchGuard : undefined;
+  await cacheGit(["git", "fetch", "origin", "--prune", ...tags], opts, guard);
   if (repo.kind === "local") {
     // Keep bare HEAD usable without retaining copied source branches. Best-effort: the recorded
     // default branch may be gone from the source while a run's explicit base branch still exists.
