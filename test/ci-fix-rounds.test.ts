@@ -10,11 +10,13 @@ import * as repos from "../src/git/repos.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { observerRoots } from "../src/harness/sandbox.ts";
 import { ciDecision } from "../src/integrations/ci-classifier.ts";
+import { bindClaim, dispatchGuard } from "../src/integrations/claim-guard.ts";
 import { normalizePr, startGitHubPoller } from "../src/integrations/github-poller.ts";
 import { LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
+import { claimKey, claimRef } from "../src/pipeline/portable.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { fakeGitHub, prNode, respond } from "./github-poller-support.ts";
@@ -795,4 +797,42 @@ test("polling finds a discreet CI PR through the store and its delivery recovers
   factory.cfg.repos = {};
   expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("succeeded");
   expect(comments).toHaveLength(1);
+});
+
+test("a shared CI round refuses disable-auto at dispatch after capability loss", async () => {
+  const id = await start();
+  const run = factory.store.getRun(id);
+  if (!run) throw new Error("missing round");
+  const key = claimKey(run, factory.store);
+  if ("none" in key) throw new Error("missing claim key");
+  const binding = bindClaim(
+    { windowOpen: () => true },
+    { repo: run.repoSlug, ref: claimRef(key), run: id, member: "m", generation: 1 },
+    () => false,
+  );
+  factory.cfg.repos = {
+    "test/repo": { shared: true, discreet: false, branchPrefix: "change/", landRequiresApproval: false },
+  };
+  factory.deps.runClaim = { binding, leases: { update: async () => "applied" } };
+  let capable = true;
+  factory.deps.capability = {
+    admit: async () => [],
+    canContinue: async () => [],
+    capableNow: () => capable,
+    forget: () => {},
+  };
+  const gh = factory.deps.gh;
+  if (!gh) throw new Error("missing gh");
+  factory.deps.gh = async (...args) => {
+    if (args[0].includes("--disable-auto")) capable = false;
+    dispatchGuard();
+    return (await gh(...args)) ?? "";
+  };
+  autoMerge = true;
+  const old = await remoteHead();
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("queued");
+  expect(factory.store.getRunState<RunState>(id)?.githubWait?.reason).toBe("claim:capability");
+  expect(autoMerge).toBe(true);
+  expect(calls.filter((c) => c.includes("--disable-auto"))).toHaveLength(0);
+  expect(await remoteHead()).toBe(old);
 });

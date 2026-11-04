@@ -345,3 +345,34 @@ test.each(["null-anchor", "stale-anchor", "unusable-time", "expired"])(
     expect(f.gh.calls("update")).toHaveLength(before + (kind.endsWith("anchor") ? 1 : 0));
   },
 );
+
+test("run capability fails closed and preserves claim-control errors", async () => {
+  const f = await fixture();
+  expect(f.execution().binding.capable?.()).toBe(false);
+  const gate = {
+    admit: async () => [],
+    canContinue: async () => [],
+    capableNow: mock(() => true),
+    forget: () => {},
+  };
+  const bound = bindRunClaim(f.run, f.store, f.authority, gate);
+  expect(bound.binding.capable?.()).toBe(true);
+  expect(gate.capableNow).toHaveBeenCalledWith(f.run.id);
+  gate.capableNow.mockReturnValue(false);
+  expect(bound.binding.capable?.()).toBe(false);
+  gate.capableNow.mockImplementation(() => {
+    throw new Error("private detail");
+  });
+  expect(bound.binding.capable?.()).toBe(false);
+  for (const control of [new ClaimLostError(), new ClaimWaitError("lease")]) {
+    gate.capableNow.mockImplementation(() => {
+      throw control;
+    });
+    try {
+      bound.binding.capable?.();
+      throw new Error("expected control");
+    } catch (error) {
+      expect(error).toBe(control);
+    }
+  }
+});

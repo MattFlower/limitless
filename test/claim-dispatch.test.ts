@@ -88,15 +88,20 @@ function durableAuthority(terminal = false) {
     { ...handle, run: run.id },
     () => false,
   );
-  const execution = bindRunClaim(run, store, {
-    binding,
-    leases: {
-      update: async () => {
-        anchor = { ...now };
-        return "applied";
+  const execution = bindRunClaim(
+    run,
+    store,
+    {
+      binding,
+      leases: {
+        update: async () => {
+          anchor = { ...now };
+          return "applied";
+        },
       },
     },
-  });
+    { admit: async () => [], canContinue: async () => [], capableNow: () => true, forget: () => {} },
+  );
   return {
     claim: execution.binding,
     execution,

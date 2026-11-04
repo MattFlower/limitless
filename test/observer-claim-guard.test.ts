@@ -30,6 +30,7 @@ import { type IssueLifecycleOptions, reconcileIssueLifecycle } from "../src/inte
 import { createLeaseManager } from "../src/integrations/leases.ts";
 import { mapClaimInterruption } from "../src/pipeline/claim-interruption.ts";
 import { claimKey, claimRef } from "../src/pipeline/portable.ts";
+import { withCapabilityLapse } from "../src/pipeline/run-claim.ts";
 import { invocationScratch, processScope } from "../src/util/proc.ts";
 import { GitHub } from "./claim-github-fake.ts";
 import { prNode } from "./github-poller-support.ts";
@@ -273,7 +274,7 @@ test("latched generation loss and restart preserve pending effects without recei
     { takeover: true },
   );
   expect(acquired.kind).toBe("held");
-  cleanup.push(a.leases.start({ active: () => true, onLost: a.binding.onLost }));
+  cleanup.push(a.leases.start({ active: withCapabilityLapse(store, () => true), onLost: a.binding.onLost }));
   await a.tick();
   expect(a.binding.lost).toBe(true);
   await poll(a.authority);

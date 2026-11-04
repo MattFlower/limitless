@@ -45,7 +45,7 @@ test.each(["prepare", "loop", "deliver"])(
   "wait preserves %s evidence and persisted retry eligibility without expiry",
   (phase) => {
     const { run, state } = fixture(phase);
-    for (const reason of ["lease", "unavailable", "cancelled"] as const) {
+    for (const reason of ["lease", "unavailable", "cancelled", "capability"] as const) {
       const now = githubWait.maxMs * 2;
       mapClaimInterruption(store, run.id, new ClaimWaitError(reason), now);
       expect(store.getRun(run.id)).toMatchObject({

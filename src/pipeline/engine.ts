@@ -217,7 +217,18 @@ const ROUNDS_PER_IMPLEMENTER = 2;
 class ReaderSetupError extends NeedsHumanError {}
 
 /** Execute (or resume) one run to completion. Never throws. */
-export async function executeRun(
+export async function executeRun(...args: Parameters<typeof executeRunOnce>): Promise<RunStatus> {
+  const [{ store, cfg, capability }, runId] = args;
+  const run = store.getRun(runId);
+  const shared = run && sharedRepository(cfg, store.getRepo(run.repoId) ?? { kind: "github" }, run.repoSlug);
+  try {
+    return await executeRunOnce(...args);
+  } finally {
+    if (shared) capability?.forget(runId);
+  }
+}
+
+async function executeRunOnce(
   deps: EngineDeps,
   runId: string,
   signal: AbortSignal,
@@ -239,7 +250,7 @@ export async function executeRun(
   if (shared) {
     try {
       const authority = deps.runClaim;
-      claim = bindRunClaim(run, deps.store, authority);
+      claim = bindRunClaim(run, deps.store, authority, deps.capability);
     } catch (caught) {
       error = selectClaimControl([caught]) ?? new ClaimWaitError("unavailable");
     }
@@ -287,7 +298,8 @@ export async function executeRun(
   return status;
 }
 
-function executionInterruption(ctx: RunContext, error: unknown) {
+function executionInterruption(ctx: RunContext, error: unknown, signal: AbortSignal) {
+  if (ctx.execution.shared && (error instanceof CancelledError || signal.aborted)) return;
   let probe: unknown;
   try {
     if (ctx.execution.shared) claimGuard();
@@ -332,6 +344,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (ctx.execution.shared) {
       await recoverScopedProcesses();
       if (!ctx.execution.claim) throw ctx.execution.error ?? new ClaimWaitError("unavailable");
+      await ctx.requireCapability(ctx.state.phase);
+      ctx.requireCapabilityNow();
       await renewRunClaim(ctx.execution.claim);
       claimGuard();
     }
@@ -418,7 +432,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ctx.log("Run succeeded");
     return "succeeded";
   } catch (e) {
-    const control = executionInterruption(ctx, e);
+    const control = executionInterruption(ctx, e, signal);
     if (control) {
       mapClaimInterruption(deps.store, runId, control);
       return deps.store.getRun(runId)?.status ?? "failed";
@@ -467,7 +481,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
       const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
       if (!shutdown) clearGitHubWait(ctx.state);
-      ctx.checkpointer.writeRun(
+      // Terminal local cancellation reporting does not require an open lease window.
+      (ctx.execution.shared && !shutdown ? localCheckpointer(deps.store) : ctx.checkpointer).writeRun(
         runId,
         {
           status,
@@ -578,7 +593,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         );
         if (ctx.execution.shared) claimGuard();
       } catch (err) {
-        const control = executionInterruption(ctx, err);
+        const control = executionInterruption(ctx, err, signal);
         if (control) {
           mapClaimInterruption(deps.store, runId, control);
           return deps.store.getRun(runId)?.status ?? "failed";
@@ -615,7 +630,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         await deliver(ctx, false);
         if (ctx.execution.shared) claimGuard();
       } catch (err) {
-        const control = executionInterruption(ctx, err);
+        const control = executionInterruption(ctx, err, signal);
         if (control) {
           mapClaimInterruption(deps.store, runId, control);
           return deps.store.getRun(runId)?.status ?? "failed";
@@ -1552,7 +1567,8 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           mode: "edit",
           complexity: ctx.complexity,
           constraints,
-          ...(!merge &&
+          ...(!ctx.execution.shared &&
+          !merge &&
           !reviewRound(ctx) &&
           !ctx.run.deliveryBranch &&
           !ctx.run.prUrl &&

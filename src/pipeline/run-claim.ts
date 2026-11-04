@@ -4,7 +4,9 @@ import type { Store } from "../db/store.ts";
 import { ClaimLostError, ClaimWaitError, rethrowClaimControl } from "../integrations/claim-errors.ts";
 import { claimGuard, claimScope, type ScopedClaim } from "../integrations/claim-guard.ts";
 import { canonicalRepo } from "../integrations/lease-store.ts";
-import type { LeaseManager } from "../integrations/leases.ts";
+import type { LeaseHandle, LeaseManager } from "../integrations/leases.ts";
+import type { CapabilityGate } from "../integrations/member-eligibility.ts";
+import type { RunState } from "./context.ts";
 import { claimKey, claimRef } from "./portable.ts";
 
 export const sharedRepository = (cfg: Pick<Config, "repos">, repo: Pick<Repo, "kind">, slug: string) =>
@@ -38,7 +40,12 @@ export function validateRunClaim(run: Run, store: Store, authority: RunClaim | n
 }
 
 /** Supply fresh per-execution dependencies; never mutate scheduler-wide dependencies. */
-export function bindRunClaim(run: Run, store: Store, authority: RunClaim | null | undefined): RunClaim {
+export function bindRunClaim(
+  run: Run,
+  store: Store,
+  authority: RunClaim | null | undefined,
+  gate?: CapabilityGate,
+): RunClaim {
   const { binding, leases } = validateRunClaim(run, store, authority);
   const runId = run.id;
   return Object.freeze({
@@ -49,6 +56,14 @@ export function bindRunClaim(run: Run, store: Store, authority: RunClaim | null 
         return binding.lost;
       },
       windowOpen: () => binding.windowOpen(),
+      capable() {
+        try {
+          return gate?.capableNow(run.id) ?? false;
+        } catch (error) {
+          rethrowClaimControl(error);
+          return false;
+        }
+      },
       onLost: (h, tip) => binding.onLost(h, tip),
       cancelled() {
         try {
@@ -64,6 +79,14 @@ export function bindRunClaim(run: Run, store: Store, authority: RunClaim | null 
       },
     } satisfies ScopedClaim),
   });
+}
+
+export const waitingForCapability = (store: Store, runId: string): boolean =>
+  store.getRun(runId)?.status === "queued" &&
+  store.getRunState<RunState>(runId)?.githubWait?.reason === "claim:capability";
+
+export function withCapabilityLapse(store: Store, active: (h: LeaseHandle) => boolean) {
+  return (h: LeaseHandle) => !waitingForCapability(store, h.run) && active(h);
 }
 
 /** Required anew before each start/restart; persisted held state grants no permission. */
