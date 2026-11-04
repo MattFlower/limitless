@@ -630,7 +630,7 @@ src/integrations/member-capabilities.ts | probeCapabilities/run | sh | 1 | exemp
 src/integrations/shared-store.ts | createCompanionIO/call | fetch | 1 | helper |  | categorized at callers
 src/integrations/shared-store.ts | createCompanionIO/repository | companionCall | 1 | read |  | Companion repository metadata GraphQL query over POST
 src/integrations/shared-store.ts | createSharedStore | createCompanionIO | 1 | helper |  | categorized at callers
-src/integrations/shared-store.ts | createSharedStore/put | companionCall | 4 | exempt | C11 | D10 shared-store writes guarded by C11 callers
+src/integrations/shared-store.ts | createSharedStore/put | companionCall | 4 | exempt | C11 | D10 shared-store writes guarded by C11 callers, including pipeline/buildCandidate
 src/land/deploy-process.ts | deployProcess | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/land/deploy-process.ts | launchctlJob | sh | 1 | exempt | not-github | Local command or daemon request; no GitHub transport
 src/land/queue.ts | LandQueue/approvalEvidence | ghClient | 1 | read |  | Approval-evidence GraphQL query over POST
