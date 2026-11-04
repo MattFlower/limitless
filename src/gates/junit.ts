@@ -5,7 +5,7 @@ import { redactGateOutput } from "./output.ts";
 import { MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH, type TestCoverage } from "./test-coverage.ts";
 
 export const MAX_RETRY_FILES = 50;
-const MAX_REPORT_BYTES = 192 * 1024;
+const MAX_REPORT_BYTES = 128 * 1024;
 
 export interface FailedTestFiles {
   failedFiles: string[];

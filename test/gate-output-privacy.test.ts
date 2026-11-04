@@ -1,7 +1,7 @@
-import { afterEach, expect, spyOn } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { GateCommand, GateConfig } from "../src/gates/detect.ts";
 import * as junit from "../src/gates/junit.ts";
 import { protectGateOutput } from "../src/gates/output-privacy.ts";
@@ -30,7 +30,12 @@ import { seeded } from "./seeded.ts";
 
 const checkers: ReturnType<typeof createPrivacyChecker>[] = [],
   dirs: string[] = [];
+const originalPath = process.env.PATH;
+beforeEach(() => {
+  process.env.PATH = `${dirname(process.execPath)}:${originalPath ?? ""}`;
+});
 afterEach(async () => {
+  process.env.PATH = originalPath;
   for (const checker of checkers.splice(0)) await checker.dispose();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
