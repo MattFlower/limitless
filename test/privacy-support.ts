@@ -1,7 +1,7 @@
 import type { GateResult } from "../src/gates/run.ts";
 import { gateIdentities, gatePrivacyScope } from "../src/gates/text-privacy.ts";
 import { credentialRegistry } from "../src/util/credential-matcher.ts";
-import { createPrivacyRegistry } from "../src/util/privacy-boundary.ts";
+import { createPrivacyRegistry, privacyLimits } from "../src/util/privacy-boundary.ts";
 import {
   createPrivacyChecker,
   type PrivacyWorkerPort,
@@ -27,7 +27,16 @@ export function privacyPort(): PrivacyWorkerPort {
   privacyWorkerHandler(worker);
   return parent;
 }
-const registry = createPrivacyRegistry(credentialRegistry);
+// Other test files in the same process register credentials beyond the checker's limit, which would
+// refuse every admission; skip those, as read-policy-support.ts does, while keeping the live generation.
+const registry = createPrivacyRegistry(
+  Object.create(credentialRegistry, {
+    values: {
+      value: (worker?: boolean) =>
+        credentialRegistry.values(worker).filter((value) => value.length <= privacyLimits.originalLength),
+    },
+  }),
+);
 export const testGatePrivacy = {
   registry,
   checker: createPrivacyChecker({ registry, workerFactory: privacyPort }),
@@ -36,14 +45,18 @@ export const testGatePrivacy = {
 export async function provenResult<T extends GateResult>(r: T): Promise<T> {
   const scope = gatePrivacyScope.getStore() ?? testGatePrivacy;
   const sign = async (field: "output" | "identities", text: string) => {
+    let refusal = "no signing key";
     const proof = await checkAndSign({
       ...scope,
       kind: "complete",
       field,
       text,
       cut: { limit: 0, unit: "U", marker: "" },
+      onRefusal: (reason) => {
+        refusal = reason;
+      },
     });
-    if (!proof) throw new Error("Fixture did not pass the privacy checker");
+    if (!proof) throw new Error(`Fixture did not pass the privacy checker: ${refusal}`);
     return { ...proof, withheld: false, checkedComplete: true };
   };
   return {

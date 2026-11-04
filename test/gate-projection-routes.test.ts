@@ -2,6 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
+import type { Stage } from "../src/core/types.ts";
 import { MAX_EVENT_DATA } from "../src/db/store.ts";
 import { formatGateOutput } from "../src/gates/failures.ts";
 import { projectGateDiagnostics as project } from "../src/gates/output.ts";
@@ -471,6 +472,123 @@ test("SSE backlog yields on every 2000-event page, keeps order and unsubscribes 
     list.mockRestore();
     subscribe.mockRestore();
   }
+});
+
+test("SSE drain buffers live messages published between pages and drops events already read", async () => {
+  const f = fixture(),
+    runId = f.run.id,
+    event = (id: number) => ({
+      id,
+      runId,
+      type: "log" as const,
+      message: "event",
+      level: "info" as const,
+      invocationId: null,
+      ts: 0,
+      data: null,
+    }),
+    events = Array.from({ length: 5000 }, (_, i) => event(i + 1));
+  let listener: ((msg: Parameters<Parameters<typeof f.store.subscribe>[0]>[0]) => void) | undefined;
+  const list = spyOn(f.store, "listEvents").mockImplementation((_id, options) => {
+    const after = options?.after ?? 0;
+    if (after === 0)
+      setImmediate(() => {
+        // Published while the drain is between pages: one non-event, one event the next page re-reads, one new.
+        listener?.({ kind: "stage", stage: { runId, status: "completed" } as unknown as Stage });
+        listener?.({ kind: "event", event: event(2500) });
+        listener?.({ kind: "event", event: event(5001) });
+      });
+    return events.slice(after, after + 2000);
+  });
+  let unsubscribed = 0;
+  const subscribe = spyOn(f.store, "subscribe").mockImplementation((fn) => {
+    listener = fn;
+    return () => {
+      unsubscribed++;
+    };
+  });
+  try {
+    const response = await f.read("/api/runs/:id/stream"),
+      reader = response.body?.getReader();
+    if (!reader) throw new Error("Missing SSE body");
+    let bytes = "";
+    while (!bytes.includes('"id":5001')) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error("Missing buffered frames");
+      bytes += new TextDecoder().decode(chunk.value);
+    }
+    const frames = bytes
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)));
+    expect(frames.map((m) => (m.kind === "event" ? m.event.id : m.kind))).toEqual([
+      ...events.map((e) => e.id),
+      "stage",
+      5001,
+    ]);
+    f.abort.abort();
+    await reader.cancel();
+    expect(unsubscribed).toBe(1);
+  } finally {
+    list.mockRestore();
+    subscribe.mockRestore();
+  }
+});
+
+test("SSE drain releases its subscription when reading the backlog fails", async () => {
+  const f = fixture();
+  let unsubscribed = 0;
+  const list = spyOn(f.store, "listEvents").mockImplementation(() => {
+    throw new Error("store unavailable");
+  });
+  const subscribe = spyOn(f.store, "subscribe").mockImplementation(() => () => {
+    unsubscribed++;
+  });
+  try {
+    const response = await f.read("/api/runs/:id/stream");
+    expect(response.status).not.toBe(200);
+    expect(unsubscribed).toBe(1);
+  } finally {
+    list.mockRestore();
+    subscribe.mockRestore();
+  }
+});
+
+test("textPrivacy outside a recognized result is projected and redacted like any other data", async () => {
+  const credential = "TEXT_PRIVACY_CREDENTIAL_517";
+  registerCredential("TEXT_PRIVACY_TEST", credential);
+  const hidden = "nested-gate-sentinel",
+    nested = { ok: false, command: hidden, output: hidden };
+  const signed = await provenResult(result("safe"));
+  const tampered = {
+    ...signed,
+    textPrivacy: {
+      ...signed.textPrivacy,
+      output: { ...signed.textPrivacy?.output, extra: { ...nested, note: credential } },
+    },
+  };
+  const inputs = [
+    { textPrivacy: { extra: { ...nested, note: credential } } },
+    { textPrivacy: { output: { withheld: true, reason: credential, extra: nested } } },
+    {
+      ok: false,
+      command: "c",
+      output: "o",
+      textPrivacy: { output: { withheld: true, reason: credential, extra: nested } },
+    },
+    tampered,
+  ];
+  for (const mode of ["durable", "outward"] as const)
+    for (const input of inputs) {
+      const bytes = JSON.stringify(project(input, { mode }));
+      expect(bytes).not.toContain(hidden);
+      expect(bytes).not.toContain(credential);
+    }
+  // Validated proof metadata still survives: the tampered record's extras are dropped, its proof is kept.
+  const durable = project(tampered, { mode: "durable" });
+  expect(durable.output).toBe("safe");
+  expect<unknown>(durable.textPrivacy).toEqual(signed.textPrivacy);
+  expect(project(tampered, { mode: "outward" }).textPrivacy?.output).not.toHaveProperty("mac");
 });
 
 test("withheld timeout markers keep their exact rendering", () => {

@@ -73,18 +73,25 @@ const isResult = (v: unknown): v is GateResult =>
   "ok" in v &&
   typeof Reflect.get(v, "command") === "string" &&
   typeof Reflect.get(v, "output") === "string";
-const identities = new Set([
-  "command",
-  "executedCommand",
-  "failedFiles",
-  "failedFileTimes",
-  "coveringTest",
-  "coveringTests",
-  "testCoverage",
-]);
+const identityKeys = ["command", "executedCommand", "failedFiles", "failedFileTimes", "testCoverage"];
+const identities = new Set([...identityKeys, "coveringTest", "coveringTests"]);
 type Field = NonNullable<GateResult["textPrivacy"]>["output"];
 type Project = (record: Field | undefined, key: "output" | "identities") => Field;
-function projectResult(r: GateResult, field: Project): GateResult {
+const flag = (v: unknown) => (typeof v === "boolean" ? v : undefined);
+/** Rebuild a record from validated proof metadata only; nothing else is carried through. */
+const canonical = ({ withheld, truncated, checkedComplete, reason, kind, mac }: Field, outward: boolean) =>
+  JSON.parse(
+    JSON.stringify({
+      ...{ withheld: withheld === true, truncated: flag(truncated), checkedComplete: flag(checkedComplete) },
+      reason: withheld === true ? withheldText(reason).slice(11, -1) : undefined,
+      kind: /^(?:complete|rendering|attested:lan|attested:github-actions)$/.test(String(kind))
+        ? kind
+        : undefined,
+      mac: withheld !== true && !outward && /^[a-f0-9]{64}$/.test(String(mac)) ? mac : undefined,
+    }),
+  ) as Field;
+function projectResult(r: GateResult, project: Project, outward = false): GateResult {
+  const field: Project = (record, key) => canonical(project(record, key), outward);
   const output = field(r.textPrivacy?.output, "output"),
     ids = field(r.textPrivacy?.identities, "identities");
   const out = {
@@ -113,15 +120,10 @@ function projectResult(r: GateResult, field: Project): GateResult {
   return out;
 }
 const confirmationReasons = new Set([
-  "worker execution attribution unavailable",
-  "targeted retry returned no check result",
-  "confinement failure",
-  "confirmation timed out",
-  "pass (worker-specific flake)",
-  "failed on coordinator",
+  ...["worker execution attribution unavailable", "targeted retry returned no check result"],
+  ...["confinement failure", "confirmation timed out", "pass (worker-specific flake)"],
+  ...["failed on coordinator", "setup failures are not retried", "check does not match base configuration"],
   "coordinator confirmation deadline expired (slot wait or execution)",
-  "setup failures are not retried",
-  "check does not match base configuration",
 ]);
 /** Proofs are authority; shape recognition only selects the fields to project. */
 export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions): T {
@@ -131,15 +133,9 @@ export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions):
   return redactData(
     value,
     function (key, v) {
-      if (key === "textPrivacy" && v && typeof v === "object") {
-        v = Object.fromEntries(
-          Object.entries(v).map(([field, record]) => {
-            if (!record || typeof record !== "object") return [field, record];
-            const { mac, ...claim } = record;
-            return [field, options.mode === "outward" ? claim : record];
-          }),
-        );
-        untouched.add(Object(v));
+      // Only the canonical record built for a recognized result holds validated metadata.
+      if (key === "textPrivacy" && results.has(this) && v && typeof v === "object") {
+        untouched.add(v);
         return v;
       }
       if (key === "provenanceError" || key === "remoteAttestation") return undefined;
@@ -155,15 +151,19 @@ export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions):
           options.signer ?? scope?.signer,
         );
         const r = v;
-        v = projectResult(r, (record, field) => {
-          if (record?.withheld === true) return record;
-          const bytes = field === "output" ? r.output : gateIdentities(r);
-          if (!record || !snapshot?.verify(record, field, bytes))
-            return { withheld: true, reason: "unproven" };
-          return redactGateOutput(bytes) === bytes
-            ? record
-            : { withheld: true, reason: "credential-changed" };
-        });
+        v = projectResult(
+          r,
+          (record, field) => {
+            if (record?.withheld === true) return record;
+            const bytes = field === "output" ? r.output : gateIdentities(r);
+            if (!record || !snapshot?.verify(record, field, bytes))
+              return { withheld: true, reason: "unproven" };
+            return redactGateOutput(bytes) === bytes
+              ? record
+              : { withheld: true, reason: "credential-changed" };
+          },
+          options.mode === "outward",
+        );
         results.add(Object(v));
         return v;
       }

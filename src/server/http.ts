@@ -736,38 +736,53 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
     "/api/runs/:id/stream": handle(async (req, server) => {
       const runId = req.params.id as string;
       const after = Number(new URL(req.url).searchParams.get("after") ?? 0);
-      const backlog: StreamMessage[] = [];
-      for (let cursor = after; ; ) {
-        const page = store.listEvents(runId, { after: cursor, limit: 2000 });
-        for (const event of page) backlog.push({ kind: "event", event });
-        const last = page.at(-1);
-        if (!last || page.length < 2000) break;
-        cursor = last.id;
-        await new Promise<void>((resolve) => setImmediate(resolve));
+      // Subscribe before the first yield: live messages are buffered while the backlog drains.
+      let deliver: ((msg: StreamMessage) => void) | undefined;
+      const buffered: StreamMessage[] = [];
+      const unsubscribe = store.subscribe((msg: StreamMessage) => {
+        const id =
+          msg.kind === "run"
+            ? msg.run.id
+            : msg.kind === "stage"
+              ? msg.stage.runId
+              : msg.kind === "invocation"
+                ? msg.invocation.runId
+                : msg.kind === "event"
+                  ? msg.event.runId
+                  : msg.kind === "question"
+                    ? msg.question.runId
+                    : msg.kind === "feed"
+                      ? msg.item.runId
+                      : null;
+        if (id === runId) deliver ? deliver(msg) : buffered.push(msg);
+      });
+      try {
+        const backlog: StreamMessage[] = [];
+        for (let cursor = after; ; ) {
+          const page = store.listEvents(runId, { after: cursor, limit: 2000 });
+          for (const event of page) backlog.push({ kind: "event", event });
+          const last = page.at(-1);
+          if (last) cursor = last.id;
+          if (!last || page.length < 2000) {
+            // Events already read from the store are dropped; everything else keeps its order.
+            backlog.push(...buffered.filter((msg) => msg.kind !== "event" || msg.event.id > cursor));
+            break;
+          }
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        return sse(
+          req,
+          server,
+          (send) => {
+            deliver = send;
+            return unsubscribe;
+          },
+          { backlog, alive: live(req) },
+        );
+      } catch (err) {
+        unsubscribe();
+        throw err;
       }
-      return sse(
-        req,
-        server,
-        (send) =>
-          store.subscribe((msg: StreamMessage) => {
-            const id =
-              msg.kind === "run"
-                ? msg.run.id
-                : msg.kind === "stage"
-                  ? msg.stage.runId
-                  : msg.kind === "invocation"
-                    ? msg.invocation.runId
-                    : msg.kind === "event"
-                      ? msg.event.runId
-                      : msg.kind === "question"
-                        ? msg.question.runId
-                        : msg.kind === "feed"
-                          ? msg.item.runId
-                          : null;
-            if (id === runId) send(msg);
-          }),
-        { backlog, alive: live(req) },
-      );
     }),
     "/api/stream": handle((req, server) =>
       sse(
