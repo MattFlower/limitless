@@ -279,7 +279,12 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
               evidence,
               publicSummary: evidence,
               test_outcome_only: true,
-              covering_tests: [{ file: "test/media.test.ts", name: "rejects malformed input.png" }],
+              covering_tests: [
+                { file: "test/media.test.ts", name: "rejects malformed input.png" },
+                // Unvalidated identities naming a capture are withheld before persistence and export.
+                { file: "test/media.test.ts", name: "private-customer-viewport.png" },
+                { file: `${output}/fail`, name: "renders" },
+              ],
             },
           ],
         },
@@ -303,6 +308,12 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
             input: { filename: "private capture.dat", type: "png" },
           },
           { type: "tool_result", id: "shot-b", output: "Correlated opaque image response", isError: true },
+          {
+            type: "tool_call",
+            id: "run-code",
+            name: "mcp__playwright__browser_run_code",
+            input: { code: `async (page) => { await page.screenshot({ path: "${output}/fail" }); }` },
+          },
           { type: "text", text: `Screenshots are stored in ${output}` },
         ],
       };

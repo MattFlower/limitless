@@ -34,12 +34,7 @@ export function collectVerifierCaptures(
   // Held verifier events learn every trusted root even when collection itself cannot run.
   for (const root of record.roots) privacy?.remember(root.path, false);
   assertProcessesStopped();
-  const saved = new Set(
-    store
-      .listArtifacts(runId)
-      .filter((a) => a.kind === "screenshot")
-      .map((a) => a.name),
-  );
+  const saved = new Set(store.listArtifacts(runId).flatMap((a) => (a.kind === "screenshot" ? [a.name] : [])));
   const rejected: Record<string, number> = {};
   const reject = (code: string) => (rejected[code] = (rejected[code] ?? 0) + 1);
   let index = 0;
@@ -114,11 +109,18 @@ export function screenshotPrivacy() {
         (safe, locator) => safe.replaceAll(locator, "[screenshot]"),
         value.replace(/iVBORw0KGgo[\w+/=]*|screenshot-\d+-\d+\.png|\/screenshots\/\S*/g, "[screenshot]"),
       );
-  // Exact identifiers (statuses, criterion ids, covering-test files and titles) are never rewritten.
-  const exact = /^(type|code|id|name|file|status|overall|blockedReason|requirement|failureClass)$/;
+  // Only enum literals keep their fields verbatim; locator-bearing covering tests are withheld, not rewritten.
+  const literal =
+    /^(type|code|status|overall|blockedReason|requirement|failureClass):(met|unmet|unclear|blocked|pass|fail|sandbox|environment|request|spec|not_required|ok|error|cancelled|timeout|stuck|quota|unavailable|declined|running|authentication|malformed|browser_unavailable|init|text|thinking|tool_call|tool_result|rate_limit|stderr|status|warning)$/;
   const data = <T>(value: T): T =>
     JSON.parse(
-      JSON.stringify(value, (key, v: unknown) => (typeof v === "string" && !exact.test(key) ? text(v) : v)),
+      JSON.stringify(value, (key, v: unknown) =>
+        typeof v === "string" && !literal.test(`${key}:${v}`)
+          ? text(v)
+          : key === "covering_tests" && Array.isArray(v)
+            ? v.filter((test) => JSON.stringify(test) === JSON.stringify(data(test)))
+            : v,
+      ),
     );
   const hold = (value: AgentEvent) => {
     if (value.type === "tool_call" && value.name.endsWith("browser_take_screenshot")) {
