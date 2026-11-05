@@ -23,7 +23,7 @@ export class CandidateRefused extends Error {
     this.name = "CandidateRefused";
   }
 }
-type Dependencies = {
+export type CandidateDeps = {
   store: Store;
   paths: Paths;
   member: string;
@@ -41,7 +41,7 @@ const artifacts = (m: PortableManifest) =>
 
 /** Inert local export: publication and ledger changes belong to the caller. */
 export async function buildCandidate(
-  deps: Dependencies,
+  deps: CandidateDeps,
   run: Run,
   handle: LeaseHandle,
   guard: () => void,

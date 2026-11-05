@@ -8,7 +8,9 @@ import { randomUUID } from "node:crypto";
 import type { RepoSettings } from "../config.ts";
 import { worktreeGit } from "../git/command.ts";
 import { checkPrivatePublication } from "../git/repos.ts";
+import { rethrowClaimControl } from "../integrations/claim-errors.ts";
 import type { GhRunner } from "../integrations/github.ts";
+import { consumeBoundaryChunk } from "../util/privacy-chunks.ts";
 import { CommandError } from "../util/proc.ts";
 import { CI_CONFIG } from "./audit.ts";
 import type { GateCommand } from "./detect.ts";
@@ -21,11 +23,12 @@ import {
   gateShutdown,
   protectedEntries,
 } from "./executor.ts";
-import { extractFailures } from "./failures.ts";
 import { redactGateOutput } from "./output.ts";
 import { PrivateError, redactPrivate } from "./private.ts";
 import { checkPublicationText } from "./publication.ts";
+import { checkRemoteLog, recheckRemote } from "./remote-privacy.ts";
 import type { GateResult, GateRun } from "./run.ts";
+import { withheldText } from "./text-privacy.ts";
 
 export interface ActionsProgress {
   repo: string;
@@ -89,6 +92,15 @@ const commit = async (cwd: string, sha: string, signal: AbortSignal) => {
 };
 
 export function githubActionsExecutor(deps: Dependencies): GateExecutor {
+  const jobLog: GhRunner = async (...args) => {
+    try {
+      return (await deps.gh(...args)) ?? "";
+    } catch (error) {
+      rethrowClaimControl(error);
+      args[1]?.throwIfAborted();
+      throw new Error("GitHub Actions log retrieval failed");
+    }
+  };
   /** Authorization is read live; private repositories also need paid minutes, discreet ones refuse. */
   const admit = (repo: string, visibility: unknown, signal: AbortSignal) => {
     signal.throwIfAborted();
@@ -262,6 +274,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
       const checkpoint = () => persist(handle);
       const checks = req.gates.checks.filter((c) => !req.checks || req.checks.includes(c.name));
       const setup = req.gates.setup.map((run) => ({ name: run, run, timeoutSec: 900 }));
+      let failure: unknown;
       const result = (async (): Promise<GateRun> => {
         const etags = new Map<string, { etag?: string; data: unknown }>();
         p.deadline ??=
@@ -416,14 +429,38 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
                 job.conclusion ?? "",
               )
                 ? ""
-                : await deps.gh(
+                : await jobLog(
                     ["run", "view", "--repo", p.repo, "--job", String(job.id), "--log"],
-                    undefined,
+                    controller.signal,
                     undefined,
                     p.repo,
                   );
+              const control = {
+                signal: controller.signal,
+                deadline: Math.min(deadline, Date.now() + 120_000),
+                memo: new Map(),
+              };
+              const whole = await checkRemoteLog(log || "", control);
               const safe = redactPrivate(redactGateOutput(log || ""), protectedEntries(p.cwd)); // Before parsing or storage.
-              mapped.set(index, parseJob(job, safe, setup, command, p.dispatchSha ?? ""));
+              const parsed = parseJob(job, safe, setup, command, p.dispatchSha ?? "", log || "");
+              for (const item of [...parsed.setup, parsed.check]) {
+                const section = parsed.raw.get(item) ?? "";
+                Object.assign(
+                  item,
+                  await recheckRemote({ ...item, output: section }, "attested:github-actions", {
+                    ...control,
+                    whole,
+                  }),
+                );
+              }
+              const { withheld, reason } = consumeBoundaryChunk(whole, 0);
+              if (withheld)
+                for (const item of [...parsed.setup, parsed.check]) {
+                  item.output = withheldText(reason);
+                  if (item.textPrivacy) item.textPrivacy.output = { withheld: true, reason };
+                }
+              // Only renderings and proofs enter progress; raw sections remain transient.
+              mapped.set(index, { setup: parsed.setup, check: parsed.check });
             }
             if (run.status === "completed") {
               alive();
@@ -452,6 +489,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
         }
       })()
         .catch(async (error: unknown) => {
+          failure = error;
+          rethrowClaimControl(error);
           if (gateShutdown(controller.signal)) throw error;
           const aborted = controller.signal.aborted;
           const kind = error instanceof PrivateError ? "refused" : aborted ? "cancelled" : "operational";
@@ -470,6 +509,8 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
             await discard(handle, controller.signal);
             await checkpoint();
           } catch (error) {
+            rethrowClaimControl(failure);
+            rethrowClaimControl(error);
             p.cleanupFailed = true;
             await checkpoint();
             if (!p.interrupted) throw new GateBlockedError("cleanup", String(error), p.cwd);
@@ -495,7 +536,7 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
   };
 }
 
-function parseJob(job: Job, log: string, setup: GateCommand[], check: GateCommand, workflowSha: string) {
+function jobSections(log: string) {
   const sections = new Map<string, string[]>();
   for (const line of log.split(/\r?\n/)) {
     const [, step, content] = line.match(/^[^\t]+\t([^\t]+)\t(?:\S+ )?(.*)$/) ?? [];
@@ -505,6 +546,19 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
       sections.set(step, lines);
     }
   }
+  return sections;
+}
+function parseJob(
+  job: Job,
+  log: string,
+  setup: GateCommand[],
+  check: GateCommand,
+  workflowSha: string,
+  rawLog: string,
+) {
+  const sections = jobSections(log),
+    rawSections = jobSections(rawLog),
+    raw = new Map<GateResult, string>();
   const tokens = (sections.get("Token") ?? []).filter((line) => /^LIMITLESS_TOKEN [a-f\d]{32}$/.test(line));
   if (tokens.length > 1) throw new Error("Duplicate gate token");
   const token = tokens[0]?.slice(16);
@@ -530,7 +584,7 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
           : undefined;
       const timedOut = v?.timeout || (!v && job.conclusion === "timed_out");
       const ok = !!v && v.exit === 0 && !timedOut && !incomplete;
-      return {
+      const result = {
         executor: { kind: "github-actions" as const, workflowSha, runsOn: "ubuntu-24.04" },
         name: c.name,
         command: c.run,
@@ -540,8 +594,9 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
         timedOut,
         incomplete,
         output: output.slice(-6_000),
-        failures: ok ? undefined : extractFailures(output),
       };
+      raw.set(result, (rawSections.get(step) ?? []).join("\n"));
+      return result;
     });
   };
   const setupResults = parse("Setup", setup);
@@ -550,6 +605,7 @@ function parseJob(job: Job, log: string, setup: GateCommand[], check: GateComman
   if (failure >= 0 && result?.ok)
     throw new GateBlockedError("contradictory-records", "Check passed after setup failed");
   return {
+    raw,
     setup: failure < 0 ? setupResults : setupResults.slice(0, failure + 1),
     check:
       result ??
