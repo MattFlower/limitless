@@ -1,8 +1,10 @@
 import { isDeepStrictEqual } from "node:util";
-import type { RunStatus } from "../core/types.ts";
+import { type RunStatus, TERMINAL_STATUSES } from "../core/types.ts";
+import type { Store } from "../db/store.ts";
 import { ClaimLostError, ClaimWaitError } from "../integrations/claim-errors.ts";
 import type { ScopedClaim } from "../integrations/claim-guard.ts";
 import type { ClaimClient } from "../integrations/claim-ref.ts";
+import { canonicalJson } from "../integrations/control-json.ts";
 import type { LeaseManager } from "../integrations/leases.ts";
 import {
   buildCandidate,
@@ -11,7 +13,7 @@ import {
   CandidateRefused,
 } from "./checkpoint-candidate.ts";
 import { settleCheckpoint } from "./checkpoint-settlement.ts";
-import { type Checkpointer, NeedsHumanError } from "./context.ts";
+import { type Checkpointer, initialRunState, NeedsHumanError, type RunState } from "./context.ts";
 
 type CommitClaim = Pick<ScopedClaim, "handle" | "onLost"> & { guard(): void };
 type Patch = { status: RunStatus };
@@ -122,10 +124,40 @@ export function sharedCheckpointer(
   local: Checkpointer,
   committer: Pick<ReturnType<typeof createCheckpointCommitter>, "commit">,
   claims: (runId: string) => ClaimContext | undefined,
+  terminal?: { store: Store; shared(runId: string): boolean },
 ): Checkpointer {
   return {
     writeState: (...args) => local.writeState(...args),
-    writeRun: (...args) => local.writeRun(...args),
+    writeRun: (...args) => {
+      const [runId, patch, supplied] = args;
+      if (!terminal || !patch.status || !TERMINAL_STATUSES.includes(patch.status) || !terminal.shared(runId))
+        return local.writeRun(...args);
+      const { store } = terminal;
+      return store.transaction(() => {
+        const run = store.getRun(runId);
+        if (!run) throw new Error("Run not found");
+        const now = Date.now();
+        store.setTerminalIntent(
+          runId,
+          canonicalJson({
+            status: patch.status,
+            error: patch.error === undefined ? run.error : patch.error,
+            finishedAt: patch.finishedAt === undefined ? now : patch.finishedAt,
+          }),
+        );
+        const state = supplied ?? store.getRunState<RunState>(runId) ?? initialRunState(run);
+        state.githubWait = {
+          reason: "claim:terminal",
+          since: state.githubWait?.since ?? now,
+          nextAttemptAt: now,
+        };
+        return local.writeRun(
+          runId,
+          { ...patch, status: "queued", stage: null, finishedAt: null, error: run.error },
+          state,
+        );
+      });
+    },
     checkpoint(runId, label) {
       if (label === undefined) return;
       const claim = claims(runId);

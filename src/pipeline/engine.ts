@@ -494,8 +494,13 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
       const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
       if (!shutdown) clearGitHubWait(ctx.state);
-      // Terminal local cancellation reporting does not require an open lease window.
-      (ctx.execution.shared && !shutdown ? localCheckpointer(deps.store) : ctx.checkpointer).writeRun(
+      // Cancellation can defer publication without requiring an open execution lease window.
+      const checkpointer =
+        ctx.execution.shared && !shutdown
+          ? (deps.checkpointer ?? localCheckpointer(deps.store))
+          : ctx.checkpointer;
+      const writeCancellation = checkpointer.writeRun.bind(
+        checkpointer,
         runId,
         {
           status,
@@ -504,6 +509,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         },
         state ?? undefined,
       );
+      if (ctx.execution.shared && !shutdown) claimScope.exit(writeCancellation);
+      else writeCancellation();
       ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
       return status;
     };
