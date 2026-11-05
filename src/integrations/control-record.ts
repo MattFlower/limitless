@@ -12,6 +12,7 @@ export const CONTROL_MANIFEST_BYTES = 262_144;
 // No pruning or rollover: recurring adverts need a separate bounded-history replay protocol.
 export const CONTROL_HISTORY_ENTRIES = 1_024;
 const id = z.string().regex(/^[0-9a-f]{32}$/);
+const runId = z.string().regex(/^[0-9a-z]{6,40}$/);
 const member = z.string().regex(/^m-[0-9a-f]{16}$/);
 const digest = z.string().regex(/^[0-9a-f]{64}$/);
 const repo = z.string().transform(canonicalRepo);
@@ -19,7 +20,7 @@ const counter = z.int().nonnegative();
 const claim = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("issue"), repo, number: z.int().positive() }),
   z.strictObject({ kind: z.literal("pr"), repo, number: z.int().positive() }),
-  z.strictObject({ kind: z.literal("run"), repo, runId: id }),
+  z.strictObject({ kind: z.literal("run"), repo, runId }),
 ]) satisfies z.ZodType<ClaimKey>;
 const actor = z
   .strictObject({
@@ -64,7 +65,7 @@ const value = z
         return Number.isFinite(date.getTime()) && date.toISOString() === s;
       }),
     }),
-    z.strictObject({ kind: z.literal("run-index"), runId: id, claim }),
+    z.strictObject({ kind: z.literal("run-index"), runId, claim }),
     // Stored data and actor IDs confer no authentication, capability or landing authority.
     z.strictObject({ kind: z.literal("member"), member, data: z.custom<JsonValue>((v) => v !== undefined) }),
     z.strictObject({

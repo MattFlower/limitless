@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { Store } from "../src/db/store.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { createControlNamer } from "../src/integrations/control-identity.ts";
 import {
@@ -61,6 +62,38 @@ function envelope(value: unknown = reserved, key: ControlKey = receiptKey) {
   return { schema: 1, key, version: 1, value, mutations: [mutation(0)] };
 }
 const wire = (value: unknown) => Buffer.from(JSON.stringify(value));
+
+test("run indexes accept store IDs while receipts retain their enclosing ID contract", () => {
+  const store = new Store(":memory:");
+  try {
+    const repo = store.upsertRepo({
+      slug: reserved.repo,
+      kind: "github",
+      url: null,
+      localPath: null,
+      defaultBranch: "main",
+      mergePolicy: "none",
+    });
+    const run = store.createRun(repo, { repo: repo.slug, prompt: "Request" });
+    const value: ControlValue = {
+      kind: "run-index",
+      runId: run.id,
+      claim: { kind: "run", repo: repo.slug, runId: run.id },
+    };
+    expect(validateControlValue(value)).toEqual(value);
+    // A receipt's own ID stays 32-hex, and a run claim must still equal that ID.
+    const receipt: InputReceipt = { ...reserved, claim: { kind: "run", repo: repo.slug, runId } };
+    expect(validateControlValue(receipt)).toEqual(receipt);
+    expect(() =>
+      validateControlValue({ ...receipt, runId: "run123z", claim: { ...receipt.claim, runId: "run123z" } }),
+    ).toThrow();
+    expect(() =>
+      validateControlValue({ ...value, claim: { ...value.claim, runId: "another123" } }),
+    ).toThrow();
+  } finally {
+    store.close();
+  }
+});
 function fails(run: () => unknown, code: SharedStoreErrorCode, sentinel?: string) {
   let caught: unknown;
   try {

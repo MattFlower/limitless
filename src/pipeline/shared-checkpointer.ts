@@ -44,7 +44,7 @@ export function createCheckpointCommitter(
     for (;;) {
       signal.throwIfAborted();
       // Settlement takes the same non-reentrant lock as publication.
-      const { settlement } = await settleCheckpoint(deps, handle);
+      const { settlement } = await settleCheckpoint(deps, handle, signal);
       if (settlement === "wait") throw new ClaimWaitError("lease");
       if (settlement === "blocked") throw blocked();
       const base = store.checkpointRecord(runId);
