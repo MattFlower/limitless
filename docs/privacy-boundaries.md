@@ -363,7 +363,7 @@ additions plus deletions; scripts and docs count as source):
 | c2.2b.2e remote re-check | #1194 | 278 | 1,047 |
 | c2.2b.2f consumer benchmark | #1192 | 229 | 475 |
 | c2.2b.2g adapter and outward core routes | #1201 | 385 | 1,256 |
-| c2.2b.2h remaining routes and docs | pending (this change) | 196 | 487 |
+| c2.2b.2h remaining routes and docs | pending (this change) | 243 | 500 |
 
 Remaining deliveries hard-stop at 250 source lines each, so a larger scope splits before filing.
 The conditional worker slices come from c2.1b.3's trigger. The c2.2–c2.5 figures are judgments

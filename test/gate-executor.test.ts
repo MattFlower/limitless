@@ -7,7 +7,7 @@ import { baselineCacheKey, cacheableBaseline } from "../src/gates/cache.ts";
 import { detectGates } from "../src/gates/detect.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest, GateRunner } from "../src/gates/executor.ts";
 import { executeGate, gateExecutorFor, gateProvenance, localExecutor } from "../src/gates/executor.ts";
-import { redactGateData } from "../src/gates/output.ts";
+import { projectGateDiagnostics, redactGateData } from "../src/gates/output.ts";
 import {
   compareGates,
   confinementFailed,
@@ -1882,7 +1882,7 @@ test.each([false, true])("baseline targeted evidence is redacted before caching 
   } else expect(row).toBeNull();
   const artifact = f.store.getArtifact(run.id, "baseline-gates.json");
   if (!artifact) throw new Error("missing baseline artifact");
-  expect(JSON.parse(artifact)).toEqual(redactGateData(state?.baseline));
+  expect(JSON.parse(artifact)).toEqual(projectGateDiagnostics(state?.baseline, { mode: "durable" }));
   for (const persisted of [artifact, JSON.stringify(f.store.listEvents(run.id))])
     expect(persisted).not.toContain(secret);
   expect(

@@ -6,6 +6,7 @@ import type { Factory } from "../src/app.ts";
 import type { BaselineCacheKey } from "../src/db/store.ts";
 import * as baselineCache from "../src/gates/cache.ts";
 import { type GateExecutor, localExecutor } from "../src/gates/executor.ts";
+import { projectGateDiagnostics } from "../src/gates/output.ts";
 import * as gateRunner from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
@@ -385,7 +386,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
         "cache",
       );
       expect(JSON.parse(f.store.getArtifact(second.run.id, "baseline-gates.json") ?? "{}")).toEqual(
-        second.state?.baseline,
+        projectGateDiagnostics(second.state?.baseline, { mode: "durable" }),
       );
     });
 
