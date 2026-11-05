@@ -1,3 +1,4 @@
+import { POST_MERGE_REASONS } from "../pipeline/post-merge-confirmation.ts";
 import { getPrivacyChecker } from "../util/privacy-checker.ts";
 import { verifier } from "../util/privacy-proof.ts";
 import { activity } from "../util/stall.ts";
@@ -130,12 +131,6 @@ function projectResult(r: GateResult, project: Project, outward = false): GateRe
   } else if (r.testCoverage) out.testCoverage = { ...r.testCoverage };
   return out;
 }
-const confirmationReasons = new Set([
-  ...["worker execution attribution unavailable", "targeted retry returned no check result"],
-  ...["confinement failure", "confirmation timed out", "pass (worker-specific flake)"],
-  ...["failed on coordinator", "setup failures are not retried", "check does not match base configuration"],
-  "coordinator confirmation deadline expired (slot wait or execution)",
-]);
 /** Proofs are authority; shape recognition only selects the fields to project. */
 export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions): T {
   let snapshot: ReturnType<typeof verifier> | undefined;
@@ -189,7 +184,7 @@ export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions):
       if (v && typeof v === "object" && "originalVerdict" in v && "reason" in v)
         return {
           ...v,
-          reason: confirmationReasons.has(String(v.reason)) ? v.reason : withheldText("unproven"),
+          reason: POST_MERGE_REASONS.has(String(v.reason)) ? v.reason : withheldText("unproven"),
         };
       return passthrough;
     },
@@ -277,4 +272,14 @@ export function sanitizeArtifact(name: string, content: string): string {
   return name.endsWith(".json")
     ? JSON.stringify(redactGateData(JSON.parse(content)), null, content.includes("\n") ? 2 : undefined)
     : redactGateOutput(content);
+}
+
+/** Setup errors flatten only projected diagnostics, never failure excerpts. */
+export function setupFailureMessage(
+  prefix: string,
+  result: GateResult | undefined,
+  fallback?: string,
+): string {
+  const safe = projectGateDiagnostics(result, { mode: "outward" });
+  return `${prefix}${safe?.command ?? (fallback ? "setup" : undefined)}\n${safe?.output ?? fallback}`;
 }

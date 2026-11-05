@@ -286,10 +286,14 @@ test("all units verified met succeed without publishing, at the pinned SHA", asy
   ]);
   const report = t.f.store.getArtifact(t.run.id, "report.md") ?? "";
   expect(report).toContain("## Acceptance");
-  for (const r of records)
-    expect(report).toContain(
-      `Factory covering test x.test.ts › ${r.name} passed at ${t.sha} (stage ${r.stageId})`,
-    );
+  expect(report).toContain(
+    `Factory covering test x.test.ts › passes passed at ${t.sha} (stage ${records[0]?.stageId})`,
+  );
+  // Grouped results replace coveringTest for the second record, invalidating its original identities proof.
+  expect(report).toContain(
+    `Factory covering test [withheld] passed at ${t.sha} (stage ${records[1]?.stageId}); command: [withheld]`,
+  );
+  expect(report).not.toContain("x.test.ts › also passes");
   expect(report).toContain(`x.test.ts@${t.sha}:1-2`);
   expect(report).toContain(`README.md@${t.sha}`);
   expect(report).toContain("model note (unverified): looked fine");

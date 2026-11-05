@@ -1,4 +1,4 @@
-import { redactGateOutput } from "../gates/output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import { confinementFailed, type GateComparison, type GateRun } from "../gates/run.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../gates/test-coverage.ts";
 import {
@@ -164,8 +164,21 @@ function refusal(
   return undefined;
 }
 
-export const coveringCitation = (run: CoveringTestRun, sha: string): string =>
-  `Factory covering test ${run.file} › ${run.name} passed at ${sha} (stage ${run.stageId}); command: ${run.result?.executedCommand ?? run.result?.command}`;
+function coveringIdentity(run: CoveringTestRun) {
+  const result = projectGateDiagnostics(run.result, { mode: "outward" });
+  return {
+    check: result && !result.textPrivacy?.identities?.withheld ? `${run.file} › ${run.name}` : "[withheld]",
+    command:
+      result && !result.textPrivacy?.identities?.withheld
+        ? (result.executedCommand ?? result.command)
+        : "[withheld]",
+  };
+}
+
+export const coveringCitation = (run: CoveringTestRun, sha: string): string => {
+  const { check, command } = coveringIdentity(run);
+  return `Factory covering test ${check} passed at ${sha} (stage ${run.stageId}); command: ${command}`;
+};
 
 function coveringTestsRelevant(runs: (CoveringTestRun | undefined)[], relevantFiles?: string[]): boolean {
   return runs.every((run) => run && relevantFiles?.includes(run.file.replace(/^\.\//, "")));
@@ -243,8 +256,8 @@ function citationRefusal(
   if (run) {
     const reason = coveringTestRefusal(run, sha, covering?.succeededStageIds ?? []);
     if (reason) return reason;
-    return citation.check === redactGateOutput(`${run.file} › ${run.name}`) &&
-      citation.command === redactGateOutput(run.result?.executedCommand ?? run.result?.command ?? "")
+    const { check, command } = coveringIdentity(run);
+    return citation.check === check && citation.command === command
       ? undefined
       : "covering-test identity or command does not match the factory record";
   }
@@ -360,8 +373,7 @@ export function applyGateEvidence(
             gateEvidence: {
               stageId: first.stageId,
               sha,
-              check: redactGateOutput(`${first.file} › ${first.name}`),
-              command: redactGateOutput(first.result.executedCommand ?? first.result.command),
+              ...coveringIdentity(first),
             },
           };
       }

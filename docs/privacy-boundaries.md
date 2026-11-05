@@ -280,6 +280,18 @@ comparison. Keep snapshots and output in scratch; tests never assert timings.
 - **macOS results** (arm64, 18 cores, Darwin 27.0.0, Bun 1.4.3, unconfined, load average 3.6–4.0; ms; measured by the orchestrator at f87ff5db): 82,938 slices; the worst was 2.3, and none exceeded 50, warmups included. Format: worst slice incl. warmups / timed median of per-trial maxima; worker CPU median; latency medians. Cold: 1.9 (a transfer turn, warmup) / 0.7; 385; 162. Eight slots: 2.2 (chunk consumption and a transfer turn, warmup) / 1.6; 14,342; 1,286–11,989, and 1 for the refusal. Bytes: 2.3 (a transfer turn, timed) / 1.2; 11,193; 3,741 and 7,136, and 1 for the refusal. Peak RSS was 3.3 GiB. One unowned heartbeat gap of 282.1 ms occurred in a timed byte trial, with no daemon slice within 0.7 s of it; its cause (runtime, GC or OS scheduling) is not established. These finite samples establish a measured envelope, not a universal latency guarantee.
 - **Linux results** (arm64 in an OrbStack VM on the same Mac, so not independent hardware; `oven/bun:1.4.3`, 18 vCPUs, Bun 1.4.3, container load average 0.6–2.1; ms; measured by the orchestrator at 43f9347b): 84,979 slices; the worst was 3.4, and none exceeded 50, warmups included. Cold: 2.5 (a transfer turn, warmup) / 0.8; 503; 261. Eight slots: 3.4 (a worker message, timed) / 1.8; 17,027; 1,687–15,647, and 1 for the refusal. Bytes: 3.1 (a transfer turn, timed) / 1.5; 12,302; 4,919 and 9,458, and 1 for the refusal. Peak RSS was 4.7 GiB. One unowned heartbeat gap of 567.2 ms occurred in a timed byte trial, with no daemon slice within 1.1 s of it.
 
+### c2.2b.2 delivered
+
+`checkAndSign` consumes a checker receipt and signs the exact checked bytes in one synchronous turn: HMAC-SHA256(key, ["limitless-gate-proof/1", kind, semantics, entriesDigest, field, sha256(bytes)]). The daemon-private key authenticates `complete`, `attested:lan`, `attested:github-actions` and `rendering` proofs; worker claims alone never authorize release. `projectGateDiagnostics` verifies against a fresh policy snapshot and withholds if credential redaction would change proved bytes. Legacy, forged and foreign-signed results are unproven.
+
+Durable projection preserves verified `mac` fields for subsequent reads; outward projection removes them. Both drop `failures`, `provenanceError` and `remoteAttestation`, withhold unproved identities, constrain attribution to its grammar and confirmation reasons to `POST_MERGE_REASONS`. Events, artifacts and observations use durable projection; immediate text renderers use outward projection. Observations hash the internal failure signature, preserving cross-location promotion without matching shared markers. Old plaintext signatures never match new hashes during the seven-day promotion window; no migration rewrites history.
+
+The base-configured `name` and command template, exit codes, typed verdicts, `executor`, factory `incomplete` text and `reused` IDs are not governed. Outward copies of commands are governed. `docsOnly` diff paths remain covered by delivery publication checks, with prompt conversion deferred to c2.3. Internal exceptions are paired/pinned worker transport, `gate_jobs` (including in-place transport), SQLite run state and gate-execution records, and run transfer (no production caller); their outward readers still project. Plaintext artifacts carry no gate-result text.
+
+The interim `formatGateOutput` guard releases projected output verbatim within the caller's limit and otherwise returns `[output withheld: unchecked-rendering]`; c2.2c removes it when checked renderings arrive. Adoption slices 2d/2e/2g/2h/2i deploy together with c2.2c; landing a slice does not authorize deployment.
+
+Benchmark evidence: [2c (#1183)](https://github.com/MattFlower/limitless/pull/1183) and [2f (#1192)](https://github.com/MattFlower/limitless/pull/1192) record two warmups and five timed trials, warmup-inclusive worst synchronous slices, timed medians and separate unowned gaps. Their published reports validate those metrics but omit numeric worst-slice and median results; those numbers remain unreported here rather than inferred or rerun. 2f explicitly labels pre-adapter projection equivalents and unavailable signed-log operations. These reports alone establish no 50-ms production envelope.
+
 ## c2 adversarial regression matrix
 
 Each row names the inventory classes it covers. Use explicit synthetic policy/credentials,
@@ -344,6 +356,14 @@ additions plus deletions; scripts and docs count as source):
 | c2.1b.1 recursive diagnostics with original and serialized authority | #1087 | 84 | 232 |
 | c2.1b.2 reusable benchmark and reporting hooks | #1100 | 312 | 437 |
 | c2.1b.3 platform evidence and this reconciliation | #999 | 214 | 23 |
+| c2.2b.2a prerequisites | #1161 | 194 | 446 |
+| c2.2b.2b proof foundation | #1172 | 303 | 845 |
+| c2.2b.2c producer benchmark | #1183 | 299 | 874 |
+| c2.2b.2d producer adoption | #1188 | 277 | 879 |
+| c2.2b.2e remote re-check | #1194 | 278 | 1,047 |
+| c2.2b.2f consumer benchmark | #1192 | 229 | 475 |
+| c2.2b.2g adapter and outward core routes | #1201 | 385 | 1,256 |
+| c2.2b.2h remaining routes and docs | pending (this change) | 196 | 487 |
 
 Remaining deliveries hard-stop at 250 source lines each, so a larger scope splits before filing.
 The conditional worker slices come from c2.1b.3's trigger. The c2.2–c2.5 figures are judgments

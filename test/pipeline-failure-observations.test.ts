@@ -1,4 +1,5 @@
 import { expect, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
@@ -6,6 +7,7 @@ import { WorkerStore } from "../src/db/workers.ts";
 import type { ExecutionHandle, GateExecutor, GateRequest } from "../src/gates/executor.ts";
 import { redactGateOutput } from "../src/gates/output.ts";
 import type { GateResult, GateRun } from "../src/gates/run.ts";
+import { withheldText } from "../src/gates/text-privacy.ts";
 import { ciSignature } from "../src/integrations/ci-classifier.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
@@ -201,10 +203,10 @@ test("failed-attempt signature and evidence redact before truncation and survive
   expect(row).toBeDefined();
   expect(JSON.stringify(row)).not.toContain(secret);
   expect(row?.command).toBe(redactedCommand);
-  expect(row?.output_tail).toBe(expectedTail);
+  expect(row?.output_tail).toBe(withheldText("unproven"));
   expect(row?.output_tail.length).toBeLessThanOrEqual(6000);
-  expect(row?.signature).toBe(failedSignature);
-  expect(row?.signature).not.toBe(passingSignature);
+  expect(row?.signature).toBe(createHash("sha256").update(failedSignature).digest("hex"));
+  expect(row?.signature).not.toBe(createHash("sha256").update(passingSignature).digest("hex"));
   expect(row).toMatchObject({ class: "flaky", history: "retry_passed" });
 });
 
