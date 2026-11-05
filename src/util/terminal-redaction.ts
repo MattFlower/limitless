@@ -1,4 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { type CredentialMatcher, credentialMatcher, type MatchState } from "./credential-matcher.ts";
+
+/** Counts only; no text is exposed through this test seam. */
+export const sanitizationObserver = new AsyncLocalStorage<(kind: "stream" | "full") => void>();
 
 /** Fixed allowance, in string-index units: terminal strings longer than this end as malformed text, and
  * held raw text and its maps never exceed the longest credential variant plus this allowance plus one.
@@ -71,7 +75,10 @@ function advance(p: Parser, c: number, pos: number, strict: boolean): number {
 
 /** Strip terminal sequences and redact credentials found in any reading over their raw spans. Output is
  * the same for every chunking; matching runs through the shared automaton, never per credential. */
-export function terminalRedactor(current: () => CredentialMatcher = credentialMatcher) {
+export function terminalRedactor(
+  current: () => CredentialMatcher = credentialMatcher,
+  kind: "stream" | "full" = "full",
+) {
   let matcher = current();
   let views: View[] = [];
   let [size, pad, limit] = [0, 0, 0];
@@ -277,6 +284,7 @@ export function terminalRedactor(current: () => CredentialMatcher = credentialMa
       };
     },
     push(chunk: string, flush = false): string {
+      sanitizationObserver.getStore()?.(kind);
       const latest = current();
       if (latest !== matcher) {
         // Rematch decided held text, including terminal state, against the new registrations.
