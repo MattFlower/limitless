@@ -71,11 +71,10 @@ type ProjectionOptions = {
 const isText = (v: object, key: string) => typeof Reflect.get(v, key) === "string";
 const isResult = (v: unknown): v is GateResult =>
   !!v && typeof v === "object" && "ok" in v && isText(v, "command") && isText(v, "output");
-const identityKeys = ["command", "executedCommand", "failedFiles", "failedFileTimes", "testCoverage"];
-const identities = new Set([...identityKeys, "coveringTest", "coveringTests"]);
+const identityKeys = ["command", "executedCommand", "failedFiles", "failedFileTimes"];
+const identities = new Set([...identityKeys, "testCoverage", "coveringTest", "coveringTests"]);
 type Field = NonNullable<GateResult["textPrivacy"]>["output"];
 type Project = (record: Field | undefined, key: "output" | "identities") => Field;
-const flag = (v: unknown) => (typeof v === "boolean" ? v : undefined);
 const kinds = new Set<unknown>(["complete", "rendering", "attested:lan", "attested:github-actions"]);
 const coverageIds = new Set(["passedFiles", "skippedFiles", "skippedTests"]);
 /** Each covered identity string and key must survive redaction alone; failedFileTimes values must be finite numbers. */
@@ -88,19 +87,20 @@ const unchanged = (v: unknown): boolean =>
 const identityState = (r: GateResult, bytes: string) =>
   bytes === "identity-cap" || !Object.values(r.failedFileTimes ?? {}).every((t) => Number.isFinite(t))
     ? "unproven"
-    : unchanged(JSON.parse(bytes))
+    : identityKeys.every((key) => unchanged(Reflect.get(r, key))) &&
+        unchanged([r.coveringTest, r.coveringTests]) &&
+        [...coverageIds].every((key) => unchanged(Reflect.get(r.testCoverage ?? {}, key)))
       ? "clean"
       : "credential-changed";
 /** Rebuild a record from validated proof metadata only; nothing else is carried through. */
-const canonical = ({ withheld, truncated, checkedComplete, reason, kind, mac }: Field, outward: boolean) =>
-  JSON.parse(
-    JSON.stringify({
-      ...{ withheld: withheld === true, truncated: flag(truncated), checkedComplete: flag(checkedComplete) },
-      reason: withheld === true ? withheldText(reason).slice(11, -1) : undefined,
-      kind: kinds.has(kind) ? kind : undefined,
-      mac: withheld !== true && !outward && /^[a-f0-9]{64}$/.test(String(mac)) ? mac : undefined,
-    }),
-  ) as Field;
+const canonical = ({ withheld, truncated, checkedComplete, reason, kind, mac }: Field, outward: boolean) => ({
+  withheld: withheld === true,
+  ...(typeof truncated === "boolean" && { truncated }),
+  ...(typeof checkedComplete === "boolean" && { checkedComplete }),
+  ...(withheld === true && { reason: withheldText(reason).slice(11, -1) }),
+  ...(kinds.has(kind) && { kind }),
+  ...(withheld !== true && !outward && /^[a-f0-9]{64}$/.test(String(mac)) && { mac }),
+});
 function projectResult(r: GateResult, project: Project, outward = false): GateResult {
   const field: Project = (record, key) => canonical(project(record, key), outward);
   const output = field(r.textPrivacy?.output, "output"),
@@ -145,6 +145,8 @@ export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions):
   return redactData(
     value,
     function (key, v) {
+      if (key === "preview" && Reflect.get(this, "truncated") === true && typeof v === "string")
+        return withheldText("unproven");
       // Only the canonical record built for a recognized result holds validated metadata.
       if (key === "textPrivacy" && results.has(this) && v && typeof v === "object") {
         untouched.add(v);

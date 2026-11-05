@@ -155,6 +155,7 @@ const providersSchema = z.array(
 );
 
 export interface McpBackend {
+  gateDiagnosticsProjected?: boolean;
   change(input: z.output<typeof ChangeQuerySchema>, signal: AbortSignal): Promise<unknown>;
   create(input: CreateRunRequest): Promise<unknown>;
   detail(id: string): Promise<unknown>;
@@ -253,6 +254,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
   };
   const path = (id: string) => `/api/runs/${encodeURIComponent(id)}`;
   return {
+    gateDiagnosticsProjected: true,
     change: ({ run, ...query }, signal) =>
       api(
         `${path(run)}/change?${new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)]))}`,
@@ -514,7 +516,9 @@ export function createMcpServer(backend: McpBackend): Server {
       const tool = tools.find((tool) => tool.name === params.name);
       if (!tool) throw new Error(`Unknown tool: ${params.name}`);
       const raw = await tool.execute(params.arguments ?? {}, signal, privacy);
-      const result = projectGateDiagnostics(raw, { mode: "outward" });
+      const result = backend.gateDiagnosticsProjected
+        ? raw
+        : projectGateDiagnostics(raw, { mode: "outward" });
       const output = privacy
         ? privateOutputData(result, privacy)
         : params.name === "limitless_status"

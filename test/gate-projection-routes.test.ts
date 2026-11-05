@@ -8,7 +8,7 @@ import { formatGateOutput } from "../src/gates/failures.ts";
 import { projectGateDiagnostics as project } from "../src/gates/output.ts";
 import type { GateComparison, GateResult } from "../src/gates/run.ts";
 import { gateIdentities, gatePrivacyScope, remoteGateData, withheldText } from "../src/gates/text-privacy.ts";
-import { factoryBackend } from "../src/integrations/mcp.ts";
+import { factoryBackend, httpBackend } from "../src/integrations/mcp.ts";
 import { RunContext } from "../src/pipeline/context.ts";
 import { formatGateFeedback, reviewPrompt, verifyPrompt } from "../src/pipeline/prompts.ts";
 import { renderReport } from "../src/pipeline/report.ts";
@@ -16,7 +16,7 @@ import { createHttpRoutes } from "../src/server/http.ts";
 import { provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
 import { checkAndSign } from "../src/util/privacy-proof.ts";
 import { registerCredential } from "../src/util/proc.ts";
-import { connect, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { connect, localServer, type Route, requestWithParams, resultValue } from "./mcp-support.ts";
 import { provenResult, testGatePrivacy } from "./privacy-support.ts";
 import { providerFixture } from "./provider-config-support.ts";
 
@@ -270,6 +270,165 @@ test("durable events retain proofs and release through HTTP, SSE and MCP", async
   for (const render of [review, verify, report]) expect(render(r)).toContain(r.command);
 });
 
+test("historical cut previews are withheld through HTTP, SSE and MCP", async () => {
+  const f = fixture(),
+    command = "historical-expanded-command-sentinel",
+    envelope = {
+      truncated: true,
+      preview: JSON.stringify({ ...result(), command, padding: "U".repeat(MAX_EVENT_DATA) }).slice(
+        0,
+        MAX_EVENT_DATA,
+      ),
+    };
+  f.store.db
+    .query("INSERT INTO events (run_id, ts, type, level, message, data) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(f.run.id, 0, "gate", "info", "historical", JSON.stringify(envelope));
+  const texts = [await (await f.read("/api/runs/:id/events")).text()];
+  const detail = await (await f.read("/api/runs/:id")).text();
+  expect(detail).not.toContain(sentinel);
+  expect(detail).not.toContain(command);
+  const response = await f.read("/api/runs/:id/stream"),
+    reader = response.body?.getReader();
+  if (!reader) throw new Error("Missing SSE body");
+  texts.push(await frame(reader));
+  f.store.addEvent({ runId: f.run.id, type: "gate", level: "info", message: "live", data: envelope });
+  texts.push(await frame(reader));
+  f.abort.abort();
+  await reader.cancel();
+  const mcp = await connect(factoryBackend(f.factory));
+  try {
+    texts.push(
+      JSON.stringify(
+        resultValue(
+          await mcp.client.callTool({
+            name: "limitless_get_run",
+            arguments: { id: f.run.id, full: true },
+          }),
+        ),
+      ),
+    );
+  } finally {
+    await mcp.close();
+  }
+  for (const text of texts) {
+    expect(text).not.toContain(sentinel);
+    expect(text).not.toContain(command);
+    expect(text).toContain(JSON.stringify({ truncated: true, preview: withheldText("unproven") }));
+  }
+  const stored = f.ctx.event({
+    runId: f.run.id,
+    type: "gate",
+    level: "info",
+    message: "replayed",
+    data: envelope,
+  });
+  expect(stored.data).toEqual({ truncated: true, preview: withheldText("unproven") });
+});
+
+test("historical envelopes are mode-independent and idempotent without losing other fields", () => {
+  const envelope = { truncated: true, preview: sentinel, count: 7, extra: { safe: true } },
+    expected = { ...envelope, preview: withheldText("unproven") };
+  for (const first of ["durable", "outward"] as const) {
+    const once = project(envelope, { mode: first });
+    expect(once).toEqual(expected);
+    for (const second of ["durable", "outward"] as const)
+      expect(JSON.stringify(project(once, { mode: second }))).toBe(JSON.stringify(expected));
+  }
+  expect(project({ truncated: false, preview: "ordinary" }, { mode: "outward" }).preview).toBe("ordinary");
+});
+
+test("stdio MCP preserves daemon-projected proofs over real HTTP routes", async () => {
+  const f = fixture(),
+    r = await provenResult(result("released-http-output"));
+  const forged = await provenResult(result()),
+    foreign = await gatePrivacyScope.run({ ...testGatePrivacy, signer: () => Buffer.alloc(32, 41) }, () =>
+      provenResult(result()),
+    );
+  if (!forged.textPrivacy?.identities) throw new Error("Missing fixture proofs");
+  forged.textPrivacy.output.mac = forged.textPrivacy.identities.mac = "f".repeat(64);
+  for (const data of [r, result(), forged, foreign])
+    f.store.addEvent({ runId: f.run.id, type: "gate", level: "info", message: "result", data });
+  const routes = createHttpRoutes(f.factory),
+    server = Bun.serve({
+      port: 0,
+      fetch: (req, server) => {
+        const path = new URL(req.url).pathname;
+        const handler =
+          routes[
+            path.includes("/events") ? "/api/runs/:id/events" : path === "/api/land" ? path : "/api/runs/:id"
+          ];
+        const route = typeof handler === "function" ? (handler as Route) : (handler as { GET: Route }).GET;
+        return route(Object.assign(req, { params: { id: f.run.id } }), server);
+      },
+    });
+  const backend = httpBackend(`http://127.0.0.1:${server.port}`),
+    mcp = await connect(backend);
+  try {
+    const events = await backend.events(f.run.id);
+    const full = resultValue<{ events: { data: GateResult }[] }>(
+      await mcp.client.callTool({
+        name: "limitless_get_run",
+        arguments: { id: f.run.id, full: true },
+      }),
+    );
+    expect<unknown>(full.events).toEqual(events);
+    expect(full.events[0]?.data).toMatchObject({ output: r.output, command: r.command });
+    for (const event of full.events.slice(1))
+      expect(event.data).toMatchObject({
+        output: withheldText("unproven"),
+        command: withheldText("unproven"),
+      });
+    expect(JSON.stringify(full.events)).not.toContain('"mac"');
+  } finally {
+    await mcp.close();
+    await server.stop(true);
+  }
+});
+
+test.each([undefined, 1])("nested results use one parse with event limit %p", async (maxEventData) => {
+  const r = await provenResult(result("parse-once-output")),
+    value = { event: { data: { ...r, targetedRetry: r, firstAttempt: r } } };
+  const parse = spyOn(JSON, "parse");
+  try {
+    const out = project(value, { mode: "durable", maxEventData });
+    expect(parse).toHaveBeenCalledTimes(1);
+    const expected = maxEventData === undefined ? r.output : withheldText("event-size");
+    expect(out.event.data.output).toBe(expected);
+    expect(out.event.data.targetedRetry.output).toBe(expected);
+    expect(out.event.data.firstAttempt.output).toBe(expected);
+  } finally {
+    parse.mockRestore();
+  }
+});
+
+test.each(["command", "failedFiles", "failedFileTimes", "skippedTests"])(
+  "later credentials in %s withhold proved identities",
+  async (field) => {
+    const credential = `IDENTITY_LATER_${field}_374`,
+      text = `alpha${credential}beta`,
+      r = result("clean identity output");
+    if (field === "command") r.command = text;
+    if (field === "failedFiles") r.failedFiles = [text];
+    if (field === "failedFileTimes") r.failedFileTimes = { [text]: 1 };
+    if (field === "skippedTests" && r.testCoverage)
+      r.testCoverage.skippedTests = [{ file: text, name: "case" }];
+    const signed = await provenResult(r);
+    registerCredential(`IDENTITY_${field}`, credential);
+    for (const mode of ["durable", "outward"] as const) {
+      const out = project(signed, { mode });
+      expect(out.command).toBe(withheldText("credential-changed"));
+      expect(out.textPrivacy?.identities).toEqual({ withheld: true, reason: "credential-changed" });
+      expect(out.output).toBe(r.output);
+    }
+  },
+);
+
+test("identity-cap bytes withhold identities even with an authentic proof", async () => {
+  const signed = await provenResult({ ...result("safe"), command: "U".repeat(65537) });
+  expect(gateIdentities(signed)).toBe("identity-cap");
+  expect(project(signed, { mode: "outward" }).command).toBe(withheldText("unproven"));
+});
+
 test("historical artifact reads refresh policy without submitting to the checker", async () => {
   const f = fixture(),
     registry = testGatePrivacy.registry;
@@ -422,6 +581,7 @@ test("projection snapshots are lazy and shared across nested result fields", asy
 
 test("SSE backlog yields on every 2000-event page, keeps order and unsubscribes on abort", async () => {
   const f = fixture(),
+    r = await provenResult(result("page-output")),
     events = Array.from({ length: 5000 }, (_, i) => ({
       id: i + 1,
       runId: f.run.id,
@@ -430,11 +590,14 @@ test("SSE backlog yields on every 2000-event page, keeps order and unsubscribes 
       level: "info" as const,
       invocationId: null,
       ts: 0,
-      data: null,
+      data: r,
     }));
   const turns: number[] = [],
-    pages: number[] = [];
+    pages: number[] = [],
+    receivedBeforePage: number[] = [];
+  let received = 0;
   const list = spyOn(f.store, "listEvents").mockImplementation((_id, options) => {
+    if (pages.length) receivedBeforePage.push(received);
     pages.push(options?.after ?? 0);
     setImmediate(() => turns.push(pages.length));
     return events.slice(options?.after ?? 0, (options?.after ?? 0) + 2000);
@@ -451,20 +614,25 @@ test("SSE backlog yields on every 2000-event page, keeps order and unsubscribes 
     const response = await f.read("/api/runs/:id/stream"),
       reader = response.body?.getReader();
     if (!reader) throw new Error("Missing SSE body");
-    expect(turns).toEqual([1, 2]);
-    expect(pages).toEqual([0, 2000, 4000]);
     expect(subscribed).toBe(1);
     let bytes = "";
-    while (!bytes.includes('"id":5000')) {
+    while (received < events.length) {
       const chunk = await reader.read();
       if (chunk.done) throw new Error("Missing backlog");
-      bytes += new TextDecoder().decode(chunk.value);
+      const text = new TextDecoder().decode(chunk.value);
+      received += text.split("data: ").length - 1;
+      bytes += text;
     }
+    expect(turns).toEqual([1, 2]);
+    expect(pages).toEqual([0, 2000, 4000]);
+    expect(receivedBeforePage).toEqual([2000, 4000]);
     const ids = bytes
       .split("\n")
       .filter((line) => line.startsWith("data: "))
       .map((line) => JSON.parse(line.slice(6)).event.id);
     expect(ids).toEqual(events.map((e) => e.id));
+    expect(bytes).toContain(r.output);
+    expect(bytes).toContain(r.command);
     f.abort.abort();
     await reader.cancel();
     expect(unsubscribed).toBe(1);
@@ -535,18 +703,60 @@ test("SSE drain buffers live messages published between pages and drops events a
   }
 });
 
-test("SSE drain releases its subscription when reading the backlog fails", async () => {
+test.each([0, 2000])("SSE drain releases its subscription when page after %i fails", async (failAfter) => {
   const f = fixture();
   let unsubscribed = 0;
-  const list = spyOn(f.store, "listEvents").mockImplementation(() => {
-    throw new Error("store unavailable");
+  const list = spyOn(f.store, "listEvents").mockImplementation((_id, options) => {
+    if ((options?.after ?? 0) === failAfter) throw new Error("store unavailable");
+    return Array.from({ length: 2000 }, (_, i) => ({
+      id: i + 1,
+      runId: f.run.id,
+      invocationId: null,
+      ts: 0,
+      type: "log" as const,
+      level: "info" as const,
+      message: "event",
+      data: null,
+    }));
   });
   const subscribe = spyOn(f.store, "subscribe").mockImplementation(() => () => {
     unsubscribed++;
   });
   try {
     const response = await f.read("/api/runs/:id/stream");
-    expect(response.status).not.toBe(200);
+    if (failAfter === 0) expect(response.status).not.toBe(200);
+    else await expect(response.text()).rejects.toThrow("store unavailable");
+    expect(unsubscribed).toBe(1);
+  } finally {
+    list.mockRestore();
+    subscribe.mockRestore();
+  }
+});
+
+test.each(["abort", "cancel"])("SSE drain stops paging on %s between pages", async (stop) => {
+  const f = fixture();
+  const list = spyOn(f.store, "listEvents").mockImplementation(() =>
+    Array.from({ length: 2000 }, (_, i) => ({
+      id: i + 1,
+      runId: f.run.id,
+      invocationId: null,
+      ts: 0,
+      type: "log" as const,
+      level: "info" as const,
+      message: "event",
+      data: null,
+    })),
+  );
+  let unsubscribed = 0;
+  const subscribe = spyOn(f.store, "subscribe").mockImplementation(() => () => {
+    unsubscribed++;
+  });
+  try {
+    const response = await f.read("/api/runs/:id/stream");
+    if (stop === "abort") f.abort.abort();
+    await response.body?.cancel();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(list).toHaveBeenCalledTimes(1);
     expect(unsubscribed).toBe(1);
   } finally {
     list.mockRestore();

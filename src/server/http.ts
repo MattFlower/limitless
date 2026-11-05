@@ -81,6 +81,7 @@ function redactGateArtifact(content: string, kind = ""): string {
 }
 
 const error = (message: string, status = 400) => json({ error: message }, status);
+type Send = (msg: unknown, wire?: string) => void;
 
 function sse(
   req: Request,
@@ -90,17 +91,24 @@ function sse(
     backlog = [],
     eventId,
     alive = () => true,
-  }: { backlog?: unknown[]; eventId?: (msg: unknown) => number; alive?: () => boolean } = {},
+    drain,
+  }: {
+    backlog?: unknown[];
+    eventId?: (msg: unknown) => number;
+    alive?: () => boolean;
+    drain?: (send: Send, active: () => boolean) => Promise<void>;
+  } = {},
 ): Response {
   server.timeout(req, 0);
-  let cleanup: (() => void) | null = null;
+  let cleanup: (() => void) | null = null,
+    stopped = false;
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      const send = (msg: unknown) => {
+      const send: Send = (msg, wire) => {
         try {
           controller.enqueue(
-            encoder.encode(`${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${serialize(msg)}\n\n`),
+            encoder.encode(wire ?? `${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${serialize(msg)}\n\n`),
           );
         } catch {
           cleanup?.();
@@ -110,7 +118,8 @@ function sse(
       controller.enqueue(encoder.encode(": connected\n\n"));
       for (const m of backlog) send(m);
       // A stream outlives the request that opened it, so it ends when its sign-in does.
-      const unsubscribe = subscribe((msg) => (alive() ? send(msg) : abort()));
+      const transmit: Send = (msg, wire) => (alive() ? send(msg, wire) : abort()),
+        unsubscribe = subscribe(transmit);
       const keepAlive = setInterval(() => {
         if (!alive()) return abort();
         try {
@@ -120,6 +129,8 @@ function sse(
         }
       }, 15_000);
       cleanup = () => {
+        if (stopped) return;
+        stopped = true;
         unsubscribe();
         clearInterval(keepAlive);
       };
@@ -133,6 +144,11 @@ function sse(
       };
       req.signal.addEventListener("abort", abort, { once: true });
       if (req.signal.aborted) abort();
+      if (drain && !stopped)
+        void drain(transmit, () => !stopped).catch((err) => {
+          cleanup?.();
+          controller.error(err);
+        });
     },
     cancel() {
       cleanup?.();
@@ -737,8 +753,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       const runId = req.params.id as string;
       const after = Number(new URL(req.url).searchParams.get("after") ?? 0);
       // Subscribe before the first yield; messages buffered meanwhile follow the backlog, minus events it read.
-      const backlog: StreamMessage[] = [],
-        buffered: StreamMessage[] = [];
+      const buffered: StreamMessage[] = [];
       let deliver = (msg: StreamMessage): void => void buffered.push(msg),
         cursor = after;
       const unsubscribe = store.subscribe((msg: StreamMessage) => {
@@ -759,23 +774,29 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         if (id === runId) deliver(msg);
       });
       try {
-        for (let page = store.listEvents(runId, { after, limit: 2000 }); page.length; ) {
-          for (const event of page) backlog.push({ kind: "event", event });
-          cursor = page.at(-1)?.id ?? cursor;
-          if (page.length < 2000) break;
-          await new Promise<void>((resolve) => setImmediate(resolve));
-          page = store.listEvents(runId, { after: cursor, limit: 2000 });
-        }
+        const first = store.listEvents(runId, { after, limit: 2000 });
+        return sse(req, server, () => unsubscribe, {
+          alive: live(req),
+          drain: async (send, active) => {
+            for (let page = first; active() && page.length; ) {
+              const frames = projectGateDiagnostics(page, { mode: "outward" }).map(
+                (event) => `data: ${JSON.stringify({ kind: "event", event })}\n\n`,
+              );
+              send(null, frames.join(""));
+              cursor = page.at(-1)?.id ?? cursor;
+              if (page.length < 2000) break;
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              if (!active()) return;
+              page = store.listEvents(runId, { after: cursor, limit: 2000 });
+            }
+            for (const msg of buffered) if (msg.kind !== "event" || msg.event.id > cursor) send(msg);
+            deliver = send;
+          },
+        });
       } catch (err) {
         unsubscribe();
         throw err;
       }
-      backlog.push(...buffered.filter((msg) => msg.kind !== "event" || msg.event.id > cursor));
-      const attach = (send: typeof deliver) => {
-        deliver = send;
-        return unsubscribe;
-      };
-      return sse(req, server, attach, { backlog, alive: live(req) });
     }),
     "/api/stream": handle((req, server) =>
       sse(
