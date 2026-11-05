@@ -79,7 +79,7 @@ const failure = (reason: Reason, generation?: Generation, provenance?: b.Provena
   policyDigest: generation ? digest(generation) : "privacy/unavailable",
   reason,
 });
-const reasons = [
+export const privacyReasons = [
   ...b.privacyRefusals,
   ..."private-match unchecked-provenance stale-generation input-length output-length assembly-count forged unreadable-policy invalid-cut json-depth json-nodes checker-busy checker-timeout checker-cancelled checker-failed".split(
     " ",
@@ -95,7 +95,7 @@ function projection(value: unknown, generation: Generation): value is Projection
     (value.truncated === undefined || typeof value.truncated === "boolean") &&
     value.policyDigest === digest(generation) &&
     (value.withheld === true
-      ? reasons.some((reason) => reason === value.reason)
+      ? privacyReasons.some((reason) => reason === value.reason)
       : value.withheld === false && value.checkedComplete === true && value.reason === undefined)
   );
 }

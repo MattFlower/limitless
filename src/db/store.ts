@@ -84,7 +84,7 @@ type RoundObservation = {
 type Row = Record<string, unknown>;
 type Listener = (msg: StreamMessage) => void;
 
-const MAX_EVENT_DATA = 16_000;
+export const MAX_EVENT_DATA = 16_000;
 
 /** A run id as `newId()` makes it: lowercase base 36. */
 const RUN_ID = /^[0-9a-z]{1,32}$/;
@@ -3073,6 +3073,12 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
       .query("SELECT content FROM artifacts WHERE run_id = ? AND name = ?")
       .get(runId, name) as Row | null;
     return r ? (r.content as string) : null;
+  }
+
+  getArtifactRecord(runId: string, name: string): { content: string; kind: string } | null {
+    return this.db
+      .query("SELECT content, kind FROM artifacts WHERE run_id = ? AND name = ?")
+      .get(runId, name) as { content: string; kind: string } | null;
   }
 
   listArtifacts(runId: string): ArtifactMeta[] {

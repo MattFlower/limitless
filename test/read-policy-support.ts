@@ -7,6 +7,7 @@ import { credentialRegistry } from "../src/util/credential-matcher.ts";
 import { createPrivacyRegistry, privacyLimits } from "../src/util/privacy-boundary.ts";
 import { createPrivacyChecker } from "../src/util/privacy-checker.ts";
 import { provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
+import { testGatePrivacy } from "./privacy-support.ts";
 
 export const testReadPolicy = configureReadPolicy(undefined, join(tmpdir(), "test-factory-config"));
 
@@ -46,8 +47,10 @@ function scoped<T extends (...args: never[]) => unknown>(runner: T): T {
                 );
                 const checker = createPrivacyChecker({ registry });
                 try {
-                  return await gatePrivacyScope.run({ checker, registry }, () =>
-                    readPolicyScope.run(testReadPolicy, () => Reflect.apply(callback, undefined, values)),
+                  return await gatePrivacyScope.run(
+                    { checker, registry, signer: testGatePrivacy.signer },
+                    () =>
+                      readPolicyScope.run(testReadPolicy, () => Reflect.apply(callback, undefined, values)),
                   );
                 } finally {
                   registration.mockRestore();

@@ -24,14 +24,16 @@ export function classify(
 export async function settleCheckpoint(
   deps: { leases: Pick<LeaseManager, "settle">; claims: Pick<ClaimClient, "read">; store: Store },
   handle: LeaseHandle,
+  signal?: AbortSignal,
 ): Promise<{ settlement: Settlement; tip: ClaimTip | null }> {
   const { leases, claims, store } = deps;
   return store.coordinateCheckpoint(handle.run, async () => {
     for (;;) {
-      if ((await leases.settle(handle.repo, handle.ref)) === "pending")
+      signal?.throwIfAborted();
+      if ((await leases.settle(handle.repo, handle.ref, signal)) === "pending")
         return { settlement: "wait", tip: null };
       const row = store.checkpointRecord(handle.run);
-      const read = await claims.read(handle.repo, handle.ref);
+      const read = await claims.read(handle.repo, handle.ref, signal);
       if (read.kind === "unconfirmed") return { settlement: "wait", tip: null };
       if (!isDeepStrictEqual(row, store.checkpointRecord(handle.run))) continue;
       const tip = read.kind === "tip" ? read.tip : null,

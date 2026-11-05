@@ -14,7 +14,7 @@ import { IssueClaimed } from "../db/store.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
 import { isInertMedia } from "../gates/media.ts";
-import { redactGateData, redactGateOutput } from "../gates/output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
 import { ensureCache, fetchBase, resolveRepo } from "../git/repos.ts";
 import { type GhRunner, GITHUB_PREFACES, quotedJson, runGh } from "../integrations/github.ts";
@@ -67,19 +67,22 @@ export interface HttpExtras {
   ui?: Record<string, Blob>;
 }
 
-const serialize = (data: unknown) => JSON.stringify(redactGateData(data));
+const serialize = (data: unknown) => JSON.stringify(projectGateDiagnostics(data, { mode: "outward" }));
 const json = (data: unknown, status = 200) =>
   new Response(serialize(data), { status, headers: { "content-type": "application/json" } });
 
-function redactGateArtifact(content: string): string {
+function redactGateArtifact(content: string, kind = ""): string {
+  let data: unknown;
   try {
-    return serialize(JSON.parse(content));
+    data = JSON.parse(content);
   } catch {
-    return redactGateOutput(content);
+    return kind === "gates" ? "[withheld: unproven]" : redactGateOutput(content);
   }
+  return serialize(data);
 }
 
 const error = (message: string, status = 400) => json({ error: message }, status);
+type Send = (msg: unknown, wire?: string) => void;
 
 function sse(
   req: Request,
@@ -89,17 +92,24 @@ function sse(
     backlog = [],
     eventId,
     alive = () => true,
-  }: { backlog?: unknown[]; eventId?: (msg: unknown) => number; alive?: () => boolean } = {},
+    drain,
+  }: {
+    backlog?: unknown[];
+    eventId?: (msg: unknown) => number;
+    alive?: () => boolean;
+    drain?: (send: Send, active: () => boolean) => Promise<void>;
+  } = {},
 ): Response {
   server.timeout(req, 0);
-  let cleanup: (() => void) | null = null;
+  let cleanup: (() => void) | null = null,
+    stopped = false;
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      const send = (msg: unknown) => {
+      const send: Send = (msg, wire) => {
         try {
           controller.enqueue(
-            encoder.encode(`${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${serialize(msg)}\n\n`),
+            encoder.encode(wire ?? `${eventId ? `id: ${eventId(msg)}\n` : ""}data: ${serialize(msg)}\n\n`),
           );
         } catch {
           cleanup?.();
@@ -109,7 +119,8 @@ function sse(
       controller.enqueue(encoder.encode(": connected\n\n"));
       for (const m of backlog) send(m);
       // A stream outlives the request that opened it, so it ends when its sign-in does.
-      const unsubscribe = subscribe((msg) => (alive() ? send(msg) : abort()));
+      const transmit: Send = (msg, wire) => (alive() ? send(msg, wire) : abort()),
+        unsubscribe = subscribe(transmit);
       const keepAlive = setInterval(() => {
         if (!alive()) return abort();
         try {
@@ -119,6 +130,8 @@ function sse(
         }
       }, 15_000);
       cleanup = () => {
+        if (stopped) return;
+        stopped = true;
         unsubscribe();
         clearInterval(keepAlive);
       };
@@ -132,6 +145,11 @@ function sse(
       };
       req.signal.addEventListener("abort", abort, { once: true });
       if (req.signal.aborted) abort();
+      if (drain && !stopped)
+        void drain(transmit, () => !stopped).catch((err) => {
+          cleanup?.();
+          controller.error(err);
+        });
     },
     cancel() {
       cleanup?.();
@@ -725,10 +743,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       );
     }),
     "/api/runs/:id/artifacts/:name": handle((req) => {
-      const content = store.getArtifact(req.params.id as string, req.params.name as string);
-      return content === null
+      const artifact = store.getArtifactRecord(req.params.id as string, req.params.name as string);
+      return artifact === null
         ? error("not found", 404)
-        : new Response(redactGateArtifact(content), {
+        : new Response(redactGateArtifact(artifact.content, artifact.kind), {
             headers: { "content-type": "text/plain; charset=utf-8" },
           });
     }),
@@ -740,40 +758,54 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       const headers = { "Content-Type": "image/png", "X-Content-Type-Options": "nosniff" };
       return new Response(bytes, { headers: { ...headers, "Cache-Control": "no-store" } });
     }, true),
-    "/api/runs/:id/stream": handle((req, server) => {
+    "/api/runs/:id/stream": handle(async (req, server) => {
       const runId = req.params.id as string;
       const after = Number(new URL(req.url).searchParams.get("after") ?? 0);
-      const backlog: StreamMessage[] = [];
-      for (let cursor = after; ; ) {
-        const page = store.listEvents(runId, { after: cursor, limit: 2000 });
-        for (const event of page) backlog.push({ kind: "event", event });
-        const last = page.at(-1);
-        if (!last || page.length < 2000) break;
-        cursor = last.id;
+      // Subscribe before the first yield; messages buffered meanwhile follow the backlog, minus events it read.
+      const buffered: StreamMessage[] = [];
+      let deliver = (msg: StreamMessage): void => void buffered.push(msg),
+        cursor = after;
+      const unsubscribe = store.subscribe((msg: StreamMessage) => {
+        const id =
+          msg.kind === "run"
+            ? msg.run.id
+            : msg.kind === "stage"
+              ? msg.stage.runId
+              : msg.kind === "invocation"
+                ? msg.invocation.runId
+                : msg.kind === "event"
+                  ? msg.event.runId
+                  : msg.kind === "question"
+                    ? msg.question.runId
+                    : msg.kind === "feed"
+                      ? msg.item.runId
+                      : null;
+        if (id === runId) deliver(msg);
+      });
+      try {
+        const first = store.listEvents(runId, { after, limit: 2000 });
+        return sse(req, server, () => unsubscribe, {
+          alive: live(req),
+          drain: async (send, active) => {
+            for (let page = first; active() && page.length; ) {
+              const frames = projectGateDiagnostics(page, { mode: "outward" }).map(
+                (event) => `data: ${JSON.stringify({ kind: "event", event })}\n\n`,
+              );
+              send(null, frames.join(""));
+              cursor = page.at(-1)?.id ?? cursor;
+              if (page.length < 2000) break;
+              await new Promise<void>((resolve) => setImmediate(resolve));
+              if (!active()) return;
+              page = store.listEvents(runId, { after: cursor, limit: 2000 });
+            }
+            for (const msg of buffered) if (msg.kind !== "event" || msg.event.id > cursor) send(msg);
+            deliver = send;
+          },
+        });
+      } catch (err) {
+        unsubscribe();
+        throw err;
       }
-      return sse(
-        req,
-        server,
-        (send) =>
-          store.subscribe((msg: StreamMessage) => {
-            const id =
-              msg.kind === "run"
-                ? msg.run.id
-                : msg.kind === "stage"
-                  ? msg.stage.runId
-                  : msg.kind === "invocation"
-                    ? msg.invocation.runId
-                    : msg.kind === "event"
-                      ? msg.event.runId
-                      : msg.kind === "question"
-                        ? msg.question.runId
-                        : msg.kind === "feed"
-                          ? msg.item.runId
-                          : null;
-            if (id === runId) send(msg);
-          }),
-        { backlog, alive: live(req) },
-      );
     }),
     "/api/stream": handle((req, server) =>
       sse(

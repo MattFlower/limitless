@@ -232,7 +232,13 @@ test("reload sanitizes legacy diagnostics while preserving executable and compar
     expect(store.listEvents(run.id)).toMatchObject([
       {
         message: "[redacted]",
-        data: { gate: { name: "[redacted]", command: "[redacted]", output: "[redacted]" } },
+        data: {
+          gate: {
+            name: "[redacted]",
+            command: "[withheld: unproven]",
+            output: "[withheld: unproven]",
+          },
+        },
       },
     ]);
     expect(loaded.state.gatesConfig?.checks[0]?.name).toBe(literal);

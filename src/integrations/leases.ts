@@ -39,7 +39,7 @@ export interface LeaseManager {
     opts?: Expect,
   ): Promise<"applied" | "wait" | "lost" | "obsolete" | "mismatch">;
   release(h: LeaseHandle, patch?: { status?: RunStatus }): Promise<"released" | "wait" | "lost" | "obsolete">;
-  settle(repo: string, ref: string): Promise<"settled" | "pending">;
+  settle(repo: string, ref: string, signal?: AbortSignal): Promise<"settled" | "pending">;
   windowOpen(h: LeaseHandle): boolean;
   start(hooks: Hooks): () => void;
 }
@@ -243,10 +243,10 @@ export async function createLeaseManager(deps: {
       const result = await mutate(h, patch.status === undefined ? {} : { status: patch.status }, true);
       return result === "applied" ? "released" : result === "mismatch" ? "wait" : result;
     },
-    async settle(repo, ref) {
+    async settle(repo, ref, signal) {
       repo = canonicalRepo(repo);
       return locked(repo, ref, async () =>
-        (await reconcile(repo, ref, undefined, true)) === "pending" ? "pending" : "settled",
+        (await reconcile(repo, ref, signal, true)) === "pending" ? "pending" : "settled",
       );
     },
     windowOpen: open,

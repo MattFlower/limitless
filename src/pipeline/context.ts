@@ -20,11 +20,12 @@ import type {
   Stage,
   StageName,
 } from "../core/types.ts";
-import type { RunPatch, Store } from "../db/store.ts";
+import { MAX_EVENT_DATA, type RunPatch, type Store } from "../db/store.ts";
 import type { AuditFinding } from "../gates/audit.ts";
 import type { GateConfig } from "../gates/detect.ts";
 import type { ExecutionHandle, GateExecutor } from "../gates/executor.ts";
 import {
+  projectGateDiagnostics,
   redactGateData,
   redactGateDiagnostics,
   redactGateOutput,
@@ -624,7 +625,7 @@ export class RunContext {
     return this.store.addEvent({
       ...event,
       message: redactGateOutput(event.message),
-      data: redactGateData(event.data),
+      data: projectGateDiagnostics(event.data, { mode: "durable", maxEventData: MAX_EVENT_DATA }),
     });
   }
 
