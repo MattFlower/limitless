@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { type RunStatus, TERMINAL_STATUSES } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
-import { cachePath } from "../src/git/repos.ts";
+import { cachePath, iterationRefs } from "../src/git/repos.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { claimScope } from "../src/integrations/claim-guard.ts";
 import { createClaimClient } from "../src/integrations/claim-ref.ts";
@@ -271,7 +271,12 @@ test.each([false, true])("engine success publishes upload-first, update fails=%s
   const f = await fixture(),
     authority = await held(f);
   const state = f.store.getRunState<RunState>(f.run.id) ?? initialRunState(f.run);
-  const { value: sha } = await seed(cachePath(f.cfg.paths, f.repo));
+  const cache = cachePath(f.cfg.paths, f.repo),
+    { value: sha } = await seed(cache);
+  await sh(["git", "-C", cache, "update-ref", `refs/limitless/iterations/${f.run.id}/1`, sha], {
+    cwd: cache,
+  });
+  expect(await iterationRefs(cache, f.run.id)).toHaveLength(1);
   Object.assign(state, {
     phase: "done",
     gatesConfig: { setup: [], checks: [], source: "none", protectedPaths: [] },
@@ -282,6 +287,7 @@ test.each([false, true])("engine success publishes upload-first, update fails=%s
   pinPolicy(f.store, f.run.id, state, { kind: "prepared", trustedBase: sha });
   expect(await executeRun({ ...f.engineDeps(), runClaim: authority }, f.run.id, f.signal)).toBe("succeeded");
   expectDeferred(f, "succeeded");
+  expect(await iterationRefs(cache, f.run.id)).toHaveLength(0);
   const before = (await f.record()).checkpoint;
   if (fault) failUpdate(f);
   expect(await f.publish()).toBe(fault ? "wait" : "done");
@@ -600,6 +606,26 @@ test("authority overlapping a publication lets the publisher reconcile a replace
     return result;
   });
   expect(await f.publish()).toBe("done");
+  expect(await overlapping).toBe("finished");
+  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "cancelled", error: "final reason" });
+  expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(await f.record()).toMatchObject({ state: "released", status: "cancelled" });
+});
+
+test("a replaced intent survives an overlapping authority when the publisher waits", async () => {
+  const f = await fixture();
+  await held(f);
+  f.defer();
+  const update = f.rt.leases.update.bind(f.rt.leases);
+  let overlapping: Promise<unknown> | undefined;
+  spyOn(f.rt.leases, "update").mockImplementation(async (h, patch, opts) => {
+    const result = await update(h, patch, opts);
+    if (overlapping) return result;
+    f.defer("cancelled");
+    overlapping = f.authority();
+    return "wait";
+  });
+  expect(await f.publish()).toBe("wait");
   expect(await overlapping).toBe("finished");
   expect(f.store.getRun(f.run.id)).toMatchObject({ status: "cancelled", error: "final reason" });
   expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();

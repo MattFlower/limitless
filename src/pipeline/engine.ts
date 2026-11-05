@@ -303,7 +303,11 @@ async function executeRunOnce(
       return deps.store.getRun(runId)?.status ?? "failed";
     },
   );
-  if (TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued"))
+  // A shared run's deferred terminal decision (D2) is final locally; only its publication is pending.
+  if (
+    TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued") ||
+    (ctx.execution.shared && deps.store.checkpointRecord(runId)?.terminal)
+  )
     await removeIterationRefs(deps.cfg.paths, repo, runId).catch((error: unknown) =>
       ctx.log(`Iteration cleanup deferred to GC: ${(error as Error).message}`, "warn"),
     );
