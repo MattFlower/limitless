@@ -210,3 +210,56 @@ test("packaged installs read the embedded skill unless an explicit root is given
   installIntegrations({ home: join(dir, "rooted"), root, write: true, release, print: () => {} });
   expect(readFileSync(destination("rooted"), "utf8")).toBe("explicit skill\n");
 });
+
+test("packaged manual MCP and SessionStart commands preserve executable and URL arguments", async () => {
+  const executable = join(dir, "opt prefix 'quoted'/bin/limitless");
+  mkdirSync(resolve(executable, ".."), { recursive: true });
+  writeFileSync(executable, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", { mode: 0o700 });
+  writeFileSync(join(dir, "SKILL.md"), "embedded skill");
+  const output: string[] = [];
+  const url = "http://daemon.invalid:7499/path?key=a&other=b";
+  installIntegrations({
+    home: dir,
+    release: { kind: "packaged", version: "2", sha: "a".repeat(40), bun: "test", root: dir },
+    executable,
+    url,
+    print: (s) => output.push(s),
+  });
+  const text = output.join("\n");
+  const toml = text.match(/(\[mcp_servers.limitless\][\s\S]*?)\n\nRegister with/)?.[1];
+  if (!toml) throw new Error("Missing packaged TOML instructions");
+  expect(Bun.TOML.parse(toml)).toEqual({
+    mcp_servers: { limitless: { command: executable, args: ["mcp"], env: { LIMITLESS_URL: url } } },
+  });
+  const hook = JSON.parse(text.split("acknowledging:\n")[1] ?? "");
+  const registration = text.split("Register with Claude Code:\n")[1]?.split("\n")[0];
+  if (!registration) throw new Error("Missing packaged Claude registration");
+  for (const [command, expected] of [
+    [hook.hooks.SessionStart[0].hooks[0].command, ["digest", "--consumer", "claude"]],
+    [
+      `claude() { printf '%s\\n' "$@"; }; ${registration}`,
+      [
+        "mcp",
+        "add",
+        "limitless",
+        "--env",
+        `LIMITLESS_URL=${url}`,
+        "--scope",
+        "user",
+        "--",
+        executable,
+        "mcp",
+      ],
+    ],
+  ] as const) {
+    const child = Bun.spawn(["sh", "-c", command], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect(code).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout.trim().split("\n")).toEqual([...expected]);
+  }
+});

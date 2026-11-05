@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { doctor, setupCommand, setupDeps } from "../src/cli/setup.ts";
 import { tomlValue } from "../src/router/config-catalog.ts";
 import { customProvider } from "./provider-config-support.ts";
-import { assertReadOnlyCommand, setupFixture } from "./setup-support.ts";
+import { assertReadOnlyCommand, packagedRelease, setupFixture } from "./setup-support.ts";
 
 const keyProvider = {
   ...customProvider,
@@ -13,6 +13,43 @@ const keyProvider = {
   health_url: "http://provider.invalid/health",
 };
 type Fixture = ReturnType<typeof setupFixture>;
+for (const outcome of ["matching", "mismatch", "empty", "unhealthy", "unavailable", "empty expected"])
+  test(`packaged doctor verifies build identity without an app checkout: ${outcome}`, async () => {
+    const f = setupFixture(undefined, { release: packagedRelease });
+    try {
+      expect(existsSync(f.d.appDir)).toBe(false);
+      if (outcome === "mismatch") f.state.sha = "b".repeat(40);
+      if (outcome === "empty") f.state.sha = "";
+      if (outcome === "unhealthy") f.state.healthy = false;
+      if (outcome === "unavailable") f.state.daemon = false;
+      if (outcome === "empty expected") {
+        f.d.release = { ...packagedRelease, sha: "" };
+        f.state.sha = "";
+      }
+      const check = (await doctor(f.d)).find((c) => c.id === "daemon");
+      expect(check).toMatchObject({ status: outcome === "matching" ? "ok" : "warn" });
+      if (outcome !== "matching")
+        expect(check?.fix).toBe(outcome === "unavailable" ? "limitless service install" : "limitless deploy");
+    } finally {
+      f.close();
+    }
+  });
+
+test("source doctor verifies the installed app directory, rather than the CLI checkout", async () => {
+  const f = setupFixture();
+  try {
+    const run = f.d.run;
+    const roots: (string | undefined)[] = [];
+    f.d.run = async (args, cwd) => {
+      if (args.includes("rev-parse")) roots.push(cwd);
+      return run(args, cwd);
+    };
+    expect((await doctor(f.d)).find((c) => c.id === "daemon")?.status).toBe("ok");
+    expect(roots).toEqual([f.d.appDir]);
+  } finally {
+    f.close();
+  }
+});
 test("real setup runner preserves the child environment and overrides only the configured port", async () => {
   const f = setupFixture("[server]\nport = 7461\n");
   const env = {

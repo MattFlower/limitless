@@ -9,6 +9,10 @@ export const fieldPrivacySchema = z
     withheld: z.boolean(),
     truncated: z.boolean().optional(),
     checkedComplete: z.boolean().optional(),
+    entriesDigest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
     reason: z.string().optional(),
     kind: z.enum(["complete", "attested:lan", "attested:github-actions", "rendering"]).optional(),
     mac: z.string().optional(),

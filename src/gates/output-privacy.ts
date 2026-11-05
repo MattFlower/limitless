@@ -39,7 +39,7 @@ export async function protectGateOutput(
             checked = withheld(part.reason ?? "checker-failed");
             break;
           }
-          checked = { withheld: false, checkedComplete: true, kind: "complete" };
+          checked = { withheld: false, checkedComplete: true, kind: "complete", entriesDigest: digest };
           if (part.done) {
             bytes = Buffer.concat(parts).toString();
             break;
