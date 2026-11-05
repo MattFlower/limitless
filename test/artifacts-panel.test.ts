@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -8,6 +8,11 @@ import ts from "@babel/preset-typescript";
 import { renderToString } from "solid-js/web";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { VerifySchema } from "../src/pipeline/schemas.ts";
+import { createHttpRoutes } from "../src/server/http.ts";
+import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { buildNeedsYouUi } from "./needs-you-ui-support.ts";
+import { test } from "./read-policy-support.ts";
+import { buildSetupUi, settle } from "./setup-ui-support.ts";
 
 const solid = createRequire(import.meta.url)("babel-preset-solid") as PresetTarget<object>;
 test("verification artifact renders blocked evidence and legacy statuses", async () => {
@@ -141,5 +146,78 @@ test("verification artifact renders blocked evidence and legacy statuses", async
     expect(dismissed).toContain("pill-succeeded");
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Run Detail lists local screenshots separately and the artifact panel renders their image URL", async () => {
+  const f = await fixture(),
+    dir = mkdtempSync(join(tmpdir(), "artifact-listing-"));
+  const previous = globalThis.fetch,
+    oldSource = globalThis.EventSource;
+  globalThis.EventSource = class {
+    close() {}
+  } as unknown as typeof EventSource;
+  const { store } = f.factory;
+  const run = await f.factory.createRun({ repo: f.repo, prompt: "Local evidence" });
+  store.putScreenshot(run.id, "screenshot-42-0.png", "local-only");
+  store.putArtifact(run.id, "notes.txt", "notes", "plain evidence");
+  const detail = store.getRunDetail(run.id);
+  if (!detail) throw new Error("No run detail");
+  const routes = createHttpRoutes(f.factory);
+  const page = await buildNeedsYouUi(join(dir, "page"));
+  const panel = await buildSetupUi(join(dir, "panel"), "ArtifactsPanel");
+  const requested: string[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: string | URL | Request) => {
+      const path = String(input);
+      requested.push(path);
+      if (path.includes("/artifacts/"))
+        return (routes["/api/runs/:id/artifacts/:name"] as Route)(
+          requestWithParams(`http://127.0.0.1${path}`, {}, { id: run.id, name: "notes.txt" }),
+          localServer,
+        );
+      const routeKey = path.endsWith("/screenshots") ? "/api/runs/:id/screenshots" : "/api/runs/:id";
+      if (path !== `/api/runs/${run.id}` && path !== `/api/runs/${run.id}/screenshots`)
+        throw new Error(`Unexpected request ${path}`);
+      return (routes[routeKey] as Route)(
+        requestWithParams(`http://127.0.0.1${path}`, {}, { id: run.id }),
+        localServer,
+      );
+    },
+    { preconnect() {} },
+  );
+  try {
+    page.mount(detail, true);
+    page.start();
+    await settle();
+    const html = renderToString(() => page.render());
+    expect(requested).toContain(`/api/runs/${run.id}/screenshots`);
+    expect(html).toContain("screenshot-42-0.png");
+    expect(html).toContain("notes.txt");
+    expect(store.listArtifacts(run.id)).toMatchObject([{ name: "notes.txt" }]);
+    const screenshots = (await (await globalThis.fetch(`/api/runs/${run.id}/screenshots`)).json()) as {
+      name: string;
+    }[];
+    panel.mount({
+      runId: run.id,
+      artifacts: [
+        ...screenshots.map(({ name }) => ({ name, kind: "screenshot", size: 0, createdAt: 0 })),
+        ...detail.artifacts,
+      ],
+    });
+    await settle();
+    expect(panel.render()).toContain(`<img src="/api/runs/${run.id}/screenshots/screenshot-42-0.png"`);
+    await panel.invoke(panel.render(), "button", "notes.txt");
+    await settle();
+    expect(panel.render()).toContain("plain evidence");
+    expect(requested).toContain(`/api/runs/${run.id}/artifacts/notes.txt`);
+    expect(requested.some((path) => path.includes("/artifacts/screenshot-"))).toBe(false);
+  } finally {
+    page.dispose();
+    panel.dispose();
+    globalThis.fetch = previous;
+    globalThis.EventSource = oldSource;
+    rmSync(dir, { recursive: true, force: true });
+    await f.close();
   }
 });

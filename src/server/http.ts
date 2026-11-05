@@ -725,8 +725,6 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       );
     }),
     "/api/runs/:id/artifacts/:name": handle((req) => {
-      const row = store.listArtifacts(req.params.id as string).find((a) => a.name === req.params.name);
-      if (row?.kind === "screenshot") return error("not found", 404);
       const content = store.getArtifact(req.params.id as string, req.params.name as string);
       return content === null
         ? error("not found", 404)
@@ -734,11 +732,10 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
             headers: { "content-type": "text/plain; charset=utf-8" },
           });
     }),
+    "/api/runs/:id/screenshots": handle((req) => json(store.listScreenshots(req.params.id as string)), true),
     "/api/runs/:id/screenshots/:name": handle((req) => {
       const { id, name } = req.params as { id: string; name: string };
-      const row = store.listArtifacts(id).find((a) => a.name === name && a.kind === "screenshot");
-      const bytes = Buffer.from((row && store.getArtifact(id, name)) || "", "base64");
-      // Collection stored only validated captures; anything else is never served as an image.
+      const bytes = Buffer.from(store.getScreenshot(id, name) ?? "", "base64");
       if (bytes.length > 5 * 1024 * 1024 || !isInertMedia("x.png", bytes)) return error("not found", 404);
       const headers = { "Content-Type": "image/png", "X-Content-Type-Options": "nosniff" };
       return new Response(bytes, { headers: { ...headers, "Cache-Control": "no-store" } });

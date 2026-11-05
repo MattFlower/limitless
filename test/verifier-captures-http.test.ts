@@ -19,10 +19,12 @@ test("screenshots serve exact validated bytes only to authenticated loopback; te
     cfg.publicOrigins = ["https://limitless.example.test"];
     const run = await f.factory.createRun({ repo: f.repo, prompt: "UI evidence" });
     const name = "screenshot-1-0.png";
-    store.putArtifact(run.id, name, "screenshot", png.toString("base64"));
+    const historical = await f.factory.createRun({ repo: f.repo, prompt: "Historical text" });
+    store.putArtifact(historical.id, "notes.txt", "notes", "unchanged text");
+    store.putScreenshot(run.id, name, png.toString("base64"));
     store.putArtifact(run.id, "report.md", "report", "# Redacted report\n");
     store.putArtifact(run.id, "verify-0.json", "verify", '{"overall":"pass"}');
-    store.putArtifact(run.id, "broken.png", "screenshot", png.subarray(0, 8).toString("base64"));
+    store.putScreenshot(run.id, "broken.png", png.subarray(0, 8).toString("base64"));
     const routes = createHttpRoutes(f.factory, { apiToken: "testtoken" });
     const get = (
       kind: "screenshots" | "artifacts",
@@ -40,6 +42,69 @@ test("screenshots serve exact validated bytes only to authenticated loopback; te
         server,
       );
     };
+    const listRoute = routes["/api/runs/:id/screenshots"] as Route;
+    const listing = await listRoute(
+      requestWithParams(
+        `http://127.0.0.1/api/runs/${run.id}/screenshots`,
+        { headers: { authorization: "Bearer testtoken" } },
+        { id: run.id },
+      ),
+      localServer,
+    );
+    expect(await listing.json()).toEqual([{ name: "broken.png" }, { name }]);
+    expect(
+      (
+        await listRoute(
+          requestWithParams(`http://127.0.0.1/api/runs/${run.id}/screenshots`, {}, { id: run.id }),
+          localServer,
+        )
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await listRoute(
+          requestWithParams(
+            `http://127.0.0.1/api/runs/${run.id}/screenshots`,
+            { headers: { authorization: "Bearer testtoken", "x-forwarded-for": "192.0.2.1" } },
+            { id: run.id },
+          ),
+          localServer,
+        )
+      ).status,
+    ).toBe(403);
+    const detailRoute = routes["/api/runs/:id"] as Route;
+    for (const id of [run.id, historical.id]) {
+      const response = await detailRoute(
+        requestWithParams(
+          `http://127.0.0.1/api/runs/${id}`,
+          { headers: { authorization: "Bearer testtoken" } },
+          { id },
+        ),
+        localServer,
+      );
+      expect(response.status).toBe(200);
+      const detail = await response.text();
+      expect(detail).not.toContain(name);
+      expect(detail).not.toContain("iVBORw0KGgo");
+    }
+    const oldText = await (routes["/api/runs/:id/artifacts/:name"] as Route)(
+      requestWithParams(
+        `http://127.0.0.1/api/runs/${historical.id}/artifacts/notes.txt`,
+        { headers: { authorization: "Bearer testtoken" } },
+        { id: historical.id, name: "notes.txt" },
+      ),
+      localServer,
+    );
+    expect(await oldText.text()).toBe("unchanged text");
+    const noScreenshot = await (routes["/api/runs/:id/screenshots/:name"] as Route)(
+      requestWithParams(
+        `http://127.0.0.1/api/runs/${historical.id}/screenshots/${name}`,
+        { headers: { authorization: "Bearer testtoken" } },
+        { id: historical.id, name },
+      ),
+      localServer,
+    );
+    expect(noScreenshot.status).toBe(404);
     const image = await get("screenshots");
     expect(image.status).toBe(200);
     expect(Buffer.from(await image.arrayBuffer())).toEqual(png);

@@ -262,7 +262,7 @@ test("run transfer exports and imports a run while omitting local screenshot row
     api = facade(f.s);
   const name = "screenshot-721-0.png",
     content = Buffer.from("local viewport pixels").toString("base64");
-  f.s.putArtifact(f.runId, name, "screenshot", content);
+  f.s.putScreenshot(f.runId, name, content);
   const exported = await api.exportRun(f.runId, repository, signal);
   for (const text of [
     exported.manifest,

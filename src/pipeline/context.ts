@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1045,7 +1045,6 @@ export class RunContext {
         }
         dispatched = true;
       };
-      // Browser verifier events stay held until their screenshot locators are known.
       const screenshots =
         opts.role === "verify" && this.previewUrl && !noTools ? screenshotPrivacy() : undefined;
       let result: AgentResult;
@@ -1089,6 +1088,7 @@ export class RunContext {
           // The private log sits in the shared temporary directory while a parallel implementer
           // runs as the same user, so it never holds the private text itself.
           redactOutput: opts.privateOutput ? withholdText : redact,
+          holdTranscript: screenshots?.holdTranscript,
           signal: callSignal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
@@ -1169,15 +1169,7 @@ export class RunContext {
                 ? (signal) => runAgentGate(this, spec.cwd, signal)
                 : undefined,
               screenshots &&
-                ((scratch) =>
-                  collectVerifierCaptures(
-                    scratch,
-                    store,
-                    this.run.id,
-                    invocation.id,
-                    spec.onEvent,
-                    screenshots,
-                  )),
+                collectVerifierCaptures(store, this.run.id, invocation.id, spec.onEvent, screenshots),
             );
           };
           result = await agentExecutor.run(
@@ -1230,6 +1222,11 @@ export class RunContext {
         };
       } finally {
         try {
+          if (screenshots)
+            appendFileSync(
+              join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
+              (opts.privateOutput ? withholdText : (redact ?? redactCredentials))(screenshots.drainLogs()),
+            );
           for (const ev of screenshots?.drain() ?? [])
             this.onAgentEvent(invocation.id, ev, opts.role, redact);
           if (!dispatched && revision.aborted && opts.role === "implement") {
