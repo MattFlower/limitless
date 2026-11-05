@@ -11,6 +11,7 @@ import {
   stripReportManifest,
 } from "../src/pipeline/report-privacy.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { provenResult } from "./privacy-support.ts";
 
 test.each(["terminal escapes", "registered credential"])(
   "report parts and clipped sources sanitize %s before computing spans and digest",
@@ -111,7 +112,7 @@ test("footer stripping preserves marker text quoted inside the report", () => {
   expect(body).toEndWith("## Checks\n");
 });
 
-test("published reports keep long public cells and summaries readable", () => {
+test("published reports keep long public cells and summaries readable", async () => {
   const criterion = `Public criterion ${"word ".repeat(80)}`;
   const evidence = `Command output\nsecond line ${"ok ".repeat(120)}`;
   const command = `public-command ${"argument ".repeat(50)}`;
@@ -126,7 +127,7 @@ test("published reports keep long public cells and summaries readable", () => {
           name: "test",
           verdict: "pass",
           blocking: false,
-          result: {
+          result: await provenResult({
             name: "test",
             ok: true,
             command,
@@ -134,7 +135,7 @@ test("published reports keep long public cells and summaries readable", () => {
             timedOut: false,
             output: "",
             durationMs: 1,
-          },
+          }),
         },
       ],
       spec: {
@@ -419,7 +420,7 @@ test.each(["``red *owl```", "`red *owl``", "``red *owl`"])(
   },
 );
 
-test("report summaries and cells normalize paths and credentials before clipping and preserve source mappings", () => {
+test("report summaries and cells normalize paths and credentials before clipping and preserve source mappings", async () => {
   const data = `/Users/${"synthetic-owner"}/.factory`;
   const work = `${data}/work/run`;
   const secret = "SYNTHETIC_REPORT_CUT_CREDENTIAL_582";
@@ -452,15 +453,15 @@ test("report summaries and cells normalize paths and credentials before clipping
             name: "test",
             verdict: "pass",
             blocking: false,
-            result: {
+            result: await provenResult({
               name: "test",
               ok: true,
-              command: crossing(300, work),
+              command: redactGateOutput(sanitizePublication(crossing(300, work), work, data)),
               exitCode: 0,
               timedOut: false,
               output: "",
               durationMs: 1,
-            },
+            }),
           },
         ],
       },

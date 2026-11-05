@@ -2,11 +2,12 @@ import { expect } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { Factory } from "../src/app.ts";
 import { Store } from "../src/db/store.ts";
 import type { GateConfig } from "../src/gates/detect.ts";
 import type { GateRunner } from "../src/gates/executor.ts";
-import { extractFailures } from "../src/gates/failures.ts";
+import { extractFailures, formatGateOutput } from "../src/gates/failures.ts";
 import {
   compareGates,
   type GateComparison,
@@ -27,6 +28,7 @@ import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { credentialGate, gateCredential } from "./gate-output-support.ts";
 import { localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { provenResult } from "./privacy-support.ts";
 import { providerFixture } from "./provider-config-support.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
@@ -133,7 +135,7 @@ test.each([
         requestWithParams(`http://localhost:7400/api/runs/${run.id}/events`, undefined, { id: run.id }),
         localServer,
       );
-      for (const text of [
+      for (const [index, text] of [
         factory.store.getArtifact(run.id, "gates.json"),
         await response.text(),
         await events.text(),
@@ -147,8 +149,10 @@ test.each([
           audit: [],
           implementerReport: "",
         }),
-      ]) {
-        expect(text).toContain(marker);
+      ].entries()) {
+        expect(text).toContain(
+          index >= 3 && result.output.length > 3000 ? "[output withheld: unchecked-rendering]" : marker,
+        );
         expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
         for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
           expect(text).not.toContain(fragment.slice(0, 12));
@@ -330,8 +334,10 @@ test("legacy gate results are redacted at checkpoints, HTTP and SSE reads withou
         runUrl: "https://example.com/run",
       }),
     ];
-    for (const message of messages) {
-      expect(message).toContain("[redacted]");
+    for (const [index, message] of messages.entries()) {
+      expect(message).toContain(
+        (index >= 4 && index <= 8) || index === 10 || index === 11 ? "[withheld: unproven]" : "[redacted]",
+      );
       expect(message).not.toContain(secret);
       expect(message).not.toContain(terminalSecret);
       expect(message).not.toContain(secret.slice(12));
@@ -362,7 +368,7 @@ test("gate feedback and review receive the checked tail without early excerpts",
     }),
   ];
   for (const message of messages) {
-    expect(message).toContain("[redacted]");
+    expect(message).toContain("[output withheld: unchecked-rendering]");
     expect(message).not.toContain("error: credential");
     expect(message).not.toContain("(fail) assertion");
     expect(message).not.toContain(gateCredential);
@@ -426,27 +432,50 @@ function comparison(output: string, failures?: string, timedOut = true): GateCom
   ];
 }
 
-function feedback(output: string, failures?: string, timedOut = true): string {
-  return formatGateFeedback(comparison(output, failures, timedOut));
+async function feedback(output: string, failures?: string, timedOut = true): Promise<string> {
+  const gates = comparison(output, failures, timedOut);
+  for (const gate of gates)
+    gate.result = await provenResult({
+      ...gate.result,
+      output: stripVTControlCharacters(gate.result.output),
+    });
+  return formatGateFeedback(gates);
 }
 
 test.each([false, true])(
-  "failure feedback puts bounded excerpts before a shorter tail (timeout: %s)",
-  (timedOut) => {
+  "failure feedback omits excerpts and withholds oversized output (timeout: %s)",
+  async (timedOut) => {
     const reason = "error: values differ\nExpected: 1\nReceived: 2\n(fail) assertion";
-    const message = feedback("summary\n".repeat(800), `${reason}\n${"x".repeat(8_000)}`, timedOut);
-    expect(message).toContain(reason);
-    expect(message.indexOf("error:")).toBeLessThan(message.indexOf("summary"));
-    expect(message).toContain("left out");
+    const message = await feedback("summary\n".repeat(800), `${reason}\n${"x".repeat(8_000)}`, timedOut);
+    expect(message).not.toContain(reason);
+    expect(message).not.toContain("summary");
+    expect(message).toContain("[output withheld: unchecked-rendering]");
     expect(message.length).toBeLessThan(3_300);
   },
 );
 
-test("legacy failed gate feedback still shows the tail", () => {
-  const message = feedback(`early\n${"x".repeat(4_000)}\nlegacy failure tail`, undefined, false);
-  expect(message).toContain("legacy failure tail");
+test("legacy failed gate feedback withholds its unchecked tail", () => {
+  const message = formatGateFeedback(
+    comparison(`early\n${"x".repeat(4_000)}\nlegacy failure tail`, undefined, false),
+  );
+  expect(message).toContain("[withheld: unproven]");
+  expect(message).not.toContain("legacy failure tail");
   expect(message).not.toContain("early");
   expect(message.length).toBeLessThan(3_300);
+});
+
+test.each([3000, 3001])("formatGateOutput guards renderings at %i UTF-16 units", async (units) => {
+  const output = "U".repeat(units);
+  const gate = await provenResult({
+    name: "test",
+    command: "test",
+    ok: false,
+    exitCode: 1,
+    durationMs: 1,
+    output,
+    failures: "private failure excerpt",
+  });
+  expect(formatGateOutput(gate)).toBe(units === 3000 ? output : "[output withheld: unchecked-rendering]");
 });
 
 test.each([
@@ -455,30 +484,30 @@ test.each([
   "ok 1 completed test\n",
   "ok 1\n",
   "ok 1 - completed test # SKIP unavailable\n",
-])("timeout feedback does not call a completed TAP subtest running: %s", (result) => {
-  expect(feedback(`[timed out]\n# Subtest: completed test\n${result}`)).not.toContain(
+])("timeout feedback does not call a completed TAP subtest running: %s", async (result) => {
+  expect(await feedback(`[timed out]\n# Subtest: completed test\n${result}`)).not.toContain(
     "the last test running was completed test",
   );
 });
 
 test.each(["", "ok 1 - other test\n", "  ok 1 - unfinished test\n"])(
   "timeout feedback names an unfinished TAP subtest: %s",
-  (result) => {
-    expect(feedback(`[timed out]\n# Subtest: unfinished test\n${result}`)).toContain(
+  async (result) => {
+    expect(await feedback(`[timed out]\n# Subtest: unfinished test\n${result}`)).toContain(
       "the last test running was unfinished test",
     );
   },
 );
 
-test("timeout feedback names the unfinished subtest after a completed one", () => {
+test("timeout feedback names the unfinished subtest after a completed one", async () => {
   expect(
-    feedback("# Subtest: completed test\nok 1 - completed test\n# Subtest: unfinished test\n"),
+    await feedback("# Subtest: completed test\nok 1 - completed test\n# Subtest: unfinished test\n"),
   ).toContain("the last test running was unfinished test");
 });
 
-test("timeout feedback recognizes indented TAP completion with ANSI and CRLF", () => {
+test("timeout feedback recognizes indented TAP completion with ANSI and CRLF", async () => {
   expect(
-    feedback("\u001b[32m  # Subtest: completed test\u001b[0m\r\n  ok 1 - completed test\r\n"),
+    await feedback("\u001b[32m  # Subtest: completed test\u001b[0m\r\n  ok 1 - completed test\r\n"),
   ).not.toContain("the last test running was completed test");
 });
 
@@ -487,9 +516,10 @@ for (const consumer of ["feedback", "review"]) {
     ["(fail) identifier", "(fail) identifier"],
     ["\u001b[31m✗ colored identifier\u001b[0m", "✗ colored identifier"],
     ["not ok 1 - tap identifier", "not ok 1 - tap identifier"],
-  ])(`${consumer} keeps the complete identity after a long diagnostic: %s`, (result, identity) => {
+  ])(`${consumer} withholds unchecked excerpts after a long diagnostic: %s`, async (result, identity) => {
     const failures = extractFailures(`error: reason\n${"x".repeat(9_000)}\n${result}`);
     const gates = comparison("summary\n".repeat(800), failures, false);
+    for (const gate of gates) gate.result = await provenResult(gate.result);
     const message =
       consumer === "feedback"
         ? formatGateFeedback(gates)
@@ -502,10 +532,10 @@ for (const consumer of ["feedback", "review"]) {
             audit: [],
             implementerReport: "",
           });
-    expect(message).toContain(identity);
-    expect(message).toContain("error: reason");
-    expect(message).toContain("left out");
-    expect(message.indexOf(identity)).toBeLessThan(message.indexOf("summary"));
+    expect(failures).toContain(identity);
+    expect(message).not.toContain(identity);
+    expect(message).not.toContain("error: reason");
+    expect(message).toContain("[output withheld: unchecked-rendering]");
     expect(message).not.toContain("\u001b");
     if (consumer === "feedback") expect(message.length).toBeLessThan(3_300);
   });
@@ -674,7 +704,7 @@ async function retryFixture() {
     protectedPaths: [],
     retryFiles: "bun test --isolate {files}",
   };
-  const original: GateResult = {
+  const original: GateResult = await provenResult({
     name: "test",
     command: "full-test",
     ok: false,
@@ -683,7 +713,7 @@ async function retryFixture() {
     durationMs: 10,
     failedFiles: ["test/a.test.ts", "test/b.test.ts"],
     failedFileTimes: { "test/a.test.ts": 1, "test/b.test.ts": 2 },
-  };
+  });
   return { cwd, sha, cfg, original, close: () => rmSync(cwd, { recursive: true, force: true }) };
 }
 
