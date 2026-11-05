@@ -21,7 +21,11 @@ import { browserMcp } from "../src/harness/browser-mcp.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import type { AgentEvent } from "../src/harness/types.ts";
-import { collectVerifierCaptures, forgetBrowserOutputs } from "../src/harness/verifier-captures.ts";
+import {
+  collectVerifierCaptures,
+  forgetBrowserOutputs,
+  screenshotPrivacy,
+} from "../src/harness/verifier-captures.ts";
 import { factoryBackend } from "../src/integrations/mcp.ts";
 import { getChange } from "../src/integrations/mcp-change.ts";
 import { RunContext } from "../src/pipeline/context.ts";
@@ -407,5 +411,29 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
     expect((await sh(["git", "status", "--porcelain"], { cwd: f.repo })).stdout).not.toContain(".png");
   } finally {
     await f.close();
+  }
+});
+
+test("held tool results sanitize JSON-escaped and nested serialized screenshot filenames", () => {
+  for (const filename of ['customer"private.png', "customer\nprivate.png"]) {
+    const privacy = screenshotPrivacy();
+    privacy.remember(filename);
+    const once = JSON.stringify({ path: filename });
+    const outputs = [once, JSON.stringify([{ type: "text", text: once }]), `saved: ${once}`];
+    for (const output of outputs)
+      privacy.hold({ type: "tool_result", id: "run-code", isError: false, output });
+    const drained = privacy.drain();
+    expect(drained).toHaveLength(3);
+    for (const event of drained) {
+      const serialized = JSON.stringify(event);
+      expect(serialized).toContain("[screenshot]");
+      for (const level of [
+        filename,
+        JSON.stringify(filename).slice(1, -1),
+        JSON.stringify(JSON.stringify(filename)),
+      ])
+        expect(serialized).not.toContain(level.replace(/^"|"$/g, ""));
+    }
+    expect(JSON.parse((drained[0] as { output: string }).output).path).not.toBe(filename);
   }
 });

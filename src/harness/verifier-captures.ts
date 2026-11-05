@@ -102,13 +102,21 @@ export function screenshotPrivacy() {
   const remember = (path: string, filename = true) => {
     for (const locator of [path, filename ? basename(path) : ""]) if (locator) locators.add(locator);
   };
-  const text = (value: string) =>
-    [...locators]
+  // Serialized tool results carry locators JSON-escaped, possibly nested: sanitize decoded strings too.
+  const escapes = (locator: string) =>
+    [1, 2, 3].reduce((all) => [...all, JSON.stringify(all.at(-1)).slice(1, -1)], [locator]);
+  const text = (value: string): string => {
+    try {
+      if (/^\s*[[{"]/.test(value)) return JSON.stringify(data(JSON.parse(value)));
+    } catch {}
+    return [...locators]
+      .flatMap(escapes)
       .sort((a, b) => b.length - a.length)
       .reduce(
         (safe, locator) => safe.replaceAll(locator, "[screenshot]"),
         value.replace(/iVBORw0KGgo[\w+/=]*|screenshot-\d+-\d+\.png|\/screenshots\/\S*/g, "[screenshot]"),
       );
+  };
   // Only enum literals keep their fields verbatim; locator-bearing covering tests are withheld, not rewritten.
   const literal =
     /^(type|code|status|overall|blockedReason|requirement|failureClass):(met|unmet|unclear|blocked|pass|fail|sandbox|environment|request|spec|not_required|ok|error|cancelled|timeout|stuck|quota|unavailable|declined|running|authentication|malformed|browser_unavailable|init|text|thinking|tool_call|tool_result|rate_limit|stderr|status|warning)$/;
