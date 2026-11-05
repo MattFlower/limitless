@@ -124,13 +124,27 @@ test("screenshots serve exact validated bytes only to authenticated loopback; te
         )
       ).status,
     ).toBe(403);
-    for (const headers of [{ "x-forwarded-for": "192.0.2.1" }, { "cf-connecting-ip": "192.0.2.1" }] as Record<
-      string,
-      string
-    >[])
+    for (const headers of [
+      { "x-forwarded-for": "192.0.2.1" },
+      { "cf-connecting-ip": "192.0.2.1" },
+      { forwarded: "for=192.0.2.1;proto=https" },
+    ] as Record<string, string>[]) {
       expect((await get("screenshots", name, { ...headers, authorization: "Bearer testtoken" })).status).toBe(
         403,
       );
+      expect(
+        (
+          await listRoute(
+            requestWithParams(
+              `http://127.0.0.1/api/runs/${run.id}/screenshots`,
+              { headers: { ...headers, authorization: "Bearer testtoken" } },
+              { id: run.id },
+            ),
+            localServer,
+          )
+        ).status,
+      ).toBe(403);
+    }
     for (const artifact of ["report.md", "verify-0.json", "broken.png", "missing.png"])
       expect((await get("screenshots", artifact)).status).toBe(404);
     const blocked = await get("artifacts");

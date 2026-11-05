@@ -217,7 +217,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       );
       if (
         access === "denied" ||
-        (localOnly && access !== "loopback") ||
+        (localOnly && (access !== "loopback" || req.headers.has("forwarded"))) ||
         (access === "tunnel" && !path.startsWith("/webhooks/")) ||
         (access !== "loopback" &&
           (path === "/mcp" || path === "/api/admin" || path.startsWith("/api/admin/"))) ||

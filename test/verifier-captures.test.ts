@@ -283,7 +283,7 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
       else appendFileSync(spec.logPath, transcript);
       spec.onEvent({ type: "text", text: "I will save the viewport to private capture.dat" });
       live.push(JSON.stringify(f.factory.store.listEvents(run.id)));
-      const evidence = `See private-customer-viewport.png, private capture.dat, ${output}, screenshot-1-0.png and /api/runs/${run.id}/screenshots/screenshot-1-0.png`;
+      const evidence = `See private-customer-viewport.png, [viewport](private%20capture.dat), private capture.dat, ${output}, screenshot-1-0.png and /api/runs/${run.id}/screenshots/screenshot-1-0.png`;
       return {
         text: evidence,
         structured: {
@@ -421,6 +421,7 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
         output,
         "private-customer-viewport.png",
         "private capture.dat",
+        "private%20capture.dat",
         "Correlated opaque image response",
       ])
         expect(text).not.toContain(forbidden);
@@ -431,10 +432,170 @@ test("coordinator lifecycle retains screenshots; reports, exports and later mode
   }
 });
 
+test("URL-encoded screenshot locators are sanitized in Markdown, nested JSON and transcripts", () => {
+  const privacy = screenshotPrivacy();
+  const filename = "customer report (1):#1.png";
+  const path = `/browser output/${filename}`;
+  privacy.hold({
+    type: "tool_call",
+    id: "shot",
+    name: "playwright.browser_take_screenshot",
+    input: { filename },
+  });
+  privacy.remember(path);
+  const locators = [filename, path].flatMap((value) => {
+    const encoded = encodeURIComponent(value).replace(/\(/g, "%28").replace(/\)/g, "%29");
+    return [
+      encodeURI(value),
+      encodeURIComponent(value),
+      encoded,
+      encoded.replace(/%29/g, ")"),
+      encoded.replace(/%[\da-f]{2}/gi, (token) => token.toLowerCase()),
+      encoded.replace(/%3A/g, "%3a"),
+      encoded.replace(/customer/g, "%63ustomer"),
+    ];
+  });
+  for (const locator of locators) {
+    const evidence = `[viewport](${locator})`;
+    expect(privacy.data({ evidence })).toEqual({ evidence: "[viewport]([screenshot])" });
+    expect(privacy.data({ notes: JSON.stringify({ evidence }) })).toEqual({
+      notes: JSON.stringify({ evidence: "[viewport]([screenshot])" }),
+    });
+    privacy.hold({ type: "text", text: evidence });
+    privacy.holdTranscript(evidence);
+  }
+  expect(
+    privacy
+      .drain()
+      .slice(1)
+      .every((event) => event.type === "text" && event.text === "[viewport]([screenshot])"),
+  ).toBe(true);
+  expect(privacy.drainLogs()).toBe("[viewport]([screenshot])\n".repeat(locators.length));
+  expect(privacy.data({ notes: "ordinary%20documentation.md" }).notes).toBe("ordinary%20documentation.md");
+  expect(privacy.data({ evidence: `[viewport](${locators[0]}) ordinary%20documentation.md` }).evidence).toBe(
+    "[viewport]([screenshot]) ordinary%20documentation.md",
+  );
+  expect(privacy.data({ evidence: "Customer%20report%20%281%29%3a%231.png" }).evidence).toBe(
+    "Customer%20report%20%281%29%3a%231.png",
+  );
+});
+
+test("Markdown-escaped screenshot destinations are sanitized in evidence, held events and transcripts", () => {
+  const privacy = screenshotPrivacy();
+  privacy.remember("customer(1).png");
+  privacy.remember("/browser output/customer report (1).png");
+  const destinations = [
+    String.raw`customer\(1\).png`,
+    String.raw`customer\(1\)\.png`,
+    String.raw`customer%20report%20\(1\).png`,
+    String.raw`\/browser%20output\/customer report \(1\).png`,
+  ];
+  for (const destination of destinations) {
+    const evidence = `[viewport](${destination})`;
+    expect(privacy.data({ evidence })).toEqual({ evidence: "[viewport]([screenshot])" });
+    expect(privacy.data({ notes: JSON.stringify({ evidence }) })).toEqual({
+      notes: JSON.stringify({ evidence: "[viewport]([screenshot])" }),
+    });
+    expect(privacy.data({ notes: `saved ${JSON.stringify({ evidence })}` }).notes).toBe(
+      `saved ${JSON.stringify({ evidence: "[viewport]([screenshot])" })}`,
+    );
+    privacy.hold({ type: "text", text: evidence });
+    privacy.holdTranscript(`[stderr] ${evidence}`);
+  }
+  expect(privacy.drain()).toEqual(
+    destinations.map(() => ({ type: "text", text: "[viewport]([screenshot])" })),
+  );
+  expect(privacy.drainLogs()).toBe("[stderr] [viewport]([screenshot])\n".repeat(destinations.length));
+  const unrelated = String.raw`[docs](guide\(1\).md) customer(2).png`;
+  expect(privacy.data({ evidence: unrelated }).evidence).toBe(unrelated);
+});
+
+test("character-referenced screenshot destinations are sanitized in evidence, held events and transcripts", () => {
+  const privacy = screenshotPrivacy();
+  privacy.remember("customer(1).png");
+  const destinations = [
+    "customer&#40;1&#41;.png",
+    "customer&#x28;1&#X29;&#46;png",
+    "customer&#0040;1&rpar;&period;png",
+    "&#99;ustomer&lpar;1%29.png",
+    String.raw`customer\(1&#41;\.png`,
+  ];
+  for (const destination of destinations) {
+    const evidence = `[viewport](${destination})`;
+    expect(privacy.data({ evidence })).toEqual({ evidence: "[viewport]([screenshot])" });
+    expect(privacy.data({ notes: `saved ${JSON.stringify({ evidence })}` }).notes).toBe(
+      `saved ${JSON.stringify({ evidence: "[viewport]([screenshot])" })}`,
+    );
+    privacy.hold({ type: "text", text: evidence });
+    privacy.holdTranscript(evidence);
+  }
+  expect(privacy.drain()).toEqual(
+    destinations.map(() => ({ type: "text", text: "[viewport]([screenshot])" })),
+  );
+  expect(privacy.drainLogs()).toBe("[viewport]([screenshot])\n".repeat(destinations.length));
+  for (const unrelated of ["customer&#40;2&#41;.png", "Customer&lpar;1&rpar;.png", "customer&unknown;1).png"])
+    expect(privacy.data({ evidence: `[docs](${unrelated}) &amp;` }).evidence).toBe(
+      `[docs](${unrelated}) &amp;`,
+    );
+});
+
+test("filenames containing literal escape syntax are sanitized in every spelling", () => {
+  const privacy = screenshotPrivacy();
+  privacy.remember("customer%20report.png");
+  privacy.remember("/out/a&#40;b.png");
+  const destinations = [
+    "customer%2520report.png",
+    "customer%20report.png",
+    "customer%25%32%30report.png",
+    "/out/a&amp;#40;b.png",
+    "/out/a%26%2340%3bb.png",
+    "a&#40;b.png",
+  ];
+  for (const destination of destinations) {
+    const evidence = `[viewport](${destination})`;
+    expect(privacy.data({ evidence })).toEqual({ evidence: "[viewport]([screenshot])" });
+    expect(privacy.data({ notes: `saved ${JSON.stringify({ evidence })}` }).notes).toBe(
+      `saved ${JSON.stringify({ evidence: "[viewport]([screenshot])" })}`,
+    );
+    privacy.hold({ type: "text", text: evidence });
+    privacy.holdTranscript(`[stderr] ${evidence}`);
+  }
+  expect(privacy.drain()).toEqual(
+    destinations.map(() => ({ type: "text", text: "[viewport]([screenshot])" })),
+  );
+  expect(privacy.drainLogs()).toBe("[stderr] [viewport]([screenshot])\n".repeat(destinations.length));
+  expect(privacy.data({ evidence: "customer%2521report.png" }).evidence).toBe("customer%2521report.png");
+});
+
+test("backslash-bearing screenshot filenames sanitize nonmatching backslash runs in bounded time", () => {
+  const slash = "\\";
+  const privacy = screenshotPrivacy();
+  privacy.remember(String.raw`customer\report.png`);
+  privacy.remember(`${slash.repeat(10)}X.png`);
+  const started = performance.now();
+  const runs = [
+    `customer${slash.repeat(80)}report.txt`,
+    `${slash.repeat(40)}Y.png`,
+    `${slash.repeat(5000)}Z ${"customer\\".repeat(2000)}`,
+  ];
+  for (const evidence of runs) {
+    expect(privacy.data({ evidence }).evidence).toBe(evidence);
+    privacy.holdTranscript(JSON.stringify({ evidence }));
+  }
+  expect(privacy.drainLogs()).toBe(runs.map((evidence) => `${JSON.stringify({ evidence })}\n`).join(""));
+  expect(performance.now() - started).toBeLessThan(1000);
+  for (const evidence of [String.raw`customer\report.png`, String.raw`customer\\report.png`])
+    expect(privacy.data({ evidence: `see ${evidence}` }).evidence).toBe("see [screenshot]");
+  expect(privacy.data({ notes: `saved ${JSON.stringify(`${slash.repeat(10)}X.png`)}` }).notes).toBe(
+    'saved "[screenshot]"',
+  );
+});
+
 test("held tool results sanitize JSON-escaped and nested serialized screenshot filenames", () => {
-  for (const filename of ['customer"private.png', "customer\nprivate.png"]) {
+  for (const filename of ['customer"private.png', "customer\nprivate.png", '["customer"]']) {
     const privacy = screenshotPrivacy();
     privacy.remember(filename);
+    expect(privacy.data({ evidence: filename }).evidence).toBe("[screenshot]");
     const once = JSON.stringify({ path: filename });
     const outputs = [once, JSON.stringify([{ type: "text", text: once }]), `saved: ${once}`];
     for (const output of outputs)
