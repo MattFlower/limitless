@@ -1,4 +1,5 @@
 import { expect, mock, spyOn } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as subprocess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -18,6 +19,7 @@ import {
   type ProcOptions,
   processBirthInspection,
   processBootInspection,
+  processDrainObserver,
   processInspection,
   processScope,
   recoveryProcessStopped,
@@ -37,7 +39,11 @@ type Chunk = { stream: "stdout" | "stderr"; text: string | Buffer };
 async function withChunks<T>(
   chunks: Chunk[] | ((token: string | undefined) => Chunk[]),
   run: () => Promise<T>,
-  finish: { beforeEnd?: (child: subprocess.ChildProcess) => void; code?: number; signal?: string } = {},
+  finish: {
+    beforeEnd?: (child: subprocess.ChildProcess) => void | Promise<void>;
+    code?: number;
+    signal?: string;
+  } = {},
 ): Promise<T> {
   const spawnFixture = (_bin: string, args?: readonly string[]) => {
     const stdout = new PassThrough();
@@ -49,17 +55,22 @@ async function withChunks<T>(
       stdin,
       stdio: [stdin, stdout, stderr],
     }) as unknown as subprocess.ChildProcess;
-    setImmediate(() => {
+    setImmediate(async () => {
+      let ended = 0;
+      const end = () => {
+        if (++ended === 2) setImmediate(() => child.emit("close", finish.code ?? 0, finish.signal ?? null));
+      };
+      stdout.once("end", end);
+      stderr.once("end", end);
       // The real sandbox wrapper prints this trusted startup token before its payload.
       const token = args?.[3];
       if (Array.isArray(chunks) && typeof token === "string" && token.startsWith("limitless-started-"))
         stdout.write(`${token}\n`);
       for (const chunk of typeof chunks === "function" ? chunks(token) : chunks)
         ({ stdout, stderr })[chunk.stream].write(chunk.text);
-      finish.beforeEnd?.(child);
+      await finish.beforeEnd?.(child);
       stdout.end();
       stderr.end();
-      setImmediate(() => child.emit("close", finish.code ?? 0, finish.signal ?? null));
     });
     return child;
   };
@@ -74,6 +85,241 @@ async function withChunks<T>(
 const options = (): ProcOptions => ({ cmd: ["fixture"], cwd: process.cwd(), env: {} });
 const captured = (opts?: Partial<ProcOptions>) =>
   runProcess({ ...options(), captureComplete: true, ...opts });
+
+type DrainEvent = Parameters<NonNullable<ReturnType<typeof processDrainObserver.getStore>>["observe"]>[0];
+const pieces = (text: string): Chunk[] =>
+  Array.from({ length: Math.ceil(text.length / 131072) }, (_, i) => ({
+    stream: "stdout",
+    text: text.slice(i * 131072, (i + 1) * 131072),
+  }));
+
+test.each(["long", "short"])("captured %s-line bursts yield within the shared budget", async (kind) => {
+  const text = kind === "long" ? "x".repeat(8 * 1024 * 1024) : `${"first\nsecond\n".repeat(436906)}last`;
+  const events: DrainEvent[] = [];
+  let sentinel = false;
+  let admittedAtSentinel = 0;
+  let admitted = 0;
+  let first = true;
+  const lines: string[] = [];
+  const result = await processDrainObserver.run(
+    {
+      budget: 32768,
+      observe: (e) => {
+        events.push(e);
+        admitted += e.admitted;
+      },
+    },
+    () =>
+      withChunks(pieces(text), () =>
+        captured({
+          tailLimit: 100,
+          maxLineLength: 65536,
+          onStdoutLine: (line) => lines.push(line),
+          onRawChunk: () => {
+            if (!first) return;
+            first = false;
+            setImmediate(() => {
+              sentinel = true;
+              admittedAtSentinel = admitted;
+            });
+          },
+        }),
+      ),
+  );
+  expect(sentinel).toBe(true);
+  expect(admittedAtSentinel).toBeLessThan(text.length);
+  expect(admitted).toBe(text.length);
+  expect(new Set(events.filter((e) => e.admitted).map((e) => e.turn)).size).toBeGreaterThan(1);
+  expect(lines).toEqual(kind === "long" ? [`${"x".repeat(65536)} [truncated]`] : text.split("\n"));
+  expect(result).toMatchObject({
+    stdout: text.slice(-100),
+    stderr: "",
+    truncated: true,
+    stdoutTruncated: true,
+    stderrTruncated: false,
+  });
+  expect(result.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
+});
+
+test("concurrent captures share a round-robin turn budget", async () => {
+  const events: DrainEvent[] = [];
+  const text = "entry\n".repeat(40000);
+  const results = await processDrainObserver.run({ budget: 32768, observe: (e) => events.push(e) }, () =>
+    withChunks(pieces(text), () => Promise.all([captured(), captured()])),
+  );
+  const admissions = events.filter((e) => e.admitted);
+  const turns = new Map<number, number>();
+  const progress = new Map<number, number>();
+  for (const e of admissions) {
+    turns.set(e.turn, (turns.get(e.turn) ?? 0) + e.admitted);
+    expect(e.total).toBe(turns.get(e.turn) ?? 0);
+    expect(e.total).toBeLessThanOrEqual(32768);
+    progress.set(e.process, (progress.get(e.process) ?? 0) + e.admitted);
+    if (progress.get(e.process) === text.length) expect(progress.size).toBe(2);
+  }
+  expect(new Set(admissions.slice(0, 2).map((e) => e.process)).size).toBe(2);
+  expect([...progress.values()]).toEqual([text.length, text.length]);
+  for (const result of results)
+    expect(result.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
+});
+
+test("capture backpressure bounds a real fast writer beyond the capture cap", async () => {
+  const events: DrainEvent[] = [];
+  let lines = 0;
+  const result = await processDrainObserver.run(
+    { budget: 32768, highWater: 65536, lowWater: 32768, observe: (e) => events.push(e) },
+    () =>
+      captured({
+        cmd: [process.execPath, "-e", 'process.stdout.write("x".repeat(32 * 1024 * 1024))'],
+        maxLineLength: 65536,
+        onStdoutLine: () => lines++,
+        timeoutMs: 15000,
+      }),
+  );
+  const peak = Math.max(...events.map((e) => e.queued));
+  const chunk = Math.max(...events.map((e) => e.received));
+  expect(peak).toBeLessThanOrEqual(65536 + chunk);
+  expect(events.some((e) => e.paused)).toBe(true);
+  expect(events.some((e, i) => i > 0 && events[i - 1]?.paused && !e.paused)).toBe(true);
+  expect(events.reduce((sum, e) => sum + e.admitted, 0)).toBe(32 * 1024 * 1024);
+  expect(lines).toBe(1);
+  expect(result).toMatchObject({ exitCode: 0, timedOut: false, stdout: "x".repeat(64000) });
+  expect(result.capture).toEqual({ provenance: { kind: "cut", truncated: true } });
+}, 20000);
+
+test("end and close flushes finish queued unterminated lines before resolution", async () => {
+  const lines: string[] = [];
+  let resolved = false;
+  const observe = (stream: string) => (line: string) => {
+    expect(resolved).toBe(false);
+    lines.push(`${stream}:${line}`);
+  };
+  const result = await processDrainObserver.run({ budget: 1, observe: () => {} }, () =>
+    withChunks(
+      [
+        { stream: "stdout", text: "one\nlast-out" },
+        { stream: "stderr", text: "two\nlast-err" },
+      ],
+      () => captured({ onStdoutLine: observe("out"), onStderrLine: observe("err") }),
+    ).then((result) => {
+      resolved = true;
+      return result;
+    }),
+  );
+  expect(lines).toEqual(["out:one", "err:two", "out:last-out", "err:last-err"]);
+  expect(result).toMatchObject({ stdout: "one\nlast-out", stderr: "two\nlast-err" });
+});
+
+test("spawn and stdin diagnostics follow previously queued stream data", async () => {
+  const lines: string[] = [];
+  const result = await processDrainObserver.run({ budget: 1, observe: () => {} }, () =>
+    withChunks(
+      [{ stream: "stderr", text: "before\n" }],
+      () =>
+        captured({
+          redactOutput: true,
+          onStderrLine: (line) => lines.push(line),
+        }),
+      {
+        beforeEnd: (child) => {
+          child.emit("error", new Error("spawn diagnostic"));
+          child.stdin?.emit("error", new Error("input diagnostic"));
+        },
+      },
+    ),
+  );
+  expect(lines).toEqual(["before", "[spawn error] spawn diagnostic", "[stdin error] input diagnostic"]);
+  expect(result.stderr).toBe("before\n\n[spawn error] spawn diagnostic\n[stdin error] input diagnostic");
+});
+
+test("a stream's EOF redaction flush stays ahead of later data on the other stream", async () => {
+  registerCredential("EOF_ORDER_TEST", "synthetic-eof-order-credential".padEnd(128, "q"));
+  const lines: string[] = [];
+  const result = await processDrainObserver.run({ budget: 16, observe: () => {} }, () =>
+    withChunks(
+      [{ stream: "stdout", text: "out\n" }],
+      () =>
+        captured({
+          redactOutput: true,
+          onStdoutLine: (line) => lines.push(line),
+          onStderrLine: (line) => lines.push(line),
+        }),
+      {
+        beforeEnd: async (child) => {
+          const stdout = child.stdout;
+          const stderr = child.stderr;
+          if (!(stdout instanceof PassThrough) || !(stderr instanceof PassThrough))
+            throw Error("missing fixture streams");
+          const ended = new Promise<void>((resolve) => stdout.once("end", resolve));
+          stdout.end();
+          await ended;
+          stderr.write(`err\n${"z".repeat(256)}\n`);
+        },
+      },
+    ),
+  );
+  expect(lines).toEqual(["out", "err", "z".repeat(256)]);
+  expect(result).toMatchObject({ stdout: "out\n", stderr: `err\n${"z".repeat(256)}\n` });
+});
+
+test("aborting mid-drain drops pending admission while another capture completes", async () => {
+  const controller = new AbortController();
+  const text = "line\n".repeat(50000);
+  let current: DrainEvent | undefined;
+  let cancelledId: number | undefined;
+  let admittedAfterAbort = 0;
+  const results = await processDrainObserver.run(
+    {
+      budget: 1024,
+      observe: (e) => {
+        if (e.process === cancelledId) admittedAfterAbort += e.admitted;
+        if (e.admitted) current = e;
+      },
+    },
+    () =>
+      withChunks(pieces(text), () =>
+        Promise.all([
+          captured({
+            signal: controller.signal,
+            onStdoutLine: () => {
+              if (controller.signal.aborted) return;
+              expect(current?.queued).toBeGreaterThan(0);
+              cancelledId = current?.process;
+              controller.abort();
+            },
+          }),
+          captured(),
+        ]),
+      ),
+  );
+  expect(cancelledId).toBeDefined();
+  expect(admittedAfterAbort).toBe(0);
+  expect(results[0]).toMatchObject({ cancelled: true, capture: { provenance: { kind: "legacy-unknown" } } });
+  expect(results[1]?.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
+});
+
+test("the shared drain restores each capture's async context instead of its waker's", async () => {
+  const store = new AsyncLocalStorage<string>();
+  const received: string[] = [];
+  const observed: string[] = [];
+  await processDrainObserver.run({ budget: 16, observe: () => {} }, () =>
+    withChunks([{ stream: "stdout", text: "first\nsecond\nlast" }], async () => {
+      const start = (name: string) =>
+        store.run(name, () =>
+          captured({
+            onRawChunk: () => received.push(name),
+            onStdoutLine: () => {
+              observed.push(name);
+              expect(store.getStore()).toBe(name);
+            },
+          }),
+        );
+      await Promise.all([start("waker"), start("other")]);
+    }),
+  );
+  expect(received).toEqual(["waker", "other"]);
+  expect(observed.filter((name) => name === "other")).toHaveLength(3);
+});
 
 test("complete capture preserves split UTF-8 and pre-redaction text on both streams", async () => {
   const secret = "synthetic-complete-capture-credential";
@@ -210,10 +456,13 @@ test("capture shares one UTF-16 cap and discards overflow while draining", async
     if (extra) chunks.push({ stream: "stderr", text: "!" }, { stream: "stdout", text: "after-overflow" });
     const run = () =>
       withChunks(chunks, () => captured({ tailLimit: 14, onRawChunk: () => observed.push(retained) }));
-    const result = await processCaptureObserver.run((units) => {
-      expect(units).toBeLessThanOrEqual(privacyLimits.inputUnits);
-      retained = units;
-    }, run);
+    const result = await processCaptureObserver.run(
+      (units) => {
+        expect(units).toBeLessThanOrEqual(privacyLimits.inputUnits);
+        retained = units;
+      },
+      () => processDrainObserver.run({ highWater: 16 * 1024 * 1024, observe: () => {} }, run),
+    );
     expect(observed).toEqual(
       extra ? [out.length, privacyLimits.inputUnits, 0, 0] : [out.length, privacyLimits.inputUnits],
     );
@@ -253,7 +502,8 @@ test.each(["stdout", "stderr", "spawn", "signal", "cancel", "invalid after overf
       signal: failure === "signal" ? "SIGTERM" : null,
     });
     expect(result.stderr).not.toContain("unpublished-stream-error");
-    expect(result.stdout).toStartWith("partial");
+    if (failure === "cancel") expect(result.stdout).toBe("");
+    else expect(result.stdout).toStartWith("partial");
   },
 );
 
@@ -277,6 +527,9 @@ test("legacy result shape and pre-dispatch encoding refusal", async () => {
   const dispatchGuard = mock(() => {});
   try {
     await expect(captured({ encoding: "latin1", dispatchGuard })).rejects.toThrow("requires UTF-8");
+    await expect(captured({ idleTimeoutMs: 1000, dispatchGuard })).rejects.toThrow(
+      "cannot use idleTimeoutMs",
+    );
     expect(spawn).not.toHaveBeenCalled();
     expect(dispatchGuard).not.toHaveBeenCalled();
   } finally {
@@ -406,6 +659,53 @@ test.each(["missing", "incomplete", "oversized prefix", "oversized suffix"])(
           ),
       ),
     ).rejects.toThrow("payload did not start");
+  },
+);
+
+test.each(["complete", "missing", "incomplete", "oversized suffix"])(
+  "captured startup confirmation survives discarded queues only for a %s token",
+  async (form) => {
+    const controller = new AbortController();
+    const started = mock(() => {});
+    const run = () =>
+      withChunks(
+        (token) => [
+          {
+            stream: "stdout",
+            text:
+              form === "complete"
+                ? `${token}\n`
+                : form === "missing"
+                  ? "candidate\n"
+                  : form === "incomplete"
+                    ? (token?.slice(0, -1) ?? "")
+                    : `${token}extra\n`,
+          },
+        ],
+        () =>
+          runSandboxed(
+            {
+              ...options(),
+              captureComplete: true,
+              redactOutput: true,
+              signal: controller.signal,
+              onStarted: started,
+            },
+            { write: [], protect: [] },
+            runProcess,
+            async () => {},
+            fakeConfinement,
+          ),
+        { beforeEnd: () => controller.abort() },
+      );
+    if (form === "complete") {
+      const result = await run();
+      expect(result).toMatchObject({ cancelled: true, stdout: "", cancelKilled: false });
+      expect(started).toHaveBeenCalledTimes(1);
+    } else {
+      await expect(run()).rejects.toThrow("payload did not start");
+      expect(started).not.toHaveBeenCalled();
+    }
   },
 );
 
@@ -1100,9 +1400,11 @@ for (const [idle, code] of [
     try {
       const cmd = [process.execPath, "-e", `process.exit(${code})`];
       const timeout = idle ? { idleTimeoutMs: 100_000 } : { timeoutMs: 100_000 };
-      const result = await captured({ cmd, ...timeout });
+      const result = await captured({ cmd, ...timeout, captureComplete: !idle });
       expect(result).toMatchObject({ exitCode: code, signal: null, timedOut: false, idleTimedOut: false });
-      expect(result.capture).toEqual({ provenance: { kind: "complete" }, stdout: "", stderr: "" });
+      expect(result.capture).toEqual(
+        idle ? undefined : { provenance: { kind: "complete" }, stdout: "", stderr: "" },
+      );
       if (!idle && code === 0) {
         await expect(sh(cmd, { cwd: process.cwd(), ...timeout })).resolves.toMatchObject({
           exitCode: 0,
@@ -1191,9 +1493,11 @@ for (const [idle, code] of [
       ];
       const timeout = idle ? { idleTimeoutMs: 100_000, idleNow: () => now } : { timeoutMs: 100_000 };
       const opts = { cwd: process.cwd(), ...timeout };
-      const result = await processInspection.run(inspect, () => captured({ cmd, ...opts }));
+      const result = await processInspection.run(inspect, () =>
+        captured({ cmd, ...opts, captureComplete: !idle }),
+      );
       expect(result).toMatchObject({ exitCode: code, signal: null, timedOut: !idle, idleTimedOut: idle });
-      expect(result.capture).toEqual({ provenance: { kind: "legacy-unknown" } });
+      expect(result.capture).toEqual(idle ? undefined : { provenance: { kind: "legacy-unknown" } });
       if (!idle && code === 0) {
         await expect(
           processInspection.run(inspect, () => sh(cmd, { ...opts, allowFail: true })),

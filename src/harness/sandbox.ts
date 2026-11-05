@@ -338,6 +338,7 @@ export async function runSandboxed(
   opts.signal?.throwIfAborted();
   const token = `limitless-started-${crypto.randomUUID()}`;
   let started = false;
+  let rawPrefix = "";
   const lineLimit = opts.maxLineLength ?? Infinity;
   const forwardLine = (line: string, onLine?: (line: string) => void) =>
     onLine?.(line.length > lineLimit ? `${line.slice(0, lineLimit)} [truncated]` : line);
@@ -348,6 +349,14 @@ export async function runSandboxed(
     onRawChunk: (chunk, stream) => {
       launch.observe(chunk, stream);
       opts.onRawChunk?.(chunk, stream);
+      // Cancellation can discard queued lines, including a token held by stream redaction.
+      if (opts.captureComplete && stream === "stdout" && rawPrefix.length < token.length + 1) {
+        rawPrefix += chunk.slice(0, token.length + 1 - rawPrefix.length);
+        if (rawPrefix === `${token}\n`) {
+          started = true;
+          opts.onStarted?.();
+        }
+      }
     },
     // The startup token must fit even when candidate output has a smaller cap.
     maxLineLength: Math.max(lineLimit, token.length),
@@ -362,6 +371,7 @@ export async function runSandboxed(
     ],
     onStdoutLine: (line) => {
       if (line === token) {
+        if (opts.captureComplete && started) return;
         started = true;
         opts.onStarted?.();
       } else forwardLine(line, opts.onStdoutLine);
