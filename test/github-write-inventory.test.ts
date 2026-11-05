@@ -645,6 +645,7 @@ src/land/queue.ts | LandQueue/merge | mergePullRequest | 1 | exempt | C17 | Land
 src/land/queue.ts | LandQueue/pushApproved | pushExistingBranch | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
 src/land/queue.ts | LandQueue/requestUnowned | runGh | 1 | exempt | C17 | Land queue publication and CI-rerun authority belongs to C17
 src/land/queue.ts | LandQueue/resolveBase | runGh | 1 | read |  | Base fetch or base-branch PR observation
+src/pipeline/shared-admission.ts | admitRun | cacheGit | 1 | exempt | C11 | Admission checks PR base and head commits in the local cache
 src/pipeline/acceptance-follow-ups.ts | fileFollowUps/api | runGh | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/engine.ts | deliver/deliverStage | createPullRequest | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/engine.ts | deliver/deliverStage | mergePullRequest | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
