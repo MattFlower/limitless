@@ -1,5 +1,6 @@
 /** Synthetic producer and consumer workloads; no owner configuration or external services. */
 import { existsSync, promises as fs } from "node:fs";
+import { loadavg } from "node:os";
 import { join } from "node:path";
 import {
   type API,
@@ -25,7 +26,7 @@ const field = (v: unknown, path: string): unknown =>
 export async function worker(root: string, name: string) {
   validate(Object.hasOwn(registry, name), "unknown workload");
   const paths =
-    "util/proc util/privacy-boundary util/privacy-checker util/privacy-chunks util/privacy-proof util/privacy-policy gates/text-privacy gates/output gates/run gates/junit gates/test-coverage harness/sandbox harness/read-policy pipeline/context pipeline/prompts pipeline/report server/http".split(
+    "util/proc util/privacy-boundary util/privacy-checker util/privacy-chunks util/privacy-proof util/privacy-policy gates/text-privacy gates/output gates/run gates/junit gates/test-coverage gates/slots harness/sandbox harness/read-policy pipeline/context pipeline/prompts pipeline/report server/http".split(
       " ",
     );
   const modules = await Promise.all(
@@ -112,7 +113,9 @@ export async function worker(root: string, name: string) {
       }),
     };
   }
-  return { pid: process.pid, name, unavailable, ...(await bench.measureWorker(root, undefined, operations)) };
+  const loadStart = loadavg();
+  const measured = await bench.measureWorker(root, undefined, operations);
+  return { pid: process.pid, name, unavailable, loadStart, loadEnd: loadavg(), ...measured };
 }
 export async function compare(refs: string[], names = defaultWorkloads, invoke = bench.launch) {
   const usage = "usage: bun scripts/benchmark-gate-output.ts <baseline-ref> <candidate-ref> [workloads]";
