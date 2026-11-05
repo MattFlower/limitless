@@ -299,7 +299,7 @@ async function executeRunOnce(
       // Guards can also interrupt a write in failure handling itself.
       const control = selectClaimControl([error]);
       if (!(control instanceof ClaimWaitError || control instanceof ClaimLostError)) throw error;
-      mapClaimInterruption(deps.store, runId, control);
+      mapClaimInterruption(deps.store, runId, control, undefined, checkpointer);
       return deps.store.getRun(runId)?.status ?? "failed";
     },
   );
@@ -451,7 +451,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   } catch (e) {
     const control = executionInterruption(ctx, e, signal);
     if (control) {
-      mapClaimInterruption(deps.store, runId, control);
+      mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
       return deps.store.getRun(runId)?.status ?? "failed";
     }
     const terminationError = processScope.getStore()?.terminationError;
@@ -619,7 +619,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       } catch (err) {
         const control = executionInterruption(ctx, err, signal);
         if (control) {
-          mapClaimInterruption(deps.store, runId, control);
+          mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
           return deps.store.getRun(runId)?.status ?? "failed";
         }
         if (err instanceof CancelledError || signal.aborted) return cancelled();
@@ -656,7 +656,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       } catch (err) {
         const control = executionInterruption(ctx, err, signal);
         if (control) {
-          mapClaimInterruption(deps.store, runId, control);
+          mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
           return deps.store.getRun(runId)?.status ?? "failed";
         }
         if (

@@ -27,6 +27,7 @@ import { authorityFor, claimHooks, publishTerminal } from "../src/pipeline/share
 import { createCheckpointCommitter, sharedCheckpointer } from "../src/pipeline/shared-checkpointer.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
+import { Scheduler } from "../src/scheduler.ts";
 import { LEASE } from "../src/util/claim-clock.ts";
 import { sh } from "../src/util/proc.ts";
 import { GitHub } from "./claim-github-fake.ts";
@@ -152,6 +153,9 @@ async function fixture() {
     blobs,
     claims,
     signal,
+    get now() {
+      return now;
+    },
     rt: await runtime(),
     get store() {
       return store;
@@ -227,9 +231,7 @@ test.each([
   ["engine cancellation", "cancelled"],
   ["failure", "failed"],
   ["human intervention", "needs_human"],
-  ["post-merge rejection", "needs_human"],
   ["recorded cancellation", "cancelled"],
-  ["scheduler internal error", "failed"],
 ] as const)("terminal deferral: %s", async (site, status) => {
   const f = await fixture();
   f.store.updateRun(f.run.id, {
@@ -445,12 +447,14 @@ test("lapse keeps terminal publication active", async () => {
     f.store.updateRun(f.run.id, { status });
     expect(hooks.active(binding.handle)).toBe(!TERMINAL_STATUSES.includes(status));
   }
-  f.store.updateRun(f.run.id, { status: "queued" });
-  for (const reason of ["checkpoint", "policy", "terminal", "lease", "unavailable"]) {
-    const state = initialRunState(f.run);
-    state.githubWait = { reason: `claim:${reason}`, since: 0, nextAttemptAt: 0 };
-    f.store.setRunState(f.run.id, state);
-    expect(hooks.active(binding.handle)).toBe(!["checkpoint", "policy"].includes(reason));
+  for (const status of ["queued", "running", "waiting_input"] as const) {
+    f.store.updateRun(f.run.id, { status });
+    for (const reason of ["checkpoint", "policy", "terminal", "lease", "unavailable"]) {
+      const state = initialRunState(f.run);
+      state.githubWait = { reason: `claim:${reason}`, since: 0, nextAttemptAt: 0 };
+      f.store.setRunState(f.run.id, state);
+      expect(hooks.active(binding.handle)).toBe(!["checkpoint", "policy"].includes(reason));
+    }
   }
 });
 
@@ -601,7 +605,6 @@ test("authority overlapping a publication lets the publisher reconcile a replace
     if (!overlapping) {
       f.defer("cancelled");
       overlapping = f.authority();
-      await Promise.race([overlapping, Bun.sleep(100)]);
     }
     return result;
   });
@@ -612,22 +615,209 @@ test("authority overlapping a publication lets the publisher reconcile a replace
   expect(await f.record()).toMatchObject({ state: "released", status: "cancelled" });
 });
 
-test("a replaced intent survives an overlapping authority when the publisher waits", async () => {
+test.each([false, true])("remote terminal overrides a replaced intent, overlapping=%s", async (overlap) => {
   const f = await fixture();
   await held(f);
   f.defer();
-  const update = f.rt.leases.update.bind(f.rt.leases);
-  let overlapping: Promise<unknown> | undefined;
-  spyOn(f.rt.leases, "update").mockImplementation(async (h, patch, opts) => {
-    const result = await update(h, patch, opts);
-    if (overlapping) return result;
-    f.defer("cancelled");
-    overlapping = f.authority();
-    return "wait";
+  const acquire = spyOn(f.rt.leases, "acquire"),
+    entered = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<"wait">(),
+    update = f.rt.leases.update.bind(f.rt.leases);
+  spyOn(f.rt.leases, "update").mockImplementationOnce(async (...args) => {
+    expect(await update(...args)).toBe("applied");
+    entered.resolve();
+    return resume.promise;
   });
-  expect(await f.publish()).toBe("wait");
-  expect(await overlapping).toBe("finished");
-  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "cancelled", error: "final reason" });
+  const publication = f.publish();
+  await entered.promise;
+  const tip = await f.record();
+  expect(tip.status).toBe("succeeded");
+  f.defer("cancelled");
+  f.expire();
+  let completed = false;
+  const authority = overlap
+    ? f.authority().then((result) => {
+        completed = true;
+        return result;
+      })
+    : undefined;
+  if (overlap) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(completed).toBe(false);
+    expectDeferred(f, "cancelled");
+  }
+  resume.resolve("wait");
+  expect(await publication).toBe("wait");
+  expect(await (authority ?? f.authority())).toBe("finished");
+  expect(f.store.getRun(f.run.id)).toMatchObject({
+    status: "succeeded",
+    error: "finished before restart",
+    finishedAt: f.now,
+  });
   expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(f.store.getRunState<RunState>(f.run.id)?.githubWait).toBeUndefined();
+  expect(f.store.listStages(f.run.id)).toHaveLength(0);
+  expect(acquire).not.toHaveBeenCalled();
+  expect(await f.record()).toEqual(tip);
+});
+
+test("authority re-reads a terminal tip changed by a publisher after settlement", async () => {
+  const f = await fixture(),
+    { binding } = await held(f),
+    acquire = spyOn(f.rt.leases, "acquire"),
+    initialRead = Promise.withResolvers<void>(),
+    resumeRead = Promise.withResolvers<void>(),
+    settled = Promise.withResolvers<void>(),
+    resumeSettlement = Promise.withResolvers<void>(),
+    published = Promise.withResolvers<void>(),
+    resumePublication = Promise.withResolvers<"wait">();
+  const read = f.claims.read.bind(f.claims);
+  spyOn(f.claims, "read").mockImplementationOnce(async (...args) => {
+    const result = await read(...args);
+    initialRead.resolve();
+    await resumeRead.promise;
+    return result;
+  });
+  const coordinate = f.store.coordinateCheckpoint.bind(f.store);
+  spyOn(f.store, "coordinateCheckpoint").mockImplementationOnce(async (runId, fn) => {
+    const result = await coordinate(runId, fn);
+    settled.resolve();
+    await resumeSettlement.promise;
+    return result;
+  });
+  const authority = f.authority();
+  await initialRead.promise;
+  expect(await f.rt.leases.update(binding.handle, { status: "succeeded" })).toBe("applied");
+  f.defer("cancelled");
+  resumeRead.resolve();
+  await settled.promise;
+  const update = f.rt.leases.update.bind(f.rt.leases);
+  spyOn(f.rt.leases, "update").mockImplementationOnce(async (...args) => {
+    expect(await update(...args)).toBe("applied");
+    published.resolve();
+    return resumePublication.promise;
+  });
+  const publication = f.publish();
+  await published.promise;
+  const tip = await f.record();
+  expect(tip.status).toBe("cancelled");
+  expect(tip.checkpoint).not.toBe(f.store.checkpointRecord(f.run.id)?.committed?.pointer);
+  f.defer("failed");
+  f.expire();
+  resumeSettlement.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expectDeferred(f, "failed");
+  resumePublication.resolve("wait");
+  expect(await publication).toBe("wait");
+  expect(await authority).toBe("finished");
+  expect(f.store.getRun(f.run.id)).toMatchObject({
+    status: "cancelled",
+    error: "finished before restart",
+    finishedAt: f.now,
+  });
+  expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(f.store.getRunState<RunState>(f.run.id)?.githubWait).toBeUndefined();
+  expect(f.store.listStages(f.run.id)).toHaveLength(0);
+  expect(acquire).not.toHaveBeenCalled();
+  expect(await f.record()).toEqual(tip);
+});
+
+test("recorded cancellation during capability admission defers before terminal publication", async () => {
+  const f = await fixture(),
+    authority = await held(f),
+    entered = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  const state = f.store.getRunState<RunState>(f.run.id) ?? initialRunState(f.run);
+  state.feedback = "durable execution evidence";
+  f.store.setRunState(f.run.id, state);
+  spyOn(f.rt.gate, "canContinue").mockImplementationOnce(async () => {
+    entered.resolve();
+    await resume.promise;
+    return [];
+  });
+  const execution = executeRun({ ...f.engineDeps(), runClaim: authority }, f.run.id, f.signal);
+  await entered.promise;
+  f.store.updateRun(f.run.id, { error: "cancelled by user" });
+  resume.resolve();
+  expect(await execution).toBe("queued");
+  expectDeferred(f, "cancelled");
+  expect(f.store.getRun(f.run.id)?.error).toBe("cancelled by user");
+  expect(f.store.getRunState<RunState>(f.run.id)?.feedback).toBe(state.feedback);
+  expect(JSON.parse(f.store.checkpointRecord(f.run.id)?.terminal ?? "null").error).toBe("cancelled by user");
+  expect(await f.record()).toMatchObject({ state: "held", status: "queued" });
+  failUpdate(f);
+  expect(await f.publish()).toBe("wait");
+  expectDeferred(f, "cancelled");
+  f.gh.fault = undefined;
+  expect(await f.record()).toMatchObject({ state: "held", status: "queued" });
+  expect(await f.publish()).toBe("done");
+  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "cancelled", error: "cancelled by user" });
   expect(await f.record()).toMatchObject({ state: "released", status: "cancelled" });
+});
+
+test("scheduler catch defers an unexpected execution rejection", async () => {
+  const f = await fixture(),
+    authority = await held(f),
+    caught = Promise.withResolvers<void>();
+  spyOn(f.rt.gate, "canContinue").mockRejectedValue(new ClaimWaitError("capability"));
+  spyOn(f.rt.gate, "forget").mockImplementation(() => {
+    throw new Error("execution cleanup failed");
+  });
+  const scheduler = new Scheduler({ ...f.engineDeps(), runClaim: authority }, 1, { loadSource: () => 0 });
+  const unsubscribe = f.store.subscribe((message) => {
+    if (message.kind !== "run") return;
+    const intent = f.store.checkpointRecord(f.run.id)?.terminal;
+    if (f.store.getRun(f.run.id)?.status === "failed" || (intent && JSON.parse(intent).status === "failed")) {
+      scheduler.setLimit(0);
+      caught.resolve();
+    }
+  });
+  try {
+    scheduler.tick();
+    await caught.promise;
+    await scheduler.stop();
+    expectDeferred(f, "failed");
+    expect(JSON.parse(f.store.checkpointRecord(f.run.id)?.terminal ?? "null").error).toBe(
+      "internal error: execution cleanup failed",
+    );
+    expect(await f.record()).toMatchObject({ state: "held", status: "queued" });
+    expect(await f.publish()).toBe("done");
+    expect(f.store.getRun(f.run.id)).toMatchObject({
+      status: "failed",
+      error: "internal error: execution cleanup failed",
+    });
+    expect(await f.record()).toMatchObject({ state: "released", status: "failed" });
+  } finally {
+    unsubscribe();
+    await scheduler.stop();
+  }
+});
+
+test("resumed post-merge rejection finalization defers until publication", async () => {
+  const f = await fixture(),
+    authority = await held(f),
+    cwd = cachePath(f.cfg.paths, f.repo),
+    { value: sha } = await seed(cwd),
+    reason = "post-merge gates regressed";
+  const state = f.store.getRunState<RunState>(f.run.id) ?? initialRunState(f.run);
+  Object.assign(state, {
+    phase: "deliver",
+    worktreePath: cwd,
+    gatesConfig: { setup: [], checks: [], source: "none", protectedPaths: [] },
+    previewConfig: null,
+    slottedCommands: [],
+    agentFullSuite: "slot",
+    deliveryComplete: true,
+    postMergeRejection: { reason, sha, base: sha, head: sha, round: 1 },
+  });
+  pinPolicy(f.store, f.run.id, state, { kind: "prepared", trustedBase: sha });
+  expect(await executeRun({ ...f.engineDeps(), runClaim: authority }, f.run.id, f.signal)).toBe("queued");
+  expectDeferred(f, "needs_human");
+  expect(JSON.parse(f.store.checkpointRecord(f.run.id)?.terminal ?? "null").error).toBe(reason);
+  expect(f.store.getRun(f.run.id)?.headSha).toBe(sha);
+  expect(f.store.getRunState<RunState>(f.run.id)?.postMergeRejection).toEqual(state.postMergeRejection);
+  expect(await f.record()).toMatchObject({ state: "held", status: "queued" });
+  expect(await f.publish()).toBe("done");
+  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "needs_human", error: reason });
+  expect(await f.record()).toMatchObject({ state: "released", status: "needs_human" });
 });
