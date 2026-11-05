@@ -78,7 +78,7 @@ type Project = (record: Field | undefined, key: "output" | "identities") => Fiel
 const flag = (v: unknown) => (typeof v === "boolean" ? v : undefined);
 const kinds = new Set<unknown>(["complete", "rendering", "attested:lan", "attested:github-actions"]);
 const coverageIds = new Set(["passedFiles", "skippedFiles", "skippedTests"]);
-/** Each covered identity string and key must survive redaction alone; failedFileTimes values must be numbers. */
+/** Each covered identity string and key must survive redaction alone; failedFileTimes values must be finite numbers. */
 const unchanged = (v: unknown): boolean =>
   typeof v === "string"
     ? redactGateOutput(v) === v
@@ -86,7 +86,7 @@ const unchanged = (v: unknown): boolean =>
       typeof v !== "object" ||
       Object.entries(v).every(([k, x]) => (Array.isArray(v) || unchanged(k)) && unchanged(x));
 const identityState = (r: GateResult, bytes: string) =>
-  bytes === "identity-cap" || !Object.values(r.failedFileTimes ?? {}).every((t) => typeof t === "number")
+  bytes === "identity-cap" || !Object.values(r.failedFileTimes ?? {}).every((t) => Number.isFinite(t))
     ? "unproven"
     : unchanged(JSON.parse(bytes))
       ? "clean"

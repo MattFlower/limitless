@@ -41,8 +41,9 @@ export async function worker(root: string, name: string) {
   const strings = fixture.entries.map((e) => e.value).join("\n");
   await fs.writeFile(join(env.LIMITLESS_CONFIG_DIR, "private-strings.txt"), strings);
   await fs.writeFile(join(env.LIMITLESS_CONFIG_DIR, "privacy-proof.key"), key, { mode: 0o600 });
-  (a.privacyRegistry as Checker["registry"]).replacePolicy(fixture.entries);
-  fixture.credentials.forEach((s, i) => void (a.registerCredential as Fn)(`BENCHMARK_${i}`, s));
+  // Older baselines may predate the privacy registry or credential exports.
+  (a.privacyRegistry as Checker["registry"] | undefined)?.replacePolicy(fixture.entries);
+  fixture.credentials.forEach((s, i) => void (a.registerCredential as Fn | undefined)?.(`BENCHMARK_${i}`, s));
   let checker: Checker;
   const jobs = await registry[name]?.({ a, cwd, env, checker: () => checker, key });
   const operations: Record<string, bench.ProducerOperation> = {},

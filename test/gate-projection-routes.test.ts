@@ -712,3 +712,15 @@ test("unsigned withheld reasons outside the fixed vocabulary render as unproven"
     });
   }
 });
+
+test.each([Infinity, -Infinity, NaN])(
+  "non-finite failedFileTimes (%p) withhold identities idempotently",
+  async (t) => {
+    const r = await provenResult({ ...result("safe"), failedFileTimes: { "safe.test.ts": 1 } });
+    Reflect.set(r.failedFileTimes ?? {}, "safe.test.ts", t);
+    const once = project(r, { mode: "durable" });
+    expect(once.command).toBe(withheldText("unproven"));
+    expect(once.textPrivacy?.identities).toEqual({ withheld: true, reason: "unproven" });
+    expect(JSON.stringify(project(once, { mode: "durable" }))).toBe(JSON.stringify(once));
+  },
+);
