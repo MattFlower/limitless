@@ -14,7 +14,7 @@ import { admitRun, type SharedRuntime } from "./shared-admission.ts";
 
 // Loss routes to the execution binding (keyed by run id) and to an in-flight publication binding.
 const routes = new WeakMap<SharedRuntime, Map<string, ScopedClaim>>();
-const tails = new WeakMap<SharedRuntime, Map<string, Promise<"done" | "wait">>>();
+const tails = new WeakMap<SharedRuntime, Map<string, Promise<unknown>>>();
 const of = <V>(m: WeakMap<SharedRuntime, Map<string, V>>, rt: SharedRuntime) =>
   m.get(rt) ?? (m.set(rt, new Map()).get(rt) as Map<string, V>);
 type Terminal = Pick<Run, "status" | "error" | "finishedAt">;
@@ -107,15 +107,20 @@ async function publish(rt: SharedRuntime, store: Store, runId: string): Promise<
   }
 }
 
-/** Publish a deferred terminal status on the claim, then finish locally and release; one at a time per run. */
-export function publishTerminal(rt: SharedRuntime, store: Store, runId: string): Promise<"done" | "wait"> {
+// Terminal publication and authority's terminal completion run one at a time per run.
+function serial<T>(rt: SharedRuntime, runId: string, fn: () => Promise<T>): Promise<T> {
   const queue = of(tails, rt);
-  const work: Promise<"done" | "wait"> = (queue.get(runId) ?? Promise.resolve())
+  const work: Promise<T> = (queue.get(runId) ?? Promise.resolve())
     .catch(() => {})
-    .then(() => publish(rt, store, runId))
+    .then(fn)
     .finally(() => queue.get(runId) === work && queue.delete(runId));
   queue.set(runId, work);
   return work;
+}
+
+/** Publish a deferred terminal status on the claim, then finish locally and release. */
+export function publishTerminal(rt: SharedRuntime, store: Store, runId: string): Promise<"done" | "wait"> {
+  return serial(rt, runId, () => publish(rt, store, runId));
 }
 
 export async function authorityFor(
@@ -127,20 +132,26 @@ export async function authorityFor(
 ): Promise<RunClaim | "finished"> {
   const { ref, handle: held, lost } = lease(rt, store, run);
   if (lost) throw new ClaimLostError();
-  const read = await rt.claims.read(run.repoSlug, ref, signal);
-  if (read.kind === "unconfirmed") throw new ClaimWaitError("unavailable");
   // D2 restart and D8: a terminal status on the claim finishes the run from the tip; it is never reacquired.
-  const finishRemote = async (status: Run["status"], h?: LeaseHandle) => {
-    const json = store.checkpointRecord(run.id)?.terminal;
-    let patch: Terminal | null = json ? JSON.parse(json) : null;
-    if (patch?.status !== status)
-      patch = { status, error: "finished before restart", finishedAt: rt.clock.now() };
-    finish(store, run.id, patch);
-    if (h) await rt.leases.release(h, {});
-    return "finished" as const;
+  // It waits behind any active publication, which reconciles a replaced intent before the tip can win.
+  const finishRemote = (tip: () => Promise<ClaimTip | null>, yieldToIntent: boolean) =>
+    serial(rt, run.id, async () => {
+      const status = remoteTerminal(run, await tip()),
+        json = store.checkpointRecord(run.id)?.terminal;
+      if (!status || (yieldToIntent && json)) return null;
+      let patch: Terminal | null = json ? JSON.parse(json) : null;
+      if (patch?.status !== status)
+        patch = { status, error: "finished before restart", finishedAt: rt.clock.now() };
+      const { handle } = lease(rt, store, run);
+      if (finish(store, run.id, patch) && handle) await rt.leases.release(handle, {});
+      return "finished" as const;
+    });
+  const read = async () => {
+    const r = await rt.claims.read(run.repoSlug, ref, signal);
+    if (r.kind === "unconfirmed") throw new ClaimWaitError("unavailable");
+    return r.kind === "tip" ? r.tip : null;
   };
-  const remote = remoteTerminal(run, read.kind === "tip" ? read.tip : null);
-  if (remote) return finishRemote(remote, held);
+  if (await finishRemote(read, false)) return "finished";
   let handle = held;
   if (!handle || !store.checkpointRecord(run.id)?.indexed)
     handle = await admitRun(rt, store, cfg, run, signal);
@@ -148,8 +159,7 @@ export async function authorityFor(
     const { settlement, tip } = await settleCheckpoint({ ...rt, store }, handle, signal);
     if (settlement === "wait") throw new ClaimWaitError("lease");
     if (settlement === "blocked") throw new ClaimWaitError("checkpoint");
-    const status = remoteTerminal(run, tip);
-    if (status && !store.checkpointRecord(run.id)?.terminal) return finishRemote(status, handle);
+    if (await finishRemote(async () => tip, true)) return "finished";
   }
   // A deferred terminal decision is published before any execution authority is granted.
   if (store.checkpointRecord(run.id)?.terminal) {

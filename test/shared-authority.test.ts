@@ -583,3 +583,25 @@ test("a terminal intent replaced during publication is published, not erased", a
   expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
   expect(await f.record()).toMatchObject({ state: "released", status: "cancelled" });
 });
+
+test("authority overlapping a publication lets the publisher reconcile a replaced intent", async () => {
+  const f = await fixture();
+  await held(f);
+  f.defer();
+  const update = f.rt.leases.update.bind(f.rt.leases);
+  let overlapping: Promise<unknown> | undefined;
+  spyOn(f.rt.leases, "update").mockImplementation(async (h, patch, opts) => {
+    const result = await update(h, patch, opts);
+    if (!overlapping) {
+      f.defer("cancelled");
+      overlapping = f.authority();
+      await Promise.race([overlapping, Bun.sleep(100)]);
+    }
+    return result;
+  });
+  expect(await f.publish()).toBe("done");
+  expect(await overlapping).toBe("finished");
+  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "cancelled", error: "final reason" });
+  expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(await f.record()).toMatchObject({ state: "released", status: "cancelled" });
+});
