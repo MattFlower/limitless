@@ -60,7 +60,7 @@ import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
 import { resolveTestWorkers } from "../src/util/test-workers.ts";
 import { fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
-import { truncationEncodings } from "./privacy-support.ts";
+import { provenResult, truncationEncodings } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
 
@@ -690,7 +690,7 @@ describe("runGates / compareGates", () => {
 
   test.each(["flag", "output", "firstAttempt", "targetedRetry"] as const)(
     "baseline confinement failure makes only its check unusable (%s)",
-    (kind) => {
+    async (kind) => {
       const passed = { ...r("test", true), confinementError: false };
       const confinement = {
         ...r("test", false),
@@ -718,7 +718,11 @@ describe("runGates / compareGates", () => {
       expect(cmp[0]?.result).toBe(passed);
       expect(formatGateFeedback(cmp)).toBe("");
       for (const timedOut of [false, true]) {
-        const failed = { ...r("test", false), output: "candidate assertion failed", timedOut };
+        const failed = await provenResult({
+          ...r("test", false),
+          output: "candidate assertion failed",
+          timedOut,
+        });
         const cmp = compare(failed);
         expect(cmp[0]).toMatchObject({ verdict: "new_failure", blocking: true });
         expect(cmp[0]?.result).toBe(failed);
@@ -913,19 +917,30 @@ test("second assertion", () => { expect({ value: "received-two" }).toEqual({ val
     },
   );
 
-  test.each([3_000, 9_000])("shortening to %i keeps every identity and the timeout explanation", (limit) => {
-    const timeout = "  ^ this test timed out after 25ms.";
-    const failures = extractFailures(
-      `error: first\n(fail) first\nerror: reason\n${"x".repeat(9_000)}\n✗ second\n${timeout}`,
-    );
-    const output = formatGateOutput({ output: "summary\n".repeat(800), failures }, limit);
-    expect(output).toContain("(fail) first");
-    expect(output).toContain(`✗ second\n${timeout}`);
-    expect(output.indexOf("(fail) first")).toBeLessThan(output.indexOf("✗ second"));
-    expect(output.indexOf("✗ second")).toBeLessThan(output.indexOf("summary"));
-    expect(output).toContain("left out");
-    expect(output.length).toBeLessThanOrEqual(limit);
-  });
+  test.each([3_000, 9_000])(
+    "formatting omits excerpts and guards the complete output at %i",
+    async (limit) => {
+      const timeout = "  ^ this test timed out after 25ms.";
+      const failures = extractFailures(
+        `error: first\n(fail) first\nerror: reason\n${"x".repeat(9_000)}\n✗ second\n${timeout}`,
+      );
+      expect(failures).toContain(`✗ second\n${timeout}`);
+      const text = "summary\n".repeat(800);
+      const result = await provenResult({
+        name: "test",
+        command: "test",
+        ok: false,
+        exitCode: 1,
+        durationMs: 1,
+        output: text,
+        failures,
+      });
+      const output = formatGateOutput(result, limit);
+      expect(output).toBe(text.length <= limit ? text : "[output withheld: unchecked-rendering]");
+      expect(output).not.toContain("(fail) first");
+      expect(output.length).toBeLessThanOrEqual(limit);
+    },
+  );
 });
 
 describe("gate slots and flaky retry", () => {

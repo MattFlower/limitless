@@ -1,6 +1,9 @@
+import { getPrivacyChecker } from "../util/privacy-checker.ts";
+import { verifier } from "../util/privacy-proof.ts";
 import { activity } from "../util/stall.ts";
 import { terminalRedactor } from "../util/terminal-redaction.ts";
 import type { GateComparison, GateResult } from "./run.ts";
+import { attributionReason, gateIdentities, gatePrivacyScope, withheldText } from "./text-privacy.ts";
 
 /** Describe limited test evidence consistently in reports and model prompts. */
 export function docsGateSummary(check: GateComparison): string | undefined {
@@ -58,11 +61,163 @@ export function findGateCounterpart<T extends { name: string }>(
 
 /** Sanitize decoded historical data without changing rows; preserve the raw confinement verdict. */
 export const redactGateData = <T>(value: T): T => activity("gates.redact", () => redactData(value));
-const redactData = <T>(value: T): T =>
+type V = Parameters<typeof verifier>;
+type ProjectionOptions = {
+  mode: "durable" | "outward";
+  registry?: V[0];
+  signer?: V[1];
+  maxEventData?: number;
+};
+const isText = (v: object, key: string) => typeof Reflect.get(v, key) === "string";
+const isResult = (v: unknown): v is GateResult =>
+  !!v && typeof v === "object" && "ok" in v && isText(v, "command") && isText(v, "output");
+const identityKeys = ["command", "executedCommand", "failedFiles", "failedFileTimes"];
+const identities = new Set([...identityKeys, "testCoverage", "coveringTest", "coveringTests"]);
+type Field = NonNullable<GateResult["textPrivacy"]>["output"];
+type Project = (record: Field | undefined, key: "output" | "identities") => Field;
+const kinds = new Set<unknown>(["complete", "rendering", "attested:lan", "attested:github-actions"]);
+const coverageIds = new Set(["passedFiles", "skippedFiles", "skippedTests"]);
+/** Each covered identity string and key must survive redaction alone; failedFileTimes values must be finite numbers. */
+const unchanged = (v: unknown): boolean =>
+  typeof v === "string"
+    ? redactGateOutput(v) === v
+    : !v ||
+      typeof v !== "object" ||
+      Object.entries(v).every(([k, x]) => (Array.isArray(v) || unchanged(k)) && unchanged(x));
+const identityState = (r: GateResult, bytes: string) =>
+  bytes === "identity-cap" || !Object.values(r.failedFileTimes ?? {}).every((t) => Number.isFinite(t))
+    ? "unproven"
+    : identityKeys.every((key) => unchanged(Reflect.get(r, key))) &&
+        unchanged([r.coveringTest, r.coveringTests]) &&
+        [...coverageIds].every((key) => unchanged(Reflect.get(r.testCoverage ?? {}, key)))
+      ? "clean"
+      : "credential-changed";
+/** Rebuild a record from validated proof metadata only; nothing else is carried through. */
+const canonical = ({ withheld, truncated, checkedComplete, reason, kind, mac }: Field, outward: boolean) => ({
+  withheld: withheld === true,
+  ...(typeof truncated === "boolean" && { truncated }),
+  ...(typeof checkedComplete === "boolean" && { checkedComplete }),
+  ...(withheld === true && { reason: withheldText(reason).slice(11, -1) }),
+  ...(kinds.has(kind) && { kind }),
+  ...(withheld !== true && !outward && /^[a-f0-9]{64}$/.test(String(mac)) && { mac }),
+});
+function projectResult(r: GateResult, project: Project, outward = false): GateResult {
+  const field: Project = (record, key) => canonical(project(record, key), outward);
+  const output = field(r.textPrivacy?.output, "output"),
+    ids = field(r.textPrivacy?.identities, "identities");
+  const out = {
+    ...r,
+    output: output.withheld
+      ? withheldText(output.reason, r.output === withheldText(output.reason, true))
+      : r.output,
+    confinementError: r.confinementError ?? launchFailure(r.output),
+    textPrivacy: { output, identities: ids },
+  };
+  delete out.failures;
+  delete out.remoteAttestation;
+  if (out.failureAttributionReason !== undefined)
+    out.failureAttributionReason = attributionReason(out.failureAttributionReason);
+  if (ids.withheld) {
+    for (const key of identities) Reflect.deleteProperty(out, key);
+    out.command = withheldText(ids.reason);
+    if (r.testCoverage)
+      out.testCoverage = {
+        passedFiles: [],
+        skippedFiles: [],
+        skippedTestsIncomplete: true,
+        summary: r.testCoverage.summary,
+      };
+  } else if (r.testCoverage) out.testCoverage = { ...r.testCoverage };
+  return out;
+}
+const confirmationReasons = new Set([
+  ...["worker execution attribution unavailable", "targeted retry returned no check result"],
+  ...["confinement failure", "confirmation timed out", "pass (worker-specific flake)"],
+  ...["failed on coordinator", "setup failures are not retried", "check does not match base configuration"],
+  "coordinator confirmation deadline expired (slot wait or execution)",
+]);
+/** Proofs are authority; shape recognition only selects the fields to project. */
+export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions): T {
+  let snapshot: ReturnType<typeof verifier> | undefined;
+  const results = new WeakSet<object>(),
+    untouched = new WeakSet<object>(),
+    coverage = new WeakSet<object>();
+  return redactData(
+    value,
+    function (key, v) {
+      if (key === "preview" && Reflect.get(this, "truncated") === true && typeof v === "string")
+        return withheldText("unproven");
+      // Only the canonical record built for a recognized result holds validated metadata.
+      if (key === "textPrivacy" && results.has(this) && v && typeof v === "object") {
+        untouched.add(v);
+        return v;
+      }
+      if (key === "provenanceError" || key === "remoteAttestation") return undefined;
+      // Only members the identities proof covers are exempt; other descendants are projected normally.
+      if (
+        untouched.has(this) ||
+        (results.has(this) && (key === "output" || (identities.has(key) && key !== "testCoverage"))) ||
+        (coverage.has(this) && coverageIds.has(key))
+      ) {
+        if (v && typeof v === "object") untouched.add(v);
+        return v;
+      }
+      if (isResult(v)) {
+        const scope = gatePrivacyScope.getStore();
+        snapshot ??= verifier(
+          options.registry ?? scope?.registry ?? getPrivacyChecker().registry,
+          options.signer ?? scope?.signer,
+        );
+        const out = projectResult(
+          v,
+          (record, field) => {
+            if (record?.withheld === true) return record;
+            const bytes = field === "output" ? v.output : gateIdentities(v);
+            const state = field === "output" ? "clean" : identityState(v, bytes);
+            if (!record || !snapshot?.verify(record, field, bytes) || state === "unproven")
+              return { withheld: true, reason: "unproven" };
+            return redactGateOutput(bytes) === bytes && state === "clean"
+              ? record
+              : { withheld: true, reason: "credential-changed" };
+          },
+          options.mode === "outward",
+        );
+        results.add(out);
+        if (!out.textPrivacy?.identities?.withheld && out.testCoverage) coverage.add(out.testCoverage);
+        return out;
+      }
+      if (v && typeof v === "object" && "originalVerdict" in v && "reason" in v)
+        return {
+          ...v,
+          reason: confirmationReasons.has(String(v.reason)) ? v.reason : withheldText("unproven"),
+        };
+      return passthrough;
+    },
+    (serialized) =>
+      JSON.parse(
+        serialized,
+        options.maxEventData !== undefined && serialized.length > options.maxEventData
+          ? (_key, v: unknown) =>
+              isResult(v)
+                ? projectResult(v, (record) =>
+                    record?.withheld ? record : { withheld: true, reason: "event-size" },
+                  )
+                : v
+          : undefined,
+      ),
+  );
+}
+const passthrough = Symbol();
+type Replacer = (this: object, key: string, value: unknown) => unknown;
+const redactData = <T>(value: T, project?: Replacer, parse = JSON.parse): T =>
   value === undefined
     ? value
-    : JSON.parse(
-        JSON.stringify(value, (key, v: unknown) => {
+    : parse(
+        JSON.stringify(value, function (key, v: unknown) {
+          if (project) {
+            const next = project.call(this, key, v);
+            if (next !== passthrough) return next;
+          }
           if (key === "failedFileTimes" && v && typeof v === "object")
             return Object.fromEntries(
               Object.entries(v).map(([file, time]) => [redactGateOutput(file), time]),

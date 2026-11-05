@@ -1,4 +1,4 @@
-import { redactGateData, redactGateOutput } from "./output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "./output.ts";
 import type { GateResult } from "./run.ts";
 
 const FAILURE_RESULT = /^(?:(?:\(fail\)|✗)(?:\s|$)|not ok(?:\s|$))/;
@@ -74,34 +74,8 @@ export function extractFailures(output: string): string | undefined {
   return excerpts.result();
 }
 
-/** Reserve complete result lines before spending the remaining budget on diagnostics. */
-function shortenFailureExcerpts(excerpt: string, limit: number): string {
-  if (excerpt.length <= limit) return excerpt;
-  const lines = excerpt.split("\n").filter((line) => line !== OMITTED);
-  const identities = new Set<number>();
-  let room = limit - OMITTED.length;
-  for (const [i, line] of lines.entries()) {
-    if ((FAILURE_RESULT.test(line.trim()) || TIMEOUT.test(line.trim())) && line.length + 1 <= room) {
-      identities.add(i);
-      room -= line.length + 1;
-    }
-  }
-  const kept: string[] = [];
-  for (const [i, line] of lines.entries()) {
-    if (identities.has(i)) kept.push(line);
-    else if (!FAILURE_RESULT.test(line.trim()) && !TIMEOUT.test(line.trim()) && room > 1) {
-      const diagnostic = line.slice(0, room - 1);
-      kept.push(diagnostic);
-      room -= diagnostic.length + 1;
-    }
-  }
-  return [...kept, OMITTED].join("\n");
-}
-
-/** Excerpts come first; legacy results keep their original tail budget. */
-export function formatGateOutput(result: Pick<GateResult, "output" | "failures">, limit = 3_000): string {
-  result = redactGateData(result);
-  if (!result.failures) return result.output.slice(-limit);
-  const failures = shortenFailureExcerpts(result.failures, limit - 1_002);
-  return `${failures}\n\n${result.output.slice(-1_000)}`;
+/** Interim guard until renderings receive their own checker-backed proofs. */
+export function formatGateOutput(result: GateResult, limit = 3_000): string {
+  const { output } = projectGateDiagnostics(result, { mode: "outward" });
+  return output.length <= limit ? output : "[output withheld: unchecked-rendering]";
 }

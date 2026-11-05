@@ -578,8 +578,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
           expect(evidence[0]?.result.output).toContain(
             "Retry rejected: tracked checkout cleanliness was not confirmed",
           );
-          expect(prompts[1]).toContain("Retry rejected:");
-          expect(prompts[1]).toContain("tracked checkout cleanliness was not confirmed");
+          expect(prompts[1]).toContain("[withheld: capture-incomplete]");
+          expect(prompts[1]).not.toContain("Retry rejected:");
+          expect(prompts[1]).not.toContain("tracked checkout cleanliness was not confirmed");
         }
         if (scenario === "twice") {
           expect(prompts[1]).toContain("Check `test` timed out after 37 s twice");

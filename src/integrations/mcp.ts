@@ -20,7 +20,7 @@ import {
   validateFeedQuery,
   waitForFeed,
 } from "../feed.ts";
-import { redactGateData, redactGateOutput } from "../gates/output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import { ReviewVerdictSchema, submitReview } from "../pipeline/review-round.ts";
 import { loadOutputPrivacy, type OutputPrivacy, privateOutputData } from "../util/private-output.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
@@ -155,6 +155,7 @@ const providersSchema = z.array(
 );
 
 export interface McpBackend {
+  gateDiagnosticsProjected?: boolean;
   change(input: z.output<typeof ChangeQuerySchema>, signal: AbortSignal): Promise<unknown>;
   create(input: CreateRunRequest): Promise<unknown>;
   detail(id: string): Promise<unknown>;
@@ -253,6 +254,7 @@ export function httpBackend(base: string, fetcher: Fetch = fetch): McpBackend {
   };
   const path = (id: string) => `/api/runs/${encodeURIComponent(id)}`;
   return {
+    gateDiagnosticsProjected: true,
     change: ({ run, ...query }, signal) =>
       api(
         `${path(run)}/change?${new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)]))}`,
@@ -513,7 +515,10 @@ export function createMcpServer(backend: McpBackend): Server {
     try {
       const tool = tools.find((tool) => tool.name === params.name);
       if (!tool) throw new Error(`Unknown tool: ${params.name}`);
-      const result = redactGateData(await tool.execute(params.arguments ?? {}, signal, privacy));
+      const raw = await tool.execute(params.arguments ?? {}, signal, privacy);
+      const result = backend.gateDiagnosticsProjected
+        ? raw
+        : projectGateDiagnostics(raw, { mode: "outward" });
       const output = privacy
         ? privateOutputData(result, privacy)
         : params.name === "limitless_status"

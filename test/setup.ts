@@ -3,12 +3,16 @@ import { beforeEach, spyOn } from "bun:test";
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gatePrivacyScope } from "../src/gates/text-privacy.ts";
 import { processBootInspection } from "../src/util/proc.ts";
+import { testGatePrivacy } from "./privacy-support.ts";
 
 // Bun isolates test callbacks' async context; supply a default without hiding explicit injections.
 // Confined macOS gates cannot read the host boot UUID.
+const readGatePrivacy = gatePrivacyScope.getStore.bind(gatePrivacyScope);
 const readBootInspection = processBootInspection.getStore.bind(processBootInspection);
 beforeEach(() => {
+  spyOn(gatePrivacyScope, "getStore").mockImplementation(() => readGatePrivacy() ?? testGatePrivacy);
   spyOn(processBootInspection, "getStore").mockImplementation(
     () => readBootInspection() ?? (() => "test-boot"),
   );

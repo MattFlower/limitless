@@ -3,7 +3,7 @@ import { cacheHitRate } from "../core/cache-format.ts";
 import { effortLabel } from "../core/effort-format.ts";
 import type { Invocation, RunModels } from "../core/types.ts";
 import { linkedIssues } from "../db/store.ts";
-import { docsGateSummary, redactGateData } from "../gates/output.ts";
+import { docsGateSummary, projectGateDiagnostics, redactGateData } from "../gates/output.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { activity } from "../util/stall.ts";
 import type { RunContext, RunState } from "./context.ts";
@@ -331,7 +331,7 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
     blocks.push(
       table(
         ["Check", "Result", ...(commands ? ["Command"] : [])],
-        state.lastGates.map((g) => {
+        projectGateDiagnostics(state.lastGates, { mode: "outward" }).map((g) => {
           const warn = g.verdict === "still_failing" || g.verdict === "flaky" || g.verdict === "not_run";
           const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
           const row = [
