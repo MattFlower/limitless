@@ -550,6 +550,50 @@ test("one overall deadline aborts a stalled upload and leaves queued held work r
   expect(f.store.checkpointRecord(f.run.id)?.indexed).toBe(true);
 });
 
+test("a reused held lease never returns authority for a remotely finished run", async () => {
+  const f = await fixture(),
+    handle = await f.admit(),
+    { checkpoint } = await tip(f);
+  expect(
+    await f.rt.leases.update(handle, { status: "succeeded" }, { expect: { checkpoint: checkpoint ?? null } }),
+  ).toBe("applied");
+  expect(f.store.getRun(f.run.id)?.status).toBe("queued");
+  const acquire = spyOn(f.rt.leases, "acquire"),
+    update = spyOn(f.rt.leases, "update");
+  await expect(f.admit()).rejects.toMatchObject({ reason: "checkpoint" });
+  expect(acquire).not.toHaveBeenCalled();
+  expect(update).not.toHaveBeenCalled();
+  expect((await tip(f)).status).toBe("succeeded");
+});
+
+test("deadline expiry cancels settlement IO and a later pick starts fresh once it drains", async () => {
+  const f = await fixture();
+  f.rt = { ...f.rt, admissionDeadlineMs: 100 };
+  spyOn(f.blobs, "put").mockRejectedValueOnce(new Error("crash"));
+  await expect(f.admit()).rejects.toMatchObject({ reason: "unavailable" });
+  expect(f.store.leaseRow(f.repo.slug, claimRef(f.key))?.confirmed?.state).toBe("held");
+  const entered = deferred<AbortSignal | undefined>(),
+    drain = deferred<void>();
+  spyOn(f.claims, "read").mockImplementationOnce(async (_repo, _ref, signal) => {
+    entered.resolve(signal);
+    if (!signal) throw new Error("settlement read without a signal");
+    await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    await drain.promise;
+    throw signal.reason;
+  });
+  const expired = f.admit().catch((e: unknown) => e);
+  const signal = await entered.promise;
+  expect(signal).toBeInstanceOf(AbortSignal);
+  f.clock.advance(101);
+  expect(signal?.aborted).toBe(true);
+  expect(await expired).toMatchObject({ reason: "unavailable" });
+  const retry = f.admit();
+  await flush();
+  drain.resolve();
+  expect((await retry).generation).toBe(1);
+  expect(f.store.checkpointRecord(f.run.id)).toMatchObject({ committed: { sequence: 1 }, indexed: true });
+});
+
 test("fast individual steps still share one admission deadline", async () => {
   const f = await fixture();
   f.rt = { ...f.rt, admissionDeadlineMs: 100 };

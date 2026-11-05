@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { addAbortListener } from "node:events";
 import type { Config } from "../config.ts";
-import type { CreateRunRequest, Repo, Run } from "../core/types.ts";
+import { type CreateRunRequest, type Repo, type Run, TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { cacheGit } from "../git/command.ts";
 import { cachePath, ensureCache } from "../git/repos.ts";
@@ -47,7 +47,7 @@ export function refuseSharedRequest(store: Store, cfg: Config, repo: Repo, req: 
   if (req.dependsOn?.length) throw new Error("Shared runs cannot have dependencies");
 }
 
-const admissions = new Map<string, Promise<LeaseHandle>>();
+const admissions = new Map<string, { signal: AbortSignal; work: Promise<LeaseHandle> }>();
 
 export async function admitRun(
   rt: SharedRuntime,
@@ -74,7 +74,13 @@ export async function admitRun(
   const aborted = Promise.withResolvers<never>();
   const listener = addAbortListener(signal, () => aborted.reject(new ClaimWaitError("unavailable")));
   try {
-    let work = admissions.get(run.id);
+    let entry = admissions.get(run.id);
+    // Expired work keeps the lock only until its cancelled IO drains; then this pick starts afresh.
+    while (entry?.signal.aborted) {
+      await Promise.race([entry.work.catch(() => {}), aborted.promise]);
+      entry = admissions.get(run.id);
+    }
+    let work = entry?.work;
     if (!work) {
       work = Promise.resolve().then(async () => {
         check();
@@ -146,9 +152,12 @@ export async function admitRun(
             );
           handle = acquired.handle;
         }
-        const { settlement } = await step(() => settleCheckpoint({ ...rt, store }, handle));
+        const { settlement, tip } = await step(() => settleCheckpoint({ ...rt, store }, handle, signal));
         if (settlement === "wait") throw new ClaimWaitError("lease");
-        if (settlement === "blocked") throw new ClaimWaitError("checkpoint");
+        const r = tip?.record;
+        // A reused held lease skips acquire, so its terminal guard (D8) is repeated on the settled tip.
+        if (settlement === "blocked" || (r && r !== "malformed" && TERMINAL_STATUSES.includes(r.status)))
+          throw new ClaimWaitError("checkpoint");
         if (!store.checkpointRecord(run.id)?.committed) {
           await step(() =>
             rt.committer.commit(
@@ -194,10 +203,11 @@ export async function admitRun(
         }
         return handle;
       });
-      admissions.set(run.id, work);
+      const own = { signal, work };
+      admissions.set(run.id, own);
       // Keep the lock until aborted IO drains, even if the deadline already returned to the picker.
       const clear = () => {
-        if (admissions.get(run.id) === work) admissions.delete(run.id);
+        if (admissions.get(run.id) === own) admissions.delete(run.id);
       };
       void work.then(clear, clear);
     }
