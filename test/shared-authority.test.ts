@@ -527,3 +527,59 @@ test("terminal intent survives without a held row; empty publication is done", a
   expectDeferred(f, "failed");
   expect(f.gh.calls("update")).toHaveLength(0);
 });
+
+test.each(["hook", "row"])("loss confirmed during terminal upload is a loss, by %s", async (kind) => {
+  const f = await fixture(),
+    { binding } = await held(f),
+    hooks = claimHooks(f.rt, f.store);
+  f.defer();
+  const put = f.blobs.put.bind(f.blobs);
+  spyOn(f.blobs, "put").mockImplementation(async (...args) => {
+    if (kind === "hook") hooks.onLost(binding.handle, null);
+    else f.store.markLeaseLost(binding.handle.repo, binding.handle.ref);
+    return put(...args);
+  });
+  const writes = f.gh.calls("update").length;
+  expect(await f.publish()).toBe("done");
+  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "cancelled", error: "superseded: claim lost" });
+  expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(f.gh.calls("update")).toHaveLength(writes);
+  expect(await f.publish()).toBe("done");
+});
+
+test("overlapping publications serialize and never requeue a finished run", async () => {
+  const f = await fixture();
+  await held(f);
+  f.defer();
+  expect(await Promise.all([f.publish(), f.publish()])).toEqual(["done", "done"]);
+  expect(f.store.getRun(f.run.id)?.status).toBe("succeeded");
+  expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(await f.record()).toMatchObject({ state: "released", status: "succeeded" });
+});
+
+test("a terminal intent recorded before admission is published instead of granting authority", async () => {
+  const f = await fixture();
+  f.defer("failed");
+  expect(await f.authority()).toBe("finished");
+  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "failed", error: "final reason" });
+  expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(await f.record()).toMatchObject({ state: "released", status: "failed" });
+});
+
+test("a terminal intent replaced during publication is published, not erased", async () => {
+  const f = await fixture();
+  await held(f);
+  f.defer();
+  const update = f.rt.leases.update.bind(f.rt.leases),
+    statuses: unknown[] = [];
+  spyOn(f.rt.leases, "update").mockImplementation(async (h, patch, opts) => {
+    statuses.push(patch.status);
+    if (statuses.length === 1) f.defer("cancelled");
+    return update(h, patch, opts);
+  });
+  expect(await f.publish()).toBe("done");
+  expect([statuses[0], statuses.at(-1)]).toEqual(["succeeded", "cancelled"]);
+  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "cancelled", error: "final reason" });
+  expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(await f.record()).toMatchObject({ state: "released", status: "cancelled" });
+});

@@ -136,26 +136,15 @@ export function sharedCheckpointer(
       return store.transaction(() => {
         const run = store.getRun(runId);
         if (!run) throw new Error("Run not found");
-        const now = Date.now();
-        store.setTerminalIntent(
-          runId,
-          canonicalJson({
-            status: patch.status,
-            error: patch.error === undefined ? run.error : patch.error,
-            finishedAt: patch.finishedAt === undefined ? now : patch.finishedAt,
-          }),
-        );
+        const now = Date.now(),
+          { status, error = run.error, finishedAt = now } = patch;
+        // D2: a shared run's terminal status waits for publication on the claim (publishTerminal).
+        store.setTerminalIntent(runId, canonicalJson({ status, error, finishedAt }));
         const state = supplied ?? store.getRunState<RunState>(runId) ?? initialRunState(run);
-        state.githubWait = {
-          reason: "claim:terminal",
-          since: state.githubWait?.since ?? now,
-          nextAttemptAt: now,
-        };
-        return local.writeRun(
-          runId,
-          { ...patch, status: "queued", stage: null, finishedAt: null, error: run.error },
-          state,
-        );
+        const since = state.githubWait?.since ?? now;
+        state.githubWait = { reason: "claim:terminal", since, nextAttemptAt: now };
+        const queued = { status: "queued", stage: null, finishedAt: null, error: run.error } as const;
+        return local.writeRun(runId, { ...patch, ...queued }, state);
       });
     },
     checkpoint(runId, label) {
