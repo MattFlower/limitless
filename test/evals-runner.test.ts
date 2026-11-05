@@ -3,6 +3,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cacheKey } from "../src/evals/cache.ts";
 import { formatEvalReport } from "../src/evals/format.ts";
+import * as evalPreparation from "../src/evals/prepare.ts";
 import type { EvalReport } from "../src/evals/stats.ts";
 import { pinnedTree, withRepoLock } from "../src/git/repos.ts";
 import type { FakeReply } from "../src/harness/fake.ts";
@@ -14,6 +15,7 @@ import type { Policy } from "../src/router/catalog.ts";
 import { sh } from "../src/util/proc.ts";
 import { reviewCase, reviewOutput } from "./evals-reading-support.ts";
 import { answer, deferred, enableEfforts, evalFixture, verifierModel } from "./evals-support.ts";
+import { assertSetupError, setupFailure, setupKinds } from "./gate-setup-privacy-support.ts";
 import { attributionEvidence } from "./review-support.ts";
 
 // These tests drive real git and subprocesses; under CPU load they outlast Bun's 5 s default (#140).
@@ -1697,6 +1699,49 @@ test("trace single eval pins both targets, accounts all calls, reloads provenanc
     expect(stopped).toMatchObject({ status: "skipped", pass: null, costUsd: 0.06 });
     expect(f.factory.tracker.status("openrouter")?.inFlight).toBe(0);
   } finally {
+    await f.close();
+  }
+});
+
+test.each([...setupKinds])("review eval setup caller projects failure diagnostics: %s", async (kind) => {
+  const f = await evalFixture();
+  const failed = await setupFailure(kind);
+  const prepare = spyOn(evalPreparation, "prepareEvalGates").mockResolvedValue({
+    gates: { setup: ["install"], checks: [], source: "none", protectedPaths: [] },
+    baseline: failed,
+  });
+  try {
+    const head = (await sh(["git", "rev-parse", "HEAD"], { cwd: f.source })).stdout.trim();
+    writeFileSync(
+      f.casePath,
+      JSON.stringify({ role: "review", version: 1, cases: [{ ...reviewCase, base: f.sha, head }] }),
+    );
+    const report = await f.run({
+      role: "review",
+      models: undefined,
+      k: 1,
+      systems: [
+        {
+          name: "setup",
+          mode: "single",
+          setup: true,
+          implementerReport: "include",
+          finders: [{ target: "candidate-a", prompt: "standard" }],
+        },
+      ],
+    });
+    expect(report.trials).toHaveLength(1);
+    expect(report.trials[0]?.status).toBe("error");
+    assertSetupError(
+      report.trials[0]?.details.reason,
+      kind,
+      "review gate setup failed: ",
+      "undefined\nundefined",
+    );
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    prepare.mockRestore();
     await f.close();
   }
 });

@@ -202,7 +202,8 @@ test("failed-attempt signature and evidence redact before truncation and survive
   const row = f.store.failureObservations({})[0];
   expect(row).toBeDefined();
   expect(JSON.stringify(row)).not.toContain(secret);
-  expect(row?.command).toBe(redactedCommand);
+  expect(row?.command).toBe(withheldText("unproven"));
+  expect(row?.command_digest).toBe(createHash("sha256").update(redactedCommand).digest("hex"));
   expect(row?.output_tail).toBe(withheldText("unproven"));
   expect(row?.output_tail.length).toBeLessThanOrEqual(6000);
   expect(row?.signature).toBe(createHash("sha256").update(failedSignature).digest("hex"));

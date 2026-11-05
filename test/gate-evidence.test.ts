@@ -177,8 +177,10 @@ test.each([undefined, null, "environment"] as const)(
   },
 );
 
-test("clean gates produce only engine-written evidence and provenance", () => {
-  const result = resolve(blocked, gates());
+test("clean gates produce only engine-written evidence and provenance", async () => {
+  const evidence = gates();
+  for (const check of evidence.checks) check.result = await provenResult(check.result);
+  const result = resolve(blocked, evidence);
   expect(result.overall).toBe("pass");
   expect(result.criteria[0]?.evidence).toBe(
     `Factory gate tests passed at ${sha} (stage 12); commands: bun run test`,
@@ -263,9 +265,10 @@ function inheritedFixture() {
 
 test.each(["broad", "targeted", "truncated", "targeted-truncated"])(
   "factory baseline permits inherited skips for %s verification",
-  (kind) => {
+  async (kind) => {
     const { evidence, check, baseline } = inheritedFixture();
     if (kind.endsWith("truncated")) check.result.output = "x".repeat(6000);
+    check.result = await provenResult(check.result);
     const publicSpec = {
       ...spec,
       acceptance_criteria: [
@@ -594,7 +597,7 @@ test.each([
   expect(privateResult.criteria[0]?.gateEvidence).toBeUndefined();
 });
 
-test("clean gate checks can cover all commands in a multi-step criterion", () => {
+test("clean gate checks can cover all commands in a multi-step criterion", async () => {
   const evidence = gates();
   const check = evidence.checks[0];
   if (!check) throw new Error("missing fixture check");
@@ -608,6 +611,7 @@ test("clean gate checks can cover all commands in a multi-step criterion", () =>
       output: "test/other.test.ts:\n(pass) other test\n1 pass\n0 fail",
     },
   });
+  for (const check of evidence.checks) check.result = await provenResult(check.result);
   const result = resolve(blocked, evidence, {
     ...spec,
     acceptance_criteria: [

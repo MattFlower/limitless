@@ -228,7 +228,9 @@ function gateBinding(
     return { reason: "candidate gate checks do not cover every required verification step" };
   const checks = [...new Set(covering)].filter((check) => check !== undefined);
   const checkNames = checks.map((check) => check.name).join(", ");
-  const checkCommands = checks.map((check) => check.result.command).join("; ");
+  const checkCommands = checks
+    .map((check) => projectGateDiagnostics(check.result, { mode: "outward" }).command ?? "[withheld]")
+    .join("; ");
   const inheritedSkips = checks.reduce(
     (count, check) => count + (check.result.testCoverage?.skippedTests?.length ?? 0),
     0,

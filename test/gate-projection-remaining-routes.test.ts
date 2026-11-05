@@ -210,6 +210,9 @@ test.each(["legacy", "forged", "proven"])(
       const row = store.failureObservations()[0];
       expect(row?.output_tail).toBe(kind === "proven" ? r.output.slice(-6000) : withheldText("unproven"));
       expect(row?.failed_files).toBe(JSON.stringify(kind === "proven" ? [sentinel] : []));
+      expect(row?.command).toBe(kind === "proven" ? r.command : withheldText("unproven"));
+      expect(row?.command_digest).toBe(hash(r.command));
+      if (kind !== "proven") expect(JSON.stringify(row)).not.toContain(sentinel);
       expect(row?.signature).toMatch(/^[a-f0-9]{64}$/);
       expect(row?.signature).toBe(hash(ciSignature(r.name, r.output.slice(-6000), r.command).signature));
     } finally {
@@ -320,5 +323,113 @@ test.each(["legacy", "forged", "proven"])(
     expect(store.getArtifact(run.id, "plain.txt")).toBe("ordinary plaintext");
     expect(() => ctx.artifact("bad.json", "gates", "{")).toThrow();
     expect(projectGateDiagnostics(JSON.parse(stored), { mode: "outward" })[0].output).toBe(parsed.output);
+  },
+);
+
+test.each(["firstAttempt", "result.firstAttempt", "earlier stage"])(
+  "withheld commands finalize the original failed attempt: %s",
+  (source) => {
+    const store = new Store(":memory:");
+    try {
+      const failed = raw("original failure");
+      observe(store, failed, "retry");
+      const passed = { ...failed, command: "changed retry command", output: "passed", ok: true, exitCode: 0 };
+      const c: GateComparison = {
+        ...comparison(passed),
+        verdict: "flaky",
+        blocking: false,
+        retryOriginal: { verdict: "regressed", blocking: true },
+        ...(source === "result.firstAttempt"
+          ? { result: { ...passed, firstAttempt: failed } }
+          : { firstAttempt: failed }),
+      };
+      const wrong = { ...comparison(failed), result: { ...failed, command: "other withheld command" } };
+      const completion = {
+        round: 0,
+        sha,
+        stageId: source === "earlier stage" ? 2 : 1,
+        comparisons: [wrong, c],
+      };
+      store.observations.finalize("retry", completion);
+      expect(store.failureObservations()[0]).toMatchObject({ history: "retry_passed", interim: 0 });
+      const rows = store.failureObservations();
+      store.observations.finalize("retry", completion);
+      expect(store.failureObservations()).toEqual(rows);
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test("historical signatures promote together but never with new hashes", () => {
+  const store = new Store(":memory:");
+  try {
+    const r = raw();
+    observe(store, r, "old-a");
+    observe(store, r, "old-b");
+    const signature = ciSignature(r.name, r.output, r.command).signature;
+    store.db
+      .query("UPDATE failure_observations SET signature=?,command=?,command_digest=NULL,location=run_id")
+      .run(signature, r.command);
+    observe(store, r, "new");
+    for (const id of ["old-a", "old-b", "new"])
+      store.observations.finalize(id, { round: 0, sha, stageId: 1, comparisons: [] });
+    expect(store.failureObservations().map((row) => row.class)).toEqual([
+      "undeclared_requirement",
+      "undeclared_requirement",
+      "setup",
+    ]);
+  } finally {
+    store.close();
+  }
+});
+
+test.each(["legacy", "forged", "proven"])(
+  "ordinary citations project commands and reapply: %s",
+  async (kind) => {
+    const r = await variant(kind, {
+      ...raw("test/example.test.ts:\n(pass) passes\n1 pass\n0 fail"),
+      ok: true,
+      exitCode: 0,
+    });
+    const spec: Spec = {
+      summary: "tests",
+      requirements: [],
+      assumptions: [],
+      out_of_scope: [],
+      blocking_questions: [],
+      acceptance_criteria: [{ id: "AC-1", criterion: "tests pass", how_to_verify: "bun test" }],
+    };
+    const value: Verify = {
+      overall: "fail",
+      notes: "",
+      criteria: [
+        {
+          id: "AC-1",
+          status: "blocked",
+          blockedReason: "sandbox",
+          evidence: "Cannot run",
+          publicSummary: "",
+        },
+      ],
+    };
+    const apply = (v: Verify) =>
+      applyGateEvidence(v, spec, { scenarios: [] }, sha, {
+        stageId: 17,
+        sha,
+        checks: [
+          { name: "configured tests", result: r, verdict: "pass", blocking: false, testCommand: "bun test" },
+        ],
+      });
+    const first = apply(value);
+    const command = kind === "proven" ? r.command : withheldText("unproven");
+    for (const result of [first, apply(first), projectGateDiagnostics(first, { mode: "outward" })]) {
+      expect(result.criteria[0]).toMatchObject({
+        status: "met",
+        evidence: `Factory gate configured tests passed at ${sha} (stage 17); commands: ${command}`,
+        gateEvidence: { stageId: 17, sha, check: "configured tests", command },
+      });
+      expect(JSON.stringify(result).includes(sentinel)).toBe(kind === "proven");
+    }
   },
 );

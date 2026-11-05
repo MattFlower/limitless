@@ -11,6 +11,7 @@ import { WorkerStore } from "../src/db/workers.ts";
 import type { GateCommand } from "../src/gates/detect.ts";
 import { type GateRequest, localExecutor } from "../src/gates/executor.ts";
 import { lanExecutor } from "../src/gates/lan.ts";
+import * as gateRunner from "../src/gates/run.ts";
 import { resolveRepo } from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import { bindClaim, dispatchGuard } from "../src/integrations/claim-guard.ts";
@@ -23,6 +24,7 @@ import { type Fault, SimulatedTermination } from "../src/pipeline/faults.ts";
 import { AcceptanceSchema } from "../src/pipeline/schemas.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { assertSetupError, setupFailure, setupKinds } from "./gate-setup-privacy-support.ts";
 import { models, pipelineSetup, policy, providers } from "./pipeline-support.ts";
 
 afterEach(() => configureGitHubIdentity(null));
@@ -1961,5 +1963,20 @@ test("releaseAcceptanceLimit normalizes the repo and only releases requested com
     ]);
   } finally {
     store.close();
+  }
+});
+
+test.each([...setupKinds])("acceptance setup caller projects failure diagnostics: %s", async (kind) => {
+  const t = await setup();
+  const failed = await setupFailure(kind);
+  const execute = spyOn(gateRunner, "runLocalGates").mockResolvedValue(failed);
+  try {
+    expect(await t.execute()).toBe("failed");
+    assertSetupError(t.f.store.getRun(t.run.id)?.error, kind, "Acceptance setup failed: $ ", "undefined\n");
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(t.calls()).toBe(0);
+    expect(t.state()?.acceptance?.setupDone).toBeUndefined();
+  } finally {
+    execute.mockRestore();
   }
 });
