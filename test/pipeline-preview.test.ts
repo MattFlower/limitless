@@ -15,7 +15,12 @@ import { BROWSER_INCOMPLETE, ENVIRONMENT_BLOCKED } from "../src/pipeline/verific
 import { sh } from "../src/util/proc.ts";
 import { fakeBrowserCache } from "./browser-mcp-support.ts";
 import { deferred } from "./evals-support.ts";
-import { assertSetupError, setupFailure, setupKinds } from "./gate-setup-privacy-support.ts";
+import {
+  assertSetupDiagnostics,
+  assertSetupError,
+  setupFailure,
+  setupKinds,
+} from "./gate-setup-privacy-support.ts";
 import {
   approve,
   type Handler,
@@ -966,7 +971,16 @@ test.each([...setupKinds])("preview setup caller projects failure diagnostics: %
       .listStages(run.id)
       .find((stage) => stage.name === "preview" && stage.status === "failed");
     assertSetupError(preview?.summary, kind, "Preview setup failed: $ ", "setup\nNo setup result");
+    const errors = f.store
+      .listEvents(run.id, { limit: Number.MAX_SAFE_INTEGER })
+      .filter((event) => event.level === "error");
+    expect(errors.map((event) => event.message)).toContain(`Run needs a human: ${preview?.summary}`);
+    assertSetupDiagnostics(JSON.stringify(errors), kind);
     expect(setup).toHaveBeenCalledTimes(1);
+    expect(setup.mock.calls[0]?.slice(0, 2)).toEqual([
+      f.store.getRunState<RunState>(run.id)?.worktreePath,
+      expect.objectContaining({ setup: ["echo ready"], checks: [] }),
+    ]);
   } finally {
     setup.mockRestore();
   }

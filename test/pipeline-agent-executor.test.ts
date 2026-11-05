@@ -644,7 +644,13 @@ test.each([...setupKinds])("reader setup caller projects failure diagnostics: %s
     const message = await thrownMessage(prepareReaderCheckout(f.cwd, ["install"], f.context.signal));
     assertSetupError(message, kind, "Reader setup failed: $ ", "undefined\nundefined");
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(
+      f.cwd,
+      { setup: ["install"], checks: [], source: ".limitless.toml", protectedPaths: [] },
+      f.context.signal,
+    );
     expect(discard).toHaveBeenCalledTimes(1);
+    expect(discard).toHaveBeenCalledWith(f.cwd);
     expect(f.calls).toHaveLength(0);
   } finally {
     execute.mockRestore();

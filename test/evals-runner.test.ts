@@ -1704,8 +1704,8 @@ test("trace single eval pins both targets, accounts all calls, reloads provenanc
 });
 
 test.each([...setupKinds])("review eval setup caller projects failure diagnostics: %s", async (kind) => {
-  const f = await evalFixture();
   const failed = await setupFailure(kind);
+  const f = await evalFixture();
   const prepare = spyOn(evalPreparation, "prepareEvalGates").mockResolvedValue({
     gates: { setup: ["install"], checks: [], source: "none", protectedPaths: [] },
     baseline: failed,
@@ -1730,15 +1730,25 @@ test.each([...setupKinds])("review eval setup caller projects failure diagnostic
         },
       ],
     });
-    expect(report.trials).toHaveLength(1);
-    expect(report.trials[0]?.status).toBe("error");
-    assertSetupError(
-      report.trials[0]?.details.reason,
-      kind,
-      "review gate setup failed: ",
-      "undefined\nundefined",
+    expect(prepare).toHaveBeenCalledWith(
+      expect.objectContaining({ base: f.sha, head }),
+      expect.any(String),
+      expect.any(AbortSignal),
+      true,
     );
     expect(prepare).toHaveBeenCalledTimes(1);
+    expect(report.trials).toHaveLength(1);
+    expect(report.trials[0]?.status).toBe("error");
+    const trials = f.factory.store.listEvalTrials(report.run.id);
+    expect(trials).toHaveLength(1);
+    expect(trials[0]).toMatchObject({
+      status: "error",
+      pass: false,
+      output: null,
+      details: { preparationFailed: true },
+    });
+    assertSetupError(trials[0]?.details.reason, kind, "review gate setup failed: ", "undefined\nundefined");
+    expect(report.trials[0]?.details.reason).toBe(trials[0]?.details.reason);
     expect(f.calls).toHaveLength(0);
   } finally {
     prepare.mockRestore();

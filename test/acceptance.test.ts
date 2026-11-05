@@ -24,7 +24,12 @@ import { type Fault, SimulatedTermination } from "../src/pipeline/faults.ts";
 import { AcceptanceSchema } from "../src/pipeline/schemas.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
-import { assertSetupError, setupFailure, setupKinds } from "./gate-setup-privacy-support.ts";
+import {
+  assertSetupDiagnostics,
+  assertSetupError,
+  setupFailure,
+  setupKinds,
+} from "./gate-setup-privacy-support.ts";
 import { models, pipelineSetup, policy, providers } from "./pipeline-support.ts";
 
 afterEach(() => configureGitHubIdentity(null));
@@ -1972,8 +1977,21 @@ test.each([...setupKinds])("acceptance setup caller projects failure diagnostics
   const execute = spyOn(gateRunner, "runLocalGates").mockResolvedValue(failed);
   try {
     expect(await t.execute()).toBe("failed");
-    assertSetupError(t.f.store.getRun(t.run.id)?.error, kind, "Acceptance setup failed: $ ", "undefined\n");
+    const run = t.f.store.getRun(t.run.id);
+    expect(run).toMatchObject({ status: "failed", stage: "prepare" });
+    assertSetupError(run?.error, kind, "Acceptance setup failed: $ ", "undefined\n");
+    const errors = t.f.store
+      .listEvents(t.run.id, { limit: Number.MAX_SAFE_INTEGER })
+      .filter((event) => event.level === "error");
+    expect(errors.map((event) => event.message)).toContain(`Run failed: ${run?.error}`);
+    assertSetupDiagnostics(JSON.stringify(errors), kind);
     expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(
+      t.state()?.worktreePath,
+      expect.objectContaining({ setup: ["echo local > local.env"], checks: [] }),
+      expect.any(AbortSignal),
+      { holder: t.run.id },
+    );
     expect(t.calls()).toBe(0);
     expect(t.state()?.acceptance?.setupDone).toBeUndefined();
   } finally {

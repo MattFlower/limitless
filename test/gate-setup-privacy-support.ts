@@ -4,17 +4,23 @@ import { withheldText } from "../src/gates/text-privacy.ts";
 import { provenResult } from "./privacy-support.ts";
 
 const setupHost = ["private-setup", "example"].join(".");
+const diagnostics = {
+  command: `install ${setupHost}`,
+  output: `diagnostic ${setupHost}`,
+  failures: "failure excerpt must not escape",
+  provenanceError: "provenance must not escape",
+};
 export const setupKinds = ["legacy", "forged", "proven", "missing"] as const;
 export async function setupFailure(kind: (typeof setupKinds)[number]): Promise<GateRun> {
   const raw: GateResult = {
     name: "setup",
-    command: `install ${setupHost}`,
-    output: `diagnostic ${setupHost}`,
-    failures: "failure excerpt must not escape",
+    command: diagnostics.command,
+    output: diagnostics.output,
+    failures: diagnostics.failures,
     executionProvenance: {
       sha: "a".repeat(40),
       trackedClean: true,
-      provenanceError: "provenance must not escape",
+      provenanceError: diagnostics.provenanceError,
     },
     ok: false,
     exitCode: 1,
@@ -28,12 +34,22 @@ export async function setupFailure(kind: (typeof setupKinds)[number]): Promise<G
   return { setupOk: false, setup: kind === "missing" ? [] : [result], checks: [] };
 }
 
+export function assertSetupDiagnostics(text: string, kind: string) {
+  expect(text).not.toContain(diagnostics.failures);
+  expect(text).not.toContain(diagnostics.provenanceError);
+  for (const permitted of [diagnostics.command, diagnostics.output]) {
+    if (kind === "proven") expect(text).toContain(permitted);
+    else expect(text).not.toContain(permitted);
+  }
+}
+
 export function assertSetupError(
   message: string | null | undefined,
   kind: string,
   prefix: string,
   missing: string,
 ) {
+  assertSetupDiagnostics(message ?? "", kind);
   expect(message).toBe(
     prefix +
       (kind === "missing"
