@@ -14,6 +14,7 @@ import { createControlStore } from "../src/integrations/control-store.ts";
 import { createLeaseManager } from "../src/integrations/leases.ts";
 import { parsePointer } from "../src/pipeline/checkpoint-settlement.ts";
 import { localCheckpointer, NeedsHumanError, RunContext, type RunState } from "../src/pipeline/context.ts";
+import { untilAborted } from "../src/pipeline/faults.ts";
 import { claimKey, claimRef, parseManifest } from "../src/pipeline/portable.ts";
 import { createRunObjectExporter } from "../src/pipeline/run-object-export.ts";
 import { createRunObjectValidator } from "../src/pipeline/run-object-quarantine.ts";
@@ -544,23 +545,65 @@ test("zero-capacity admission publishes one generation, initial checkpoint and i
   expect((await f.tip(run)).checkpoint).toBe(record.checkpoint);
 });
 
-test("queued cancellation is deferred until the sweep publishes and releases; stop clears both timers", async () => {
+test.each([0, 1])(
+  "queued cancellation at capacity %s waits for publication without spinning",
+  async (capacity) => {
+    const f = await fixture();
+    f.factory.start();
+    const run = await f.create();
+    f.factory.cancelRun(run.id);
+    expect(f.store.getRun(run.id)?.status).toBe("queued");
+    expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:terminal");
+    expect(JSON.parse(f.store.checkpointRecord(run.id)?.terminal ?? "null").status).toBe("cancelled");
+    const intent = f.store.checkpointRecord(run.id)?.terminal;
+    const update = f.store.updateRun.bind(f.store);
+    let writes = 0;
+    spyOn(f.store, "updateRun").mockImplementation((...args) => {
+      // Bound the regression so a microtask loop cannot starve the test's own deadline.
+      if (args[0] === run.id && ++writes === 5) f.factory.scheduler.setLimit(0);
+      return update(...args);
+    });
+    f.factory.scheduler.setLimit(capacity);
+    f.factory.scheduler.tick();
+    await flush();
+    expect(writes).toBe(0);
+    expect(f.store.checkpointRecord(run.id)?.terminal).toBe(intent);
+    await f.tick();
+    await f.ready(() => f.store.getRun(run.id)?.status === "cancelled");
+    expect((await f.tip(run)).status).toBe("cancelled");
+    await f.ready(() => f.store.heldLeaseRows().length === 0);
+    await f.factory.stop();
+    expect(f.tasks.size).toBe(0);
+    const calls = f.gh.requests.length;
+    await f.tick();
+    expect(f.gh.requests.length).toBe(calls);
+  },
+);
+
+test("shutdown during authority acquisition preserves the queued run for a new Factory", async () => {
   const f = await fixture();
-  f.factory.start();
   const run = await f.create();
-  f.factory.cancelRun(run.id);
-  expect(f.store.getRun(run.id)?.status).toBe("queued");
-  expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("claim:terminal");
-  expect(JSON.parse(f.store.checkpointRecord(run.id)?.terminal ?? "null").status).toBe("cancelled");
-  await f.tick();
-  await f.ready(() => f.store.getRun(run.id)?.status === "cancelled");
-  expect((await f.tip(run)).status).toBe("cancelled");
-  await f.ready(() => f.store.heldLeaseRows().length === 0);
+  const entered = Promise.withResolvers<void>();
+  const read = spyOn(f.rt.claims, "read").mockImplementationOnce(async (_repo, _ref, signal) => {
+    if (!signal) throw new Error("missing authority signal");
+    entered.resolve();
+    await untilAborted(signal);
+    throw signal.reason;
+  });
+  f.factory.start();
+  f.factory.scheduler.setLimit(1);
+  f.factory.scheduler.tick();
+  await entered.promise;
   await f.factory.stop();
-  expect(f.tasks.size).toBe(0);
-  const calls = f.gh.requests.length;
-  await f.tick();
-  expect(f.gh.requests.length).toBe(calls);
+  expect(f.store.getRun(run.id)).toMatchObject({ status: "queued", error: null, finishedAt: null });
+  expect(f.store.checkpointRecord(run.id)?.terminal).toBeNull();
+  expect(f.store.listStages(run.id)).toHaveLength(0);
+  read.mockRestore();
+  f.cfg.maxConcurrentRuns = 1;
+  await f.restart();
+  await f.ready(() => !!f.store.checkpointRecord(run.id)?.terminal);
+  expect(f.store.listStages(run.id).map((stage) => stage.name)).toContain("implement");
+  expect(JSON.parse(f.store.checkpointRecord(run.id)?.terminal ?? "null").status).toBe("succeeded");
 });
 
 test("terminal sweeps deduplicate publications and stop waits for in-flight work", async () => {

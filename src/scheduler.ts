@@ -44,12 +44,19 @@ export class Scheduler {
     this.maxConcurrent = limit;
   }
 
+  private finalizeCancellation(runId: string): boolean {
+    const terminal = this.options.shared && this.deps.store.checkpointRecord(runId)?.terminal;
+    // A deferred cancellation already awaits publication; rewriting it wakes another pick.
+    if (terminal && (JSON.parse(terminal) as { status: string }).status === "cancelled") return true;
+    return finalizeRecordedCancellation(this.deps.store, runId, this.checkpointer);
+  }
+
   start(): void {
     for (const run of this.deps.store.listRuns({
       status: ["queued", "cancelled"],
       limit: Number.MAX_SAFE_INTEGER,
     })) {
-      if (run.status === "queued") finalizeRecordedCancellation(this.deps.store, run.id, this.checkpointer);
+      if (run.status === "queued") this.finalizeCancellation(run.id);
       else if (run.githubWait)
         this.checkpointer.writeRun(
           run.id,
@@ -59,7 +66,7 @@ export class Scheduler {
     }
     const interrupted = this.deps.store.listRuns({ status: ["running", "waiting_input"], limit: 1000 });
     for (const run of interrupted) {
-      const cancelled = finalizeRecordedCancellation(this.deps.store, run.id, this.checkpointer);
+      const cancelled = this.finalizeCancellation(run.id);
       for (const stage of this.deps.store.listStages(run.id))
         if (stage.status === "running")
           this.deps.store.finishStage(stage.id, "cancelled", "Daemon interrupted stage");
@@ -156,12 +163,13 @@ export class Scheduler {
     for (const run of this.deps.store.nextQueuedRuns(capacity)) {
       if (this.stopping || this.draining) return;
       if (this.active.has(run.id)) continue;
-      if (finalizeRecordedCancellation(this.deps.store, run.id, this.checkpointer)) continue;
+      if (this.finalizeCancellation(run.id)) continue;
       const controller = new AbortController();
       const rt = this.options.shared;
       const { promise, resolve } = Promise.withResolvers<unknown>();
       const done = promise
         .catch((e) => {
+          if (rt && this.stopping && controller.signal.aborted) return;
           if (e instanceof ClaimWaitError || e instanceof ClaimLostError) {
             mapClaimInterruption(this.deps.store, run.id, e, rt?.clock.now(), this.checkpointer);
             return;
@@ -173,7 +181,7 @@ export class Scheduler {
           });
         })
         .finally(() => {
-          finalizeRecordedCancellation(this.deps.store, run.id, this.checkpointer);
+          this.finalizeCancellation(run.id);
           this.active.delete(run.id);
           if (!this.stopping) this.tick();
         });
@@ -201,7 +209,7 @@ export class Scheduler {
     if (active) {
       active.controller.abort();
     } else {
-      finalizeRecordedCancellation(this.deps.store, runId, this.checkpointer);
+      this.finalizeCancellation(runId);
       const repo = this.deps.store.getRepo(run.repoId);
       if (repo)
         void removeIterationRefs(this.deps.cfg.paths, repo, runId).catch((error: unknown) =>
