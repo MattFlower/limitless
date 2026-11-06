@@ -2,7 +2,7 @@ import { expect, mock, spyOn } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as subprocess from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -140,6 +140,43 @@ test.each(["long", "short"])("captured %s-line bursts yield within the shared bu
   });
   expect(result.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
 });
+
+test.each(["stdout", "stderr"] as const)(
+  "captured redaction survives budget slice boundaries on %s",
+  async (stream) => {
+    const budget = 4096;
+    const head = "synthetic-budget-head";
+    const foot = "distinct-budget-footer";
+    const secret = head + foot;
+    registerCredential("BUDGET_SLICE_TEST_TOKEN", secret);
+    // One received chunk; the first turn ends inside the escape embedded in the credential.
+    const start = "visible-start ";
+    const prefix = start + ".".repeat(budget - start.length - head.length - 2);
+    const text = `${prefix}${head}\u001b[31m${foot}\u001b[0m visible-end\n`;
+    const expected = `${prefix}[redacted] visible-end`;
+    const events: DrainEvent[] = [];
+    const raw: string[] = [];
+    const lines: string[] = [];
+    const result = await processDrainObserver.run({ budget, observe: (e) => events.push(e) }, () =>
+      withChunks([{ stream, text }], () =>
+        captured({
+          redactOutput: true,
+          onRawChunk: (chunk) => raw.push(chunk),
+          onStdoutLine: (line) => lines.push(line),
+          onStderrLine: (line) => lines.push(line),
+        }),
+      ),
+    );
+    expect(raw).toEqual([text]);
+    const admissions = events.filter((e) => e.admitted > 0);
+    expect(admissions.map((e) => e.admitted)).toEqual([budget, text.length - budget]);
+    expect(new Set(admissions.map((e) => e.turn)).size).toBe(2);
+    expect(lines).toEqual([expected]);
+    expect(result[stream]).toBe(`${expected}\n`);
+    for (const output of [...lines, result[stream]])
+      for (const fragment of [secret, head, foot]) expect(output).not.toContain(fragment);
+  },
+);
 
 test("concurrent captures share a round-robin turn budget", async () => {
   const events: DrainEvent[] = [];
@@ -297,6 +334,122 @@ test("aborting mid-drain drops pending admission while another capture completes
   expect(results[0]).toMatchObject({ cancelled: true, capture: { provenance: { kind: "legacy-unknown" } } });
   expect(results[1]?.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
 });
+
+test("captured timeout stops a yielded drain with a backpressured child", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "proc-drain-timeout-"));
+  const ready = join(dir, "backpressured");
+  const drained = join(dir, "drained");
+  const events: DrainEvent[] = [];
+  const controller = new AbortController();
+  const children: subprocess.ChildProcess[] = [];
+  const spawn = subprocess.spawn;
+  const setTimer = globalThis.setTimeout;
+  const immediate = globalThis.setImmediate;
+  const held = Promise.withResolvers<void>();
+  let firstAdmission = true;
+  let holdNext = false;
+  let resumeDrain = () => {};
+  let fire: () => void = () => {
+    throw new Error("timeout was not installed");
+  };
+  const deadline = Promise.withResolvers<never>();
+  // Bound both readiness and close, independently of the intercepted timeout.
+  const deadlineTimer = setTimer(
+    () => deadline.reject(new Error("captured timeout did not complete")),
+    10000,
+  );
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    ms?: number,
+    ...args: unknown[]
+  ) => {
+    if (ms !== 25) return setTimer(fn, ms, ...args);
+    fire = () => fn(...args);
+    return setTimer(() => {}, 60000);
+  }) as typeof setTimeout);
+  const scheduling = spyOn(globalThis, "setImmediate").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    ...args: unknown[]
+  ) => {
+    if (!holdNext) return immediate(fn, ...args);
+    holdNext = false;
+    resumeDrain = () => {
+      resumeDrain = () => {};
+      immediate(fn, ...args);
+    };
+    held.resolve();
+    return immediate(() => {});
+  }) as typeof setImmediate);
+  const spawning = spyOn(subprocess, "spawn").mockImplementation(((
+    ...args: Parameters<typeof subprocess.spawn>
+  ) => {
+    const child = spawn(...args);
+    children.push(child);
+    return child;
+  }) as typeof subprocess.spawn);
+  try {
+    const running = processDrainObserver.run(
+      {
+        budget: 1024,
+        highWater: 4096,
+        lowWater: 2048,
+        observe: (e) => {
+          events.push(e);
+          if (e.admitted && firstAdmission) {
+            firstAdmission = false;
+            // This step consumes the whole budget; hold the drain's next scheduled turn.
+            holdNext = true;
+          }
+        },
+      },
+      () =>
+        captured({
+          cmd: [
+            process.execPath,
+            "-e",
+            `import { writeFileSync } from "node:fs";
+             if (process.stdout.write(Buffer.alloc(32 * 1024 * 1024, 120))) throw Error("expected backpressure");
+             process.stdout.once("drain", () => writeFileSync(${JSON.stringify(drained)}, "drained"));
+             writeFileSync(${JSON.stringify(ready)}, "ready");
+             setInterval(() => {}, 1000);`,
+          ],
+          signal: controller.signal,
+          timeoutMs: 25,
+        }),
+    );
+    await Promise.race([held.promise, running, deadline.promise]);
+    while (!existsSync(ready)) await Promise.race([Bun.sleep(10), deadline.promise]);
+    const pending = events.at(-1);
+    expect(pending?.queued).toBeGreaterThan(0);
+    expect(pending?.paused).toBe(true);
+    expect(existsSync(drained)).toBe(false);
+    expect(events.reduce((sum, e) => sum + e.admitted, 0)).toBe(1024);
+    const beforeTimeout = events.length;
+    fire();
+    resumeDrain();
+    const result = await Promise.race([running, deadline.promise]);
+    expect(
+      events
+        .slice(beforeTimeout)
+        .reduce((sum, e) => sum + (e.process === pending?.process ? e.admitted : 0), 0),
+    ).toBe(0);
+    expect(result).toMatchObject({
+      timedOut: true,
+      cancelled: false,
+      capture: { provenance: { kind: "legacy-unknown" } },
+    });
+  } finally {
+    scheduling.mockRestore();
+    timer.mockRestore();
+    spawning.mockRestore();
+    controller.abort();
+    resumeDrain();
+    clearTimeout(deadlineTimer);
+    for (const child of children)
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 15000);
 
 test("the shared drain restores each capture's async context instead of its waker's", async () => {
   const store = new AsyncLocalStorage<string>();
