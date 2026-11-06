@@ -1,7 +1,5 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
-import { stripVTControlCharacters } from "node:util";
-import { redactGateOutput } from "./output.ts";
 
 export const MAX_SKIPPED_TESTS = 1000;
 export const MAX_TEST_IDENTITY_LENGTH = 2000;
@@ -40,16 +38,15 @@ export class BunTestCoverage {
     }
   }
 
+  /** Input has already passed credential and terminal sanitization. */
   observe(line: string): void {
-    const raw = stripVTControlCharacters(line).trim();
+    const raw = line.trim();
     if (/^\(fail\)/.test(raw)) this.sawFailure = true;
     // Bun repeats inline skip/todo rows in its final recap.
     if (/^\d+ tests? (skipped|todo):?$/.test(raw)) this.skipRecap = true;
     if (!this.skipRecap && /^\((?:skip|todo)\)/.test(raw)) this.skipRows++;
     // Bun's GitHub Actions reporter groups file headers; presentation is not part of the path.
-    line = redactGateOutput(line)
-      .trim()
-      .replace(/^::group::/, "");
+    line = raw.replace(/^::group::/, "");
     if (line === "::endgroup::") this.current = undefined;
     const summary = /^(\d+) (pass(?:ed)?|fail(?:ed)?)$/.exec(line);
     if (summary?.[2]?.startsWith("pass")) this.passed = Number(summary[1]);

@@ -18,6 +18,7 @@ import { transferHash } from "../src/pipeline/run-transfer-integrity.ts";
 import { encodeTransferJson } from "../src/pipeline/run-transfer-json.ts";
 import type { Verify } from "../src/pipeline/schemas.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { provenResult } from "./privacy-support.ts";
 import { policyFixture } from "./run-transfer-policy-support.ts";
 import { fixture, sha } from "./run-transfer-support.ts";
 
@@ -479,14 +480,14 @@ test("review samples and gate citations preserve exact SHA bindings despite loca
         verdict: "pass" as const,
         blocking: false,
         testCommand: "bun test",
-        result: {
+        result: await provenResult({
           name: "tests",
           command: "bun test",
           ok: true,
           exitCode: 0,
           durationMs: 1,
           output: "test/example.test.ts:\n(pass) example [1ms]\n1 pass\n0 fail",
-        },
+        }),
       },
     ],
   };

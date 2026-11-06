@@ -1,4 +1,5 @@
 import { describe, expect, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Factory } from "../src/app.ts";
@@ -180,7 +181,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         );
         expect(check?.result.targetedRetry).toMatchObject({ ok: true, exitCode: 0 });
         expect(check?.result.firstAttempt?.ok).toBe(false);
-        expect(f.store.getRun(run.id)?.error).toContain("tracked checkout cleanliness was not confirmed");
+        expect(f.store.getRun(run.id)?.error).toContain("[withheld: unproven]");
+        expect(f.store.getRun(run.id)?.error).not.toContain("tracked checkout cleanliness was not confirmed");
         expect(f.store.getRun(run.id)?.headSha).toBe(approved);
       } else if (scenario === "pass" || scenario === "fail") {
         expect(checkpoints.length).toBeGreaterThan(1);
@@ -225,7 +227,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
             )[scenario] ?? "missing diagnostic",
           ),
         );
-        expect(f.store.getRun(run.id)?.error).toContain(reason);
+        const error = f.store.getRun(run.id)?.error ?? "";
+        if (["missing attribution", "invalid files", "confinement"].includes(scenario)) {
+          expect(error).toContain("[withheld: unproven]");
+          expect(error).not.toContain(reason);
+        } else expect(error).toContain(reason);
       }
     } finally {
       persist.mockRestore();
@@ -263,7 +269,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
     try {
       const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
       expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("needs_human");
-      expect(f.deps.store.getRun(run.id)?.error ?? "").toContain("check is not a single bun test invocation");
+      expect(f.deps.store.getRun(run.id)?.error ?? "").toContain("[withheld: unproven]");
+      expect(fixture.saved(run.id)?.result?.comparison[0]?.coordinatorConfirmation?.reason).toBe(
+        "check is not a single bun test invocation",
+      );
       expect(fixture.local).toHaveLength(0);
     } finally {
       fixture.processSpy.mockRestore();
@@ -574,10 +583,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
               retryAttempt: { ok: true, executionProvenance: { trackedClean: false } },
             },
           });
-          expect(evidence[0]?.result.output).toContain("[withheld: capture-incomplete; timed out]");
-          expect(evidence[0]?.result.output).toContain(
-            "Retry rejected: tracked checkout cleanliness was not confirmed",
-          );
+          expect(evidence[0]?.result.output).toBe("[withheld: capture-incomplete]");
           expect(prompts[1]).toContain("[withheld: capture-incomplete]");
           expect(prompts[1]).not.toContain("Retry rejected:");
           expect(prompts[1]).not.toContain("tracked checkout cleanliness was not confirmed");
@@ -890,10 +896,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
           firstAttempt: { ok: false, durationMs: 400_000 },
           result: { ok: recovered, firstAttempt: { ok: false, durationMs: 400_000 } },
         });
-        if (scenario === "slow dirty")
-          expect(evidence[0]?.result.output).toContain(
-            "Retry rejected: tracked checkout cleanliness was not confirmed",
-          );
+        if (scenario === "slow dirty") expect(evidence[0]?.result.output).toBe("[withheld: unproven]");
         if (targeted) {
           expect(evidence[0]?.result.targetedRetry).toMatchObject({
             ok: true,
@@ -955,9 +958,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
               blocking: true,
               result: { ok: false, timedOut: true, retryAttempt: { ok: true } },
             });
-            expect(evidence[0]?.result.output).toContain(
-              "Retry rejected: tracked checkout cleanliness was not confirmed",
-            );
+            expect(evidence[0]?.result.output).toBe("[withheld: capture-incomplete]");
           }
           expect(reason).toContain("post-merge gate timed out");
           expect(reason).not.toContain("regressed");
@@ -1230,8 +1231,12 @@ test.each([process.platform, process.platform === "linux" ? "darwin" : "linux", 
         output_tail: before[0]?.output_tail,
       });
       expect(after[0]?.finalized_at).toBeNumber();
-      expect(after[0]?.output_tail).toBe("[withheld: private text]");
-      expect(after[0]?.signature).toBe(ciSignature("test", "[withheld: private text]", "bun test").signature);
+      expect(after[0]?.output_tail).toBe("[withheld: unproven]");
+      expect(after[0]?.signature).toBe(
+        createHash("sha256")
+          .update(ciSignature("test", "[withheld: private text]", "bun test").signature)
+          .digest("hex"),
+      );
       expect(after[0]?.output_tail).not.toContain("1 pass");
       await executeRun(f.deps, run.id, new AbortController().signal);
       expect(f.store.failureObservations().filter((r) => r.purpose === "rebase")).toEqual(after);

@@ -1,6 +1,12 @@
 import type { GateConfig } from "../gates/detect.ts";
 import { type ExecutionHandle, executeGate, localExecutor } from "../gates/executor.ts";
-import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
+import { formatGateOutput } from "../gates/failures.ts";
+import {
+  findGateCounterpart,
+  projectGateDiagnostics,
+  redactGateData,
+  redactGateOutput,
+} from "../gates/output.ts";
 import {
   compareGates,
   confinementFailed,
@@ -13,6 +19,26 @@ import {
 import type { RunContext } from "./context.ts";
 import { InjectedFault, SimulatedTermination } from "./faults.ts";
 import { executionSite } from "./gate-execution.ts";
+
+export const POST_MERGE_REASONS: ReadonlySet<string> = new Set([
+  "worker execution attribution unavailable",
+  "targeted retry returned no check result",
+  "confinement failure",
+  "confirmation timed out",
+  "pass (worker-specific flake)",
+  "failed on coordinator",
+  "coordinator confirmation deadline expired (slot wait or execution)",
+  "setup failures are not retried",
+  "check does not match base configuration",
+  "retry provenance rejected",
+]);
+
+export function postMergeConfirmationText(c: GateComparison, details = false): string {
+  const confirmation = projectGateDiagnostics(c.coordinatorConfirmation, { mode: "outward" });
+  // formatGateOutput verifies the original nested result itself; outward copies no longer hold macs.
+  const result = c.coordinatorConfirmation?.result;
+  return `${c.name} ${details ? "" : "post-merge "}coordinator confirmation (${confirmation?.worker ?? "unknown worker"}): ${confirmation?.reason}${details ? `\n${result ? formatGateOutput(result, 9_000) : ""}` : ""}`;
+}
 
 /** A LAN handle alone does not prove remote execution: failed jobs can finish locally. */
 export function postMergeWorker(ctx: RunContext, handle: ExecutionHandle): string | null | undefined {
@@ -60,7 +86,7 @@ export async function confirmPostMerge(
           c.retryOriginal?.blocking ??
           (c.coordinatorConfirmation?.originalVerdict ? true : comparison.blocking);
         c.retryProvenanceRejected = true;
-        if (c.coordinatorConfirmation) c.coordinatorConfirmation.reason = c.result.output;
+        if (c.coordinatorConfirmation) c.coordinatorConfirmation.reason = "retry provenance rejected";
         await save();
         continue;
       }

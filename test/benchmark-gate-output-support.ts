@@ -1,6 +1,7 @@
 /** Synthetic fixtures and outcome validators shared by the producer benchmark and its regressions. */
 import type { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import type { ProducerOperation } from "../scripts/benchmark-privacy-boundary.ts";
@@ -69,6 +70,11 @@ export function projectionOutcome(
   return released ? "50 released baseline/proven results" : "50 withheld results";
 }
 export function consumerCounters(name: string, value: unknown) {
+  if (name === "gate-concurrent")
+    return {
+      requestedConcurrency: field(value, "requestedConcurrency"),
+      observedOverlap: field(value, "observedOverlap"),
+    };
   if (name === "event-drain")
     return {
       count: 50000,
@@ -224,19 +230,7 @@ export const registry: Record<string, (c: Context) => Promise<Job[]> | Job[]> = 
       source: "detected",
       protectedPaths: [],
     };
-    const run = () => operation(a, "runGates").run?.(cwd, cfg, new AbortController().signal, { env });
-    const read = () => scope(a, "readPolicyScope", { home: env.HOME, environment: env }, run);
-    const confined = () =>
-      scope(a, "confinementScope", { verify: async () => {}, wrap: (cmd: string[]) => cmd }, read);
-    const go = () =>
-      a.gatePrivacyScope
-        ? scope(
-            a,
-            "gatePrivacyScope",
-            { checker: checker(), registry: checker().registry, signer: () => key },
-            confined,
-          )
-        : confined();
+    const go = () => executeWholeGate({ a, cwd, env, checker, key }, cfg);
     return [
       [
         "runGates",
@@ -247,10 +241,55 @@ export const registry: Record<string, (c: Context) => Promise<Job[]> | Job[]> = 
             field(v, "setupOk") &&
               field(v, "checks.length") === 1 &&
               field(v, "checks.0.ok") &&
+              field(v, "checks.0.exitCode") === 0 &&
+              field(v, "checks.0.textPrivacy.output.withheld") === false &&
               field(v, "checks.0.output") === ".".repeat(6000),
           ),
       ],
     ];
+  },
+  "gate-line-8mb": (c) => wholeGate(c, 8000000),
+  "gate-line-32mib": (c) => wholeGate(c, 32 * Mi),
+  "gate-fail-5mib": (c) => wholeGate(c, 5 * Mi, true),
+  "gate-concurrent": async (c) => {
+    const job = (await registry["gate-5mib"]?.(c))?.[0];
+    if (!job?.[2]) throw Error("whole-gate production execution unavailable");
+    const requestedConcurrency = Number(invoke(c, "defaultGateSlots"));
+    const run = async () => {
+      let active = 0,
+        observedOverlap = 0;
+      const emit = EventEmitter.prototype.emit;
+      const tracked = function (
+        this: EventEmitter & { spawnargs?: string[] },
+        event: string | symbol,
+        ...args: unknown[]
+      ) {
+        if (this.spawnargs?.some((arg) => arg.startsWith("limitless-started-"))) {
+          if (event === "spawn") observedOverlap = Math.max(observedOverlap, ++active);
+          if (event === "exit") active--;
+        }
+        return emit.call(this, event, ...args);
+      };
+      EventEmitter.prototype.emit = tracked;
+      try {
+        const gates = await Promise.all(Array.from({ length: requestedConcurrency }, () => job[2]?.()));
+        return { gates, requestedConcurrency, observedOverlap };
+      } finally {
+        EventEmitter.prototype.emit = emit;
+      }
+    };
+    const check = (v: unknown) => {
+      const gates = field(v, "gates") as unknown[];
+      validate(Array.isArray(gates) && gates.length === requestedConcurrency, "concurrent gate count");
+      gates.forEach(job[3]);
+      return validate(
+        field(v, "requestedConcurrency") === requestedConcurrency &&
+          Number(field(v, "observedOverlap")) >= 1 &&
+          Number(field(v, "observedOverlap")) <= requestedConcurrency,
+        "passing concurrent gates; observed child overlap",
+      );
+    };
+    return [["runGates", requestedConcurrency * 5 * Mi, run, check]];
   },
   "gate-cap": ({ a, checker }) => {
     const streams = [".".repeat(4 * Mi), ".".repeat(4 * Mi)];
@@ -387,6 +426,68 @@ export const registry: Record<string, (c: Context) => Promise<Job[]> | Job[]> = 
     return jobs;
   },
 };
+function executeWholeGate({ a, cwd, env, checker, key }: Context, cfg: unknown) {
+  const run = () => operation(a, "runGates").run?.(cwd, cfg, new AbortController().signal, { env });
+  const read = () => scope(a, "readPolicyScope", { home: env.HOME, environment: env }, run);
+  const confined = () =>
+    scope(a, "confinementScope", { verify: async () => {}, wrap: (cmd: string[]) => cmd }, read);
+  return a.gatePrivacyScope
+    ? scope(
+        a,
+        "gatePrivacyScope",
+        { checker: checker(), registry: checker().registry, signer: () => key },
+        confined,
+      )
+    : confined();
+}
+
+/** Each fixture runs through the selected revision's complete gate producer. */
+async function wholeGate(c: Context, bytes: number, failing = false): Promise<Job[]> {
+  let text = ".".repeat(bytes);
+  if (failing) {
+    const block = `sample.test.ts:\n(fail) synthetic\n${"detail line\n".repeat(8)}`;
+    const rows = `${block.repeat(25000)}0 pass\n25000 fail\nRan 25000 tests across 1 file.\n`;
+    text = rows + ".".repeat(bytes - rows.length);
+  }
+  await fs.writeFile(join(c.cwd, "stdout"), text);
+  await fs.writeFile(join(c.cwd, "stderr"), "");
+  const run = () =>
+    executeWholeGate(c, {
+      setup: [],
+      source: "detected",
+      protectedPaths: [],
+      checks: [{ name: "synthetic", run: `cat stdout; cat stderr >&2${failing ? "; exit 1" : ""}` }],
+    });
+  const check = (v: unknown) => {
+    validate(
+      field(v, "setupOk") &&
+        field(v, "checks.length") === 1 &&
+        field(v, "checks.0.ok") === !failing &&
+        field(v, "checks.0.exitCode") === Number(failing),
+      "gate exit status",
+    );
+    if (bytes > 8 * Mi)
+      return validate(
+        field(v, "checks.0.textPrivacy.output.withheld") === true &&
+          field(v, "checks.0.textPrivacy.output.reason") === "capture-cap",
+        "capture-cap withheld",
+      );
+    validate(
+      field(v, "checks.0.textPrivacy.output.withheld") === false &&
+        field(v, "checks.0.output") === ".".repeat(6000),
+      "released under-cap output",
+    );
+    if (failing)
+      validate(
+        field(v, "checks.0.testCoverage.summary.failed") === 25000 &&
+          field(v, "checks.0.testCoverage.passedFiles.length") === 0,
+        "failing Bun summary",
+      );
+    return "released under-cap output";
+  };
+  return [["runGates", bytes, run, check]];
+}
+
 async function scannerLines({ a, cwd, env }: Context, lines: number, units: number): Promise<Job[]> {
   const file = join(cwd, "lines"),
     handle = await fs.open(file, "w"),
@@ -476,8 +577,25 @@ export function describe(name: string, label: string, size: number, api: API) {
     streams: name === "gate-cap" ? 2 : undefined,
     joinSeparator: name === "gate-cap" ? "" : undefined,
     units: name === "gate-cap" ? 8 * Mi : undefined,
-    stdoutBytes: name === "gate-5mib" ? 4 * Mi : null,
-    stderrBytes: name === "gate-5mib" ? Mi : null,
+    stdoutBytes:
+      name === "gate-5mib" || name === "gate-concurrent"
+        ? 4 * Mi
+        : name === "gate-line-8mb"
+          ? 8000000
+          : name === "gate-line-32mib"
+            ? 32 * Mi
+            : name === "gate-fail-5mib"
+              ? 5 * Mi
+              : null,
+    stderrBytes:
+      name === "gate-5mib" || name === "gate-concurrent"
+        ? Mi
+        : name.startsWith("gate-line-") || name === "gate-fail-5mib"
+          ? 0
+          : null,
+    unterminatedLines: name.startsWith("gate-line-") ? 1 : undefined,
+    failureRows: name === "gate-fail-5mib" ? 25000 : undefined,
+    requestedConcurrency: name === "gate-concurrent" ? (api.defaultGateSlots as Fn)() : undefined,
   };
 }
 

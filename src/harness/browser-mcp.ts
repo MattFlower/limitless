@@ -19,6 +19,8 @@ import { validateScratch } from "./scratch.ts";
 import type { AgentSpec } from "./types.ts";
 import { registerBrowserOutput } from "./verifier-captures.ts";
 
+export { BROWSER_TOOLS } from "./browser-tools.ts";
+
 export const BROWSER_MCP_VERSION = "0.0.83";
 const CORE_VERSION = "1.64.0-alpha-1790635538000";
 const FLAGS = [
@@ -30,27 +32,6 @@ const FLAGS = [
   "--executable-path",
   "--block-service-workers",
   "--no-webmcp",
-];
-// The pinned server also exposes RCE, routing and configuration tools. Grant only UI operations.
-export const BROWSER_TOOLS = [
-  "browser_navigate",
-  "browser_navigate_back",
-  "browser_snapshot",
-  "browser_click",
-  "browser_type",
-  "browser_fill_form",
-  "browser_select_option",
-  "browser_press_key",
-  "browser_hover",
-  "browser_drag",
-  "browser_wait_for",
-  "browser_tabs",
-  "browser_close",
-  "browser_resize",
-  "browser_handle_dialog",
-  "browser_console_messages",
-  "browser_network_requests",
-  "browser_take_screenshot",
 ];
 
 // Gaps not yet proven closed on the paths that apply the factory profile; any entry disables the

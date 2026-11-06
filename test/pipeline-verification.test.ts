@@ -12,6 +12,7 @@ import { SimulatedTermination } from "../src/pipeline/faults.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { deferred } from "./evals-support.ts";
 import { approve, holdout, pass, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
+import { privacyTexts } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
 import { findingEvidence } from "./review-support.ts";
 
@@ -126,7 +127,7 @@ afterAll(async () => {
               args.includes("--name-only") &&
               existsSync(join(opts.cwd, "farewell.txt"))
             )
-              throw new Error("inspection unavailable");
+              throw new Error(privacyTexts[0]);
             return originalGit(args, opts, retry);
           })
         : undefined;
@@ -317,8 +318,15 @@ afterAll(async () => {
         .filter((e) => e.message.startsWith("Gate evidence withheld"));
       expect(diagnostics.length).toBeGreaterThan(0);
       const messages = JSON.stringify(diagnostics);
-      expect(messages).toContain(trackedOutput ? "changed-[redacted]" : "provenance could not be confirmed");
+      expect(
+        diagnostics.every(
+          (e) =>
+            e.message ===
+            "Gate evidence withheld: execution provenance could not be confirmed for the checked commit",
+        ),
+      ).toBe(true);
       expect(messages).not.toContain(secret);
+      for (const sentinel of privacyTexts) expect(messages).not.toContain(sentinel);
       if (!state?.worktreePath || !state.reviewedSha) throw new Error("missing reviewed checkout");
       expect(await repos.headSha(state.worktreePath)).toBe(state.reviewedSha);
       expect(terminal).toBe("needs_human");

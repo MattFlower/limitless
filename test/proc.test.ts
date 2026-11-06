@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { Store } from "../src/db/store.ts";
+import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import { compareGates, runGates } from "../src/gates/run.ts";
+import { BunTestCoverage } from "../src/gates/test-coverage.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
 import { privacyLimits } from "../src/util/privacy-boundary.ts";
@@ -24,6 +26,7 @@ import {
   sh,
 } from "../src/util/proc.ts";
 import { processCaptureObserver } from "../src/util/proc-capture.ts";
+import { sanitizationObserver } from "../src/util/terminal-redaction.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { expectProcessStopped } from "./process-support.ts";
 import { test } from "./read-policy-support.ts";
@@ -101,6 +104,82 @@ test("complete capture preserves split UTF-8 and pre-redaction text on both stre
   expect(result.stderr).toBe(result.stdout);
   expect(lines).toEqual(["\uFEFFé€🔑[redacted]", "\uFEFFé€🔑[redacted]", "last", "last"]);
   expect(result.exitCode).toBe(7);
+});
+
+test("captured observers sanitize once with exact whole-line credentials on both streams", async () => {
+  const secret = "synthetic-sanitize-once-credential";
+  const short = "a1short";
+  registerCredential("SANITIZE_ONCE_LONG", secret);
+  registerCredential("SANITIZE_ONCE_SHORT", short);
+  const input = [
+    "\u001b[32mvisible\u001b[0m",
+    secret,
+    short,
+    `prefix-${short}-suffix`,
+    `test/${secret}.test.ts:`,
+    "(pass) synthetic",
+    "(skip) unavailable",
+    "1 pass",
+    "0 fail",
+    "1 skip",
+    "Ran 2 tests across 1 file.",
+    short,
+  ];
+  const expected = [
+    "visible",
+    "[redacted]",
+    "[redacted]",
+    `prefix-${short}-suffix`,
+    "test/[redacted].test.ts:",
+    "(pass) synthetic",
+    "(skip) unavailable",
+    "1 pass",
+    "0 fail",
+    "1 skip",
+    "Ran 2 tests across 1 file.",
+    "[redacted]",
+  ];
+  for (const stream of ["stdout", "stderr"] as const) {
+    const coverage = new BunTestCoverage();
+    const evidence = new RunnerFailureEvidence();
+    const seen: string[] = [];
+    const counts = { stream: 0, full: 0 };
+    const observe = (line: string) => {
+      seen.push(line);
+      coverage.observe(line);
+      evidence.observe(line);
+    };
+    const text = input.join("\n");
+    const split = text.indexOf(secret) + 13;
+    const chunks = [text.slice(0, split), text.slice(split)].map((text) => ({ stream, text }));
+    const result = await sanitizationObserver.run(
+      (kind) => counts[kind]++,
+      () =>
+        withChunks(chunks, () =>
+          captured({
+            redactOutput: true,
+            maxLineLength: 65536,
+            onStdoutLine: observe,
+            onStderrLine: observe,
+          }),
+        ),
+    );
+    expect(counts).toEqual({ stream: 6, full: 0 }); // Two data pushes; end and close flush both streams.
+    expect(seen).toEqual(expected);
+    expect(result.capture).toEqual({
+      provenance: { kind: "complete" },
+      stdout: stream === "stdout" ? text : "",
+      stderr: stream === "stderr" ? text : "",
+    });
+    expect(result[stream]).toBe(["visible", "[redacted]", short, ...expected.slice(3, -1), short].join("\n"));
+    expect(coverage.result()).toEqual({
+      passedFiles: ["test/[redacted].test.ts"],
+      skippedFiles: ["test/[redacted].test.ts"],
+      skippedTestsIncomplete: true,
+      summary: { passed: 1, failed: 0 },
+    });
+    expect(evidence.agrees({ tests: 2, failures: 0, errors: 0, skipped: 1 })).toBe(true);
+  }
 });
 
 test.each(["stdout", "stderr"] as const)("capture refuses malformed %s bytes", async (stream) => {

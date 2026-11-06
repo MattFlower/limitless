@@ -47,6 +47,7 @@ import { fakeConfinement, recordingConfinement } from "./confinement.ts";
 import { deferred } from "./evals-support.ts";
 import { fakeGitHub, respond } from "./github-poller-support.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
+import { provenResult } from "./privacy-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
 import { waitClock } from "./wait-clock.ts";
 
@@ -1307,22 +1308,28 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
   const { pr, head } = await retryLandFixture();
   const credential = "synthetic-targeted-land-secret";
   registerCredential("TARGETED_LAND_SECRET", credential);
-  const fake = fakeLandGates((req, attempt) =>
-    retryRun(
-      req,
-      attempt === 1
-        ? {
-            test: { ...testFailure, output: `initial test failure ${credential}` },
-            other: { ...testFailure, failedFiles: ["README.md"], failedFileTimes: undefined },
-          }
-        : { [req.gates.checks[0]?.name ?? ""]: { output: `targeted pass ${credential}` } },
-    ),
-  );
+  const fake = fakeLandGates(async (req, attempt) => {
+    const run = redactGateData(
+      retryRun(
+        req,
+        attempt === 1
+          ? {
+              test: { ...testFailure, output: `initial test failure ${credential}` },
+              other: { ...testFailure, failedFiles: ["README.md"], failedFileTimes: undefined },
+            }
+          : { [req.gates.checks[0]?.name ?? ""]: { output: `targeted pass ${credential}` } },
+      ),
+    );
+    if (restart) run.checks = await Promise.all(run.checks.map((r) => provenResult(r)));
+    return run;
+  });
   ci = () => null;
   const q = queue({ gateExecutor: fake.executor });
   const entry = await q.request({ target: pr.run.id });
   await waitFor(() => store.getLandEntry(entry.id)?.state === "waiting_ci");
-  const summary = `flaky: test (${retryFile}); other (README.md)`;
+  const summary = restart
+    ? `flaky: test (${retryFile}); other (README.md)`
+    : "flaky: test (files withheld); other (files withheld)";
   expect(store.getLandEntry(entry.id)?.reason).toBe(summary);
   expect(store.failureObservations()).toHaveLength(2);
   expect(
@@ -1350,6 +1357,7 @@ test.each([false, true])("targeted land retries record flakes through CI (restar
     `# targeted retry\n\n$ prepare\npassed\n\n$ ${retryCommand}\ntargeted pass [redacted]`,
   );
   expect(log).not.toContain(credential);
+  expect(log).toContain(summary);
   if (restart) {
     await q.stop();
     queue({ gateExecutor: fake.executor });
@@ -1514,7 +1522,7 @@ test.each([false, true])("LAN land retry in a fresh checkout (setup fails: %s)",
   } else {
     expect(completed).toMatchObject({
       state: "landed",
-      reason: `flaky: test (${retryFile}); merged ${head.slice(0, 12)}`,
+      reason: `flaky: test (files withheld); merged ${head.slice(0, 12)}`,
     });
     expect(log).toContain("(pass) retry dependency");
     expect(log.indexOf(`\n$ ${setup}`, log.indexOf("# targeted retry"))).toBeLessThan(
@@ -1733,7 +1741,7 @@ test("a completed attributed test timeout with a redacted command lands after on
     const landed = store.getLandEntry(entry.id);
     expect(landed).toMatchObject({
       state: "landed",
-      reason: `flaky: test (${retryFile}); merged ${head.slice(0, 12)}`,
+      reason: `flaky: test (files withheld); merged ${head.slice(0, 12)}`,
     });
     expect(fake.requests.map((r) => r.gates.checks.map((c) => c.run))).toEqual([
       [command, otherTestCommand, "lint"],
@@ -1811,7 +1819,7 @@ test("flaky land diagnostics strip formatting before credential redaction", asyn
   const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
   await settle();
   const landed = store.getLandEntry(entry.id);
-  const reason = `flaky: [redacted] (${retryFile})`;
+  const reason = "flaky: [redacted] (files withheld)";
   expect(landed).toMatchObject({ state: "landed", reason: `${reason}; merged ${head.slice(0, 12)}` });
   const warnings = store.listEvents(pr.run.id).filter((e) => e.level === "warn");
   expect(warnings).toMatchObject([{ message: `Land ${entry.id} ${reason}` }]);
