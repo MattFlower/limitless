@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { CiFailure } from "../core/types.ts";
 import {
   classifyObservation,
@@ -5,7 +6,7 @@ import {
   type FailureHistory,
   observationHistory,
 } from "../gates/failure-class.ts";
-import { redactGateOutput } from "../gates/output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import type { GateComparison } from "../gates/run.ts";
 import type { CiTestEvidence } from "../integrations/ci-test-evidence.ts";
 import type { Store } from "./store.ts";
@@ -25,6 +26,7 @@ export interface FailureObservation {
   phase: "setup" | "check";
   name: string;
   command: string;
+  command_digest?: string | null;
   // Local only: D1a must map location to a placeholder before anything is published.
   location: string | null;
   os: string | null;
@@ -44,6 +46,8 @@ export interface FailureObservation {
   interim: number;
 }
 export type ObservationFilter = { repo?: string; since?: number; class?: FailureClass; finalized?: boolean };
+export const observationCommandDigest = (command: string) =>
+  createHash("sha256").update(redactGateOutput(command)).digest("hex");
 export class FailureObservations {
   constructor(private readonly store: Store) {}
   /** Eligibility evidence is not a successful retry: retain the failed execution and no_retry history. */
@@ -140,7 +144,10 @@ export class FailureObservations {
         (c) =>
           c.verdict !== "not_run" &&
           redactGateOutput(c.name) === row.name &&
-          redactGateOutput((c.firstAttempt ?? c.result.firstAttempt ?? c.result).command) === row.command,
+          (row.command_digest == null
+            ? redactGateOutput((c.firstAttempt ?? c.result.firstAttempt ?? c.result).command) === row.command
+            : observationCommandDigest((c.firstAttempt ?? c.result.firstAttempt ?? c.result).command) ===
+              row.command_digest),
       );
       const history = completion
         ? observationHistory(
@@ -149,7 +156,13 @@ export class FailureObservations {
               (row.purpose === "initial" || (row.purpose === "rebase" && !c?.coordinatorConfirmation)),
           )
         : "interrupted";
-      const cls = classifyObservation({ ...row, history }, c);
+      const cls = classifyObservation(
+        { ...row, history },
+        c && {
+          ...c,
+          coordinatorConfirmation: projectGateDiagnostics(c.coordinatorConfirmation, { mode: "durable" }),
+        },
+      );
       this.store.db
         .query(
           "UPDATE failure_observations SET class=?,reason=?,history=?,finalized_at=?,interim=? WHERE id=?",

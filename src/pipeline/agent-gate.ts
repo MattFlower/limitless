@@ -185,12 +185,7 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
         let executionId = "";
         let nonReusable: string | undefined;
         const confirm = (provenance: GateRun) => {
-          let reason: string | undefined;
-          if (!provenance.sha || !provenance.treeHash) reason = "snapshot provenance could not be confirmed";
-          else if (provenance.sha !== head || provenance.treeHash !== tree)
-            reason = `the snapshot changed during the gate${provenance.provenanceError ? `; ${provenance.provenanceError}` : ""}`;
-          else if (provenance.trackedClean !== true)
-            reason = provenance.provenanceError ?? "snapshot provenance could not be confirmed";
+          const reason = snapshotRefusal(provenance, head, tree);
           if (reason) {
             nonReusable ||= reason;
             ctx.log(redactGateOutput(`Result is not reusable because ${reason}.`), "warn");
@@ -271,4 +266,10 @@ export async function runAgentGate(ctx: RunContext, cwd: string, sessionSignal: 
       }),
     )();
   });
+}
+
+export function snapshotRefusal(provenance: GateRun, head: string, tree: string): string | undefined {
+  if (!provenance.sha || !provenance.treeHash) return "snapshot provenance could not be confirmed";
+  if (provenance.sha !== head || provenance.treeHash !== tree) return "the snapshot changed during the gate";
+  if (provenance.trackedClean !== true) return "snapshot provenance could not be confirmed";
 }

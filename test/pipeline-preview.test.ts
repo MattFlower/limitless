@@ -1,9 +1,10 @@
-import { describe, expect } from "bun:test";
+import { describe, expect, spyOn } from "bun:test";
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { type GateExecutor, gateProvenance, localExecutor } from "../src/gates/executor.ts";
 import type { GateRun } from "../src/gates/run.ts";
+import * as gateRunner from "../src/gates/run.ts";
 import { browserCache, browserMcp } from "../src/harness/browser-mcp.ts";
 import { readPolicyScope } from "../src/harness/read-policy.ts";
 import type { AgentSpec } from "../src/harness/types.ts";
@@ -14,6 +15,12 @@ import { BROWSER_INCOMPLETE, ENVIRONMENT_BLOCKED } from "../src/pipeline/verific
 import { sh } from "../src/util/proc.ts";
 import { fakeBrowserCache } from "./browser-mcp-support.ts";
 import { deferred } from "./evals-support.ts";
+import {
+  assertSetupDiagnostics,
+  assertSetupError,
+  setupFailure,
+  setupKinds,
+} from "./gate-setup-privacy-support.ts";
 import {
   approve,
   type Handler,
@@ -929,3 +936,52 @@ test.each(["review", "verify", "cancel"] as const)(
     }
   },
 );
+
+test.each([...setupKinds])("preview setup caller projects failure diagnostics: %s", async (kind) => {
+  await previewFixture();
+  writeFileSync(
+    join(repoDir, ".limitless.toml"),
+    readFileSync(join(repoDir, ".limitless.toml"), "utf8").replace(
+      "[gates]",
+      '[gates]\nsetup = ["echo ready"]',
+    ),
+  );
+  await sh(["git", "add", "."], { cwd: repoDir });
+  await sh(["git", "commit", "-qm", "preview setup"], { cwd: repoDir });
+  const f = start((agent) => {
+    const role = roleOf(agent);
+    if (role === "triage") return { structured: triage() };
+    if (role === "spec") return { structured: spec };
+    if (role === "holdout") return { structured: holdout };
+    if (role === "review") return { structured: approve };
+    if (role === "verify") return { structured: pass };
+    return { files: { "ui/change.txt": "visible\n" } };
+  });
+  await f.stop();
+  f.deps.faults = { "stage:preview:before": { action: "kill" } };
+  const run = await f.createRun({ repo: repoDir, prompt: "Change the UI", profile: "standard" });
+  const execute = () => executeRun(f.deps, run.id, new AbortController().signal);
+  expect(await execute()).toBe("running");
+  f.deps.faults = undefined;
+  const failed = await setupFailure(kind);
+  const setup = spyOn(gateRunner, "runLocalGates").mockResolvedValue(failed);
+  try {
+    expect(await execute()).toBe("needs_human");
+    const preview = f.store
+      .listStages(run.id)
+      .find((stage) => stage.name === "preview" && stage.status === "failed");
+    assertSetupError(preview?.summary, kind, "Preview setup failed: $ ", "setup\nNo setup result");
+    const errors = f.store
+      .listEvents(run.id, { limit: Number.MAX_SAFE_INTEGER })
+      .filter((event) => event.level === "error");
+    expect(errors.map((event) => event.message)).toContain(`Run needs a human: ${preview?.summary}`);
+    assertSetupDiagnostics(JSON.stringify(errors), kind);
+    expect(setup).toHaveBeenCalledTimes(1);
+    expect(setup.mock.calls[0]?.slice(0, 2)).toEqual([
+      f.store.getRunState<RunState>(run.id)?.worktreePath,
+      expect.objectContaining({ setup: ["echo ready"], checks: [] }),
+    ]);
+  } finally {
+    setup.mockRestore();
+  }
+});

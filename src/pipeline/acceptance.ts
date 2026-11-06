@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { globToRegex } from "../gates/audit.ts";
 import { detectGates, readDocs, readRetryFiles } from "../gates/detect.ts";
-import { redactGateOutput } from "../gates/output.ts";
+import { setupFailureMessage } from "../gates/output.ts";
 import { runLocalGates } from "../gates/run.ts";
 import {
   addDetachedWorktree,
@@ -237,10 +237,7 @@ export async function prepareAcceptance(ctx: RunContext): Promise<void> {
       const setup = await runLocalGates(path, { ...gates, checks: [] }, ctx.signal, { holder: ctx.run.id });
       ctx.checkCancelled();
       const failed = setup.setup.find((result) => !result.ok);
-      if (!setup.setupOk)
-        throw new Error(
-          redactGateOutput(`Acceptance setup failed: $ ${failed?.command}\n${failed?.output ?? ""}`),
-        );
+      if (!setup.setupOk) throw new Error(setupFailureMessage("Acceptance setup failed: $ ", failed, ""));
     }
     acceptance.setupDone = true;
     await ctx.save("acceptance-setup");

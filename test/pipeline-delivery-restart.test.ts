@@ -22,6 +22,7 @@ import {
   waitFor,
 } from "./pipeline-support.ts";
 import { postMergeWorkerFixture } from "./post-merge-worker-support.ts";
+import { privacyTexts } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
 
 let home: string;
@@ -356,7 +357,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(JSON.stringify(saved)).not.toContain(secret);
         if (savedOutcome === "legacy fail" && saved?.result) {
           delete saved.result.workers;
-          for (const c of saved.result.comparison) delete c.postMergeWorker;
+          for (const c of saved.result.comparison) {
+            delete c.postMergeWorker;
+            if (c.coordinatorConfirmation)
+              c.coordinatorConfirmation.reason = privacyTexts[0] ?? "legacy reason";
+          }
           reopened.setRunState(run.id, state);
         }
         const check = saved?.result?.comparison[0];
@@ -378,6 +383,21 @@ describe("pipeline (fake agents, real git + gates)", () => {
         expect(fixture.local).toHaveLength(outcome === "confinement" ? 0 : 1);
         expect(fixture.remote).toHaveLength(2);
         expect(reopened.getRunState<RunState>(run.id)?.postMergeGates).toEqual(saved);
+        if (savedOutcome === "legacy fail") {
+          const rejection = reopened.getRunState<RunState>(run.id)?.postMergeRejection?.reason ?? "";
+          const log = reopened
+            .listEvents(run.id)
+            .filter((e) => e.message.includes("post-merge coordinator confirmation"))
+            .map((e) => e.message)
+            .join("\n");
+          expect(rejection).toContain("[withheld: unproven]");
+          expect(log).toContain("[withheld: unproven]");
+          for (const sentinel of privacyTexts) {
+            expect(rejection).not.toContain(sentinel);
+            expect(log).not.toContain(sentinel);
+            expect(reopened.getRun(run.id)?.error ?? "").not.toContain(sentinel);
+          }
+        }
         expect(JSON.stringify(reopened.getRunState<RunState>(run.id)?.postMergeGates)).not.toContain(secret);
         expect(reopened.getArtifact(run.id, "gates-rebase-0.json")).not.toContain(secret);
         if (outcome === "fail") {
@@ -388,7 +408,8 @@ describe("pipeline (fake agents, real git + gates)", () => {
         }
         if (outcome === "confinement") {
           expect(confinementChecks).toBe(1);
-          expect(reopened.getRun(run.id)?.error).toContain(confirmation?.reason ?? "missing reason");
+          expect(reopened.getRun(run.id)?.error).toContain("[withheld: unproven]");
+          expect(reopened.getRun(run.id)?.error).not.toContain(confirmation?.reason ?? "missing reason");
         }
       } finally {
         persist.mockRestore();

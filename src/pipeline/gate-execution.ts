@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import type { StageName } from "../core/types.ts";
-import type { FailureObservation } from "../db/failure-observations.ts";
+import { type FailureObservation, observationCommandDigest } from "../db/failure-observations.ts";
 import type { Store } from "../db/store.ts";
 import { hostLoadPerCore, WorkerStore } from "../db/workers.ts";
 import type { GateConfig } from "../gates/detect.ts";
@@ -14,7 +15,7 @@ import {
   replayable,
 } from "../gates/executor.ts";
 import { lanExecutor } from "../gates/lan.ts";
-import { redactGateOutput } from "../gates/output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import type { GateHooks, GateResult, GateRun } from "../gates/run.ts";
 import { confinementFailed, gateEnv } from "../gates/run.ts";
 import { checkoutCommitted, headSha } from "../git/repos.ts";
@@ -80,11 +81,13 @@ export function observeGateFailures(
         const name = redactGateOutput(r.name),
           command = redactGateOutput(r.command);
         const output = redactGateOutput(r.output).slice(-6000);
+        const safe = projectGateDiagnostics(r, { mode: "durable" });
         store.observations.insert({
           ...identity,
           phase,
           name,
-          command,
+          command: safe.command ?? "[withheld]",
+          command_digest: observationCommandDigest(r.command),
           location: location === null ? null : redactGateOutput(location),
           os,
           load_per_core: load,
@@ -93,9 +96,11 @@ export function observeGateFailures(
           timed_out: Number(!!r.timedOut),
           confinement: Number(confinement),
           duration_ms: r.durationMs,
-          failed_files: JSON.stringify((r.failedFiles ?? []).map(redactGateOutput)),
-          output_tail: output,
-          signature: ciSignature(name, output, command).signature,
+          failed_files: JSON.stringify(safe.failedFiles ?? []),
+          output_tail: safe.output.slice(-6000),
+          signature: createHash("sha256")
+            .update(ciSignature(name, output, command).signature)
+            .digest("hex"),
           setup_eligible: Number((phase === "setup" || r.exitCode === 127) && !confinement),
         });
       }

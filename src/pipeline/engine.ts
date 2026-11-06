@@ -26,9 +26,13 @@ import {
 } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
 import { type ExecutionHandle, gateProvenance } from "../gates/executor.ts";
-import { formatGateOutput } from "../gates/failures.ts";
 import { canonicalTestFile } from "../gates/junit.ts";
-import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
+import {
+  findGateCounterpart,
+  redactGateData,
+  redactGateOutput,
+  setupFailureMessage,
+} from "../gates/output.ts";
 import { loadPrivateStrings, PrivateError, privateStringsDigest, redactPrivate } from "../gates/private.ts";
 import { checkPublicationText, publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import {
@@ -146,7 +150,7 @@ import {
   discreetModelText,
   hasFactoryMark,
 } from "./markers.ts";
-import { confirmPostMerge, postMergeWorker } from "./post-merge-confirmation.ts";
+import { confirmPostMerge, postMergeConfirmationText, postMergeWorker } from "./post-merge-confirmation.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
   formatAuditFeedback,
@@ -299,11 +303,15 @@ async function executeRunOnce(
       // Guards can also interrupt a write in failure handling itself.
       const control = selectClaimControl([error]);
       if (!(control instanceof ClaimWaitError || control instanceof ClaimLostError)) throw error;
-      mapClaimInterruption(deps.store, runId, control);
+      mapClaimInterruption(deps.store, runId, control, undefined, checkpointer);
       return deps.store.getRun(runId)?.status ?? "failed";
     },
   );
-  if (TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued"))
+  // A shared run's deferred terminal decision (D2) is final locally; only its publication is pending.
+  if (
+    TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued") ||
+    (ctx.execution.shared && deps.store.checkpointRecord(runId)?.terminal)
+  )
     await removeIterationRefs(deps.cfg.paths, repo, runId).catch((error: unknown) =>
       ctx.log(`Iteration cleanup deferred to GC: ${(error as Error).message}`, "warn"),
     );
@@ -447,7 +455,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   } catch (e) {
     const control = executionInterruption(ctx, e, signal);
     if (control) {
-      mapClaimInterruption(deps.store, runId, control);
+      mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
       return deps.store.getRun(runId)?.status ?? "failed";
     }
     const terminationError = processScope.getStore()?.terminationError;
@@ -494,8 +502,13 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
       const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
       if (!shutdown) clearGitHubWait(ctx.state);
-      // Terminal local cancellation reporting does not require an open lease window.
-      (ctx.execution.shared && !shutdown ? localCheckpointer(deps.store) : ctx.checkpointer).writeRun(
+      // Cancellation can defer publication without requiring an open execution lease window.
+      const checkpointer =
+        ctx.execution.shared && !shutdown
+          ? (deps.checkpointer ?? localCheckpointer(deps.store))
+          : ctx.checkpointer;
+      const writeCancellation = checkpointer.writeRun.bind(
+        checkpointer,
         runId,
         {
           status,
@@ -504,6 +517,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         },
         state ?? undefined,
       );
+      if (ctx.execution.shared && !shutdown) claimScope.exit(writeCancellation);
+      else writeCancellation();
       ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
       return status;
     };
@@ -608,7 +623,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       } catch (err) {
         const control = executionInterruption(ctx, err, signal);
         if (control) {
-          mapClaimInterruption(deps.store, runId, control);
+          mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
           return deps.store.getRun(runId)?.status ?? "failed";
         }
         if (err instanceof CancelledError || signal.aborted) return cancelled();
@@ -645,7 +660,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       } catch (err) {
         const control = executionInterruption(ctx, err, signal);
         if (control) {
-          mapClaimInterruption(deps.store, runId, control);
+          mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
           return deps.store.getRun(runId)?.status ?? "failed";
         }
         if (
@@ -1785,7 +1800,7 @@ async function oneRound(
               reusable = false;
               ctx.log(
                 redactGateOutput(
-                  `Gate evidence withheld: ${run.provenanceError ?? "execution provenance could not be confirmed for the checked commit"}`,
+                  "Gate evidence withheld: execution provenance could not be confirmed for the checked commit",
                 ),
                 "warn",
               );
@@ -2497,9 +2512,7 @@ async function oneRound(
               if (!setup.setupOk) {
                 const failed = setup.setup.find((result) => !result.ok);
                 throw new ReaderSetupError(
-                  redactGateOutput(
-                    `Preview setup failed: $ ${failed?.command ?? "setup"}\n${failed?.failures ?? ""}\n${failed?.output ?? "No setup result"}`,
-                  ),
+                  setupFailureMessage("Preview setup failed: $ ", failed, "No setup result"),
                 );
               }
               localSetupReady = true;
@@ -3932,11 +3945,7 @@ async function mergeForDelivery(
         ctx.checkCancelled();
         for (const c of comparison) {
           const confirmation = c.coordinatorConfirmation;
-          if (confirmation)
-            ctx.log(
-              `${c.name} post-merge coordinator confirmation (${confirmation.worker ?? "unknown worker"}): ${confirmation.reason}`,
-              "warn",
-            );
+          if (confirmation) ctx.log(postMergeConfirmationText(c), "warn");
         }
         await mergeGit(cwd, ["reset", "--hard", "HEAD"]);
         await mergeGit(cwd, ["clean", "-fdq"]);
@@ -3959,10 +3968,7 @@ async function mergeForDelivery(
             (timedOut ? "post-merge gate timed out" : "post-merge gates regressed") +
               comparison
                 .filter((c) => c.blocking && c.coordinatorConfirmation)
-                .map((c) => {
-                  const confirmation = c.coordinatorConfirmation;
-                  return `\n${c.name} coordinator confirmation (${confirmation?.worker ?? "unknown worker"}): ${confirmation?.reason}\n${confirmation?.result ? formatGateOutput(confirmation.result, 9_000) : ""}`;
-                })
+                .map((c) => `\n${postMergeConfirmationText(c, true)}`)
                 .join(""),
           );
         return { summary: `${comparison.length} post-merge checks ok`, value: undefined };

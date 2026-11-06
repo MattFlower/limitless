@@ -6,15 +6,19 @@ import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
 import { WorkerStore } from "../src/db/workers.ts";
 import { agentTestLease } from "../src/gates/agent-tests.ts";
+import * as gateRunner from "../src/gates/run.ts";
+import * as repos from "../src/git/repos.ts";
 import { type FakeReply, fakeHarness } from "../src/harness/fake.ts";
 import type { AgentResult, AgentSpec } from "../src/harness/types.ts";
 import type { AgentCall, AgentExecutor } from "../src/pipeline/agent-executor.ts";
+import { prepareReaderCheckout } from "../src/pipeline/agent-executor.ts";
 import { type EngineDeps, type InvokeOptions, NeedsHumanError, RunContext } from "../src/pipeline/context.ts";
 import type { FaultPlan } from "../src/pipeline/faults.ts";
 import { lanAgentExecutor } from "../src/pipeline/lan-agent.ts";
 import { ProviderTracker } from "../src/router/providers.ts";
 import { Router } from "../src/router/router.ts";
 import { registerCredential } from "../src/util/proc.ts";
+import { assertSetupError, setupFailure, setupKinds, thrownMessage } from "./gate-setup-privacy-support.ts";
 import { models, policy, providers } from "./pipeline-support.ts";
 
 const cleanup: (() => void)[] = [];
@@ -629,4 +633,27 @@ test("structured authentication rejection without diagnostics retains a usable r
   expect(f.store.listInvocations(f.run.id)).toMatchObject([
     { status: "unavailable", error: "authentication failed" },
   ]);
+});
+
+test.each([...setupKinds])("reader setup caller projects failure diagnostics: %s", async (kind) => {
+  const f = fixture();
+  const failed = await setupFailure(kind);
+  const execute = spyOn(gateRunner, "runLocalGates").mockResolvedValue(failed);
+  const discard = spyOn(repos, "discardChanges").mockResolvedValue(false);
+  try {
+    const message = await thrownMessage(prepareReaderCheckout(f.cwd, ["install"], f.context.signal));
+    assertSetupError(message, kind, "Reader setup failed: $ ", "undefined\nundefined");
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith(
+      f.cwd,
+      { setup: ["install"], checks: [], source: ".limitless.toml", protectedPaths: [] },
+      f.context.signal,
+    );
+    expect(discard).toHaveBeenCalledTimes(1);
+    expect(discard).toHaveBeenCalledWith(f.cwd);
+    expect(f.calls).toHaveLength(0);
+  } finally {
+    execute.mockRestore();
+    discard.mockRestore();
+  }
 });
