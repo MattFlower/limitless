@@ -170,8 +170,8 @@ export class Scheduler {
       const done = promise
         .catch((e) => {
           if (rt && this.stopping && controller.signal.aborted) return;
-          if (e instanceof ClaimWaitError || e instanceof ClaimLostError) {
-            mapClaimInterruption(this.deps.store, run.id, e, rt?.clock.now(), this.checkpointer);
+          if (rt && (e instanceof ClaimWaitError || e instanceof ClaimLostError)) {
+            mapClaimInterruption(this.deps.store, run.id, e, rt.clock.now(), this.checkpointer);
             return;
           }
           this.checkpointer.writeRun(run.id, {
