@@ -70,6 +70,7 @@ export function projectionOutcome(
   return released ? "50 released baseline/proven results" : "50 withheld results";
 }
 export function consumerCounters(name: string, value: unknown) {
+  if (name === "gate-line-32mib") return field(value, "drain");
   if (name === "gate-concurrent")
     return {
       requestedConcurrency: field(value, "requestedConcurrency"),
@@ -451,13 +452,25 @@ async function wholeGate(c: Context, bytes: number, failing = false): Promise<Jo
   }
   await fs.writeFile(join(c.cwd, "stdout"), text);
   await fs.writeFile(join(c.cwd, "stderr"), "");
-  const run = () =>
+  const execute = () =>
     executeWholeGate(c, {
       setup: [],
       source: "detected",
       protectedPaths: [],
       checks: [{ name: "synthetic", run: `cat stdout; cat stderr >&2${failing ? "; exit 1" : ""}` }],
     });
+  const run = async () => {
+    const drain = { peakQueued: 0, largestChunk: 0, pausedReceipts: 0 };
+    const observe = (e: { queued: number; received: number; paused: boolean }) => {
+      drain.peakQueued = Math.max(drain.peakQueued, e.queued);
+      drain.largestChunk = Math.max(drain.largestChunk, e.received);
+      if (e.paused && e.received) drain.pausedReceipts++;
+    };
+    const value = await (c.a.processDrainObserver
+      ? scope(c.a, "processDrainObserver", { observe }, execute)
+      : execute());
+    return { ...Object(value), ...(c.a.processDrainObserver ? { drain } : {}) };
+  };
   const check = (v: unknown) => {
     validate(
       field(v, "setupOk") &&
