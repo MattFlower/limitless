@@ -303,11 +303,15 @@ async function executeRunOnce(
       // Guards can also interrupt a write in failure handling itself.
       const control = selectClaimControl([error]);
       if (!(control instanceof ClaimWaitError || control instanceof ClaimLostError)) throw error;
-      mapClaimInterruption(deps.store, runId, control);
+      mapClaimInterruption(deps.store, runId, control, undefined, checkpointer);
       return deps.store.getRun(runId)?.status ?? "failed";
     },
   );
-  if (TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued"))
+  // A shared run's deferred terminal decision (D2) is final locally; only its publication is pending.
+  if (
+    TERMINAL_STATUSES.includes(deps.store.getRun(runId)?.status ?? "queued") ||
+    (ctx.execution.shared && deps.store.checkpointRecord(runId)?.terminal)
+  )
     await removeIterationRefs(deps.cfg.paths, repo, runId).catch((error: unknown) =>
       ctx.log(`Iteration cleanup deferred to GC: ${(error as Error).message}`, "warn"),
     );
@@ -451,7 +455,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   } catch (e) {
     const control = executionInterruption(ctx, e, signal);
     if (control) {
-      mapClaimInterruption(deps.store, runId, control);
+      mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
       return deps.store.getRun(runId)?.status ?? "failed";
     }
     const terminationError = processScope.getStore()?.terminationError;
@@ -498,8 +502,13 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       // An interrupted save can leave in-memory state ahead of its durable checkpoint.
       const state = shutdown ? undefined : clearGitHubWait(deps.store.getRunState<RunState>(runId));
       if (!shutdown) clearGitHubWait(ctx.state);
-      // Terminal local cancellation reporting does not require an open lease window.
-      (ctx.execution.shared && !shutdown ? localCheckpointer(deps.store) : ctx.checkpointer).writeRun(
+      // Cancellation can defer publication without requiring an open execution lease window.
+      const checkpointer =
+        ctx.execution.shared && !shutdown
+          ? (deps.checkpointer ?? localCheckpointer(deps.store))
+          : ctx.checkpointer;
+      const writeCancellation = checkpointer.writeRun.bind(
+        checkpointer,
         runId,
         {
           status,
@@ -508,6 +517,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
         },
         state ?? undefined,
       );
+      if (ctx.execution.shared && !shutdown) claimScope.exit(writeCancellation);
+      else writeCancellation();
       ctx.log(reason ?? (shutdown ? "Daemon shutdown; run re-queued to resume" : "Run cancelled"), "warn");
       return status;
     };
@@ -612,7 +623,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       } catch (err) {
         const control = executionInterruption(ctx, err, signal);
         if (control) {
-          mapClaimInterruption(deps.store, runId, control);
+          mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
           return deps.store.getRun(runId)?.status ?? "failed";
         }
         if (err instanceof CancelledError || signal.aborted) return cancelled();
@@ -649,7 +660,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       } catch (err) {
         const control = executionInterruption(ctx, err, signal);
         if (control) {
-          mapClaimInterruption(deps.store, runId, control);
+          mapClaimInterruption(deps.store, runId, control, undefined, deps.checkpointer);
           return deps.store.getRun(runId)?.status ?? "failed";
         }
         if (

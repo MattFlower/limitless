@@ -3,14 +3,15 @@ import type { Store } from "../db/store.ts";
 import { githubWait } from "../git/github-wait.ts";
 import { ClaimLostError, type ClaimWaitError } from "../integrations/claim-errors.ts";
 import { finalizeRecordedCancellation } from "./cancellation.ts";
-import { initialRunState, localCheckpointer, type RunState } from "./context.ts";
+import { type Checkpointer, initialRunState, localCheckpointer, type RunState } from "./context.ts";
 
-/** Stop this execution locally, without publishing a shared cancellation or checkpoint. */
+/** Stop execution, deferring ordinary shared cancellation but keeping confirmed loss local. */
 export function mapClaimInterruption(
   store: Store,
   runId: string,
   error: ClaimWaitError | ClaimLostError,
   now = Date.now(),
+  checkpointer: Checkpointer = localCheckpointer(store),
 ): void {
   store.transaction(() => {
     const lost = error instanceof ClaimLostError;
@@ -21,7 +22,7 @@ export function mapClaimInterruption(
           error: lost ? "interrupted: claim lost" : "interrupted: claim wait",
           finishedAt: now,
         });
-    if (finalizeRecordedCancellation(store, runId, localCheckpointer(store))) return;
+    if (finalizeRecordedCancellation(store, runId, lost ? localCheckpointer(store) : checkpointer)) return;
     const run = store.getRun(runId);
     if (!run || TERMINAL_STATUSES.includes(run.status)) return;
     const state = store.getRunState<Partial<RunState>>(runId) ?? initialRunState(run);

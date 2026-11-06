@@ -470,11 +470,12 @@ test("client IO clears scope through awaits and ambiguous-result readback", asyn
   ]);
 });
 
-test("source boundaries restrict claim scopes to execution, observer validation and explicit exits", async () => {
+test("source boundaries restrict claim scopes to execution, terminal publication, observer validation and explicit exits", async () => {
   const execution = "src/pipeline/run-claim.ts";
   const engine = "src/pipeline/engine.ts";
   const observer = "src/integrations/claim-projection.ts";
-  const scoped = new Set([execution, engine, observer]);
+  const authority = "src/pipeline/shared-authority.ts";
+  const scoped = new Set([execution, engine, observer, authority]);
   const allowed = new Set([
     "src/integrations/claim-ref.ts",
     "src/integrations/leases.ts",
@@ -495,19 +496,20 @@ test("source boundaries restrict claim scopes to execution, observer validation 
       ]);
       continue;
     }
-    expect(source).not.toMatch(/\bbindClaim\b/);
+    if (/\bbindClaim\b/.test(source)) expect(path).toBe(authority);
     if (/\bbindRunClaim\b/.test(source)) {
       expect(scoped.has(path)).toBe(true);
       binders.push(path);
     }
     if (path !== execution && path !== engine) {
       expect(source).not.toMatch(/\brenewRunClaim\b/);
-      if (path !== observer) expect(source).not.toMatch(/claimScope\.run\b|\bvalidateRunClaim\b/);
+      if (path !== observer && path !== authority) expect(source).not.toMatch(/claimScope\.run\b/);
+      if (path !== observer) expect(source).not.toMatch(/\bvalidateRunClaim\b/);
       const runtime =
         path === "src/pipeline/context.ts"
           ? source.replace('import type { RunClaim } from "./run-claim.ts";', "")
           : source;
-      expect(runtime).not.toContain('from "./run-claim.ts"');
+      if (path !== authority) expect(runtime).not.toContain('from "./run-claim.ts"');
     }
     if (/\bclaimGuard\b/.test(source))
       expect([
@@ -521,14 +523,14 @@ test("source boundaries restrict claim scopes to execution, observer validation 
         observer,
         execution,
         engine,
+        authority,
       ]).toContain(path);
     if (/\bhasClaimScope\b/.test(source)) expect(path).toBe("src/pipeline/engine.ts");
     if (/\bclaimScope\b/.test(source)) {
       expect(allowed.has(path)).toBe(true);
       const operation = scoped.has(path) ? "claimScope.run" : "claimScope.exit";
-      expect(source.replace(/import .*claimScope.*\n/, "").replaceAll(operation, "")).not.toMatch(
-        /\bclaimScope\b/,
-      );
+      const body = source.replace(/import .*claimScope.*\n/, "").replaceAll(operation, "");
+      expect(path === engine ? body.replaceAll("claimScope.exit", "") : body).not.toMatch(/\bclaimScope\b/);
       references.push(path);
     }
   }

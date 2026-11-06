@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { Store } from "../src/db/store.ts";
 import { githubWait } from "../src/git/github-wait.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { mapClaimInterruption } from "../src/pipeline/claim-interruption.ts";
+import { localCheckpointer } from "../src/pipeline/context.ts";
 
 let dir: string;
 let store: Store;
@@ -153,8 +154,17 @@ test.each(TERMINAL_STATUSES.flatMap((status) => [false, true].map((loss) => ({ s
 test.each([false, true])("recorded user cancellation finalizes with invocation cleanup, loss=%s", (loss) => {
   const { run, state } = fixture();
   const assertClosed = interruptedInvocations(run.id);
+  const checkpointer = localCheckpointer(store);
+  const write = spyOn(checkpointer, "writeRun");
   store.updateRun(run.id, { error: "cancelled by owner", finishedAt: 55 });
-  mapClaimInterruption(store, run.id, loss ? new ClaimLostError() : new ClaimWaitError("lease"), 99);
+  mapClaimInterruption(
+    store,
+    run.id,
+    loss ? new ClaimLostError() : new ClaimWaitError("lease"),
+    99,
+    checkpointer,
+  );
+  expect(write).toHaveBeenCalledTimes(loss ? 0 : 1);
   assertClosed(loss);
   expect(store.getRun(run.id)).toMatchObject({
     status: "cancelled",
