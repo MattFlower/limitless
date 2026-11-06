@@ -29,6 +29,7 @@ import {
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
 import { extractFailures, FailureExcerpts, formatGateOutput } from "../src/gates/failures.ts";
 import { readJUnitSkips } from "../src/gates/junit.ts";
+import { redactGateOutput } from "../src/gates/output.ts";
 import {
   canonical,
   checkPrivateText,
@@ -3240,8 +3241,10 @@ test.each([
       ...rows,
       ...skipSummary,
     ]) {
-      coverage.observe(line);
-      runner.observe(line);
+      // Reproduce the runner's sanitized observer input, including the colored recap.
+      const sanitized = redactGateOutput(line);
+      coverage.observe(sanitized);
+      runner.observe(sanitized);
     }
     expect(runner.agrees(parsed?.counts)).toBe(true);
     const result = coverage.result(parsed, runner.agrees(parsed?.counts));

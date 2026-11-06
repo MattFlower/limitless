@@ -17,7 +17,7 @@ import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import type { GateConfig } from "../src/gates/detect.ts";
 import { singleBunTest } from "../src/gates/docs.ts";
 import { readCoveringJUnit, readJUnitSkips } from "../src/gates/junit.ts";
-import { redactGateData, redactGateDiagnostics } from "../src/gates/output.ts";
+import { redactGateData, redactGateDiagnostics, redactGateOutput } from "../src/gates/output.ts";
 import { compareGates, type GateRun, runGates, runLocalGates } from "../src/gates/run.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS } from "../src/gates/test-coverage.ts";
 import { confinementScope } from "../src/harness/sandbox.ts";
@@ -207,6 +207,32 @@ test("a factory execution reused by the gates stage supplies ordinary gate evide
   expect(result.criteria[0]?.status).toBe("met");
   expect(result.criteria[0]?.gateEvidence?.stageId).toBe(evidence.stageId);
   expect(resolve(blocked, evidence, spec, "d".repeat(40)).criteria[0]?.status).toBe("blocked");
+});
+
+test("stored output reconstruction sanitizes colored credential-bearing coverage identities", () => {
+  const secret = "synthetic-reconstructed-coverage-credential";
+  registerCredential("RECONSTRUCTED_COVERAGE", secret);
+  const evidence = gates();
+  const check = evidence.checks[0];
+  if (!check) throw Error("missing check");
+  const localSpec = {
+    ...spec,
+    acceptance_criteria: [{ id: "AC-1", criterion: "all tests pass", how_to_verify: "bun test" }],
+  };
+  // Use a broad recorded command: the file identity must come from the reconstructed output.
+  check.testCommand = "bun test";
+  check.result.output = `\u001b[32mtest/${secret}.test.ts:\u001b[0m\n(pass) synthetic\n\u001b[32m1 pass\u001b[0m\n0 fail`;
+  const observed = spyOn(BunTestCoverage.prototype, "observe");
+  try {
+    expect(resolve(blocked, evidence, localSpec).criteria[0]?.status).toBe("met");
+    expect(observed.mock.calls.map(([line]) => line)).toContain("test/[redacted].test.ts:");
+    check.result.output = check.result.output.replace("(pass)", "(skip)");
+    expect(resolve(blocked, evidence, localSpec).criteria[0]?.status).toBe("blocked");
+    check.result.output = check.result.output.replace("(skip)", "(fail)");
+    expect(resolve(blocked, evidence, localSpec).criteria[0]?.status).toBe("blocked");
+  } finally {
+    observed.mockRestore();
+  }
 });
 
 // Synthetic console fixtures below also provide a corresponding report; real Bun XML is
@@ -891,7 +917,8 @@ test.each(["relative", "linux-absolute", "macos-absolute", "colored-crlf", "gith
       lines[2] = "1 passed";
       lines[3] = "0 failed";
     }
-    for (const line of lines) coverage.observe(format === "colored-crlf" ? `\x1b[32m${line}\x1b[0m\r` : line);
+    for (const line of lines)
+      coverage.observe(redactGateOutput(format === "colored-crlf" ? `\x1b[32m${line}\x1b[0m\r` : line));
     expect(coverage.result()).toEqual({
       passedFiles: ["test/loopback.test.ts"],
       skippedFiles: format === "skipped" ? ["test/loopback.test.ts"] : [],

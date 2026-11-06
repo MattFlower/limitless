@@ -64,7 +64,7 @@ function covers(check: GateEvidence["checks"][number], requestedCommand: string)
   if (requested.some((file) => selected.length > 0 && !selected.some((filter) => file.includes(filter))))
     return false;
   const recorded = new BunTestCoverage();
-  for (const line of check.result.output.split(/\r?\n/)) recorded.observe(line);
+  for (const line of check.result.output.split(/\r?\n/)) recorded.observe(redactGateOutput(line));
   const coverage = check.result.testCoverage ?? recorded.result();
   if (!coverage.summary || coverage.summary.passed < 1 || coverage.summary.failed !== 0) return false;
   const ran = coverage.passedFiles;
