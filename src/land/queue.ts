@@ -11,7 +11,12 @@ import { detectGates } from "../gates/detect.ts";
 import { docsOnlyGates } from "../gates/docs.ts";
 import { type ExecutionHandle, executeGate, type GateExecutor } from "../gates/executor.ts";
 import { formatGateOutput } from "../gates/failures.ts";
-import { findGateCounterpart, redactGateData, redactGateOutput } from "../gates/output.ts";
+import {
+  findGateCounterpart,
+  projectGateDiagnostics,
+  redactGateData,
+  redactGateOutput,
+} from "../gates/output.ts";
 import { loadPrivateStrings } from "../gates/private.ts";
 import { publicationWorktree, sanitizePublication } from "../gates/publication.ts";
 import { confinementFailed, type GateResult, retryFailures, targetedRetrySkipReason } from "../gates/run.ts";
@@ -1008,9 +1013,8 @@ export class LandQueue {
           if (entry.runId) this.store.addEvent({ runId: entry.runId, type: "gate", level: "info", message });
         }
         if (retries.size) {
-          const reason = redactGateOutput(
-            `flaky: ${[...retries.keys()].map((c) => `${c.name} (${c.failedFiles?.join(", ")})`).join("; ")}`,
-          );
+          const reason = landFlakyReason([...retries.keys()]);
+          appendFileSync(log, `${reason}\n`);
           this.owned(entry.id, () => {
             finalize();
             this.store.updateLandEntry(entry.id, { reason });
@@ -1596,4 +1600,15 @@ export class LandQueue {
     if (state === "landed") this.store.landFeed("land.landed", entry, reason);
     return entry;
   }
+}
+
+export function landFlakyReason(results: GateResult[]): string {
+  return redactGateOutput(
+    `flaky: ${results
+      .map((c) => {
+        const safe = projectGateDiagnostics(c, { mode: "outward" });
+        return `${c.name} (${safe.failedFiles?.join(", ") ?? "files withheld"})`;
+      })
+      .join("; ")}`,
+  );
 }

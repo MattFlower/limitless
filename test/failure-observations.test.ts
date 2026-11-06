@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FailureObservation } from "../src/db/failure-observations.ts";
 import { Store } from "../src/db/store.ts";
+import { withheldText } from "../src/gates/text-privacy.ts";
+import { POST_MERGE_REASONS } from "../src/pipeline/post-merge-confirmation.ts";
 import { sh } from "../src/util/proc.ts";
 import { stallReporter } from "../src/util/stall.ts";
 
@@ -304,9 +306,23 @@ test("D0a observations retain evidence and get additive source defaults", () => 
         "utf8",
       ),
     );
+    db.exec(
+      readFileSync(
+        new URL("../src/db/migrations/20261105T072049-observation-command-digest.sql", import.meta.url),
+        "utf8",
+      ),
+    );
     expect(
-      db.query("SELECT purpose,slow_regression,reason,signature FROM failure_observations").get(),
-    ).toEqual({ purpose: "initial", slow_regression: 0, reason: null, signature: "same failure" });
+      db
+        .query("SELECT purpose,slow_regression,reason,signature,command_digest FROM failure_observations")
+        .get(),
+    ).toEqual({
+      purpose: "initial",
+      slow_regression: 0,
+      reason: null,
+      signature: "same failure",
+      command_digest: null,
+    });
   } finally {
     db.close();
   }
@@ -378,6 +394,45 @@ test.each(["linux", null])(
       expect(observed?.finalized_at).toBeNumber();
       complete();
       expect(store.failureObservations()).toEqual([observed]);
+    } finally {
+      store.close();
+    }
+  },
+);
+
+test.each(["legacy confirmation diagnostic", ...POST_MERGE_REASONS])(
+  "restored confirmation without a result projects its stored reason: %s",
+  (reason) => {
+    const store = new Store(":memory:");
+    try {
+      insert(store, { ...row("legacy", null, 0), phase: "check", setup_eligible: 0 });
+      const confirmation = JSON.parse(JSON.stringify({ originalVerdict: "regressed", reason }));
+      store.observations.finalize("legacy", {
+        round: 0,
+        sha: "head",
+        stageId: 1,
+        comparisons: [
+          {
+            name: "setup:0",
+            verdict: "regressed",
+            blocking: true,
+            result: {
+              name: "setup:0",
+              command: "missing-tool",
+              output: "failure",
+              ok: false,
+              exitCode: 1,
+              durationMs: 0,
+            },
+            coordinatorConfirmation: confirmation,
+          },
+        ],
+      });
+      expect(store.failureObservations()[0]).toMatchObject({
+        class: "unclassified",
+        history: "confirmation_unavailable",
+        reason: POST_MERGE_REASONS.has(reason) ? reason : withheldText("unproven"),
+      });
     } finally {
       store.close();
     }

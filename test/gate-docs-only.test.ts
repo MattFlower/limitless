@@ -268,7 +268,11 @@ ${snapshot ? '[limits]\nslotted_commands = ["bun test"]\nagent_full_suite = "gat
       expect(testCheck).toMatchObject({
         verdict: "not_run",
         blocking: false,
-        result: { output: "docs-only change; no test reads the changed files" },
+        result: {
+          output: "[withheld: unproven]",
+          command: "[withheld: unproven]",
+          docsOnly: { reason: "docs-only change; no test reads the changed files" },
+        },
       });
       if (!postMerge)
         expect(f.store.getArtifact(run.id, "report.md")).toContain(

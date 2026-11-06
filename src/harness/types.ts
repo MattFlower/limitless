@@ -86,6 +86,7 @@ export interface AgentSpec {
   privateSession?: boolean;
   /** Redact private prompt content before writing the CLI transcript. */
   redactOutput?: (text: string) => string;
+  holdTranscript?: (line: string) => void;
   signal: AbortSignal;
   /** Raw stream is appended here for post-mortem debugging. */
   logPath: string;

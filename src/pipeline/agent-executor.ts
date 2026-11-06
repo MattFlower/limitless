@@ -1,7 +1,7 @@
 import type { Invocation, Role, Run } from "../core/types.ts";
 import type { AgentJobRequest } from "../db/workers.ts";
 import type { FactoryGateHandler, TestWait } from "../gates/agent-tests.ts";
-import { redactGateOutput } from "../gates/output.ts";
+import { setupFailureMessage } from "../gates/output.ts";
 import { runLocalGates } from "../gates/run.ts";
 import { discardChanges } from "../git/repos.ts";
 import { withScratch } from "../harness/scratch.ts";
@@ -76,7 +76,7 @@ export async function prepareReaderCheckout(cwd: string, setup: string[], signal
   await discardChanges(cwd);
   if (!result.setupOk) {
     const failed = result.setup.find((r) => !r.ok);
-    throw new Error(redactGateOutput(`Reader setup failed: $ ${failed?.command}\n${failed?.output}`));
+    throw new Error(setupFailureMessage("Reader setup failed: $ ", failed));
   }
 }
 
@@ -90,8 +90,9 @@ export function runToolAgent(
   dispatch?: () => void,
   policy: { role?: Role; agentFullSuite?: AgentFullSuite } = {},
   factoryGate?: FactoryGateHandler,
+  beforeRemove?: (scratch: string) => void,
 ): Promise<AgentResult> {
-  return withScratch(spec.cwd, (scratchDir) => {
+  const run = (scratchDir: string) => {
     dispatch?.();
     return withSlottedCommands(
       commands,
@@ -119,5 +120,6 @@ export function runToolAgent(
       undefined,
       factoryGate,
     );
-  });
+  };
+  return withScratch(spec.cwd, run, { beforeRemove });
 }

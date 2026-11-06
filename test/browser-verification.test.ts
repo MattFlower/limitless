@@ -140,11 +140,12 @@ test("authors mark preview checks and the verifier receives the URL, IDs and bot
     "resize the viewport",
     "record observations at both 1280 × 800 and 375 × 812 CSS pixels",
     "actions taken and the results observed at both sizes",
-    "own inspection but are not retained",
+    "Where capture is available, take PNG viewport screenshots at both 1280 × 800 and 375 × 812 CSS pixels",
     "A screenshot alone does not establish interactive correctness",
     'blockedReason "environment"',
   ])
     expect(prompt).toContain(text);
+  expect(prompt).not.toContain("not retained");
   const without = verifyPrompt(input);
   expect(without).not.toContain("# Browser");
   expect(without).not.toContain("1280");

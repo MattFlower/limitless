@@ -13,6 +13,7 @@ import { computeProviderStatistics, computeStats } from "../db/stats.ts";
 import { IssueClaimed } from "../db/store.ts";
 import { FeedAckSchema, parseFeedParams, waitForFeed } from "../feed.ts";
 import { agentTestLease } from "../gates/agent-tests.ts";
+import { isInertMedia } from "../gates/media.ts";
 import { projectGateDiagnostics, redactGateOutput } from "../gates/output.ts";
 import { agentTestSlots, gateSlots, isGatePriority } from "../gates/slots.ts";
 import { ensureCache, fetchBase, resolveRepo } from "../git/repos.ts";
@@ -216,7 +217,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
       );
       if (
         access === "denied" ||
-        (localOnly && access !== "loopback") ||
+        (localOnly && (access !== "loopback" || req.headers.has("forwarded"))) ||
         (access === "tunnel" && !path.startsWith("/webhooks/")) ||
         (access !== "loopback" &&
           (path === "/mcp" || path === "/api/admin" || path.startsWith("/api/admin/"))) ||
@@ -749,6 +750,14 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
             headers: { "content-type": "text/plain; charset=utf-8" },
           });
     }),
+    "/api/runs/:id/screenshots": handle((req) => json(store.listScreenshots(req.params.id as string)), true),
+    "/api/runs/:id/screenshots/:name": handle((req) => {
+      const { id, name } = req.params as { id: string; name: string };
+      const bytes = Buffer.from(store.getScreenshot(id, name) ?? "", "base64");
+      if (bytes.length > 5 * 1024 * 1024 || !isInertMedia("x.png", bytes)) return error("not found", 404);
+      const headers = { "Content-Type": "image/png", "X-Content-Type-Options": "nosniff" };
+      return new Response(bytes, { headers: { ...headers, "Cache-Control": "no-store" } });
+    }, true),
     "/api/runs/:id/stream": handle(async (req, server) => {
       const runId = req.params.id as string;
       const after = Number(new URL(req.url).searchParams.get("after") ?? 0);
