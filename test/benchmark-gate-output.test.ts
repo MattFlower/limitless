@@ -1,4 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
+import * as subprocess from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -395,6 +398,10 @@ test("implicit workload selection keeps the original producer defaults", async (
   await compare(["HEAD", "HEAD"], undefined, invoke);
   const producers = [
     "gate-5mib",
+    "gate-line-8mb",
+    "gate-line-32mib",
+    "gate-fail-5mib",
+    "gate-concurrent",
     "gate-cap",
     "long-line",
     "scanner-overflow",
@@ -816,5 +823,119 @@ test("preparation owns no measured turns, runs seven times and disposes on prepa
     ).rejects.toThrow("fixture failure");
     const { count } = await import(join(root, "src/util/privacy-checker.ts"));
     expect(count()).toBe(8);
+  });
+});
+
+test("whole-gate fixtures use production scopes, validate outcomes and report measured child overlap", async () => {
+  await temporary(async (cwd) => {
+    let serial = Promise.resolve();
+    const spawnFixture = () => {
+      const child = Object.assign(new EventEmitter(), {
+        spawnargs: ["fixture", "limitless-started-fixture"],
+      }) as subprocess.ChildProcess;
+      setImmediate(() => {
+        child.emit("spawn");
+        child.emit("exit", 0);
+      });
+      return child;
+    };
+    const spawn = spyOn(subprocess, "spawn").mockImplementation(spawnFixture as typeof subprocess.spawn);
+    try {
+      for (const name of [
+        "gate-5mib",
+        "gate-line-8mb",
+        "gate-line-32mib",
+        "gate-fail-5mib",
+        "gate-concurrent",
+      ]) {
+        let calls = 0;
+        const a = {
+          defaultGateSlots: () => 3,
+          confinementScope: new AsyncLocalStorage(),
+          readPolicyScope: new AsyncLocalStorage(),
+          runGates: (_cwd: string, cfg: { checks: { run: string }[] }) => {
+            const result = serial.then(async () => {
+              calls++;
+              const child = subprocess.spawn("fixture", ["limitless-started-fixture"]);
+              await new Promise<void>((done) => child.once("exit", () => done()));
+              const [stdout, stderr] = await Promise.all([
+                fs.readFile(join(cwd, "stdout"), "utf8"),
+                fs.readFile(join(cwd, "stderr"), "utf8"),
+              ]);
+              const failing = name === "gate-fail-5mib",
+                over = name === "gate-line-32mib";
+              expect(stdout.length).toBe(
+                name === "gate-line-8mb"
+                  ? 8000000
+                  : over
+                    ? 32 * 1048576
+                    : failing
+                      ? 5 * 1048576
+                      : 4 * 1048576,
+              );
+              expect(stderr.length).toBe(name === "gate-5mib" || name === "gate-concurrent" ? 1048576 : 0);
+              if (failing) {
+                expect(cfg.checks[0]?.run).toEndWith("; exit 1");
+                expect(stdout.match(/^\(fail\)/gm)).toHaveLength(25000);
+                expect(stdout.split("\n")).toHaveLength(250004);
+              } else expect(cfg.checks[0]?.run).toBe("cat stdout; cat stderr >&2");
+              return {
+                setupOk: true,
+                checks: [
+                  {
+                    ok: !failing,
+                    exitCode: Number(failing),
+                    output: ".".repeat(6000),
+                    textPrivacy: { output: { withheld: over, ...(over ? { reason: "capture-cap" } : {}) } },
+                    testCoverage: { summary: { passed: 0, failed: 25000 }, passedFiles: [] },
+                  },
+                ],
+              };
+            });
+            serial = result.then(() => {});
+            return result;
+          },
+        };
+        const jobs = await registry[name]?.({
+          a,
+          cwd,
+          env: environment(cwd),
+          key: Buffer.alloc(32),
+          checker: () => {
+            throw Error("unused");
+          },
+        });
+        const job = jobs?.[0];
+        if (!job?.[2]) throw Error("missing production workload");
+        const value = await job[2]();
+        expect(job[3](value)).toBeString();
+        expect(calls).toBe(name === "gate-concurrent" ? 3 : 1);
+        const dimensions = describe(name, job[0], job[1], a);
+        expect(dimensions.implementation).toBe("revision-local production");
+        if (name === "gate-concurrent") {
+          expect(value).toMatchObject({ requestedConcurrency: 3, observedOverlap: 1 });
+          expect(dimensions.requestedConcurrency).toBe(3);
+          expect(() => job[3]({ ...Object(value), observedOverlap: 0 })).toThrow("observed child overlap");
+          expect(() => job[3]({ ...Object(value), gates: [] })).toThrow("concurrent gate count");
+        } else {
+          const corrupted = structuredClone(value) as {
+            checks: {
+              exitCode: number;
+              output: string;
+              textPrivacy: { output: { withheld: boolean; reason?: string } };
+            }[];
+          };
+          const check = corrupted.checks[0];
+          if (!check) throw Error("missing result");
+          check.exitCode = 7;
+          expect(() => job[3](corrupted)).toThrow();
+          check.exitCode = name === "gate-fail-5mib" ? 1 : 0;
+          check.textPrivacy.output.withheld = !check.textPrivacy.output.withheld;
+          expect(() => job[3](corrupted)).toThrow();
+        }
+      }
+    } finally {
+      spawn.mockRestore();
+    }
   });
 });

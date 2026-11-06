@@ -974,8 +974,12 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     let idleTimedOut = false;
     let settled = false;
     const idle = idleWatchdog(opts.idleTimeoutMs ?? Infinity, opts.idleNow);
-    const out = lineSplitter(opts.onStdoutLine, opts.maxLineLength);
-    const err = lineSplitter(opts.onStderrLine, opts.maxLineLength);
+    const observe = (callback?: (line: string) => void) =>
+      callback && opts.captureComplete && opts.redactOutput
+        ? (line: string) => callback(credentialMatcher().has(line) ? "[redacted]" : line)
+        : callback;
+    const out = lineSplitter(observe(opts.onStdoutLine), opts.maxLineLength);
+    const err = lineSplitter(observe(opts.onStderrLine), opts.maxLineLength);
 
     let shutdown: Promise<void> | undefined;
     let terminationError: ProcessTerminationError | undefined;
@@ -1093,7 +1097,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       child.stderr.setEncoding("utf8");
     }
     const streamOutput = (stream: "stdout" | "stderr", lines: ReturnType<typeof lineSplitter>) => {
-      const redactor = terminalRedactor();
+      const redactor = terminalRedactor(credentialMatcher, "stream");
       const emit = (text: string) => {
         if (stream === "stdout") stdout = appendTail(stdout, text, stream);
         else stderr = appendTail(stderr, text, stream);
