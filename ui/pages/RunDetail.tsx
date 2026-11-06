@@ -135,8 +135,13 @@ export const RunDetail: Component = () => {
     const request = ++generation;
     pushed.clear();
     currentRead = request;
-    getRunDetail(params.id)
-      .then((detail) => {
+    Promise.all([
+      getRunDetail(params.id),
+      fetch(`/api/runs/${encodeURIComponent(params.id)}/screenshots`)
+        .then((r) => (r.ok ? (r.json() as Promise<{ name: string }[]>) : []))
+        .catch(() => []),
+    ])
+      .then(([detail, screenshots]) => {
         if (request !== generation) return;
         loaded = true;
         setLoadError(null);
@@ -157,7 +162,10 @@ export const RunDetail: Component = () => {
             for (const q of fresh("question", detail.questions)) d[q.id] = q;
           }),
         );
-        setArtifacts(detail.artifacts);
+        setArtifacts([
+          ...detail.artifacts,
+          ...screenshots.map(({ name }) => ({ name, kind: "screenshot", size: 0, createdAt: 0 })),
+        ]);
       })
       .catch((e) => request === generation && setLoadError((e as Error).message))
       .finally(() => {

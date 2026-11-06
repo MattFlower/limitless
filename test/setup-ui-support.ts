@@ -27,7 +27,7 @@ export type Ui = {
 /** SSR events exercise the real component handlers; cached render closures retain client signals. */
 export async function buildSetupUi(
   dir: string,
-  name: "Setup" | "NewRun" | "CatalogForm" | "RetryModels",
+  name: "Setup" | "NewRun" | "CatalogForm" | "RetryModels" | "ArtifactsPanel",
 ): Promise<Ui> {
   const runtime = `
     export const handlers = new Map(), components = new Map(), cleanups = [], listeners = new Set();
@@ -86,11 +86,11 @@ export async function buildSetupUi(
               "const useNavigate = () => path => navigated.push(path);",
             );
             const component = args.path.match(
-              /\/(Setup|NewRun|CatalogForm|RetryModels|RunModelPicker)\.tsx$/,
+              /\/(Setup|NewRun|CatalogForm|RetryModels|RunModelPicker|ArtifactsPanel)\.tsx$/,
             )?.[1];
             if (component) {
               source = source.replace(
-                new RegExp(`export const ${component}(?:: Component)? =`),
+                new RegExp(`export const ${component}(?:: Component(?:<[^\\n]+>)?)? =`),
                 `const ${component}Impl =`,
               );
               const start = source.lastIndexOf("\n  return (");

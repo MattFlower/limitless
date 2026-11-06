@@ -90,8 +90,9 @@ export function runToolAgent(
   dispatch?: () => void,
   policy: { role?: Role; agentFullSuite?: AgentFullSuite } = {},
   factoryGate?: FactoryGateHandler,
+  beforeRemove?: (scratch: string) => void,
 ): Promise<AgentResult> {
-  return withScratch(spec.cwd, (scratchDir) => {
+  const run = (scratchDir: string) => {
     dispatch?.();
     return withSlottedCommands(
       commands,
@@ -119,5 +120,6 @@ export function runToolAgent(
       undefined,
       factoryGate,
     );
-  });
+  };
+  return withScratch(spec.cwd, run, { beforeRemove });
 }

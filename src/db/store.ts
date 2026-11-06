@@ -3044,6 +3044,21 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
 
   // ---- artifacts -----------------------------------------------------------
 
+  putScreenshot(runId: string, name: string, content: string): void {
+    const sql = "INSERT INTO verifier_screenshots VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING";
+    this.db.query(sql).run(runId, name, content, Date.now());
+  }
+
+  getScreenshot(runId: string, name: string): string | null {
+    const sql = "SELECT content FROM verifier_screenshots WHERE run_id = ? AND name = ?";
+    return (this.db.query(sql).get(runId, name) as { content: string } | null)?.content ?? null;
+  }
+
+  listScreenshots(runId: string): { name: string }[] {
+    const sql = "SELECT name FROM verifier_screenshots WHERE run_id = ? ORDER BY name";
+    return this.db.query(sql).all(runId) as { name: string }[];
+  }
+
   putArtifact(runId: string, name: string, kind: string, content: string): void {
     this.db
       .query(

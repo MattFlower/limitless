@@ -21,6 +21,7 @@ import {
 } from "../util/proc.ts";
 import { ConfinementError, homeReadPolicy, policySpellings } from "./read-policy.ts";
 import type { AgentSpec } from "./types.ts";
+import { forgetBrowserOutputs } from "./verifier-captures.ts";
 
 function within(parent: string, path: string): boolean {
   const rel = relative(parent, path);
@@ -309,7 +310,7 @@ export function readConfinement(spec: AgentSpec, scratch: string): ReadConfineme
 export async function withScratch<T>(
   cwd: string,
   run: (scratchDir: string) => Promise<T>,
-  options: { existing?: string; keep?: () => boolean } = {},
+  options: { existing?: string; keep?: () => boolean; beforeRemove?: (scratch: string) => void } = {},
 ): Promise<T> {
   const scratchDir = options.existing ?? createScratch(cwd);
   const scope = processScope.getStore();
@@ -321,6 +322,10 @@ export async function withScratch<T>(
     if (scope && error instanceof ProcessTerminationError) scope.terminationError = error;
     throw error;
   } finally {
+    try {
+      options.beforeRemove?.(scratchDir);
+    } catch {} // Evidence collection must not change invocation results or prevent cleanup.
+    forgetBrowserOutputs(scratchDir);
     if (!options.keep?.()) removeScratch(scratchDir);
     scope?.scratchDirs.delete(scratchDir);
   }

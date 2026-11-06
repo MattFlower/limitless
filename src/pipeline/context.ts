@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { lstat, readFile } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,6 +40,7 @@ import { selectHarness } from "../harness/select.ts";
 import type { AgentFullSuite, SlottedCommands } from "../harness/slotted-config.ts";
 import { parseFakeStream } from "../harness/stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness, ModelTarget } from "../harness/types.ts";
+import { collectVerifierCaptures, screenshotPrivacy } from "../harness/verifier-captures.ts";
 import { ClaimControlError, ClaimWaitError } from "../integrations/claim-errors.ts";
 import { claimGuard } from "../integrations/claim-guard.ts";
 import type { GhRunner } from "../integrations/github.ts";
@@ -1052,6 +1053,8 @@ export class RunContext {
         }
         dispatched = true;
       };
+      const screenshots =
+        opts.role === "verify" && this.previewUrl && !noTools ? screenshotPrivacy() : undefined;
       let result: AgentResult;
       let needsHuman: NeedsHumanError | undefined;
       const privateDir = opts.privateOutput ? mkdtempSync(join(tmpdir(), "limitless-private-")) : null;
@@ -1093,6 +1096,7 @@ export class RunContext {
           // The private log sits in the shared temporary directory while a parallel implementer
           // runs as the same user, so it never holds the private text itself.
           redactOutput: opts.privateOutput ? withholdText : redact,
+          holdTranscript: screenshots?.holdTranscript,
           signal: callSignal,
           logPath: join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
           onEvent: opts.privateOutput
@@ -1113,7 +1117,8 @@ export class RunContext {
                   this.onAgentEvent(invocation.id, { ...ev, id: String(Bun.hash(ev.id)) }, opts.role);
               }
             : (ev) => {
-                this.onAgentEvent(invocation.id, ev, opts.role, redact);
+                if (screenshots) screenshots.hold(ev);
+                else this.onAgentEvent(invocation.id, ev, opts.role, redact);
               },
         };
         const faultContext = {
@@ -1171,6 +1176,8 @@ export class RunContext {
                 this.state.gatesConfig?.checks.some((c) => c.name === "test")
                 ? (signal) => runAgentGate(this, spec.cwd, signal)
                 : undefined,
+              screenshots &&
+                collectVerifierCaptures(store, this.run.id, invocation.id, spec.onEvent, screenshots),
             );
           };
           result = await agentExecutor.run(
@@ -1223,6 +1230,13 @@ export class RunContext {
         };
       } finally {
         try {
+          if (screenshots)
+            appendFileSync(
+              join(privateDir ?? this.runDir, `inv-${invocation.id}.log`),
+              (opts.privateOutput ? withholdText : (redact ?? redactCredentials))(screenshots.drainLogs()),
+            );
+          for (const ev of screenshots?.drain() ?? [])
+            this.onAgentEvent(invocation.id, ev, opts.role, redact);
           if (!dispatched && revision.aborted && opts.role === "implement") {
             this.state.implementer = previousImplementer;
             this.checkpointer.writeState(this.run.id, this.state);
@@ -1244,6 +1258,7 @@ export class RunContext {
           cleanupFailure(error);
         }
       }
+      result = screenshots?.data(result) ?? result;
       if (needsHuman) {
         store.updateInvocation(invocation.id, {
           status: "error",

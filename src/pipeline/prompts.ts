@@ -788,7 +788,7 @@ export function verifyPrompt(input: {
           .filter((c) => c.browser === true)
           .map((c) => c.id)
           .join(", ") || "none"
-      }), resize the viewport and record observations at both 1280 × 800 and 375 × 812 CSS pixels. For interactions, record the actions taken and the results observed at both sizes. Screenshots may be taken for your own inspection but are not retained. A screenshot alone does not establish interactive correctness. If browser tools are actually unavailable, report the row blocked with blockedReason "environment" and the observed reason.\n`
+      }), resize the viewport and record observations at both 1280 × 800 and 375 × 812 CSS pixels. For interactions, record the actions taken and the results observed at both sizes. Where capture is available, take PNG viewport screenshots at both 1280 × 800 and 375 × 812 CSS pixels. A screenshot alone does not establish interactive correctness. If browser tools are actually unavailable, report the row blocked with blockedReason "environment" and the observed reason.\n`
     : "";
   return `You are the acceptance verifier for an automated coding pipeline. Decide whether the implementation on this branch actually satisfies each acceptance criterion. Be skeptical: verify by running commands, executing the code, and reading the implementation — never by trusting comments, commit messages, or the implementer's claims.
 

@@ -17,6 +17,7 @@ import { homeReadPolicy, policySpellings } from "./read-policy.ts";
 import { SANDBOX_EXEC, seatbeltProfile } from "./sandbox.ts";
 import { validateScratch } from "./scratch.ts";
 import type { AgentSpec } from "./types.ts";
+import { registerBrowserOutput } from "./verifier-captures.ts";
 
 export { BROWSER_TOOLS } from "./browser-tools.ts";
 
@@ -230,6 +231,7 @@ export function browserMcp(
     );
     // --allowed-origins restricts browser requests; --allowed-hosts would only govern the MCP HTTP
     // transport, which stdio does not use.
+    registerBrowserOutput(scratch, output);
     return {
       // Agents start MCP servers in their checkout, which the profile denies; Node needs a readable cwd.
       command: "/usr/bin/env",

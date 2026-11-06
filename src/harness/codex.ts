@@ -966,6 +966,7 @@ export async function runCodex(
   });
 
   appendFileSync(spec.logPath, redactCredentials(`# codex ${t.model} ${new Date().toISOString()}\n`));
+  const transcript = spec.holdTranscript ?? ((text: string) => appendFileSync(spec.logPath, `${text}\n`));
   const proc = await processRunner({
     cmd: args,
     cwd: spec.cwd,
@@ -976,11 +977,11 @@ export async function runCodex(
     idleTimeoutMs: spec.idleTimeoutMs,
     idleNow: spec.idleNow,
     onStdoutLine: (line) => {
-      appendFileSync(spec.logPath, `${redactJsonLine(line, spec.redactOutput)}\n`);
+      transcript(redactJsonLine(line, spec.redactOutput));
       parser.feed(redactJsonLine(line, redactCredentials));
     },
     onStderrLine: (line) => {
-      appendFileSync(spec.logPath, `[stderr] ${spec.redactOutput?.(line) ?? line}\n`);
+      transcript(`[stderr] ${spec.redactOutput?.(line) ?? line}`);
       if (!line.startsWith("Reading additional input")) spec.onEvent({ type: "stderr", text: line });
     },
   });
