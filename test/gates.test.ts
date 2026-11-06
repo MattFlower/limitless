@@ -29,7 +29,7 @@ import {
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
 import { extractFailures, FailureExcerpts, formatGateOutput } from "../src/gates/failures.ts";
 import { readJUnitSkips } from "../src/gates/junit.ts";
-import { redactGateOutput } from "../src/gates/output.ts";
+import { projectGateDiagnostics, redactGateOutput } from "../src/gates/output.ts";
 import {
   canonical,
   checkPrivateText,
@@ -51,11 +51,13 @@ import {
 } from "../src/gates/run.ts";
 import { defaultGateSlots, type GatePriority, gateSlots, Semaphore } from "../src/gates/slots.ts";
 import { BunTestCoverage, MAX_SKIPPED_TESTS, MAX_TEST_IDENTITY_LENGTH } from "../src/gates/test-coverage.ts";
+import { gatePrivacyScope } from "../src/gates/text-privacy.ts";
 import { recordWorktree } from "../src/git/command.ts";
 import { checkoutCommitted, type DiffInfo } from "../src/git/repos.ts";
 import * as sandbox from "../src/harness/sandbox.ts";
 import { ConfinementError } from "../src/harness/sandbox.ts";
 import { formatAuditFeedback, formatGateFeedback } from "../src/pipeline/prompts.ts";
+import { verifier } from "../src/util/privacy-proof.ts";
 import { loadOutputPrivacy, privateOutputData } from "../src/util/private-output.ts";
 import * as proc from "../src/util/proc.ts";
 import { sh } from "../src/util/proc.ts";
@@ -75,6 +77,28 @@ function tempDir(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "limitless-gates-"));
   for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
   return dir;
+}
+
+function checkedFailures(result: GateResult | undefined): string {
+  const scope = gatePrivacyScope.getStore();
+  if (!result?.failures || !scope) throw new Error("Missing checked excerpts or privacy scope");
+  expect(result.textPrivacy?.failures).toMatchObject({
+    withheld: false,
+    checkedComplete: true,
+    truncated: true,
+  });
+  expect(
+    verifier(scope.registry, scope.signer).verify(
+      result.textPrivacy?.failures,
+      "failures",
+      result.failures,
+      true,
+    ),
+  ).toBe(true);
+  const outward = projectGateDiagnostics(result, { mode: "outward" });
+  expect(outward).not.toHaveProperty("failures");
+  expect(outward.textPrivacy).not.toHaveProperty("failures");
+  return result.failures;
 }
 
 describe("detectGates", () => {
@@ -173,7 +197,10 @@ describe("runGates / compareGates", () => {
       expect(run.checks[0]?.output).toBe(
         "error: [redacted]\n(fail) stdout assertion\n\n(fail) stderr [redacted]\n^ this test timed out after 100ms.\n",
       );
-      expect(run.checks[0]?.failures).toBeUndefined();
+      expect(checkedFailures(run.checks[0]).split("\n\n").sort()).toEqual([
+        "(fail) stderr [redacted]\n^ this test timed out after 100ms.",
+        "error: [redacted]\n(fail) stdout assertion",
+      ]);
       expect(JSON.stringify(run)).not.toContain(secret);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -181,7 +208,7 @@ describe("runGates / compareGates", () => {
   });
 
   test.each(["stdout", "stderr"])(
-    "the untruncated %s stream contributes only to the checked rendering",
+    "the untruncated %s stream contributes to checked output and excerpts",
     async (stream) => {
       const secret = "synthetic-per-stream-cut-credential-421";
       proc.registerCredential("PER_STREAM_CUT_TEST_TOKEN", secret);
@@ -208,7 +235,7 @@ describe("runGates / compareGates", () => {
         );
         // The checked rendering retains stdout when the combined stream fits.
         if (stream === "stdout") expect(run.checks[0]?.output).toContain(diagnostic.trim());
-        expect(run.checks[0]?.failures).toBeUndefined();
+        expect(checkedFailures(run.checks[0])).toBe(diagnostic.trim());
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -283,7 +310,9 @@ describe("runGates / compareGates", () => {
       }
       expect(run.checks).toHaveLength(6);
       expect(run.checks[2]?.output).toContain("[redacted]");
-      expect(run.checks[4]?.failures).toBeUndefined();
+      expect(checkedFailures(run.checks[4])).toBe(
+        `error: [redacted]\n${"x".repeat(7906)}\n(fail) assertion\n\n[failure excerpts: diagnostic lines or failures left out]`,
+      );
       expect(run.checks[4]?.output).toContain("[redacted]");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -371,11 +400,11 @@ describe("runGates / compareGates", () => {
         expect(result.output).toContain("[redacted]");
         expect(result.output).not.toContain(credential.slice(-20));
       }
-      expect(run.checks[0]?.failures).toBeUndefined();
+      expect(checkedFailures(run.checks[0])).toBe("error: credential [redacted]\n(fail) assertion");
       expect(observed).toHaveLength(3);
       const retried = await retryBaselineFailures(run, dir, cfg, signal);
       expect(retried.checks[0]?.firstAttempt).toBe(run.checks[0]);
-      expect(retried.checks[0]?.failures).toBeUndefined();
+      expect(checkedFailures(retried.checks[0])).toBe("error: credential [redacted]\n(fail) assertion");
       const failed = run.checks[0];
       if (!failed) throw new Error("missing check result");
       const regression = await retryRegressions(
@@ -385,7 +414,7 @@ describe("runGates / compareGates", () => {
         [],
         signal,
       );
-      expect(regression[0]?.result.failures).toBeUndefined();
+      expect(checkedFailures(regression[0]?.result)).toBe("error: credential [redacted]\n(fail) assertion");
       for (const text of [...observed, JSON.stringify(retried), JSON.stringify(regression)]) {
         expect(text).not.toContain(credential);
         expect(text).not.toContain(credential.slice(-20));
@@ -437,7 +466,7 @@ describe("runGates / compareGates", () => {
         },
         new AbortController().signal,
       );
-      expect(run.checks[0]?.failures).toBeUndefined();
+      expect(checkedFailures(run.checks[0])).toBe(`${"x".repeat(7900)}[redacted]\n(fail) assertion`);
       expect(JSON.stringify(run)).not.toContain(credential);
       expect(JSON.stringify(run)).not.toContain(credential.slice(0, 12));
     } finally {
@@ -469,7 +498,7 @@ describe("runGates / compareGates", () => {
         new AbortController().signal,
       );
       expect(run.checks[0]?.output).toBe("error: [redacted]\n(fail) colored assertion\n");
-      expect(run.checks[0]?.failures).toBeUndefined();
+      expect(checkedFailures(run.checks[0])).toBe("error: [redacted]\n(fail) colored assertion");
       const repo = store.upsertRepo({
         slug: "test/repo",
         kind: "github",
@@ -548,7 +577,9 @@ describe("runGates / compareGates", () => {
       expect(run.checks[0]?.ok).toBe(false);
       expect(run.checks[0]?.output).toBe(output.slice(-6_000));
       expect(run.checks[0]?.output).not.toContain("error:");
-      expect(run.checks[0]?.failures).toBeUndefined();
+      expect(checkedFailures(run.checks[0])).toBe(
+        "error: values differ\nExpected: 1\nReceived: 2\n(fail) assertion",
+      );
       expect(formatGateFeedback(compareGates(null, run))).not.toContain("error: values differ");
       expect(run.checks[1]?.ok).toBe(true);
       expect(run.checks[1]).not.toHaveProperty("failures");
@@ -561,10 +592,16 @@ describe("runGates / compareGates", () => {
         mergePolicy: "pr",
       });
       const savedRun = store.createRun(repo, { repo: repo.slug, prompt: "test" });
-      store.putArtifact(savedRun.id, "gates.json", "gates", JSON.stringify(run));
+      store.putArtifact(
+        savedRun.id,
+        "gates.json",
+        "gates",
+        JSON.stringify(projectGateDiagnostics(run, { mode: "durable" })),
+      );
       const saved = JSON.parse(store.getArtifact(savedRun.id, "gates.json") ?? "null") as GateRun;
       expect(saved.checks[0]?.output).toBe(output.slice(-6_000));
       expect(saved.checks[0]?.failures).toBeUndefined();
+      expect(saved.checks[0]?.textPrivacy).not.toHaveProperty("failures");
       expect(store.listArtifacts(savedRun.id)).toHaveLength(1);
     } finally {
       store.close();

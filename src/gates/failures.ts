@@ -14,8 +14,7 @@ export class FailureExcerpts {
   private omitted = false;
   private failure: string | undefined;
 
-  observe(raw: string): void {
-    const line = redactGateOutput(raw);
+  observe(line: string): void {
     const text = line.trim();
     if (this.failure !== undefined) {
       // Bun emits the timeout explanation just after the result, unlike assertion diagnostics.
@@ -70,7 +69,7 @@ export class FailureExcerpts {
 
 export function extractFailures(output: string): string | undefined {
   const excerpts = new FailureExcerpts();
-  for (const line of output.split(/\r?\n/)) excerpts.observe(line);
+  for (const line of output.split(/\r?\n/)) excerpts.observe(redactGateOutput(line));
   return excerpts.result();
 }
 

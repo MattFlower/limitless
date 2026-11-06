@@ -1,6 +1,6 @@
 import { getPrivacyChecker } from "../util/privacy-checker.ts";
 import { consumeBoundaryChunk } from "../util/privacy-chunks.ts";
-import { checkAndSign } from "../util/privacy-proof.ts";
+import { checkAndSign, verifier } from "../util/privacy-proof.ts";
 import type { ProcResult } from "../util/proc.ts";
 import { privateStringsDigest } from "./private.ts";
 import { gatePrivacyScope, type TextPrivacy, withheldText } from "./text-privacy.ts";
@@ -10,8 +10,10 @@ export async function protectGateOutput(
   res: ProcResult,
   identities: string | (() => string),
   control: { signal?: AbortSignal; deadline: number },
-): Promise<{ output: string; textPrivacy: TextPrivacy }> {
+  excerpt?: string,
+): Promise<{ output: string; textPrivacy: TextPrivacy; failures?: string }> {
   const withheld = (reason: string): TextPrivacy["output"] => ({ withheld: true, reason });
+  let failures: string | undefined, failureField: TextPrivacy["failures"];
   let output = "",
     field = withheld("checker-failed"),
     identityField = withheld("checker-failed");
@@ -28,7 +30,9 @@ export async function protectGateOutput(
     const reader = {
       registry,
       protectText: async (...args: Parameters<typeof checker.protectText>) => {
-        const receipt = await checker.protectText(...args),
+        const receipt = await (args[0].provenance.kind === "cut"
+            ? checker.protectProducerCut
+            : checker.protectText)(...args),
           parts: Uint8Array[] = [];
         checked = withheld("checker-failed");
         bytes = "";
@@ -39,7 +43,13 @@ export async function protectGateOutput(
             checked = withheld(part.reason ?? "checker-failed");
             break;
           }
-          checked = { withheld: false, checkedComplete: true, kind: "complete", entriesDigest: digest };
+          checked = {
+            withheld: false,
+            checkedComplete: true,
+            kind: "complete",
+            entriesDigest: digest,
+            ...(part.truncated && args[0].cut?.limit !== 0 && { truncated: true }),
+          };
           if (part.done) {
             bytes = Buffer.concat(parts).toString();
             break;
@@ -49,18 +59,21 @@ export async function protectGateOutput(
         return receipt;
       },
     };
+    const signingReader = { ...reader, protectProducerCut: reader.protectText };
     const verdict = { limit: 0, unit: "U" as const, marker: "" };
     const sign = async (
       text: string,
       field: string,
       cut: Parameters<typeof checkAndSign>[0]["cut"] = verdict,
+      producerCut = false,
     ) => {
       let refused: string | undefined;
       const proof = await checkAndSign({
         onRefusal: (reason) => {
           refused = reason;
         },
-        checker: reader,
+        checker: signingReader,
+        producerCut,
         signer: scope?.signer,
         kind: "complete",
         field,
@@ -71,6 +84,7 @@ export async function protectGateOutput(
       // A configured signer refusing its final guard must not become an unsigned release.
       return refused ? withheld(refused) : { ...checked, ...proof };
     };
+    let sourceDigest = "";
     try {
       const capture = res.capture;
       if (
@@ -107,7 +121,10 @@ export async function protectGateOutput(
             side: "tail",
           });
           if (generation !== undefined && generation !== digest) field = withheld("stale-generation");
-          if (!field.withheld) output = bytes;
+          if (!field.withheld) {
+            output = bytes;
+            sourceDigest = digest;
+          }
         }
       }
     } catch {
@@ -120,11 +137,35 @@ export async function protectGateOutput(
         identityField = withheld("checker-failed");
       }
     }
+    if (excerpt !== undefined) {
+      const signing = verifier(registry, scope?.signer).available;
+      failureField = field.withheld ? withheld(field.reason ?? "checker-failed") : withheld("checker-failed");
+      if (!field.withheld) {
+        try {
+          failureField = await sign(
+            excerpt,
+            "failures",
+            { limit: Math.max(1, excerpt.length), unit: "U" },
+            true,
+          );
+          if (digest !== sourceDigest) failureField = withheld("stale-generation");
+          if (!failureField.withheld) failures = excerpt;
+        } catch {
+          failureField = withheld("checker-failed");
+        }
+      }
+      if (!signing) failureField = undefined;
+    }
   } catch {
     field = withheld("checker-failed");
   }
   return {
     output: field.withheld ? withheldText(field.reason, res.timedOut) : output,
-    textPrivacy: { output: field, identities: identityField },
+    ...(failures !== undefined && { failures }),
+    textPrivacy: {
+      output: field,
+      identities: identityField,
+      ...(failureField && { failures: failureField }),
+    },
   };
 }
