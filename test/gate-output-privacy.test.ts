@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { GateCommand, GateConfig } from "../src/gates/detect.ts";
+import { extractFailures } from "../src/gates/failures.ts";
 import * as junit from "../src/gates/junit.ts";
+import { projectGateDiagnostics } from "../src/gates/output.ts";
 import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import { privateStringsDigest } from "../src/gates/private.ts";
 import { retryFailures, runGates, targetedRetrySkipReason, validateRetry } from "../src/gates/run.ts";
@@ -25,7 +27,7 @@ import {
 } from "../src/util/privacy-checker.ts";
 import { issuePrivacyWorkerChunks } from "../src/util/privacy-chunks.ts";
 import { verifier } from "../src/util/privacy-proof.ts";
-import { agentEnv, type ProcResult, runProcess, sh } from "../src/util/proc.ts";
+import { agentEnv, type ProcResult, registerCredential, runProcess, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
@@ -129,8 +131,8 @@ test("real gates sign exact untrimmed rendering and identities; workers make MAC
   expect(r.failures).toBeUndefined();
   expect(r.textPrivacy?.output).toMatchObject({ withheld: false, checkedComplete: true, kind: "complete" });
   const verify = verifier(f.registry, f.signer).verify;
-  expect(verify(r.textPrivacy?.output, "output", r.output)).toBe(true);
-  expect(verify(r.textPrivacy?.output, "output", `${r.output}!`)).toBe(false);
+  expect(verify(r.textPrivacy?.output, "output", r.output, true)).toBe(true);
+  expect(verify(r.textPrivacy?.output, "output", `${r.output}!`, true)).toBe(false);
   expect(verify(r.textPrivacy?.identities, "identities", gateIdentities(r))).toBe(true);
   const unsigned = await f.gate(" safe ", "", {}, () => undefined);
   expect(unsigned.textPrivacy?.output).toEqual({
@@ -471,7 +473,7 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
     return { ...test, reason: "missing" };
   });
   try {
-    const r = await f.gate("failed", "", {
+    const r = await f.gate("diagnostic\n(fail) case", "", {
       coveringTests: [
         { file: "a.test.ts", name: "one" },
         { file: "a.test.ts", name: "two" },
@@ -499,6 +501,7 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
       verifier(f.registry, f.signer).verify(rejected.textPrivacy?.output, "output", rejected.output),
     ).toBe(false);
     expect(rejected.failures).toBeUndefined();
+    expect(rejected.textPrivacy).not.toHaveProperty("failures");
     expect(rejected.firstAttempt).toBe(r);
     expect(
       verifier(f.registry, f.signer).verify(rejected.firstAttempt?.textPrivacy?.output, "output", r.output),
@@ -519,8 +522,10 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
 
 test("retry setup failure composes protected output, never the private setup command", async () => {
   const f = fixture(["private-case"]);
-  const original = await f.gate("original diagnostic");
-  const setup = await f.gate("setup diagnostic", "", { run: "bun emit.ts; : private-case; exit 1" });
+  const original = await f.gate("original diagnostic\n(fail) case");
+  const setup = await f.gate("setup diagnostic\n(fail) setup", "", {
+    run: "bun emit.ts; : private-case; exit 1",
+  });
   expect(setup.textPrivacy?.identities).toEqual({ withheld: true, reason: "private-match" });
   const results = await retryFailures(
     [{ check: { name: original.name, run: original.command }, original }],
@@ -537,6 +542,7 @@ test("retry setup failure composes protected output, never the private setup com
     false,
   );
   expect(r?.failures).toBeUndefined();
+  expect(r?.textPrivacy).not.toHaveProperty("failures");
   expect(r?.firstAttempt).toBe(original);
   expect(
     verifier(f.registry, f.signer).verify(r?.firstAttempt?.textPrivacy?.output, "output", original.output),
@@ -620,4 +626,128 @@ test("expanded retry and covering commands execute internally while their identi
       expect(r?.command).toContain("private-case");
     }),
   );
+});
+
+test.each([5999, 6000, 6001])("output proof binds clipping at %s units", async (size) => {
+  const f = fixture(),
+    text = "x".repeat(size);
+  const protectedOutput = await f.scoped(() => protectGateOutput(capture(text), "[]", control()));
+  const r = { name: "test", command: "true", ok: false, exitCode: 1, durationMs: 0, ...protectedOutput };
+  const project = (value = r) =>
+    projectGateDiagnostics(value, { mode: "outward", registry: f.registry, signer: f.signer });
+  expect(protectedOutput.textPrivacy.output.truncated === true).toBe(size > 6000);
+  expect(project().output).toBe(text.slice(-6000));
+  if (size > 6000) {
+    for (const truncated of [undefined, false]) {
+      const changed = {
+        ...r,
+        textPrivacy: { ...r.textPrivacy, output: { ...r.textPrivacy.output, truncated } },
+      };
+      expect(project(changed).output).toBe(withheldText("unproven"));
+    }
+  }
+});
+
+const omitted = "[failure excerpts: diagnostic lines or failures left out]";
+const identity = "(fail) case";
+const diagnosticRoom = 8000 - omitted.length - 2 - identity.length - 1;
+test.each(["line", "budget", "join"])("excerpt own-byte check rejects %s cuts", async (kind) => {
+  const entry = kind === "join" ? "alpha beta" : "host.example";
+  const source =
+    kind === "line"
+      ? `${" ".repeat(8000 - entry.length)}${entry}\u0301\n${identity}`
+      : kind === "budget"
+        ? `${"x".repeat(diagnosticRoom - entry.length)}${entry}\u0301\n${identity}`
+        : "(fail) alpha\n(pass) reset\nbeta\n(fail) other";
+  const f = fixture([entry]),
+    excerpt = extractFailures(source);
+  expect(excerpt).toBeDefined();
+  const r = await f.scoped(() => protectGateOutput(capture(source), "[]", control(), excerpt));
+  expect(r.textPrivacy.output.withheld).toBe(false);
+  expect(r.failures).toBeUndefined();
+  expect(r.textPrivacy.failures).toEqual({ withheld: true, reason: "private-match" });
+});
+
+test.each([0, 1])(
+  "diagnostics exactly filling their room plus %s preserve omission conditions",
+  async (extra) => {
+    const source = `${"x".repeat(diagnosticRoom + extra)}\n${identity}`;
+    const f = fixture(),
+      excerpt = extractFailures(source);
+    expect(excerpt?.includes(omitted)).toBe(extra === 1);
+    const r = await f.scoped(() => protectGateOutput(capture(source), "[]", control(), excerpt));
+    expect(r.failures).toBe(excerpt);
+    const verify = verifier(f.registry, f.signer).verify;
+    expect(verify(r.textPrivacy.failures, "failures", r.failures ?? "", true)).toBe(true);
+    expect(verify(r.textPrivacy.failures, "failures", `${r.failures}!`, true)).toBe(false);
+    expect(verify(r.textPrivacy.failures, "failures", r.failures ?? "", false)).toBe(false);
+  },
+);
+
+test.each(["R1", "R3", "timeout", "cancelled", "cut"])(
+  "%s withholding skips excerpts but still checks identities",
+  async (kind) => {
+    const f = fixture([kind === "R3" ? "alpha beta" : "private-value"]);
+    const res =
+      kind === "R1"
+        ? capture("private-value", "safe")
+        : kind === "R3"
+          ? capture("alpha", "beta")
+          : capture("safe");
+    if (kind === "timeout") res.timedOut = true;
+    if (kind === "cancelled") res.cancelled = true;
+    if (kind === "cut") res.capture = { provenance: { kind: "cut", truncated: true } };
+    const checks = spyOn(f.checker, "protectText"),
+      cuts = spyOn(f.checker, "protectProducerCut");
+    const r = await f.scoped(() => protectGateOutput(res, "[]", control(), identity));
+    expect(r.failures).toBeUndefined();
+    expect(r.textPrivacy.failures?.withheld).toBe(true);
+    expect(cuts).not.toHaveBeenCalled();
+    expect(checks.mock.calls.at(-1)?.[0].text).toBe("[]");
+    expect(r.textPrivacy.identities?.withheld).toBe(false);
+  },
+);
+
+test.each([true, false])("unsigned excerpts require a clean check: clean=%s", async (clean) => {
+  const f = fixture(["private-value"]),
+    c = control();
+  const cuts = spyOn(f.checker, "protectProducerCut");
+  const r = await f.scoped(
+    () => protectGateOutput(capture("source"), "[]", c, clean ? identity : "private-value"),
+    () => undefined,
+  );
+  expect(r.failures).toBe(clean ? identity : undefined);
+  expect(r.textPrivacy).not.toHaveProperty("failures");
+  expect(cuts.mock.calls[0]?.[1]).toEqual(c);
+});
+
+test("an entries change between source and excerpt refuses the excerpt", async () => {
+  const f = fixture(),
+    original = f.checker.protectProducerCut;
+  spyOn(f.checker, "protectProducerCut").mockImplementation((...args) => {
+    f.registry.replacePolicy([{ value: "elsewhere", entry: 0 }]);
+    return original(...args);
+  });
+  const r = await f.scoped(() => protectGateOutput(capture("source"), "[]", control(), identity));
+  expect(r.failures).toBeUndefined();
+  expect(r.textPrivacy.failures).toEqual({ withheld: true, reason: "stale-generation" });
+});
+
+test("runner and deploy extraction retain whole-value short credential redaction", async () => {
+  const credential = "s7Token";
+  registerCredential("EXCERPT_SHORT_TEST", credential);
+  const f = fixture([], credential),
+    source = `${credential}\n${identity}`;
+  expect(extractFailures(source)).toBe(`[redacted]\n${identity}`);
+  const r = await f.gate(source);
+  expect(r.failures).toBe(`[redacted]\n${identity}`);
+});
+
+test("passing gates never request excerpts even with failure-shaped rows", async () => {
+  const f = fixture(),
+    cuts = spyOn(f.checker, "protectProducerCut");
+  const r = await f.gate(`diagnostic\n${identity}`, "", { run: "bun emit.ts; exit 0" });
+  expect(r.ok).toBe(true);
+  expect(r.failures).toBeUndefined();
+  expect(cuts).not.toHaveBeenCalled();
 });

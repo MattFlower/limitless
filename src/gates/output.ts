@@ -169,7 +169,11 @@ export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions):
             if (record?.withheld === true) return record;
             const bytes = field === "output" ? v.output : gateIdentities(v);
             const state = field === "output" ? "clean" : identityState(v, bytes);
-            if (!record || !snapshot?.verify(record, field, bytes) || state === "unproven")
+            if (
+              !record ||
+              !snapshot?.verify(record, field, bytes, record.truncated === true) ||
+              state === "unproven"
+            )
               return { withheld: true, reason: "unproven" };
             return redactGateOutput(bytes) === bytes && state === "clean"
               ? record

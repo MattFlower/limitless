@@ -78,40 +78,51 @@ const mac = (key: Buffer, binding: string[], bytes: string | Uint8Array) =>
 export async function checkAndSign(
   input: Omit<Parameters<Checker["protectText"]>[0], "provenance" | "terminal"> &
     Parameters<Checker["protectText"]>[1] & {
-      checker: Pick<Checker, "protectText" | "registry">;
+      checker: Pick<Checker, "protectText" | "registry"> & Partial<Pick<Checker, "protectProducerCut">>;
+      /** Privileged producer/re-check path, after the complete-source verdict released. */
+      producerCut?: boolean;
       signer?: typeof provider;
       onRefusal?: (reason: string) => void;
       kind: PrivacyProof["kind"];
       field: string;
     },
 ): Promise<PrivacyProof | undefined> {
-  const { checker, kind, field, text, cut, signal, deadline, signer = provider } = input;
-  const receipt = await checker.protectText(
-    { text, cut, terminal: true, provenance: { kind: "complete" } },
+  const { checker, kind, field, text, cut, signal, deadline, producerCut, signer = provider } = input;
+  const protect = producerCut ? checker.protectProducerCut : checker.protectText;
+  if (!protect) return void input.onRefusal?.("unchecked-provenance");
+  const receipt = await protect(
+    {
+      text,
+      cut,
+      terminal: true,
+      provenance: producerCut ? { kind: "cut", truncated: true } : { kind: "complete" },
+    },
     { signal, deadline },
   );
   const { registry } = checker,
     key = signer(),
     bound = { registry, input: cut?.limit === 0 ? hash(text) : undefined };
   const parts: Uint8Array[] = [];
+  let truncated = false;
   for (let index = 0; ; index++) {
     const part = consumeBoundaryChunk(receipt, index, bound);
     if (part.withheld || !part.checkedComplete) {
       input.onRefusal?.(part.reason ?? "checker-failed");
       return;
     }
+    truncated = (producerCut || cut?.limit !== 0) && part.truncated === true;
     if (part.done) break;
     parts.push(part.bytes);
   }
   const rendering = Buffer.concat(parts);
   // The checker marks a verdict-only receipt whose original credential redaction would change.
-  if (cut?.limit === 0 && rendering.length) {
+  if ((cut?.limit === 0 && rendering.length) || (producerCut && rendering.toString() !== text)) {
     input.onRefusal?.("private-match");
     return;
   }
   if (!key) return;
   const bytes = cut?.limit === 0 ? text : rendering,
-    binding = [kind, registry.semantics, privateStringsDigest(registry.entries), field];
+    binding = [kind, registry.semantics, privateStringsDigest(registry.entries), field, String(truncated)];
   const policy = preparePrivacyPolicy({
     ready: true,
     entries: [],
@@ -134,10 +145,11 @@ export function verifier(registry: typeof privacyRegistry, signer = provider) {
   }
   const key = signer();
   return {
-    verify(value: unknown, field: string, bytes: string | Uint8Array): boolean {
+    available: !!key,
+    verify(value: unknown, field: string, bytes: string | Uint8Array, truncated = false): boolean {
       const proof = proofSchema.safeParse(value);
       if (!key || !policy || !proof.success) return false;
-      const expected = mac(key, [proof.data.kind, ...policy, field], bytes),
+      const expected = mac(key, [proof.data.kind, ...policy, field, String(truncated === true)], bytes),
         actual = Buffer.from(proof.data.mac, "hex");
       return actual.length === expected.length && timingSafeEqual(actual, expected);
     },

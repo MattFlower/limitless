@@ -443,6 +443,10 @@ type TextInput = {
 export function protectText(input: TextInput, options: Options = {}): BoundaryText {
   return protectTextPrepared({ ...input, policy: refreshPolicy(input.policy, options) }, options);
 }
+/** Privileged bridge for producer candidates whose complete source was already released. */
+export function protectProducerCut(input: TextInput, options: Options = {}): BoundaryText {
+  return protectTextPrepared({ ...input, policy: refreshPolicy(input.policy, options) }, options, true);
+}
 function refreshPolicy(policy: Prepared, options: Options): Prepared {
   const registry = options.registry ?? privacyRegistry;
   try {
@@ -463,11 +467,13 @@ function refreshPolicy(policy: Prepared, options: Options): Prepared {
 function protectTextPrepared(
   { text, provenance, policy, cut, terminal }: TextInput,
   options: Options = {},
+  producerCut = false,
 ): BoundaryText {
   let state = context(policy, options);
   state.truncated = provenance.kind === "cut" ? true : provenance.kind === "complete" ? false : undefined;
   try {
-    if (provenance.kind !== "complete") return issue(withheld(state, "unchecked-provenance"));
+    if (provenance.kind !== "complete" && !(producerCut && provenance.kind === "cut"))
+      return issue(withheld(state, "unchecked-provenance"));
     if ("refused" in policy) return issue(withheld(state, "unreadable-policy"));
     const reason = admit(state, text);
     if (reason) return issue(withheld(state, reason));

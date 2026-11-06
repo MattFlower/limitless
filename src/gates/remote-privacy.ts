@@ -61,23 +61,32 @@ export async function recheckRemote(r: GateResult, kind: Kind, control: Control)
             ? { limit: 6000, unit: "U" as const, side: "tail" as const }
             : undefined;
       const key = createHash("sha256")
-        .update(JSON.stringify([kind, name, text, cut]))
+        .update(JSON.stringify([kind, name, text, cut, claim?.truncated === true]))
         .digest("hex");
       const cached = control.memo.get(key);
       if (
         cached?.privacy.kind === kind &&
-        fresh.verify(cached.privacy, name, name === "identities" ? text : cached.output)
+        fresh.verify(
+          cached.privacy,
+          name,
+          name === "identities" ? text : cached.output,
+          cached.privacy.truncated === true,
+        )
       )
         return cached;
-      let output = text;
+      let output = text,
+        truncated = false;
       const reader = {
         registry,
         protectText: async (...args: Parameters<typeof checker.protectText>) => {
-          const receipt = await checker.protectText(...args),
+          const receipt = await (args[0].provenance.kind === "cut"
+              ? checker.protectProducerCut
+              : checker.protectText)(...args),
             parts: Uint8Array[] = [];
           if (!live()) throw Error("Changed remote job");
           for (let index = 0; ; index++) {
             const part = consumeBoundaryChunk(receipt, index, { registry });
+            truncated = name === "output" && part.truncated === true;
             if (part.withheld || part.done) break;
             parts.push(part.bytes);
           }
@@ -87,7 +96,8 @@ export async function recheckRemote(r: GateResult, kind: Kind, control: Control)
       };
       let reason = "checker-failed";
       const proof = await checkAndSign({
-        checker: reader,
+        checker: { ...reader, protectProducerCut: reader.protectText },
+        producerCut: name === "output" && kind === "attested:lan" && claim?.truncated === true,
         signer,
         kind,
         field: name,
@@ -102,7 +112,15 @@ export async function recheckRemote(r: GateResult, kind: Kind, control: Control)
       if (!live() || !eligible()) return refuse("unproven");
       if (name === "output" && wholeReason()) return refuse(wholeReason() ?? "checker-failed");
       if (!proof) return refuse(reason);
-      const signed = { output, privacy: { withheld: false, checkedComplete: true, ...proof } };
+      const signed = {
+        output,
+        privacy: {
+          withheld: false,
+          checkedComplete: true,
+          ...(truncated ? { truncated: true } : {}),
+          ...proof,
+        },
+      };
       control.memo.set(key, signed);
       return signed;
     } catch {
@@ -125,7 +143,12 @@ export async function recheckRemote(r: GateResult, kind: Kind, control: Control)
       (!live() ||
         (kind === "attested:lan" && !control.parity?.()) ||
         (name === "output" && control.whole && consumeBoundaryChunk(control.whole, 0).withheld) ||
-        !fresh.verify(privacy, name, name === "output" ? out.output : gateIdentities(out)))
+        !fresh.verify(
+          privacy,
+          name,
+          name === "output" ? out.output : gateIdentities(out),
+          privacy.truncated === true,
+        ))
     ) {
       out.textPrivacy[name] = { withheld: true, reason: "stale-generation" };
       if (name === "output") out.output = withheldText("stale-generation");

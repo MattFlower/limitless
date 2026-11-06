@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
+import { FailureExcerpts } from "../src/gates/failures.ts";
 import { compareGates, runGates } from "../src/gates/run.ts";
 import { BunTestCoverage } from "../src/gates/test-coverage.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
@@ -541,12 +542,14 @@ test("captured observers sanitize once with exact whole-line credentials on both
   for (const stream of ["stdout", "stderr"] as const) {
     const coverage = new BunTestCoverage();
     const evidence = new RunnerFailureEvidence();
+    const excerpts = new FailureExcerpts();
     const seen: string[] = [];
     const counts = { stream: 0, full: 0 };
     const observe = (line: string) => {
       seen.push(line);
       coverage.observe(line);
       evidence.observe(line);
+      excerpts.observe(line);
     };
     const text = input.join("\n");
     const split = text.indexOf(secret) + 13;
