@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { appendLandLog, openLandLog } from "../src/land/land-log.ts";
 import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
@@ -42,9 +43,13 @@ test("land logs are redacted and confined to canonical runs and land paths", asy
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toStartWith("text/plain");
       const body = await response.text();
-      expect(body).toContain("checks:");
+      expect(body).toBe("[land log entry withheld: unproven]\n");
       expect(body).not.toContain(secret);
-      expect(body).toContain("[redacted]");
+      const handle = openLandLog(log);
+      await appendLandLog(handle, ["checked entry\n"]);
+      appendFileSync(log, `foreign ${secret}`);
+      const verified = await get(entry(log));
+      expect(await verified.text()).toBe("checked entry\n[land log entry withheld: unproven]\n");
     }
     const sibling = `${paths.runs}-outside`;
     mkdirSync(sibling);

@@ -22,6 +22,7 @@ import { parseJUnit } from "../src/gates/junit.ts";
 import { redactGateData } from "../src/gates/output.ts";
 import { type GateResult, type GateRun, runLocalGates } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
+import { gatePrivacyScope } from "../src/gates/text-privacy.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
 import * as gitMerge from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
@@ -33,6 +34,7 @@ import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import { configureGitHubIdentity } from "../src/integrations/github-identity.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type GitHubClient, normalizePr, startGitHubPoller } from "../src/integrations/github-poller.ts";
+import * as landLogs from "../src/land/land-log.ts";
 import { LandBlocked, type LandDeps, type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import * as gateExecution from "../src/pipeline/gate-execution.ts";
@@ -464,6 +466,61 @@ const testFailure: Partial<GateResult> = {
   failureAttributionComplete: true,
 };
 
+test("land blocks and finalizes only after structured result appends settle", async () => {
+  const { pr } = await retryLandFixture(),
+    started = deferred<void>(),
+    release = deferred<void>();
+  const scope = gatePrivacyScope.getStore();
+  if (!scope) throw Error("Missing privacy scope");
+  const raw = "distinctive-raw-land-output",
+    protect = scope.checker.protectText;
+  const checker = spyOn(scope.checker, "protectText").mockImplementation(async (...args) => {
+    if (args[0].text.includes("\n$ ")) {
+      started.resolve();
+      await release.promise;
+    }
+    return protect(...args);
+  });
+  let finalizedBeforeWrite = false;
+  const finish = store.observations.finalize.bind(store.observations);
+  const append = spyOn(landLogs, "appendLandLog"),
+    finalize = spyOn(store.observations, "finalize").mockImplementation((...args) => {
+      const path = store.getLandEntry(Number(args[0].slice(5)))?.logPath;
+      finalizedBeforeWrite ||= !path || !readFileSync(path, "utf8").includes(raw);
+      return finish(...args);
+    });
+  const fake = fakeLandGates(async () => ({
+    setupOk: false,
+    checks: [],
+    setup: [await provenResult(gateResult("setup", "prepare", { ok: false, exitCode: 1, output: raw }))],
+  }));
+  try {
+    const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+    await started.promise;
+    expect(store.getLandEntry(entry.id)?.state).toBe("checking");
+    expect(finalize).not.toHaveBeenCalled();
+    release.resolve();
+    await waitFor(() => store.getLandEntry(entry.id)?.state === "blocked");
+    expect(readFileSync(store.getLandEntry(entry.id)?.logPath ?? "", "utf8")).toContain(raw);
+    expect(finalize).toHaveBeenCalled();
+    expect(finalizedBeforeWrite).toBe(false);
+    expect(
+      append.mock.calls.some(([, parts]) => parts.some((p) => typeof p === "object" && p.output === raw)),
+    ).toBe(true);
+    expect(
+      append.mock.calls
+        .flatMap(([, parts]) => parts)
+        .filter((p) => typeof p === "string")
+        .every((p) => !p.includes(raw)),
+    ).toBe(true);
+  } finally {
+    release.resolve();
+    checker.mockRestore();
+    append.mockRestore();
+    finalize.mockRestore();
+  }
+});
+
 function fakeLandGates(
   run: (req: GateRequest, attempt: number, signal: AbortSignal) => GateRun | Promise<GateRun>,
 ) {
@@ -484,9 +541,17 @@ function fakeLandGates(
           async *[Symbol.asyncIterator]() {
             const completed = await result;
             for (const r of completed.setup)
-              yield { type: "check" as const, phase: "setup" as const, result: r };
+              yield {
+                type: "check" as const,
+                phase: "setup" as const,
+                result: await provenResult(redactGateData(r)),
+              };
             for (const r of completed.checks)
-              yield { type: "check" as const, phase: "check" as const, result: r };
+              yield {
+                type: "check" as const,
+                phase: "check" as const,
+                result: await provenResult(redactGateData(r)),
+              };
           },
         },
         async cancel() {},

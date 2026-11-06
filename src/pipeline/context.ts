@@ -47,6 +47,8 @@ import type { CapabilityGate, CapabilityRefusal } from "../integrations/member-e
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
+import { verifier } from "../util/privacy-proof.ts";
+import { checkRendering, renderingPrivacy } from "../util/privacy-rendering.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import type { AcceptanceState } from "./acceptance.ts";
 import {
@@ -431,6 +433,7 @@ export class RunContext {
   readonly runDir: string;
   previewUrl?: string;
   state: RunState;
+  loadedFeedback: string | null;
 
   get freeFirstRouting(): boolean {
     return this.run.requestedBy === "dependabot[bot]" && this.deps.cfg.dependabotRouting === "free_first";
@@ -481,6 +484,18 @@ export class RunContext {
     mkdirSync(this.runDir, { recursive: true });
     const stored = deps.store.getRunState<RunState>(run.id);
     this.state = stored ?? initialRunState(run);
+    if (this.state.feedback !== null) {
+      const { registry, signer } = renderingPrivacy(),
+        feedback = this.state.feedback;
+      if (
+        !verifier(registry, signer).verify(this.state.feedbackProof, "feedback", feedback) ||
+        redactGateOutput(feedback) !== feedback
+      ) {
+        this.state.feedback = "[previous feedback withheld: unverified]";
+        delete this.state.feedbackProof;
+      }
+    }
+    this.loadedFeedback = this.state.feedback;
     const comparisons = <T extends GateComparison>(checks: T[]): T[] =>
       checks.map((check) => ({
         ...check,
@@ -523,6 +538,17 @@ export class RunContext {
       const value = this.state[field];
       if (typeof value === "string") this.state[field] = redactGateOutput(value);
     }
+  }
+
+  async checkFeedback(): Promise<void> {
+    if (this.state.feedback === null) delete this.state.feedbackProof;
+    else if (this.state.feedback !== this.loadedFeedback) {
+      const { rendering, proof, reason } = await checkRendering(this.state.feedback, "feedback", this.signal);
+      this.state.feedback = reason ? `[previous feedback withheld: ${reason}]` : rendering;
+      if (proof) this.state.feedbackProof = proof;
+      else delete this.state.feedbackProof;
+    }
+    this.loadedFeedback = this.state.feedback;
   }
 
   get store(): Store {

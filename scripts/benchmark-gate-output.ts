@@ -26,7 +26,7 @@ const field = (v: unknown, path: string): unknown =>
 export async function worker(root: string, name: string) {
   validate(Object.hasOwn(registry, name), "unknown workload");
   const paths =
-    "util/proc util/privacy-boundary util/privacy-checker util/privacy-chunks util/privacy-proof util/privacy-policy gates/text-privacy gates/output gates/run gates/junit gates/test-coverage gates/slots harness/sandbox harness/read-policy pipeline/context pipeline/prompts pipeline/report server/http".split(
+    "util/proc util/privacy-boundary util/privacy-checker util/privacy-chunks util/privacy-proof util/privacy-policy gates/text-privacy gates/output gates/run gates/junit gates/test-coverage gates/slots harness/sandbox harness/read-policy pipeline/context pipeline/prompts pipeline/report land/land-log server/http".split(
       " ",
     );
   const modules = await Promise.all(

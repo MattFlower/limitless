@@ -1,6 +1,6 @@
 import { profile, type SamplingProfileStackTraces } from "bun:jsc";
 import { existsSync } from "node:fs";
-import { readFile, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { join, sep } from "node:path";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { Server } from "bun";
@@ -21,6 +21,7 @@ import { lifecycleManaged } from "../integrations/issue-lifecycle.ts";
 import { ISSUE_TEXT_FIELDS, issueTextSchema } from "../integrations/issue-trust.ts";
 import { ResolveRunSchema, resolveConflict } from "../integrations/mcp.ts";
 import { getChange } from "../integrations/mcp-change.ts";
+import { readLandLog } from "../land/land-log.ts";
 import { landWire } from "../land/wire.ts";
 import { acceptanceRunRequest, resolveIntent } from "../pipeline/acceptance.ts";
 import { ReviewRefused, submitReview } from "../pipeline/review-round.ts";
@@ -847,7 +848,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         );
         if (!roots.some((root) => root && path.startsWith(`${root}${sep}`)))
           return error("land log not found", 404);
-        return new Response(redactGateArtifact(await readFile(path, "utf8")), {
+        return new Response(redactGateArtifact(readLandLog(path)), {
           headers: { "content-type": "text/plain; charset=utf-8" },
         });
       } catch {

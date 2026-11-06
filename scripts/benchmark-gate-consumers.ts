@@ -1,3 +1,5 @@
+import type { AsyncLocalStorage } from "node:async_hooks";
+import { join } from "node:path";
 import {
   type Context,
   consumerSign,
@@ -168,6 +170,34 @@ async function feedback(c: Context): Promise<Job[]> {
     ],
   ];
 }
+async function landLog(c: Context): Promise<Job[]> {
+  const available = ["openLandLog", "appendLandLog", "readLandLog", "gatePrivacyScope"].every((k) => c.a[k]),
+    path = join(c.cwd, "land.log"),
+    count = 10000,
+    text = "checked entry\n";
+  const scoped = (run: () => unknown) =>
+    (c.a.gatePrivacyScope as AsyncLocalStorage<unknown>).run(
+      { checker: c.checker(), registry: c.checker().registry, signer: () => c.key },
+      run,
+    );
+  const append = async () => {
+    const log = call(c, "openLandLog", path);
+    for (let i = 0; i < count; i++) await call(c, "appendLandLog", log, [text]);
+    return count;
+  };
+  const read = () => scoped(() => call(c, "readLandLog", path));
+  return ["append", "read-and-verify"].map((label) => [
+    `${label}:production`,
+    count,
+    available ? () => (label === "append" ? scoped(append) : read()) : undefined,
+    (v) => validate((label === "append" ? read() : v) === text.repeat(count), "checked entries"),
+    label === "append"
+      ? undefined
+      : async () => {
+          await scoped(append);
+        },
+  ]);
+}
 function render(c: Context): Job[] {
   const state = consumerState(64),
     gates = state.lastGates;
@@ -188,14 +218,5 @@ export const consumerRegistry: Record<string, (c: Context) => Promise<Job[]> | J
   ["event-drain", drain],
   ["feedback-sign", feedback],
   ["render-prompts", render],
-  [
-    "land-log",
-    () =>
-      ["append", "read-and-verify"].map((label) => [
-        `${label}:unavailable:signed-log API absent`,
-        10000,
-        undefined,
-        () => validate(false, "signed log unavailable"),
-      ]),
-  ],
+  ["land-log", landLog],
 ]);
