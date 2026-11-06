@@ -322,6 +322,27 @@ describe("runGates / compareGates", () => {
     }
   });
 
+  test("raw confinement scanning includes the final chunk before a queued gate resolves", async () => {
+    const dir = tempDir({ "last.txt": `${".".repeat(131072)}\nsandbox_apply: Operation not permitted` });
+    try {
+      const run = await proc.processDrainObserver.run({ budget: 1024, observe: () => {} }, () =>
+        runGates(
+          dir,
+          {
+            setup: [],
+            source: "detected",
+            protectedPaths: [],
+            checks: [{ name: "final-chunk", run: "cat last.txt" }],
+          },
+          new AbortController().signal,
+        ),
+      );
+      expect(run.checks[0]).toMatchObject({ confinementError: true, ok: false, exitCode: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("redacts setup, checks and retries before tail cuts, callbacks and persistence", async () => {
     const credential = "synthetic-gate-boundary-credential-409";
     proc.registerCredential("GATE_BOUNDARY_TEST_TOKEN", credential);
