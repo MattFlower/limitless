@@ -11,6 +11,7 @@ export async function protectGateOutput(
   identities: string | (() => string),
   control: { signal?: AbortSignal; deadline: number },
   excerpt?: string,
+  excerptCurrent?: () => boolean,
 ): Promise<{ output: string; textPrivacy: TextPrivacy; failures?: string }> {
   const withheld = (reason: string): TextPrivacy["output"] => ({ withheld: true, reason });
   let failures: string | undefined, failureField: TextPrivacy["failures"];
@@ -140,7 +141,7 @@ export async function protectGateOutput(
     if (excerpt !== undefined) {
       const signing = verifier(registry, scope?.signer).available;
       failureField = field.withheld ? withheld(field.reason ?? "checker-failed") : withheld("checker-failed");
-      if (!field.withheld) {
+      if (!field.withheld && excerptCurrent?.()) {
         try {
           failureField = await sign(
             excerpt,
@@ -153,6 +154,10 @@ export async function protectGateOutput(
         } catch {
           failureField = withheld("checker-failed");
         }
+      }
+      if (!excerptCurrent?.()) {
+        failures = undefined;
+        failureField = withheld("stale-generation");
       }
       if (!signing) failureField = undefined;
     }

@@ -1,4 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
+import { createHash, createHmac } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -17,6 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { privateStringsDigest } from "../src/gates/private.ts";
 import { checkPublicationText } from "../src/gates/publication.ts";
 import { createCredentialRegistry, credentialRegistry } from "../src/util/credential-matcher.ts";
 import { createPrivacyRegistry, privacyRegistry } from "../src/util/privacy-boundary.ts";
@@ -578,4 +580,48 @@ test("producer cuts use partial-prefix semantics and domain-separated proofs", a
     provenance: { kind: "cut", truncated: true },
   });
   expect(consumeBoundaryChunk(receipt, 0)).toMatchObject({ withheld: true, reason: "unchecked-provenance" });
+});
+
+test.each([true, false])("producer cuts refuse credential-changed bytes with signer=%s", async (signed) => {
+  const secrets = createCredentialRegistry(),
+    credential = "cut-candidate-credential";
+  secrets.add(credential);
+  const f = fixture(secrets),
+    refusals: string[] = [];
+  const proof = await f.sign(`diagnostic ${credential}\n(fail) case`, {
+    producerCut: true,
+    field: "failures",
+    signer: signed ? f.signer : () => undefined,
+    onRefusal: (reason) => refusals.push(reason),
+  });
+  expect(proof).toBeUndefined();
+  expect(refusals).toEqual(["private-match"]);
+});
+
+test("authentic proofs from before the cut binding cannot verify under either flag", async () => {
+  const f = fixture(),
+    source = "x".repeat(6100),
+    tail = source.slice(-6000),
+    key = f.signer();
+  if (!key) throw Error("Missing key");
+  const historical = {
+    kind: "complete",
+    mac: createHmac("sha256", key)
+      .update(
+        JSON.stringify([
+          "limitless-gate-proof/1",
+          "complete",
+          "privacy/1",
+          privateStringsDigest(f.registry.entries),
+          "output",
+          createHash("sha256").update(tail).digest("hex"),
+        ]),
+      )
+      .digest("hex"),
+  };
+  const verify = p.verifier(f.registry, f.signer).verify;
+  expect(verify(historical, "output", tail, false)).toBe(false);
+  expect(verify(historical, "output", tail, true)).toBe(false);
+  const current = await f.sign(source, { cut: { limit: 6000, unit: "U", side: "tail" } });
+  expect(verify(current, "output", tail, true)).toBe(true);
 });

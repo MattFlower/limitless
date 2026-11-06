@@ -3,6 +3,7 @@ import { existsSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { worktreeGit } from "../git/command.ts";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
+import { credentialRegistry } from "../util/credential-matcher.ts";
 import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import { RunnerFailureEvidence } from "./attribution.ts";
@@ -164,6 +165,7 @@ async function runOne(
   let overflow = false;
   const evidence = new RunnerFailureEvidence();
   const excerpts = new FailureExcerpts();
+  const excerptGeneration = credentialRegistry.generation;
   const observe = (line: string) => {
     evidence.observe(line);
     coverage.observe(line);
@@ -261,6 +263,7 @@ async function runOne(
       identities,
       { signal, deadline: Date.now() + 120_000 },
       !ok ? excerpts.result() : undefined,
+      () => credentialRegistry.generation === excerptGeneration,
     ),
   );
 }

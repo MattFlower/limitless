@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
+import { createHash, createHmac } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,7 +15,7 @@ import * as identityModule from "../src/gates/text-privacy.ts";
 import { gateIdentities, gatePrivacyScope, IDENTITY_CAP, withheldText } from "../src/gates/text-privacy.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { coveringTestCommand } from "../src/pipeline/covering-tests.ts";
-import { createCredentialRegistry } from "../src/util/credential-matcher.ts";
+import { createCredentialRegistry, credentialRegistry } from "../src/util/credential-matcher.ts";
 import {
   createPrivacyRegistry,
   currentPrivacyGeneration,
@@ -78,6 +79,8 @@ function fixture(entries: string[] = [], credential?: string) {
   const checker = createPrivacyChecker({ registry, workerFactory: port });
   checkers.push(checker);
   const signer = () => Buffer.alloc(32, 23);
+  const excerptGeneration = credentialRegistry.generation;
+  const excerptCurrent = () => credentialRegistry.generation === excerptGeneration;
   const scoped = <T>(run: () => T, sign: () => Buffer | undefined = signer) =>
     gatePrivacyScope.run({ checker, registry, signer: sign }, run);
   const gate = async (
@@ -105,7 +108,7 @@ function fixture(entries: string[] = [], credential?: string) {
     if (!result) throw Error("Missing gate result");
     return result;
   };
-  return { cwd, registry, checker, signer, scoped, gate };
+  return { cwd, registry, checker, signer, scoped, gate, excerptCurrent };
 }
 const capture = (stdout = "marker", stderr = ""): ProcResult => ({
   capture: { provenance: { kind: "complete" }, stdout, stderr },
@@ -662,7 +665,9 @@ test.each(["line", "budget", "join"])("excerpt own-byte check rejects %s cuts", 
   const f = fixture([entry]),
     excerpt = extractFailures(source);
   expect(excerpt).toBeDefined();
-  const r = await f.scoped(() => protectGateOutput(capture(source), "[]", control(), excerpt));
+  const r = await f.scoped(() =>
+    protectGateOutput(capture(source), "[]", control(), excerpt, f.excerptCurrent),
+  );
   expect(r.textPrivacy.output.withheld).toBe(false);
   expect(r.failures).toBeUndefined();
   expect(r.textPrivacy.failures).toEqual({ withheld: true, reason: "private-match" });
@@ -675,7 +680,9 @@ test.each([0, 1])(
     const f = fixture(),
       excerpt = extractFailures(source);
     expect(excerpt?.includes(omitted)).toBe(extra === 1);
-    const r = await f.scoped(() => protectGateOutput(capture(source), "[]", control(), excerpt));
+    const r = await f.scoped(() =>
+      protectGateOutput(capture(source), "[]", control(), excerpt, f.excerptCurrent),
+    );
     expect(r.failures).toBe(excerpt);
     const verify = verifier(f.registry, f.signer).verify;
     expect(verify(r.textPrivacy.failures, "failures", r.failures ?? "", true)).toBe(true);
@@ -699,7 +706,7 @@ test.each(["R1", "R3", "timeout", "cancelled", "cut"])(
     if (kind === "cut") res.capture = { provenance: { kind: "cut", truncated: true } };
     const checks = spyOn(f.checker, "protectText"),
       cuts = spyOn(f.checker, "protectProducerCut");
-    const r = await f.scoped(() => protectGateOutput(res, "[]", control(), identity));
+    const r = await f.scoped(() => protectGateOutput(res, "[]", control(), identity, f.excerptCurrent));
     expect(r.failures).toBeUndefined();
     expect(r.textPrivacy.failures?.withheld).toBe(true);
     expect(cuts).not.toHaveBeenCalled();
@@ -713,7 +720,7 @@ test.each([true, false])("unsigned excerpts require a clean check: clean=%s", as
     c = control();
   const cuts = spyOn(f.checker, "protectProducerCut");
   const r = await f.scoped(
-    () => protectGateOutput(capture("source"), "[]", c, clean ? identity : "private-value"),
+    () => protectGateOutput(capture("source"), "[]", c, clean ? identity : "private-value", f.excerptCurrent),
     () => undefined,
   );
   expect(r.failures).toBe(clean ? identity : undefined);
@@ -728,7 +735,9 @@ test("an entries change between source and excerpt refuses the excerpt", async (
     f.registry.replacePolicy([{ value: "elsewhere", entry: 0 }]);
     return original(...args);
   });
-  const r = await f.scoped(() => protectGateOutput(capture("source"), "[]", control(), identity));
+  const r = await f.scoped(() =>
+    protectGateOutput(capture("source"), "[]", control(), identity, f.excerptCurrent),
+  );
   expect(r.failures).toBeUndefined();
   expect(r.textPrivacy.failures).toEqual({ withheld: true, reason: "stale-generation" });
 });
@@ -750,4 +759,100 @@ test("passing gates never request excerpts even with failure-shaped rows", async
   expect(r.ok).toBe(true);
   expect(r.failures).toBeUndefined();
   expect(cuts).not.toHaveBeenCalled();
+});
+
+test.each(
+  [true, false].flatMap((signed) =>
+    ["source", "identities", "excerpt", "after-excerpt", "unchanged"].map(
+      (stage) => [signed, stage] as const,
+    ),
+  ),
+)("excerpt collection credentials stay current: signed=%s registration=%s", async (signed, stage) => {
+  const f = fixture(),
+    token = `excerpt-race-${signed}-${stage}-${"q".repeat(48)}`,
+    source = `${"x".repeat(7905)}${token}\n(fail) case`,
+    prefix = token.slice(0, 24),
+    original = f.checker.protectText,
+    originalCut = f.checker.protectProducerCut;
+  // This is the fragment collected before any checker hook registers the complete token.
+  expect(extractFailures(source)).toContain(prefix);
+  const register = () => {
+    registerCredential("EXCERPT_RACE_TEST", token);
+    f.registry.addCredential(token);
+  };
+  let requests = 0;
+  spyOn(f.checker, "protectText").mockImplementation((...args) => {
+    if (++requests === (stage === "source" ? 1 : stage === "identities" ? 2 : 0)) register();
+    return original(...args);
+  });
+  const cuts = spyOn(f.checker, "protectProducerCut").mockImplementation(async (...args) => {
+    if (stage === "excerpt") register();
+    const receipt = await originalCut(...args);
+    if (stage === "after-excerpt") register();
+    return receipt;
+  });
+  const r = await f.gate(source, "", {}, signed ? f.signer : () => undefined);
+  expect(r.textPrivacy?.output.withheld).toBe(false);
+  expect(r.textPrivacy?.identities?.withheld).toBe(false);
+  if (stage === "source") {
+    expect(r.output).toBe(`${"x".repeat(7905)}[redacted]\n(fail) case`.slice(-6000));
+    expect(cuts).not.toHaveBeenCalled();
+  }
+  if (stage === "unchanged") {
+    expect(r.failures).toContain(prefix);
+    if (signed)
+      expect(
+        verifier(f.registry, f.signer).verify(r.textPrivacy?.failures, "failures", r.failures ?? "", true),
+      ).toBe(true);
+  } else {
+    expect(r.failures).toBeUndefined();
+    if (signed) expect(r.textPrivacy?.failures).toEqual({ withheld: true, reason: "stale-generation" });
+  }
+  if (!signed) expect(r.textPrivacy).not.toHaveProperty("failures");
+});
+
+test("resumed historical tail proofs project as unproven while current tail proofs release", async () => {
+  const f = fixture(),
+    protectedOutput = await f.scoped(() => protectGateOutput(capture("x".repeat(6100)), "[]", control()));
+  const historical = {
+    kind: "complete",
+    mac: createHmac("sha256", f.signer())
+      .update(
+        JSON.stringify([
+          "limitless-gate-proof/1",
+          "complete",
+          "privacy/1",
+          privateStringsDigest(f.registry.entries),
+          "output",
+          createHash("sha256").update(protectedOutput.output).digest("hex"),
+        ]),
+      )
+      .digest("hex"),
+  };
+  const current = {
+    name: "test",
+    command: "true",
+    ok: false,
+    exitCode: 1,
+    durationMs: 0,
+    ...protectedOutput,
+  };
+  for (const truncated of [false, true]) {
+    const restored: typeof current = JSON.parse(
+      JSON.stringify({
+        ...current,
+        textPrivacy: {
+          ...current.textPrivacy,
+          output: { ...current.textPrivacy.output, ...historical, truncated },
+        },
+      }),
+    );
+    expect(
+      projectGateDiagnostics(restored, { mode: "outward", registry: f.registry, signer: f.signer }).output,
+    ).toBe(withheldText("unproven"));
+  }
+  const restored: typeof current = JSON.parse(JSON.stringify(current));
+  expect(
+    projectGateDiagnostics(restored, { mode: "outward", registry: f.registry, signer: f.signer }).output,
+  ).toBe("x".repeat(6000));
 });
