@@ -286,8 +286,9 @@ test.each(["targeted only", "targeted", "full"])(
         );
         if (reason) {
           expect(result?.output).toContain(reason);
-          expect(result?.failures).toContain(reason);
-          expect(result?.failures).toContain("original assertion");
+          expect(result?.failures).toBeUndefined();
+          expect(result?.textPrivacy).not.toHaveProperty("failures");
+          expect(result?.firstAttempt?.failures).toBe("original assertion");
           expect(skipped[0]).toContain(reason);
           expect(result?.confinementError).toBe(false);
         } else expect(skipped).toEqual([]);
@@ -1333,7 +1334,9 @@ test("real Bun JUnit capture keeps failing files, console excerpts and coverage"
       ),
     );
     expect(gates.checks[0]?.failedFiles).toEqual(["test/b.test.ts"]);
-    expect(gates.checks[0]?.failures).toBeUndefined();
+    expect(gates.checks[0]?.failures).toContain("(fail) fails");
+    expect(gates.checks[0]?.failures).toContain("Expected: 2");
+    expect(gates.checks[0]?.failures).toContain("Received: 1");
     expect(gates.checks[0]?.output).toContain("(fail) fails");
     expect(gates.checks[0]?.testCoverage?.summary).toBeTruthy();
     expect(gates.checks[0]?.failureAttributionComplete).toBe(true);
