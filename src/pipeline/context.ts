@@ -531,7 +531,14 @@ export class RunContext {
 
   /** Artifacts are outward copies; decode JSON so escaped controls are sanitized as text. */
   artifact(name: string, kind: string, content: string): void {
-    this.store.putArtifact(this.run.id, name, kind, sanitizeArtifact(name, content));
+    const projected = name.endsWith(".json")
+      ? JSON.stringify(
+          projectGateDiagnostics(JSON.parse(content), { mode: "durable" }),
+          null,
+          content.includes("\n") ? 2 : undefined,
+        )
+      : content;
+    this.store.putArtifact(this.run.id, name, kind, sanitizeArtifact(name, projected));
   }
 
   get complexity(): Complexity {

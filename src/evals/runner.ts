@@ -7,6 +7,7 @@ import {
   type PanelRules,
   type ReviewSample,
 } from "../core/types.ts";
+import { setupFailureMessage } from "../gates/output.ts";
 import { Semaphore } from "../gates/slots.ts";
 import { worktreeGit } from "../git/command.ts";
 import {
@@ -827,10 +828,7 @@ export class EvalRunner {
         const head = (await worktreeGit(["git", "rev-parse", "HEAD"], { cwd, signal })).stdout.trim();
         const { baseline } = await prepareEvalGates(effective, cwd, signal, true);
         const failed = baseline.setup.find((step) => !step.ok);
-        if (!baseline.setupOk)
-          throw new Error(
-            redactCredentials(`review gate setup failed: ${failed?.command}\n${failed?.output}`),
-          );
+        if (!baseline.setupOk) throw new Error(setupFailureMessage("review gate setup failed: ", failed));
         // Pin attributes too: setup may leave .gitattributes. Retain dependencies and other outputs.
         await worktreeGit(["git", `--attr-source=${head}`, "reset", "--hard", "-q", head], { cwd, signal });
       }

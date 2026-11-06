@@ -1,4 +1,4 @@
-import { expect, spyOn } from "bun:test";
+import { beforeEach, expect, spyOn } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -39,6 +39,7 @@ import {
 } from "../src/pipeline/verification.ts";
 import { registerCredential, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
+import { provenResult } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
 import { seeded } from "./seeded.ts";
 
@@ -176,8 +177,10 @@ test.each([undefined, null, "environment"] as const)(
   },
 );
 
-test("clean gates produce only engine-written evidence and provenance", () => {
-  const result = resolve(blocked, gates());
+test("clean gates produce only engine-written evidence and provenance", async () => {
+  const evidence = gates();
+  for (const check of evidence.checks) check.result = await provenResult(check.result);
+  const result = resolve(blocked, evidence);
   expect(result.overall).toBe("pass");
   expect(result.criteria[0]?.evidence).toBe(
     `Factory gate tests passed at ${sha} (stage 12); commands: bun run test`,
@@ -288,9 +291,10 @@ function inheritedFixture() {
 
 test.each(["broad", "targeted", "truncated", "targeted-truncated"])(
   "factory baseline permits inherited skips for %s verification",
-  (kind) => {
+  async (kind) => {
     const { evidence, check, baseline } = inheritedFixture();
     if (kind.endsWith("truncated")) check.result.output = "x".repeat(6000);
+    check.result = await provenResult(check.result);
     const publicSpec = {
       ...spec,
       acceptance_criteria: [
@@ -619,7 +623,7 @@ test.each([
   expect(privateResult.criteria[0]?.gateEvidence).toBeUndefined();
 });
 
-test("clean gate checks can cover all commands in a multi-step criterion", () => {
+test("clean gate checks can cover all commands in a multi-step criterion", async () => {
   const evidence = gates();
   const check = evidence.checks[0];
   if (!check) throw new Error("missing fixture check");
@@ -633,6 +637,7 @@ test("clean gate checks can cover all commands in a multi-step criterion", () =>
       output: "test/other.test.ts:\n(pass) other test\n1 pass\n0 fail",
     },
   });
+  for (const check of evidence.checks) check.result = await provenResult(check.result);
   const result = resolve(blocked, evidence, {
     ...spec,
     acceptance_criteria: [
@@ -1305,6 +1310,11 @@ const requested: Verify = {
     covering_tests: [{ file: "x.test.ts", name: "passes" }],
   })),
 };
+let coveringProof: NonNullable<CoveringTestRun["result"]>["textPrivacy"];
+beforeEach(async () => {
+  const result = coveringRun().result;
+  if (result) coveringProof = (await provenResult(result)).textPrivacy;
+});
 function coveringRun(): CoveringTestRun {
   return {
     file: "x.test.ts",
@@ -1315,6 +1325,7 @@ function coveringRun(): CoveringTestRun {
     result: {
       name: "test",
       command: "bun test -t '(?:^| )passes$' './x.test.ts'",
+      textPrivacy: coveringProof,
       ok: true,
       exitCode: 0,
       durationMs: 1,
@@ -1346,7 +1357,7 @@ test.each([
   "retained",
   "citation-only",
   "unavailable",
-])("covering tests cannot establish unverified relevance: %s", (mode) => {
+])("covering tests cannot establish unverified relevance: %s", async (mode) => {
   const runs = [coveringRun()];
   if (mode.startsWith("mixed")) {
     const other = coveringRun();
@@ -1354,6 +1365,7 @@ test.each([
     other.file = "other.test.ts";
     other.stageId = 14;
     other.result.coveringTest = { file: other.file, name: other.name };
+    other.result = await provenResult(other.result);
     runs.push(other);
   }
   const input =
@@ -1613,10 +1625,11 @@ test("catches exposing private text or raw modelOutput after test-outcome reconc
   }
 });
 
-test("behavioural coverage binds only the factory record and cites its exact command", () => {
+test("behavioural coverage binds only the factory record and cites its exact command", async () => {
   const run = coveringRun();
   if (!run.result) throw new Error("missing result");
   run.result.executedCommand = `${run.result.command} --reporter=junit --reporter-outfile=report.xml`;
+  run.result = await provenResult(run.result);
   const result = bindCovering(requested, [run]).criteria[0];
   expect(result).toMatchObject({
     status: "met",
@@ -2034,6 +2047,7 @@ async function reconcileCovering(
     run.result.coveringTest = { file, name: run.name };
     return run;
   });
+  for (const run of runs) if (run.result) run.result = await provenResult(run.result);
   const input: Verify = {
     ...requested,
     criteria: requested.criteria.map((c) => ({
@@ -2414,7 +2428,7 @@ test.each([
   ["symlink", "JUnit report missing, stale or unsafe"],
   ["pre-existing", "JUnit report existed before execution"],
   ["malformed", "unparseable JUnit report"],
-] as const)("covering JUnit requires fresh exact testcase evidence: %s", (mode, reason) => {
+] as const)("covering JUnit requires fresh exact testcase evidence: %s", async (mode, reason) => {
   const cwd = mkdtempSync(join(tmpdir(), "covering-junit-"));
   try {
     writeFileSync(join(cwd, "x.test.ts"), "");
@@ -2478,6 +2492,7 @@ test.each([
     if (!run.result) throw new Error("missing result");
     run.name = name;
     run.result.coveringTest = junit;
+    run.result = await provenResult(run.result);
     const value = {
       ...requested,
       criteria: requested.criteria.map((c) => ({ ...c, covering_tests: [{ file: "x.test.ts", name }] })),

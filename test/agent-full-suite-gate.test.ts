@@ -13,7 +13,7 @@ import type { Verify } from "../src/pipeline/schemas.ts";
 import { agentEnv, registerCredential, sh } from "../src/util/proc.ts";
 import { GateRunSchema } from "../src/workers/protocol.ts";
 import { approve, pipelineSetup, roleOf, spec, triage, waitFor } from "./pipeline-support.ts";
-import { provenResult } from "./privacy-support.ts";
+import { privacyTexts, provenResult } from "./privacy-support.ts";
 import { test } from "./read-policy-support.ts";
 
 const fixture: { home: string; repoDir: string; factory: Factory | null } = {
@@ -294,6 +294,7 @@ test.each([
                         : (await sh(["git", "rev-parse", "HEAD^{tree}"], { cwd: request.cwd })).stdout.trim(),
                   }),
             });
+            run.provenanceError = privacyTexts[0];
             if (scenario === "lan-legacy") delete run.trackedClean;
             if (scenario === "lan-missing") {
               delete run.sha;
@@ -373,6 +374,13 @@ test.each([
           if (unconfirmed) {
             expect(f.store.db.query("SELECT * FROM agent_gate_executions").all()).toEqual([]);
             expect(result.stdout).toContain("Result is not reusable because");
+            for (const sentinel of privacyTexts) expect(result.stdout).not.toContain(sentinel);
+            expect(
+              f.store
+                .listEvents(runId)
+                .filter((e) => e.message.startsWith("Result is not reusable because"))
+                .every((e) => !privacyTexts.some((s) => e.message.includes(s))),
+            ).toBe(true);
             expect(result.stdout).toContain(
               scenario.includes("unreadable") ||
                 ["lan-missing", "lan-sha-only", "lan-legacy"].includes(scenario)
@@ -388,7 +396,7 @@ test.each([
                       "deleted",
                       "renamed",
                     ].includes(scenario)
-                  ? "tracked files changed"
+                  ? "snapshot provenance could not be confirmed"
                   : "snapshot changed during the gate",
             );
             const state = f.store.getRunState<RunState>(runId);

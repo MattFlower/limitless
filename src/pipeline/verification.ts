@@ -1,6 +1,6 @@
 import type { RunEvent } from "../core/types.ts";
 import { redactGateData, redactGateOutput } from "../gates/output.ts";
-import { BROWSER_TOOLS } from "../harness/browser-mcp.ts";
+import { BROWSER_TOOLS } from "../harness/browser-tools.ts";
 import { promptJson, redactHoldoutText } from "./prompts.ts";
 import { type Holdout, requirementCitationIssue, rowKind, type Spec, type Verify } from "./schemas.ts";
 
