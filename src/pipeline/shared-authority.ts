@@ -11,9 +11,18 @@ import { initialRunState, localCheckpointer, type RunState } from "./context.ts"
 import { claimKey, claimRef } from "./portable.ts";
 import { bindRunClaim, type RunClaim } from "./run-claim.ts";
 import { admitRun, type SharedRuntime } from "./shared-admission.ts";
+import type { ClaimContext } from "./shared-checkpointer.ts";
 
 // Loss routes to the execution binding (keyed by run id) and to an in-flight publication binding.
 const routes = new WeakMap<SharedRuntime, Map<string, ScopedClaim>>();
+export function executionClaim(
+  rt: SharedRuntime,
+  runId: string,
+  signal: AbortSignal,
+): ClaimContext | undefined {
+  const binding = routes.get(rt)?.get(runId);
+  return binding && { binding: { ...binding, guard: () => claimScope.run([binding], claimGuard) }, signal };
+}
 const tails = new WeakMap<SharedRuntime, Map<string, Promise<unknown>>>();
 const of = <V>(m: WeakMap<SharedRuntime, Map<string, V>>, rt: SharedRuntime) =>
   m.get(rt) ?? (m.set(rt, new Map()).get(rt) as Map<string, V>);

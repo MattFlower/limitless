@@ -148,6 +148,7 @@ export function sharedCheckpointer(
       });
     },
     checkpoint(runId, label) {
+      if (terminal && !terminal.shared(runId)) return local.checkpoint(runId, label);
       if (label === undefined) return;
       const claim = claims(runId);
       if (!claim) return;

@@ -147,6 +147,17 @@ test("Run Detail shows the GitHub wait only for queued runs with an outage episo
     expect(capability).not.toContain("waiting for GitHub");
     for (const time of [githubWait.since, githubWait.nextAttemptAt])
       expect(capability).toContain(formatDateTime(time));
+    for (const [reason, label] of [
+      ["claim:checkpoint", "waiting for a readable checkpoint"],
+      ["claim:policy", "waiting for shared run policy"],
+      ["claim:terminal", "publishing the final status"],
+    ] as const) {
+      page.mount({ ...detail, run: { ...run, status: "queued", githubWait: { ...githubWait, reason } } });
+      const html = renderToString(() => page.render());
+      expect(html).toContain(`${label} since`);
+      expect(html).toContain("next check");
+      expect(html).not.toContain("waiting for GitHub");
+    }
     page.mount(detail);
     expect(renderToString(() => page.render())).not.toContain("waiting for GitHub");
     page.mount({ ...detail, run: { ...run, status: "running", githubWait } });

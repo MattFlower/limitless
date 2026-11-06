@@ -13,7 +13,7 @@ import { OriginalPrompt } from "../components/OriginalPrompt.tsx";
 import { RetryModels } from "../components/RetryModels.tsx";
 import { StageTimeline } from "../components/StageTimeline.tsx";
 import { RunStatusPill } from "../components/StatusPill.tsx";
-import { compactNumber, duration, formatDateTime, relativeTime } from "../lib/format.ts";
+import { compactNumber, duration, relativeTime, runWaitLabel } from "../lib/format.ts";
 import { now } from "../lib/ticker.ts";
 
 type Detail = Awaited<ReturnType<typeof getRunDetail>>;
@@ -321,13 +321,7 @@ export const RunDetail: Component = () => {
                     <span class="run-title">{r().title}</span>
                   </div>
                   <Show when={r().status === "queued" && r().githubWait}>
-                    {(wait) => (
-                      <div class="text-dim">
-                        {wait().reason === "claim:capability"
-                          ? `waiting for a capable member since ${formatDateTime(wait().since)}; next check ${formatDateTime(wait().nextAttemptAt)}`
-                          : `waiting for GitHub since ${formatDateTime(wait().since)}; next try ${formatDateTime(wait().nextAttemptAt)}; gives up ${formatDateTime(wait().deadline)}`}
-                      </div>
-                    )}
+                    {(wait) => <div class="text-dim">{runWaitLabel(wait())}</div>}
                   </Show>
                   <Show when={r().status === "waiting"}>
                     <p>waiting for {r().dependsOn.join(", ")} to merge</p>

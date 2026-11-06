@@ -5,7 +5,7 @@ import { type Config, loadConfig } from "./config.ts";
 import { type ConfigReload, reloadedConfig } from "./config-reload.ts";
 import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { TERMINAL_STATUSES } from "./core/types.ts";
-import { type GitHubComment, IssueClaimed, Store } from "./db/store.ts";
+import { type GitHubComment, ISSUE_CLAIM_STATUSES, IssueClaimed, Store } from "./db/store.ts";
 import { WorkerStore } from "./db/workers.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
@@ -23,15 +23,20 @@ import { runLlm } from "./harness/llm.ts";
 import { platformConfinement } from "./harness/sandbox.ts";
 import { removeScratch } from "./harness/scratch.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
+import { ClaimLostError, ClaimWaitError } from "./integrations/claim-errors.ts";
 import { configureGitHubIdentity } from "./integrations/github-identity.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
 import { type AcceptanceSnapshot, resolveIntent } from "./pipeline/acceptance.ts";
-import type { EngineDeps, RunState } from "./pipeline/context.ts";
+import { mapClaimInterruption } from "./pipeline/claim-interruption.ts";
+import { type EngineDeps, NeedsHumanError, type RunState } from "./pipeline/context.ts";
 import { lanAgentExecutor } from "./pipeline/lan-agent.ts";
+import { claimKey } from "./pipeline/portable.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
-import { sharedRepository } from "./pipeline/run-claim.ts";
+import { sharedRepository, withCapabilityLapse } from "./pipeline/run-claim.ts";
 import { ensureAdmissionPin } from "./pipeline/run-policy-pins.ts";
+import { admitRun, refuseSharedRequest, type SharedRuntime } from "./pipeline/shared-admission.ts";
+import { claimHooks, publishTerminal } from "./pipeline/shared-authority.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
 import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
@@ -41,11 +46,13 @@ import { Router } from "./router/router.ts";
 import { RuntimeCatalog } from "./router/runtime-catalog.ts";
 import { RuntimePolicy } from "./router/runtime-policy.ts";
 import { Scheduler } from "./scheduler.ts";
+import { LEASE } from "./util/claim-clock.ts";
 import { redactCredentialData, redactCredentials } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 import { activity } from "./util/stall.ts";
 
 export interface FactoryOptions {
+  shared?: SharedRuntime;
   agentExecutor?: EngineDeps["agentExecutor"];
   gateExecutor?: EngineDeps["gateExecutor"];
   confinement?: EngineDeps["confinement"];
@@ -100,6 +107,9 @@ export class Factory {
   private readonly gcTimer: NonNullable<FactoryOptions["gcTimer"]>;
   private gcInterval: ReturnType<typeof setInterval> | null = null;
   private gcInFlight: Promise<GcResult> | null = null;
+  private stopLeases?: () => void;
+  private stopSweep?: () => void;
+  private readonly sweeps?: Map<string, Promise<unknown>>;
   private readonly configValidated = new Set<(cfg: Config) => void>();
 
   constructor(
@@ -228,8 +238,14 @@ export class Factory {
         ]),
       ),
     };
+    if (opts.shared) {
+      this.sweeps = new Map();
+      this.deps.checkpointer = opts.shared.checkpointer;
+      this.deps.capability = opts.shared.gate;
+    }
     this.evals = new EvalRunner(this.deps, opts.evalCasePath);
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns, {
+      shared: opts.shared,
       maxLoadPerCore: cfg.maxLoadPerCore,
       loadSource: opts.loadSource,
     });
@@ -339,10 +355,54 @@ export class Factory {
         .map((p) => p.sshForward as NonNullable<ProviderDef["sshForward"]>),
     );
     this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
+    const rt = this.opts.shared,
+      sweeps = this.sweeps;
+    if (rt && sweeps) {
+      const hooks = claimHooks(rt, this.store);
+      // exempt C11: Factory.start owns shared lease renewal and terminal publication.
+      this.stopLeases = rt.leases.start({
+        active: withCapabilityLapse(this.store, hooks.active),
+        onLost: hooks.onLost,
+      });
+      const sweep = () => {
+        for (const row of this.store.heldLeaseRows()) {
+          const run = this.store.getRun(row.runId);
+          if (
+            !run ||
+            sweeps.has(run.id) ||
+            (!this.store.checkpointRecord(run.id)?.terminal && !TERMINAL_STATUSES.includes(run.status))
+          )
+            continue;
+          const work = publishTerminal(rt, this.store, run.id)
+            .then(() => {
+              if (TERMINAL_STATUSES.includes(run.status) && row.confirmed)
+                return rt.leases.release(
+                  { ...row, run: run.id, member: rt.member, generation: row.confirmed.generation },
+                  {},
+                );
+            })
+            .catch((error: unknown) =>
+              console.warn(redactCredentials(`Shared terminal sweep: ${String(error)}`)),
+            )
+            .finally(() => sweeps.delete(run.id));
+          sweeps.set(run.id, work);
+        }
+      };
+      let timer: unknown;
+      const tick = () => {
+        timer = rt.clock.timer.set(tick, LEASE.renewMs);
+        sweep();
+      };
+      timer = rt.clock.timer.set(tick, LEASE.renewMs);
+      this.stopSweep = () => rt.clock.timer.clear(timer);
+    }
     this.scheduler.start();
   }
 
   async stop(): Promise<void> {
+    this.stopLeases?.();
+    this.stopSweep?.();
+    if (this.sweeps) await Promise.allSettled(this.sweeps.values());
     this.tracker.stop();
     if (this.gcInterval) this.gcTimer.clear(this.gcInterval);
     this.gcInterval = null;
@@ -401,6 +461,7 @@ export class Factory {
         ),
       };
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
+    if (this.opts.shared) refuseSharedRequest(this.store, this.cfg, repo, req);
     const create = () =>
       chat
         ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
@@ -426,6 +487,22 @@ export class Factory {
       type: "log",
       message: `Run created from ${run.source}${run.requestedBy ? ` by ${run.requestedBy}` : ""}`,
     });
+    const rt = this.opts.shared;
+    if (rt && sharedRepository(this.cfg, repo, repo.slug)) {
+      try {
+        await admitRun(rt, this.store, this.cfg, run, new AbortController().signal);
+      } catch (error) {
+        if (error instanceof NeedsHumanError)
+          rt.checkpointer.writeRun(run.id, { status: "needs_human", error: error.message });
+        else {
+          const control =
+            error instanceof ClaimLostError || error instanceof ClaimWaitError
+              ? error
+              : new ClaimWaitError("unavailable");
+          mapClaimInterruption(this.store, run.id, control, rt.clock.now(), rt.checkpointer);
+        }
+      }
+    }
     return run;
   }
 
@@ -436,6 +513,8 @@ export class Factory {
   ): Promise<Run> {
     resolveIntent(snapshot);
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
+    if (this.opts.shared && sharedRepository(this.cfg, repo, repo.slug))
+      throw new Error("Shared repositories do not support acceptance runs");
     const run = this.store.createAcceptanceRun(repo, req, snapshot, admission);
     this.store.addEvent({ runId: run.id, type: "log", message: `Run created from ${run.source}` });
     return run;
@@ -466,6 +545,14 @@ export class Factory {
   async retryRun(id: string, models?: RunModels): Promise<Run> {
     const run = this.store.getRun(id);
     if (!run) throw new Error(`run ${id} not found`);
+    if (
+      this.opts.shared &&
+      sharedRepository(this.cfg, this.store.getRepo(run.repoId) ?? { kind: "github" }, run.repoSlug)
+    ) {
+      const key = claimKey(run, this.store);
+      if (!("none" in key) && key.kind !== "run" && ISSUE_CLAIM_STATUSES.includes(run.status))
+        throw new Error("Shared issue and PR runs cannot be retried while their claim is held");
+    }
     if (run.flow === "acceptance")
       throw new Error("acceptance runs are restarted from the ticket, not retried");
     return this.createRun(

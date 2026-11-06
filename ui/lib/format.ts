@@ -1,5 +1,7 @@
 // Small, dependency-free formatting helpers shared by every page.
+
 import { utilizationPercent } from "../../src/core/quota-format.ts";
+import type { Run } from "../../src/core/types.ts";
 
 /** Real-money formatting: "$12.34", "$0.004" for tiny metered amounts. */
 export function money(n: number): string {
@@ -86,4 +88,18 @@ export function formatDateTime(ts: number): string {
 
 export function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+export function runWaitLabel(wait: NonNullable<Run["githubWait"]>): string {
+  const label = (
+    {
+      "claim:capability": "waiting for a capable member",
+      "claim:checkpoint": "waiting for a readable checkpoint",
+      "claim:policy": "waiting for shared run policy",
+      "claim:terminal": "publishing the final status",
+    } as Record<string, string>
+  )[wait.reason];
+  return label
+    ? `${label} since ${formatDateTime(wait.since)}; next check ${formatDateTime(wait.nextAttemptAt)}`
+    : `waiting for GitHub since ${formatDateTime(wait.since)}; next try ${formatDateTime(wait.nextAttemptAt)}; gives up ${formatDateTime(wait.deadline)}`;
 }

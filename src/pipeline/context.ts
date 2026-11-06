@@ -675,6 +675,13 @@ export class RunContext {
     throw new ClaimWaitError("capability");
   }
 
+  async boundary(label: string): Promise<void> {
+    if (this.execution.shared) {
+      const p = this.checkpointer.checkpoint(this.run.id, label);
+      if (p) await p;
+    }
+  }
+
   /** Run a stage with bookkeeping; the callback returns a one-line summary. */
   async stage<T>(
     name: StageName,
@@ -713,6 +720,7 @@ export class RunContext {
       this.requireCapabilityNow();
       this.checkCancelled();
       requirePinnedPolicy(this.deps.cfg, this.store, this.run, this.repo);
+      await this.boundary(`stage:${name}`);
     }
     if (!background)
       this.run = this.checkpointer.writeRun(this.run.id, {
