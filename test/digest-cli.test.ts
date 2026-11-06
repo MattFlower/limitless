@@ -394,7 +394,9 @@ test("digest reads unowned land state and PR observations through local routes w
     expect(first.at(-1)).toEndWith('"[withheld: private text]"');
     expect(await read()).toEqual(first);
     expect(store.readFeed({ consumer: "session" })).toEqual(before);
-    expect(requests.some((path) => path.includes("ack"))).toBe(false);
+    expect(requests.some((path) => new URL(path, "http://localhost").pathname === "/api/feed/ack")).toBe(
+      false,
+    );
     store.saveGithubPr({
       url: unownedPrUrl,
       repo: "o/r",
