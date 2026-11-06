@@ -755,6 +755,33 @@ test("recorded cancellation during capability admission defers before terminal p
   expect(await f.record()).toMatchObject({ state: "released", status: "cancelled" });
 });
 
+test("outer engine catch defers cancellation recorded during failure handling", async () => {
+  const f = await fixture(),
+    authority = await held(f);
+  const state = f.store.getRunState<RunState>(f.run.id) ?? initialRunState(f.run);
+  Object.assign(state, {
+    phase: "done",
+    flow: "verify-change",
+    previewConfig: null,
+    slottedCommands: [],
+    agentFullSuite: "slot",
+  });
+  f.store.setRunState(f.run.id, state);
+  const addEvent = f.store.addEvent.bind(f.store);
+  let recorded = false;
+  spyOn(f.store, "addEvent").mockImplementation((event) => {
+    if (event.message.startsWith("Run failed:")) {
+      recorded = true;
+      f.store.updateRun(f.run.id, { error: "cancelled by user" });
+    }
+    return addEvent(event);
+  });
+  expect(await executeRun({ ...f.engineDeps(), runClaim: authority }, f.run.id, f.signal)).toBe("queued");
+  expect(recorded).toBe(true);
+  expectDeferred(f, "cancelled");
+  expect(f.store.getRun(f.run.id)?.error).toBe("cancelled by user");
+});
+
 test("scheduler catch defers an unexpected execution rejection", async () => {
   const f = await fixture(),
     authority = await held(f),
