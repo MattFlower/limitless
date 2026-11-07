@@ -1590,6 +1590,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
           ctx.state.roundsOnImplementer = 0;
         }
+        await ctx.prepareFeedback();
         const view = implementerView(ctx.state);
         const { result, target } = await ctx.invoke({
           role: "implement",

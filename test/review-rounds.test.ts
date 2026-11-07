@@ -1304,10 +1304,16 @@ test.each([
     expect(implementPrompts).toHaveLength(2);
     expect(implementPrompts[1]).toContain("Handle the empty input");
     if (failure) {
-      expect(implementPrompts[1]?.split("### Resolution findings")).toHaveLength(2);
       const feedback = state?.reviewResolution?.feedback;
       expect(feedback).toContain(failure === "review" ? RESOLUTION_FINDING : RESOLUTION_GATE);
-      expect(implementPrompts[1]?.split(feedback as string)).toHaveLength(2);
+      if (boundary === "resolution") {
+        // These findings were saved before reaching the implement prompt, so have no proof on resume.
+        expect(implementPrompts[1]).toContain("[previous feedback withheld: unverified]");
+        expect(implementPrompts[1]).not.toContain(feedback as string);
+      } else {
+        expect(implementPrompts[1]?.split("### Resolution findings")).toHaveLength(2);
+        expect(implementPrompts[1]?.split(feedback as string)).toHaveLength(2);
+      }
     } else expect(implementPrompts[1]).not.toContain("### Resolution findings");
     expect(pushed).toHaveBeenCalledTimes(1);
     expect(pr.comments).toHaveLength(0);

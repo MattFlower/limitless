@@ -32,6 +32,7 @@ import {
   sanitizeArtifact,
 } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
+import { gatePrivacyScope, withheldText } from "../gates/text-privacy.ts";
 import { worktreeGit } from "../git/command.ts";
 import { discardChanges, headSha } from "../git/repos.ts";
 import { browserCache } from "../harness/browser-mcp.ts";
@@ -48,6 +49,8 @@ import type { CapabilityGate, CapabilityRefusal } from "../integrations/member-e
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
+import { getPrivacyChecker } from "../util/privacy-checker.ts";
+import { checkAndSign, verifier } from "../util/privacy-proof.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import type { AcceptanceState } from "./acceptance.ts";
 import {
@@ -432,6 +435,7 @@ export class RunContext {
   readonly runDir: string;
   previewUrl?: string;
   state: RunState;
+  loadedFeedback: string | null;
 
   get freeFirstRouting(): boolean {
     return this.run.requestedBy === "dependabot[bot]" && this.deps.cfg.dependabotRouting === "free_first";
@@ -482,6 +486,20 @@ export class RunContext {
     mkdirSync(this.runDir, { recursive: true });
     const stored = deps.store.getRunState<RunState>(run.id);
     this.state = stored ?? initialRunState(run);
+    const privacy = gatePrivacyScope.getStore() ?? { checker: getPrivacyChecker(), signer: undefined };
+    if (
+      this.state.feedback !== null &&
+      (!verifier(privacy.checker.registry, privacy.signer).verify(
+        this.state.feedbackProof,
+        "feedback",
+        this.state.feedback,
+      ) ||
+        redactGateOutput(this.state.feedback) !== this.state.feedback)
+    ) {
+      this.state.feedback = "[previous feedback withheld: unverified]";
+      delete this.state.feedbackProof;
+    }
+    this.loadedFeedback = this.state.feedback;
     const comparisons = <T extends GateComparison>(checks: T[]): T[] =>
       checks.map((check) => ({
         ...check,
@@ -524,6 +542,30 @@ export class RunContext {
       const value = this.state[field];
       if (typeof value === "string") this.state[field] = redactGateOutput(value);
     }
+  }
+
+  async prepareFeedback(): Promise<void> {
+    if (this.state.feedback === null || this.state.feedback === this.loadedFeedback) return;
+    const text = this.state.feedback;
+    let reason = "unproven";
+    const proof = await checkAndSign({
+      ...(gatePrivacyScope.getStore() ?? { checker: getPrivacyChecker() }),
+      text,
+      kind: "rendering",
+      field: "feedback",
+      cut: { limit: 0, unit: "U", marker: "" },
+      onRefusal: (r) => {
+        reason = r;
+      },
+    });
+    if (proof) {
+      this.state.feedback = text;
+      this.state.feedbackProof = proof;
+    } else {
+      this.state.feedback = withheldText(reason).replace("[withheld:", "[previous feedback withheld:");
+      delete this.state.feedbackProof;
+    }
+    this.loadedFeedback = this.state.feedback;
   }
 
   get store(): Store {

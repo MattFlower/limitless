@@ -224,7 +224,7 @@ test("legacy gate results are redacted at checkpoints, HTTP and SSE reads withou
     store = new Store(db);
     factory = new Factory(fixture.load(), { store });
     const context = new RunContext(factory.deps, run, repo, controller.signal);
-    expect(context.state.feedback).toBe("gate feedback: [redacted]");
+    expect(context.state.feedback).toBe("[previous feedback withheld: unverified]");
     expect(context.state.terminalReason).toBe("gate failure: [redacted]");
     expect(context.state.lastGates?.[0]?.result).toMatchObject({
       output: "credential: [redacted]",

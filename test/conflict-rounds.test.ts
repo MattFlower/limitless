@@ -160,7 +160,8 @@ beforeEach(async () => {
         }
         expect(roleOf(s)).toBe("implement");
         implementations++;
-        expect(s.prompt).toContain("preserving both intents");
+        expect(s.prompt).toContain("preserving both changes' intent");
+        expect(s.prompt).toContain("## Conflict resolution");
         expect(readFileSync(join(s.cwd, "greeting.txt"), "utf8")).toContain("<<<<<<<");
         return {
           files: {

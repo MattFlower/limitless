@@ -22,6 +22,7 @@ import { parseJUnit } from "../src/gates/junit.ts";
 import { redactGateData } from "../src/gates/output.ts";
 import { type GateResult, type GateRun, runLocalGates } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
+import { gatePrivacyScope } from "../src/gates/text-privacy.ts";
 import { worktreeGitScope } from "../src/git/command.ts";
 import * as gitMerge from "../src/git/merge.ts";
 import * as repos from "../src/git/repos.ts";
@@ -33,6 +34,7 @@ import { type GhRunner, runGh } from "../src/integrations/github.ts";
 import { configureGitHubIdentity } from "../src/integrations/github-identity.ts";
 import { type GitHubPrView, getGitHubPr, reconcileMergedRuns } from "../src/integrations/github-notifier.ts";
 import { type GitHubClient, normalizePr, startGitHubPoller } from "../src/integrations/github-poller.ts";
+import * as signedLog from "../src/land/land-log.ts";
 import { LandBlocked, type LandDeps, type LandPrClient, LandQueue } from "../src/land/queue.ts";
 import { processConflictTriggers } from "../src/pipeline/conflict-round.ts";
 import * as gateExecution from "../src/pipeline/gate-execution.ts";
@@ -466,6 +468,7 @@ const testFailure: Partial<GateResult> = {
 
 function fakeLandGates(
   run: (req: GateRequest, attempt: number, signal: AbortSignal) => GateRun | Promise<GateRun>,
+  proveEvents = true,
 ) {
   const requests: GateRequest[] = [];
   const executor: GateExecutor = {
@@ -484,9 +487,17 @@ function fakeLandGates(
           async *[Symbol.asyncIterator]() {
             const completed = await result;
             for (const r of completed.setup)
-              yield { type: "check" as const, phase: "setup" as const, result: r };
+              yield {
+                type: "check" as const,
+                phase: "setup" as const,
+                result: proveEvents ? await provenResult(redactGateData(r)) : r,
+              };
             for (const r of completed.checks)
-              yield { type: "check" as const, phase: "check" as const, result: r };
+              yield {
+                type: "check" as const,
+                phase: "check" as const,
+                result: proveEvents ? await provenResult(redactGateData(r)) : r,
+              };
           },
         },
         async cancel() {},
@@ -6590,5 +6601,42 @@ test.each([true, false])("disable-auto preserves claim interruption (control: %s
   } finally {
     merge.mockRestore();
     disable.mockRestore();
+  }
+});
+
+test("land waits for checked log entries before blocking and never appends raw unproved output", async () => {
+  const { pr } = await retryLandFixture(undefined, "test", "prepare", "bun test; security-scan");
+  const raw = "distinctive-unproved-land-output";
+  const fake = fakeLandGates((req) => retryRun(req, { test: { ...testFailure, output: raw } }), false);
+  const append = spyOn(signedLog, "appendLandLog");
+  const update = store.updateLandEntry.bind(store);
+  let checked = false;
+  const block = spyOn(store, "updateLandEntry").mockImplementation((id, patch) => {
+    if (patch.state === "blocked") {
+      const entry = store.getLandEntry(id),
+        path = entry?.logPath;
+      if (!path) throw new Error("No land log before blocking");
+      expect(signedLog.readLandLog(path)).toContain("[withheld: unproven]");
+      expect(readFileSync(`${path}.proof`, "utf8").trim().split("\n").length).toBeGreaterThan(2);
+      checked = true;
+    }
+    return update(id, patch);
+  });
+  const scope = gatePrivacyScope.getStore();
+  if (!scope) throw new Error("No checker scope");
+  const protect = scope.checker.protectText;
+  const slow = spyOn(scope.checker, "protectText").mockImplementation(async (...args) => {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return protect(...args);
+  });
+  try {
+    await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+    await settle();
+    expect(checked).toBe(true);
+    expect(append.mock.calls.flatMap(([, parts]) => parts).join("")).not.toContain(raw);
+  } finally {
+    append.mockRestore();
+    block.mockRestore();
+    slow.mockRestore();
   }
 });

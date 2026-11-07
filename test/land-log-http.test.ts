@@ -5,7 +5,7 @@ import { createHttpRoutes } from "../src/server/http.ts";
 import { registerCredential } from "../src/util/proc.ts";
 import { fixture, localServer, type Route, requestWithParams } from "./mcp-support.ts";
 
-test("land logs are redacted and confined to canonical runs and land paths", async () => {
+test("legacy land logs are withheld and confined to canonical runs and land paths", async () => {
   const f = await fixture();
   try {
     const store = f.factory.store;
@@ -42,9 +42,8 @@ test("land logs are redacted and confined to canonical runs and land paths", asy
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toStartWith("text/plain");
       const body = await response.text();
-      expect(body).toContain("checks:");
+      expect(body).toBe("[land log entry withheld: unverified]");
       expect(body).not.toContain(secret);
-      expect(body).toContain("[redacted]");
     }
     const sibling = `${paths.runs}-outside`;
     mkdirSync(sibling);
