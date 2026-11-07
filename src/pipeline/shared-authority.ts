@@ -1,6 +1,7 @@
 import type { Config } from "../config.ts";
 import { type Run, TERMINAL_STATUSES } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
+import { githubWait } from "../git/github-wait.ts";
 import { ClaimLostError, ClaimWaitError } from "../integrations/claim-errors.ts";
 import { bindClaim, claimGuard, claimScope, type ScopedClaim } from "../integrations/claim-guard.ts";
 import type { ClaimTip } from "../integrations/claim-ref.ts";
@@ -56,7 +57,8 @@ function wait(rt: SharedRuntime, store: Store, runId: string, reason: string): "
     const state = store.getRunState<RunState>(runId) ?? initialRunState(run),
       now = rt.clock.now(),
       since = state.githubWait?.since ?? now;
-    state.githubWait = { reason: `claim:${reason}`, since, nextAttemptAt: now };
+    // A failed publication attempt retries after the wait interval, never in a tight loop.
+    state.githubWait = { reason: `claim:${reason}`, since, nextAttemptAt: now + githubWait.intervalMs };
     store.updateRun(runId, { status: "queued", stage: null, finishedAt: null }, state);
     return "wait";
   });

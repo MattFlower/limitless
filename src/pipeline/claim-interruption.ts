@@ -22,10 +22,22 @@ export function mapClaimInterruption(
           error: lost ? "interrupted: claim lost" : "interrupted: claim wait",
           finishedAt: now,
         });
-    if (finalizeRecordedCancellation(store, runId, lost ? localCheckpointer(store) : checkpointer)) return;
+    const cancelled = finalizeRecordedCancellation(
+      store,
+      runId,
+      lost ? localCheckpointer(store) : checkpointer,
+    );
     const run = store.getRun(runId);
     if (!run || TERMINAL_STATUSES.includes(run.status)) return;
     const state = store.getRunState<Partial<RunState>>(runId) ?? initialRunState(run);
+    if (cancelled) {
+      // A deferred cancellation keeps its publication wait and retries only after the interval.
+      if (error instanceof ClaimLostError || !state.githubWait) return;
+      const reason = error.reason === "checkpoint" ? "claim:checkpoint" : state.githubWait.reason;
+      state.githubWait = { ...state.githubWait, reason, nextAttemptAt: now + githubWait.intervalMs };
+      store.updateRun(runId, {}, state);
+      return;
+    }
     state.githubWait = lost
       ? undefined
       : {

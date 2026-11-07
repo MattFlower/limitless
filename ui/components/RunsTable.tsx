@@ -7,6 +7,13 @@ import { now } from "../lib/ticker.ts";
 import { CostCell } from "./CostCell.tsx";
 import { RunStatusPill } from "./StatusPill.tsx";
 
+const claimWaitLabels: Record<string, string> = {
+  "claim:capability": "waiting for a capable member",
+  "claim:checkpoint": "waiting for a readable checkpoint",
+  "claim:policy": "waiting for the run policy to be confirmed",
+  "claim:terminal": "publishing the final status",
+};
+
 function runDuration(run: Run, nowMs: number): string {
   const start = run.startedAt ?? run.createdAt;
   const end = run.finishedAt ?? (run.status === "running" || run.status === "waiting_input" ? nowMs : start);
@@ -47,8 +54,8 @@ export const RunsTable: Component<{ runs: Run[] }> = (props) => {
                   <Show when={run.status === "queued" && run.githubWait}>
                     {(wait) => (
                       <div class="text-dim">
-                        {wait().reason === "claim:capability"
-                          ? `waiting for a capable member since ${formatDateTime(wait().since)}; next check ${formatDateTime(wait().nextAttemptAt)}`
+                        {claimWaitLabels[wait().reason]
+                          ? `${claimWaitLabels[wait().reason]} since ${formatDateTime(wait().since)}; next check ${formatDateTime(wait().nextAttemptAt)}`
                           : `waiting for GitHub since ${formatDateTime(wait().since)}; next try ${formatDateTime(wait().nextAttemptAt)}; gives up ${formatDateTime(wait().deadline)}`}
                       </div>
                     )}

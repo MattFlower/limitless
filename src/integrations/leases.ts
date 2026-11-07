@@ -41,7 +41,7 @@ export interface LeaseManager {
   release(h: LeaseHandle, patch?: { status?: RunStatus }): Promise<"released" | "wait" | "lost" | "obsolete">;
   settle(repo: string, ref: string, signal?: AbortSignal): Promise<"settled" | "pending">;
   windowOpen(h: LeaseHandle): boolean;
-  start(hooks: Hooks): () => void;
+  start(hooks: Hooks): () => Promise<void>;
 }
 export async function createLeaseManager(deps: {
   client: ClaimClient;
@@ -256,16 +256,25 @@ export async function createLeaseManager(deps: {
         if (!loss.delivered) next.onLost(loss.handle, loss.tip);
         loss.delivered = true;
       }
-      const id = timer.set(
-        () =>
-          claimScope.exit(async () => {
-            for (const row of store.leaseRowsWithIntent())
-              await locked(row.repo, row.ref, () => reconcile(row.repo, row.ref));
-            for (const h of store.heldLeaseRows().map(handle)) if (next.active(h)) await mutate(h, {});
-          }),
-        LEASE.renewMs,
-      );
-      return () => timer.clear(id);
+      // Stopping ends the loop between leases and resolves once the pass in flight has finished.
+      let stopped = false;
+      const passes = new Set<Promise<void>>();
+      const id = timer.set(() => {
+        if (stopped) return;
+        const pass = claimScope.exit(async () => {
+          for (const row of store.leaseRowsWithIntent())
+            if (!stopped) await locked(row.repo, row.ref, () => reconcile(row.repo, row.ref));
+          for (const h of store.heldLeaseRows().map(handle))
+            if (!stopped && next.active(h)) await mutate(h, {});
+        });
+        passes.add(pass);
+        return pass.finally(() => passes.delete(pass));
+      }, LEASE.renewMs);
+      return async () => {
+        stopped = true;
+        timer.clear(id);
+        await Promise.allSettled(passes);
+      };
     },
   };
   return {
