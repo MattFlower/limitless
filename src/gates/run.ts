@@ -3,12 +3,14 @@ import { existsSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { worktreeGit } from "../git/command.ts";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
+import { credentialRegistry } from "../util/credential-matcher.ts";
 import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import { RunnerFailureEvidence } from "./attribution.ts";
 import type { GateCommand, GateConfig } from "./detect.ts";
 import { type DocsSelection, quoteRetryFiles, singleBunTest } from "./docs.ts";
 import { executeGate, type GateRunner, gateProvenance } from "./executor.ts";
+import { FailureExcerpts } from "./failures.ts";
 import {
   type CoveringTestEvidence,
   type FailedTestFiles,
@@ -162,9 +164,12 @@ async function runOne(
   const coverage = new BunTestCoverage(cwd);
   let overflow = false;
   const evidence = new RunnerFailureEvidence();
+  const excerpts = new FailureExcerpts();
+  const excerptGeneration = credentialRegistry.generation;
   const observe = (line: string) => {
     evidence.observe(line);
     coverage.observe(line);
+    excerpts.observe(line);
     if (line.length === 65536 + " [truncated]".length && line.endsWith(" [truncated]")) overflow = true;
   };
   const scratch = invocationScratch.getStore();
@@ -253,7 +258,13 @@ async function runOne(
   };
   return Object.assign(
     result,
-    await protectGateOutput(res, identities, { signal, deadline: Date.now() + 120_000 }),
+    await protectGateOutput(
+      res,
+      identities,
+      { signal, deadline: Date.now() + 120_000 },
+      !ok ? excerpts.result() : undefined,
+      () => credentialRegistry.generation === excerptGeneration,
+    ),
   );
 }
 
@@ -384,13 +395,19 @@ export function targetedRetrySkipReason(
   return undefined;
 }
 
+function withoutExcerpts({ failures: _failures, textPrivacy, ...rest }: GateResult): GateResult {
+  if (!textPrivacy) return rest;
+  const { failures: _record, ...privacy } = textPrivacy;
+  return { ...rest, textPrivacy: privacy };
+}
+
 function retrySetupFailure(original: GateResult, run: GateRun): GateResult {
   const failed = run.setup.find((r) => !r.ok);
   return {
-    ...original,
+    ...withoutExcerpts(original),
     firstAttempt: original,
     // The setup command is an identity of `failed`, so only its protected output is composed.
-    output: `${original.output}\n\nRetry setup failed:\n${failed?.failures ?? ""}\n${failed?.output ?? "No setup result"}`,
+    output: `${original.output}\n\nRetry setup failed:\n\n${failed?.output ?? "No setup result"}`,
     confinementError: confinementFailed(original) || confinementFailed(failed),
   };
 }
@@ -421,12 +438,11 @@ export function validateRetry(
   const diagnostic = `Retry rejected: ${reason}`;
   onReject?.(original, diagnostic);
   return {
-    ...original,
+    ...withoutExcerpts(original),
     firstAttempt: original,
     retryAttempt: result,
     confinementError: confinementFailed(original),
     output: `${original.output}\n\n${diagnostic}`,
-    ...(original.failures ? { failures: `${original.failures}\n\n${diagnostic}` } : {}),
   };
 }
 

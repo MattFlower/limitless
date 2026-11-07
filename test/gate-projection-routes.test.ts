@@ -934,3 +934,66 @@ test.each([Infinity, -Infinity, NaN])(
     expect(JSON.stringify(project(once, { mode: "durable" }))).toBe(JSON.stringify(once));
   },
 );
+
+test("8000-unit local excerpts leave events, HTTP, SSE and MCP byte-identical", async () => {
+  const f = fixture(),
+    base = { ...(await provenResult(result("x".repeat(6000)))), detail: "p".repeat(3000) };
+  delete base.failures;
+  const failures = "e".repeat(8000);
+  const proof = await checkAndSign({
+    ...testGatePrivacy,
+    kind: "complete",
+    field: "failures",
+    text: failures,
+    producerCut: true,
+  });
+  expect(proof).toBeDefined();
+  const withExcerpts = {
+    ...base,
+    failures,
+    textPrivacy: {
+      ...base.textPrivacy,
+      output: base.textPrivacy?.output ?? { withheld: true },
+      failures: { withheld: false, checkedComplete: true, truncated: true, ...proof },
+    },
+  };
+  expect(JSON.stringify(base).length).toBeLessThan(MAX_EVENT_DATA);
+  expect(JSON.stringify(withExcerpts).length).toBeGreaterThan(MAX_EVENT_DATA);
+  for (const mode of ["outward", "durable"] as const) {
+    const options = { mode, maxEventData: MAX_EVENT_DATA };
+    expect(JSON.stringify(project(withExcerpts, options))).toBe(JSON.stringify(project(base, options)));
+    expect(project(withExcerpts, options).output).toBe(base.output);
+  }
+  const event = f.ctx.event({ runId: f.run.id, type: "gate", level: "info", message: "result", data: base });
+  const snapshot = async () => {
+    const http = await (await f.read("/api/runs/:id/events")).text();
+    const response = await f.read("/api/runs/:id/stream"),
+      reader = response.body?.getReader();
+    if (!reader) throw Error("Missing SSE body");
+    const sse = await frame(reader);
+    await reader.cancel();
+    const mcp = await connect(factoryBackend(f.factory));
+    try {
+      return [
+        http,
+        sse,
+        JSON.stringify(
+          await mcp.client.callTool({ name: "limitless_get_run", arguments: { id: f.run.id, full: true } }),
+        ),
+      ];
+    } finally {
+      await mcp.close();
+    }
+  };
+  const before = await snapshot();
+  const durable = project(withExcerpts, { mode: "durable", maxEventData: MAX_EVENT_DATA });
+  expect<unknown>(durable).toEqual(event.data);
+  f.store.db.query("UPDATE events SET data = ? WHERE id = ?").run(JSON.stringify(durable), event.id);
+  const after = await snapshot();
+  expect(after).toEqual(before);
+  for (const text of after) {
+    expect(text).toContain(base.output);
+    expect(text).not.toContain("event-size");
+    expect(text).not.toContain('"failures"');
+  }
+});
