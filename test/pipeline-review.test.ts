@@ -789,7 +789,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     expect(f.store.getRun(run.id)?.error).toContain("Still failing");
   });
 
-  test("resuming legacy feedback redacts credentials from round-exhaustion errors and events", async () => {
+  test("resuming legacy feedback withholds it from round-exhaustion errors and events", async () => {
     const secret = "synthetic-legacy-feedback-credential-486";
     registerCredential("legacy-feedback-test", secret);
     const f = start(() => {
@@ -821,11 +821,11 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const resumed = f.store.getRun(run.id);
     expect(resumed?.status).toBe("needs_human");
     expect(resumed?.error).toContain("Still failing after 5 implementation rounds");
-    expect(resumed?.error).toContain("Gate failed with credential [redacted]");
+    expect(resumed?.error).toContain("[previous feedback withheld: unverified]");
     expect(resumed?.error).not.toContain(secret);
     const events = JSON.stringify(f.store.listEvents(run.id));
     expect(events).toContain("Still failing after 5 implementation rounds");
-    expect(events).toContain("Gate failed with credential [redacted]");
+    expect(events).toContain("[previous feedback withheld: unverified]");
     expect(events).not.toContain(secret);
     expect(events).not.toContain("\\u001b");
   });

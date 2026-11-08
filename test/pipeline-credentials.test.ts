@@ -184,7 +184,7 @@ test("reload sanitizes legacy diagnostics while preserving executable and compar
     };
     expect(loaded.state).toEqual({
       ...state,
-      feedback: "[redacted]",
+      feedback: "[previous feedback withheld: unverified]",
       terminalReason: "[redacted]",
       needsHumanReason: "[redacted]",
       implementerReport: "[redacted]",

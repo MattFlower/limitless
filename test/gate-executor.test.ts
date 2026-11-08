@@ -40,6 +40,7 @@ import {
   triage,
   waitFor,
 } from "./pipeline-support.ts";
+import { provenResult } from "./privacy-support.ts";
 import { expectProcessStopped } from "./process-support.ts";
 import { test, testReadPolicy } from "./read-policy-support.ts";
 
@@ -1139,7 +1140,7 @@ test("formatted gate identities keep baseline verdicts after gate-started restar
   ).toContain("timed out after 37 s");
 });
 
-test("reload preserves literal control state while redacting legacy feedback", async () => {
+test("reload preserves literal control state while withholding legacy feedback", async () => {
   const literal = "synthetic-state-credential-486\x1b[31m";
   registerCredential("gate-state-test", "synthetic-state-credential-486");
   const { f, ctx, restore } = await context();
@@ -1190,7 +1191,7 @@ test("reload preserves literal control state while redacting legacy feedback", a
   const resumed = restore();
   expect(resumed.state.spec).toEqual(ctx.state.spec);
   expect(resumed.state.holdout).toEqual(ctx.state.holdout);
-  expect(resumed.state.feedback).toBe("[redacted]");
+  expect(resumed.state.feedback).toBe("[previous feedback withheld: unverified]");
   expect(resumed.state.answers).toEqual([literal]);
   expect(resumed.state.gatesConfig?.checks[0]?.run).toBe(literal);
   expect(resumed.state.baselineScripts?.check).toBe(literal);
@@ -1624,15 +1625,16 @@ test.each(["injected", "local"])("landing checks log setup and check events once
   const blocked = deferred<void>();
   const scripted = fake(async (_h, req) => ({
     ...result(req, false),
+    checks: await Promise.all(result(req, false).checks.map((r) => provenResult(r))),
     setup: [
-      {
+      await provenResult({
         name: "setup",
         command: req.gates.setup[0] ?? "",
         ok: true,
         exitCode: 0,
         durationMs: 1,
         output: "setup",
-      },
+      }),
     ],
   }));
   const queue = new LandQueue({

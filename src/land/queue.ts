@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { type Config, type Paths, repoSettings } from "../config.ts";
@@ -71,6 +71,8 @@ import { stripReportManifest } from "../pipeline/report-privacy.ts";
 import { sharedRepository } from "../pipeline/run-claim.ts";
 import { redactCredentials } from "../util/proc.ts";
 import { beginActivity } from "../util/stall.ts";
+
+import { appendLandLog, openLandLog } from "./land-log.ts";
 
 /** A land the factory will not retry: the operator has to look at it. */
 export class LandBlocked extends Error {}
@@ -888,16 +890,16 @@ export class LandQueue {
       ? join(this.deps.paths.runs, entry.runId, `land-${entry.id}.log`)
       : join(this.deps.paths.home, "land", `land-${entry.id}.log`);
     const base = `${cwd}-base`;
+    mkdirSync(dirname(log), { recursive: true });
+    const landLog = openLandLog(log, `# land ${entry.id} ${entry.prUrl} at ${entry.approvedSha}\n`);
     try {
       rmSync(base, { recursive: true, force: true });
       mkdirSync(base, { recursive: true });
-      mkdirSync(dirname(log), { recursive: true });
-      writeFileSync(log, `# land ${entry.id} ${entry.prUrl} at ${entry.approvedSha}\n`);
       await exportCommit(cwd, baseSha, base, signal);
       const docs = await docsOnlyGates(cwd, detectGates(base), baseSha, await headSha(cwd));
       const gates = docs.gates;
       const selection = redactGateOutput(`Gate selection: ${JSON.stringify(redactGateData(docs.selection))}`);
-      appendFileSync(log, `${selection}\n`);
+      appendLandLog(landLog, [selection, "\n"]);
       if (entry.runId)
         this.store.addEvent({ runId: entry.runId, type: "gate", level: "info", message: selection });
       const request = {
@@ -910,11 +912,16 @@ export class LandQueue {
       };
       const hooks = {
         holder: "land",
-        onResult: (r: GateResult) =>
-          appendFileSync(
-            log,
-            redactGateOutput(`\n$ ${r.command}\n${r.failures ? formatGateOutput(r, 9_000) : r.output}\n`),
-          ),
+        onResult: (r: GateResult) => {
+          const projected = projectGateDiagnostics(r, { mode: "outward" });
+          void appendLandLog(landLog, [
+            "\n$ ",
+            projected.command,
+            "\n",
+            r.failures ? formatGateOutput(r, 9_000) : projected.output,
+            "\n",
+          ]);
+        },
       };
       await gateSlotScope(async () => {
         let handle: ExecutionHandle | undefined;
@@ -953,7 +960,7 @@ export class LandQueue {
           signal,
           undefined,
           (retry, options) => {
-            appendFileSync(log, "\n# targeted retry\n");
+            appendLandLog(landLog, ["\n# targeted retry\n"]);
             return executeGate(
               { ...request, gates: retry, skipGateSlot: options?.skipGateSlot },
               signal,
@@ -979,7 +986,7 @@ export class LandQueue {
               ? "check does not match base configuration"
               : (skipped.get(c) ?? "targeted retry returned no check result");
           const message = redactGateOutput(`Land ${entry.id} ${c.name}: no targeted retry: ${reason}`);
-          appendFileSync(log, `${message}\n`);
+          appendLandLog(landLog, [message, "\n"]);
           if (entry.runId) this.store.addEvent({ runId: entry.runId, type: "gate", level: "warn", message });
         }
         const finalize = () =>
@@ -997,6 +1004,7 @@ export class LandQueue {
               ...(retries.has(r) ? { retryOriginal: { verdict: "regressed" as const, blocking: true } } : {}),
             })),
           });
+        await landLog.pending;
         if (failed.length) {
           this.owned(entry.id, () => {
             finalize();
@@ -1009,12 +1017,12 @@ export class LandQueue {
           const message = redactGateOutput(
             `${check.name}: targeted pass (${check.docsOnly.files.join(", ")}; ${check.docsOnly.reason}; full suite didn't run)`,
           );
-          appendFileSync(log, `${message}\n`);
+          appendLandLog(landLog, [message, "\n"]);
           if (entry.runId) this.store.addEvent({ runId: entry.runId, type: "gate", level: "info", message });
         }
         if (retries.size) {
           const reason = landFlakyReason([...retries.keys()]);
-          appendFileSync(log, `${reason}\n`);
+          await appendLandLog(landLog, [reason, "\n"]);
           this.owned(entry.id, () => {
             finalize();
             this.store.updateLandEntry(entry.id, { reason });
@@ -1029,6 +1037,7 @@ export class LandQueue {
         }
       })();
     } finally {
+      await landLog.pending;
       rmSync(base, { recursive: true, force: true });
     }
   }

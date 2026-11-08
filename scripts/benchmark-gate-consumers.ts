@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   type Context,
   consumerSign,
@@ -179,6 +181,35 @@ function render(c: Context): Job[] {
     (v) => validate(typeof v === "string" && gates.every((g) => v.includes(g.name)), "50 rendered gate rows"),
   ]);
 }
+async function landLog(c: Context): Promise<Job[]> {
+  const available = ["openLandLog", "appendLandLog", "readLandLog"].every(
+    (k) => typeof c.a[k] === "function",
+  );
+  const path = join(c.cwd, "land.log"),
+    entries = Array.from({ length: 10000 }, (_, i) => `${`entry ${i} `.padEnd(511, ".")}\n`),
+    expected = entries.join("");
+  const privacy = () => ({ checker: c.checker(), signer: () => c.key });
+  let seeded = false;
+  const append = async () => {
+    const log = call(c, "openLandLog", path, "", privacy());
+    for (const entry of entries) await call(c, "appendLandLog", log, [entry]);
+    seeded = true;
+    return path;
+  };
+  const check = (v: unknown) => validate(v === expected, "10000 verified entries in order");
+  return [
+    ["append:production", 10000, available ? append : undefined, () => check(readFileSync(path, "utf8"))],
+    [
+      "read-and-verify:production",
+      10000,
+      available ? () => call(c, "readLandLog", path, privacy()) : undefined,
+      check,
+      async () => {
+        if (!seeded) await append();
+      },
+    ],
+  ];
+}
 export const consumerRegistry: Record<string, (c: Context) => Promise<Job[]> | Job[]> = Object.fromEntries([
   ...["project-proven", "project-unproven", "project-refused", "project-after-edit"].map((name) => [
     name,
@@ -188,14 +219,5 @@ export const consumerRegistry: Record<string, (c: Context) => Promise<Job[]> | J
   ["event-drain", drain],
   ["feedback-sign", feedback],
   ["render-prompts", render],
-  [
-    "land-log",
-    () =>
-      ["append", "read-and-verify"].map((label) => [
-        `${label}:unavailable:signed-log API absent`,
-        10000,
-        undefined,
-        () => validate(false, "signed log unavailable"),
-      ]),
-  ],
+  ["land-log", landLog],
 ]);

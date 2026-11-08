@@ -1,10 +1,12 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import { join } from "node:path";
 import { Factory } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
+import { gatePrivacyScope } from "../src/gates/text-privacy.ts";
 import { fakeHarness } from "../src/harness/fake.ts";
 import { RunContext, type RunState } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
+import { verifier } from "../src/util/privacy-proof.ts";
 import {
   bootIdentity,
   ProcessTerminationError,
@@ -27,6 +29,7 @@ import {
   triage,
   waitFor,
 } from "./pipeline-support.ts";
+import { testGatePrivacy } from "./privacy-support.ts";
 
 let home: string;
 let repoDir: string;
@@ -414,3 +417,56 @@ describe("per-run model chains", () => {
     },
   );
 });
+
+test.each([false, true])(
+  "implement checks fresh feedback before building its prompt (refused: %s)",
+  async (refused) => {
+    const text = "fresh implementation feedback";
+    const expected = refused ? "[previous feedback withheld:" : text;
+    let prepared: RunContext | undefined,
+      captured = "";
+    const original = RunContext.prototype.prepareFeedback;
+    const signing = spyOn(RunContext.prototype, "prepareFeedback").mockImplementation(async function (
+      this: RunContext,
+    ) {
+      prepared = this;
+      this.state.feedback = text;
+      const scope = testGatePrivacy;
+      const checker = refused
+        ? {
+            ...scope.checker,
+            protectText: async () => ({}) as Awaited<ReturnType<typeof scope.checker.protectText>>,
+          }
+        : scope.checker;
+      await gatePrivacyScope.run({ ...scope, checker }, () => original.call(this));
+    });
+    try {
+      const f = start((s) => {
+        const role = roleOf(s);
+        if (role === "triage") return { structured: triage() };
+        if (role === "review") return { structured: approve };
+        captured = s.prompt;
+        expect(s.prompt).toContain(expected);
+        if (!prepared) throw new Error("Feedback was not prepared");
+        const saved = f.store.getRunState<RunState>(prepared.run.id);
+        expect(saved?.feedback).toBe(prepared.state.feedback);
+        if (refused) expect(saved?.feedbackProof).toBeUndefined();
+        else
+          expect(
+            verifier(testGatePrivacy.registry, testGatePrivacy.signer).verify(
+              saved?.feedbackProof,
+              "feedback",
+              text,
+            ),
+          ).toBe(true);
+        return { files: { "farewell.txt": "goodbye\n" } };
+      });
+      const run = await f.createRun({ repo: repoDir, prompt: "Add farewell", profile: "quick" });
+      expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+      expect(captured).toContain(expected);
+      expect(signing).toHaveBeenCalledTimes(1);
+    } finally {
+      signing.mockRestore();
+    }
+  },
+);

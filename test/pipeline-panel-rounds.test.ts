@@ -6,6 +6,7 @@ import type { AgentSpec } from "../src/harness/types.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { readingTimeout } from "../src/pipeline/engine.ts";
 import { sh } from "../src/util/proc.ts";
+import { deferred } from "./evals-support.ts";
 import {
   approve,
   type Handler,
@@ -77,6 +78,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     const verifiers: string[][] = [[], [], []];
     let implementations = 0;
     let slow = true;
+    const implementing = deferred<void>();
     const handler: Handler = (s) => {
       if (s.prompt.startsWith("You are a code-review verifier")) {
         verifiers[finders.length - 1]?.push(s.prompt);
@@ -108,7 +110,10 @@ describe("pipeline (fake agents, real git + gates)", () => {
       implementations++;
       // The second implementation fails the gates, so that round never reaches a review.
       if (implementations === 2) return { files: { "farewell.txt": "BAD\n" } };
-      if (slow && implementations === 4) return { delayMs: 30_000 };
+      if (slow && implementations === 4) {
+        implementing.resolve();
+        return { fault: "block" };
+      }
       return { files: { "farewell.txt": `goodbye ${implementations}\n` } };
     };
     const panel = {
@@ -123,13 +128,9 @@ describe("pipeline (fake agents, real git + gates)", () => {
     registerGithub(f, bare);
     const run = await f.createRun({ repo: "test/repo", prompt: "Add farewell", profile: "quick" });
     // Stop the factory between R2 and R3, while the fourth implementation runs.
-    const deadline = Date.now() + 15_000;
-    while (
-      (f.store.getRunState<RunState>(run.id)?.round !== 3 || f.store.getRun(run.id)?.stage !== "implement") &&
-      Date.now() < deadline
-    )
-      await Bun.sleep(10);
+    await implementing.promise;
     const before = f.store.getRunState<RunState>(run.id);
+    expect(f.store.getRun(run.id)).toMatchObject({ status: "running", stage: "implement" });
     expect(before?.reviewHistory?.map((e) => [e.round, e.panelReview])).toEqual([
       [0, 1],
       [2, 2],
