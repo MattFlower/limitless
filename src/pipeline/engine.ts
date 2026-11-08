@@ -102,6 +102,7 @@ import { type GhRunner, runGh } from "../integrations/github.ts";
 import { originExclusion } from "../router/origins.ts";
 import type { RouteConstraints } from "../router/router.ts";
 import { formatTarget } from "../router/targets.ts";
+import { NetworkFailure, networkFailure } from "../util/network-failure.ts";
 import {
   assertProcessesStopped,
   CommandError,
@@ -339,7 +340,8 @@ function startRun(ctx: RunContext): void {
     ctx.state.needsHumanReason ??= REVIEW_RESOLUTION_BLOCK;
   ctx.state.parked = false;
   if (
-    ctx.state.githubWait?.reason.startsWith("claim:") ? ctx.execution.shared : ctx.state.phase !== "deliver"
+    !ctx.state.githubWait?.step &&
+    (ctx.state.githubWait?.reason.startsWith("claim:") ? ctx.execution.shared : ctx.state.phase !== "deliver")
   )
     ctx.state.githubWait = undefined;
   // Local rejections are terminal; claimed rejections still owe rollback and reporting.
@@ -354,6 +356,41 @@ function startRun(ctx: RunContext): void {
       ctx.state,
     );
   if (ctx.state.phase !== "prepare") ctx.log(`Resuming at phase "${ctx.state.phase}"`, "warn");
+}
+
+function parkOutage(ctx: RunContext, error: unknown): RunStatus | undefined {
+  if (finalizeRecordedCancellation(ctx.store, ctx.run.id, ctx.checkpointer)) return "cancelled";
+  const network = networkFailure(error),
+    unavailable = githubUnavailable(error);
+  const now = Date.now(),
+    since = ctx.state.githubWait?.since ?? now;
+  if (
+    (network ||
+      (unavailable &&
+        ctx.state.phase === "deliver" &&
+        ctx.repo.kind === "github" &&
+        !ctx.run.deliveryBranch &&
+        !reviewRound(ctx) &&
+        !ctx.state.verification)) &&
+    !processScope.getStore()?.terminationError &&
+    !ctx.state.needsHumanReason?.startsWith(ProcessTerminationError.prefix) &&
+    githubWait.maxMs > 0 &&
+    now < since + githubWait.maxMs
+  ) {
+    const reason = redactCredentials(network?.message ?? (error as Error).message).slice(0, 300);
+    ctx.state.githubWait = {
+      since,
+      nextAttemptAt: Math.min(now + githubWait.intervalMs, since + githubWait.maxMs),
+      reason,
+      ...(network ? { step: network.step ?? `stage:${ctx.run.stage}` } : {}),
+    };
+    ctx.run = ctx.checkpointer.writeRun(ctx.run.id, { status: "queued", stage: null }, ctx.state);
+    ctx.log(
+      `${network ? "Network unavailable; step" : "GitHub unavailable; delivery"} retries at ${new Date(ctx.state.githubWait.nextAttemptAt).toISOString()}, gives up at ${new Date(since + githubWait.maxMs).toISOString()}: ${reason}`,
+      "warn",
+    );
+    return "queued";
+  }
 }
 
 async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<RunStatus> {
@@ -375,6 +412,9 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     if (ctx.state.postMergeRejection) await rollbackRejectedMerge(ctx);
     // Recheck persisted provenance on resume, including runs created before this guard existed.
     assertExistingBranchDelivery(ctx.repo, ctx.run, reviewRound(ctx)?.grant);
+    const wait = ctx.state.githubWait;
+    if (wait?.step && Date.now() >= wait.since + githubWait.maxMs)
+      throw new NetworkFailure(wait.reason.replace(/^Network failure: /, ""), wait.step);
     if (
       ctx.state.needsHumanReason &&
       !(
@@ -533,35 +573,18 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     const terminationBlocked =
       !!processScope.getStore()?.terminationError ||
       ctx.state.needsHumanReason?.startsWith(ProcessTerminationError.prefix);
+    const network = networkFailure(e);
     const unavailable = githubUnavailable(e);
     const now = Date.now();
     const since = ctx.state.githubWait?.since ?? now;
-    if (
-      unavailable &&
-      ctx.state.phase === "deliver" &&
-      ctx.repo.kind === "github" &&
-      !ctx.run.deliveryBranch &&
-      !reviewRound(ctx) &&
-      !ctx.state.verification &&
-      !terminationBlocked &&
-      githubWait.maxMs > 0 &&
-      now < since + githubWait.maxMs
-    ) {
-      if (deps.store.getRun(runId)?.error?.startsWith("cancelled by")) return cancelled();
-      const reason = redactCredentials((e as Error).message).slice(0, 300);
-      ctx.state.githubWait = { since, nextAttemptAt: now + githubWait.intervalMs, reason };
-      ctx.run = ctx.checkpointer.writeRun(runId, { status: "queued", stage: null }, ctx.state);
-      ctx.log(
-        `GitHub unavailable; delivery retries at ${new Date(ctx.state.githubWait.nextAttemptAt).toISOString()}, gives up at ${new Date(since + githubWait.maxMs).toISOString()}: ${reason}`,
-        "warn",
-      );
-      return "queued";
-    }
-    const waited =
-      unavailable && ctx.state.githubWait
+    const parked = parkOutage(ctx, e);
+    if (parked) return parked;
+    const waited = network
+      ? "; network wait exhausted"
+      : unavailable && ctx.state.githubWait
         ? `; waited ${Math.floor((now - since) / 60_000)} minutes for GitHub`
         : "";
-    if (ctx.state.githubWait) {
+    if (ctx.state.githubWait && (network || !ctx.state.githubWait.step)) {
       ctx.state.githubWait = undefined;
       ctx.checkpointer.writeState(runId, ctx.state);
     }
@@ -573,12 +596,13 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       (ctx.state.phase === "deliver" || ctx.state.conflictRound !== undefined);
     const resolvingReview = !!ctx.state.reviewResolution && !ctx.state.reviewResolution.sha;
     const needsHuman =
+      !!network ||
       e instanceof NeedsHumanError ||
       e instanceof NoCapacityError ||
       !!verifiedFailure ||
       resolvingReview ||
       terminationBlocked;
-    let message = redactGateOutput((e as Error).message) + waited;
+    let message = (network?.message ?? redactGateOutput((e as Error).message)) + waited;
     let unreported = false;
     if (resolvingReview && !(e instanceof ReaderSetupError)) {
       message = redactGateOutput(
@@ -600,6 +624,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     });
     if (
       verifiedFailure &&
+      !network &&
       !(e instanceof ReaderSetupError) &&
       !(e instanceof DeliveryHeadError) &&
       !(e instanceof GateNameCollisionError) &&
@@ -627,6 +652,8 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           return deps.store.getRun(runId)?.status ?? "failed";
         }
         if (err instanceof CancelledError || signal.aborted) return cancelled();
+        const parked = parkOutage(ctx, err);
+        if (parked) return parked;
         if (
           !signal.aborted &&
           (err instanceof SimulatedTermination || ctx.termination || err instanceof InjectedFault)
@@ -640,6 +667,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       }
     } else if (
       ctx.state.flow !== "acceptance" &&
+      !network &&
       e instanceof NeedsHumanError &&
       !(e instanceof ReaderSetupError) &&
       !(e instanceof DeliveryHeadError) &&
@@ -670,7 +698,10 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
           return "running";
         // Cancellation or shutdown during the draft must not be recorded as the original failure.
         if (err instanceof CancelledError || signal.aborted) return cancelled();
-        if (err instanceof NeedsHumanError) message = redactGateOutput(err.message);
+        const parked = parkOutage(ctx, err);
+        if (parked) return parked;
+        if (networkFailure(err)) message = `${networkFailure(err)?.message}; network wait exhausted`;
+        else if (err instanceof NeedsHumanError) message = redactGateOutput(err.message);
         unreported = true;
         ctx.log(`Could not open draft PR: ${(err as Error).message}`, "warn");
       }
@@ -683,6 +714,11 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
     ) {
       ctx.state.needsHumanReason = redactCredentials(message);
       ctx.state.terminalReason = ctx.state.needsHumanReason;
+      ctx.checkpointer.writeState(runId, ctx.state);
+    }
+    if (ctx.store.getRun(runId)?.githubWait || network) {
+      ctx.state.githubWait = undefined;
+      if (network) ctx.state.needsHumanReason = message;
       ctx.checkpointer.writeState(runId, ctx.state);
     }
     if (ctx.state.postMergeRejection)
@@ -1318,7 +1354,7 @@ export async function buildLoop(ctx: RunContext): Promise<void> {
       const round = ctx.state.round;
       const passed = await oneRound(ctx, round, holdout);
       if (hasClaimScope()) await holdout;
-      const interruption = selectClaimControl([holdoutError]);
+      const interruption = selectClaimControl([holdoutError]) ?? networkFailure(holdoutError);
       if (interruption) throw interruption;
       if (passed) {
         await ctx.setPhase("deliver");
@@ -1436,6 +1472,8 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
   const remoteSha = () =>
     remoteBranchSha(ctx.repo, cwd, branch, ctx.signal).catch((error) => {
       rethrowClaimControl(error);
+      const network = networkFailure(error);
+      if (network) throw network;
       return undefined;
     });
   return {
@@ -1459,7 +1497,9 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
         );
       } catch (error) {
         rethrowClaimControl(error);
-        throw new NeedsHumanError(`Cannot reconcile worker job: ${redactCredentials(String(error))}`);
+        throw new NeedsHumanError(`Cannot reconcile worker job: ${redactCredentials(String(error))}`, {
+          cause: error,
+        });
       }
     },
     async prepare() {
@@ -1531,6 +1571,7 @@ function workerPublication(ctx: RunContext, cwd: string, round: number): AgentPu
         rethrowClaimControl(error);
         throw new NeedsHumanError(
           `Cannot adopt worker commit ${sha} for round ${round}: ${redactCredentials((error as Error).message)}`,
+          { cause: error },
         );
       }
       ctx.state.publishedSha = sha;
@@ -1588,7 +1629,6 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
                     .length,
               ) ?? {});
           ctx.log(`Escalating implementer beyond ${current.modelId}`, "warn", { constraints });
-          ctx.state.roundsOnImplementer = 0;
         }
         const view = implementerView(ctx.state);
         const { result, target } = await ctx.invoke({
@@ -1644,6 +1684,7 @@ async function implementStage(ctx: RunContext, round: number): Promise<void> {
           )
         )
           ctx.state.triedImplementers.push({ modelId: target.modelId, effort: target.effort ?? null });
+        if (escalate) ctx.state.roundsOnImplementer = 0;
         ctx.state.implementerReport = result.finalText;
         ctx.artifact(`implement-${round}.md`, "report", result.finalText || "(no report)");
         ctx.state.implementerIssue =
@@ -2119,7 +2160,7 @@ async function oneRound(
         localSetupReady = true;
       } catch (error) {
         ctx.checkCancelled();
-        throw new ReaderSetupError(redactGateOutput((error as Error).message));
+        throw networkFailure(error) ?? new ReaderSetupError(redactGateOutput((error as Error).message));
       }
     })());
   // --- review
@@ -2686,6 +2727,7 @@ async function oneRound(
         if (results[1].status === "rejected") {
           const error: unknown = results[1].reason;
           if (
+            networkFailure(error) ||
             results[0].value.verdict !== "request_changes" ||
             error instanceof CancelledError ||
             error instanceof SimulatedTermination ||
@@ -3050,8 +3092,16 @@ async function checkPublication(
     if (hit) throw new PrivateError(hit.detail);
   } catch (error) {
     rethrowClaimControl(error);
+    const network = networkFailure(error);
+    if (network) {
+      network.message = `Private-string check could not run: ${step} failed: ${network.message}`;
+      throw network;
+    }
+    if (githubUnavailable(error))
+      throw new Error(`Private-string check could not run: ${step} failed (GitHub unavailable)`, {
+        cause: error,
+      });
     if (
-      githubUnavailable(error) ||
       error instanceof CancelledError ||
       ctx.signal.aborted ||
       (error instanceof Error && error.name === "AbortError")
@@ -3465,7 +3515,8 @@ async function deliver(ctx: RunContext, success: boolean): Promise<void> {
             rethrowClaimControl(error);
             if (error instanceof InjectedFault || error instanceof SimulatedTermination) throw error;
             ctx.checkCancelled();
-            if (!confirmingHead) throw error;
+            // A network failure waits durably and repeats the lookup instead of ending the run.
+            if (!confirmingHead || networkFailure(error)) throw error;
             const reason = `Unable to confirm PR head before verdict: ${(error as Error).message}`;
             ctx.state.terminalReason = reason;
             ctx.state.needsHumanReason = undefined;

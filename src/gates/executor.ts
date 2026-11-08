@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { WorkerStore } from "../db/workers.ts";
 import { worktreeGit } from "../git/command.ts";
 import { withScratch } from "../harness/scratch.ts";
+import { networkFailure } from "../util/network-failure.ts";
 import { registeredCredentials } from "../util/proc.ts";
 import type { GateConfig } from "./detect.ts";
 import type { ActionsProgress } from "./github-actions.ts";
@@ -359,6 +360,10 @@ export async function executeGate(
         if (event.type === "check") hooks.onResult?.(redactGateData(event.result), event.phase);
     })();
     const [result] = await Promise.all([execution.result, events]);
+    for (const failed of [...result.setup, ...result.checks]) {
+      const network = networkFailure(failed);
+      if (network && !signal.aborted) throw network;
+    }
     if (handle.kind === "local") Object.assign(result, await gateProvenance(req.cwd, signal, req.headSha));
     return result;
   } catch (error) {

@@ -68,7 +68,11 @@ const runSchema = object({
   titleProvenance: oneOf("explicit defaulted").nullable().optional(),
   flow: oneOf("build verify-change acceptance").optional(),
   noBaselineCache: z.boolean().optional(),
-  githubWait: object({ ...fields("since nextAttemptAt deadline", counter), reason: text }).optional(),
+  githubWait: object({
+    ...fields("since nextAttemptAt deadline", counter),
+    reason: text,
+    step: text.optional(),
+  }).optional(),
   models: object(fields("triage spec holdout implement review verify", z.array(text).optional())).optional(),
   allow: z.array(oneOf("submodules gitattributes binary workflows")).optional(),
 });

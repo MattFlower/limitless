@@ -192,6 +192,7 @@ function factory(
   cfg.reviewSamples = 1;
   const f = new Factory(cfg, {
     confinement: fakeConfinement,
+    loadSource: () => 0,
     healthFetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
     fetch: Object.assign(async () => new Response("{}"), { preconnect() {} }),
     providers,
@@ -1925,13 +1926,16 @@ test("abrupt daemon death mid-gate discards staged edits and untracked residue b
     import { observerRoots } from ${JSON.stringify(join(import.meta.dir, "../src/harness/sandbox.ts"))};
     observerRoots.add(${JSON.stringify(realpathSync(root))});
     const { fakeConfinement } = await import(${JSON.stringify(join(import.meta.dir, "confinement.ts"))});
+    const { processBootInspection } = await import(${JSON.stringify(join(import.meta.dir, "../src/util/proc.ts"))});
+    processBootInspection.run(() => 'test-boot', () => {
     const f = new Factory(loadConfig(${JSON.stringify({ home: join(root, "data"), configDir: join(root, "cfg") })}), { confinement: fakeConfinement,
-      providers: ${JSON.stringify(providers)}, models: ${JSON.stringify(models)}, policy: ${JSON.stringify(policy)},
+      providers: ${JSON.stringify(providers)}, models: ${JSON.stringify(models)}, policy: ${JSON.stringify(policy)}, loadSource: () => 0,
       healthFetch: async () => new Response('{}'), fetch: async () => new Response('{}'),
       harnesses: { fake: fakeHarness(s => s.prompt.startsWith('Classify')
         ? { structured: ${JSON.stringify(triage)} } : { files: { 'ui/change.txt': 'broken\\n' } }) }
     });
     f.scheduler.start();
+    });
   `,
   );
   // Bun's test preload is not inherited by the daemon subprocess.
@@ -2107,7 +2111,7 @@ test("verify-change reconciles a posted verification comment after its save is l
 });
 
 // A timed-out lookup retries like a 502; the retry classification test below covers timeouts.
-test.each(["502", "exhausted", "injected", "terminated"] as const)(
+test.each(["502", "exhausted", "injected", "terminated", "network"] as const)(
   "verify-change head recheck preserves retries and interruptions: %s",
   async (failure) => {
     const comments: string[] = [];
@@ -2121,6 +2125,8 @@ test.each(["502", "exhausted", "injected", "terminated"] as const)(
         if (lookups === 1 || failure === "exhausted") {
           if (failure === "injected") throw new InjectedFault("head recheck interrupted");
           if (failure === "terminated") throw new SimulatedTermination("head recheck terminated");
+          if (failure === "network")
+            throw new CommandError("gh failed", 1, "", "getaddrinfo ENOTFOUND api.github.com", false);
           throw new CommandError("gh failed", 1, "", "HTTP 502: Bad Gateway", false);
         }
         return JSON.stringify({ headRefOid: headSha });
@@ -2140,8 +2146,12 @@ test.each(["502", "exhausted", "injected", "terminated"] as const)(
       expect(f.store.getArtifact(run.id, "report.md")).toContain(reason);
       return;
     }
-    if (failure === "injected" || failure === "terminated") {
-      expect(status).toBe(failure === "injected" ? "queued" : "running");
+    if (failure === "network") {
+      expect(status).toBe("queued");
+      expect(f.store.getRunState<RunState>(run.id)?.githubWait?.reason).toBe("Network failure: ENOTFOUND");
+    }
+    if (failure === "injected" || failure === "terminated" || failure === "network") {
+      expect(status).toBe(failure === "terminated" ? "running" : "queued");
       expect(comments).toHaveLength(0);
       expect(f.store.getRunState<RunState>(run.id)?.terminalReason).toBeUndefined();
       expect(await executeRun(f.deps, run.id, new AbortController().signal)).toBe("succeeded");
@@ -2487,10 +2497,10 @@ test("GitHub retries classify structured failures and share one abortable deadli
   }
 });
 
-test("GitHub retries SSH temporary DNS failures", async () => {
+test("GitHub defers SSH temporary DNS failures to the durable wait", async () => {
   let calls = 0;
-  expect(
-    await withGitHubRetry(async () => {
+  await expect(
+    withGitHubRetry(async () => {
       if (++calls === 1)
         throw new CommandError(
           "git push failed",
@@ -2501,8 +2511,8 @@ test("GitHub retries SSH temporary DNS failures", async () => {
         );
       return "pushed";
     }),
-  ).toBe("pushed");
-  expect(calls).toBe(2);
+  ).rejects.toThrow("Network failure: host resolution or connection failed");
+  expect(calls).toBe(1);
 });
 
 test("GitHub retries only structured SSH publickey refusals through recovery or exhaustion", async () => {
@@ -3202,7 +3212,11 @@ test.each(["cause", "cancel recorded during failure"])("GitHub outage: %s", asyn
   }
 });
 
-test.each(["Could not resolve host: example.invalid", githubPublickey])(
+test.each([
+  "Could not resolve host: example.invalid",
+  "getaddrinfo ENOTFOUND example.invalid",
+  githubPublickey,
+])(
   "GitHub outage in publication check parks instead of reporting a private-string block: %s",
   async (diagnostic) => {
     const { f, r, pr, restore } = await deliveryFaultFixture();
@@ -3217,13 +3231,20 @@ test.each(["Could not resolve host: example.invalid", githubPublickey])(
     });
     try {
       expect(await executeRun(f.deps, r.id, new AbortController().signal)).toBe("queued");
-      expect(attempts).toBe(githubRetry.attempts);
+      const network = diagnostic !== githubPublickey;
+      expect(attempts).toBe(network ? 1 : githubRetry.attempts);
       expect(f.store.getRun(r.id)?.status).toBe("queued");
-      expect(f.store.getRun(r.id)?.githubWait?.reason).toContain(diagnostic);
+      expect(f.store.getRun(r.id)?.githubWait?.reason).toContain("Private-string check could not run");
+      if (network) {
+        expect(f.store.getRun(r.id)?.githubWait?.reason).toContain("Network failure:");
+        expect(f.store.getRun(r.id)?.githubWait?.reason).not.toContain("example.invalid");
+      }
       expect(f.store.getRunState<RunState>(r.id)?.githubWait).toBeDefined();
       expect(f.store.getRunState<RunState>(r.id)?.needsHumanReason).toBeUndefined();
       expect(f.store.getRun(r.id)?.githubWait?.reason).not.toContain("Private-string check blocked");
       expect(ghCalls(pr, "pr create")).toEqual([]);
+      command.mockRestore();
+      expect(await executeRun(f.deps, r.id, new AbortController().signal)).toBe("succeeded");
     } finally {
       command.mockRestore();
       await restore();
@@ -3316,7 +3337,11 @@ test.each(["permanent PR-create failure", "PR-create timeout", "unparsable PR-cr
 
 test.each([
   ["push rejection", "stale info", false],
-  ["exhausted network fetch failure", "Could not resolve host: example.invalid", true],
+  [
+    "exhausted network fetch failure",
+    "Network failure: host resolution or connection failed; network wait exhausted",
+    false,
+  ],
   ["deleted base branch", "couldn't find remote ref refs/heads/main", true],
   ["blocking bare-cache Git lock", "main.lock", true],
   ["corrupt bare cache", "failed to unpack tree object HEAD", false],
@@ -3351,7 +3376,7 @@ command=$(while :; do case "$1" in (-c) shift 2;; (--config-env=*) shift;; (*) b
 if [ "$command" = fetch ]; then
   case "$*" in *'+refs/heads/main:refs/remotes/origin/main'*)
     echo fetch >> '${join(root, "fetch-calls")}'
-    echo '${reason}' >&2; exit 128;;
+    echo 'Could not resolve host: example.invalid' >&2; exit 128;;
   esac
 fi
 exec '${realGit.replaceAll("'", "'\\''")}' "$@"
@@ -3375,9 +3400,7 @@ exec '${realGit.replaceAll("'", "'\\''")}' "$@"
       );
     } else expect(await refs()).toBe(originalRefs);
     if (fault === "exhausted network fetch failure")
-      expect(readFileSync(join(root, "fetch-calls"), "utf8").trim().split("\n")).toHaveLength(
-        githubRetry.attempts,
-      );
+      expect(readFileSync(join(root, "fetch-calls"), "utf8").trim().split("\n")).toHaveLength(1);
     if (fault === "corrupt bare cache") {
       rmSync(join(cache, "objects"), { recursive: true });
       renameSync(join(root, "cached-objects"), join(cache, "objects"));
@@ -3669,4 +3692,305 @@ test("scheduler-started commands record and gate cleanups without ambient storag
       await new Promise<void>((resolve) => child.once("exit", () => resolve()));
     }
   }
+});
+
+const networkFailureRecoverySteps = [
+  "prepare setup",
+  "setup",
+  "gate",
+  "claude implement",
+  "thrown implement",
+  "final text implement",
+  "codex fix",
+  "review",
+  "verify",
+];
+test.each(networkFailureRecoverySteps)(
+  "Network outage preserves the logical round and recovers: %s",
+  async (step) => {
+    githubWait.intervalMs = 60_000;
+    const marker = join(root, "offline");
+    const command = `if [ -f '${marker}' ]; then echo 'error: ENOTFOUND downloading tarball' >&2; exit 1; fi`;
+    if (["prepare setup", "setup", "gate"].includes(step)) {
+      writeFileSync(
+        join(source, ".limitless.toml"),
+        `[gates]\nsetup = ${step === "gate" ? "[]" : JSON.stringify([command])}\nchecks = [{name="check",run=${JSON.stringify(step === "gate" ? command : "true")}}]\n`,
+      );
+      await sh(["git", "add", ".limitless.toml"], { cwd: source });
+      await sh(["git", "commit", "-qm", "fixture setup"], { cwd: source });
+    }
+    let offline = false;
+    const calls = { implement: 0, review: 0, verify: 0 };
+    const handler = (s: AgentSpec): FakeReply => {
+      const role = s.prompt.startsWith("You are an adversarial")
+        ? "review"
+        : s.prompt.startsWith("You are the acceptance")
+          ? "verify"
+          : s.mode === "edit"
+            ? "implement"
+            : undefined;
+      if (role) calls[role]++;
+      if (
+        offline &&
+        ((role === "implement" && step.includes("implement")) ||
+          (role === "implement" && step.includes("fix")) ||
+          role === step)
+      ) {
+        if (step === "thrown implement") throw new Error("Could not resolve host: example.invalid");
+        if (step === "claude implement")
+          return {
+            stream: {
+              parser: "claude",
+              lines: [
+                JSON.stringify({
+                  type: "result",
+                  subtype: "error_during_execution",
+                  is_error: true,
+                  result: "API Error: Can't reach the API server (ENOTFOUND)",
+                }),
+              ],
+            },
+          };
+        if (step === "final text implement")
+          return {
+            status: "error",
+            error: "claude exited with code 1",
+            text: "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+          };
+        if (step === "codex fix")
+          return {
+            stream: {
+              parser: "codex",
+              lines: [
+                JSON.stringify({
+                  type: "turn.failed",
+                  error: { message: "connect ECONNREFUSED example.invalid" },
+                }),
+              ],
+            },
+          };
+        return { status: "unavailable", error: "getaddrinfo ENOTFOUND example.invalid", costUsd: 0.02 };
+      }
+      return answer(s);
+    };
+    const f = factory(
+      step === "prepare setup" ? undefined : { "stage:implement:before": { action: "kill" } },
+      handler,
+    );
+    const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+    const signal = new AbortController().signal;
+    if (step !== "prepare setup") {
+      expect(await executeRun(f.deps, r.id, signal)).toBe("running");
+      const saved = f.store.getRunState<RunState>(r.id);
+      if (!saved) throw new Error("missing checkpoint");
+      saved.feedback = "Legitimate previous findings";
+      if (step === "codex fix") {
+        saved.round = 1;
+        saved.roundsOnImplementer = 2;
+        saved.implementer = { modelId: "a", tier: 4, vendor: "anthropic" };
+      }
+      f.store.setRunState(r.id, saved);
+      f.deps.faults = undefined;
+    }
+    const before = f.store.getRunState<RunState>(r.id);
+    offline = true;
+    writeFileSync(marker, "offline");
+    expect(await executeRun(f.deps, r.id, signal)).toBe("queued");
+    const parked = f.store.getRunState<RunState>(r.id);
+    expect(parked?.githubWait?.reason).toContain("Network failure:");
+    expect(parked?.githubWait?.nextAttemptAt).toBeGreaterThan(parked?.githubWait?.since ?? Infinity);
+    expect(parked?.round).toBe(before?.round ?? 0);
+    expect(parked?.roundsOnImplementer).toBe(before?.roundsOnImplementer ?? 0);
+    expect(parked?.feedback).toBe(before?.feedback ?? null);
+    expect(parked?.implementationReadyRound === parked?.round).toBe(
+      ["setup", "gate", "review", "verify"].includes(step),
+    );
+    const counts = { ...calls };
+    const sha = f.store.getRun(r.id)?.headSha;
+    // Real close/reopen and scheduler admission must retain the wait and all completed work.
+    const next = await reopen(f, handler);
+    expect(next.scheduler.activeRunIds).toEqual([]);
+    expect(next.store.getRunState<RunState>(r.id)?.githubWait).toEqual(parked?.githubWait);
+    expect(calls).toEqual(counts);
+    offline = false;
+    rmSync(marker);
+    const state = next.store.getRunState<RunState>(r.id);
+    if (!state?.githubWait) throw new Error("missing wait after restart");
+    state.githubWait.nextAttemptAt = Date.now() - 1;
+    next.store.setRunState(r.id, state);
+    next.scheduler.tick();
+    await settled(next, r.id);
+    expect(next.store.getRun(r.id)?.status).toBe("succeeded");
+    expect(next.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+    expect(next.store.getRunState<RunState>(r.id)?.round).toBe(parked?.round);
+    if (["setup", "gate", "review", "verify"].includes(step)) {
+      expect(calls.implement).toBe(counts.implement);
+      expect(next.store.getRun(r.id)?.headSha).toBe(sha);
+    }
+    if (step === "verify") expect(calls.review).toBe(counts.review);
+    history(next, r.id);
+  },
+);
+
+test.each(["deadline", "cancel waiting", "cancel retry", "cancel late success"])(
+  "Network outage: %s",
+  async (scenario) => {
+    githubWait.intervalMs = 60_000;
+    githubWait.maxMs = 600_000;
+    let calls = 0;
+    let retryStarted = () => {};
+    const started = new Promise<void>((resolve) => {
+      retryStarted = resolve;
+    });
+    let release = () => {};
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const f = factory(undefined, async (s) => {
+      if (s.mode !== "edit") return answer(s);
+      calls++;
+      if (scenario.startsWith("cancel ") && scenario !== "cancel waiting" && calls === 3) {
+        retryStarted();
+        await released;
+        if (scenario === "cancel late success") return answer(s);
+        throw new Error("getaddrinfo ENOTFOUND");
+      }
+      return { status: "error", error: "getaddrinfo ENOTFOUND" };
+    });
+    const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+    const signal = new AbortController().signal;
+    expect(await executeRun(f.deps, r.id, signal)).toBe("queued");
+    const original = f.store.getRunState<RunState>(r.id);
+    expect(original?.githubWait).toBeDefined();
+    expect(await executeRun(f.deps, r.id, signal)).toBe("queued");
+    expect(f.store.getRunState<RunState>(r.id)?.githubWait?.since).toBe(original?.githubWait?.since);
+    expect(f.store.getRunState<RunState>(r.id)?.round).toBe(0);
+    expect(calls).toBe(2);
+    if (scenario === "deadline") {
+      const state = f.store.getRunState<RunState>(r.id);
+      if (!state?.githubWait) throw new Error("missing wait");
+      state.githubWait.since = Date.now() - githubWait.maxMs - 1;
+      f.store.setRunState(r.id, state);
+      expect(await executeRun(f.deps, r.id, signal)).toBe("needs_human");
+      expect(calls).toBe(2);
+      expect(f.store.getRun(r.id)?.error).toContain("Network failure: ENOTFOUND; network wait exhausted");
+      expect(f.store.getRunState<RunState>(r.id)?.needsHumanReason).toContain("network wait exhausted");
+      expect(f.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+    } else {
+      let retry: Promise<unknown> | undefined;
+      if (scenario !== "cancel waiting") {
+        retry = executeRun(f.deps, r.id, signal);
+        await started;
+      }
+      try {
+        expect(f.scheduler.cancel(r.id, "test")).toBe(true);
+      } finally {
+        release();
+      }
+      if (retry) expect(await retry).toBe("cancelled");
+      const next = await reopen(f);
+      expect(next.store.getRun(r.id)?.status).toBe("cancelled");
+      expect(next.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+      expect(calls).toBe(scenario === "cancel waiting" ? 2 : 3);
+    }
+  },
+);
+
+test("Network outage at PR creation retains successful work and the recorded push", async () => {
+  const { f, r, before, pr, restore } = await deliveryFaultFixture();
+  const realSh = proc.sh;
+  let pushes = 0;
+  const command = spyOn(proc, "sh").mockImplementation(async (cmd, opts) => {
+    if (cmd.includes("push")) pushes++;
+    return realSh(cmd, opts);
+  });
+  try {
+    writeFileSync(
+      `${pr}.fail`,
+      JSON.stringify([{ on: "pr create", err: "getaddrinfo ENOTFOUND example.invalid" }]),
+    );
+    expect(await executeRun(f.deps, r.id, new AbortController().signal)).toBe("queued");
+    const wait = f.store.getRunState<RunState>(r.id)?.githubWait;
+    expect(wait?.reason).toBe("Network failure: ENOTFOUND");
+    expect(f.store.getRunState<RunState>(r.id)?.round).toBe(before.round);
+    expect(f.store.getRunState<RunState>(r.id)?.feedback).toBe(before.feedback);
+    expect(ghCalls(pr, "pr create")).toHaveLength(1);
+    const attempts = f.store.listInvocations(r.id).length;
+    const next = await reopen(f);
+    expect(ghCalls(pr, "pr create")).toHaveLength(1);
+    expect(next.store.getRunState<RunState>(r.id)?.githubWait).toEqual(wait);
+    writeFileSync(`${pr}.fail`, "[]");
+    const state = next.store.getRunState<RunState>(r.id);
+    if (!state?.githubWait) throw new Error("missing wait");
+    state.githubWait.nextAttemptAt = Date.now() - 1;
+    next.store.setRunState(r.id, state);
+    next.scheduler.tick();
+    await settled(next, r.id);
+    expect(next.store.getRun(r.id)?.status).toBe("succeeded");
+    expect(next.store.listInvocations(r.id)).toHaveLength(attempts);
+    expect(pushes).toBe(1);
+    expect(ghCalls(pr, "pr create")).toHaveLength(2);
+  } finally {
+    command.mockRestore();
+    await restore();
+  }
+});
+
+test("Network outage during draft reporting keeps its original deadline on retry", async () => {
+  const { f, r, before, pr, restore } = await deliveryFaultFixture();
+  before.needsHumanReason = "Legitimate findings";
+  f.store.setRunState(r.id, before);
+  const fail = () =>
+    writeFileSync(`${pr}.fail`, JSON.stringify([{ on: "pr create", err: "getaddrinfo ENOTFOUND" }]));
+  const signal = new AbortController().signal;
+  try {
+    fail();
+    expect(await executeRun(f.deps, r.id, signal)).toBe("queued");
+    const state = f.store.getRunState<RunState>(r.id);
+    if (!state?.githubWait) throw new Error("missing draft wait");
+    state.githubWait.since -= 1000;
+    f.store.setRunState(r.id, state);
+    fail();
+    expect(await executeRun(f.deps, r.id, signal)).toBe("queued");
+    expect(f.store.getRunState<RunState>(r.id)?.githubWait?.since).toBe(state.githubWait.since);
+    expect(f.store.getRunState<RunState>(r.id)?.round).toBe(before.round);
+    writeFileSync(`${pr}.fail`, "[]");
+    expect(await executeRun(f.deps, r.id, signal)).toBe("needs_human");
+    expect(f.store.getRun(r.id)?.error).toBe("Legitimate findings");
+    expect(f.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
+    expect(ghCalls(pr, "pr create")).toHaveLength(3);
+  } finally {
+    await restore();
+  }
+});
+
+test("Network outage in one panel finder keeps its deadline while a sibling finder succeeds", async () => {
+  githubWait.intervalMs = 60_000;
+  let offline = true;
+  const handler = (s: AgentSpec): FakeReply =>
+    !/^You are (an adversarial|a) code reviewer/.test(s.prompt)
+      ? answer(s)
+      : offline && s.prompt.includes("# Lens: failure-paths")
+        ? { status: "unavailable", error: "getaddrinfo ENOTFOUND example.invalid" }
+        : { structured: review };
+  const f = factory(undefined, handler);
+  f.deps.cfg.reviewMode = "panel";
+  f.deps.cfg.reviewRosters.standard = [
+    ...f.deps.cfg.reviewRosters.standard,
+    { prompt: "standard", lens: { name: "failure-paths", focus: "Failure paths." } },
+  ];
+  const r = await f.createRun({ repo: source, prompt: "Change", profile: "standard" });
+  const signal = new AbortController().signal;
+  expect(await executeRun(f.deps, r.id, signal)).toBe("queued");
+  const state = f.store.getRunState<RunState>(r.id);
+  if (!state?.githubWait) throw new Error("missing review wait");
+  expect(state.githubWait.step).toBe("agent:review");
+  state.githubWait.since -= 1000;
+  f.store.setRunState(r.id, state);
+  expect(await executeRun(f.deps, r.id, signal)).toBe("queued");
+  expect(f.store.getRunState<RunState>(r.id)?.githubWait?.since).toBe(state.githubWait.since);
+  expect(f.store.getRunState<RunState>(r.id)?.round).toBe(state.round);
+  offline = false;
+  expect(await executeRun(f.deps, r.id, signal)).toBe("succeeded");
+  expect(f.store.getRunState<RunState>(r.id)?.githubWait).toBeUndefined();
 });

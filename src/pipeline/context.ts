@@ -48,6 +48,7 @@ import type { CapabilityGate, CapabilityRefusal } from "../integrations/member-e
 import type { ProviderTracker } from "../router/providers.ts";
 import type { RouteConstraints, RouteDecision, Router } from "../router/router.ts";
 import { formatTarget, recordEffort } from "../router/targets.ts";
+import { networkFailure } from "../util/network-failure.ts";
 import { redactCredentialData, redactCredentials } from "../util/proc.ts";
 import type { AcceptanceState } from "./acceptance.ts";
 import {
@@ -127,7 +128,7 @@ export interface RunState {
   verdictCommentPosted?: boolean;
   verdictCommentPending?: boolean;
   phase: Phase;
-  githubWait?: { since: number; nextAttemptAt: number; reason: string };
+  githubWait?: { since: number; nextAttemptAt: number; reason: string; step?: string };
   worktreePath?: string;
   /** The commit the coordinator last confirmed on the run's own branch on GitHub; absent means never published. */
   publishedSha?: string;
@@ -592,8 +593,20 @@ export class RunContext {
     return this.stageContext.getStore()?.id;
   }
 
+  clearNetworkWait(step: string): void {
+    const waiting = this.state.githubWait?.step;
+    if (
+      waiting === step ||
+      (step === "stage:gates" && waiting?.startsWith("gates:")) ||
+      // Panel finders share one key, so only the completed review stage ends a review wait.
+      (step === "stage:review" && waiting === "agent:review")
+    )
+      this.state.githubWait = undefined;
+  }
+
   async save(checkpoint?: string, onComplete?: () => void): Promise<void> {
     if (
+      !this.state.githubWait?.step &&
       !this.state.githubWait?.reason.startsWith("claim:") &&
       (this.state.phase !== "deliver" || this.state.deliveryComplete)
     )
@@ -618,6 +631,7 @@ export class RunContext {
   }
 
   async setPhase(phase: Phase): Promise<void> {
+    if (phase === "done") this.state.githubWait = undefined;
     if (phase !== this.state.phase) consumeGateExecution(this);
     this.state.phase = phase;
     if (phase === "done") this.state.completedChecks = undefined;
@@ -640,6 +654,9 @@ export class RunContext {
     claimGuard();
     if (this.termination) throw this.termination;
     if (this.signal.aborted) throw new CancelledError();
+    // A cancel recorded while this execution was not the scheduler's active one (e.g. a retry
+    // from a network wait) still ends it before any further work or a late success.
+    if (this.store.getRun(this.run.id)?.error?.startsWith("cancelled by")) throw new CancelledError();
   }
 
   async requireCapability(phase: Phase): Promise<void> {
@@ -727,6 +744,7 @@ export class RunContext {
         await this.faults.hit(`stage:${name}:before`, context, this.signal);
         this.checkCancelled();
         const output = await fn(stage);
+        this.clearNetworkWait(`stage:${name}`);
         await this.faults.hit(`stage:${name}:after`, context, this.signal);
         this.checkCancelled();
         if (cacheable) {
@@ -989,6 +1007,7 @@ export class RunContext {
       }
       tried.push({ modelId: target.modelId, effort: target.effort ?? null });
       const previousImplementer = this.state.implementer;
+      const previousTried = [...this.state.triedImplementers];
       if (opts.role === "implement") {
         this.state.implementer = {
           policyRevision: cellRevision,
@@ -1225,7 +1244,7 @@ export class RunContext {
           numTurns: 0,
           costUsd: 0,
           costEquivUsd: 0,
-          error: (e as Error).message,
+          error: networkFailure(e)?.message ?? (e as Error).message,
           quota: null,
         };
       } finally {
@@ -1332,6 +1351,15 @@ export class RunContext {
               : result.error,
         finishedAt: Date.now(),
       });
+      const network = networkFailure(result, `agent:${opts.role}`);
+      if (network && !this.termination && !cause && !signal.aborted && result.status !== "cancelled") {
+        this.run = store.refreshRunTotals(this.run.id);
+        if (opts.role === "implement") {
+          this.state.implementer = previousImplementer;
+          this.state.triedImplementers = previousTried;
+        }
+        throw network;
+      }
       // Shadow outcomes never reach provider health, quota telemetry or model blocks.
       if (result.quota?.windows) health?.observeWindows(target.provider, result.quota.windows);
       if (result.confinement) health?.observeConfinement(target.provider, result.confinement);
@@ -1361,6 +1389,7 @@ export class RunContext {
       if (this.termination) throw this.termination;
       if (cause) throw cause;
       if (result.status === "cancelled" || signal.aborted) throw new CancelledError();
+      if (!shadow && opts.role !== "review") this.clearNetworkWait(`agent:${opts.role}`);
       if (result.status === "declined") {
         // Not a failure and not a routing attempt: each decision model declines at most once.
         const reason = opts.privateOutput

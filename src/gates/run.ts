@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import { worktreeGit } from "../git/command.ts";
 import { runConfined, withCommandScratch } from "../harness/sandbox.ts";
 import { credentialRegistry } from "../util/credential-matcher.ts";
+import { networkFailure } from "../util/network-failure.ts";
 import { agentEnv, invocationScratch } from "../util/proc.ts";
 import { resolveTestWorkers } from "../util/test-workers.ts";
 import { RunnerFailureEvidence } from "./attribution.ts";
@@ -199,6 +200,10 @@ async function runOne(
     onStdoutLine: observe,
     onStderrLine: observe,
   });
+  const out = res.capture && "stdout" in res.capture ? res.capture : res;
+  const output = `${out.stderr}\n${out.stdout}`;
+  const network = networkFailure({ ok: false, exitCode: res.exitCode, output });
+  if (network && !launch.failed() && !signal.aborted) throw network;
   await new Promise(setImmediate);
   const skipReport = readJUnitSkips(report, cwd);
   const testCoverage = coverage.result(skipReport, evidence.agrees(skipReport?.counts));

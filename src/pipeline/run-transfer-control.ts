@@ -17,7 +17,11 @@ export const transferControlSchema = object({
   feedback: text.nullable(),
   toolCommands: z.array(text),
   // Recorded scheduling data, independent of destination clocks or lease validity.
-  githubWait: object({ ...r.fields("since nextAttemptAt", r.counter), reason: text }).optional(),
+  githubWait: object({
+    ...r.fields("since nextAttemptAt", r.counter),
+    reason: text,
+    step: text.optional(),
+  }).optional(),
 
   // Selections retain historical target IDs without consulting a destination catalog.
   implementer: object({

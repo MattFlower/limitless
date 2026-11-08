@@ -128,7 +128,7 @@ export interface Repo {
 export interface Run {
   models?: RunModels;
   flow?: "build" | "verify-change" | "acceptance";
-  githubWait?: { since: number; nextAttemptAt: number; reason: string; deadline: number };
+  githubWait?: { since: number; nextAttemptAt: number; reason: string; deadline: number; step?: string };
   id: string;
   repoId: string;
   repoSlug: string;

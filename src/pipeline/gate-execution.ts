@@ -22,6 +22,7 @@ import { checkoutCommitted, headSha } from "../git/repos.ts";
 import { withCommandScratch } from "../harness/sandbox.ts";
 import { removeScratch, withScratch } from "../harness/scratch.ts";
 import { ciSignature } from "../integrations/ci-classifier.ts";
+import { NetworkFailure, networkFailure } from "../util/network-failure.ts";
 import { invocationScratch } from "../util/proc.ts";
 import type { RunContext } from "./context.ts";
 
@@ -311,8 +312,15 @@ export async function runGateExecution(
       );
     settled = true;
     ctx.checkCancelled();
+    ctx.clearNetworkWait(`gates:${purpose}`);
     if (handle) onExecuted?.(handle, result);
     return result;
+  } catch (error) {
+    const network = networkFailure(error);
+    if (!network) throw error;
+    consumeGateExecution(ctx);
+    settled = true;
+    throw new NetworkFailure(network.message.slice("Network failure: ".length), `gates:${purpose}`);
   } finally {
     // A termination before attach leaves the durable identity available for resume; so does
     // failed remote cleanup, so a later resume or discard retries it.

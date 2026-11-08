@@ -1,4 +1,5 @@
 import type { StreamFault } from "../pipeline/faults.ts";
+import { networkFailure } from "../util/network-failure.ts";
 import { ClaudeStreamParser } from "./claude.ts";
 import { CodexStreamParser } from "./codex.ts";
 import { type AgentEvent, type AgentResult, extractJson } from "./types.ts";
@@ -11,9 +12,13 @@ export function parseFakeStream(stream: StreamFault, emit: (event: AgentEvent) =
     parser instanceof ClaudeStreamParser
       ? parser.gotResult && !parser.isError
       : parser.completed && !parser.failed;
+  const error = parser instanceof ClaudeStreamParser ? parser.isError && parser.finalText : parser.failed;
   return {
     status: complete ? "ok" : "error",
-    error: complete ? null : "malformed or truncated harness stream: missing successful completion",
+    error: complete
+      ? null
+      : (networkFailure({ status: "error", error })?.message ??
+        "malformed or truncated harness stream: missing successful completion"),
     finalText: parser instanceof ClaudeStreamParser ? parser.finalText : parser.lastMessage,
     structured: parser instanceof ClaudeStreamParser ? parser.structured : extractJson(parser.lastMessage),
     ...(parser instanceof ClaudeStreamParser

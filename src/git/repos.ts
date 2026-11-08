@@ -28,6 +28,7 @@ import { dispatchGuard as claimDispatchGuard } from "../integrations/claim-guard
 import type { GhRunner } from "../integrations/github.ts";
 import { GitHubIdentityError, githubSh, githubUrlRepo } from "../integrations/github-identity.ts";
 import { checkDiscreetBranch, DiscreetError } from "../pipeline/markers.ts";
+import { networkFailure } from "../util/network-failure.ts";
 import {
   CommandError,
   ProcessTerminationError,
@@ -123,6 +124,8 @@ export async function withGitHubRetry<T>(
     try {
       return await charged(call);
     } catch (error) {
+      const network = networkFailure(error);
+      if (network && !opts.signal?.aborted) throw network;
       if (!(isTransient(error) || error instanceof RetryableError) || opts.signal?.aborted) throw error;
       const delay = githubRetry.baseDelayMs * 3 ** (attempt - 1);
       if (attempt >= githubRetry.attempts || delay >= budget.leftMs)
@@ -1229,6 +1232,8 @@ export async function deliveryPublicationRange(
   const marked = discreet && checkDiscreetBranch(branch, discreet.runId, true);
   const remote = await remoteSh(["git", "ls-remote", url, `refs/heads/${branch}`], opts).catch((error) => {
     rethrowClaimControl(error);
+    const network = networkFailure(error);
+    if (network) throw network;
     if (marked && !signal?.aborted)
       throw new DiscreetError("Discreet mode cannot establish branch-name publication status");
     throw error;
@@ -1957,7 +1962,7 @@ export async function createPullRequest(
           (r) => lookupUrl(r.stdout, opts.identity),
           (e) => {
             rethrowClaimControl(e);
-            return e instanceof GitHubIdentityError || isTransient(e) || signal?.aborted
+            return e instanceof GitHubIdentityError || networkFailure(e) || isTransient(e) || signal?.aborted
               ? Promise.reject(e)
               : "";
           },
@@ -1996,6 +2001,8 @@ export async function createPullRequest(
     ).catch((e) => {
       rethrowClaimControl(e);
       if (e instanceof GitHubIdentityError || signal?.aborted) throw e;
+      const network = networkFailure(e);
+      if (network) throw network;
     });
   return url;
 }
@@ -2117,6 +2124,8 @@ export async function mergePullRequest(
       rethrowClaimControl(e);
       if (e instanceof GitHubGuardError) throw e.cause;
       if (e instanceof GitHubIdentityError || signal?.aborted) throw e;
+      const network = networkFailure(e);
+      if (network) throw network;
       const cause = e instanceof GitHubUnavailableError ? (e.cause ?? e) : e;
       const detail =
         cause instanceof CommandError ? cause.stderr || cause.stdout || cause.message : String(cause);
