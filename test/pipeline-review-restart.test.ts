@@ -317,6 +317,7 @@ describe("pipeline (fake agents, real git + gates)", () => {
     let implementsCount = 0;
     let slow = true;
     const prompts: string[] = [];
+    const thirdImplementation = deferred<void>();
     const handler: Handler = (s) => {
       const role = roleOf(s);
       if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
@@ -393,18 +394,14 @@ describe("pipeline (fake agents, real git + gates)", () => {
         };
       }
       implementsCount++;
+      if (slow && implementsCount === 3) thirdImplementation.resolve();
       return slow && implementsCount === 3
         ? { delayMs: 30_000 }
         : { files: { "farewell.txt": `goodbye ${implementsCount}\n` } };
     };
     const f = start(handler);
     const run = await f.createRun({ repo: repoDir, prompt: "Add a farewell file" });
-    const deadline = Date.now() + 10_000;
-    while (
-      (f.store.getRunState<RunState>(run.id)?.round !== 2 || f.store.getRun(run.id)?.stage !== "implement") &&
-      Date.now() < deadline
-    )
-      await Bun.sleep(10);
+    await thirdImplementation.promise;
     const before = f.store.getRunState<RunState>(run.id);
     expect(before?.reviewedSha).toMatch(/^[a-f0-9]{40}$/);
     expect(before?.lastReview?.findings[0]?.title).toBe("Regression");

@@ -2454,9 +2454,9 @@ describe("pipeline hardening", () => {
           expect(await waitDone(f, run.id)).toBe("needs_human");
           expect(implementCalls).toBe(1);
           expect(f.store.getRun(run.id)?.error).toContain("Invocation termination could not be confirmed");
-          expect(f.store.getRunState<{ feedback: string }>(run.id)?.feedback).toContain(
-            "cannot inspect marked descendant",
-          );
+          const feedback = f.store.getRunState<{ feedback: string }>(run.id)?.feedback;
+          if (shutdown) expect(feedback).toBe("[previous feedback withheld: unverified]");
+          else expect(feedback).toContain("cannot inspect marked descendant");
           const invocation = f.store.listInvocations(run.id).find((i) => i.role === "implement");
           if (shutdown) expect(invocation?.status).toBe("cancelled");
           else
