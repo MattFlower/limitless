@@ -136,7 +136,7 @@ test.each([
         requestWithParams(`http://localhost:7400/api/runs/${run.id}/events`, undefined, { id: run.id }),
         localServer,
       );
-      for (const [index, text] of [
+      for (const text of [
         factory.store.getArtifact(run.id, "gates.json"),
         await response.text(),
         await events.text(),
@@ -150,10 +150,8 @@ test.each([
           audit: [],
           implementerReport: "",
         }),
-      ].entries()) {
-        expect(text).toContain(
-          index >= 3 && result.output.length > 3000 ? "[output withheld: unchecked-rendering]" : marker,
-        );
+      ]) {
+        expect(text).toContain(marker);
         expect(text).not.toContain(JSON.stringify(secret).slice(1, -1));
         for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
           expect(text).not.toContain(fragment.slice(0, 12));
@@ -354,7 +352,7 @@ test("legacy gate results are redacted at checkpoints, HTTP and SSE reads withou
   }
 });
 
-test("gate feedback and review receive the checked tail without early excerpts", async () => {
+test("gate feedback and review receive checked excerpts and tail", async () => {
   const gates = compareGates(null, await credentialGate());
   const messages = [
     formatGateFeedback(gates),
@@ -369,9 +367,8 @@ test("gate feedback and review receive the checked tail without early excerpts",
     }),
   ];
   for (const message of messages) {
-    expect(message).toContain("[output withheld: unchecked-rendering]");
-    expect(message).not.toContain("error: credential");
-    expect(message).not.toContain("(fail) assertion");
+    expect(message).toContain("error: credential [redacted]\n(fail) assertion\n\n");
+    expect(message).toContain("summary\n");
     expect(message).not.toContain(gateCredential);
   }
 });
@@ -450,7 +447,7 @@ test.each([false, true])(
     const message = await feedback("summary\n".repeat(800), `${reason}\n${"x".repeat(8_000)}`, timedOut);
     expect(message).not.toContain(reason);
     expect(message).not.toContain("summary");
-    expect(message).toContain("[output withheld: unchecked-rendering]");
+    expect(message).toContain("[withheld: unproven]");
     expect(message.length).toBeLessThan(3_300);
   },
 );
@@ -465,7 +462,7 @@ test("legacy failed gate feedback withholds its unchecked tail", () => {
   expect(message.length).toBeLessThan(3_300);
 });
 
-test.each([3000, 3001])("formatGateOutput guards renderings at %i UTF-16 units", async (units) => {
+test.each([3000, 3001])("formatGateOutput refuses unsigned excerpts at %i UTF-16 units", async (units) => {
   const output = "U".repeat(units);
   const gate = await provenResult({
     name: "test",
@@ -476,7 +473,7 @@ test.each([3000, 3001])("formatGateOutput guards renderings at %i UTF-16 units",
     output,
     failures: "private failure excerpt",
   });
-  expect(formatGateOutput(gate)).toBe(units === 3000 ? output : "[output withheld: unchecked-rendering]");
+  expect(formatGateOutput(gate)).toBe("[withheld: unproven]");
 });
 
 test.each([
@@ -536,7 +533,7 @@ for (const consumer of ["feedback", "review"]) {
     expect(failures).toContain(identity);
     expect(message).not.toContain(identity);
     expect(message).not.toContain("error: reason");
-    expect(message).toContain("[output withheld: unchecked-rendering]");
+    expect(message).toContain("[withheld: unproven]");
     expect(message).not.toContain("\u001b");
     if (consumer === "feedback") expect(message.length).toBeLessThan(3_300);
   });

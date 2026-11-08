@@ -22,6 +22,9 @@ export const textPrivacySchema = z.strictObject({
   output: fieldPrivacySchema,
   identities: fieldPrivacySchema.optional(),
   failures: fieldPrivacySchema.optional(),
+  renderings: z
+    .strictObject({ "3000": fieldPrivacySchema.optional(), "9000": fieldPrivacySchema.optional() })
+    .optional(),
 });
 export type TextPrivacy = z.infer<typeof textPrivacySchema>;
 const WITHHELD_REASONS = new Set<unknown>([

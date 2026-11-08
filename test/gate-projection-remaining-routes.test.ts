@@ -150,7 +150,9 @@ test.each(["legacy", "forged", "proven"])(
       const error = postMergeConfirmationText(c, true);
       expect(log).toContain(reason === sentinel ? withheldText("unproven") : reason);
       expect(log).not.toContain(sentinel);
-      expect(error.includes(sentinel)).toBe(released);
+      // The output proof cannot authorize a composition with the unproved excerpt.
+      expect(error).toContain(withheldText("unproven"));
+      expect(error).not.toContain(sentinel);
       expect(error).not.toContain(`excerpt-${sentinel}`);
     }
   },

@@ -21,6 +21,7 @@ import * as gateExecutorModule from "../src/gates/executor.ts";
 import { type GateExecutor, type GateRequest, gateProvenance } from "../src/gates/executor.ts";
 import { parseJUnit } from "../src/gates/junit.ts";
 import { redactGateData } from "../src/gates/output.ts";
+import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import * as gateRunModule from "../src/gates/run.ts";
 import { type GateResult, type GateRun, runLocalGates } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
@@ -473,6 +474,13 @@ function fakeLandGates(
   proveEvents = true,
 ) {
   const requests: GateRequest[] = [];
+  const eventResult = async (r: GateResult) => {
+    if (!proveEvents) return r;
+    const signed = await provenResult(redactGateData(r));
+    if (signed.textPrivacy && r.textPrivacy?.renderings)
+      signed.textPrivacy.renderings = r.textPrivacy.renderings;
+    return signed;
+  };
   const executor: GateExecutor = {
     kind: "lan",
     freshCheckoutFor: () => true,
@@ -492,13 +500,13 @@ function fakeLandGates(
               yield {
                 type: "check" as const,
                 phase: "setup" as const,
-                result: proveEvents ? await provenResult(redactGateData(r)) : r,
+                result: await eventResult(r),
               };
             for (const r of completed.checks)
               yield {
                 type: "check" as const,
                 phase: "check" as const,
-                result: proveEvents ? await provenResult(redactGateData(r)) : r,
+                result: await eventResult(r),
               };
           },
         },
@@ -2833,7 +2841,7 @@ test("red CI on the pushed commit blocks the entry with the failing check names"
 test.each([
   ["(fail) identifier", "(fail) identifier"],
   ["\u001b[31m✗ colored identifier\u001b[0m", "✗ colored identifier"],
-])("a failing land check logs the checked tail without early excerpts: %s", async (result, identity) => {
+])("a failing land check logs checked excerpts and tail: %s", async (result, identity) => {
   const credential = "synthetic-land-gate-credential-409";
   registerCredential("LAND_GATE_TEST_TOKEN", credential);
   writeFileSync(
@@ -2862,9 +2870,9 @@ test.each([
   expect(blocked?.reason).toMatch(/^lint failed \(/);
   expect(blocked?.reason).not.toContain("secret in output");
   const log = readFileSync(blocked?.logPath ?? "", "utf8");
-  expect(log).not.toContain("error: values differ");
-  expect(log).not.toContain(identity);
-  expect(log).not.toContain("left out");
+  expect(log).toContain("error: values differ");
+  expect(log).toContain(identity);
+  expect(log).toContain("left out");
   expect(log).toContain("skipped summary");
   expect(log).toContain("credential: [redacted]");
   expect(log).not.toContain(credential);
@@ -6722,3 +6730,49 @@ test.each(["blocking", "exception"])(
     }
   },
 );
+
+test.each([true, false])("land entries use the original gate rendering, proven=%s", async (proven) => {
+  const { pr } = await retryLandFixture(undefined, "test", "prepare", "bun test; security-scan");
+  const output = "z".repeat(6000),
+    failures = "checked land diagnostic\n(fail) case";
+  const protectedOutput = await protectGateOutput(
+    {
+      capture: { provenance: { kind: "complete" }, stdout: output, stderr: "" },
+      stdout: "",
+      stderr: "",
+      exitCode: 1,
+      signal: null,
+      cancelled: false,
+      timedOut: false,
+      idleTimedOut: false,
+      truncated: false,
+      durationMs: 1,
+    },
+    "[]",
+    { deadline: Date.now() + 120000 },
+    failures,
+    () => true,
+  );
+  const fake = fakeLandGates(
+    (req) =>
+      retryRun(req, {
+        test: {
+          ...testFailure,
+          ...protectedOutput,
+          ...(proven ? {} : { textPrivacy: undefined }),
+        },
+      }),
+    false,
+  );
+  const entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+  await settle();
+  const path = store.getLandEntry(entry.id)?.logPath;
+  if (!path) throw Error("Missing land log");
+  const text = await signedLog.readLandLog(path);
+  if (proven) expect(text).toContain(`${failures}\n\n${output.slice(-1000)}`);
+  else {
+    expect(text).toContain("[withheld: unproven]");
+    expect(text).not.toContain(failures);
+    expect(text).not.toContain(output.slice(-1000));
+  }
+});

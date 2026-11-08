@@ -35,8 +35,13 @@ export function consumerState(cap: number) {
         ok: false,
         exitCode: 1,
         durationMs: 1,
+        failures: undefined as string | undefined,
         textPrivacy: undefined as
-          | { output: Record<string, unknown>; identities: Record<string, unknown> }
+          | {
+              output: Record<string, unknown>;
+              identities: Record<string, unknown>;
+              renderings?: Record<string, unknown>;
+            }
           | undefined,
       },
     })),
@@ -84,7 +89,7 @@ export function consumerCounters(name: string, value: unknown) {
       unsubscribed: field(value, "unsubscribed"),
     };
   if (name === "events") return { sinkEvents: value };
-  if (name === "render-prompts") return { renderedResults: 50 };
+  if (name.startsWith("render-prompts")) return { renderedResults: 50 };
   return undefined;
 }
 /** Decode and validate retained SSE bytes only after the measured consumer turns have ended. */
@@ -158,6 +163,55 @@ export async function projectFixture(c: Context, name: string, state: ReturnType
     if (name === "project-after-edit") await fs.writeFile(file, `${original}\nconsumer-policy-edit\n`);
   };
   return prepare;
+}
+export function renderConsumer(c: Context, name: string, input: unknown, proven: boolean) {
+  const run = () => invoke(c, name, input);
+  return proven
+    ? scope(
+        c.a,
+        "gatePrivacyScope",
+        {
+          checker: c.checker(),
+          registry: c.checker().registry,
+          signer: () => c.key,
+        },
+        run,
+      )
+    : run();
+}
+export function renderFixture(c: Context, state: ReturnType<typeof consumerState>) {
+  return async () => {
+    invoke(c, "provisionPrivacyPolicy", c.env.LIMITLESS_CONFIG_DIR, [], { registry: c.checker().registry });
+    const r = state.lastGates[0]?.result;
+    if (!r) throw Error("Missing render fixture");
+    r.failures = "checked diagnostic\n(fail) case";
+    const sign = async (text: string, field: string, producerCut = false) => {
+      const proof = await invoke(c, "checkAndSign", {
+        checker: c.checker(),
+        kind: "complete",
+        field,
+        text,
+        signer: () => c.key,
+        producerCut,
+        cut: { limit: producerCut ? Math.max(1, text.length) : 0, unit: "U", marker: "" },
+      });
+      validate(fixtureSnapshot(c).verify(proof, field, text, producerCut), "render fixture proof");
+      return { ...Object(proof), withheld: false, ...(producerCut && { truncated: true }) };
+    };
+    const output = await sign(r.output, "output"),
+      identities = await sign(String(invoke(c, "gateIdentities", r)), "identities"),
+      renderings: Record<string, unknown> = {};
+    for (const limit of [3000, 9000])
+      renderings[limit] = await sign(
+        String(invoke(c, "renderGateOutput", r, limit)),
+        `rendering:${limit}`,
+        true,
+      );
+    for (const g of state.lastGates) {
+      g.result.failures = r.failures;
+      g.result.textPrivacy = { output, identities, renderings };
+    }
+  };
 }
 export function renderInputs(state: ReturnType<typeof consumerState>): [string, unknown][] {
   const gates = state.lastGates;
@@ -560,7 +614,7 @@ export function describe(name: string, label: string, size: number, api: API) {
         ? "available"
         : "unavailable"
       : undefined,
-    results: name.startsWith("project-") || name === "render-prompts" ? 50 : undefined,
+    results: name.startsWith("project-") || name.startsWith("render-prompts") ? 50 : undefined,
     outputUnits: name.startsWith("project-") ? 6000 : undefined,
     identitiesAtCap: name.startsWith("project-") ? (api.IDENTITY_CAP ?? 65536) : undefined,
     gateEvents: name === "event-drain" ? 5000 : undefined,
@@ -570,7 +624,7 @@ export function describe(name: string, label: string, size: number, api: API) {
     size,
     label,
     sizeUnit:
-      name.startsWith("project-") || name === "render-prompts"
+      name.startsWith("project-") || name.startsWith("render-prompts")
         ? "results"
         : name === "events" || name === "event-drain"
           ? "events"

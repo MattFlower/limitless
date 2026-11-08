@@ -2,6 +2,7 @@ import { getPrivacyChecker } from "../util/privacy-checker.ts";
 import { consumeBoundaryChunk } from "../util/privacy-chunks.ts";
 import { checkAndSign, verifier } from "../util/privacy-proof.ts";
 import type { ProcResult } from "../util/proc.ts";
+import { RENDER_LIMITS, renderGateOutput } from "./failures.ts";
 import { privateStringsDigest } from "./private.ts";
 import { gatePrivacyScope, type TextPrivacy, withheldText } from "./text-privacy.ts";
 
@@ -14,7 +15,9 @@ export async function protectGateOutput(
   excerptCurrent?: () => boolean,
 ): Promise<{ output: string; textPrivacy: TextPrivacy; failures?: string }> {
   const withheld = (reason: string): TextPrivacy["output"] => ({ withheld: true, reason });
-  let failures: string | undefined, failureField: TextPrivacy["failures"];
+  let failures: string | undefined,
+    failureField: TextPrivacy["failures"],
+    renderings: TextPrivacy["renderings"];
   let output = "",
     field = withheld("checker-failed"),
     identityField = withheld("checker-failed");
@@ -161,6 +164,31 @@ export async function protectGateOutput(
       }
       if (!signing) failureField = undefined;
     }
+    if (!field.withheld && verifier(registry, scope?.signer).available) {
+      let stopped: TextPrivacy["output"] | undefined;
+      for (const limit of RENDER_LIMITS) {
+        const rendering = renderGateOutput({ output, failures }, limit);
+        if (rendering === output) continue;
+        let record = stopped ?? withheld("checker-failed");
+        if (!stopped) {
+          try {
+            record = await sign(
+              rendering,
+              `rendering:${limit}`,
+              { limit: Math.max(1, rendering.length), unit: "U" },
+              true,
+            );
+            if (digest !== sourceDigest) record = withheld("stale-generation");
+          } catch {
+            record = withheld("checker-failed");
+          }
+        }
+        // Expiry, failure or a policy change stops later limits; a match on these bytes is per limit.
+        if (record.withheld && /^checker-|^stale-generation$/.test(record.reason ?? "")) stopped = record;
+        renderings ??= {};
+        renderings[limit] = record;
+      }
+    }
   } catch {
     field = withheld("checker-failed");
   }
@@ -171,6 +199,7 @@ export async function protectGateOutput(
       output: field,
       identities: identityField,
       ...(failureField && { failures: failureField }),
+      ...(renderings && { renderings }),
     },
   };
 }

@@ -395,10 +395,14 @@ export function targetedRetrySkipReason(
   return undefined;
 }
 
+/** A composition carries no source, excerpt or rendering proof; only the identities proof still applies. */
 function withoutExcerpts({ failures: _failures, textPrivacy, ...rest }: GateResult): GateResult {
   if (!textPrivacy) return rest;
-  const { failures: _record, ...privacy } = textPrivacy;
-  return { ...rest, textPrivacy: privacy };
+  const { identities } = textPrivacy;
+  return {
+    ...rest,
+    textPrivacy: { output: { withheld: true, reason: "unproven" }, ...(identities && { identities }) },
+  };
 }
 
 function retrySetupFailure(original: GateResult, run: GateRun): GateResult {
