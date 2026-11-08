@@ -5,6 +5,7 @@ import type { RunStatus } from "../core/types.ts";
 import type { Store } from "../db/store.ts";
 import { CommandError, redactCredentials } from "../util/proc.ts";
 import { claimScope } from "./claim-guard.ts";
+import { trackClaimWork } from "./claim-work.ts";
 import type { GhRunner } from "./github.ts";
 
 export type ClaimKind = "issue" | "pr" | "run";
@@ -109,6 +110,7 @@ export function createClaimClient(deps: { gh: GhRunner; sample: () => Anchor }):
     };
   }
   async function wait<T>(request: Promise<T>, signal?: AbortSignal): Promise<T> {
+    trackClaimWork(signal, request);
     // Observe the request even if it synchronously aborted the signal.
     const aborted = Promise.withResolvers<never>();
     const listener = signal && addAbortListener(signal, () => aborted.reject(signal.reason));

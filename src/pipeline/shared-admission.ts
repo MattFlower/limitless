@@ -7,6 +7,7 @@ import { cacheGit } from "../git/command.ts";
 import { cachePath, ensureCache } from "../git/repos.ts";
 import { ClaimLostError, ClaimWaitError, rethrowClaimControl } from "../integrations/claim-errors.ts";
 import type { ClaimClient } from "../integrations/claim-ref.ts";
+import { drainClaimWork, trackClaimWork } from "../integrations/claim-work.ts";
 import type { ControlNamer } from "../integrations/control-identity.ts";
 import { canonicalJson } from "../integrations/control-json.ts";
 import { type ControlValue, controlKey } from "../integrations/control-record.ts";
@@ -92,7 +93,9 @@ export async function admitRun(
         const refused = await step(() =>
           rt.gate.admit({ runId: run.id, phase, models: current.models, repo }, signal),
         );
-        if (refused.length) throw new ClaimWaitError("capability");
+        const terminal = store.checkpointRecord(run.id)?.terminal;
+        if (refused.some((reason) => !terminal || !["slots", "power", "draining"].includes(reason)))
+          throw new ClaimWaitError("capability");
         if (current.sourceRef?.kind === "pull_request") {
           await step(() =>
             rt.refreshCache
@@ -203,6 +206,8 @@ export async function admitRun(
         }
         return handle;
       });
+      work = work.finally(() => drainClaimWork(signal));
+      trackClaimWork(rt, work);
       const own = { signal, work };
       admissions.set(run.id, own);
       // Keep the lock until aborted IO drains, even if the deadline already returned to the picker.
