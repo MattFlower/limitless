@@ -779,6 +779,7 @@ export interface ProcOptions {
 }
 
 export interface ProcResult {
+  outputError?: string;
   capture?: CompleteCapture;
   exitCode: number | null;
   signal: string | null;
@@ -1073,12 +1074,27 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     let settled = false;
     const queue = opts.captureComplete ? outputQueue(child) : undefined;
     const idle = idleWatchdog(opts.idleTimeoutMs ?? Infinity, opts.idleNow);
+    let outputError: string | undefined;
+    const guard = <T extends unknown[]>(callback?: (...args: T) => void) =>
+      callback &&
+      ((...args: T) => {
+        if (outputError) return;
+        try {
+          callback(...args);
+        } catch {
+          outputError = "Invocation output callback failed";
+          capture?.fail();
+          queue?.stop();
+          void terminate();
+        }
+      });
+    const rawChunk = guard(opts.onRawChunk);
     const observe = (callback?: (line: string) => void) =>
       callback && opts.captureComplete && opts.redactOutput
         ? (line: string) => callback(credentialMatcher().has(line) ? "[redacted]" : line)
         : callback;
-    const out = lineSplitter(observe(opts.onStdoutLine), opts.maxLineLength);
-    const err = lineSplitter(observe(opts.onStderrLine), opts.maxLineLength);
+    const out = lineSplitter(guard(observe(opts.onStdoutLine)), opts.maxLineLength);
+    const err = lineSplitter(guard(observe(opts.onStderrLine)), opts.maxLineLength);
 
     let shutdown: Promise<void> | undefined;
     let terminationError: ProcessTerminationError | undefined;
@@ -1209,7 +1225,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         push(chunk: string) {
           if (!capture) {
             idle.reset();
-            opts.onRawChunk?.(chunk, stream);
+            rawChunk?.(chunk, stream);
           }
           emit(opts.redactOutput ? redactor.push(chunk) : chunk);
         },
@@ -1230,7 +1246,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
           capture.push(stream, bytes);
           const decoded = decoder.write(bytes);
           if (decoded) {
-            opts.onRawChunk?.(decoded, stream);
+            rawChunk?.(decoded, stream);
             queue?.push(decoded, output.push);
           }
         });
@@ -1239,7 +1255,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
           const decoded = decoder.end();
           if (decoded) {
             idle.reset();
-            opts.onRawChunk?.(decoded, stream);
+            rawChunk?.(decoded, stream);
             queue?.push(decoded, output.push);
           }
           queue?.push("", output.flush);
@@ -1258,7 +1274,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       const text = `\n[spawn error] ${e.message}`;
       if (queue && opts.redactOutput) {
         idle.reset();
-        opts.onRawChunk?.(text, "stderr");
+        rawChunk?.(text, "stderr");
       }
       if (queue)
         queue.push(
@@ -1293,7 +1309,8 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       scope?.children.delete(child);
       resolveStopped?.();
       resolve({
-        exitCode: code,
+        outputError,
+        exitCode: outputError ? 1 : code,
         signal: sig,
         cancelled,
         cancelKilled,
@@ -1319,7 +1336,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       const text = `\n[stdin error] ${e.message}`;
       if (queue && opts.redactOutput) {
         idle.reset();
-        opts.onRawChunk?.(text, "stderr");
+        rawChunk?.(text, "stderr");
       }
       if (queue)
         queue.push(
