@@ -36,7 +36,7 @@ import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-sy
 import { sharedRepository, withCapabilityLapse } from "./pipeline/run-claim.ts";
 import { ensureAdmissionPin } from "./pipeline/run-policy-pins.ts";
 import { admitRun, refuseSharedRequest, type SharedRuntime } from "./pipeline/shared-admission.ts";
-import { claimHooks, publishTerminal } from "./pipeline/shared-authority.ts";
+import { authorityFor, claimHooks } from "./pipeline/shared-authority.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
 import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
@@ -360,26 +360,38 @@ export class Factory {
       });
       const sweep = () => {
         timer = rt.clock.timer.set(sweep, LEASE.renewMs);
-        for (const row of this.store.heldLeaseRows()) {
-          const run = this.store.getRun(row.runId);
-          if (!run || !row.confirmed || this.terminalSweeps.has(run.id)) continue;
+        const held = new Map(this.store.heldLeaseRows().map((row) => [row.runId, row]));
+        const pending = this.store
+          .nextQueuedRuns(Number.MAX_SAFE_INTEGER, rt.clock.now())
+          .filter((run) => this.store.checkpointRecord(run.id)?.terminal)
+          .map((run) => run.id);
+        for (const id of new Set([...held.keys(), ...pending])) {
+          const run = this.store.getRun(id),
+            row = held.get(id);
+          if (!run || this.terminalSweeps.has(run.id)) continue;
           const terminal = this.store.checkpointRecord(run.id)?.terminal;
-          if (!terminal && !TERMINAL_STATUSES.includes(run.status)) continue;
+          if (!terminal && (!row?.confirmed || !TERMINAL_STATUSES.includes(run.status))) continue;
           const work = (
             terminal
-              ? publishTerminal(rt, this.store, run.id)
-              : rt.leases.release(
-                  {
-                    repo: row.repo,
-                    ref: row.ref,
-                    run: run.id,
-                    member: rt.member,
-                    generation: row.confirmed.generation,
-                  },
-                  {},
-                )
+              ? authorityFor(rt, this.store, this.cfg, run, new AbortController().signal)
+              : row?.confirmed
+                ? rt.leases.release(
+                    {
+                      repo: row.repo,
+                      ref: row.ref,
+                      run: run.id,
+                      member: rt.member,
+                      generation: row.confirmed.generation,
+                    },
+                    {},
+                  )
+                : Promise.resolve()
           )
-            .catch((error: unknown) => console.warn(redactCredentials(`Terminal sweep: ${String(error)}`)))
+            .catch((error: unknown) => {
+              if (error instanceof ClaimWaitError || error instanceof ClaimLostError)
+                mapClaimInterruption(this.store, run.id, error, rt.clock.now(), rt.checkpointer);
+              else console.warn(redactCredentials(`Terminal sweep: ${String(error)}`));
+            })
             .finally(() => this.terminalSweeps.delete(run.id));
           this.terminalSweeps.set(run.id, work);
         }

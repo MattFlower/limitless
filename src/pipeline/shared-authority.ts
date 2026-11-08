@@ -154,7 +154,8 @@ export async function authorityFor(
   };
   if (await finishRemote(read)) return "finished";
   let handle = held;
-  if (!handle || !store.checkpointRecord(run.id)?.indexed)
+  const checkpoint = store.checkpointRecord(run.id);
+  if (!handle || (!checkpoint?.indexed && !checkpoint?.terminal))
     handle = await admitRun(rt, store, cfg, run, signal);
   else {
     const { settlement } = await settleCheckpoint({ ...rt, store }, handle, signal);

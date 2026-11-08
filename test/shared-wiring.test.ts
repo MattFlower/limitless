@@ -13,7 +13,7 @@ import { createControlStore } from "../src/integrations/control-store.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { createLeaseManager } from "../src/integrations/leases.ts";
 import { parsePointer } from "../src/pipeline/checkpoint-settlement.ts";
-import { localCheckpointer, NeedsHumanError, type RunState } from "../src/pipeline/context.ts";
+import { localCheckpointer, NeedsHumanError, RunContext, type RunState } from "../src/pipeline/context.ts";
 import { claimKey, claimRef, parseManifest } from "../src/pipeline/portable.ts";
 import { createRunObjectExporter } from "../src/pipeline/run-object-export.ts";
 import { createRunObjectValidator } from "../src/pipeline/run-object-quarantine.ts";
@@ -22,6 +22,7 @@ import { receiptDescriptors } from "../src/pipeline/run-transfer-integrity.ts";
 import type { SharedRuntime } from "../src/pipeline/shared-admission.ts";
 import { createCheckpointCommitter, sharedCheckpointer } from "../src/pipeline/shared-checkpointer.ts";
 import { LEASE } from "../src/util/claim-clock.ts";
+import { credentialRegistry } from "../src/util/credential-matcher.ts";
 import { GitHub } from "./claim-github-fake.ts";
 import { fixture as memberFixture } from "./member-support.ts";
 import {
@@ -481,6 +482,20 @@ test("a runtime leaves local execution and checkpointer scheduling unchanged", a
   expect(x.remote.calls).toHaveLength(0);
   expect(x.rt.gate.admit).not.toHaveBeenCalled();
   expect(x.rt.gate.canContinue).not.toHaveBeenCalled();
+  for (const factory of [x.f, f]) {
+    const run = x.store.createRun(x.repo, { repo: x.repo.slug, prompt: "Local stage ordering" });
+    const ctx = new RunContext(factory.deps, run, x.repo, new AbortController().signal),
+      order: string[] = [];
+    const stage = ctx.stage("triage", async () => {
+      order.push("callback");
+      return { summary: "entered", value: undefined };
+    });
+    expect(x.store.listStages(run.id).map((row) => row.name)).toEqual(["triage"]);
+    queueMicrotask(() => order.push("microtask"));
+    await stage;
+    expect(order).toEqual(["callback", "microtask"]);
+  }
+  expect(traces.flat().some((entry) => entry.startsWith("checkpoint:stage:"))).toBe(false);
 });
 
 test("shared acceptance creation refuses before inserting or contacting companions", async () => {
@@ -610,6 +625,82 @@ test("a picked deferred cancellation publishes instead of repeatedly finalizing 
   await x.idle();
   expect(await x.record(run)).toMatchObject({ status: "cancelled", state: "released" });
   expect(x.store.listStages(run.id)).toHaveLength(0);
+});
+
+test("a refused initial export preserves needs_human without retrying admission", async () => {
+  const x = await fixture(),
+    credential = ["synthetic", "wiring", "identity", "credential"].join("-");
+  const registrations = spyOn(credentialRegistry, "values").mockReturnValue([
+    ...credentialRegistry.values(),
+    credential,
+  ]);
+  const admit = spyOn(x.rt.gate, "admit").mockImplementation(async () => {
+    // Bound a broken scheduler's immediate re-picks so the regression fails without spinning.
+    if (admit.mock.calls.length > 1) x.f.scheduler.setLimit(0);
+    return [];
+  });
+  try {
+    const run = await x.create({ requestedBy: credential }),
+      intent = JSON.parse(x.store.checkpointRecord(run.id)?.terminal ?? "null");
+    expect(intent).toMatchObject({ status: "needs_human", error: "Shared checkpoint refused: invalid" });
+    expect(x.store.checkpointRecord(run.id)?.committed).toBeNull();
+    expect(x.store.checkpointRecord(run.id)?.indexed).toBe(false);
+    expect(x.store.heldLeaseRows()).toHaveLength(1);
+    x.f.scheduler.setLimit(1);
+    x.f.scheduler.tick();
+    await x.idle();
+    expect(x.store.getRun(run.id)).toMatchObject(intent);
+    expect(await x.record(run)).toMatchObject({
+      status: "needs_human",
+      state: "released",
+    });
+    expect((await x.record(run)).checkpoint).toBeUndefined();
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(x.store.heldLeaseRows()).toHaveLength(0);
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+    expect(x.store.listInvocations(run.id)).toHaveLength(0);
+  } finally {
+    registrations.mockRestore();
+  }
+});
+
+test("an unleased cancellation publishes with zero execution slots", async () => {
+  const x = await fixture();
+  spyOn(x.rt.gate, "admit").mockRejectedValueOnce(new ClaimWaitError("capability"));
+  const run = await x.create();
+  x.f.cancelRun(run.id);
+  expect(x.store.getRun(run.id)).toMatchObject({
+    status: "queued",
+    githubWait: { reason: "claim:terminal" },
+  });
+  expect(x.store.heldLeaseRows()).toHaveLength(0);
+  const resume = Promise.withResolvers<void>(),
+    commit = x.rt.committer.commit;
+  let publishing = false;
+  spyOn(x.rt.committer, "commit").mockImplementation(async (...args) => {
+    if (args[3]) {
+      publishing = true;
+      await resume.promise;
+    }
+    return commit(...args);
+  });
+  try {
+    await x.clock.advance(LEASE.renewMs);
+    await wait(() => publishing, { timeoutMs: 20_000 });
+    expect(x.f.scheduler.activeRunIds).toEqual([]);
+    expect(x.store.getRun(run.id)?.status).toBe("queued");
+    expect(await x.record(run)).toMatchObject({ status: "queued", state: "held" });
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+    resume.resolve();
+    await wait(() => x.store.getRun(run.id)?.status === "cancelled", { timeoutMs: 20_000 });
+    await wait(() => x.store.heldLeaseRows().length === 0, { timeoutMs: 20_000 });
+    expect(await x.record(run)).toMatchObject({ status: "cancelled", state: "released" });
+    expect(x.f.scheduler.activeRunIds).toEqual([]);
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+    expect(x.store.listInvocations(run.id)).toHaveLength(0);
+  } finally {
+    resume.resolve();
+  }
 });
 
 test("stop waits for a renewal paused inside a claim read and the loop writes nothing after", async () => {
