@@ -14,7 +14,7 @@ import { controlKey } from "../src/integrations/control-record.ts";
 import { createControlStore } from "../src/integrations/control-store.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { createLeaseManager } from "../src/integrations/leases.ts";
-import type { CapabilityGate } from "../src/integrations/member-eligibility.ts";
+import type { CapabilityGate, CapabilityRefusal } from "../src/integrations/member-eligibility.ts";
 import { parsePointer } from "../src/pipeline/checkpoint-settlement.ts";
 import { localCheckpointer, NeedsHumanError } from "../src/pipeline/context.ts";
 import { claimKey, claimRef, parseManifest } from "../src/pipeline/portable.ts";
@@ -199,6 +199,44 @@ async function fixture(disk = false, sourceRef?: Record<string, unknown>) {
   return f;
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+test.each(["slots", "power", "draining"] as const)(
+  "ordinary admission still refuses %s without acquiring or publishing",
+  async (reason) => {
+    const f = await fixture();
+    spyOn(f.gate, "admit").mockResolvedValue([reason]);
+    const acquire = spyOn(f.rt.leases, "acquire");
+    await expect(f.admit()).rejects.toMatchObject({ reason: "capability" });
+    expect(acquire).not.toHaveBeenCalled();
+    expect(f.gh.requests).toHaveLength(0);
+    expect(f.remote.calls).toHaveLength(0);
+  },
+);
+
+test.each([
+  "advert",
+  "stale",
+  "protocol",
+  "checkpoint",
+  "os",
+  "confinement",
+  "login",
+  "route",
+  "parity",
+  "access",
+] as const)("terminal admission preserves %s refusals, including mixed lists", async (reason) => {
+  const f = await fixture();
+  f.store.setTerminalIntent(f.run.id, JSON.stringify({ status: "cancelled", error: null, finishedAt: 1 }));
+  const acquire = spyOn(f.rt.leases, "acquire");
+  for (const refused of [[reason], ["slots", reason, "power", "draining"]] satisfies CapabilityRefusal[][]) {
+    spyOn(f.gate, "admit").mockResolvedValue(refused);
+    await expect(f.admit()).rejects.toMatchObject({ reason: "capability" });
+  }
+  expect(acquire).not.toHaveBeenCalled();
+  expect(f.gh.requests).toHaveLength(0);
+  expect(f.remote.calls).toHaveLength(0);
+});
+
 async function tip(f: Fixture) {
   const result = await f.claims.read(f.repo.slug, claimRef(f.key));
   if (result.kind !== "tip" || result.tip.record === "malformed") throw new Error("fixture tip");

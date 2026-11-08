@@ -5,6 +5,7 @@ import { githubWait } from "../git/github-wait.ts";
 import { ClaimLostError, ClaimWaitError } from "../integrations/claim-errors.ts";
 import { bindClaim, claimGuard, claimScope, type ScopedClaim } from "../integrations/claim-guard.ts";
 import type { ClaimTip } from "../integrations/claim-ref.ts";
+import { drainClaimWork } from "../integrations/claim-work.ts";
 import type { LeaseHandle } from "../integrations/leases.ts";
 import { settleCheckpoint } from "./checkpoint-settlement.ts";
 import { mapClaimInterruption } from "./claim-interruption.ts";
@@ -71,10 +72,15 @@ function lose(rt: SharedRuntime, store: Store, runId: string): "done" {
   return "done";
 }
 
-async function publish(rt: SharedRuntime, store: Store, runId: string): Promise<"done" | "wait"> {
-  const signal = new AbortController().signal,
-    routed = of(routes, rt);
+async function publish(
+  rt: SharedRuntime,
+  store: Store,
+  runId: string,
+  signal: AbortSignal,
+): Promise<"done" | "wait"> {
+  const routed = of(routes, rt);
   for (;;) {
+    signal.throwIfAborted();
     const run = store.getRun(runId),
       json = store.checkpointRecord(runId)?.terminal;
     if (!run || !json) return "done";
@@ -89,7 +95,10 @@ async function publish(rt: SharedRuntime, store: Store, runId: string): Promise<
       if (settlement === "wait" || settlement === "blocked")
         throw new ClaimWaitError(settlement === "wait" ? "lease" : "checkpoint");
       if (remoteTerminal(run, tip) !== patch.status) {
-        const guard = () => claimScope.run([binding], claimGuard);
+        const guard = () => {
+          signal.throwIfAborted();
+          claimScope.run([binding], claimGuard);
+        };
         await rt.committer.commit(runId, { handle, guard, onLost: claimHooks(rt, store).onLost }, signal, {
           status: patch.status,
         });
@@ -121,8 +130,23 @@ function serial<T>(rt: SharedRuntime, runId: string, fn: () => Promise<T>): Prom
 }
 
 /** Publish a deferred terminal status on the claim, then finish locally and release. */
-export function publishTerminal(rt: SharedRuntime, store: Store, runId: string): Promise<"done" | "wait"> {
-  return serial(rt, runId, () => publish(rt, store, runId));
+export function publishTerminal(
+  rt: SharedRuntime,
+  store: Store,
+  runId: string,
+  signal = new AbortController().signal,
+): Promise<"done" | "wait"> {
+  return serial(rt, runId, async () => {
+    try {
+      return await publish(rt, store, runId, signal);
+    } catch (error) {
+      if (!signal.aborted || error instanceof ClaimLostError) throw error;
+      return wait(rt, store, runId, "terminal");
+    } finally {
+      // Both Scheduler and sweep callers own transports that can outlive an abort race.
+      await drainClaimWork(signal);
+    }
+  });
 }
 
 export async function authorityFor(
@@ -137,8 +161,10 @@ export async function authorityFor(
   // D2/D8: serialize behind publication, then finish from a terminal tip without reacquiring.
   const finishRemote = (tip: () => Promise<ClaimTip | null>) =>
     serial(rt, run.id, async () => {
+      signal.throwIfAborted();
       const status = remoteTerminal(run, await tip()),
         json = store.checkpointRecord(run.id)?.terminal;
+      signal.throwIfAborted();
       let patch: Terminal | null = json ? JSON.parse(json) : null;
       if (!status) return null;
       if (patch?.status !== status)
@@ -165,7 +191,7 @@ export async function authorityFor(
   }
   // A deferred terminal decision is published before any execution authority is granted.
   if (store.checkpointRecord(run.id)?.terminal) {
-    if ((await publishTerminal(rt, store, run.id)) === "done") return "finished";
+    if ((await publishTerminal(rt, store, run.id, signal)) === "done") return "finished";
     throw new ClaimWaitError("terminal");
   }
   const binding = bindClaim(rt.leases, handle, () => false);

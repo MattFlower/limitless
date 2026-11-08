@@ -7,6 +7,7 @@ import { cacheGit } from "../git/command.ts";
 import { cachePath, ensureCache } from "../git/repos.ts";
 import { ClaimLostError, ClaimWaitError, rethrowClaimControl } from "../integrations/claim-errors.ts";
 import type { ClaimClient } from "../integrations/claim-ref.ts";
+import { drainClaimWork } from "../integrations/claim-work.ts";
 import type { ControlNamer } from "../integrations/control-identity.ts";
 import { canonicalJson } from "../integrations/control-json.ts";
 import { type ControlValue, controlKey } from "../integrations/control-record.ts";
@@ -48,6 +49,11 @@ export function refuseSharedRequest(store: Store, cfg: Config, repo: Repo, req: 
 }
 
 const admissions = new Map<string, { signal: AbortSignal; work: Promise<LeaseHandle> }>();
+
+/** A timed-out admission can still be draining IO; shutdown must contain that work. */
+export async function drainAdmission(runId: string): Promise<void> {
+  await admissions.get(runId)?.work.catch(() => {});
+}
 
 export async function admitRun(
   rt: SharedRuntime,
@@ -92,7 +98,9 @@ export async function admitRun(
         const refused = await step(() =>
           rt.gate.admit({ runId: run.id, phase, models: current.models, repo }, signal),
         );
-        if (refused.length) throw new ClaimWaitError("capability");
+        const terminal = store.checkpointRecord(run.id)?.terminal;
+        if (refused.some((reason) => !terminal || !["slots", "power", "draining"].includes(reason)))
+          throw new ClaimWaitError("capability");
         if (current.sourceRef?.kind === "pull_request") {
           await step(() =>
             rt.refreshCache
@@ -203,6 +211,7 @@ export async function admitRun(
         }
         return handle;
       });
+      work = work.finally(() => drainClaimWork(signal));
       const own = { signal, work };
       admissions.set(run.id, own);
       // Keep the lock until aborted IO drains, even if the deadline already returned to the picker.

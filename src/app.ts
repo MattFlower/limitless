@@ -24,6 +24,7 @@ import { platformConfinement } from "./harness/sandbox.ts";
 import { removeScratch } from "./harness/scratch.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
 import { ClaimLostError, ClaimWaitError } from "./integrations/claim-errors.ts";
+import { drainClaimWork } from "./integrations/claim-work.ts";
 import { configureGitHubIdentity } from "./integrations/github-identity.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
@@ -35,7 +36,12 @@ import { claimKey } from "./pipeline/portable.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { sharedRepository, withCapabilityLapse } from "./pipeline/run-claim.ts";
 import { ensureAdmissionPin } from "./pipeline/run-policy-pins.ts";
-import { admitRun, refuseSharedRequest, type SharedRuntime } from "./pipeline/shared-admission.ts";
+import {
+  admitRun,
+  drainAdmission,
+  refuseSharedRequest,
+  type SharedRuntime,
+} from "./pipeline/shared-admission.ts";
 import { authorityFor, claimHooks } from "./pipeline/shared-authority.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
@@ -353,12 +359,14 @@ export class Factory {
     this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
     const rt = this.opts.shared;
     if (rt) {
+      const sweepController = new AbortController();
       const h = claimHooks(rt, this.store);
       const stopLoop = rt.leases.start({
         active: withCapabilityLapse(this.store, h.active),
         onLost: h.onLost,
       });
       const sweep = () => {
+        if (sweepController.signal.aborted) return;
         timer = rt.clock.timer.set(sweep, LEASE.renewMs);
         const held = new Map(this.store.heldLeaseRows().map((row) => [row.runId, row]));
         const pending = this.store
@@ -371,9 +379,10 @@ export class Factory {
           if (!run || this.terminalSweeps.has(run.id)) continue;
           const terminal = this.store.checkpointRecord(run.id)?.terminal;
           if (!terminal && (!row?.confirmed || !TERMINAL_STATUSES.includes(run.status))) continue;
+          const signal = AbortSignal.any([sweepController.signal]);
           const work = (
             terminal
-              ? authorityFor(rt, this.store, this.cfg, run, new AbortController().signal)
+              ? authorityFor(rt, this.store, this.cfg, run, signal)
               : row?.confirmed
                 ? rt.leases.release(
                     {
@@ -392,12 +401,17 @@ export class Factory {
                 mapClaimInterruption(this.store, run.id, error, rt.clock.now(), rt.checkpointer);
               else console.warn(redactCredentials(`Terminal sweep: ${String(error)}`));
             })
-            .finally(() => this.terminalSweeps.delete(run.id));
+            .finally(async () => {
+              await drainAdmission(run.id);
+              await drainClaimWork(signal);
+              this.terminalSweeps.delete(run.id);
+            });
           this.terminalSweeps.set(run.id, work);
         }
       };
       let timer = rt.clock.timer.set(sweep, LEASE.renewMs);
       this.stopShared = () => {
+        sweepController.abort(new ClaimWaitError("unavailable"));
         rt.clock.timer.clear(timer);
         return stopLoop();
       };
