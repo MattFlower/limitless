@@ -231,6 +231,8 @@ export function pipelineSetup(state: PipelineFixture) {
       | "harnesses"
       | "providers"
       | "bootSha"
+      | "shared"
+      | "store"
     > = {},
   ): Factory {
     const alpha = models[0];

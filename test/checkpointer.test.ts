@@ -15,6 +15,7 @@ import {
 } from "../src/pipeline/context.ts";
 import { executeRun } from "../src/pipeline/engine.ts";
 import { untilAborted } from "../src/pipeline/faults.ts";
+import { sharedCheckpointer } from "../src/pipeline/shared-checkpointer.ts";
 import { Scheduler } from "../src/scheduler.ts";
 import { sh } from "../src/util/proc.ts";
 import { approve, pipelineSetup, roleOf, triage } from "./pipeline-support.ts";
@@ -182,6 +183,39 @@ test("foreground stage refreshes ctx.run with the writeRun result", async () => 
     return { summary: "observed refreshed run", value: undefined };
   });
 });
+
+test.each([false, true])(
+  "an uncached local stage adds no microtask (shared seams injected=%s)",
+  async (injected) => {
+    const { f, run, repo } = await setup(),
+      order: string[] = [],
+      local = localCheckpointer(f.store),
+      checkpointer = injected
+        ? sharedCheckpointer(
+            local,
+            {
+              commit: async () => {
+                throw new Error("Local stages must not publish");
+              },
+            },
+            () => undefined,
+            { store: f.store, shared: () => false },
+          )
+        : local,
+      checkpoint = spyOn(checkpointer, "checkpoint");
+    const ctx = new RunContext({ ...f.deps, checkpointer }, run, repo, new AbortController().signal);
+    const stage = ctx.stage("triage", async () => {
+      order.push("callback");
+      return { summary: "entered", value: undefined };
+    });
+    expect(f.store.listStages(run.id).map((row) => row.name)).toEqual(["triage"]);
+    expect(f.store.getRun(run.id)?.stage).toBe("triage");
+    queueMicrotask(() => order.push("microtask"));
+    await stage;
+    expect(order).toEqual(["callback", "microtask"]);
+    expect(checkpoint).not.toHaveBeenCalled();
+  },
+);
 
 test("save awaits a shared boundary after the write and passes its label", async () => {
   const { f, run, repo } = await setup();

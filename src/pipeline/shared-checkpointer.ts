@@ -139,10 +139,17 @@ export function sharedCheckpointer(
         const now = Date.now(),
           { status, error = run.error, finishedAt = now } = patch;
         // D2: a shared run's terminal status waits for publication on the claim (publishTerminal).
+        // A repeated decision keeps the publication wait already recorded, including its retry time.
+        const pending = store.checkpointRecord(runId)?.terminal
+          ? store.getRunState<RunState>(runId)?.githubWait
+          : undefined;
         store.setTerminalIntent(runId, canonicalJson({ status, error, finishedAt }));
         const state = supplied ?? store.getRunState<RunState>(runId) ?? initialRunState(run);
         const since = state.githubWait?.since ?? now;
-        state.githubWait = { reason: "claim:terminal", since, nextAttemptAt: now };
+        state.githubWait =
+          pending?.reason === "claim:terminal" || pending?.reason === "claim:checkpoint"
+            ? pending
+            : { reason: "claim:terminal", since, nextAttemptAt: now };
         const queued = { status: "queued", stage: null, finishedAt: null, error: run.error } as const;
         return local.writeRun(runId, { ...patch, ...queued }, state);
       });

@@ -120,7 +120,8 @@ test("Run Detail shows the GitHub wait only for queued runs with an outage episo
   const run = store.createRun(repo, { repo: repo.slug, prompt: "Wait" });
   const detail = store.getRunDetail(run.id);
   if (!detail) throw new Error("missing detail");
-  const page = await buildNeedsYouUi(dir);
+  const page = await buildNeedsYouUi(join(dir, "detail"));
+  const table = await buildSetupUi(join(dir, "table"), "RunsTable");
   const since = Date.UTC(2026, 0, 1, 12);
   const githubWait = {
     since,
@@ -147,6 +148,31 @@ test("Run Detail shows the GitHub wait only for queued runs with an outage episo
     expect(capability).not.toContain("waiting for GitHub");
     for (const time of [githubWait.since, githubWait.nextAttemptAt])
       expect(capability).toContain(formatDateTime(time));
+    for (const [reason, label] of Object.entries({
+      "claim:checkpoint": "waiting for a readable checkpoint",
+      "claim:policy": "waiting for the run policy to be confirmed",
+      "claim:terminal": "publishing the final status",
+      "claim:capability": "waiting for a capable member",
+      unavailable: "waiting for GitHub",
+    })) {
+      const queued = { ...run, status: "queued" as const, githubWait: { ...githubWait, reason } };
+      page.mount({ ...detail, run: queued });
+      table.mount({ runs: [queued] });
+      for (const rendered of [renderToString(() => page.render()), table.render()]) {
+        expect(rendered).toContain(`${label} since`);
+        for (const time of [githubWait.since, githubWait.nextAttemptAt])
+          expect(rendered).toContain(formatDateTime(time));
+        if (reason.startsWith("claim:")) {
+          expect(rendered).toContain("next check");
+          expect(rendered).not.toContain("gives up");
+          expect(rendered).not.toContain("waiting for GitHub");
+        } else {
+          expect(rendered).toContain("next try");
+          expect(rendered).toContain("gives up");
+        }
+      }
+    }
+    table.dispose();
     page.mount(detail);
     expect(renderToString(() => page.render())).not.toContain("waiting for GitHub");
     page.mount({ ...detail, run: { ...run, status: "running", githubWait } });

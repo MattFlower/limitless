@@ -58,6 +58,13 @@ const QuestionCard: Component<{ runId: string; question: Question }> = (props) =
   );
 };
 
+const claimWaitLabels: Record<string, string> = {
+  "claim:capability": "waiting for a capable member",
+  "claim:checkpoint": "waiting for a readable checkpoint",
+  "claim:policy": "waiting for the run policy to be confirmed",
+  "claim:terminal": "publishing the final status",
+};
+
 export const RunDetail: Component = () => {
   const params = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -323,8 +330,8 @@ export const RunDetail: Component = () => {
                   <Show when={r().status === "queued" && r().githubWait}>
                     {(wait) => (
                       <div class="text-dim">
-                        {wait().reason === "claim:capability"
-                          ? `waiting for a capable member since ${formatDateTime(wait().since)}; next check ${formatDateTime(wait().nextAttemptAt)}`
+                        {claimWaitLabels[wait().reason]
+                          ? `${claimWaitLabels[wait().reason]} since ${formatDateTime(wait().since)}; next check ${formatDateTime(wait().nextAttemptAt)}`
                           : `waiting for GitHub since ${formatDateTime(wait().since)}; next try ${formatDateTime(wait().nextAttemptAt)}; gives up ${formatDateTime(wait().deadline)}`}
                       </div>
                     )}

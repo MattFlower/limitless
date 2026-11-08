@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { type RunStatus, TERMINAL_STATUSES } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
+import { githubWait } from "../src/git/github-wait.ts";
 import { cachePath, iterationRefs } from "../src/git/repos.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { claimScope } from "../src/integrations/claim-guard.ts";
@@ -315,6 +316,10 @@ test("ambiguous terminal successor is promoted before release", async () => {
   failUpdate(f, true);
   expect(await f.publish()).toBe("wait");
   expectDeferred(f, "succeeded");
+  const deadline = f.rt.clock.now() + githubWait.intervalMs;
+  expect(f.store.getRunState<RunState>(f.run.id)?.githubWait?.nextAttemptAt).toBe(deadline);
+  expect(f.store.nextQueuedRuns(1, deadline - 1)).toEqual([]);
+  expect(f.store.nextQueuedRuns(1, deadline).map((run) => run.id)).toEqual([f.run.id]);
   f.gh.fault = undefined;
   const published = (await f.record()).checkpoint;
   expect(published).not.toBe(before);
@@ -574,6 +579,20 @@ test("a terminal intent recorded before admission is published instead of granti
   expect(f.store.getRun(f.run.id)).toMatchObject({ status: "failed", error: "final reason" });
   expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
   expect(await f.record()).toMatchObject({ state: "released", status: "failed" });
+});
+
+test("authority recovers an unleased cancellation and finishes without execution authority", async () => {
+  const f = await fixture();
+  f.store.updateRun(f.run.id, { error: "cancelled by user" });
+  expect(finalizeRecordedCancellation(f.store, f.run.id, f.rt.checkpointer)).toBe(true);
+  expectDeferred(f, "cancelled");
+  expect(f.store.heldLeaseRows()).toHaveLength(0);
+  expect(await f.authority()).toBe("finished");
+  expect(f.store.getRun(f.run.id)).toMatchObject({ status: "cancelled", error: "cancelled by user" });
+  expect(f.store.checkpointRecord(f.run.id)?.terminal).toBeNull();
+  expect(f.store.heldLeaseRows()).toHaveLength(0);
+  expect(f.store.listStages(f.run.id)).toHaveLength(0);
+  expect(await f.record()).toMatchObject({ state: "released", status: "cancelled" });
 });
 
 test("a terminal intent replaced during publication is published, not erased", async () => {
