@@ -1419,6 +1419,7 @@ async function authorHoldout(ctx: RunContext): Promise<void> {
       ctx.state.holdoutSameVendor = target.vendor === ctx.state.specAuthorVendor;
       ctx.state.holdoutStatus = "complete";
       await ctx.save();
+      if (ctx.execution.shared) await ctx.boundary("holdout-complete");
       return {
         summary: `authored ${ctx.state.holdout.scenarios.length} private scenarios (${target.modelId})`,
         value: undefined,

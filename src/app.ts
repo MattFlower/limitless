@@ -5,7 +5,7 @@ import { type Config, loadConfig } from "./config.ts";
 import { type ConfigReload, reloadedConfig } from "./config-reload.ts";
 import type { CreateRunRequest, Question, Run, RunModels } from "./core/types.ts";
 import { TERMINAL_STATUSES } from "./core/types.ts";
-import { type GitHubComment, IssueClaimed, Store } from "./db/store.ts";
+import { type GitHubComment, ISSUE_CLAIM_STATUSES, IssueClaimed, Store } from "./db/store.ts";
 import { WorkerStore } from "./db/workers.ts";
 import { type EvalPolicyResponse, generatePolicy, selectEvidence } from "./evals/policy.ts";
 import { EvalRunner } from "./evals/runner.ts";
@@ -23,15 +23,20 @@ import { runLlm } from "./harness/llm.ts";
 import { platformConfinement } from "./harness/sandbox.ts";
 import { removeScratch } from "./harness/scratch.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
+import { ClaimLostError, ClaimWaitError } from "./integrations/claim-errors.ts";
 import { configureGitHubIdentity } from "./integrations/github-identity.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
 import { type AcceptanceSnapshot, resolveIntent } from "./pipeline/acceptance.ts";
-import type { EngineDeps, RunState } from "./pipeline/context.ts";
+import { mapClaimInterruption } from "./pipeline/claim-interruption.ts";
+import { type EngineDeps, NeedsHumanError, type RunState } from "./pipeline/context.ts";
 import { lanAgentExecutor } from "./pipeline/lan-agent.ts";
+import { claimKey } from "./pipeline/portable.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
-import { sharedRepository } from "./pipeline/run-claim.ts";
+import { sharedRepository, withCapabilityLapse } from "./pipeline/run-claim.ts";
 import { ensureAdmissionPin } from "./pipeline/run-policy-pins.ts";
+import { admitRun, refuseSharedRequest, type SharedRuntime } from "./pipeline/shared-admission.ts";
+import { authorityFor, claimHooks } from "./pipeline/shared-authority.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
 import { readPolicy, validatePolicy, validateRunModels } from "./router/policy.ts";
@@ -41,11 +46,13 @@ import { Router } from "./router/router.ts";
 import { RuntimeCatalog } from "./router/runtime-catalog.ts";
 import { RuntimePolicy } from "./router/runtime-policy.ts";
 import { Scheduler } from "./scheduler.ts";
+import { LEASE } from "./util/claim-clock.ts";
 import { redactCredentialData, redactCredentials } from "./util/proc.ts";
 import { SshTunnels } from "./util/ssh-tunnel.ts";
 import { activity } from "./util/stall.ts";
 
 export interface FactoryOptions {
+  shared?: SharedRuntime;
   agentExecutor?: EngineDeps["agentExecutor"];
   gateExecutor?: EngineDeps["gateExecutor"];
   confinement?: EngineDeps["confinement"];
@@ -100,6 +107,8 @@ export class Factory {
   private readonly gcTimer: NonNullable<FactoryOptions["gcTimer"]>;
   private gcInterval: ReturnType<typeof setInterval> | null = null;
   private gcInFlight: Promise<GcResult> | null = null;
+  private stopShared?: () => Promise<void>;
+  private readonly terminalSweeps = new Map<string, Promise<unknown>>();
   private readonly configValidated = new Set<(cfg: Config) => void>();
 
   constructor(
@@ -187,6 +196,8 @@ export class Factory {
       this.router.describeFallback(provider, exhausted),
     );
     this.deps = {
+      checkpointer: opts.shared?.checkpointer,
+      capability: opts.shared?.gate,
       agentExecutor:
         opts.agentExecutor ??
         (cfg.workers.listen && cfg.workers.agents.length ? lanAgentExecutor(this.workers, cfg) : undefined),
@@ -230,6 +241,7 @@ export class Factory {
     };
     this.evals = new EvalRunner(this.deps, opts.evalCasePath);
     this.scheduler = new Scheduler(this.deps, cfg.maxConcurrentRuns, {
+      shared: opts.shared,
       maxLoadPerCore: cfg.maxLoadPerCore,
       loadSource: opts.loadSource,
     });
@@ -339,16 +351,70 @@ export class Factory {
         .map((p) => p.sshForward as NonNullable<ProviderDef["sshForward"]>),
     );
     this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
+    const rt = this.opts.shared;
+    if (rt) {
+      const h = claimHooks(rt, this.store);
+      const stopLoop = rt.leases.start({
+        active: withCapabilityLapse(this.store, h.active),
+        onLost: h.onLost,
+      });
+      const sweep = () => {
+        timer = rt.clock.timer.set(sweep, LEASE.renewMs);
+        const held = new Map(this.store.heldLeaseRows().map((row) => [row.runId, row]));
+        const pending = this.store
+          .nextQueuedRuns(Number.MAX_SAFE_INTEGER, rt.clock.now())
+          .filter((run) => this.store.checkpointRecord(run.id)?.terminal)
+          .map((run) => run.id);
+        for (const id of new Set([...held.keys(), ...pending])) {
+          const run = this.store.getRun(id),
+            row = held.get(id);
+          if (!run || this.terminalSweeps.has(run.id)) continue;
+          const terminal = this.store.checkpointRecord(run.id)?.terminal;
+          if (!terminal && (!row?.confirmed || !TERMINAL_STATUSES.includes(run.status))) continue;
+          const work = (
+            terminal
+              ? authorityFor(rt, this.store, this.cfg, run, new AbortController().signal)
+              : row?.confirmed
+                ? rt.leases.release(
+                    {
+                      repo: row.repo,
+                      ref: row.ref,
+                      run: run.id,
+                      member: rt.member,
+                      generation: row.confirmed.generation,
+                    },
+                    {},
+                  )
+                : Promise.resolve()
+          )
+            .catch((error: unknown) => {
+              if (error instanceof ClaimWaitError || error instanceof ClaimLostError)
+                mapClaimInterruption(this.store, run.id, error, rt.clock.now(), rt.checkpointer);
+              else console.warn(redactCredentials(`Terminal sweep: ${String(error)}`));
+            })
+            .finally(() => this.terminalSweeps.delete(run.id));
+          this.terminalSweeps.set(run.id, work);
+        }
+      };
+      let timer = rt.clock.timer.set(sweep, LEASE.renewMs);
+      this.stopShared = () => {
+        rt.clock.timer.clear(timer);
+        return stopLoop();
+      };
+    }
     this.scheduler.start();
   }
 
   async stop(): Promise<void> {
+    const leaseLoop = this.stopShared?.();
+    this.stopShared = undefined;
     this.tracker.stop();
     if (this.gcInterval) this.gcTimer.clear(this.gcInterval);
     this.gcInterval = null;
     await this.gcInFlight;
     this.tunnels.stop();
     await Promise.all([this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
+    if (this.opts.shared) await Promise.allSettled([leaseLoop, ...this.terminalSweeps.values()]);
     this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
   }
 
@@ -401,6 +467,7 @@ export class Factory {
         ),
       };
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
+    if (this.opts.shared) refuseSharedRequest(this.store, this.cfg, repo, req);
     const create = () =>
       chat
         ? this.store.createChatRun(repo, req, chat.conversationId, chat.proposalId)
@@ -426,6 +493,22 @@ export class Factory {
       type: "log",
       message: `Run created from ${run.source}${run.requestedBy ? ` by ${run.requestedBy}` : ""}`,
     });
+    const rt = this.opts.shared;
+    if (rt && sharedRepository(this.cfg, repo, repo.slug)) {
+      try {
+        await admitRun(rt, this.store, this.cfg, run, new AbortController().signal);
+      } catch (error) {
+        if (error instanceof ClaimWaitError || error instanceof ClaimLostError)
+          mapClaimInterruption(this.store, run.id, error, rt.clock.now(), rt.checkpointer);
+        else if (error instanceof NeedsHumanError)
+          rt.checkpointer.writeRun(run.id, {
+            status: "needs_human",
+            error: error.message,
+            finishedAt: rt.clock.now(),
+          });
+        else console.warn(redactCredentials(`Shared admission: ${String(error)}`));
+      }
+    }
     return run;
   }
 
@@ -436,6 +519,8 @@ export class Factory {
   ): Promise<Run> {
     resolveIntent(snapshot);
     const repo = await resolveRepo(this.store, req.repo, this.cfg.githubMerge);
+    if (this.opts.shared && sharedRepository(this.cfg, repo, repo.slug))
+      throw new Error("Acceptance runs are not supported in shared repositories");
     const run = this.store.createAcceptanceRun(repo, req, snapshot, admission);
     this.store.addEvent({ runId: run.id, type: "log", message: `Run created from ${run.source}` });
     return run;
@@ -466,6 +551,17 @@ export class Factory {
   async retryRun(id: string, models?: RunModels): Promise<Run> {
     const run = this.store.getRun(id);
     if (!run) throw new Error(`run ${id} not found`);
+    const repo = this.opts.shared ? this.store.getRepo(run.repoId) : null;
+    if (
+      this.opts.shared &&
+      repo &&
+      sharedRepository(this.cfg, repo, run.repoSlug) &&
+      ISSUE_CLAIM_STATUSES.includes(run.status)
+    ) {
+      const key = claimKey(run, this.store);
+      if (!("none" in key) && (key.kind === "issue" || key.kind === "pr"))
+        throw new Error("Shared issue and PR runs cannot be retried while their claim is held");
+    }
     if (run.flow === "acceptance")
       throw new Error("acceptance runs are restarted from the ticket, not retried");
     return this.createRun(

@@ -660,6 +660,13 @@ export class RunContext {
     if (p) await p;
   }
 
+  async boundary(label: string): Promise<void> {
+    if (this.execution.shared) {
+      const p = this.checkpointer.checkpoint(this.run.id, label);
+      if (p) await p;
+    }
+  }
+
   async setPhase(phase: Phase): Promise<void> {
     if (phase !== this.state.phase) consumeGateExecution(this);
     this.state.phase = phase;
@@ -756,6 +763,7 @@ export class RunContext {
       this.requireCapabilityNow();
       this.checkCancelled();
       requirePinnedPolicy(this.deps.cfg, this.store, this.run, this.repo);
+      await this.boundary(`stage:${name}`);
     }
     if (!background)
       this.run = this.checkpointer.writeRun(this.run.id, {

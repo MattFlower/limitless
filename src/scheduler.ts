@@ -1,9 +1,14 @@
 import { availableParallelism, loadavg } from "node:os";
 import { TERMINAL_STATUSES } from "./core/types.ts";
 import { removeIterationRefs } from "./git/repos.ts";
+import { ClaimLostError, ClaimWaitError } from "./integrations/claim-errors.ts";
 import { clearGitHubWait, finalizeRecordedCancellation } from "./pipeline/cancellation.ts";
+import { mapClaimInterruption } from "./pipeline/claim-interruption.ts";
 import { type Checkpointer, type EngineDeps, localCheckpointer, type RunState } from "./pipeline/context.ts";
 import { executeRun } from "./pipeline/engine.ts";
+import { sharedRepository } from "./pipeline/run-claim.ts";
+import type { SharedRuntime } from "./pipeline/shared-admission.ts";
+import { authorityFor } from "./pipeline/shared-authority.ts";
 import { beginActivity } from "./util/stall.ts";
 
 /**
@@ -28,9 +33,13 @@ export class Scheduler {
   constructor(
     private readonly deps: EngineDeps,
     private maxConcurrent: number,
-    private readonly options: { maxLoadPerCore?: number; loadSource?: () => number } = {},
+    private readonly options: {
+      maxLoadPerCore?: number;
+      loadSource?: () => number;
+      shared?: SharedRuntime;
+    } = {},
   ) {
-    this.checkpointer = deps.checkpointer ?? localCheckpointer(deps.store);
+    this.checkpointer = options.shared?.checkpointer ?? deps.checkpointer ?? localCheckpointer(deps.store);
   }
 
   setLimit(limit: number): void {
@@ -149,11 +158,22 @@ export class Scheduler {
     for (const run of this.deps.store.nextQueuedRuns(capacity)) {
       if (this.stopping || this.draining) return;
       if (this.active.has(run.id)) continue;
-      if (finalizeRecordedCancellation(this.deps.store, run.id, this.checkpointer)) continue;
+      const rt = this.options.shared,
+        repo = rt ? this.deps.store.getRepo(run.repoId) : null;
+      const shared = rt && repo && sharedRepository(this.deps.cfg, repo, run.repoSlug);
+      if (
+        !(shared && this.deps.store.checkpointRecord(run.id)?.terminal) &&
+        finalizeRecordedCancellation(this.deps.store, run.id, this.checkpointer)
+      )
+        continue;
       const controller = new AbortController();
       const { promise, resolve } = Promise.withResolvers<unknown>();
       const done = promise
         .catch((e) => {
+          if (shared && (e instanceof ClaimWaitError || e instanceof ClaimLostError)) {
+            mapClaimInterruption(this.deps.store, run.id, e, rt.clock.now(), this.checkpointer);
+            return;
+          }
           this.checkpointer.writeRun(run.id, {
             status: "failed",
             error: `internal error: ${(e as Error).message}`,
@@ -167,7 +187,21 @@ export class Scheduler {
         });
       this.active.set(run.id, { controller, done });
       // State subscribers can cancel or stop synchronously during executeRun's first publication.
-      resolve(executeRun(this.deps, run.id, controller.signal, () => this.draining, this.drainEvents));
+      if (shared)
+        resolve(
+          authorityFor(rt, this.deps.store, this.deps.cfg, run, controller.signal).then((runClaim) =>
+            runClaim === "finished"
+              ? undefined
+              : executeRun(
+                  { ...this.deps, checkpointer: this.checkpointer, runClaim },
+                  run.id,
+                  controller.signal,
+                  () => this.draining,
+                  this.drainEvents,
+                ),
+          ),
+        );
+      else resolve(executeRun(this.deps, run.id, controller.signal, () => this.draining, this.drainEvents));
     }
   }
 
