@@ -1,4 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
+import { createHash, createHmac } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -17,6 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { privateStringsDigest } from "../src/gates/private.ts";
 import { checkPublicationText } from "../src/gates/publication.ts";
 import { createCredentialRegistry, credentialRegistry } from "../src/util/credential-matcher.ts";
 import { createPrivacyRegistry, privacyRegistry } from "../src/util/privacy-boundary.ts";
@@ -185,7 +187,7 @@ test("cut proofs cover rendering bytes, with verdict-only empty cuts covering in
   const f = fixture();
   for (const deadline of [undefined, Date.now() + 30_000]) {
     const proof = await f.sign("safe text", { cut: { limit: 4, unit: "U", marker: "" }, deadline });
-    expect(p.verifier(f.registry, f.signer).verify(proof, "output", "safe")).toBe(true);
+    expect(p.verifier(f.registry, f.signer).verify(proof, "output", "safe", true)).toBe(true);
     const verdict = await f.sign("safe text", { cut: { limit: 0, unit: "U", marker: "" }, deadline });
     expect(p.verifier(f.registry, f.signer).verify(verdict, "output", "safe text")).toBe(true);
   }
@@ -546,4 +548,80 @@ test("main-thread credentials never enter worker snapshots on either admission p
   }
   expect(chunks).toBe(sent);
   expect(leaked).toBe(false);
+});
+
+test("producer cuts use partial-prefix semantics and domain-separated proofs", async () => {
+  const f = fixture();
+  writeFileSync(join(f.dir, "private-strings.txt"), "host.example\n");
+  const complete = `${"x".repeat(4000)}host.exa`;
+  const proof = await f.sign(complete);
+  expect(p.verifier(f.registry, f.signer).verify(proof, "output", complete, false)).toBe(true);
+  expect(p.verifier(f.registry, f.signer).verify(proof, "output", complete, true)).toBe(false);
+  const refusals: string[] = [];
+  expect(
+    await f.sign(complete.slice(-3000), {
+      producerCut: true,
+      onRefusal: (reason) => refusals.push(reason),
+    }),
+  ).toBeUndefined();
+  expect(refusals).toEqual(["private-match"]);
+  const cut = await f.sign("safe text", { producerCut: true });
+  const uncut = await f.sign("safe text");
+  const verify = p.verifier(f.registry, f.signer).verify;
+  expect(cut?.mac).not.toBe(uncut?.mac);
+  expect(verify(cut, "output", "safe text", true)).toBe(true);
+  expect(verify(cut, "output", "safe text", false)).toBe(false);
+  expect(verify(uncut, "output", "safe text", true)).toBe(false);
+  const empty = await f.sign("", { producerCut: true, cut: { limit: 0, unit: "U" } });
+  expect(verify(empty, "output", "", true)).toBe(true);
+  expect(verify(empty, "output", "", false)).toBe(false);
+  const receipt = await f.checker.protectText({
+    text: "safe text",
+    provenance: { kind: "cut", truncated: true },
+  });
+  expect(consumeBoundaryChunk(receipt, 0)).toMatchObject({ withheld: true, reason: "unchecked-provenance" });
+});
+
+test.each([true, false])("producer cuts refuse credential-changed bytes with signer=%s", async (signed) => {
+  const secrets = createCredentialRegistry(),
+    credential = "cut-candidate-credential";
+  secrets.add(credential);
+  const f = fixture(secrets),
+    refusals: string[] = [];
+  const proof = await f.sign(`diagnostic ${credential}\n(fail) case`, {
+    producerCut: true,
+    field: "failures",
+    signer: signed ? f.signer : () => undefined,
+    onRefusal: (reason) => refusals.push(reason),
+  });
+  expect(proof).toBeUndefined();
+  expect(refusals).toEqual(["private-match"]);
+});
+
+test("authentic proofs from before the cut binding cannot verify under either flag", async () => {
+  const f = fixture(),
+    source = "x".repeat(6100),
+    tail = source.slice(-6000),
+    key = f.signer();
+  if (!key) throw Error("Missing key");
+  const historical = {
+    kind: "complete",
+    mac: createHmac("sha256", key)
+      .update(
+        JSON.stringify([
+          "limitless-gate-proof/1",
+          "complete",
+          "privacy/1",
+          privateStringsDigest(f.registry.entries),
+          "output",
+          createHash("sha256").update(tail).digest("hex"),
+        ]),
+      )
+      .digest("hex"),
+  };
+  const verify = p.verifier(f.registry, f.signer).verify;
+  expect(verify(historical, "output", tail, false)).toBe(false);
+  expect(verify(historical, "output", tail, true)).toBe(false);
+  const current = await f.sign(source, { cut: { limit: 6000, unit: "U", side: "tail" } });
+  expect(verify(current, "output", tail, true)).toBe(true);
 });

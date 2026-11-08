@@ -206,3 +206,16 @@ test("worker ingress keeps claims as MAC-free attestations, recursively, and fix
   );
   expect(worker.textPrivacy?.output.mac).toBe("b".repeat(64));
 });
+
+test.each([
+  { withheld: true, reason: "private-match" },
+  { withheld: false, checkedComplete: true, kind: "complete" as const, truncated: true, mac: "c".repeat(64) },
+])("excerpt records pass every strict reader and stay out of worker claims: %p", (failures) => {
+  const r = { ...result(), textPrivacy: { ...privacy, failures } };
+  expect(textPrivacySchema.parse(r.textPrivacy).failures).toEqual(failures);
+  for (const schema of [Check, transferGateResultSchema, resultSchema]) {
+    expect(schema.parse(r).textPrivacy?.failures).toEqual(failures);
+    expect(schema.safeParse({ ...r, textPrivacy: { ...r.textPrivacy, unknown: true } }).success).toBe(false);
+  }
+  expect(JSON.stringify(remoteGateData(r))).toBe(JSON.stringify(remoteGateData(result())));
+});
