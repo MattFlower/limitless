@@ -50,16 +50,32 @@ function fixed({ operation, kind, cut, terminal, entries, limits, chunk }: Fixed
   const fixedLimits = Object.keys(b.privacyLimits).map((key) => [key, n(Reflect.get(Object(limits), key))]);
   return {
     operation: operation === "data" ? operation : ("text" as const),
-    kind: (kind === "cut" || kind === "complete" ? kind : "legacy-unknown") as b.Provenance["kind"],
+    kind: (kind === "producer-cut" || kind === "cut" || kind === "complete" ? kind : "legacy-unknown") as
+      | b.Provenance["kind"]
+      | "producer-cut",
     ...{ cut: bounds, terminal: !!terminal, entries: n(entries), chunk: n(chunk, t.maxChunk) || n(-1) },
     limits: Object.fromEntries(fixedLimits) as typeof b.privacyLimits,
   };
 }
-function envelope(operation: Operation, input: Input, s: Snapshot, limits: object, chunk: number) {
+function envelope(
+  operation: Operation,
+  input: Input,
+  s: Snapshot,
+  limits: object,
+  chunk: number,
+  producerCut = false,
+) {
   const { identity: _identity, ...generation } = s.generation;
   const texts = [String(operation === "text" ? input.text : input.json), String(input.cut?.marker ?? "")];
   const stream = t.segments([...texts, ...s.entries.map(({ value }) => value), ...s.credentials]);
-  const meta = { ...input, operation, kind: input.provenance.kind, entries: s.entries.length, limits, chunk };
+  const meta = {
+    ...input,
+    operation,
+    kind: producerCut ? "producer-cut" : input.provenance.kind,
+    entries: s.entries.length,
+    limits,
+    chunk,
+  };
   return { generation, stream, meta: fixed(meta) };
 }
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -111,13 +127,14 @@ function operate(f: Final, parts: ArrayBuffer[]) {
   const registry = { ...local, generation };
   const snapshot = { ready: true, entries, credentials: rest.slice(f.entries), generation };
   const policy = b.preparePrivacyPolicy(snapshot, { limits: f.limits });
-  const provenance: b.Provenance = f.kind === "cut" ? { kind: "cut", truncated: true } : { kind: f.kind };
+  const provenance: b.Provenance =
+    f.kind === "cut" || f.kind === "producer-cut" ? { kind: "cut", truncated: true } : { kind: f.kind };
   const cut = f.cut && ({ ...f.cut, marker } as b.BoundaryCut);
   const input = { provenance, policy, cut, terminal: f.terminal };
   const result =
     f.operation === "data"
       ? b.protectData({ ...input, json: text }, { registry })
-      : b.protectText({ ...input, text }, { registry });
+      : (f.kind === "producer-cut" ? b.protectProducerCut : b.protectText)({ ...input, text }, { registry });
   return b.consumeBoundaryText(result);
 }
 /** Worker-only handler; preparation and the entire synchronous operation stay here. */
@@ -261,7 +278,12 @@ export function createPrivacyChecker(options: Options = {}) {
       draining = false;
     }
   }
-  function submit(operation: Operation, input: Input, control: Control): Promise<c.BoundaryChunks> {
+  function submit(
+    operation: Operation,
+    input: Input,
+    control: Control,
+    producerCut = false,
+  ): Promise<c.BoundaryChunks> {
     const { signal, deadline } = control;
     control = { signal, deadline };
     let generation: Generation | undefined;
@@ -335,7 +357,7 @@ export function createPrivacyChecker(options: Options = {}) {
         const capturedSize = size(snapshot);
         if (!eligible()) return true;
         if (!fits(capturedSize)) return false;
-        const request = envelope(operation, input, snapshot, limits, window);
+        const request = envelope(operation, input, snapshot, limits, window, producerCut);
         if (!eligible()) return true;
         const admittedAt = now();
         if (!eligible()) return true;
@@ -495,6 +517,9 @@ export function createPrivacyChecker(options: Options = {}) {
   return {
     registry,
     protectText: (input: TextInput, control: Control = {}) => submit("text", input, control),
+    /** Only producer/re-check helpers may use this after releasing the complete source. */
+    protectProducerCut: (input: TextInput, control: Control = {}) =>
+      submit("text", { ...input, provenance: { kind: "cut", truncated: true } }, control, true),
     protectData: (input: DataInput, control: Control = {}) => submit("data", input, control),
     async dispose() {
       disposed = true;

@@ -206,3 +206,31 @@ test("expiry between field requests cannot renew the job budget", async () => {
   expect(out.textPrivacy?.output.mac).toBeUndefined();
   expect(out.textPrivacy?.identities?.mac).toBeUndefined();
 });
+
+test.each(["attested:lan", "attested:github-actions"] as const)(
+  "%s output proofs preserve cut provenance through memo and final verification",
+  async (kind) => {
+    const f = fixture(),
+      c = control();
+    const r = f.result({ output: "x".repeat(kind === "attested:lan" ? 6000 : 6100) });
+    if (kind === "attested:lan" && r.remoteAttestation) r.remoteAttestation.output.truncated = true;
+    const out = await f.scoped(() => recheckRemote(r, kind, c));
+    expect(out.output).toBe("x".repeat(6000));
+    expect(out.textPrivacy?.output.truncated).toBe(true);
+    const verify = verifier(f.registry, f.signer).verify;
+    expect(verify(out.textPrivacy?.output, "output", out.output, true)).toBe(true);
+    expect(verify(out.textPrivacy?.output, "output", out.output, false)).toBe(false);
+    expect(verify(out.textPrivacy?.identities, "identities", gateIdentities(out), false)).toBe(true);
+    expect(verify(out.textPrivacy?.identities, "identities", gateIdentities(out), true)).toBe(false);
+    const calls = spyOn(f.checker, "protectText");
+    const cached = await f.scoped(() => recheckRemote(r, kind, c));
+    expect(cached.output).toBe(out.output);
+    expect(calls).not.toHaveBeenCalled();
+    if (kind === "attested:lan" && r.remoteAttestation) {
+      delete r.remoteAttestation.output.truncated;
+      const complete = await f.scoped(() => recheckRemote(r, kind, c));
+      expect(complete.textPrivacy?.output.truncated).toBeUndefined();
+      expect(verify(complete.textPrivacy?.output, "output", complete.output, false)).toBe(true);
+    }
+  },
+);

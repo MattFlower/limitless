@@ -96,9 +96,10 @@ test.each([
       );
       const result = gates.checks[0];
       if (!result) throw new Error("missing gate result");
-      expect(result.failures).toBeUndefined();
+      if (secret.length > 16384) expect(result.failures).toBeUndefined();
+      else expect(result.failures).toContain("[redacted]");
       const marker = secret.length > 16384 ? "[withheld: unreadable-policy]" : "[redacted]";
-      for (const text of [result.output]) {
+      for (const text of [result.output, ...(result.failures ? [result.failures] : [])]) {
         expect(text).toContain(marker);
         expect(text).not.toContain(diagnostic);
         for (const fragment of secret.split("\n").filter((part) => part.length >= 8))
