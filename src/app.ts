@@ -36,12 +36,7 @@ import { claimKey } from "./pipeline/portable.ts";
 import { checkRosterTargets, productionReviewSystem } from "./pipeline/review-system.ts";
 import { sharedRepository, withCapabilityLapse } from "./pipeline/run-claim.ts";
 import { ensureAdmissionPin } from "./pipeline/run-policy-pins.ts";
-import {
-  admitRun,
-  drainAdmission,
-  refuseSharedRequest,
-  type SharedRuntime,
-} from "./pipeline/shared-admission.ts";
+import { admitRun, refuseSharedRequest, type SharedRuntime } from "./pipeline/shared-admission.ts";
 import { authorityFor, claimHooks } from "./pipeline/shared-authority.ts";
 import { DEFAULT_POLICY, MODELS, type ModelDef, type Policy, type ProviderDef } from "./router/catalog.ts";
 import { resolveCatalog } from "./router/config-catalog.ts";
@@ -401,11 +396,7 @@ export class Factory {
                 mapClaimInterruption(this.store, run.id, error, rt.clock.now(), rt.checkpointer);
               else console.warn(redactCredentials(`Terminal sweep: ${String(error)}`));
             })
-            .finally(async () => {
-              await drainAdmission(run.id);
-              await drainClaimWork(signal);
-              this.terminalSweeps.delete(run.id);
-            });
+            .finally(() => this.terminalSweeps.delete(run.id));
           this.terminalSweeps.set(run.id, work);
         }
       };
@@ -421,14 +412,16 @@ export class Factory {
 
   async stop(): Promise<void> {
     const leaseLoop = this.stopShared?.();
+    const scheduler = this.opts.shared ? this.scheduler.stop() : undefined;
     this.stopShared = undefined;
     this.tracker.stop();
     if (this.gcInterval) this.gcTimer.clear(this.gcInterval);
     this.gcInterval = null;
     await this.gcInFlight;
     this.tunnels.stop();
-    await Promise.all([this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
+    await Promise.all([scheduler ?? this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
     if (this.opts.shared) await Promise.allSettled([leaseLoop, ...this.terminalSweeps.values()]);
+    if (this.opts.shared) await drainClaimWork(this.opts.shared);
     this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
   }
 

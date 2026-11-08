@@ -1,9 +1,9 @@
-const requests = new WeakMap<AbortSignal, Set<Promise<unknown>>>();
+const requests = new WeakMap<object, Set<Promise<unknown>>>();
 
-export function trackClaimWork(signal: AbortSignal | undefined, request: Promise<unknown>): void {
-  if (!signal) return;
-  const pending = requests.get(signal) ?? new Set<Promise<unknown>>();
-  requests.set(signal, pending);
+export function trackClaimWork(owner: object | undefined, request: Promise<unknown>): void {
+  if (!owner) return;
+  const pending = requests.get(owner) ?? new Set<Promise<unknown>>();
+  requests.set(owner, pending);
   pending.add(request);
   const done = () => {
     pending.delete(request);
@@ -12,7 +12,7 @@ export function trackClaimWork(signal: AbortSignal | undefined, request: Promise
 }
 
 /** Cancellation ends a caller's wait; shutdown also drains its underlying transports. */
-export async function drainClaimWork(signal: AbortSignal): Promise<void> {
-  const pending = requests.get(signal);
+export async function drainClaimWork(owner: object): Promise<void> {
+  const pending = requests.get(owner);
   while (pending?.size) await Promise.allSettled([...pending]);
 }

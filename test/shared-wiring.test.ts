@@ -697,6 +697,81 @@ test("stop drains a scheduler terminal publication's aborted companion upload", 
   }
 });
 
+test("stop drains a scheduler's unleased terminal admission past its deadline", async () => {
+  const x = await fixture();
+  spyOn(x.rt.gate, "admit").mockResolvedValue(["slots"]);
+  const run = await x.create(),
+    entered = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  expect(x.store.heldLeaseRows()).toHaveLength(0);
+  expect(x.store.checkpointRecord(run.id)).toBeNull();
+  Object.assign(x.rt, { admissionDeadlineMs: 50 });
+  x.f.cancelRun(run.id);
+  const intent = x.store.checkpointRecord(run.id)?.terminal,
+    key = claimKey(run, x.store);
+  if ("none" in key) throw new Error("fixture claim key");
+  expect(x.store.leaseRow(run.repoSlug, claimRef(key))).toBeNull();
+  expect(JSON.parse(intent ?? "null")).toMatchObject({ status: "cancelled" });
+  x.gh.fault = async (request) => {
+    if (request.step !== "update") return;
+    const update = x.gh.update(request),
+      record = parseRecord(x.gh.commits.get(update.afterOid)?.message ?? "", update.name);
+    if (record === "malformed" || !record.checkpoint) return;
+    entered.resolve();
+    await resume.promise;
+  };
+  const confirmedLease = spyOn(x.store, "confirmLease"),
+    confirmedCheckpoint = spyOn(x.store, "confirmCheckpoint");
+  let stopping: Promise<void> | undefined;
+  try {
+    // Pick before advancing the sweep clock: the Scheduler owns this admission.
+    x.f.scheduler.setLimit(1);
+    x.f.scheduler.tick();
+    await entered.promise;
+    expect(x.f.scheduler.activeRunIds).toEqual([run.id]);
+    expect(x.store.checkpointRecord(run.id)?.committed).toBeNull();
+    expect(confirmedCheckpoint).not.toHaveBeenCalled();
+    let stopped = false;
+    stopping = x.f.stop().then(() => {
+      stopped = true;
+    });
+    await x.clock.advance(51);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    resume.resolve();
+    await stopping;
+    expect(JSON.parse(x.store.checkpointRecord(run.id)?.terminal ?? "null")).toMatchObject({
+      status: "cancelled",
+      error: "cancelled by user",
+    });
+    expect(x.store.getRun(run.id)).toMatchObject({
+      status: "queued",
+      githubWait: { reason: "claim:terminal" },
+    });
+    const snapshot = () => ({
+      ledger: x.store.leaseRow(run.repoSlug, claimRef(key)),
+      intents: x.store.leaseRowsWithIntent(),
+      leaseConfirmations: confirmedLease.mock.calls.length,
+      checkpointConfirmations: confirmedCheckpoint.mock.calls.length,
+      checkpoint: x.store.checkpointRecord(run.id),
+      refs: [...x.gh.refs],
+      requests: x.gh.requests.length,
+      blobs: [...x.remote.blobs],
+      blobRefs: [...x.remote.refs],
+      calls: x.remote.calls.length,
+    });
+    const before = snapshot();
+    await x.clock.advance(LEASE.renewMs * 3);
+    for (let i = 0; i < 3; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(snapshot()).toEqual(before);
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+    expect(x.store.listInvocations(run.id)).toHaveLength(0);
+  } finally {
+    resume.resolve();
+    await stopping;
+  }
+});
+
 test("the scheduler retries incomplete admission only after its durable wait elapses", async () => {
   const x = await fixture();
   spyOn(x.rt.gate, "admit").mockRejectedValueOnce(new ClaimWaitError("capability"));

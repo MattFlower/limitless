@@ -5,7 +5,7 @@ import { githubWait } from "../git/github-wait.ts";
 import { ClaimLostError, ClaimWaitError } from "../integrations/claim-errors.ts";
 import { bindClaim, claimGuard, claimScope, type ScopedClaim } from "../integrations/claim-guard.ts";
 import type { ClaimTip } from "../integrations/claim-ref.ts";
-import { drainClaimWork } from "../integrations/claim-work.ts";
+import { drainClaimWork, trackClaimWork } from "../integrations/claim-work.ts";
 import type { LeaseHandle } from "../integrations/leases.ts";
 import { settleCheckpoint } from "./checkpoint-settlement.ts";
 import { mapClaimInterruption } from "./claim-interruption.ts";
@@ -149,7 +149,23 @@ export function publishTerminal(
   });
 }
 
-export async function authorityFor(
+export function authorityFor(
+  rt: SharedRuntime,
+  store: Store,
+  cfg: Config,
+  run: Run,
+  signal: AbortSignal,
+): Promise<RunClaim | "finished"> {
+  const work = authority(rt, store, cfg, run, signal);
+  // Return on deadlines normally; shutdown also waits for the underlying transports.
+  trackClaimWork(
+    rt,
+    work.finally(() => drainClaimWork(signal)),
+  );
+  return work;
+}
+
+async function authority(
   rt: SharedRuntime,
   store: Store,
   cfg: Config,
