@@ -564,6 +564,9 @@ export function describe(name: string, label: string, size: number, api: API) {
     outputUnits: name.startsWith("project-") ? 6000 : undefined,
     identitiesAtCap: name.startsWith("project-") ? (api.IDENTITY_CAP ?? 65536) : undefined,
     gateEvents: name === "event-drain" ? 5000 : undefined,
+    logBytes: name === "land-log" ? 5120000 : undefined,
+    policyEntries: name === "land-log" ? 8 : undefined,
+    registeredCredentials: name === "land-log" ? 600 : undefined,
     size,
     label,
     sizeUnit:

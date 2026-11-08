@@ -49,9 +49,9 @@ test("entries retain their original policy binding without renewing earlier proo
   writeFileSync(join(f.dir, "private-strings.txt"), "new-private-value\n");
   await appendLandLog(f.log, ["second entry\n"]);
   expect(readFileSync(`${f.path}.proof`, "utf8")).toStartWith(earlier);
-  expect(f.read()).not.toContain("first entry");
-  expect(f.read()).toContain("[land log entry withheld:");
-  expect(f.read()).toEndWith("second entry\n");
+  expect(await f.read()).not.toContain("first entry");
+  expect(await f.read()).toContain("[land log entry withheld:");
+  expect(await f.read()).toEndWith("second entry\n");
   expect(statSync(`${f.path}.proof`).mode & 0o777).toBe(0o600);
 });
 test.each(["refusal", "generation", "missing-key"])(
@@ -75,7 +75,7 @@ test.each(["refusal", "generation", "missing-key"])(
     }
     expect(f.proofs()).toEqual(before);
     expect(readFileSync(f.path, "utf8")).toContain("[land log entry withheld:");
-    expect(f.read()).not.toContain("blocked-entry");
+    expect(await f.read()).not.toContain("blocked-entry");
   },
 );
 test("foreign, malformed, overlapping and out-of-range records cover no private bytes", async () => {
@@ -88,10 +88,10 @@ test("foreign, malformed, overlapping and out-of-range records cover no private 
     `${f.path}.proof`,
     `garbage\n${JSON.stringify(first)}\n${JSON.stringify({ ...first, offset: 99999 })}\nnull\n`,
   );
-  expect(f.read()).toBe("header\nverified π\n[land log entry withheld: unverified]");
+  expect(await f.read()).toBe("header\nverified π\n[land log entry withheld: unverified]");
   writeFileSync(f.path, privateValue);
   rmSync(`${f.path}.proof`);
-  expect(f.read()).toBe("[land log entry withheld: unverified]");
+  expect(await f.read()).toBe("[land log entry withheld: unverified]");
 });
 test("concurrent appends serialize checks and writes in call order", async () => {
   const f = fixture();
@@ -121,7 +121,7 @@ test("concurrent appends serialize checks and writes in call order", async () =>
     expect(seen).toEqual(["first\n"]);
     release();
     await Promise.all([first, second]);
-    expect(f.read()).toBe("header\nfirst\nsecond\n");
+    expect(await f.read()).toBe("header\nfirst\nsecond\n");
     const entries = f.proofs().map((line) => JSON.parse(line));
     expect(entries.map((e) => e.offset)).toEqual([0, 7, 13]);
   } finally {
@@ -140,20 +140,108 @@ test("failed writes settle and later appends continue; reopening truncates both 
   rmSync(f.path, { recursive: true });
   writeFileSync(f.path, "header\n");
   await appendLandLog(f.log, ["kept"]);
-  expect(f.read()).toBe("header\nkept");
+  expect(await f.read()).toBe("header\nkept");
   const next = openLandLog(f.path, "new attempt", f.privacy);
   await next.pending;
-  expect(f.read()).toBe("new attempt");
+  expect(await f.read()).toBe("new attempt");
   expect(f.proofs()).toHaveLength(1);
   rmSync(`${f.path}.proof`);
   await appendLandLog(next, ["recreated"]);
   expect(statSync(`${f.path}.proof`).mode & 0o777).toBe(0o600);
-  expect(f.read()).toBe("[land log entry withheld: unverified]recreated");
+  expect(await f.read()).toBe("[land log entry withheld: unverified]recreated");
 });
 test("verified bytes changed by credential redaction are withheld", async () => {
   const f = fixture(),
     text = `later-credential-${crypto.randomUUID()}`;
   await appendLandLog(f.log, [text]);
   registerCredential("LAND_LOG_LATER", text);
-  expect(f.read()).toBe("header\n[land log entry withheld: credential-changed]");
+  expect(await f.read()).toBe("header\n[land log entry withheld: credential-changed]");
 });
+test("saved URL entries with a newly registered encoded credential are withheld without renewing proofs", async () => {
+  const f = fixture(),
+    token = `late+/${crypto.randomUUID()}=`,
+    url = `https://example.com/check?token=${encodeURIComponent(token)}`,
+    clean = "https://example.com/check?value=clean%2B%2F%3D\n";
+  await appendLandLog(f.log, [url]);
+  await appendLandLog(f.log, [clean]);
+  const proofs = readFileSync(`${f.path}.proof`, "utf8");
+  expect(await f.read()).toBe(`header\n${url}${clean}`);
+  registerCredential("LAND_LOG_ENCODED_LATER", token);
+  expect(await f.read()).toBe(`header\n[land log entry withheld: credential-changed]${clean}`);
+  expect(readFileSync(`${f.path}.proof`, "utf8")).toBe(proofs);
+});
+
+test("reads yield between batches and keep one policy snapshot for the whole read", async () => {
+  const f = fixture(),
+    text = "entry\n",
+    count = 384;
+  await appendLandLog(f.log, [text]);
+  const proof = JSON.parse(f.proofs().at(-1) ?? "{}");
+  writeFileSync(f.path, text.repeat(count));
+  writeFileSync(
+    `${f.path}.proof`,
+    Array.from(
+      { length: count },
+      (_, i) => `${JSON.stringify({ offset: i * text.length, length: text.length, mac: proof.mac })}\n`,
+    ).join(""),
+  );
+  const refresh = spyOn(f.registry, "refreshPolicy");
+  let yielded = false;
+  const turn = new Promise<void>((resolve) =>
+    setImmediate(() => {
+      yielded = true;
+      writeFileSync(join(f.dir, "private-strings.txt"), "new-private-entry\n");
+      resolve();
+    }),
+  );
+  try {
+    const reading = f.read();
+    expect(yielded).toBe(false);
+    expect(await reading).toBe(text.repeat(count));
+    expect(yielded).toBe(true);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(await f.read()).not.toContain(text);
+  } finally {
+    await turn;
+    refresh.mockRestore();
+  }
+});
+
+test.each(["literal", "encoded"])(
+  "credentials registered during a yielded read withhold earlier %s entries",
+  async (kind) => {
+    const f = fixture(),
+      token = `during+/${crypto.randomUUID()}=`,
+      text = `https://example.com/check?token=${kind === "encoded" ? encodeURIComponent(token) : token}\n`,
+      count = 384;
+    await appendLandLog(f.log, [text]);
+    const proof = JSON.parse(f.proofs().at(-1) ?? "{}");
+    writeFileSync(f.path, text.repeat(count));
+    writeFileSync(
+      `${f.path}.proof`,
+      Array.from(
+        { length: count },
+        (_, i) => `${JSON.stringify({ offset: i * text.length, length: text.length, mac: proof.mac })}\n`,
+      ).join(""),
+    );
+    const proofs = readFileSync(`${f.path}.proof`, "utf8");
+    let registered = false;
+    const turn = new Promise<void>((resolve) =>
+      setImmediate(() => {
+        registerCredential("LAND_LOG_DURING_READ", token);
+        registered = true;
+        resolve();
+      }),
+    );
+    try {
+      const result = await f.read();
+      expect(registered).toBe(true);
+      expect(result).not.toContain(text);
+      expect(result).toBe("[land log entry withheld: credential-changed]".repeat(count));
+      expect(await f.read()).toBe(result);
+      expect(readFileSync(`${f.path}.proof`, "utf8")).toBe(proofs);
+    } finally {
+      await turn;
+    }
+  },
+);

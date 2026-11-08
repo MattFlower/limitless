@@ -1,6 +1,7 @@
 import { appendFileSync, chmodSync, readFileSync, writeFileSync } from "node:fs";
-import { redactGateOutput } from "../gates/output.ts";
+import { renderingCredentialsUnchanged } from "../gates/output.ts";
 import { gatePrivacyScope, withheldText } from "../gates/text-privacy.ts";
+import { credentialRegistry } from "../util/credential-matcher.ts";
 import { getPrivacyChecker } from "../util/privacy-checker.ts";
 import { checkAndSign, verifier } from "../util/privacy-proof.ts";
 
@@ -49,9 +50,10 @@ export function appendLandLog(log: ReturnType<typeof openLandLog>, parts: readon
     });
   return log.pending;
 }
-export function readLandLog(path: string, privacy = options()): string {
+export async function readLandLog(path: string, privacy = options()): Promise<string> {
   const bytes = readFileSync(path),
-    snapshot = verifier(privacy.checker.registry, privacy.signer);
+    snapshot = verifier(privacy.checker.registry, privacy.signer),
+    credentials = credentialRegistry.generation;
   let sidecar = "",
     offset = 0;
   try {
@@ -61,11 +63,13 @@ export function readLandLog(path: string, privacy = options()): string {
   }
   const output: string[] = [];
   let uncovered = false;
+  let batch = 0;
   const hide = () => {
     if (!uncovered) output.push(withheld());
     uncovered = true;
   };
   for (const line of sidecar.split("\n")) {
+    if (++batch % 128 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
     let entry: { offset: number; length: number; mac: string };
     try {
       entry = JSON.parse(line);
@@ -87,7 +91,7 @@ export function readLandLog(path: string, privacy = options()): string {
     if (!snapshot.verify({ kind: "rendering", mac: entry.mac }, "land-log-entry", part)) {
       output.push(withheld());
       uncovered = false;
-    } else if (redactGateOutput(text) !== text) {
+    } else if (!renderingCredentialsUnchanged(text)) {
       output.push(withheld("credential-changed"));
       uncovered = false;
     } else {
@@ -97,5 +101,7 @@ export function readLandLog(path: string, privacy = options()): string {
     offset = entry.offset + entry.length;
   }
   if (offset < bytes.length) hide();
+  // A yield can register credentials after earlier entries passed their checks.
+  if (credentials !== credentialRegistry.generation) output.fill(withheld("credential-changed"));
   return output.join("");
 }

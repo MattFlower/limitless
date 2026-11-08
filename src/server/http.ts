@@ -857,7 +857,7 @@ export function createHttpRoutes(factory: Factory, extras: HttpExtras = {}): Rec
         );
         if (!roots.some((root) => root && path.startsWith(`${root}${sep}`)))
           return error("land log not found", 404);
-        return new Response(readLandLog(path), {
+        return new Response(await readLandLog(path), {
           headers: { "content-type": "text/plain; charset=utf-8" },
         });
       } catch {

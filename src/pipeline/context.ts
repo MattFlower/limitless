@@ -29,6 +29,7 @@ import {
   redactGateData,
   redactGateDiagnostics,
   redactGateOutput,
+  renderingCredentialsUnchanged,
   sanitizeArtifact,
 } from "../gates/output.ts";
 import type { GateComparison, GateRun } from "../gates/run.ts";
@@ -494,7 +495,7 @@ export class RunContext {
         "feedback",
         this.state.feedback,
       ) ||
-        redactGateOutput(this.state.feedback) !== this.state.feedback)
+        !renderingCredentialsUnchanged(this.state.feedback))
     ) {
       this.state.feedback = "[previous feedback withheld: unverified]";
       delete this.state.feedbackProof;

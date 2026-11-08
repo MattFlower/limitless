@@ -46,6 +46,15 @@ export function launchFailureScan() {
  * to a short credential is still redacted. */
 export const redactGateOutput = (output: string): string => terminalRedactor().push(output, true);
 
+/** Saved renderings keep their original proofs; a newly registered credential only withholds them. */
+export function renderingCredentialsUnchanged(text: string): boolean {
+  if (redactGateOutput(text) !== text) return false;
+  const decoded = text.replace(/(?:%[0-9a-f]{2})+/gi, (run) =>
+    Buffer.from(run.replaceAll("%", ""), "hex").toString("utf8"),
+  );
+  return decoded === text || redactGateOutput(decoded) === decoded;
+}
+
 /** Prefer literal identity; sanitized stored names are usable only without collisions on either side. */
 export function findGateCounterpart<T extends { name: string }>(
   gate: { name: string },

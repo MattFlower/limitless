@@ -17,9 +17,11 @@ import { loadConfig, type Paths } from "../src/config.ts";
 import type { LandEntry, Run, StreamMessage } from "../src/core/types.ts";
 import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
+import * as gateExecutorModule from "../src/gates/executor.ts";
 import { type GateExecutor, type GateRequest, gateProvenance } from "../src/gates/executor.ts";
 import { parseJUnit } from "../src/gates/junit.ts";
 import { redactGateData } from "../src/gates/output.ts";
+import * as gateRunModule from "../src/gates/run.ts";
 import { type GateResult, type GateRun, runLocalGates } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
 import { gatePrivacyScope } from "../src/gates/text-privacy.ts";
@@ -6611,12 +6613,13 @@ test("land waits for checked log entries before blocking and never appends raw u
   const append = spyOn(signedLog, "appendLandLog");
   const update = store.updateLandEntry.bind(store);
   let checked = false;
+  let reading: Promise<string> | undefined;
   const block = spyOn(store, "updateLandEntry").mockImplementation((id, patch) => {
     if (patch.state === "blocked") {
       const entry = store.getLandEntry(id),
         path = entry?.logPath;
       if (!path) throw new Error("No land log before blocking");
-      expect(signedLog.readLandLog(path)).toContain("[withheld: unproven]");
+      reading = signedLog.readLandLog(path);
       expect(readFileSync(`${path}.proof`, "utf8").trim().split("\n").length).toBeGreaterThan(2);
       checked = true;
     }
@@ -6633,6 +6636,7 @@ test("land waits for checked log entries before blocking and never appends raw u
     await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
     await settle();
     expect(checked).toBe(true);
+    expect(await reading).toContain("[withheld: unproven]");
     expect(append.mock.calls.flatMap(([, parts]) => parts).join("")).not.toContain(raw);
   } finally {
     append.mockRestore();
@@ -6640,3 +6644,81 @@ test("land waits for checked log entries before blocking and never appends raw u
     slow.mockRestore();
   }
 });
+
+test.each(["blocking", "exception"])(
+  "land log drain holds %s completion until pending appends finish",
+  async (kind) => {
+    const { pr } = await retryLandFixture(undefined, "test", "prepare", "bun test; security-scan");
+    const fake = fakeLandGates((req) => retryRun(req, { test: testFailure }), false);
+    const entered = deferred<void>(),
+      release = deferred<void>(),
+      returned = deferred<void>(),
+      retriesFinished = deferred<void>();
+    const scope = gatePrivacyScope.getStore();
+    if (!scope) throw new Error("No checker scope");
+    const protect = scope.checker.protectText;
+    const slow = spyOn(scope.checker, "protectText").mockImplementation(async (input, control) => {
+      if (input.text.startsWith("\n$ ")) {
+        entered.resolve();
+        await release.promise;
+      }
+      return protect(input, control);
+    });
+    const execute = gateExecutorModule.executeGate;
+    const execution = spyOn(gateExecutorModule, "executeGate").mockImplementation(async (...args) => {
+      const result = await execute(...args);
+      returned.resolve();
+      if (kind === "exception") throw new Error("injected after result callbacks");
+      return result;
+    });
+    const retry = gateRunModule.retryFailures;
+    const retries = spyOn(gateRunModule, "retryFailures").mockImplementation(async (...args) => {
+      const result = await retry(...args);
+      retriesFinished.resolve();
+      return result;
+    });
+    const finalize = spyOn(store.observations, "finalize");
+    const append = spyOn(signedLog, "appendLandLog");
+    const q = queue({ gateExecutor: fake.executor });
+    let stopped = false;
+    let stopping: Promise<void> | undefined;
+    try {
+      const entry = await q.request({ target: pr.run.id });
+      await Promise.all([entered.promise, kind === "blocking" ? retriesFinished.promise : returned.promise]);
+      if (kind === "exception")
+        stopping = q.stop().then(() => {
+          stopped = true;
+        });
+      await settleIdle();
+      expect(finalize).not.toHaveBeenCalled();
+      expect(store.getLandEntry(entry.id)?.state).toBe("checking");
+      expect(stopped).toBe(false);
+      const cwd = fake.requests[0]?.cwd;
+      if (!cwd) throw new Error("No gate checkout");
+      expect(existsSync(`${cwd}-base`)).toBe(true);
+      release.resolve();
+      if (stopping) await stopping;
+      else {
+        await settle();
+        await q.stop();
+      }
+      expect(existsSync(`${cwd}-base`)).toBe(false);
+      if (kind === "blocking") {
+        expect(store.getLandEntry(entry.id)?.state).toBe("blocked");
+        expect(finalize).toHaveBeenCalled();
+      }
+      const log = append.mock.calls[0]?.[0];
+      if (!log) throw new Error("No checked log");
+      const expected = append.mock.calls.flatMap(([, parts]) => parts).join("");
+      expect(await signedLog.readLandLog(log.path)).toBe(expected);
+    } finally {
+      release.resolve();
+      await q.stop();
+      slow.mockRestore();
+      execution.mockRestore();
+      retries.mockRestore();
+      finalize.mockRestore();
+      append.mockRestore();
+    }
+  },
+);

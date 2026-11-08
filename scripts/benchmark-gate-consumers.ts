@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type Context,
@@ -185,23 +186,19 @@ async function landLog(c: Context): Promise<Job[]> {
     (k) => typeof c.a[k] === "function",
   );
   const path = join(c.cwd, "land.log"),
-    expected = Array.from({ length: 10000 }, (_, i) => `entry ${i}\n`).join("");
+    entries = Array.from({ length: 10000 }, (_, i) => `${`entry ${i} `.padEnd(511, ".")}\n`),
+    expected = entries.join("");
   const privacy = () => ({ checker: c.checker(), signer: () => c.key });
   let seeded = false;
   const append = async () => {
     const log = call(c, "openLandLog", path, "", privacy());
-    for (let i = 0; i < 10000; i++) await call(c, "appendLandLog", log, [`entry ${i}\n`]);
+    for (const entry of entries) await call(c, "appendLandLog", log, [entry]);
     seeded = true;
     return path;
   };
   const check = (v: unknown) => validate(v === expected, "10000 verified entries in order");
   return [
-    [
-      "append:production",
-      10000,
-      available ? append : undefined,
-      () => check(call(c, "readLandLog", path, privacy())),
-    ],
+    ["append:production", 10000, available ? append : undefined, () => check(readFileSync(path, "utf8"))],
     [
       "read-and-verify:production",
       10000,

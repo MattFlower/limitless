@@ -50,6 +50,29 @@ function fixture() {
   return { ...f, store, ctx, load, prepare, privacy };
 }
 const note = "[previous feedback withheld: unverified]";
+test("saved URL feedback with a newly registered encoded credential is withheld before logging", async () => {
+  const f = fixture(),
+    token = `late+/${crypto.randomUUID()}=`,
+    url = `https://example.com/check?token=${encodeURIComponent(token)}`;
+  f.ctx.state.feedback = url;
+  await f.prepare();
+  await f.ctx.save();
+  expect(f.load().state.feedback).toBe(url);
+  registerCredential("FEEDBACK_ENCODED_LATER", token);
+  const protect = spyOn(f.privacy.checker, "protectText");
+  try {
+    const loaded = f.load();
+    loaded.log(`Gate feedback: ${loaded.state.feedback}`);
+    await gatePrivacyScope.run(f.privacy, () => loaded.prepareFeedback());
+    expect(loaded.state.feedback).toBe(note);
+    expect(loaded.loadedFeedback).toBe(note);
+    expect(loaded.state.feedbackProof).toBeUndefined();
+    expect(JSON.stringify(f.store.listEvents(loaded.run.id))).not.toContain(encodeURIComponent(token));
+    expect(protect).not.toHaveBeenCalled();
+  } finally {
+    protect.mockRestore();
+  }
+});
 test.each(["legacy", "policy", "credential", "writeState", "writeRun"])(
   "resume withholds %s feedback before logging",
   async (kind) => {
@@ -75,7 +98,8 @@ test.each(["legacy", "policy", "credential", "writeState", "writeRun"])(
 );
 test("new feedback is signed once, saved, and resumed with its original bytes and MAC", async () => {
   const f = fixture();
-  f.ctx.state.feedback = "fix the failing check";
+  const text = "fix https://example.com/check?value=clean%2B%2F%3D";
+  f.ctx.state.feedback = text;
   const protect = spyOn(f.privacy.checker, "protectText");
   try {
     await f.prepare();
@@ -88,7 +112,7 @@ test("new feedback is signed once, saved, and resumed with its original bytes an
     expect(f.store.getRunState<RunState>(f.ctx.run.id)?.feedbackProof).toEqual(proof);
     const loaded = f.load();
     await gatePrivacyScope.run(f.privacy, () => loaded.prepareFeedback());
-    expect(loaded.state.feedback).toBe("fix the failing check");
+    expect(loaded.state.feedback).toBe(text);
     expect(loaded.state.feedbackProof).toEqual(proof);
     expect(protect).toHaveBeenCalledTimes(1);
   } finally {
