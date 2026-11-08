@@ -525,6 +525,91 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
     verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
   } as unknown as CodexReaderProbe);
 
+test.each(["claude", "codex"] as const)(
+  "%s output callback failures become invocation errors after a zero exit",
+  async (harness) => {
+    await confinedEdit(import.meta.dir, async (scratchDir) => {
+      const invoke = harness === "codex" ? verifiedCodex : runClaude;
+      const spec: AgentSpec = {
+        cwd: import.meta.dir,
+        scratchDir,
+        prompt: "synthetic",
+        mode: "edit",
+        logPath: join(scratchDir, "callback.log"),
+        target: {
+          modelId: `${harness}/test`,
+          provider: harness,
+          harness,
+          model: "test",
+          vendor: "other",
+          tier: 4,
+          billing: "subscription",
+        },
+        timeoutMs: 30_000,
+        idleTimeoutMs: 30_000,
+        maxToolCalls: 10,
+        signal: new AbortController().signal,
+        onEvent: () => {},
+      };
+      const complete = JSON.stringify(
+        harness === "codex" ? { type: "turn.completed", usage: {} } : { type: "result", result: "healthy" },
+      );
+      for (const stream of ["stdout", "stderr"] as const) {
+        for (const failure of ["transcript", "event"] as const) {
+          let calls = 0;
+          const fail = () => {
+            calls++;
+            throw new Error("unregistered private callback content");
+          };
+          const result = await invoke(
+            {
+              ...spec,
+              ...(failure === "transcript"
+                ? {
+                    holdTranscript: (line: string) => {
+                      if (line.includes("synthetic event")) fail();
+                    },
+                  }
+                : {
+                    onEvent: (event: AgentEvent) => {
+                      if (
+                        (stream === "stderr" && event.type === "stderr") ||
+                        (stream === "stdout" && event.type === "status" && event.text === "synthetic event")
+                      )
+                        fail();
+                    },
+                  }),
+            },
+            (opts) =>
+              runProcess({
+                ...opts,
+                cmd: swapCommand(opts.cmd, [
+                  process.execPath,
+                  "-e",
+                  `process.stdout.write(${JSON.stringify(`${complete}\n`)}); process.${stream}.write("synthetic event");`,
+                ]),
+              }),
+          );
+          expect(result.status).toBe("error");
+          expect(result.error).toBe("Invocation output callback failed");
+          expect(calls).toBe(1);
+        }
+      }
+      const next = await invoke(spec, (opts) =>
+        runProcess({
+          ...opts,
+          cmd: swapCommand(opts.cmd, [
+            process.execPath,
+            "-e",
+            `process.stdout.write(${JSON.stringify(complete)})`,
+          ]),
+        }),
+      );
+      expect(next.status).toBe("ok");
+    });
+  },
+);
+
 test.each(["accepted", "stream rejection", "stderr rejection"])(
   "factory Claude subscription authentication: %s",
   async (outcome) => {

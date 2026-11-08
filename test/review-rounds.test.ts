@@ -666,6 +666,35 @@ test("an oversized blocked-round report posts bounded evidence and a full-report
   expect(report).toContain(largeFindings[0]?.detail ?? "missing finding");
 });
 
+test("whole-value withholding preserves blocked-round delivery and its trusted classification", async () => {
+  const original = await delivered("standard");
+  const created = await review(original.id, {
+    verdict: "changes",
+    reviewedSha: await remoteHead(),
+    findings: Array.from({ length: 20 }, (_, i) => ({
+      ...findings[0],
+      title: `Finding ${i}`,
+      detail: "quoted detail ".repeat(1420),
+    })),
+  });
+  expect(created.status).toBe(201);
+  const id = created.body.round?.id as string;
+  verifyStatus = "blocked";
+  verifyEvidence = "runtimeBlocked_1";
+  expect(await executeRun(factory.deps, id, new AbortController().signal)).toBe("needs_human");
+  const state = factory.store.getRunState<RunState>(id);
+  expect(state?.terminalReason).toStartWith(`${ENVIRONMENT_BLOCKED}\n[value withheld:`);
+  expect(state?.needsHumanReason).toBe(state?.terminalReason);
+  expect(pr.comments).toHaveLength(1);
+  const comment = pr.comments[0]?.body ?? "";
+  expect(comment).toContain(`<!-- limitless-review-round:${id} -->`);
+  expect(comment).toContain(await remoteHead());
+  expect(comment).toContain("🚧 blocked AC-1: [value withheld:");
+  expect(comment).toContain("🚧 blocked H-1: Environment unavailable");
+  expect(comment).toContain(`Full report: ${factory.cfg.uiUrl}/runs/${id}`);
+  expect(comment).not.toContain(verifyEvidence);
+});
+
 test("blocked-round evidence and overall comment sanitize paths before both cuts", async () => {
   const original = await delivered("standard");
   const id = (await changes(original.id)).body.round?.id as string;

@@ -496,6 +496,7 @@ export async function runClaude(
         : null,
   };
 
+  if (proc.outputError) return { ...base, status: "error", error: proc.outputError };
   if (proc.cancelled && firstAbort === "caller") return { ...base, status: "cancelled", error: "cancelled" };
   if (stuckReason) return { ...base, status: "stuck", error: stuckReason };
   if (proc.cancelled) return { ...base, status: "cancelled", error: "cancelled" };
