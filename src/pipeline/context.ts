@@ -364,6 +364,7 @@ export interface InvokeOptions {
 }
 
 export interface InvokeOutcome {
+  retry?: { prompt?: string; tried: (string | ModelSelection)[]; ids: string[]; attempt: number };
   result: AgentResult;
   target: ModelTarget;
   invocation: Invocation;
@@ -850,17 +851,20 @@ export class RunContext {
   private async invokeWithAdmission(opts: InvokeOptions, call?: network.AgentCall): Promise<InvokeOutcome> {
     const agentExecutor = this.deps.agentExecutor ?? localAgentExecutor;
     const { router, tracker, store, harnesses } = this.deps;
+    let pending = call?.pending;
+    const retry = pending?.retry;
+    if (retry?.prompt !== undefined) opts = { ...opts, prompt: retry.prompt };
     const { shadow } = opts;
     const chain = shadow ? undefined : this.run.models?.[opts.role as RunRole];
     const failures = new Map<string, string>();
     const authenticationFailures = new Map<string, string>();
     const health = shadow ? undefined : tracker;
     const signal = shadow?.signal ?? this.signal;
-    const tried: (string | ModelSelection)[] = [...(opts.constraints?.exclude ?? [])];
+    const tried: (string | ModelSelection)[] = [...(retry?.tried ?? opts.constraints?.exclude ?? [])];
     const busy = new Set<string>();
     let waitMs = 0;
     let lastFailure: string | null = null;
-    const specIdRetried = new Set<string>();
+    const specIdRetried = new Set<string>(retry?.ids);
     const exhaustPinned = (decision: RouteDecision, deadline = false): never => {
       const skipped = [
         ...decision.skipped,
@@ -887,7 +891,7 @@ export class RunContext {
     };
 
     const left = () => (opts.deadline === undefined ? Number.POSITIVE_INFINITY : opts.deadline - Date.now());
-    for (let attempt = 0; attempt < (chain ? Infinity : 6); attempt++) {
+    for (let attempt = retry?.attempt ?? 0; attempt < (chain ? Infinity : 6); attempt++) {
       this.checkCancelled();
       if (signal.aborted) throw new CancelledError();
       if (!chain && left() <= 0)
@@ -902,6 +906,7 @@ export class RunContext {
         this.routingConstraints({
           ...opts.constraints,
           exclude: tried,
+          ...(pending ? { only: pending.target.targetId ?? pending.target.modelId } : {}),
           ...(chain ? { chain, ...(opts.role === "verify" ? { excludeModels: undefined } : {}) } : {}),
         }),
         !shadow,
@@ -1045,6 +1050,7 @@ export class RunContext {
         release();
         throw new Error(`No harness registered for ${harnessName}`);
       }
+      pending = undefined;
       tried.push({ modelId: target.modelId, effort: target.effort ?? null });
       const previousImplementer = this.state.implementer;
       if (opts.role === "implement") {
@@ -1393,6 +1399,11 @@ export class RunContext {
       this.run = store.refreshRunTotals(this.run.id);
       const hint =
         !result.failureClass && /^(error|unavailable)$/.test(result.status) && result.transportError;
+      if (call && hint) {
+        const prompt = typeof opts.prompt === "string" ? redactGateOutput(opts.prompt) : undefined;
+        const resume = { prompt, tried: tried.slice(0, -1), ids: [...specIdRetried], attempt };
+        call.record({ result, target, invocation: updated }, resume);
+      }
       const confirming = call && network.confirmNetwork(this, call, hint, network.modelDestination(target));
       if (confirming) await confirming;
       // Shadow outcomes never reach provider health, quota telemetry or model blocks.

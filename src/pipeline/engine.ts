@@ -150,7 +150,7 @@ import {
   discreetModelText,
   hasFactoryMark,
 } from "./markers.ts";
-import { NetworkWaitError, networkDeadline } from "./network-wait.ts";
+import { agentCall, NetworkWaitError, networkDeadline } from "./network-wait.ts";
 import { confirmPostMerge, postMergeConfirmationText, postMergeWorker } from "./post-merge-confirmation.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
@@ -2286,6 +2286,7 @@ async function oneRound(
             const saved =
               kept === undefined ? undefined : savedReviewSample(ctx, round, kept, request, reviewedSha);
             if (saved) {
+              agentCall(stage, ctx.state.networkWait).record(saved);
               ctx.log(`review: reusing finished sample ${(kept ?? 0) + 1} from before the restart`);
               return saved;
             }

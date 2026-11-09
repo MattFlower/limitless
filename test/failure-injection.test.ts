@@ -256,14 +256,22 @@ async function networkFixture(
   path: "baseline" | "setup" | "agent" | "check",
   reply?: FakeReply,
   profile: "quick" | "standard" = "quick",
+  installSetup = true,
 ) {
-  await seedNetworkSource(root);
-  const control = { fail: true, now: Date.now(), probes: [] as string[], sessions: [] as AgentSpec[] };
+  await (installSetup ? seedNetworkSource(root) : seedSource(root));
+  const control = {
+    configured: false,
+    fail: true,
+    now: Date.now(),
+    probes: [] as string[],
+    sessions: [] as AgentSpec[],
+  };
   const requests: GateRequest[] = [];
   const executor: GateExecutor = {
     kind: "local",
     async start(request) {
       requests.push(request);
+      if (control.configured) writeFileSync(join(request.cwd, ".npmrc"), "audit=false\n");
       return { kind: "local", id: String(requests.length - 1), startedAt: control.now };
     },
     attach(handle, _signal, _request, hooks) {
@@ -365,6 +373,18 @@ test.each(["baseline", "setup"] as const)("network outage: setup %s", async (pat
   }
 });
 
+test("network outage: configured setup failure follows ordinary handling without a probe", async () => {
+  const { f, r, control, execute } = await networkFixture("baseline");
+  control.configured = true;
+  expect(await execute()).toBe("succeeded");
+  expect(control.probes).toEqual([]);
+  const state = f.store.getRunState<RunState>(r.id);
+  expect(state?.networkWait).toBeUndefined();
+  expect(state?.baseline?.setupOk).toBe(false);
+  expect(state?.baseline?.setup[0]?.output).toContain("ENOTFOUND");
+  expect(f.store.getRun(r.id)?.error).toBeNull();
+});
+
 test.each([false, true])("network outage: agent confirmation reachable=%s", async (reachable) => {
   const { f, r, control, execute } = await networkFixture("agent");
   f.deps.network = {
@@ -437,7 +457,10 @@ test("network outage: agent corrective spec invocation resumes without replaying
   // The checkpointed replay keeps the outcome but none of the router's provider credentials.
   expect(saved?.replay?.[0]?.target.modelId).toBeString();
   expect(JSON.stringify(f.store.getRunState(r.id))).not.toContain("sentinel-provider-token");
-  expect(saved).toMatchObject({ operation: "agent:spec:0:1", replay: [expect.anything()] });
+  expect(saved).toMatchObject({
+    operation: "agent:spec:0:1",
+    replay: [expect.anything(), expect.anything()],
+  });
   expect(prompts[1]).toContain("Too many acceptance criteria");
   // A repeated outage retries only the corrective invocation and keeps the original start.
   control.now = saved?.nextAttemptAt ?? 0;
@@ -457,6 +480,118 @@ test("network outage: agent corrective spec invocation resumes without replaying
   expect(state?.spec?.acceptance_criteria).toHaveLength(1);
   expect(state).toMatchObject({ round: 0, roundsOnImplementer: 0 });
 });
+
+test.each(["recover", "deadline", "invalid again"])(
+  "network outage: internal criterion ID correction resumes with retry state, %s",
+  async (ending) => {
+    const { f, r, control, execute } = await networkFixture("agent", undefined, "standard");
+    const original = f.deps.harnesses.fake;
+    if (!original) throw new Error("missing harness");
+    const prompts: string[] = [];
+    const targets: string[] = [];
+    const invalid = { ...spec, acceptance_criteria: [{ ...spec.acceptance_criteria[0], id: "wrong" }] };
+    f.deps.harnesses.fake = async (s) => {
+      if (!s.prompt.startsWith("Write the specification")) return original(s);
+      prompts.push(s.prompt);
+      targets.push(s.target.modelId);
+      const result = await original(s);
+      if (prompts.length === 1 || (!control.fail && ending === "invalid again" && s.target.modelId === "a"))
+        return { ...result, structured: invalid };
+      if (!control.fail) return result;
+      const error = "getaddrinfo ENOTFOUND api.example.test";
+      return { ...result, status: "unavailable", structured: null, error, transportError: error };
+    };
+    expect(await execute()).toBe("queued");
+    const saved = f.store.getRunState<RunState>(r.id)?.networkWait;
+    if (!saved) throw new Error("missing wait");
+    expect(saved.operation).toBe("agent:spec:0:0");
+    expect(prompts[1]).toContain("Invalid spec: Invalid id wrong");
+    expect(JSON.stringify(saved)).not.toContain("sentinel-provider-token");
+    control.now = saved.nextAttemptAt;
+    expect(await execute()).toBe("queued");
+    const [initial, corrective] = prompts;
+    if (initial === undefined || corrective === undefined) throw new Error("missing prompts");
+    expect(prompts).toEqual([initial, corrective, corrective]);
+    expect(targets).toEqual(["a", "a", "a"]);
+    const repeated = f.store.getRunState<RunState>(r.id)?.networkWait;
+    expect(repeated?.since).toBe(saved.since);
+    if (ending === "deadline") {
+      control.now = saved.since + githubWait.maxMs;
+      expect(await execute()).toBe("needs_human");
+      expect(prompts).toHaveLength(3);
+      expect(f.store.getRun(r.id)?.error).toContain("network outage deadline");
+    } else {
+      control.fail = false;
+      control.now = repeated?.nextAttemptAt ?? 0;
+      expect(await execute()).toBe("succeeded");
+      expect(prompts.slice(1).every((p) => p === prompts[1])).toBe(true);
+      expect(targets).toEqual(ending === "invalid again" ? ["a", "a", "a", "a", "b"] : ["a", "a", "a", "a"]);
+    }
+    expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+  },
+);
+
+test.each([false, true])(
+  "network outage: saved review sample preserves independent invocations, both failed=%s",
+  async (bothFailed) => {
+    const { f, r, control, execute } = await networkFixture("agent", undefined, "quick", false);
+    control.fail = false;
+    f.deps.cfg.reviewSamples = 2;
+    let release = () => {};
+    const saved = new Promise<void>((done) => {
+      release = done;
+    });
+    const probe = f.deps.network?.probe;
+    if (bothFailed && f.deps.network && probe)
+      f.deps.network.probe = async (url, signal) => {
+        release();
+        return probe(url, signal);
+      };
+    const put = f.store.putArtifact.bind(f.store);
+    const saving = spyOn(f.store, "putArtifact").mockImplementation((...args) => {
+      put(...args);
+      if (args[1] === "review-0.sample-0.json") release();
+    });
+    let reviews = 0;
+    const original = f.deps.harnesses.fake;
+    if (!original) throw new Error("missing harness");
+    f.deps.harnesses.fake = async (s) => {
+      if (!s.prompt.startsWith("You are an adversarial")) return original(s);
+      const count = ++reviews;
+      if (count === 2) await saved;
+      const result = await original(s);
+      if (count === 2 || (bothFailed && count === 1)) {
+        const error = "getaddrinfo ENOTFOUND api.example.test";
+        return { ...result, status: "unavailable", structured: null, error, transportError: error };
+      }
+      return {
+        ...result,
+        structured: { ...review, summary: `${review.summary}; independent sample ${count}` },
+      };
+    };
+    try {
+      expect(await execute()).toBe("queued");
+      const wait = f.store.getRunState<RunState>(r.id)?.networkWait;
+      expect(wait?.operation).toStartWith("agent:review:0:");
+      expect(wait?.replay?.filter((call) => call?.retry)).toHaveLength(bothFailed ? 2 : 1);
+      expect(reviews).toBe(2);
+      control.now = wait?.nextAttemptAt ?? 0;
+      expect({ status: await execute(), error: f.store.getRun(r.id)?.error }).toEqual({
+        status: "succeeded",
+        error: null,
+      });
+      expect(reviews).toBe(bothFailed ? 4 : 3);
+      const sample = JSON.parse(f.store.getArtifact(r.id, "review-0.sample-1.json") ?? "{}");
+      expect(sample.result.structured.summary).toBe(
+        `${review.summary}; independent sample ${bothFailed ? 4 : 3}`,
+      );
+      expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+    } finally {
+      saving.mockRestore();
+      release();
+    }
+  },
+);
 
 test.each([
   ["model finalText", { text: "quoted ENOTFOUND; connection reset", files: { "ui/change.txt": "done\n" } }],
