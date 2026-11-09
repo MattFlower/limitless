@@ -52,7 +52,7 @@ export class Scheduler {
       limit: Number.MAX_SAFE_INTEGER,
     })) {
       if (run.status === "queued") finalizeRecordedCancellation(this.deps.store, run.id, this.checkpointer);
-      else if (run.githubWait)
+      else if (run.githubWait || this.deps.store.getRunState<RunState>(run.id)?.networkWait)
         this.checkpointer.writeRun(
           run.id,
           {},
@@ -155,7 +155,7 @@ export class Scheduler {
       held ? (this.active.size === 0 ? 1 : 0) : Infinity,
     );
     if (capacity <= 0) return;
-    for (const run of this.deps.store.nextQueuedRuns(capacity)) {
+    for (const run of this.deps.store.nextQueuedRuns(capacity, this.deps.network?.now?.())) {
       if (this.stopping || this.draining) return;
       if (this.active.has(run.id)) continue;
       const rt = this.options.shared,

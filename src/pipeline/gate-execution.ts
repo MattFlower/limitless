@@ -24,6 +24,7 @@ import { removeScratch, withScratch } from "../harness/scratch.ts";
 import { ciSignature } from "../integrations/ci-classifier.ts";
 import { invocationScratch } from "../util/proc.ts";
 import type { RunContext } from "./context.ts";
+import { confirmNetwork, setupDestination } from "./network-wait.ts";
 
 /**
  * A LAN identity alone does not prove remote execution: it can finish locally.
@@ -311,6 +312,10 @@ export async function runGateExecution(
       );
     settled = true;
     ctx.checkCancelled();
+    const failed = result.setup.find((r) => !r.ok && !confinementFailed(r));
+    const endpoint = failed && setupDestination(failed.command, cwd);
+    if ((stage === "prepare" || stage === "gates") && !handle?.githubActions)
+      await confirmNetwork(ctx, { operation: `setup:${stage}:${purpose}` }, failed?.output, endpoint);
     if (handle) onExecuted?.(handle, result);
     return result;
   } finally {

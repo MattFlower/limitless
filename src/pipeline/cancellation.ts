@@ -2,7 +2,7 @@ import type { Store } from "../db/store.ts";
 import { type Checkpointer, localCheckpointer, type RunState } from "./context.ts";
 
 export function clearGitHubWait(state: RunState | null): RunState | undefined {
-  if (state) state.githubWait = undefined;
+  if (state) Object.assign(state, { githubWait: undefined, networkWait: undefined });
   return state ?? undefined;
 }
 
@@ -15,7 +15,7 @@ export function finalizeRecordedCancellation(
   const run = store.getRun(runId);
   if (!run?.error?.startsWith("cancelled by")) return false;
   const state = store.getRunState<RunState>(runId);
-  if (run.status !== "cancelled" || run.finishedAt === null || state?.githubWait)
+  if (run.status !== "cancelled" || run.finishedAt === null || state?.githubWait || state?.networkWait)
     checkpointer.writeRun(
       runId,
       { status: "cancelled", finishedAt: run.finishedAt ?? Date.now() },

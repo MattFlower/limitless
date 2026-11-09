@@ -1,5 +1,7 @@
 import { describe, expect, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -44,6 +46,7 @@ import {
   priceOf,
   redactJsonLine,
 } from "../src/harness/types.ts";
+import { modelDestination, setupDestination, transportError } from "../src/pipeline/network-wait.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
 import { agentEnv, type ProcOptions, runProcess } from "../src/util/proc.ts";
 import { browserSpec, fakeBrowserCache } from "./browser-mcp-support.ts";
@@ -524,6 +527,282 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
     resolve: () => "codex",
     verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
   } as unknown as CodexReaderProbe);
+
+for (const harness of ["claude", "codex"] as const) {
+  test.each(["transport", "stderr", "model result", "tool result", "structured", "unavailable"])(
+    `network outage: ${harness} provenance %s`,
+    async (kind) => {
+      const dir = mkdtempSync(join(tmpdir(), "limitless-network-harness-"));
+      const diagnostic = "getaddrinfo ENOTFOUND models.example.test";
+      const claude =
+        kind === "stderr"
+          ? []
+          : [
+              ...(kind === "tool result"
+                ? [
+                    {
+                      type: "user",
+                      message: {
+                        content: [
+                          { type: "tool_result", tool_use_id: "t", content: diagnostic, is_error: true },
+                        ],
+                      },
+                    },
+                  ]
+                : []),
+              {
+                type: "result",
+                subtype: kind === "transport" ? "error_during_execution" : "success",
+                is_error: ["transport", "model result", "unavailable"].includes(kind),
+                result: kind === "model result" ? diagnostic : "done",
+                ...(kind === "transport" ? { errors: [diagnostic] } : {}),
+                ...(kind === "unavailable" ? { errors: ["API Error: 503 unavailable"] } : {}),
+              },
+            ];
+      const codex =
+        kind === "stderr"
+          ? []
+          : [
+              { type: "turn.started" },
+              ...(kind === "tool result"
+                ? [
+                    {
+                      type: "item.completed",
+                      item: {
+                        id: "t",
+                        type: "command_execution",
+                        command: "test",
+                        aggregated_output: diagnostic,
+                        exit_code: 1,
+                      },
+                    },
+                  ]
+                : []),
+              {
+                type: "item.completed",
+                item: { type: "agent_message", text: kind === "model result" ? diagnostic : "done" },
+              },
+              kind === "transport" || kind === "unavailable"
+                ? {
+                    type: "turn.failed",
+                    error: { message: kind === "transport" ? diagnostic : "503 unavailable" },
+                  }
+                : { type: "turn.completed", usage: {} },
+            ];
+      try {
+        const outcome = await (harness === "claude" ? runClaude : verifiedCodex)(
+          {
+            cwd: dir,
+            prompt: "x",
+            mode: "readonly",
+            noTools: true,
+            target: {
+              modelId: "test/model",
+              provider: harness,
+              harness,
+              model: "model",
+              vendor: harness,
+              tier: 4,
+              billing: "subscription",
+            },
+            ...(kind === "structured" ? { jsonSchema: { type: "object" } } : {}),
+            timeoutMs: 10_000,
+            idleTimeoutMs: 10_000,
+            maxToolCalls: 0,
+            signal: new AbortController().signal,
+            logPath: join(dir, "log"),
+            onEvent: () => {},
+          },
+          async (opts) => {
+            for (const event of harness === "claude" ? claude : codex)
+              opts.onStdoutLine?.(JSON.stringify(event));
+            return {
+              exitCode: kind === "stderr" ? 1 : 0,
+              signal: null,
+              truncated: false,
+              durationMs: 1,
+              stdout: "",
+              stderr: kind === "stderr" ? diagnostic : "",
+              timedOut: false,
+              idleTimedOut: false,
+              cancelled: false,
+            };
+          },
+        );
+        expect(transportError(outcome.transportError ?? "")).toBe(kind === "transport" || kind === "stderr");
+        if (kind === "model result") expect(outcome.finalText).toContain(diagnostic);
+        if (kind === "structured") {
+          expect(outcome.status).toBe("error");
+          expect(outcome.error).toContain("structured output");
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+test.each([
+  ["ENOTFOUND", true],
+  ["EAI_AGAIN", true],
+  ["ECONNRESET", true],
+  ["ECONNREFUSED", true],
+  ["API Error: Connection error.", true],
+  ["connection timed out", true],
+  ["stream disconnected before completion", true],
+  ["TLS handshake timeout", true],
+  ["503 unavailable", false],
+  ["authentication failed ECONNRESET", false],
+  ["quota exceeded ENOTFOUND", false],
+  ["structured output failed validation ENOTFOUND", false],
+  ["request failed", false],
+] as const)("network outage: classifier %s", (hint, eligible) => {
+  expect(transportError(hint)).toBe(eligible);
+});
+
+test("network outage: destinations come from the target and known install commands", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "limitless-network-destinations-"));
+  const previous = [process.env.npm_config_registry, process.env.NPM_CONFIG_REGISTRY];
+  delete process.env.npm_config_registry;
+  delete process.env.NPM_CONFIG_REGISTRY;
+  try {
+    expect(setupDestination("bun install --frozen-lockfile", cwd)).toBe("https://registry.npmjs.org");
+    expect(setupDestination("npm ci", cwd)).toBe("https://registry.npmjs.org");
+    expect(setupDestination("yarn install --immutable", cwd)).toBe("https://registry.yarnpkg.com");
+    expect(setupDestination("bun test", cwd)).toBeUndefined();
+    expect(setupDestination("bun install && bun test", cwd)).toBeUndefined();
+    // Any checkout configuration makes the setup destination unknown.
+    writeFileSync(join(cwd, "bunfig.toml"), '[serve]\nport = 3000\n\n[test]\nroot = "test"\n');
+    expect(setupDestination("bun install --frozen-lockfile", cwd)).toBeUndefined();
+    writeFileSync(join(cwd, "bunfig.toml"), '[install]\nregistry = "https://bun.example.test"\n');
+    expect(setupDestination("bun install --frozen-lockfile", cwd)).toBeUndefined();
+    rmSync(join(cwd, "bunfig.toml"));
+    process.env.npm_config_registry = "https://registry.example.test";
+    expect(setupDestination("npm ci", cwd)).toBe("https://registry.example.test");
+    delete process.env.npm_config_registry;
+    process.env.NPM_CONFIG_REGISTRY = "https://upper.example.test";
+    expect(setupDestination("pnpm install --ignore-scripts", cwd)).toBe("https://upper.example.test");
+    writeFileSync(join(cwd, ".npmrc"), "registry=https://project.example.test\n");
+    expect(setupDestination("npm ci", cwd)).toBeUndefined();
+    const target: AgentSpec["target"] = {
+      modelId: "test/model",
+      provider: "claude",
+      harness: "claude",
+      model: "model",
+      vendor: "anthropic",
+      tier: 4,
+      billing: "subscription",
+    };
+    expect(modelDestination(target)).toBe("https://api.anthropic.com");
+    expect(modelDestination({ ...target, harness: "codex" })).toBe("https://chatgpt.com");
+    expect(
+      modelDestination({ ...target, backend: { baseUrl: "https://models.example.test/api", authToken: "" } }),
+    ).toBe("https://models.example.test/api");
+    expect(modelDestination({ ...target, harness: "fake" })).toBeUndefined();
+  } finally {
+    for (const [i, key] of ["npm_config_registry", "NPM_CONFIG_REGISTRY"].entries()) {
+      if (previous[i] === undefined) delete process.env[key];
+      else process.env[key] = previous[i];
+    }
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+const packageConfigs = [".npmrc", ".yarnrc", ".yarnrc.yml", "bunfig.toml"];
+test.each(
+  packageConfigs.flatMap((name) =>
+    ["empty", "unrelated", "directory", "symlink", "dangling", "unreadable"].map(
+      (kind) => [name, kind] as const,
+    ),
+  ),
+)("network outage: configuration %s entry %s suppresses destination", (name, kind) => {
+  const cwd = mkdtempSync(join(tmpdir(), "limitless-network-config-"));
+  const entry = join(cwd, name);
+  try {
+    if (kind === "directory") mkdirSync(entry);
+    else if (kind === "symlink" || kind === "dangling") {
+      const target = join(cwd, "target");
+      if (kind === "symlink") writeFileSync(target, "unrelated = true\n");
+      symlinkSync(target, entry);
+    } else {
+      writeFileSync(entry, kind === "empty" ? "" : "unrelated = true\n");
+      if (kind === "unreadable") chmodSync(entry, 0);
+    }
+    expect(setupDestination("bun install --frozen-lockfile", cwd)).toBeUndefined();
+  } finally {
+    if (kind === "unreadable") chmodSync(entry, 0o600);
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test.each(packageConfigs)(
+  "network outage: configuration %s FIFO cannot block the coordinator",
+  async (name) => {
+    const cwd = mkdtempSync(join(tmpdir(), "limitless-network-fifo-"));
+    let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    try {
+      const made = await runProcess({
+        cmd: ["mkfifo", join(cwd, name)],
+        cwd,
+        env: agentEnv(),
+        timeoutMs: 10_000,
+      });
+      expect(made.exitCode).toBe(0);
+      const modulePath = join(import.meta.dir, "../src/pipeline/network-wait.ts");
+      child = Bun.spawn(
+        [
+          process.execPath,
+          "--eval",
+          `
+      import { setupDestination } from ${JSON.stringify(modulePath)};
+      console.log("entered");
+      if (setupDestination("bun install --frozen-lockfile", ${JSON.stringify(cwd)}) !== undefined)
+        throw new Error("configuration must suppress destination");
+      console.log("returned");
+    `,
+        ],
+        { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+      );
+      const running = child;
+      timer = setTimeout(() => {
+        timedOut = true;
+        running.kill("SIGKILL");
+      }, 10_000);
+      const [exit, output, errors] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect({ timedOut, exit, output, errors }).toEqual({
+        timedOut: false,
+        exit: 0,
+        output: "entered\nreturned\n",
+        errors: "",
+      });
+    } finally {
+      clearTimeout(timer);
+      if (child) {
+        if (child.exitCode === null) child.kill("SIGKILL");
+        await child.exited;
+      }
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+  20_000,
+);
+
+test("network outage: metadata errors make configuration unknown", () => {
+  const metadata = spyOn(fs, "lstatSync").mockImplementation(() => {
+    throw Object.assign(new Error("metadata denied"), { code: "EACCES" });
+  });
+  try {
+    expect(setupDestination("npm ci", tmpdir())).toBeUndefined();
+  } finally {
+    metadata.mockRestore();
+  }
+});
 
 test.each(["claude", "codex"] as const)(
   "%s output callback failures become invocation errors after a zero exit",

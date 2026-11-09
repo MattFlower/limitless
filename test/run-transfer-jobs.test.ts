@@ -174,8 +174,10 @@ test("strict portable records refuse local resources at every boundary", () => {
 });
 
 test("persisted AgentResultReport completions export with publication metadata checked against the job", () => {
+  const transportError = "getaddrinfo ENOTFOUND models.example.test";
   const report = AgentResultReport.parse({
     ...result,
+    transportError,
     parentSha: parent,
     sha: resultSha,
     branch: "run/example",
@@ -186,6 +188,7 @@ test("persisted AgentResultReport completions export with publication metadata c
   const value = roundTrip(done);
   expect(value.result).toMatchObject({
     status: "ok",
+    transportError,
     usage: result.usage,
     parentSha: parent,
     sha: resultSha,

@@ -32,6 +32,8 @@ test("agent result reports accept only terminal statuses and strict fields", () 
     expect(AgentResultReport.safeParse({ ...report, status }).success).toBe(true);
   for (const failureClass of ["authentication", "malformed"] as const)
     expect(AgentResultReport.parse({ ...report, failureClass }).failureClass).toBe(failureClass);
+  const transportError = "getaddrinfo ENOTFOUND models.example.test";
+  expect(AgentResultReport.parse({ ...report, transportError }).transportError).toBe(transportError);
   expect(
     AgentResultReport.parse({ ...report, status: "error", error: "Failed to authenticate" }).failureClass,
   ).toBeUndefined();
@@ -41,6 +43,7 @@ test("agent result reports accept only terminal statuses and strict fields", () 
     { extra: true },
     { failureClass: "unknown" },
     { failureClass: true },
+    { transportError: true },
   ])
     expect(AgentResultReport.safeParse({ ...report, ...bad }).success).toBe(false);
 });

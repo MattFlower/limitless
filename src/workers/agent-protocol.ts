@@ -36,6 +36,7 @@ const result = z
   .object({
     status: z.enum(["ok", "error", "cancelled", "timeout", "stuck", "quota", "unavailable", "declined"]),
     failureClass: z.enum(["authentication", "malformed"]).optional(),
+    transportError: z.string().optional(),
     finalText: z.string(),
     structured: z.json(),
     sessionId: z.string().nullable(),

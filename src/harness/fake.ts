@@ -6,6 +6,7 @@ import { parseFakeStream } from "./stream-fault.ts";
 import type { AgentEvent, AgentResult, AgentSpec, Harness } from "./types.ts";
 
 export interface FakeReply {
+  transportError?: string;
   fault?: "exit" | "kill" | "timeout" | "throw" | "block";
   events?: AgentEvent[];
   stream?: StreamFault;
@@ -62,6 +63,7 @@ export function fakeHarness(handler: (spec: AgentSpec) => FakeReply | Promise<Fa
     return baseResult({
       status: reply.status ?? "ok",
       failureClass: reply.failureClass,
+      transportError: reply.transportError,
       numTurns: 1,
       sessionId: reply.sessionId === undefined ? "fake-session" : reply.sessionId,
       finalText: reply.text ?? "",

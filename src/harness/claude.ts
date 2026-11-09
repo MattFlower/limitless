@@ -62,6 +62,7 @@ function toolResultText(content: unknown): string {
 
 /** Pure parser for `claude -p --output-format stream-json --verbose` output. */
 export class ClaudeStreamParser {
+  transportError?: string;
   sessionId: string | null = null;
   finalText = "";
   lastAssistantText = "";
@@ -170,6 +171,8 @@ export class ClaudeStreamParser {
             : { cacheWrite1h: Number(creation.ephemeral_1h_input_tokens) }),
         };
         this.structured = e.structured_output ?? null;
+        if (this.isError && Array.isArray(e.errors))
+          this.transportError = e.errors.filter((v) => typeof v === "string").join("\n");
         this.finalText = typeof e.result === "string" ? e.result : this.lastAssistantText;
         if (typeof e.result === "string" && QUOTA_TEXT.test(e.result)) this.quotaText = true;
         break;
@@ -509,6 +512,7 @@ export async function runClaude(
     fastModeState: parser.fastModeState,
     fastModeDisabledReason: parser.fastModeDisabledReason,
     finalText: parser.finalText || parser.lastAssistantText,
+    transportError: parser.transportError,
     structured: parser.structured,
     sessionId: parser.sessionId ?? (spec.resumeSessionId || sessionId),
     usage: parser.usage,
@@ -558,6 +562,7 @@ export async function runClaude(
       ...base,
       status: unavailable ? "unavailable" : "error",
       error: stderr || `claude exited with ${proc.exitCode ?? proc.signal} and no result`,
+      transportError: stderr,
     };
   }
   if (parser.isError) {

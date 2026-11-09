@@ -2480,7 +2480,7 @@ ${quotedJson(Object.fromEntries(Object.entries(failure).map(([k, v]) => [k, reda
     return (
       this.db
         .query(
-          `${RUN_SELECT} WHERE runs.status = 'queued' AND coalesce(json_extract(runs.state_json, '$.githubWait.nextAttemptAt'), 0) <= ? ORDER BY runs.priority DESC, runs.created_at ASC LIMIT ?`,
+          `${RUN_SELECT} WHERE runs.status = 'queued' AND max(coalesce(json_extract(runs.state_json, '$.githubWait.nextAttemptAt'), 0), coalesce(json_extract(runs.state_json, '$.networkWait.nextAttemptAt'), 0)) <= ? ORDER BY runs.priority DESC, runs.created_at ASC LIMIT ?`,
         )
         .all(now, limit) as Row[]
     ).map(toRun);
