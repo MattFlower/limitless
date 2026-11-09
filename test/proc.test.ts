@@ -148,6 +148,50 @@ test.each([
   },
 );
 
+test.each(["stdout", "stderr"] as const)(
+  "raw %s decoder EOF callback failures are contained",
+  async (stream) => {
+    const seen: string[] = [];
+    const result = await withChunks([{ stream, text: Buffer.from([0x61, 0xe2, 0x82]) }], () =>
+      captured({
+        onRawChunk: (text, source) => {
+          expect(source).toBe(stream);
+          seen.push(text);
+          if (text === "\uFFFD") throw new Error("synthetic private EOF exception");
+        },
+      }),
+    );
+    expect(seen).toEqual(["a", "\uFFFD"]);
+    expect(result.outputError).toBe("Invocation output callback failed");
+    expect(result.exitCode).toBe(1);
+    expect(result.capture?.provenance.kind).not.toBe("complete");
+    expect(JSON.stringify(result)).not.toContain("synthetic private EOF exception");
+  },
+);
+
+test("sandbox preserves output callback failure before the startup token", async () => {
+  const failure = {
+    outputError: "Invocation output callback failed",
+    exitCode: 1,
+    signal: null,
+    cancelled: false,
+    timedOut: false,
+    idleTimedOut: false,
+    stdout: "",
+    stderr: "",
+    truncated: false,
+    durationMs: 0,
+  };
+  const result = await runSandboxed(
+    options(),
+    { write: [], protect: [] },
+    async () => failure,
+    undefined,
+    fakeConfinement,
+  );
+  expect(result).toEqual(failure);
+});
+
 test("gate inspection failure on an unterminated line cannot pass a zero-exit command", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "limitless-callback-gate-"));
   const observe = spyOn(BunTestCoverage.prototype, "observe").mockImplementation(() => {
