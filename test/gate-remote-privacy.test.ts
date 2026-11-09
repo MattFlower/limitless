@@ -1,8 +1,10 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { formatGateOutput, RENDER_LIMITS, renderGateOutput } from "../src/gates/failures.ts";
 import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import { recheckRemote } from "../src/gates/remote-privacy.ts";
 import { gateIdentities, IDENTITY_CAP, remoteGateData } from "../src/gates/text-privacy.ts";
 import { verifier } from "../src/util/privacy-proof.ts";
+import { registerCredential } from "../src/util/proc.ts";
 import { remoteFixture } from "./gate-remote-support.ts";
 
 const fixtures: ReturnType<typeof remoteFixture>[] = [];
@@ -234,3 +236,180 @@ test.each(["attested:lan", "attested:github-actions"] as const)(
     }
   },
 );
+
+test("LAN excerpts and both renderings bind exact bytes, transport and cut semantics", async () => {
+  const f = fixture(),
+    c = control(),
+    source = f.result({
+      ok: false,
+      exitCode: 1,
+      output: "x".repeat(6000),
+      failures: "assertion detail\n(fail) example",
+    });
+  const result = await f.scoped(() => recheckRemote(source, "attested:lan", c));
+  expect(result.failures).toBe(source.failures);
+  const verify = verifier(f.registry, f.signer).verify;
+  for (const [name, bytes, proof] of [
+    ["failures", source.failures ?? "", result.textPrivacy?.failures],
+    ...RENDER_LIMITS.map(
+      (limit) =>
+        [
+          `rendering:${limit}`,
+          renderGateOutput(result, limit),
+          result.textPrivacy?.renderings?.[limit],
+        ] as const,
+    ),
+  ] as const) {
+    expect(proof).toMatchObject({ kind: "attested:lan", truncated: true });
+    expect(verify(proof, name, bytes, true)).toBe(true);
+    expect(verify({ ...proof, kind: "complete" }, name, bytes, true)).toBe(false);
+    expect(verify(proof, name, bytes, false)).toBe(false);
+    expect(verify(proof, name, `${bytes}!`, true)).toBe(false);
+  }
+  const cuts = spyOn(f.checker, "protectProducerCut");
+  await f.scoped(() => recheckRemote(source, "attested:lan", c));
+  expect(cuts).not.toHaveBeenCalled();
+  const changed = await f.scoped(() =>
+    recheckRemote({ ...source, failures: "different detail" }, "attested:lan", c),
+  );
+  expect(changed.failures).toBe("different detail");
+  expect(cuts).toHaveBeenCalledTimes(3);
+  for (const limit of RENDER_LIMITS)
+    expect(f.scoped(() => formatGateOutput(changed, limit))).toBe(`different detail\n\n${"x".repeat(1000)}`);
+});
+
+test.each([
+  "withheld",
+  "incomplete",
+  "missing",
+  "digest",
+  "parity",
+  "passing",
+  "private",
+  "prefix",
+  "credential",
+])("untrusted LAN excerpts fail closed: %s", async (condition) => {
+  const f = fixture(["private-example"], "excerpt-credential"),
+    source = f.result({
+      ok: condition === "passing",
+      exitCode: condition === "passing" ? 0 : 1,
+      failures:
+        condition === "private"
+          ? "private-example"
+          : condition === "prefix"
+            ? "detail p"
+            : condition === "credential"
+              ? "excerpt-credential"
+              : "detail",
+    });
+  const claim = source.remoteAttestation?.output;
+  if (!claim) throw Error("Missing claim");
+  if (condition === "withheld") claim.withheld = true;
+  if (condition === "incomplete") claim.checkedComplete = false;
+  if (condition === "missing") delete source.remoteAttestation;
+  if (condition === "digest") claim.entriesDigest = "0".repeat(64);
+  const cuts = spyOn(f.checker, "protectProducerCut");
+  const checked = await f.scoped(() =>
+    recheckRemote(source, "attested:lan", { ...control(), parity: () => condition !== "parity" }),
+  );
+  expect(checked.failures).toBeUndefined();
+  expect(checked.textPrivacy?.failures?.mac).toBeUndefined();
+  if (condition !== "passing") expect(checked.textPrivacy?.failures?.withheld).toBe(true);
+  if (!["private", "prefix", "credential"].includes(condition)) expect(cuts).not.toHaveBeenCalled();
+  else expect(checked.textPrivacy?.failures?.reason).toBe("private-match");
+});
+
+test.each(["attested:lan", "attested:github-actions"] as const)(
+  "%s timeout bypasses a successful memo",
+  async (kind) => {
+    const f = fixture(),
+      c = control(),
+      source = f.result({ ok: false, exitCode: 1, output: "x".repeat(6000), failures: "detail" });
+    await f.scoped(() => recheckRemote(source, kind, c));
+    const cuts = spyOn(f.checker, "protectProducerCut");
+    const timed = await f.scoped(() => recheckRemote({ ...source, timedOut: true }, kind, c));
+    expect(timed.output).toBe("[withheld: timeout; timed out]");
+    expect(timed.textPrivacy?.output).toEqual({ withheld: true, reason: "timeout" });
+    expect(timed.textPrivacy?.identities?.kind).toBe(kind);
+    expect(timed.failures).toBeUndefined();
+    expect(timed.textPrivacy?.failures).toBeUndefined();
+    expect(timed.textPrivacy?.renderings).toBeUndefined();
+    expect(cuts).not.toHaveBeenCalled();
+  },
+);
+
+test.each([1, 2, 3])(
+  "diagnostic check %s revalidates policy, parity, cancellation, expiry and claims",
+  async (pending) => {
+    for (const change of ["policy", "parity", "cancel", "deadline", "claim", "credentials"]) {
+      const f = fixture(),
+        c = control(),
+        controller = new AbortController();
+      let parity = true,
+        now = Date.now(),
+        calls = 0;
+      const source = f.result({
+        ok: false,
+        exitCode: 1,
+        output: "x".repeat(6000),
+        failures: `diagnostic-for-${pending}`,
+      });
+      const ready = Promise.withResolvers<void>(),
+        finish = Promise.withResolvers<void>(),
+        original = f.checker.protectProducerCut;
+      const spy = spyOn(f.checker, "protectProducerCut").mockImplementation(async (input, options) => {
+        expect(options?.deadline).toBe(c.deadline);
+        const receipt = await original(input, options);
+        if (++calls === pending) {
+          ready.resolve();
+          await finish.promise;
+        }
+        return receipt;
+      });
+      const checked = f.scoped(() =>
+        recheckRemote(source, "attested:lan", {
+          ...c,
+          signal: controller.signal,
+          now: () => now,
+          parity: () => parity,
+        }),
+      );
+      await ready.promise;
+      if (change === "policy") f.policy(["other-entry"]);
+      if (change === "parity") parity = false;
+      if (change === "cancel") controller.abort();
+      if (change === "deadline") now = c.deadline;
+      if (change === "claim" && source.remoteAttestation)
+        source.remoteAttestation.output.checkedComplete = false;
+      if (change === "credentials")
+        registerCredential("REMOTE_EXCERPT_TEST", `diagnostic-for-${pending}`, true);
+      finish.resolve();
+      const result = await checked;
+      expect(result.failures).toBeUndefined();
+      expect(result.textPrivacy?.failures?.mac).toBeUndefined();
+      for (const [limit, record] of Object.entries(result.textPrivacy?.renderings ?? {})) {
+        if (change === "credentials" && pending === 1) {
+          expect(f.scoped(() => formatGateOutput(result, Number(limit) as 3000 | 9000))).toBe(
+            "x".repeat(Number(limit) === 3000 ? 3000 : 6000),
+          );
+        } else expect(record.mac).toBeUndefined();
+      }
+      spy.mockRestore();
+    }
+  },
+);
+
+test("memoized remote cuts cannot be re-signed after a credential suffix becomes known", async () => {
+  const f = fixture(),
+    c = control(),
+    source = f.result({ ok: false, exitCode: 1, failures: "memoized-fragment" });
+  const first = await f.scoped(() => recheckRemote(source, "attested:lan", c));
+  expect(first.failures).toBe("memoized-fragment");
+  registerCredential("REMOTE_MEMO_CUT", "memoized-fragment-with-newly-known-suffix", true);
+  const cuts = spyOn(f.checker, "protectProducerCut");
+  const result = await f.scoped(() => recheckRemote(source, "attested:lan", c));
+  expect(result.failures).toBeUndefined();
+  expect(result.textPrivacy?.failures).toEqual({ withheld: true, reason: "credential-changed" });
+  expect(result.textPrivacy?.renderings).toBeUndefined();
+  expect(cuts).not.toHaveBeenCalled();
+});

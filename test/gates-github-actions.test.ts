@@ -20,7 +20,9 @@ import {
   type GateRequest,
   localExecutor,
 } from "../src/gates/executor.ts";
+import { formatGateOutput, renderGateOutput } from "../src/gates/failures.ts";
 import { type ActionsProgress, githubActionsExecutor } from "../src/gates/github-actions.ts";
+import { projectGateDiagnostics } from "../src/gates/output.ts";
 import {
   compareGates,
   type GateRun,
@@ -37,6 +39,7 @@ import {
   resumeGateExecution,
   runGateExecution,
 } from "../src/pipeline/gate-execution.ts";
+import { formatGateFeedback } from "../src/pipeline/prompts.ts";
 import { verifier } from "../src/util/privacy-proof.ts";
 import { CommandError, registerCredential, sh } from "../src/util/proc.ts";
 import { remoteFixture } from "./gate-remote-support.ts";
@@ -505,7 +508,7 @@ test.each(["cancelled", "skipped", "startup_failure", "missing-record"])(
 
 test("redaction covers a credential crossing the setup output tail boundary before any clipping", async () => {
   const f = fixture();
-  const credential = "synthetic-boundary-credential-for-actions-output";
+  const credential = "synthetic-boundary-value-with-distinct-fragments";
   registerCredential("ACTIONS_SETUP_BOUNDARY", credential);
   privacy.credentials.add(credential);
   f.state.logs.set(
@@ -2399,4 +2402,51 @@ test("Actions withholds a section if the whole-log receipt becomes stale during 
     expect(r.textPrivacy?.output.mac).toBeUndefined();
     expect(r.output).toStartWith("[withheld:");
   }
+});
+
+test("Actions sections receive verified renderings and projections omit diagnostic records", async () => {
+  const f = fixture();
+  f.state.logs.set(1, log(framed(), `${"x".repeat(6000)}\n${framed(0, 1)}`));
+  const result = (await f.run()).checks[0];
+  if (!result) throw Error("Missing result");
+  const bytes = renderGateOutput(result, 3000);
+  expect(bytes).toBe(`${"x".repeat(3000 - framed(0, 1).length - 1)}\n${framed(0, 1)}`);
+  expect(result.textPrivacy?.renderings?.[3000]).toMatchObject({
+    kind: "attested:github-actions",
+    truncated: true,
+  });
+  expect(
+    verifier(privacy.registry, privacy.signer).verify(
+      result.textPrivacy?.renderings?.[3000],
+      "rendering:3000",
+      bytes,
+      true,
+    ),
+  ).toBe(true);
+  expect(privacy.scoped(() => formatGateOutput(result, 3000))).toBe(bytes);
+  expect(result.failures).toBeUndefined();
+  for (const mode of ["outward", "durable"] as const) {
+    const projected = privacy.scoped(() => projectGateDiagnostics(result, { mode }));
+    expect(projected.failures).toBeUndefined();
+    expect(projected.textPrivacy?.failures).toBeUndefined();
+    expect(projected.textPrivacy?.renderings).toBeUndefined();
+  }
+});
+
+test("Actions supervisor timeout withholds clean running-test diagnostics", async () => {
+  const f = fixture();
+  f.state.logs.set(1, log(framed(), `RUN unfinished case\n${framed(0, 137, 345, true)}`));
+  const result = (await f.run()).checks[0];
+  if (!result) throw Error("Missing result");
+  expect(result.timedOut).toBe(true);
+  expect(result.output).toBe("[withheld: timeout; timed out]");
+  expect(result.textPrivacy?.output).toEqual({ withheld: true, reason: "timeout" });
+  expect(result.failures).toBeUndefined();
+  expect(result.textPrivacy?.renderings).toBeUndefined();
+  const feedback = privacy.scoped(() =>
+    formatGateFeedback([{ name: "test", verdict: "regressed", blocking: true, result }], req.gates),
+  );
+  expect(feedback).toContain("timed out after 80 s");
+  expect(feedback).not.toContain("last test running");
+  expect(feedback).not.toContain("unfinished case");
 });

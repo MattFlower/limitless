@@ -356,3 +356,83 @@ test("LAN shares one deadline through events, finals and attempts; abort cancels
   cancelled.controller.abort();
   expect(await result).toBeUndefined();
 });
+
+test.each([1, 2, 3])(
+  "LAN diagnostic check %s rejects moved leases before events and final results",
+  async (pending) => {
+    for (const path of ["event", "final"])
+      for (const change of ["worker", "attempt"]) {
+        const f = await fixture(),
+          r = f.privacy.result({
+            ok: false,
+            exitCode: 1,
+            output: "x".repeat(6000),
+            failures: "assertion detail",
+          });
+        // Retained attempts take the same checked path as the current result.
+        const retained = { ...f.privacy.result(), firstAttempt: r };
+        if (path === "event")
+          f.workers.event(f.handle.id, { type: "check", phase: "check", result: retained });
+        f.workers.complete(f.handle.id, path === "final" ? { ...f.empty, checks: [retained] } : f.empty);
+        const ready = Promise.withResolvers<void>(),
+          finish = Promise.withResolvers<void>(),
+          original = f.privacy.checker.protectProducerCut;
+        let calls = 0;
+        spyOn(f.privacy.checker, "protectProducerCut").mockImplementation(async (...args) => {
+          const receipt = await original(...args);
+          if (++calls === pending) {
+            ready.resolve();
+            await finish.promise;
+          }
+          return receipt;
+        });
+        const execution = f.attach(),
+          events: ExecutionEvent[] = [];
+        const drain = (async () => {
+          for await (const event of execution.events) events.push(event);
+        })();
+        await ready.promise;
+        f.store.db
+          .query("UPDATE gate_jobs SET result=?,events='[]' WHERE id=?")
+          .run(JSON.stringify(f.empty), f.handle.id);
+        f.store.db
+          .query(
+            change === "worker"
+              ? "UPDATE gate_jobs SET worker='replacement' WHERE id=?"
+              : "UPDATE gate_jobs SET attempt=attempt+1 WHERE id=?",
+          )
+          .run(f.handle.id);
+        finish.resolve();
+        const run = await execution.result;
+        await drain;
+        expect(events).toEqual([]);
+        expect(run.checks).toEqual([]);
+      }
+  },
+);
+
+test("coordinator restart drops legacy excerpts on an already leased job", async () => {
+  const f = await fixture(),
+    { remoteAttestation: _claims, ...legacy } = f.privacy.result({
+      ok: false,
+      exitCode: 1,
+      failures: "unchecked legacy detail",
+    });
+  expect(f.workers.job(f.handle.id)?.state).toBe("leased");
+  const restarted = new WorkerStore(f.store, "f".repeat(40), { tick: 1 });
+  restarted.event(f.handle.id, { type: "check", phase: "check", result: legacy });
+  restarted.complete(f.handle.id, { ...f.empty, checks: [legacy] });
+  const execution = f.privacy.scoped(() =>
+    lanExecutor(restarted, ["test/repo"]).attach(f.handle, f.controller.signal),
+  );
+  const results = [];
+  for await (const event of execution.events) if (event.type === "check") results.push(event.result);
+  results.push(...(await execution.result).checks);
+  expect(results).toHaveLength(2);
+  for (const result of results) {
+    expect(result.failures).toBeUndefined();
+    expect(result.textPrivacy?.output.mac).toBeUndefined();
+    expect(result.textPrivacy?.failures?.mac).toBeUndefined();
+    expect(result.textPrivacy?.renderings).toBeUndefined();
+  }
+});

@@ -294,6 +294,33 @@ Producer-cut proofs also authenticate a keyed digest of the sorted credential se
 
 Benchmark evidence: [2c (#1183)](https://github.com/MattFlower/limitless/pull/1183) and [2f (#1192)](https://github.com/MattFlower/limitless/pull/1192) record two warmups and five timed trials, warmup-inclusive worst synchronous slices, timed medians and separate unowned gaps. Their published reports validate those metrics but omit numeric worst-slice and median results; those numbers remain unreported here rather than inferred or rerun. 2f explicitly labels pre-adapter projection equivalents and unavailable signed-log operations. These reports alone establish no 50-ms production envelope.
 
+### c2.2c delivered
+
+Captured gates share a 262,144-U work budget per turn across processes, with round-robin
+admission, backpressure and ordered EOF/close draining in each caller's async context. Lines
+are sanitized once; observers retain the whole-value credential rule without re-redacting.
+D1 checks producer cuts with truncated semantics, including partial private-entry prefixes;
+proofs bind the cut flag, policy, transport kind, field, exact bytes and diagnostic credential set.
+
+Failing, complete local captures may release checked excerpts. LAN excerpts additionally need
+an eligible complete-check output claim, current entries digest, matching worker parity and a
+coordinator cut check; legacy worker excerpts authorize nothing. LAN and Actions renderings
+are recomputed and checked at 3,000 and 9,000 U with their transport kind. Actions has no
+excerpts. Remote timeouts release `[withheld: timeout; timed out]`, with no diagnostic proof or
+rendering; independently checked identities remain possible. Every check shares its result's
+absolute deadline, and jobs/claims/proofs are revalidated after awaits and before release.
+Workers add no wire keys. Optional excerpt/rendering records need no migration and both
+outward and durable projections omit them.
+
+The declared envelope is worst daemon turns ≤50 ms, warmups included, for `gate-5mib`,
+`gate-line-8mb`, `gate-line-32mib`, `gate-concurrent` and `gate-fail-5mib` on the factory's
+macOS arm64 class, including receipt capture, decoding and raw scanning. The issue's baseline
+at `70047eaa` reports warmup-inclusive worst turns of 30.1, 55.2, 240.4, 61.3 and 204.2 ms
+respectively (load 2–16 across trials); removing redundant observer redaction alone reached
+90.3 ms for failing output. These are baseline observations, not candidate acceptance results.
+Numeric post-budget results for all five workloads are not recorded here; that evidence is
+still missing. The shared unit bound is deterministic; a universal latency guarantee is not claimed.
+
 ## c2 adversarial regression matrix
 
 Each row names the inventory classes it covers. Use explicit synthetic policy/credentials,
@@ -378,7 +405,7 @@ envelope through the worker checker.
 | c2.1c.1 / c2.1b.3 (#1102) | Worker checker protocol, generations, lifecycle and reservations. | 170–220 / 100–150 | Fake-port generation, protocol, capacity and lifecycle mutations. |
 | c2.1c.2 / c2.1c.1 (#1103) | Bounded transport, result authority and service integration. | 140–200 / 80–120 | Backpressure and semantic parity through fake ports. |
 | c2.1c.3 / c2.1c.2 (#1104) | Compiled worker entry, real-worker probes, benchmark rerun and design update. | 120–180 / 30–60 | macOS and Linux probes, packaged execution; no daemon slice over 50 ms, warmups included. |
-| c2.2 / c2.1c.3 (#928) | Complete bounded gate capture, excerpts/tail and gate metadata; 2–3 deliveries. | 400–600 / 300–500 | proc/gates/feedback tests; split/overlap/cap cases and whole gate benchmark reporting worst daemon stall beside medians; meet the 50-ms synchronous-slice budget including concurrent gates and transfers. Other producers remain explicitly unaudited. |
+| c2.2 / c2.1c.3 (#928) | Delivered through c2.2c-d: shared capture budget, checked excerpts and fixed-limit local/remote renderings; remote timeouts withheld. | Split deliveries; c2.2c-d hard stop 250 source lines | proc/gates/feedback and mixed-wire regressions; declared five-workload ≤50-ms envelope still needs numeric post-budget evidence here. Other producers remain explicitly unaudited. |
 | c2.3 / c2.2 (#929) | Harness logs/results/events, prompts and post-merge/worker persistence; 2–3 deliveries. | 400–600 / 300–500 | harness/pipeline/workers restart tests; no unchecked log append, flags survive persistence. |
 | c2.4 / c2.3 (#930) | MCP transport/results, REST/SSE, privateOutputData, feed/digest/change/report adapters and optional metadata storage; 2–3 deliveries. | 450–650 / 350–550 | MCP/feed/digest/report/HTTP tests plus old-writer/new-reader and rollback migration fixtures. |
 | c2.5 / c2.4 (#931) | PR/commit/Discord/deploy/eval/log/script adapters and remaining audit; 2 deliveries. | 350–500 / 250–400 | Publication/delivery/Discord/deploy/eval tests and repeat inventory search; claim universal coverage only when every row is accounted for. |

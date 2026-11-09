@@ -30,7 +30,7 @@ export const textPrivacySchema = z.strictObject({
 export type TextPrivacy = z.infer<typeof textPrivacySchema>;
 const WITHHELD_REASONS = new Set<unknown>([
   ...privacyReasons,
-  ..."capture-cap capture-incomplete identity-cap unproven credential-changed event-size".split(" "),
+  ..."capture-cap capture-incomplete identity-cap unproven credential-changed event-size timeout".split(" "),
 ]);
 export const withheldText = (reason: unknown, timedOut = false) =>
   `[withheld: ${WITHHELD_REASONS.has(reason) ? reason : "unproven"}${timedOut ? "; timed out" : ""}]`;
