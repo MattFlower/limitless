@@ -8,7 +8,7 @@ import { Store } from "../src/db/store.ts";
 import { githubWait } from "../src/git/github-wait.ts";
 import { ClaimLostError, ClaimWaitError } from "../src/integrations/claim-errors.ts";
 import { claimGuard } from "../src/integrations/claim-guard.ts";
-import { createClaimClient } from "../src/integrations/claim-ref.ts";
+import { createClaimClient, parseRecord } from "../src/integrations/claim-ref.ts";
 import { createControlStore } from "../src/integrations/control-store.ts";
 import type { GhRunner } from "../src/integrations/github.ts";
 import { createLeaseManager } from "../src/integrations/leases.ts";
@@ -397,7 +397,7 @@ test("queued cancellation defers, sweep publishes then releases, and local termi
   x.store.updateRun(other.id, { status: "succeeded" });
   await x.clock.advance(LEASE.renewMs);
   await wait(() => x.store.heldLeaseRows().length === 0, { timeoutMs: 20_000 });
-  expect((await x.record(other)).checkpoint).toBe(pointer);
+  expect(await x.record(other)).toMatchObject({ status: "queued", state: "released", checkpoint: pointer });
 });
 
 test("lease loop lapses blocked waits, renews terminal waits, and stops with the Factory", async () => {
@@ -558,17 +558,23 @@ test("terminal sweeps stay single-flight and stop waits for publication", async 
   const x = await fixture(),
     run = await x.create();
   const entered = Promise.withResolvers<void>(),
-    resume = Promise.withResolvers<void>();
+    resume = Promise.withResolvers<void>(),
+    publicationSignal = Promise.withResolvers<AbortSignal>();
   const commit = x.rt.committer.commit;
-  let publications = 0;
-  spyOn(x.rt.committer, "commit").mockImplementation(async (...args) => {
-    if (args[3]) {
-      publications++;
-      entered.resolve();
-      await resume.promise;
-    }
+  spyOn(x.rt.committer, "commit").mockImplementation((...args) => {
+    if (args[3]) publicationSignal.resolve(args[2]);
     return commit(...args);
   });
+  let publications = 0;
+  x.gh.fault = async (request) => {
+    if (request.step !== "update") return;
+    const update = x.gh.update(request),
+      record = parseRecord(x.gh.commits.get(update.afterOid)?.message ?? "", update.name);
+    if (record === "malformed" || record.status !== "cancelled") return;
+    publications++;
+    entered.resolve();
+    await resume.promise;
+  };
   x.f.cancelRun(run.id);
   let stopping: Promise<void> | undefined;
   try {
@@ -580,6 +586,7 @@ test("terminal sweeps stay single-flight and stop waits for publication", async 
     stopping = x.f.stop().then(() => {
       stopped = true;
     });
+    expect((await publicationSignal.promise).aborted).toBe(true);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(stopped).toBe(false);
     resume.resolve();
@@ -588,6 +595,177 @@ test("terminal sweeps stay single-flight and stop waits for publication", async 
     const writes = x.gh.requests.length;
     await x.clock.advance(LEASE.renewMs);
     expect(x.gh.requests).toHaveLength(writes);
+  } finally {
+    resume.resolve();
+    await stopping;
+  }
+});
+
+test("scheduler shutdown preserves the terminal decision during publication", async () => {
+  const x = await fixture(),
+    run = await x.create(),
+    entered = Promise.withResolvers<AbortSignal>(),
+    resume = Promise.withResolvers<void>(),
+    commit = x.rt.committer.commit;
+  x.rt.checkpointer.writeRun(run.id, {
+    status: "needs_human",
+    error: "intended decision",
+    finishedAt: x.clock.now(),
+  });
+  const intent = x.store.checkpointRecord(run.id)?.terminal;
+  spyOn(x.rt.committer, "commit").mockImplementation(async (...args) => {
+    entered.resolve(args[2]);
+    await resume.promise;
+    return commit(...args);
+  });
+  let stopping: Promise<void> | undefined;
+  try {
+    x.f.scheduler.setLimit(1);
+    x.f.scheduler.tick();
+    const signal = await entered.promise;
+    stopping = x.f.stop();
+    await wait(() => signal.aborted, { timeoutMs: 20_000 });
+    resume.resolve();
+    await stopping;
+    expect(x.store.checkpointRecord(run.id)?.terminal).toBe(intent);
+    expect(x.store.getRun(run.id)).toMatchObject({
+      status: "queued",
+      error: null,
+      finishedAt: null,
+      githubWait: { reason: "claim:terminal", nextAttemptAt: x.clock.now() + githubWait.intervalMs },
+    });
+    expect(await x.record(run)).toMatchObject({ status: "queued", state: "held" });
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+    expect(x.store.listInvocations(run.id)).toHaveLength(0);
+  } finally {
+    resume.resolve();
+    await stopping;
+  }
+});
+
+test("stop drains a scheduler terminal publication's aborted companion upload", async () => {
+  const x = await fixture(),
+    run = await x.create(),
+    entered = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  x.rt.checkpointer.writeRun(run.id, {
+    status: "needs_human",
+    error: "intended decision",
+    finishedAt: x.clock.now(),
+  });
+  const intent = x.store.checkpointRecord(run.id)?.terminal;
+  x.remote.hook = async (call, next) => {
+    if (call.method === "POST" && call.url.endsWith("/git/blobs")) {
+      entered.resolve();
+      await resume.promise;
+    }
+    return next();
+  };
+  let stopping: Promise<void> | undefined;
+  try {
+    x.f.scheduler.setLimit(1);
+    x.f.scheduler.tick();
+    await entered.promise;
+    let stopped = false;
+    stopping = x.f.stop().then(() => {
+      stopped = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    resume.resolve();
+    await stopping;
+    expect(x.store.checkpointRecord(run.id)?.terminal).toBe(intent);
+    const snapshot = () => ({
+      ledger: { held: x.store.heldLeaseRows(), intents: x.store.leaseRowsWithIntent() },
+      checkpoint: x.store.checkpointRecord(run.id),
+      refs: [...x.gh.refs],
+      requests: x.gh.requests.length,
+      blobs: [...x.remote.blobs],
+      blobRefs: [...x.remote.refs],
+      calls: x.remote.calls.length,
+    });
+    const before = snapshot();
+    resume.resolve();
+    await x.clock.advance(LEASE.renewMs * 3);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(snapshot()).toEqual(before);
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+    expect(x.store.listInvocations(run.id)).toHaveLength(0);
+  } finally {
+    resume.resolve();
+    await stopping;
+  }
+});
+
+test("stop drains a scheduler's unleased terminal admission past its deadline", async () => {
+  const x = await fixture();
+  spyOn(x.rt.gate, "admit").mockResolvedValue(["slots"]);
+  const run = await x.create(),
+    entered = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  expect(x.store.heldLeaseRows()).toHaveLength(0);
+  expect(x.store.checkpointRecord(run.id)).toBeNull();
+  Object.assign(x.rt, { admissionDeadlineMs: 50 });
+  x.f.cancelRun(run.id);
+  const intent = x.store.checkpointRecord(run.id)?.terminal,
+    key = claimKey(run, x.store);
+  if ("none" in key) throw new Error("fixture claim key");
+  expect(x.store.leaseRow(run.repoSlug, claimRef(key))).toBeNull();
+  expect(JSON.parse(intent ?? "null")).toMatchObject({ status: "cancelled" });
+  x.gh.fault = async (request) => {
+    if (request.step !== "update") return;
+    const update = x.gh.update(request),
+      record = parseRecord(x.gh.commits.get(update.afterOid)?.message ?? "", update.name);
+    if (record === "malformed" || !record.checkpoint) return;
+    entered.resolve();
+    await resume.promise;
+  };
+  const confirmedLease = spyOn(x.store, "confirmLease"),
+    confirmedCheckpoint = spyOn(x.store, "confirmCheckpoint");
+  let stopping: Promise<void> | undefined;
+  try {
+    // Pick before advancing the sweep clock: the Scheduler owns this admission.
+    x.f.scheduler.setLimit(1);
+    x.f.scheduler.tick();
+    await entered.promise;
+    expect(x.f.scheduler.activeRunIds).toEqual([run.id]);
+    expect(x.store.checkpointRecord(run.id)?.committed).toBeNull();
+    expect(confirmedCheckpoint).not.toHaveBeenCalled();
+    let stopped = false;
+    stopping = x.f.stop().then(() => {
+      stopped = true;
+    });
+    await x.clock.advance(51);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopped).toBe(false);
+    resume.resolve();
+    await stopping;
+    expect(JSON.parse(x.store.checkpointRecord(run.id)?.terminal ?? "null")).toMatchObject({
+      status: "cancelled",
+      error: "cancelled by user",
+    });
+    expect(x.store.getRun(run.id)).toMatchObject({
+      status: "queued",
+      githubWait: { reason: "claim:terminal" },
+    });
+    const snapshot = () => ({
+      ledger: x.store.leaseRow(run.repoSlug, claimRef(key)),
+      intents: x.store.leaseRowsWithIntent(),
+      leaseConfirmations: confirmedLease.mock.calls.length,
+      checkpointConfirmations: confirmedCheckpoint.mock.calls.length,
+      checkpoint: x.store.checkpointRecord(run.id),
+      refs: [...x.gh.refs],
+      requests: x.gh.requests.length,
+      blobs: [...x.remote.blobs],
+      blobRefs: [...x.remote.refs],
+      calls: x.remote.calls.length,
+    });
+    const before = snapshot();
+    await x.clock.advance(LEASE.renewMs * 3);
+    for (let i = 0; i < 3; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(snapshot()).toEqual(before);
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+    expect(x.store.listInvocations(run.id)).toHaveLength(0);
   } finally {
     resume.resolve();
     await stopping;
@@ -615,17 +793,24 @@ test("the scheduler retries incomplete admission only after its durable wait ela
   expect(x.trace.slice(0, 3)).toEqual(["commit:1", "commit:2", "stage:prepare"]);
 });
 
-test("a picked deferred cancellation publishes instead of repeatedly finalizing locally", async () => {
-  const x = await fixture(),
-    run = await x.create();
-  x.f.cancelRun(run.id);
-  x.f.scheduler.setLimit(1);
-  x.f.scheduler.tick();
-  await wait(() => x.store.getRun(run.id)?.status === "cancelled", { timeoutMs: 20_000 });
-  await x.idle();
-  expect(await x.record(run)).toMatchObject({ status: "cancelled", state: "released" });
-  expect(x.store.listStages(run.id)).toHaveLength(0);
-});
+test.each(["slots", "power", "draining"] as const)(
+  "a picked unleased cancellation ignores %s",
+  async (reason) => {
+    const x = await fixture();
+    spyOn(x.rt.gate, "admit").mockResolvedValue([reason]);
+    const run = await x.create();
+    expect(x.store.heldLeaseRows()).toHaveLength(0);
+    x.f.cancelRun(run.id);
+    x.f.scheduler.setLimit(1);
+    x.f.scheduler.tick();
+    await wait(() => x.store.getRun(run.id)?.status === "cancelled", { timeoutMs: 20_000 });
+    await x.idle();
+    expect(await x.record(run)).toMatchObject({ status: "cancelled", state: "released" });
+    expect(x.store.checkpointRecord(run.id)?.terminal).toBeNull();
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+    expect(x.store.listInvocations(run.id)).toHaveLength(0);
+  },
+);
 
 test("a refused initial export preserves needs_human without retrying admission", async () => {
   const x = await fixture(),
@@ -664,44 +849,228 @@ test("a refused initial export preserves needs_human without retrying admission"
   }
 });
 
-test("an unleased cancellation publishes with zero execution slots", async () => {
-  const x = await fixture();
-  spyOn(x.rt.gate, "admit").mockRejectedValueOnce(new ClaimWaitError("capability"));
-  const run = await x.create();
-  x.f.cancelRun(run.id);
-  expect(x.store.getRun(run.id)).toMatchObject({
-    status: "queued",
-    githubWait: { reason: "claim:terminal" },
-  });
-  expect(x.store.heldLeaseRows()).toHaveLength(0);
-  const resume = Promise.withResolvers<void>(),
-    commit = x.rt.committer.commit;
-  let publishing = false;
-  spyOn(x.rt.committer, "commit").mockImplementation(async (...args) => {
-    if (args[3]) {
-      publishing = true;
-      await resume.promise;
+test.each(["slots", "power", "draining"] as const)(
+  "an unleased cancellation publishes despite %s with no scheduler capacity",
+  async (reason) => {
+    const x = await fixture();
+    spyOn(x.rt.gate, "admit").mockResolvedValue([reason]);
+    const run = await x.create();
+    if (reason === "draining") {
+      x.f.scheduler.setLimit(1);
+      x.f.scheduler.drain();
     }
-    return commit(...args);
+    x.f.cancelRun(run.id);
+    expect(x.store.getRun(run.id)).toMatchObject({
+      status: "queued",
+      githubWait: { reason: "claim:terminal" },
+    });
+    expect(x.store.heldLeaseRows()).toHaveLength(0);
+    const resume = Promise.withResolvers<void>(),
+      commit = x.rt.committer.commit;
+    let publishing = false;
+    spyOn(x.rt.committer, "commit").mockImplementation(async (...args) => {
+      if (args[3]) {
+        publishing = true;
+        await resume.promise;
+      }
+      return commit(...args);
+    });
+    try {
+      await x.clock.advance(LEASE.renewMs);
+      await wait(() => publishing, { timeoutMs: 20_000 });
+      expect(x.f.scheduler.activeRunIds).toEqual([]);
+      expect(x.store.getRun(run.id)?.status).toBe("queued");
+      expect(await x.record(run)).toMatchObject({ status: "queued", state: "held" });
+      expect(x.store.listStages(run.id)).toHaveLength(0);
+      resume.resolve();
+      await wait(() => x.store.getRun(run.id)?.status === "cancelled", { timeoutMs: 20_000 });
+      await wait(() => x.store.heldLeaseRows().length === 0, { timeoutMs: 20_000 });
+      expect(await x.record(run)).toMatchObject({ status: "cancelled", state: "released" });
+      expect(x.store.checkpointRecord(run.id)?.terminal).toBeNull();
+      expect(x.f.scheduler.activeRunIds).toEqual([]);
+      expect(x.store.listStages(run.id)).toHaveLength(0);
+      expect(x.store.listInvocations(run.id)).toHaveLength(0);
+    } finally {
+      resume.resolve();
+    }
+  },
+);
+
+test("repeated terminal sweep ticks enter authority only once before its read settles", async () => {
+  const x = await fixture();
+  spyOn(x.rt.gate, "admit").mockResolvedValue(["slots"]);
+  const run = await x.create(),
+    entered = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  x.f.cancelRun(run.id);
+  const leaseRow = spyOn(x.store, "leaseRow"),
+    read = x.rt.claims.read;
+  spyOn(x.rt.claims, "read").mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await resume.promise;
+    return read(...args);
   });
   try {
     await x.clock.advance(LEASE.renewMs);
-    await wait(() => publishing, { timeoutMs: 20_000 });
-    expect(x.f.scheduler.activeRunIds).toEqual([]);
-    expect(x.store.getRun(run.id)?.status).toBe("queued");
-    expect(await x.record(run)).toMatchObject({ status: "queued", state: "held" });
-    expect(x.store.listStages(run.id)).toHaveLength(0);
+    await entered.promise;
+    for (let i = 0; i < 3; i++) await x.clock.advance(LEASE.renewMs);
+    // Each authority entry reads the local lease before joining the downstream publication queue.
+    expect(leaseRow).toHaveBeenCalledTimes(1);
     resume.resolve();
     await wait(() => x.store.getRun(run.id)?.status === "cancelled", { timeoutMs: 20_000 });
     await wait(() => x.store.heldLeaseRows().length === 0, { timeoutMs: 20_000 });
+    await x.clock.advance(LEASE.renewMs);
     expect(await x.record(run)).toMatchObject({ status: "cancelled", state: "released" });
-    expect(x.f.scheduler.activeRunIds).toEqual([]);
-    expect(x.store.listStages(run.id)).toHaveLength(0);
-    expect(x.store.listInvocations(run.id)).toHaveLength(0);
   } finally {
     resume.resolve();
   }
 });
+
+test("stop aborts a terminal sweep's initial production claim read", async () => {
+  const x = await fixture();
+  Object.assign(x.rt, { admissionDeadlineMs: 50 });
+  spyOn(x.rt.gate, "admit").mockResolvedValue(["slots"]);
+  const run = await x.create(),
+    entered = Promise.withResolvers<AbortSignal>(),
+    aborted = Promise.withResolvers<void>(),
+    resume = Promise.withResolvers<void>();
+  x.f.cancelRun(run.id);
+  x.gh.fault = async (request) => {
+    if (request.step !== "ref") return;
+    const signal = request.signal;
+    if (!signal) throw new Error("initial read must be cancellable");
+    entered.resolve(signal);
+    await Promise.race([
+      new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true })),
+      resume.promise,
+    ]);
+    if (signal.aborted) {
+      aborted.resolve();
+      throw signal.reason;
+    }
+  };
+  await x.clock.advance(LEASE.renewMs);
+  const signal = await entered.promise;
+  const stopping = x.f.stop();
+  try {
+    expect(signal.aborted).toBe(true);
+    await aborted.promise;
+    await stopping;
+    expect(x.store.heldLeaseRows()).toHaveLength(0);
+    expect(x.store.checkpointRecord(run.id)?.committed).toBeNull();
+    const writes = [x.gh.requests.length, x.remote.calls.length];
+    resume.resolve();
+    await x.clock.advance(LEASE.renewMs);
+    expect([x.gh.requests.length, x.remote.calls.length]).toEqual(writes);
+  } finally {
+    resume.resolve();
+    await stopping;
+  }
+});
+
+test.each(["checkpoint", "acquisition", "blob"] as const)(
+  "stop drains a terminal admission's %s write past its deadline",
+  async (phase) => {
+    const x = await fixture();
+    spyOn(x.rt.gate, "admit").mockResolvedValue(["slots"]);
+    const run = await x.create(),
+      entered = Promise.withResolvers<void>(),
+      resume = Promise.withResolvers<void>();
+    // The runtime is readonly to consumers, but this fixture injects a short admission deadline.
+    Object.assign(x.rt, { admissionDeadlineMs: 50 });
+    x.f.cancelRun(run.id);
+    x.gh.fault = async (request) => {
+      if (request.step !== "update") return;
+      const update = x.gh.update(request),
+        record = parseRecord(x.gh.commits.get(update.afterOid)?.message ?? "", update.name);
+      if (record === "malformed" || phase === "blob" || !!record.checkpoint !== (phase === "checkpoint"))
+        return;
+      entered.resolve();
+      await resume.promise;
+    };
+    if (phase === "blob")
+      x.remote.hook = async (call, next) => {
+        if (call.method === "POST" && call.url.endsWith("/git/blobs")) {
+          entered.resolve();
+          await resume.promise;
+        }
+        return next();
+      };
+    let stopping: Promise<void> | undefined;
+    try {
+      await x.clock.advance(LEASE.renewMs);
+      await entered.promise;
+      let stopped = false;
+      stopping = x.f.stop().then(() => {
+        stopped = true;
+      });
+      await x.clock.advance(51);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(stopped).toBe(false);
+      resume.resolve();
+      await stopping;
+      const snapshot = () => ({
+        ledger: { held: x.store.heldLeaseRows(), intents: x.store.leaseRowsWithIntent() },
+        checkpoint: x.store.checkpointRecord(run.id),
+        refs: [...x.gh.refs],
+        requests: x.gh.requests.length,
+        blobs: x.remote.calls.length,
+        blobRefs: [...x.remote.refs],
+      });
+      const before = snapshot();
+      resume.resolve();
+      await x.clock.advance(LEASE.renewMs * 3);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(snapshot()).toEqual(before);
+      expect(x.store.listStages(run.id)).toHaveLength(0);
+    } finally {
+      resume.resolve();
+      await stopping;
+    }
+  },
+);
+
+test.each(["wait", "lost"] as const)(
+  "terminal sweep maps a thrown claim %s at the runtime time",
+  async (kind) => {
+    const x = await fixture();
+    spyOn(x.rt.gate, "admit").mockResolvedValue(["slots"]);
+    const run = await x.create();
+    x.rt.checkpointer.writeRun(run.id, {
+      status: "failed",
+      error: "terminal decision",
+      finishedAt: x.clock.now(),
+    });
+    const read = spyOn(x.rt.claims, "read").mockRejectedValue(
+      kind === "wait" ? new ClaimWaitError("lease") : new ClaimLostError(),
+    );
+    await x.clock.advance(LEASE.renewMs);
+    const now = x.clock.now();
+    await wait(() => read.mock.calls.length > 0, { timeoutMs: 20_000 });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (kind === "wait") {
+      expect(x.store.getRun(run.id)).toMatchObject({
+        status: "queued",
+        finishedAt: null,
+        githubWait: { reason: "claim:lease", nextAttemptAt: now + githubWait.intervalMs },
+      });
+    } else {
+      expect(x.store.getRun(run.id)).toMatchObject({
+        status: "cancelled",
+        error: "superseded: claim lost",
+        finishedAt: now,
+        githubWait: undefined,
+      });
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await x.clock.advance(LEASE.renewMs);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(x.store.heldLeaseRows()).toHaveLength(0);
+    expect(x.gh.requests).toHaveLength(0);
+    expect(x.remote.calls).toHaveLength(0);
+    expect(x.store.listStages(run.id)).toHaveLength(0);
+  },
+);
 
 test("stop waits for a renewal paused inside a claim read and the loop writes nothing after", async () => {
   const x = await fixture();

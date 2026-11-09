@@ -987,7 +987,7 @@ export async function runCodex(
   });
 
   const windows = parser.threadId ? readCodexRateLimits(parser.threadId) : null;
-  if (windows && Object.keys(windows).length) {
+  if (!proc.outputError && windows && Object.keys(windows).length) {
     spec.onEvent({ type: "rate_limit", status: "observed", windows, resetsAt: null });
   }
   let structured: unknown = null;
@@ -1011,6 +1011,7 @@ export async function runCodex(
     ...(confinement ? { confinement } : {}),
   };
 
+  if (proc.outputError) return { ...base, status: "error", error: proc.outputError };
   if (stuckReason) return { ...base, status: "stuck", error: stuckReason };
   if (proc.cancelled) return { ...base, status: "cancelled", error: "cancelled" };
   const repeatReason = loop.finish();

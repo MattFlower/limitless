@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { BlobRef } from "../pipeline/portable.ts";
 import { redactCredentials, registerCredential } from "../util/proc.ts";
 import { rethrowClaimControl } from "./claim-errors.ts";
+import { trackClaimWork } from "./claim-work.ts";
 import { canonicalRepo } from "./lease-store.ts";
 
 // Codes `put` throws instead of classifying them as a retention outcome.
@@ -85,7 +86,9 @@ async function abortable<T>(signals: (AbortSignal | undefined)[], work: () => Pr
   const abort = () => aborted.reject(new SharedStoreError("aborted"));
   const subscriptions = signals.flatMap((s) => (s ? [addAbortListener(s, abort)] : []));
   try {
-    return await Promise.race([work(), aborted.promise]);
+    const request = work();
+    for (const signal of signals) trackClaimWork(signal, request);
+    return await Promise.race([request, aborted.promise]);
   } finally {
     for (const s of subscriptions) s[Symbol.dispose]();
   }

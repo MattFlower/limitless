@@ -24,6 +24,7 @@ import { platformConfinement } from "./harness/sandbox.ts";
 import { removeScratch } from "./harness/scratch.ts";
 import { type Harness, protectCredentials } from "./harness/types.ts";
 import { ClaimLostError, ClaimWaitError } from "./integrations/claim-errors.ts";
+import { drainClaimWork } from "./integrations/claim-work.ts";
 import { configureGitHubIdentity } from "./integrations/github-identity.ts";
 import { getGitHubPr } from "./integrations/github-notifier.ts";
 import { type LandDeps, LandQueue } from "./land/queue.ts";
@@ -353,12 +354,14 @@ export class Factory {
     this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
     const rt = this.opts.shared;
     if (rt) {
+      const sweepController = new AbortController();
       const h = claimHooks(rt, this.store);
       const stopLoop = rt.leases.start({
         active: withCapabilityLapse(this.store, h.active),
         onLost: h.onLost,
       });
       const sweep = () => {
+        if (sweepController.signal.aborted) return;
         timer = rt.clock.timer.set(sweep, LEASE.renewMs);
         const held = new Map(this.store.heldLeaseRows().map((row) => [row.runId, row]));
         const pending = this.store
@@ -371,9 +374,10 @@ export class Factory {
           if (!run || this.terminalSweeps.has(run.id)) continue;
           const terminal = this.store.checkpointRecord(run.id)?.terminal;
           if (!terminal && (!row?.confirmed || !TERMINAL_STATUSES.includes(run.status))) continue;
+          const signal = AbortSignal.any([sweepController.signal]);
           const work = (
             terminal
-              ? authorityFor(rt, this.store, this.cfg, run, new AbortController().signal)
+              ? authorityFor(rt, this.store, this.cfg, run, signal)
               : row?.confirmed
                 ? rt.leases.release(
                     {
@@ -398,6 +402,7 @@ export class Factory {
       };
       let timer = rt.clock.timer.set(sweep, LEASE.renewMs);
       this.stopShared = () => {
+        sweepController.abort(new ClaimWaitError("unavailable"));
         rt.clock.timer.clear(timer);
         return stopLoop();
       };
@@ -407,14 +412,16 @@ export class Factory {
 
   async stop(): Promise<void> {
     const leaseLoop = this.stopShared?.();
+    const scheduler = this.opts.shared ? this.scheduler.stop() : undefined;
     this.stopShared = undefined;
     this.tracker.stop();
     if (this.gcInterval) this.gcTimer.clear(this.gcInterval);
     this.gcInterval = null;
     await this.gcInFlight;
     this.tunnels.stop();
-    await Promise.all([this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
+    await Promise.all([scheduler ?? this.scheduler.stop(), this.evals.stop(), this.land.stop()]);
     if (this.opts.shared) await Promise.allSettled([leaseLoop, ...this.terminalSweeps.values()]);
+    if (this.opts.shared) await drainClaimWork(this.opts.shared);
     this.workers.cancelOpenAgentJobs(activity("workers.retain-agent-jobs", () => this.keptAgentJobs(), 50));
   }
 

@@ -266,9 +266,14 @@ export function privateHoldoutDetails(holdout: Holdout, publicSources = "", obse
   return details;
 }
 
-function collectHoldoutDetails(holdout: Holdout, collect: (detail: string) => void) {
+function collectHoldoutDetails(
+  holdout: Holdout,
+  collect: (detail: string) => void,
+  inspect?: (source: string) => void,
+) {
   for (const scenario of holdout.scenarios) {
     for (const source of [scenario.description, scenario.steps, scenario.expected]) {
+      inspect?.(source);
       // Whole phrases cover prose; only syntax-shaped literals are removed in isolation.
       if (source.trim().split(/\s+/).length > 1) collect(source.trim());
       for (const sentence of source.match(/[^.!?\n]+[.!?]/g) ?? [])
@@ -287,22 +292,51 @@ export function redactHoldoutText(
   return holdoutRedactor(holdout, publicSources)(value, includeObservedLiterals);
 }
 
+// UTF-16 units; limits bound extraction, literal regexes, scans per operation and retained state.
+const holdoutLimits = {
+  input: 65_536,
+  sources: 262_144,
+  detail: 4096,
+  count: 512,
+  pattern: 32_768,
+  classification: 4_194_304,
+  cache: 2048,
+};
+const holdoutWithheld = "[value withheld: holdout redaction limit or matcher failure]";
+
 export function holdoutRedactor(holdout: Holdout, publicSources = "") {
+  let work = 0;
+  const check = (ok: boolean) => {
+    if (!ok) throw new Error("Holdout redaction limit");
+  };
+  // Preflight the extractor's unanchored searches, including failed path and sentence matches.
+  const inspect = (source: string) =>
+    check(
+      source.length <= holdoutLimits.input &&
+        !/\S{513}/u.test(source) &&
+        source.split(/[.!?\n]/u).every((part) => part.length <= 4096),
+    );
   const privateLiterals = new Map<string, boolean>();
   const isPrivate = (detail: string) => {
     let result = privateLiterals.get(detail);
     if (result === undefined) {
+      check(publicSources.length <= holdoutLimits.sources);
+      check(detail.length <= holdoutLimits.detail && privateLiterals.size < holdoutLimits.cache);
+      work += detail.length + publicSources.length;
+      check(work <= holdoutLimits.classification);
       result = !!detail && !new RegExp(holdoutBoundaryPattern(detail), "iu").test(publicSources);
       privateLiterals.set(detail, result);
     }
     return result;
   };
   const details = new Set<string>();
-  collectHoldoutDetails(holdout, (detail) => {
-    if (isPrivate(detail)) details.add(detail);
-  });
-  const compile = (literals: Set<string>) =>
-    literals.size
+  const compile = (literals: Set<string>) => {
+    check(literals.size <= holdoutLimits.count);
+    check(
+      [...literals].reduce((size, detail) => size + holdoutBoundaryPattern(detail).length + 1, 0) <=
+        holdoutLimits.pattern,
+    );
+    return literals.size
       ? new RegExp(
           [...literals]
             .sort((a, b) => b.length - a.length)
@@ -311,22 +345,47 @@ export function holdoutRedactor(holdout: Holdout, publicSources = "") {
           "giu",
         )
       : undefined;
-  const basePattern = compile(details);
+  };
+  let basePattern: RegExp | undefined;
+  let failed = false;
+  try {
+    let size = 0;
+    check(holdout.scenarios.length <= holdoutLimits.count);
+    collectHoldoutDetails(
+      holdout,
+      (detail) => {
+        if (isPrivate(detail)) details.add(detail);
+        check(privateLiterals.size <= holdoutLimits.count);
+      },
+      (source) => {
+        size += source.length;
+        check(size <= holdoutLimits.sources);
+        inspect(source);
+      },
+    );
+    basePattern = compile(details);
+  } catch {
+    failed = true;
+  }
   // Retain only the last observed pattern: event IDs make observed sets mostly unique.
   let lastKey = "";
   let lastPattern: RegExp | undefined;
-  return (value: string, includeObservedLiterals = true): string => {
-    if (!holdout.scenarios.length) return value;
+  const redact = (value: string, includeObservedLiterals: boolean): string => {
+    check(value.length <= holdoutLimits.input);
+    if (includeObservedLiterals) inspect(value);
+    work = 0;
+    if (privateLiterals.size > holdoutLimits.cache - holdoutLimits.count) privateLiterals.clear();
     const extra = new Set<string>();
     // Observed details belong only to this value; public exemptions are safe to memoize.
     if (includeObservedLiterals)
       collectHoldoutLiterals(value, (detail) => {
         if (!details.has(detail) && isPrivate(detail)) extra.add(detail);
+        check(extra.size <= holdoutLimits.count);
       });
     const key = extra.size ? JSON.stringify([...extra].sort()) : "";
     if (key && key !== lastKey) {
-      lastKey = key;
       lastPattern = compile(extra);
+      lastKey = key;
     }
     const observedPattern = key ? lastPattern : undefined;
     if (basePattern) basePattern.lastIndex = 0;
@@ -360,6 +419,15 @@ export function holdoutRedactor(holdout: Holdout, publicSources = "") {
       }
     }
     return removed ? `${safe}${value.slice(position)} [${removed} private details withheld]` : value;
+  };
+  return (value: string, includeObservedLiterals = true): string => {
+    if (!holdout.scenarios.length) return value;
+    if (failed) return holdoutWithheld;
+    try {
+      return redact(value, includeObservedLiterals);
+    } catch {
+      return holdoutWithheld;
+    }
   };
 }
 
