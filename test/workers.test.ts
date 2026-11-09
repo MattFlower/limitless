@@ -91,6 +91,7 @@ import { attemptBudget, credentialBearing, validRun } from "../src/workers/valid
 import { bwrapSkip, fakeConfinement, recordingConfinement, seatbeltSkip } from "./confinement.ts";
 import { remoteFixture } from "./gate-remote-support.ts";
 import { PreviousHeartbeat } from "./previous-heartbeat.ts";
+import { PreviousCheck } from "./previous-worker-check.ts";
 import { resetProcessPrivacy, testPrivacy } from "./privacy-process-support.ts";
 import { test } from "./read-policy-support.ts";
 import {
@@ -8063,8 +8064,19 @@ describe("outer", () => {
     ],
   };
   const privacy = remoteFixture(),
-    streamed: ExecutionEvent[] = [];
-  const worker = await gatePrivacyScope.run({ ...privacy.scope, signer: undefined }, () => loop());
+    streamed: ExecutionEvent[] = [],
+    wireChecks: unknown[] = [];
+  const worker = await gatePrivacyScope.run({ ...privacy.scope, signer: undefined }, () =>
+    loop({
+      request: async (...args) => {
+        if (args[1].endsWith("/events")) {
+          const event = args[2] as { type?: string; result?: unknown };
+          if (event.type === "check") wireChecks.push(structuredClone(event.result));
+        }
+        return workerRequest(...args);
+      },
+    }),
+  );
   try {
     const run = await privacy.scoped(() =>
       executeGate(
@@ -8115,6 +8127,24 @@ describe("outer", () => {
       expect(text).not.toContain("textPrivacy");
       expect(text).not.toContain('"mac"');
     }
+    expect(wireChecks).toHaveLength(1);
+    const wire = wireChecks[0];
+    expect(PreviousCheck.parse(wire)).toEqual(wire);
+    expect((wire as { failures?: string }).failures).toContain("(fail) outer > fails");
+    expect(
+      PreviousCheck.safeParse({
+        ...(wire as object),
+        firstAttempt: wire,
+        targetedRetry: wire,
+        retryAttempt: wire,
+      }).success,
+    ).toBe(true);
+    expect(
+      PreviousCheck.safeParse({
+        ...(wire as object),
+        textPrivacy: { output: { withheld: false }, renderings: {} },
+      }).success,
+    ).toBe(false);
     expect(streamed).toContainEqual({ type: "check", phase: "check", result: returned });
     for (const result of [
       run.checks[0],
@@ -8125,7 +8155,8 @@ describe("outer", () => {
       const v = verifier(privacy.registry, privacy.signer);
       expect(v.verify(result.textPrivacy?.output, "output", result.output)).toBe(true);
       expect(v.verify(result.textPrivacy?.identities, "identities", gateIdentities(result))).toBe(true);
-      expect(result.failures).toBeUndefined();
+      expect(result.failures).toContain("(fail) outer > fails");
+      expect(v.verify(result.textPrivacy?.failures, "failures", result.failures ?? "", true)).toBe(true);
     }
     expect(run.checks[0]?.executedCommand).toContain("--reporter=junit");
     expect(run.checks[0]?.command).toBe(req.gates.checks[0]?.run);

@@ -456,7 +456,10 @@ export function githubActionsExecutor(deps: Dependencies): GateExecutor {
               const { withheld, reason } = consumeBoundaryChunk(whole, 0);
               if (withheld)
                 for (const item of [...parsed.setup, parsed.check]) {
+                  if (item.timedOut) continue;
                   item.output = withheldText(reason);
+                  delete item.failures;
+                  if (item.textPrivacy) delete item.textPrivacy.renderings;
                   if (item.textPrivacy) item.textPrivacy.output = { withheld: true, reason };
                 }
               // Only renderings and proofs enter progress; raw sections remain transient.
