@@ -41,6 +41,7 @@ export function consumerState(cap: number) {
               output: Record<string, unknown>;
               identities: Record<string, unknown>;
               renderings?: Record<string, unknown>;
+              failures?: Record<string, unknown>;
             }
           | undefined,
       },
@@ -200,6 +201,7 @@ export function renderFixture(c: Context, state: ReturnType<typeof consumerState
     };
     const output = await sign(r.output, "output"),
       identities = await sign(String(invoke(c, "gateIdentities", r)), "identities"),
+      failures = await sign(r.failures, "failures", true),
       renderings: Record<string, unknown> = {};
     for (const limit of [3000, 9000])
       renderings[limit] = await sign(
@@ -209,7 +211,7 @@ export function renderFixture(c: Context, state: ReturnType<typeof consumerState
       );
     for (const g of state.lastGates) {
       g.result.failures = r.failures;
-      g.result.textPrivacy = { output, identities, renderings };
+      g.result.textPrivacy = { output, identities, failures, renderings };
     }
   };
 }

@@ -290,6 +290,8 @@ The base-configured `name` and command template, exit codes, typed verdicts, `ex
 
 `formatGateOutput(result, limit)` accepts only the limits in `RENDER_LIMITS` (3,000 and 9,000 U). It recomputes `renderGateOutput` from the unprojected result and releases the bytes only if they equal the proven `output` or if they verify against that limit's cut proof in `textPrivacy.renderings` under a fresh snapshot (c2.2c-c). In every other case it returns a marker. Adoption slices 2d/2e/2g/2h/2i deploy together with c2.2c; landing a slice does not authorize deployment.
 
+Producer-cut proofs also authenticate a keyed digest of the sorted credential set. A rendering and its excerpt must match the current credential set, or return `credential-changed`: either cut may have discarded a newly registered credential's suffix. The digest survives restarts and registration order changes with the same key and credentials. Older cuts lacking this binding are withheld; exact-output proof reuse is unchanged.
+
 Benchmark evidence: [2c (#1183)](https://github.com/MattFlower/limitless/pull/1183) and [2f (#1192)](https://github.com/MattFlower/limitless/pull/1192) record two warmups and five timed trials, warmup-inclusive worst synchronous slices, timed medians and separate unowned gaps. Their published reports validate those metrics but omit numeric worst-slice and median results; those numbers remain unreported here rather than inferred or rerun. 2f explicitly labels pre-adapter projection equivalents and unavailable signed-log operations. These reports alone establish no 50-ms production envelope.
 
 ## c2 adversarial regression matrix

@@ -398,10 +398,13 @@ export function targetedRetrySkipReason(
 /** A composition carries no source, excerpt or rendering proof; only the identities proof still applies. */
 function withoutExcerpts({ failures: _failures, textPrivacy, ...rest }: GateResult): GateResult {
   if (!textPrivacy) return rest;
-  const { identities } = textPrivacy;
+  const { identities, output } = textPrivacy;
   return {
     ...rest,
-    textPrivacy: { output: { withheld: true, reason: "unproven" }, ...(identities && { identities }) },
+    textPrivacy: {
+      output: output.withheld ? output : { withheld: true, reason: "unproven" },
+      ...(identities && { identities }),
+    },
   };
 }
 

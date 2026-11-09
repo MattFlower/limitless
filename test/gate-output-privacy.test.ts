@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1058,6 +1058,83 @@ test("renderings observe current policy and credentials without rewriting text",
     expect(r.failures).toContain("fresh-render-credential-928");
   });
 });
+
+test.each(["encoded", ...RENDER_LIMITS, "collector"] as const)(
+  "late credentials withhold renderings including collected credential fragments: %s",
+  async (kind) => {
+    const credential = `late-${randomUUID()}`,
+      encoded = [...Buffer.from(credential)].map((byte) => `%${byte.toString(16)}`).join(""),
+      identity = "(fail) case",
+      omitted = "[failure excerpts: diagnostic lines or failures left out]";
+    const keep = typeof kind === "number" ? kind - 1002 - omitted.length - identity.length - 2 : 0;
+    const collectorKeep = 8000 - omitted.length - identity.length - 3;
+    const collectedSource = `${"x".repeat(collectorKeep - 16)}${credential}${"!".repeat(200)}\n${identity}`;
+    const failures =
+      kind === "encoded"
+        ? `${encoded}\n${identity}`
+        : kind === "collector"
+          ? extractFailures(collectedSource)
+          : `${"x".repeat(keep - 15)}${credential}${"!".repeat(8000 - (keep - 15) - credential.length - identity.length - 1)}\n${identity}`;
+    if (!failures) throw Error("Missing failure excerpt");
+    if (kind === "collector") {
+      expect(failures).toContain(credential.slice(0, 16));
+      expect(failures).not.toContain(credential.slice(16));
+    }
+    const output = "z".repeat(6000),
+      f = fixture();
+    const r = {
+      name: "test",
+      command: "test",
+      ok: false,
+      exitCode: 1,
+      durationMs: 1,
+      ...(await f.scoped(() =>
+        protectGateOutput(
+          capture(`${kind === "collector" ? collectedSource : failures}\n${output}`),
+          "[]",
+          control(),
+          failures,
+          f.excerptCurrent,
+        ),
+      )),
+    };
+    f.scoped(() => {
+      for (const limit of RENDER_LIMITS) {
+        const text = formatGateOutput(r, limit);
+        expect(text).toBe(renderGateOutput(r, limit));
+        if (kind === "encoded") expect(text).toContain(encoded);
+        else if (limit === kind || (kind === "collector" && limit === 9000)) {
+          expect(text).toContain(credential.slice(0, 15));
+          expect(text).not.toContain(credential.slice(15));
+        }
+      }
+      registerCredential("LATE_RENDER_TEST", credential);
+      for (const limit of RENDER_LIMITS)
+        expect(formatGateOutput(r, limit)).toBe(withheldText("credential-changed"));
+      const feedback = formatGateFeedback([
+        { name: "test", result: r, verdict: "regressed", blocking: true },
+      ]);
+      expect(feedback).toContain(withheldText("credential-changed"));
+      expect(feedback).not.toContain(encoded);
+      expect(feedback).not.toContain(credential.slice(0, 15));
+      expect(r.output).toBe(output);
+      expect(r.failures).toBe(failures);
+      // Changing authenticated context or its generation claim cannot bypass the refusal.
+      if (typeof kind === "number") {
+        const changed = { ...r, failures: failures.replace(credential.slice(15), "safe") };
+        expect(formatGateOutput(changed, kind)).toBe(withheldText("unproven"));
+      }
+      const rendering = r.textPrivacy.renderings?.[9000];
+      if (!rendering) throw Error("Missing rendering proof");
+      const changed = structuredClone(r);
+      changed.textPrivacy.renderings = {
+        ...changed.textPrivacy.renderings,
+        9000: { ...rendering, credentials: "0".repeat(64) },
+      };
+      expect(formatGateOutput(changed, 9000)).toBe(withheldText("unproven"));
+    });
+  },
+);
 
 test.each(["deadline", "generation", "failure"])(
   "rendering requests stop and preserve output on %s",

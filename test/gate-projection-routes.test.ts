@@ -563,6 +563,32 @@ test("remote claims never grant release; coordinator attested proofs do", async 
   expect(out.remoteAttestation).toBeUndefined();
 });
 
+test("truncated attested LAN output survives durable then outward projection", async () => {
+  const output = "safe remote tail",
+    proof = await checkAndSign({
+      ...testGatePrivacy,
+      kind: "attested:lan",
+      field: "output",
+      text: output,
+      producerCut: true,
+    });
+  expect(proof).toBeDefined();
+  const r = await provenResult(result(output));
+  delete r.failures;
+  const signed = {
+    ...r,
+    textPrivacy: {
+      ...r.textPrivacy,
+      identities: r.textPrivacy?.identities ?? { withheld: true },
+      output: { withheld: false, truncated: true, ...proof },
+    },
+  };
+  const durable = project(signed, { mode: "durable" });
+  expect(durable.output).toBe(output);
+  expect(project(durable, { mode: "outward" }).output).toBe(output);
+  expect(project(project(durable, { mode: "durable" }), { mode: "outward" }).output).toBe(output);
+});
+
 test("projection snapshots are lazy and shared across nested result fields", async () => {
   const r = await provenResult(result()),
     refresh = spyOn(testGatePrivacy.registry, "refreshPolicy");

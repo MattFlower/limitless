@@ -16,6 +16,7 @@ export const fieldPrivacySchema = z
     reason: z.string().optional(),
     kind: z.enum(["complete", "attested:lan", "attested:github-actions", "rendering"]).optional(),
     mac: z.string().optional(),
+    credentials: z.string().optional(),
   })
   .refine((field) => !field.withheld || field.mac === undefined, "Withheld fields are unsigned");
 export const textPrivacySchema = z.strictObject({

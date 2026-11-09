@@ -1,6 +1,6 @@
 import { getPrivacyChecker } from "../util/privacy-checker.ts";
 import { verifier } from "../util/privacy-proof.ts";
-import { projectGateDiagnostics, redactGateOutput } from "./output.ts";
+import { projectGateDiagnostics, redactGateOutput, renderingCredentialsUnchanged } from "./output.ts";
 import type { GateResult } from "./run.ts";
 import { gatePrivacyScope, withheldText } from "./text-privacy.ts";
 
@@ -135,5 +135,13 @@ export function formatGateOutput(result: GateResult, limit: RenderLimit = 3_000)
     !snapshot.verify(record, `rendering:${limit}`, bytes, record.truncated === true)
   )
     return withheldText("unproven");
-  return redactGateOutput(bytes) === bytes ? bytes : withheldText("credential-changed");
+  // Excerpts are cuts too: neither they nor the rendering retain complete credential context.
+  if (result.failures && !snapshot.verify(result.textPrivacy?.failures, "failures", result.failures, true))
+    return withheldText("unproven");
+  if (
+    !snapshot.credentialsUnchanged(record) ||
+    (result.failures && !snapshot.credentialsUnchanged(result.textPrivacy?.failures))
+  )
+    return withheldText("credential-changed");
+  return renderingCredentialsUnchanged(bytes) ? bytes : withheldText("credential-changed");
 }
