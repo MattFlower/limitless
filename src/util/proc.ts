@@ -803,6 +803,18 @@ export interface ProcResult {
 }
 
 const DEFAULT_TAIL = 64_000;
+export function outputCallbackError<T extends unknown[]>(
+  callback: (...args: T) => void,
+  ...args: T
+): string | null {
+  try {
+    callback(...args);
+  } catch {
+    return "Invocation output callback failed";
+  }
+  return null;
+}
+
 /** Test seam; byte/clock overrides are shared by the queues participating in a turn. */
 export const processDrainObserver = new AsyncLocalStorage<{
   budget?: number;
@@ -1084,10 +1096,9 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       callback &&
       ((...args: T) => {
         if (outputError) return;
-        try {
-          callback(...args);
-        } catch {
-          outputError = "Invocation output callback failed";
+        const error = outputCallbackError(callback, ...args);
+        if (error) {
+          outputError = error;
           capture?.fail();
           queue?.stop();
           void terminate();
