@@ -9,6 +9,7 @@ const text = z.string();
 export const transferAgentResultSchema = object({
   status: r.oneOf("running ok error cancelled timeout stuck quota unavailable declined"),
   failureClass: r.oneOf("authentication malformed").optional(),
+  transportError: text.optional(),
   finalText: text,
   structured: z.unknown().transform(parseTransferJson),
   usage: object({

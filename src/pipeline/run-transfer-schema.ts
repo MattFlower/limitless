@@ -32,6 +32,7 @@ const classification = {
   ...tag(s.transferSizeSchema.shape, "size"),
   ...tag(policyState.shape, "policy"),
   feedbackProof: "excluded",
+  networkWait: "excluded",
   gateExecution: "execution",
   agentJob: "job",
   ...tag(r.fields("worktreePath worktreeAliases baseline baselineCached", r.counter), "excluded"),

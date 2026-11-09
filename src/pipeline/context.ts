@@ -65,6 +65,7 @@ import type { CoveringTestRun } from "./covering-tests.ts";
 import { type FaultInjector, type FaultPlan, injectorFor, SimulatedTermination } from "./faults.ts";
 import type { GateEvidence } from "./gate-evidence.ts";
 import { consumeGateExecution } from "./gate-execution.ts";
+import * as network from "./network-wait.ts";
 import type { PreviewConfig } from "./preview.ts";
 import { FACTORY_PREAMBLE, holdoutRedactor } from "./prompts.ts";
 import type { RunClaim } from "./run-claim.ts";
@@ -92,6 +93,7 @@ export function localCheckpointer(store: Store): Checkpointer {
 }
 
 export interface EngineDeps {
+  network?: network.NetworkDependencies;
   runClaim?: RunClaim;
   capability?: CapabilityGate;
   loadSource?: () => number;
@@ -118,6 +120,7 @@ export type Phase = "prepare" | "triage" | "clarify" | "spec" | "loop" | "delive
 
 /** Everything a run needs to resume after a restart. Persisted as runs.state_json. */
 export interface RunState {
+  networkWait?: { since: number; nextAttemptAt: number; reason: string; operation: string; replay?: Replay };
   sizeReport?: SizeReport;
   parked?: boolean;
   flow?: "build" | "verify-change" | "acceptance";
@@ -365,6 +368,7 @@ export interface InvokeOutcome {
   target: ModelTarget;
   invocation: Invocation;
 }
+export type Replay = (InvokeOutcome | null)[];
 
 /** Every string in a private CLI log line; numbers, booleans and the JSON shape remain. */
 export const withholdText = (text: string): string => (text ? "[private]" : text);
@@ -831,7 +835,10 @@ export class RunContext {
    * quota or unavailable. Task-level failures are returned to the caller, not retried here.
    */
   invoke(opts: InvokeOptions): Promise<InvokeOutcome> {
-    return this.invokeWithAdmission(opts).catch((error: unknown) => {
+    const call = opts.shadow ? undefined : network.agentCall(opts.stage, this.state.networkWait);
+    if (call?.replayed) return Promise.resolve(call.record(call.replayed));
+    const outcome = this.invokeWithAdmission(opts, call).then((o) => call?.record(o) ?? o);
+    return outcome.catch((error: unknown) => {
       if (error instanceof SuppressedError && error.suppressed instanceof ClaimControlError) {
         this.log(redactCredentials(`Invocation cleanup failed: ${String(error.error)}`), "warn");
         throw error.suppressed;
@@ -840,7 +847,7 @@ export class RunContext {
     });
   }
 
-  private async invokeWithAdmission(opts: InvokeOptions): Promise<InvokeOutcome> {
+  private async invokeWithAdmission(opts: InvokeOptions, call?: network.AgentCall): Promise<InvokeOutcome> {
     const agentExecutor = this.deps.agentExecutor ?? localAgentExecutor;
     const { router, tracker, store, harnesses } = this.deps;
     const { shadow } = opts;
@@ -1383,6 +1390,11 @@ export class RunContext {
               : result.error,
         finishedAt: Date.now(),
       });
+      this.run = store.refreshRunTotals(this.run.id);
+      const hint =
+        !result.failureClass && /^(error|unavailable)$/.test(result.status) && result.transportError;
+      const confirming = call && network.confirmNetwork(this, call, hint, network.modelDestination(target));
+      if (confirming) await confirming;
       // Shadow outcomes never reach provider health, quota telemetry or model blocks.
       if (result.quota?.windows) health?.observeWindows(target.provider, result.quota.windows);
       if (result.confinement) health?.observeConfinement(target.provider, result.confinement);
@@ -1400,7 +1412,6 @@ export class RunContext {
                 ? redact(result.error)
                 : result.error,
         });
-      this.run = store.refreshRunTotals(this.run.id);
       if (result.status !== "ok")
         failures.set(
           target.targetId ?? target.modelId,

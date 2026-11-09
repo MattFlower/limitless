@@ -103,6 +103,7 @@ export interface Usage {
 }
 
 export interface AgentResult {
+  transportError?: string; // CLI transport diagnostics only; never assistant text or tool output.
   fastModeState?: string | null;
   fastModeDisabledReason?: string | null;
   status: InvocationStatus;

@@ -44,6 +44,7 @@ import {
   priceOf,
   redactJsonLine,
 } from "../src/harness/types.ts";
+import { modelDestination, setupDestination, transportError } from "../src/pipeline/network-wait.ts";
 import { redactHoldoutText } from "../src/pipeline/prompts.ts";
 import { agentEnv, type ProcOptions, runProcess } from "../src/util/proc.ts";
 import { browserSpec, fakeBrowserCache } from "./browser-mcp-support.ts";
@@ -524,6 +525,183 @@ const verifiedCodex: typeof runClaude = (spec, runner) =>
     resolve: () => "codex",
     verify: async () => ({ ok: true, path: "codex", version: "test", reason: null, exitCode: null }),
   } as unknown as CodexReaderProbe);
+
+for (const harness of ["claude", "codex"] as const) {
+  test.each(["transport", "stderr", "model result", "tool result", "structured", "unavailable"])(
+    `network outage: ${harness} provenance %s`,
+    async (kind) => {
+      const dir = mkdtempSync(join(tmpdir(), "limitless-network-harness-"));
+      const diagnostic = "getaddrinfo ENOTFOUND models.example.test";
+      const claude =
+        kind === "stderr"
+          ? []
+          : [
+              ...(kind === "tool result"
+                ? [
+                    {
+                      type: "user",
+                      message: {
+                        content: [
+                          { type: "tool_result", tool_use_id: "t", content: diagnostic, is_error: true },
+                        ],
+                      },
+                    },
+                  ]
+                : []),
+              {
+                type: "result",
+                subtype: kind === "transport" ? "error_during_execution" : "success",
+                is_error: ["transport", "model result", "unavailable"].includes(kind),
+                result: kind === "model result" ? diagnostic : "done",
+                ...(kind === "transport" ? { errors: [diagnostic] } : {}),
+                ...(kind === "unavailable" ? { errors: ["API Error: 503 unavailable"] } : {}),
+              },
+            ];
+      const codex =
+        kind === "stderr"
+          ? []
+          : [
+              { type: "turn.started" },
+              ...(kind === "tool result"
+                ? [
+                    {
+                      type: "item.completed",
+                      item: {
+                        id: "t",
+                        type: "command_execution",
+                        command: "test",
+                        aggregated_output: diagnostic,
+                        exit_code: 1,
+                      },
+                    },
+                  ]
+                : []),
+              {
+                type: "item.completed",
+                item: { type: "agent_message", text: kind === "model result" ? diagnostic : "done" },
+              },
+              kind === "transport" || kind === "unavailable"
+                ? {
+                    type: "turn.failed",
+                    error: { message: kind === "transport" ? diagnostic : "503 unavailable" },
+                  }
+                : { type: "turn.completed", usage: {} },
+            ];
+      try {
+        const outcome = await (harness === "claude" ? runClaude : verifiedCodex)(
+          {
+            cwd: dir,
+            prompt: "x",
+            mode: "readonly",
+            noTools: true,
+            target: {
+              modelId: "test/model",
+              provider: harness,
+              harness,
+              model: "model",
+              vendor: harness,
+              tier: 4,
+              billing: "subscription",
+            },
+            ...(kind === "structured" ? { jsonSchema: { type: "object" } } : {}),
+            timeoutMs: 10_000,
+            idleTimeoutMs: 10_000,
+            maxToolCalls: 0,
+            signal: new AbortController().signal,
+            logPath: join(dir, "log"),
+            onEvent: () => {},
+          },
+          async (opts) => {
+            for (const event of harness === "claude" ? claude : codex)
+              opts.onStdoutLine?.(JSON.stringify(event));
+            return {
+              exitCode: kind === "stderr" ? 1 : 0,
+              signal: null,
+              truncated: false,
+              durationMs: 1,
+              stdout: "",
+              stderr: kind === "stderr" ? diagnostic : "",
+              timedOut: false,
+              idleTimedOut: false,
+              cancelled: false,
+            };
+          },
+        );
+        expect(transportError(outcome.transportError ?? "")).toBe(kind === "transport" || kind === "stderr");
+        if (kind === "model result") expect(outcome.finalText).toContain(diagnostic);
+        if (kind === "structured") {
+          expect(outcome.status).toBe("error");
+          expect(outcome.error).toContain("structured output");
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+test.each([
+  ["ENOTFOUND", true],
+  ["EAI_AGAIN", true],
+  ["ECONNRESET", true],
+  ["ECONNREFUSED", true],
+  ["API Error: Connection error.", true],
+  ["connection timed out", true],
+  ["stream disconnected before completion", true],
+  ["TLS handshake timeout", true],
+  ["503 unavailable", false],
+  ["authentication failed ECONNRESET", false],
+  ["quota exceeded ENOTFOUND", false],
+  ["structured output failed validation ENOTFOUND", false],
+  ["request failed", false],
+] as const)("network outage: classifier %s", (hint, eligible) => {
+  expect(transportError(hint)).toBe(eligible);
+});
+
+test("network outage: destinations come from the target and known install commands", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "limitless-network-destinations-"));
+  const previous = [process.env.npm_config_registry, process.env.NPM_CONFIG_REGISTRY];
+  delete process.env.npm_config_registry;
+  delete process.env.NPM_CONFIG_REGISTRY;
+  try {
+    expect(setupDestination("bun install --frozen-lockfile", cwd)).toBe("https://registry.npmjs.org");
+    expect(setupDestination("npm ci", cwd)).toBe("https://registry.npmjs.org");
+    expect(setupDestination("yarn install --immutable", cwd)).toBe("https://registry.yarnpkg.com");
+    expect(setupDestination("bun test", cwd)).toBeUndefined();
+    expect(setupDestination("bun install && bun test", cwd)).toBeUndefined();
+    // Unrelated Bun settings keep the standard registry; registry settings make it unknown.
+    writeFileSync(join(cwd, "bunfig.toml"), '[serve]\nport = 3000\n\n[test]\nroot = "test"\n');
+    expect(setupDestination("bun install --frozen-lockfile", cwd)).toBe("https://registry.npmjs.org");
+    writeFileSync(join(cwd, "bunfig.toml"), '[install]\nregistry = "https://bun.example.test"\n');
+    expect(setupDestination("bun install --frozen-lockfile", cwd)).toBeUndefined();
+    rmSync(join(cwd, "bunfig.toml"));
+    process.env.npm_config_registry = "https://registry.example.test";
+    expect(setupDestination("npm ci", cwd)).toBe("https://registry.example.test");
+    writeFileSync(join(cwd, ".npmrc"), "registry=https://project.example.test\n");
+    expect(setupDestination("npm ci", cwd)).toBeUndefined();
+    const target: AgentSpec["target"] = {
+      modelId: "test/model",
+      provider: "claude",
+      harness: "claude",
+      model: "model",
+      vendor: "anthropic",
+      tier: 4,
+      billing: "subscription",
+    };
+    expect(modelDestination(target)).toBe("https://api.anthropic.com");
+    expect(modelDestination({ ...target, harness: "codex" })).toBe("https://chatgpt.com");
+    expect(
+      modelDestination({ ...target, backend: { baseUrl: "https://models.example.test/api", authToken: "" } }),
+    ).toBe("https://models.example.test/api");
+    expect(modelDestination({ ...target, harness: "fake" })).toBeUndefined();
+  } finally {
+    for (const [i, key] of ["npm_config_registry", "NPM_CONFIG_REGISTRY"].entries()) {
+      if (previous[i] === undefined) delete process.env[key];
+      else process.env[key] = previous[i];
+    }
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test.each(["accepted", "stream rejection", "stderr rejection"])(
   "factory Claude subscription authentication: %s",

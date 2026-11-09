@@ -657,6 +657,7 @@ src/pipeline/engine.ts | deliverReviewRound | pushExistingBranch | 1 | run-scope
 src/pipeline/engine.ts | deliverReviewRound | runGh | 4 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/engine.ts | deliverVerifiedDraft | createPullRequest | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
 src/pipeline/engine.ts | deliverVerifiedDraft | pushBranch | 1 | run-scope |  | Engine stage execution inside claimScope.run through guarded transports
+src/pipeline/network-wait.ts | head | fetch | 1 | read |  | Coordinator reachability probe sends HEAD without credentials or a body
 src/pipeline/review-round.ts | readPrHead | runGh | 1 | read |  | Review head observation
 src/pipeline/review-round.ts | submitReview | runGh | 1 | exempt | C16 | Review submission authority belongs to C16
 src/pipeline/run-object-export.ts | createRunObjectExporter/git | cacheGit | 1 | exempt | not-github | Local committed-object bundle export; no remote commands

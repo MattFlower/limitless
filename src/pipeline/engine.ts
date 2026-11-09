@@ -150,6 +150,7 @@ import {
   discreetModelText,
   hasFactoryMark,
 } from "./markers.ts";
+import { NetworkWaitError, networkDeadline } from "./network-wait.ts";
 import { confirmPostMerge, postMergeConfirmationText, postMergeWorker } from "./post-merge-confirmation.ts";
 import { needsPreview, type Preview, readPreviewConfig, startPreview } from "./preview.ts";
 import {
@@ -361,6 +362,7 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
   const runId = run.id;
   if (!ctx.execution.shared) startRun(ctx);
   try {
+    networkDeadline(ctx);
     if (ctx.execution.shared) {
       await recoverScopedProcesses();
       if (!ctx.execution.claim) throw ctx.execution.error ?? new ClaimWaitError("unavailable");
@@ -523,6 +525,12 @@ async function executeScopedRun(ctx: RunContext, signal: AbortSignal): Promise<R
       return status;
     };
     if (e instanceof CancelledError || signal.aborted) return cancelled();
+    if (e instanceof NetworkWaitError) {
+      if (deps.store.getRun(runId)?.error?.startsWith("cancelled by")) return cancelled();
+      ctx.state.agentJob = undefined;
+      ctx.run = ctx.checkpointer.writeRun(runId, { status: "queued", stage: null }, ctx.state);
+      return "queued";
+    }
     if (e instanceof ParkedError) {
       ctx.state.parked = true;
       ctx.run = ctx.checkpointer.writeRun(runId, { status: "queued", stage: null }, ctx.state);

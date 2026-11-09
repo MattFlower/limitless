@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { Factory, type FactoryOptions } from "../src/app.ts";
 import { loadConfig } from "../src/config.ts";
 import { Store } from "../src/db/store.ts";
+import type { GateExecutor, GateRequest } from "../src/gates/executor.ts";
 import { loadPrivateStrings } from "../src/gates/private.ts";
 import * as repos from "../src/git/repos.ts";
 import {
@@ -239,6 +240,444 @@ async function run(f: Factory) {
   return r.id;
 }
 
+const seedNetworkSource = seeded(async (dir) => {
+  await seedSource(dir);
+  const cwd = join(dir, "source");
+  // The check deliberately uses install syntax: only the setup phase may supply outage evidence.
+  writeFileSync(
+    join(cwd, ".limitless.toml"),
+    '[gates]\nsetup = ["bun install --frozen-lockfile"]\nchecks = [{name="check",run="bun install --frozen-lockfile"}]\n',
+  );
+  await sh(["git", "add", "."], { cwd });
+  await sh(["git", "commit", "-qm", "dependency setup"], { cwd });
+});
+
+async function networkFixture(
+  path: "baseline" | "setup" | "agent" | "check",
+  reply?: FakeReply,
+  profile: "quick" | "standard" = "quick",
+) {
+  await seedNetworkSource(root);
+  const control = { fail: true, now: Date.now(), probes: [] as string[], sessions: [] as AgentSpec[] };
+  const requests: GateRequest[] = [];
+  const executor: GateExecutor = {
+    kind: "local",
+    async start(request) {
+      requests.push(request);
+      return { kind: "local", id: String(requests.length - 1), startedAt: control.now };
+    },
+    attach(handle, _signal, _request, hooks) {
+      const request = requests[Number(handle.id)];
+      if (!request) throw new Error("missing gate request");
+      const baseline = request.headSha === requests[0]?.headSha;
+      const failed = control.fail && (path === "baseline" ? baseline : !baseline && path !== "agent");
+      const setupFailed = failed && path !== "check";
+      if (!setupFailed) hooks?.onLocalSetup?.();
+      const result = (name: string, command: string, ok: boolean) => ({
+        name,
+        command,
+        ok,
+        exitCode: ok ? 0 : 1,
+        durationMs: 1,
+        output: ok ? "ok" : "getaddrinfo ENOTFOUND registry.npmjs.org",
+      });
+      if (failed && path === "check") control.fail = false;
+      return {
+        events: (async function* () {})(),
+        cancel: async () => {},
+        result: Promise.resolve({
+          sha: request.headSha,
+          trackedClean: true,
+          setupOk: !setupFailed,
+          setup: request.gates.setup.map((cmd, i) => result(`setup-${i}`, cmd, !setupFailed)),
+          checks: setupFailed ? [] : request.gates.checks.map((cmd) => result(cmd.name, cmd.run, !failed)),
+        }),
+      };
+    },
+  };
+  const handler = (s: AgentSpec): FakeReply => {
+    if (s.mode === "edit") {
+      control.sessions.push(s);
+      if (path === "agent" && control.fail)
+        return (
+          reply ?? {
+            status: "unavailable",
+            error: "getaddrinfo ENOTFOUND",
+            transportError: "getaddrinfo ENOTFOUND",
+          }
+        );
+    }
+    return answer(s);
+  };
+  const f = factory(undefined, handler, {
+    gateExecutor: executor,
+    providers: providers.map((p) => ({
+      ...p,
+      baseUrl: "https://models.example.test",
+      apiKey: "sentinel-provider-token",
+    })),
+  });
+  f.deps.network = {
+    now: () => control.now,
+    probe: async (url) => {
+      control.probes.push(url);
+      return false;
+    },
+  };
+  const r = await f.createRun({ repo: source, prompt: "Change", profile });
+  const execute = () => executeRun(f.deps, r.id, new AbortController().signal);
+  return { f, r, control, requests, handler, execute };
+}
+
+test.each(["baseline", "setup"] as const)("network outage: setup %s", async (path) => {
+  for (const reachable of [false, true]) {
+    const { f, r, control, requests, execute } = await networkFixture(path);
+    f.deps.network = {
+      now: () => control.now,
+      probe: async (url) => {
+        control.probes.push(url);
+        if (reachable) control.fail = false;
+        return reachable;
+      },
+    };
+    expect(await execute()).toBe(reachable ? "succeeded" : "queued");
+    expect(control.probes).toEqual(["https://registry.npmjs.org"]);
+    const state = f.store.getRunState<RunState>(r.id);
+    expect(state?.networkWait !== undefined).toBe(!reachable);
+    if (reachable) continue;
+    expect(f.store.getRun(r.id)?.status).toBe("queued");
+    expect(state).toMatchObject({ round: 0, roundsOnImplementer: 0 });
+    expect(state?.feedback).toBeFalsy();
+    expect(state?.networkWait?.operation).toBe(
+      path === "baseline" ? "setup:prepare:baseline" : "setup:gates:initial",
+    );
+    const calls = requests.length;
+    control.fail = false;
+    control.now = state?.networkWait?.nextAttemptAt ?? 0;
+    expect({ status: await execute(), error: f.store.getRun(r.id)?.error }).toEqual({
+      status: "succeeded",
+      error: null,
+    });
+    expect(requests.length).toBeGreaterThan(calls);
+    expect(control.sessions).toHaveLength(1);
+    expect(f.store.getRunState<RunState>(r.id)).toMatchObject({ round: 0, roundsOnImplementer: 0 });
+    expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+  }
+});
+
+test.each([false, true])("network outage: agent confirmation reachable=%s", async (reachable) => {
+  const { f, r, control, execute } = await networkFixture("agent");
+  f.deps.network = {
+    now: () => control.now,
+    probe: async (url) => {
+      control.probes.push(url);
+      if (reachable) control.fail = false;
+      return reachable;
+    },
+  };
+  expect(await execute()).toBe(reachable ? "succeeded" : "queued");
+  expect(control.probes).toEqual(["https://models.example.test"]);
+  if (reachable) {
+    expect(
+      f.store
+        .listInvocations(r.id)
+        .filter((i) => i.role === "implement")
+        .map((i) => i.modelId),
+    ).toEqual(["a", "b"]);
+    expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+    return;
+  }
+  const before = f.store.getRunState<RunState>(r.id);
+  expect(before).toMatchObject({
+    round: 0,
+    roundsOnImplementer: 0,
+    networkWait: { operation: "agent:implement:0:0" },
+  });
+  expect(before?.feedback).toBeFalsy();
+  expect(control.sessions).toHaveLength(1);
+  control.fail = false;
+  control.now = before?.networkWait?.nextAttemptAt ?? 0;
+  expect(await execute()).toBe("succeeded");
+  expect(control.sessions).toHaveLength(2);
+  expect(control.sessions[1]?.prompt).toBe(control.sessions[0]?.prompt);
+  expect(control.sessions[1]?.mode).toBe("edit");
+  expect(control.sessions[1]?.target.modelId).toBe("a");
+  expect(f.store.getRunState<RunState>(r.id)).toMatchObject({
+    round: 0,
+    roundsOnImplementer: 0,
+    triedImplementers: before?.triedImplementers,
+  });
+  expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+});
+
+test("network outage: agent corrective spec invocation resumes without replaying the stage", async () => {
+  const { f, r, control, execute } = await networkFixture(
+    "agent",
+    { files: { "ui/change.txt": "done\n" }, text: "done" },
+    "standard",
+  );
+  const original = f.deps.harnesses.fake;
+  if (!original) throw new Error("missing harness");
+  const prompts: string[] = [];
+  const oversized = {
+    ...spec,
+    acceptance_criteria: [1, 2, 3, 4].map((i) => ({ ...spec.acceptance_criteria[0], id: `AC-${i}` })),
+  };
+  f.deps.harnesses.fake = async (s) => {
+    if (!s.prompt.startsWith("Write the specification")) return original(s);
+    prompts.push(s.prompt);
+    const result = await original(s);
+    if (prompts.length === 1) return { ...result, structured: oversized };
+    if (!control.fail) return result;
+    const error = "getaddrinfo ENOTFOUND api.example.test";
+    return { ...result, status: "unavailable", structured: null, error, transportError: error };
+  };
+  expect(await execute()).toBe("queued");
+  const saved = f.store.getRunState<RunState>(r.id)?.networkWait;
+  // The checkpointed replay keeps the outcome but none of the router's provider credentials.
+  expect(saved?.replay?.[0]?.target.modelId).toBeString();
+  expect(JSON.stringify(f.store.getRunState(r.id))).not.toContain("sentinel-provider-token");
+  expect(saved).toMatchObject({ operation: "agent:spec:0:1", replay: [expect.anything()] });
+  expect(prompts[1]).toContain("Too many acceptance criteria");
+  // A repeated outage retries only the corrective invocation and keeps the original start.
+  control.now = saved?.nextAttemptAt ?? 0;
+  expect(await execute()).toBe("queued");
+  const [initial, corrective] = prompts;
+  expect(prompts).toEqual([initial, corrective, corrective] as string[]);
+  expect(f.store.getRunState<RunState>(r.id)?.networkWait).toMatchObject({
+    since: saved?.since,
+    operation: "agent:spec:0:1",
+  });
+  control.fail = false;
+  control.now = f.store.getRunState<RunState>(r.id)?.networkWait?.nextAttemptAt ?? 0;
+  expect(await execute()).toBe("succeeded");
+  expect(prompts).toEqual([initial, corrective, corrective, corrective] as string[]);
+  const state = f.store.getRunState<RunState>(r.id);
+  expect(state?.networkWait).toBeUndefined();
+  expect(state?.spec?.acceptance_criteria).toHaveLength(1);
+  expect(state).toMatchObject({ round: 0, roundsOnImplementer: 0 });
+});
+
+test.each([
+  ["model finalText", { text: "quoted ENOTFOUND; connection reset", files: { "ui/change.txt": "done\n" } }],
+  ["model error", { status: "error", error: "quoted ENOTFOUND; connection reset", text: "ENOTFOUND" }],
+  [
+    "authentication",
+    {
+      status: "unavailable",
+      failureClass: "authentication",
+      error: "login failed",
+      transportError: "ENOTFOUND",
+    },
+  ],
+  [
+    "malformed",
+    { status: "error", failureClass: "malformed", error: "invalid output", transportError: "ENOTFOUND" },
+  ],
+  ["validation", { structured: { quoted: "ENOTFOUND" } }],
+  ["check", undefined],
+] as const)("network outage: excluded evidence %s", async (kind, reply) => {
+  const { f, r, control, execute } = await networkFixture(
+    kind === "check" ? "check" : "agent",
+    reply,
+    kind === "validation" ? "standard" : "quick",
+  );
+  if (kind === "validation") {
+    const original = f.deps.harnesses.fake;
+    if (!original) throw new Error("missing harness");
+    f.deps.harnesses.fake = async (s) =>
+      s.prompt.startsWith("Write the specification")
+        ? {
+            ...(await original(s)),
+            structured: {
+              ...spec,
+              acceptance_criteria: [{ ...spec.acceptance_criteria[0], id: "ENOTFOUND" }],
+            },
+          }
+        : original(s);
+  }
+  const outcome = await execute();
+  expect(outcome).toBe(kind === "model finalText" || kind === "check" ? "succeeded" : "needs_human");
+  expect(control.probes).toEqual([]);
+  expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+  if (kind === "validation")
+    expect(
+      f.store
+        .listInvocations(r.id)
+        .some(
+          (i) => i.error?.includes("structured output failed validation") && i.error.includes("ENOTFOUND"),
+        ),
+    ).toBe(true);
+  if (kind === "check") {
+    expect(f.store.getRunState<RunState>(r.id)?.round).toBe(0);
+    expect(f.store.getRunState<RunState>(r.id)?.lastGates?.[0]?.verdict).toBe("flaky");
+  }
+});
+
+test.each([
+  ["setup", 401],
+  ["agent", 403],
+  ["agent", 503],
+] as const)("network outage: lifecycle %s HTTP %s proves reachability", async (path, status) => {
+  const { f, r, control, execute } = await networkFixture(path);
+  f.deps.network = { now: () => control.now };
+  const probe = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      async (_url: Parameters<typeof fetch>[0], options?: Parameters<typeof fetch>[1]) => {
+        expect(options?.signal).toBeInstanceOf(AbortSignal);
+        expect(options?.method).toBe("HEAD");
+        control.fail = false;
+        return new Response(null, { status });
+      },
+      { preconnect() {} },
+    ),
+  );
+  try {
+    expect(await execute()).toBe("succeeded");
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(probe.mock.calls[0]?.[0]).toBe(
+      path === "setup" ? "https://registry.npmjs.org" : "https://models.example.test",
+    );
+    expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+  } finally {
+    probe.mockRestore();
+  }
+});
+
+test("network outage: agent retires the failed worker invocation before retry", async () => {
+  const { f, r, control, execute } = await networkFixture("agent");
+  expect(await execute()).toBe("queued");
+  const state = f.store.getRunState<RunState>(r.id);
+  if (!state) throw new Error("missing run state");
+  state.agentJob = { round: state.round, id: "failed-job" };
+  f.store.setRunState(r.id, state);
+  const cached: string[] = [];
+  f.deps.agentExecutor = {
+    kind: "fake-worker",
+    async run(call, local) {
+      if (call.role === "implement" && call.agentJob) cached.push(call.agentJob.id);
+      return local();
+    },
+  };
+  expect(await execute()).toBe("queued");
+  expect(f.store.getRunState<RunState>(r.id)?.agentJob).toBeUndefined();
+  control.fail = false;
+  expect(await execute()).toBe("succeeded");
+  expect(cached).toEqual(["failed-job"]);
+});
+
+test.each(["baseline", "setup", "agent"] as const)("network outage: restart %s", async (path) => {
+  const { f, r, control, requests, handler, execute } = await networkFixture(path);
+  expect(await execute()).toBe("queued");
+  const state = f.store.getRunState<RunState>(r.id);
+  const saved = state?.networkWait;
+  if (!saved) throw new Error("missing network wait");
+  const calls = requests.length;
+  const baselineCalls = requests.filter((req) => req.headSha === requests[0]?.headSha).length;
+  const sessions = control.sessions.length;
+  const next = await reopen(f, handler, (next) => {
+    next.deps.network = f.deps.network;
+    next.deps.gateExecutor = f.deps.gateExecutor;
+  });
+  control.now = saved.nextAttemptAt - 1;
+  next.scheduler.tick();
+  expect(next.scheduler.activeRunIds).toEqual([]);
+  expect(next.store.getRunState<RunState>(r.id)?.networkWait).toEqual(saved);
+  expect(requests).toHaveLength(calls);
+  expect(control.sessions).toHaveLength(sessions);
+  const repo = next.store.getRepo(r.repoId);
+  if (!repo) throw new Error("missing repo");
+  const other = next.store.createRun(repo, { repo: source, prompt: "Other", profile: "quick" });
+  expect(next.store.nextQueuedRuns(1, control.now).map((r) => r.id)).toEqual([other.id]);
+  next.scheduler.tick();
+  expect(next.scheduler.activeRunIds).toContain(other.id);
+  next.scheduler.cancel(other.id);
+  await wait(() => !next.scheduler.activeRunIds.length);
+  control.fail = false;
+  control.now = saved.nextAttemptAt;
+  next.scheduler.tick();
+  await settled(next, r.id);
+  expect(next.store.getRun(r.id)?.status).toBe("succeeded");
+  const after = next.store.getRunState<RunState>(r.id);
+  expect(after).toMatchObject({ round: 0, roundsOnImplementer: 0 });
+  expect(after?.networkWait).toBeUndefined();
+  expect(control.sessions).toHaveLength(path === "agent" ? 2 : 1);
+  expect(requests.filter((req) => req.headSha === requests[0]?.headSha)).toHaveLength(
+    baselineCalls + (path === "baseline" ? 1 : 0),
+  );
+});
+
+for (const path of ["baseline", "setup", "agent"] as const) {
+  test.each(["deadline", "timeout", "cancel probe", "cancel parked", "shutdown"])(
+    `network outage: lifecycle ${path} %s`,
+    async (scenario) => {
+      const { f, r, control, requests, handler, execute } = await networkFixture(path);
+      if (["timeout", "cancel probe", "shutdown"].includes(scenario)) {
+        const ready = Promise.withResolvers<void>();
+        const pending = Promise.withResolvers<boolean>();
+        f.deps.network = {
+          now: () => control.now,
+          timeoutMs: scenario === "timeout" ? 10 : 5000,
+          probe: async () => {
+            ready.resolve();
+            return pending.promise;
+          },
+        };
+        if (scenario === "timeout") {
+          expect(await execute()).toBe("queued");
+          pending.resolve(true);
+        } else {
+          f.scheduler.start();
+          await ready.promise;
+          if (scenario === "shutdown") await f.stop();
+          else f.scheduler.cancel(r.id);
+          pending.resolve(false);
+          await wait(() => !f.scheduler.activeRunIds.length);
+          expect(f.store.getRun(r.id)?.status).toBe(scenario === "shutdown" ? "queued" : "cancelled");
+          expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+          control.fail = false;
+          const next = await reopen(f, handler, (next) => {
+            next.deps.gateExecutor = f.deps.gateExecutor;
+          });
+          if (scenario === "shutdown") {
+            await settled(next, r.id);
+            expect(next.store.getRun(r.id)?.status).toBe("succeeded");
+          } else expect(next.scheduler.activeRunIds).toEqual([]);
+          return;
+        }
+      } else expect(await execute()).toBe("queued");
+      const saved = f.store.getRunState<RunState>(r.id)?.networkWait;
+      if (!saved) throw new Error("missing wait");
+      if (scenario === "cancel parked") {
+        f.scheduler.cancel(r.id);
+        const calls = requests.length;
+        const next = await reopen(f, handler);
+        expect(next.store.getRun(r.id)?.status).toBe("cancelled");
+        expect(next.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+        expect(requests).toHaveLength(calls);
+        return;
+      }
+      if (scenario === "timeout") return;
+      control.now = saved.nextAttemptAt;
+      expect(await execute()).toBe("queued");
+      expect(f.store.getRunState<RunState>(r.id)?.networkWait?.since).toBe(saved.since);
+      control.now = saved.since + githubWait.maxMs - 1;
+      expect(await execute()).toBe("queued");
+      expect(f.store.getRunState<RunState>(r.id)?.networkWait?.nextAttemptAt).toBe(
+        saved.since + githubWait.maxMs,
+      );
+      const calls = requests.length;
+      const sessions = control.sessions.length;
+      control.now++;
+      expect(await execute()).toBe("needs_human");
+      expect(f.store.getRun(r.id)?.error).toContain("network outage deadline");
+      expect(f.store.getRunState<RunState>(r.id)?.networkWait).toBeUndefined();
+      expect(requests).toHaveLength(calls);
+      expect(control.sessions).toHaveLength(sessions);
+    },
+  );
+}
+
 test("unconfirmed holdout shutdown preserves its snapshot and surfaces the termination reason", async () => {
   const pidFile = join(root, "holdout-writer-pid");
   const script = join(root, "holdout-parent.js");
@@ -384,12 +823,17 @@ async function settled(f: Factory, id: string, timeoutMs = 25_000) {
     subscribe: (wake) => f.store.subscribe(wake),
   });
 }
-async function reopen(f: Factory, handler: (s: AgentSpec) => FakeReply | Promise<FakeReply> = answer) {
+async function reopen(
+  f: Factory,
+  handler: (s: AgentSpec) => FakeReply | Promise<FakeReply> = answer,
+  configure?: (next: Factory) => void,
+) {
   await f.stop();
   f.store.close();
   factories = factories.filter((v) => v !== f);
   const next = factory(undefined, handler);
   next.deps.gh = f.deps.gh;
+  configure?.(next);
   next.scheduler.start();
   return next;
 }

@@ -1037,7 +1037,8 @@ export async function runCodex(
       return { ...base, status: "quota", error: failure, quota: { windows: windows ?? {}, exhaustedUntil } };
     }
     const unavailable = /stream disconnected|connection|timed out|503|502|500|overloaded/i.test(failure);
-    return { ...base, status: unavailable ? "unavailable" : "error", error: failure };
+    const transportError = parser.failed ?? redactCredentials(proc.stderr).trim().slice(-2000);
+    return { ...base, status: unavailable ? "unavailable" : "error", error: failure, transportError };
   }
   if (spec.jsonSchema && structured === null) {
     return { ...base, status: "error", error: "agent did not return valid structured output" };
