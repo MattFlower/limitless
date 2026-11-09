@@ -804,6 +804,138 @@ const heldEdit = (
 const watchdogFired = (event: AgentEvent) =>
   event.type === "status" && event.text.startsWith("stopping agent: no progress");
 
+test.each([
+  "throw",
+  "throw-before-start",
+  "throw-abort-rejection",
+  "throw-reentrant",
+  "stuck",
+  "caller",
+] as const)("claude watchdog consumer: %s settles and clears its timer", async (behavior) => {
+  await confinedEdit(import.meta.dir, async (scratchDir) => {
+    const caller = new AbortController();
+    const ready = deferred<ProcOptions>();
+    const release = deferred<void>();
+    const events: AgentEvent[] = [];
+    const transcript: string[] = [];
+    let now = 0;
+    let tick = () => {};
+    let cleared = 0;
+    let cleaned = false;
+    let reenter = () => {};
+    const timers: Parameters<typeof runClaude>[2] = {
+      set: (callback) => {
+        tick = callback;
+        return setInterval(() => {}, 60_000);
+      },
+      clear: (handle) => {
+        cleared++;
+        clearInterval(handle);
+      },
+    };
+    const spec: AgentSpec = {
+      cwd: import.meta.dir,
+      scratchDir,
+      prompt: "test",
+      mode: "edit",
+      logPath: join(scratchDir, "watchdog.log"),
+      target: {
+        modelId: "claude/test",
+        provider: "claude",
+        harness: "claude",
+        model: "test",
+        vendor: "anthropic",
+        tier: 4,
+        billing: "subscription",
+      },
+      timeoutMs: 30_000,
+      idleTimeoutMs: 1,
+      idleNow: () => now,
+      maxToolCalls: 10,
+      signal: caller.signal,
+      holdTranscript: (line) => transcript.push(line),
+      onEvent: (event) => {
+        events.push(event);
+        if (behavior === "throw-reentrant") {
+          if (watchdogFired(event)) reenter();
+          if (event.type === "stderr") throw new Error("synthetic private watchdog exception");
+        } else if (watchdogFired(event) && behavior.startsWith("throw"))
+          throw new Error("synthetic private watchdog exception");
+      },
+    };
+    const resultFixture = {
+      exitCode: 1,
+      signal: null,
+      cancelled: true,
+      cancelKilled: true,
+      timedOut: false,
+      idleTimedOut: false,
+      stdout: "",
+      stderr: "",
+      truncated: false,
+      durationMs: 0,
+    };
+    const invocation = runClaude(
+      spec,
+      async (opts) => {
+        if (behavior !== "throw-before-start") opts.onStdoutLine?.(opts.cmd[4] ?? "");
+        ready.resolve(opts);
+        if (!opts.signal?.aborted)
+          await new Promise((resolve) => opts.signal?.addEventListener("abort", resolve, { once: true }));
+        await release.promise;
+        cleaned = true;
+        if (behavior === "throw-abort-rejection") throw opts.signal?.reason;
+        return resultFixture;
+      },
+      timers,
+    );
+    try {
+      const opts = await ready.promise;
+      reenter = () => opts.onStderrLine?.("nested consumer event");
+      if (behavior === "caller") caller.abort();
+      now = 2;
+      expect(() => tick()).not.toThrow();
+      expect(opts.signal?.aborted).toBe(true);
+      expect(events.filter(watchdogFired)).toHaveLength(1);
+      if (behavior.startsWith("throw")) {
+        const before = transcript.length;
+        opts.onStdoutLine?.(JSON.stringify({ type: "result", result: "later output" }));
+        opts.onStderrLine?.("later stderr");
+        tick();
+        expect(events).toHaveLength(behavior === "throw-reentrant" ? 2 : 1);
+        expect(transcript).toHaveLength(before);
+      }
+      release.resolve();
+      const result = await invocation;
+      expect(result.status).toBe(
+        behavior.startsWith("throw") ? "error" : behavior === "caller" ? "cancelled" : "stuck",
+      );
+      if (behavior.startsWith("throw")) expect(result.error).toBe("Invocation output callback failed");
+      expect(cleaned).toBe(true);
+      expect(cleared).toBe(1);
+      expect(JSON.stringify([result, events, transcript, readFileSync(spec.logPath, "utf8")])).not.toContain(
+        "synthetic private watchdog exception",
+      );
+      const healthy = await runClaude(
+        { ...spec, signal: new AbortController().signal },
+        async (opts) => {
+          opts.onStdoutLine?.(opts.cmd[4] ?? "");
+          opts.onStdoutLine?.(JSON.stringify({ type: "result", result: "healthy" }));
+          return { ...resultFixture, cancelled: false, cancelKilled: false, exitCode: 0 };
+        },
+        timers,
+      );
+      expect(healthy.status).toBe("ok");
+      expect(healthy.finalText).toBe("healthy");
+      expect(cleared).toBe(2);
+    } finally {
+      caller.abort();
+      release.resolve();
+      await invocation;
+    }
+  });
+});
+
 test("a claude editor whose sandbox hangs until the no-progress watchdog fires is a confinement error", async () => {
   const caller = new AbortController();
   await expect(heldEdit(heldLaunch(undefined, true), caller.signal)).rejects.toThrow(

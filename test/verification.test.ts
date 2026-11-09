@@ -533,6 +533,39 @@ const boundedHoldout = (steps = "--private-mode"): Holdout => ({
 const whollyWithheld = (output: string) =>
   expect(output).toBe("[value withheld: holdout redaction limit or matcher failure]");
 
+test("the per-detail cap accepts 4096 units and withholds 4097 after extraction preflight", () => {
+  // Short sentence segments pass preflight; only the whole phrase reaches the detail cap.
+  const detail = `${"word. ".repeat(682)}word`;
+  expect(detail.length).toBe(4096);
+  expect(holdoutRedactor(boundedHoldout(detail))(detail, false)).toBe(
+    "[private detail] [1 private details withheld]",
+  );
+  whollyWithheld(holdoutRedactor(boundedHoldout(`${detail}x`))("ordinary", false));
+});
+
+test("the authored-source cap counts repeated valid fields across scenarios", () => {
+  const authored = (units: number): Holdout => {
+    const fields = Array.from({ length: 6 }, (_, i) => {
+      const length = Math.floor(units / 6) + (i < units % 6 ? 1 : 0);
+      // Padding counts as authored source, but extracts no additional private details.
+      return `private phrase${"\n".repeat(length - "private phrase".length)}`;
+    });
+    return {
+      scenarios: [0, 3].map((i) => ({
+        id: `H-${i}`,
+        description: fields[i] ?? "",
+        steps: fields[i + 1] ?? "",
+        expected: fields[i + 2] ?? "",
+        edge_case: false,
+      })),
+    };
+  };
+  expect(holdoutRedactor(authored(262_144))("private phrase", false)).toBe(
+    "[private detail] [1 private details withheld]",
+  );
+  whollyWithheld(holdoutRedactor(authored(262_145))("ordinary", false));
+});
+
 test("large static and observed detail sets and oversized inputs fail closed", () => {
   const literals = Array.from({ length: 6000 }, (_, i) => `syntheticPrivate_${i}`);
   const value = literals.join(" ");
