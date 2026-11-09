@@ -2773,8 +2773,8 @@ async function oneRound(
               : `${c.id}: ${discreetModelText(c.evidence, repoSettings(ctx.deps.cfg, ctx.repo.slug).discreet)}`,
           )
           .join("\n");
-        const rawDetail = `${ENVIRONMENT_BLOCKED}\n${evidence}${routing ? `\n${routing}` : ""}`;
-        const detail = redactHoldoutText(rawDetail, ctx.state.holdout as Holdout, publicSources);
+        const rawDetail = `${evidence}${routing ? `\n${routing}` : ""}`;
+        const detail = `${ENVIRONMENT_BLOCKED}\n${redactHoldoutText(rawDetail, ctx.state.holdout as Holdout, publicSources)}`;
         ctx.store.recordOwnerDiagnostic(
           {
             runId: ctx.run.id,

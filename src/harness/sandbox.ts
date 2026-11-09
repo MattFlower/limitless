@@ -384,6 +384,7 @@ export async function runSandboxed(
     cwd: payload.cwd,
   };
   const result = await run({ ...payload, ...launched });
+  if (result.outputError) return result;
   if (!started) {
     // Our cancel stopped the launch before the trusted shell ran, so the payload never did.
     if (killedByCancel(result) && !launch.failed()) return result;

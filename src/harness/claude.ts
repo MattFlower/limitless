@@ -1,7 +1,14 @@
 import { appendFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { QuotaWindow } from "../core/types.ts";
-import { agentEnv, idleWatchdog, type ProcResult, redactCredentials, runProcess } from "../util/proc.ts";
+import {
+  agentEnv,
+  idleWatchdog,
+  outputCallbackError,
+  type ProcResult,
+  redactCredentials,
+  runProcess,
+} from "../util/proc.ts";
 import { BROWSER_TOOLS, type BrowserMcpServer, browserMcp } from "./browser-mcp.ts";
 import { homeReadPolicy } from "./read-policy.ts";
 import { ConfinementError, runSandboxed } from "./sandbox.ts";
@@ -340,7 +347,10 @@ function claudeEditorRoots(spec: AgentSpec, scratch: string) {
 export async function runClaude(
   spec: AgentSpec,
   processRunner = runProcess,
-  progressTimer = { set: setInterval, clear: clearInterval },
+  progressTimer: {
+    set: (callback: () => void, ms: number) => ReturnType<typeof setInterval>;
+    clear: (handle: ReturnType<typeof setInterval>) => void;
+  } = { set: setInterval, clear: clearInterval },
 ): Promise<AgentResult> {
   spec = protectCredentials(spec);
   const sessionId = crypto.randomUUID();
@@ -394,6 +404,15 @@ export async function runClaude(
 
   const loop = new LoopDetector(spec.maxToolCalls);
   const stuckController = new AbortController();
+  let callbackError: string | null = null;
+  const onEvent = (event: AgentEvent) => {
+    if (callbackError) return;
+    const error = outputCallbackError(spec.onEvent, event);
+    if (error) {
+      callbackError = error;
+      stuckController.abort();
+    }
+  };
   let stuckReason: string | null = null;
   const signal = AbortSignal.any([spec.signal, stuckController.signal]);
   // The first abort decides who stopped the agent; the other may follow during cleanup.
@@ -416,7 +435,7 @@ export async function runClaude(
       stuckReason = `no progress (text or tool activity) for ${Math.round(spec.idleTimeoutMs / 1000)}s`;
       // Abort before reporting, so the watchdog's stop is recorded ahead of anything the event triggers.
       stuckController.abort();
-      spec.onEvent({ type: "status", text: `stopping agent: ${stuckReason}` });
+      onEvent({ type: "status", text: `stopping agent: ${stuckReason}` });
     },
     Math.min(spec.idleTimeoutMs, 10_000),
   );
@@ -437,14 +456,14 @@ export async function runClaude(
       if (reason) {
         stuckReason = reason;
         stuckController.abort();
-        spec.onEvent({ type: "status", text: `stopping agent: ${reason}` });
+        onEvent({ type: "status", text: `stopping agent: ${reason}` });
       }
     }
-    spec.onEvent(ev);
+    onEvent(ev);
   });
 
   const transcript = spec.holdTranscript ?? ((text: string) => appendFileSync(spec.logPath, `${text}\n`));
-  const proc = await runner({
+  const pending = runner({
     cmd: args,
     cwd: spec.cwd,
     env: {
@@ -468,17 +487,23 @@ export async function runClaude(
     idleTimeoutMs: spec.idleTimeoutMs,
     idleNow: spec.idleNow,
     onStdoutLine: (line) => {
+      if (callbackError) return;
       transcript(redactJsonLine(line, spec.redactOutput));
       parser.feed(redactJsonLine(line, redactCredentials));
     },
     onStderrLine: (line) => {
+      if (callbackError) return;
       transcript(`[stderr] ${spec.redactOutput?.(line) ?? line}`);
-      spec.onEvent({ type: "stderr", text: line });
+      onEvent({ type: "stderr", text: line });
     },
   }).finally(() => {
     progressTimer.clear(progressWatch);
     spec.signal.removeEventListener("abort", callerAborted);
     if (keyFile) rmSync(keyFile, { force: true });
+  });
+  const proc = await pending.catch((error: unknown) => {
+    if (!callbackError || !(error instanceof ConfinementError || error === signal.reason)) throw error;
+    return null;
   });
 
   const cost = priceOf(parser.usage, t.price);
@@ -500,6 +525,8 @@ export async function runClaude(
         : null,
   };
 
+  if (!proc || callbackError) return { ...base, status: "error", error: callbackError };
+  if (proc.outputError) return { ...base, status: "error", error: proc.outputError };
   if (proc.cancelled && firstAbort === "caller") return { ...base, status: "cancelled", error: "cancelled" };
   if (stuckReason) return { ...base, status: "stuck", error: stuckReason };
   if (proc.cancelled) return { ...base, status: "cancelled", error: "cancelled" };

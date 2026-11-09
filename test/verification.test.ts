@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { compareGates, type GateComparison } from "../src/gates/run.ts";
 import {
   formatGateFeedback,
@@ -525,6 +525,172 @@ test("streaming redaction reuses patterns without retaining every observed combi
   } finally {
     globalThis.RegExp = original;
   }
+});
+
+const boundedHoldout = (steps = "--private-mode"): Holdout => ({
+  scenarios: [{ id: "H-1", description: "private", steps, expected: "ok", edge_case: false }],
+});
+const whollyWithheld = (output: string) =>
+  expect(output).toBe("[value withheld: holdout redaction limit or matcher failure]");
+
+test("the per-detail cap accepts 4096 units and withholds 4097 after extraction preflight", () => {
+  // Short sentence segments pass preflight; only the whole phrase reaches the detail cap.
+  const detail = `${"word. ".repeat(682)}word`;
+  expect(detail.length).toBe(4096);
+  expect(holdoutRedactor(boundedHoldout(detail))(detail, false)).toBe(
+    "[private detail] [1 private details withheld]",
+  );
+  whollyWithheld(holdoutRedactor(boundedHoldout(`${detail}x`))("ordinary", false));
+});
+
+test("the authored-source cap counts repeated valid fields across scenarios", () => {
+  const authored = (units: number): Holdout => {
+    const fields = Array.from({ length: 6 }, (_, i) => {
+      const length = Math.floor(units / 6) + (i < units % 6 ? 1 : 0);
+      // Padding counts as authored source, but extracts no additional private details.
+      return `private phrase${"\n".repeat(length - "private phrase".length)}`;
+    });
+    return {
+      scenarios: [0, 3].map((i) => ({
+        id: `H-${i}`,
+        description: fields[i] ?? "",
+        steps: fields[i + 1] ?? "",
+        expected: fields[i + 2] ?? "",
+        edge_case: false,
+      })),
+    };
+  };
+  expect(holdoutRedactor(authored(262_144))("private phrase", false)).toBe(
+    "[private detail] [1 private details withheld]",
+  );
+  whollyWithheld(holdoutRedactor(authored(262_145))("ordinary", false));
+});
+
+test("large static and observed detail sets and oversized inputs fail closed", () => {
+  const literals = Array.from({ length: 6000 }, (_, i) => `syntheticPrivate_${i}`);
+  const value = literals.join(" ");
+  for (const output of [
+    holdoutRedactor(boundedHoldout(literals.map((s) => `'${s}'`).join(" ")))(value, false),
+    holdoutRedactor(boundedHoldout())(value),
+    holdoutRedactor(boundedHoldout(`'${"x".repeat(4097)}'`))("ordinary"),
+    holdoutRedactor(boundedHoldout())("x".repeat(65_537), false),
+    holdoutRedactor(boundedHoldout(), "x".repeat(262_145))("ordinary"),
+  ]) {
+    whollyWithheld(output);
+    for (const literal of literals) expect(output).not.toContain(literal);
+  }
+  // Aggregate pattern size, independently of alternative count or single-detail length.
+  const phrases: Holdout = {
+    scenarios: Array.from({ length: 20 }, (_, i) => ({
+      id: `H-${i}`,
+      description: "private",
+      steps: `'${"ordinary ".repeat(200)} ${i}'`,
+      expected: "ok",
+      edge_case: false,
+    })),
+  };
+  whollyWithheld(holdoutRedactor(phrases)("ordinary"));
+  // Short numbers stay within extraction limits but exceed the observed-alternative cap.
+  whollyWithheld(holdoutRedactor(boundedHoldout())(Array.from({ length: 513 }, (_, i) => i).join(" ")));
+});
+
+test("classification budgets precede regex work and cached observations are bounded", () => {
+  const original = globalThis.RegExp;
+  let compiled = 0;
+  globalThis.RegExp = new Proxy(original, {
+    construct(target, args) {
+      if (args[1] === "iu") compiled++;
+      return Reflect.construct(target, args);
+    },
+  });
+  try {
+    // Each scan costs 131072 + detail.length units; 31 scans fit in 4194304 units.
+    const publicSources = "prefixruntimeId_0suffix ".repeat(6000).slice(0, 131072);
+    const redact = holdoutRedactor(boundedHoldout("private"), publicSources);
+    compiled = 0;
+    expect(redact("runtimeId_0")).toBe("[private detail] [1 private details withheld]");
+    expect(compiled).toBe(1); // Interior occurrences never grant a public exemption.
+    compiled = 0;
+    whollyWithheld(redact(Array.from({ length: 33 }, (_, i) => `runtimeId_${i + 1}`).join(" ")));
+    expect(compiled).toBe(31);
+    // Retried failed work still withholds the whole value, including cached prefixes.
+    whollyWithheld(redact(Array.from({ length: 100 }, (_, i) => `otherId_${i}`).join(" ")));
+    compiled = 0;
+    whollyWithheld(
+      holdoutRedactor(
+        boundedHoldout(Array.from({ length: 40 }, (_, i) => `staticId_${i}`).join(" ")),
+        publicSources,
+      )("private"),
+    );
+    expect(compiled).toBe(31);
+    const cached = holdoutRedactor(boundedHoldout("private"));
+    cached("runtimeId_0");
+    for (let i = 1; i < 2200; i++) cached(`runtimeId_${i}`);
+    const before = compiled;
+    expect(cached("runtimeId_0")).toBe("[private detail] [1 private details withheld]");
+    expect(compiled).toBe(before + 1); // An old classification was evicted.
+    expect(cached("ordinary", false)).toBe("ordinary");
+  } finally {
+    globalThis.RegExp = original;
+  }
+});
+
+test("extraction limits precede unanchored matching for values and authored details", () => {
+  const redact = holdoutRedactor(boundedHoldout());
+  const match = spyOn(String.prototype, "match");
+  try {
+    for (const value of ["x".repeat(8000), "a ".repeat(4000), "x".repeat(513), "x.".repeat(4000)]) {
+      whollyWithheld(redact(value));
+      whollyWithheld(
+        holdoutRedactor({
+          scenarios: boundedHoldout().scenarios.map((scenario) => ({ ...scenario, description: value })),
+        })("ordinary"),
+      );
+    }
+    expect(match).not.toHaveBeenCalled();
+  } finally {
+    match.mockRestore();
+  }
+  expect(redact("x".repeat(512))).toBe("x".repeat(512));
+  expect(redact("a ".repeat(2048))).toBe("a ".repeat(2048));
+  whollyWithheld(redact("a ".repeat(2049)));
+  // Without extraction, the bounded literal matcher can still process longer ordinary text.
+  expect(redact("x".repeat(8000), false)).toBe("x".repeat(8000));
+});
+
+test("large public sources are inspected only when a detail needs classification", () => {
+  const publicSources = "ordinary ".repeat(40_000);
+  const redact = holdoutRedactor(boundedHoldout("private"), publicSources);
+  expect(redact("Real confinement probes require unconfined gates")).toBe(
+    "Real confinement probes require unconfined gates",
+  );
+  whollyWithheld(redact("runtimeBlocked_1"));
+  expect(redact("ordinary")).toBe("ordinary");
+});
+
+test("matcher failures during construction and execution withhold whole values safely", () => {
+  const original = globalThis.RegExp;
+  const execution = holdoutRedactor(boundedHoldout());
+  globalThis.RegExp = new Proxy(original, {
+    construct() {
+      throw new Error("synthetic secret-bearing exception");
+    },
+  });
+  try {
+    whollyWithheld(holdoutRedactor(boundedHoldout())("--private-mode"));
+    whollyWithheld(execution("--private-mode newRuntime_1"));
+  } finally {
+    globalThis.RegExp = original;
+  }
+  const exec = spyOn(RegExp.prototype, "exec").mockImplementation(() => {
+    throw new Error("synthetic secret-bearing match exception");
+  });
+  try {
+    whollyWithheld(execution("--private-mode", false));
+  } finally {
+    exec.mockRestore();
+  }
+  expect(execution("--private-mode", false)).toBe("[private detail] [1 private details withheld]");
 });
 
 test("private summaries redact runtime error identifiers on unmet and unclear retries", () => {

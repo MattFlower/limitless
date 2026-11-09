@@ -87,6 +87,173 @@ const options = (): ProcOptions => ({ cmd: ["fixture"], cwd: process.cwd(), env:
 const captured = (opts?: Partial<ProcOptions>) =>
   runProcess({ ...options(), captureComplete: true, ...opts });
 
+test.each([
+  [false, "stdout", false],
+  [false, "stderr", false],
+  [false, "raw", false],
+  [true, "stdout", false],
+  [true, "stderr", false],
+  [true, "raw", false],
+  [false, "stdout", true],
+  [false, "stderr", true],
+  [true, "stdout", true],
+  [true, "stderr", true],
+] as const)(
+  "output callback failure: capture=%s stream=%s final=%s",
+  async (captureComplete, stream, final) => {
+    let calls = 0;
+    const callback = () => {
+      calls++;
+      throw new Error("synthetic private exception content");
+    };
+    const result = await withChunks(
+      [
+        {
+          stream: stream === "stderr" ? "stderr" : "stdout",
+          text: final ? "unterminated" : "first\nsecond\n",
+        },
+        { stream: final && stream === "stderr" ? "stdout" : "stderr", text: "earlier complete\n" },
+        { stream: stream === "stderr" ? "stderr" : "stdout", text: "later output" },
+      ],
+      () =>
+        runProcess({
+          ...options(),
+          captureComplete,
+          ...(stream === "raw" ? { onRawChunk: callback } : {}),
+          onStdoutLine:
+            stream === "stdout"
+              ? callback
+              : () => {
+                  calls++;
+                },
+          onStderrLine:
+            stream === "stderr"
+              ? callback
+              : () => {
+                  calls++;
+                },
+        }),
+    );
+    expect(result.outputError).toBe("Invocation output callback failed");
+    expect(result.exitCode).not.toBe(0);
+    expect(result.outputError).not.toContain("synthetic private");
+    expect(result.cancelled || result.timedOut || result.idleTimedOut).toBe(false);
+    // Final unterminated lines follow the other stream; everything after the failure is suppressed.
+    expect(calls).toBe(final ? 2 : 1);
+    expect(result.capture?.provenance.kind).not.toBe("complete");
+    const next = await withChunks([{ stream: "stdout", text: "healthy\n" }], () => captured());
+    expect(next.outputError).toBeUndefined();
+    expect(next.exitCode).toBe(0);
+    expect(next.stdout).toBe("healthy\n");
+  },
+);
+
+test.each(["stdout", "stderr"] as const)(
+  "raw %s decoder EOF callback failures are contained",
+  async (stream) => {
+    const seen: string[] = [];
+    const result = await withChunks([{ stream, text: Buffer.from([0x61, 0xe2, 0x82]) }], () =>
+      captured({
+        onRawChunk: (text, source) => {
+          expect(source).toBe(stream);
+          seen.push(text);
+          if (text === "\uFFFD") throw new Error("synthetic private EOF exception");
+        },
+      }),
+    );
+    expect(seen).toEqual(["a", "\uFFFD"]);
+    expect(result.outputError).toBe("Invocation output callback failed");
+    expect(result.exitCode).toBe(1);
+    expect(result.capture?.provenance.kind).not.toBe("complete");
+    expect(JSON.stringify(result)).not.toContain("synthetic private EOF exception");
+  },
+);
+
+test("sandbox preserves output callback failure before the startup token", async () => {
+  const failure = {
+    outputError: "Invocation output callback failed",
+    exitCode: 1,
+    signal: null,
+    cancelled: false,
+    timedOut: false,
+    idleTimedOut: false,
+    stdout: "",
+    stderr: "",
+    truncated: false,
+    durationMs: 0,
+  };
+  const result = await runSandboxed(
+    options(),
+    { write: [], protect: [] },
+    async () => failure,
+    undefined,
+    fakeConfinement,
+  );
+  expect(result).toEqual(failure);
+});
+
+test("gate inspection failure on an unterminated line cannot pass a zero-exit command", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "limitless-callback-gate-"));
+  const observe = spyOn(BunTestCoverage.prototype, "observe").mockImplementation(() => {
+    throw new Error("synthetic private inspection exception");
+  });
+  const cfg = {
+    source: "detected" as const,
+    setup: [],
+    checks: [{ name: "test", run: "printf failure" }],
+    protectedPaths: [],
+  };
+  try {
+    const result = await confinementScope.run(fakeConfinement, () =>
+      runGates(cwd, cfg, new AbortController().signal),
+    );
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(result.checks[0]).toMatchObject({ ok: false, exitCode: 1 });
+    expect(JSON.stringify(result)).not.toContain("synthetic private inspection exception");
+    expect(result.checks[0]?.output).toBe("[withheld: capture-incomplete]");
+    observe.mockRestore();
+    const next = await confinementScope.run(fakeConfinement, () =>
+      runGates(cwd, cfg, new AbortController().signal),
+    );
+    expect(next.checks[0]).toMatchObject({ ok: true, exitCode: 0 });
+  } finally {
+    observe.mockRestore();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("output callback failure stops its live child and completes scoped cleanup", async () => {
+  const children = new Map<subprocess.ChildProcess, Promise<void>>();
+  let pid = 0;
+  await processScope.run(
+    { signal: new AbortController().signal, killGraceMs: 0, children, scratchDirs: new Set() },
+    async () => {
+      const result = await runProcess({
+        cmd: [process.execPath, "-e", "console.log(process.pid); setInterval(() => {}, 1000)"],
+        cwd: process.cwd(),
+        env: {},
+        timeoutMs: 30_000,
+        onStdoutLine: (line) => {
+          pid = Number(line);
+          throw "unregistered private exception";
+        },
+      });
+      expect(result.outputError).toBe("Invocation output callback failed");
+      expect(result.timedOut || result.cancelled).toBe(false);
+      expect(children.size).toBe(0);
+    },
+  );
+  expect(pid).toBeGreaterThan(0);
+  await expectProcessStopped(pid);
+  const next = await runProcess({
+    cmd: [process.execPath, "-e", 'console.log("healthy")'],
+    cwd: process.cwd(),
+    env: {},
+  });
+  expect(next.exitCode).toBe(0);
+  expect(next.outputError).toBeUndefined();
+});
+
 type DrainEvent = Parameters<NonNullable<ReturnType<typeof processDrainObserver.getStore>>["observe"]>[0];
 const pieces = (text: string): Chunk[] =>
   Array.from({ length: Math.ceil(text.length / 131072) }, (_, i) => ({
