@@ -1,5 +1,8 @@
-import { projectGateDiagnostics, redactGateOutput } from "./output.ts";
+import { getPrivacyChecker } from "../util/privacy-checker.ts";
+import { verifier } from "../util/privacy-proof.ts";
+import { projectGateDiagnostics, redactGateOutput, renderingCredentialsUnchanged } from "./output.ts";
 import type { GateResult } from "./run.ts";
+import { gatePrivacyScope, withheldText } from "./text-privacy.ts";
 
 const FAILURE_RESULT = /^(?:(?:\(fail\)|✗)(?:\s|$)|not ok(?:\s|$))/;
 const TIMEOUT = /^\^ this test timed out after \d+(?:\.\d+)?ms\.$/;
@@ -73,8 +76,72 @@ export function extractFailures(output: string): string | undefined {
   return excerpts.result();
 }
 
-/** Interim guard until renderings receive their own checker-backed proofs. */
-export function formatGateOutput(result: GateResult, limit = 3_000): string {
-  const { output } = projectGateDiagnostics(result, { mode: "outward" });
-  return output.length <= limit ? output : "[output withheld: unchecked-rendering]";
+export const RENDER_LIMITS = [3_000, 9_000] as const;
+type RenderLimit = (typeof RENDER_LIMITS)[number];
+const high = (n: number) => n >= 0xd800 && n <= 0xdbff;
+const low = (n: number) => n >= 0xdc00 && n <= 0xdfff;
+const head = (s: string, room: number) =>
+  s.slice(0, high(s.charCodeAt(room - 1)) && low(s.charCodeAt(room)) ? room - 1 : room);
+const tail = (s: string, room: number) => {
+  const start = Math.max(0, s.length - room);
+  return s.slice(high(s.charCodeAt(start - 1)) && low(s.charCodeAt(start)) ? start + 1 : start);
+};
+
+/** Reserve complete result lines before spending the remaining budget on diagnostics. */
+function shortenFailureExcerpts(excerpt: string, limit: number): string {
+  if (excerpt.length <= limit) return excerpt;
+  const lines = excerpt.split("\n").filter((line) => line !== OMITTED);
+  const identities = new Set<number>();
+  let room = limit - OMITTED.length;
+  for (const [i, line] of lines.entries()) {
+    if ((FAILURE_RESULT.test(line.trim()) || TIMEOUT.test(line.trim())) && line.length + 1 <= room) {
+      identities.add(i);
+      room -= line.length + 1;
+    }
+  }
+  const kept: string[] = [];
+  for (const [i, line] of lines.entries()) {
+    if (identities.has(i)) kept.push(line);
+    else if (!FAILURE_RESULT.test(line.trim()) && !TIMEOUT.test(line.trim()) && room > 1) {
+      const diagnostic = head(line, room - 1);
+      kept.push(diagnostic);
+      room -= diagnostic.length + 1;
+    }
+  }
+  return [...kept, OMITTED].join("\n");
+}
+
+/** Render exact candidate bytes; only the producer checks and signs cuts. */
+export function renderGateOutput(
+  result: Pick<GateResult, "output" | "failures">,
+  limit: RenderLimit,
+): string {
+  if (!result.failures) return tail(result.output, limit);
+  return `${shortenFailureExcerpts(result.failures, limit - 1_002)}\n\n${tail(result.output, 1_000)}`;
+}
+
+export function formatGateOutput(result: GateResult, limit: RenderLimit = 3_000): string {
+  const scope = gatePrivacyScope.getStore();
+  const snapshot = verifier(scope?.registry ?? getPrivacyChecker().registry, scope?.signer);
+  const projected = projectGateDiagnostics(result, { mode: "outward", snapshot });
+  if (projected.textPrivacy?.output.withheld) return projected.output;
+  if (!RENDER_LIMITS.includes(limit)) return withheldText("unproven");
+  const bytes = renderGateOutput(result, limit);
+  if (bytes === result.output) return projected.output;
+  const record = result.textPrivacy?.renderings?.[limit];
+  if (
+    record?.withheld !== false ||
+    record.truncated !== true ||
+    !snapshot.verify(record, `rendering:${limit}`, bytes, record.truncated === true)
+  )
+    return withheldText("unproven");
+  // Excerpts are cuts too: neither they nor the rendering retain complete credential context.
+  if (result.failures && !snapshot.verify(result.textPrivacy?.failures, "failures", result.failures, true))
+    return withheldText("unproven");
+  if (
+    !snapshot.credentialsUnchanged(record) ||
+    (result.failures && !snapshot.credentialsUnchanged(result.textPrivacy?.failures))
+  )
+    return withheldText("credential-changed");
+  return renderingCredentialsUnchanged(bytes) ? bytes : withheldText("credential-changed");
 }

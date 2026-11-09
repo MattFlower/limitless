@@ -3,10 +3,13 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import type { Factory } from "../src/app.ts";
 import { WorkerStore } from "../src/db/workers.ts";
+import * as execution from "../src/gates/executor.ts";
 import { type GateExecutor, type GateRequest, gateProvenance, localExecutor } from "../src/gates/executor.ts";
 import { lanExecutor } from "../src/gates/lan.ts";
 import { redactGateOutput } from "../src/gates/output.ts";
+import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import type { GateComparison } from "../src/gates/run.ts";
+import { gateIdentities } from "../src/gates/text-privacy.ts";
 import type { RunState } from "../src/pipeline/context.ts";
 import { applyGateEvidence } from "../src/pipeline/gate-evidence.ts";
 import type { Verify } from "../src/pipeline/schemas.ts";
@@ -707,9 +710,8 @@ test.each([
       });
       expect(result.exitCode).toBe(flaky && !rejected ? 0 : 3);
       expect(result.stdout).not.toContain(secret);
-      expect(result.stdout).toContain(
-        rejected ? "[withheld: unproven]" : flaky ? "pass on retry" : "tail [redacted]",
-      );
+      // Only the output is proved; composing it with the raw excerpt requires a rendering proof.
+      expect(result.stdout).toContain(rejected || !flaky ? "[withheld: unproven]" : "pass on retry");
       expect(result.stdout).not.toContain("failure excerpt");
       if (rejected) expect(result.stdout).not.toContain("Retry rejected:");
       const stored = f.store.db.query("SELECT * FROM agent_gate_executions").all();
@@ -764,7 +766,68 @@ test.each([
   expect(roundZeroTests).toBe(0);
   expect(calls).toBe(flaky ? 3 : 2);
   if (!flaky) {
-    expect(feedback).toContain("tail [redacted]");
+    expect(feedback).toContain("[withheld: unproven]");
+    expect(feedback).not.toContain("tail [redacted]");
     expect(feedback).not.toContain("failure excerpt");
   }
+});
+
+test("agent-test session reply releases checked failure renderings", async () => {
+  await configure(true);
+  let replied = false;
+  const f = start(async (agent) => {
+    const role = roleOf(agent);
+    if (role === "triage") return { structured: triage({ suggested_profile: "quick" }) };
+    if (role === "review") return { structured: approve };
+    writeFileSync(join(agent.cwd, "farewell.txt"), "goodbye\n");
+    const execute = execution.executeGate;
+    const output = "z".repeat(6000),
+      failures = "checked agent diagnostic\n(fail) case";
+    const stub = spyOn(execution, "executeGate").mockImplementation(async (...args) => {
+      const run = await execute(...args);
+      for (const r of run.checks)
+        Object.assign(
+          r,
+          { ok: false, exitCode: 1 },
+          await protectGateOutput(
+            {
+              capture: { provenance: { kind: "complete" }, stdout: output, stderr: "" },
+              stdout: "",
+              stderr: "",
+              exitCode: 1,
+              signal: null,
+              cancelled: false,
+              timedOut: false,
+              idleTimedOut: false,
+              truncated: false,
+              durationMs: 1,
+            },
+            gateIdentities(r),
+            { deadline: Date.now() + 120000 },
+            failures,
+            () => true,
+          ),
+        );
+      return run;
+    });
+    try {
+      const directory = agent.commandPath?.split(delimiter)[0];
+      if (!directory) throw Error("Missing wrapper");
+      const reply = await sh([join(directory, "bun"), "test"], {
+        cwd: agent.cwd,
+        env: agentEnv(),
+        allowFail: true,
+      });
+      expect(reply.exitCode).toBe(1);
+      expect(reply.stdout).toContain(`${failures}\n\n${output.slice(-1000)}`);
+      replied = true;
+    } finally {
+      stub.mockRestore();
+      f.store.db.exec("DELETE FROM agent_gate_executions");
+    }
+    return { text: "implemented" };
+  });
+  const run = await f.createRun({ repo: fixture.repoDir, prompt: "Add farewell.txt" });
+  expect(await waitFor(f, run.id, ["succeeded", "failed", "needs_human"])).toBe("succeeded");
+  expect(replied).toBe(true);
 });

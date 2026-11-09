@@ -77,6 +77,7 @@ type ProjectionOptions = {
   registry?: V[0];
   signer?: V[1];
   maxEventData?: number;
+  snapshot?: ReturnType<typeof verifier>;
 };
 const isText = (v: object, key: string) => typeof Reflect.get(v, key) === "string";
 const isResult = (v: unknown): v is GateResult =>
@@ -142,7 +143,7 @@ function projectResult(r: GateResult, project: Project, outward = false): GateRe
 }
 /** Proofs are authority; shape recognition only selects the fields to project. */
 export function projectGateDiagnostics<T>(value: T, options: ProjectionOptions): T {
-  let snapshot: ReturnType<typeof verifier> | undefined;
+  let snapshot = options.snapshot;
   const results = new WeakSet<object>(),
     untouched = new WeakSet<object>(),
     coverage = new WeakSet<object>();

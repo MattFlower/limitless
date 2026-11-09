@@ -16,12 +16,16 @@ export const fieldPrivacySchema = z
     reason: z.string().optional(),
     kind: z.enum(["complete", "attested:lan", "attested:github-actions", "rendering"]).optional(),
     mac: z.string().optional(),
+    credentials: z.string().optional(),
   })
   .refine((field) => !field.withheld || field.mac === undefined, "Withheld fields are unsigned");
 export const textPrivacySchema = z.strictObject({
   output: fieldPrivacySchema,
   identities: fieldPrivacySchema.optional(),
   failures: fieldPrivacySchema.optional(),
+  renderings: z
+    .strictObject({ "3000": fieldPrivacySchema.optional(), "9000": fieldPrivacySchema.optional() })
+    .optional(),
 });
 export type TextPrivacy = z.infer<typeof textPrivacySchema>;
 const WITHHELD_REASONS = new Set<unknown>([

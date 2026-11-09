@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { privateStringsDigest } from "../gates/private.ts";
+import { credentialRegistry } from "./credential-matcher.ts";
 import { checkPrepared, preparePrivacyPolicy, type privacyRegistry } from "./privacy-boundary.ts";
 import type { createPrivacyChecker } from "./privacy-checker.ts";
 import { consumeBoundaryChunk } from "./privacy-chunks.ts";
@@ -11,7 +12,14 @@ import { redactCredentials, registerCredential } from "./proc.ts";
 export { PRIVACY_CHECKER_SEMANTICS } from "./privacy-boundary.ts";
 
 const kinds = z.enum(["complete", "attested:lan", "attested:github-actions", "rendering"]);
-const proofSchema = z.object({ kind: kinds, mac: z.string().regex(/^[a-f0-9]{64}(?![\s\S])/) });
+const proofSchema = z.object({
+  kind: kinds,
+  mac: z.string().regex(/^[a-f0-9]{64}(?![\s\S])/),
+  credentials: z
+    .string()
+    .regex(/^[a-f0-9]{64}(?![\s\S])/)
+    .optional(),
+});
 export type PrivacyProof = z.infer<typeof proofSchema>;
 type Checker = ReturnType<typeof createPrivacyChecker>;
 type KeyState = { loaded?: boolean; key?: Buffer };
@@ -75,6 +83,18 @@ const mac = (key: Buffer, binding: string[], bytes: string | Uint8Array) =>
   createHmac("sha256", key)
     .update(JSON.stringify(["limitless-gate-proof/1", ...binding, hash(bytes)]))
     .digest();
+let credentialState: { generation: number; key: Buffer; digest: string } | undefined;
+/** Stable across restart and registration order; keyed so the digest cannot disclose credentials. */
+function credentialDigest(key: Buffer): string {
+  const generation = credentialRegistry.generation;
+  if (credentialState?.generation !== generation || !credentialState.key.equals(key))
+    credentialState = {
+      generation,
+      key,
+      digest: mac(key, ["credentials"], JSON.stringify(credentialRegistry.values().sort())).toString("hex"),
+    };
+  return credentialState.digest;
+}
 export async function checkAndSign(
   input: Omit<Parameters<Checker["protectText"]>[0], "provenance" | "terminal"> &
     Parameters<Checker["protectText"]>[1] & {
@@ -88,6 +108,10 @@ export async function checkAndSign(
     },
 ): Promise<PrivacyProof | undefined> {
   const { checker, kind, field, text, cut, signal, deadline, producerCut, signer = provider } = input;
+  // Only excerpt and rendering proofs bind the credential set; output proofs survive durable projection.
+  const key = signer(),
+    credentials =
+      producerCut && key && /^(?:failures|rendering:\d+)$/.test(field) ? credentialDigest(key) : undefined;
   const protect = producerCut ? checker.protectProducerCut : checker.protectText;
   if (!protect) return void input.onRefusal?.("unchecked-provenance");
   const receipt = await protect(
@@ -100,7 +124,6 @@ export async function checkAndSign(
     { signal, deadline },
   );
   const { registry } = checker,
-    key = signer(),
     bound = { registry, input: cut?.limit === 0 ? hash(text) : undefined };
   const parts: Uint8Array[] = [];
   let truncated = false;
@@ -123,6 +146,7 @@ export async function checkAndSign(
   if (!key) return;
   const bytes = cut?.limit === 0 ? text : rendering,
     binding = [kind, registry.semantics, privateStringsDigest(registry.entries), field, String(truncated)];
+  if (credentials) binding.push(credentials);
   const policy = preparePrivacyPolicy({
     ready: true,
     entries: [],
@@ -133,7 +157,7 @@ export async function checkAndSign(
     input.onRefusal?.("checker-failed");
     return;
   }
-  return { kind, mac: mac(key, binding, bytes).toString("hex") };
+  return { kind, mac: mac(key, binding, bytes).toString("hex"), ...(credentials && { credentials }) };
 }
 export function verifier(registry: typeof privacyRegistry, signer = provider) {
   let policy: [string, string] | undefined;
@@ -144,12 +168,19 @@ export function verifier(registry: typeof privacyRegistry, signer = provider) {
     /* An unreadable policy cannot verify. */
   }
   const key = signer();
+  const credentials = key ? credentialDigest(key) : undefined;
   return {
     available: !!key,
+    credentialsUnchanged(value: unknown): boolean {
+      const proof = proofSchema.safeParse(value);
+      return !!credentials && proof.success && proof.data.credentials === credentials;
+    },
     verify(value: unknown, field: string, bytes: string | Uint8Array, truncated = false): boolean {
       const proof = proofSchema.safeParse(value);
       if (!key || !policy || !proof.success) return false;
-      const expected = mac(key, [proof.data.kind, ...policy, field, String(truncated === true)], bytes),
+      const binding = [proof.data.kind, ...policy, field, String(truncated === true)];
+      if (proof.data.credentials) binding.push(proof.data.credentials);
+      const expected = mac(key, binding, bytes),
         actual = Buffer.from(proof.data.mac, "hex");
       return actual.length === expected.length && timingSafeEqual(actual, expected);
     },

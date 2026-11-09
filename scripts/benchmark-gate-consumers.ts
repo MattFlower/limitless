@@ -12,6 +12,8 @@ import {
   operation,
   projectFixture,
   projectionOutcome,
+  renderConsumer,
+  renderFixture,
   renderInputs,
   validate,
 } from "../test/benchmark-gate-output-support.ts";
@@ -170,15 +172,31 @@ async function feedback(c: Context): Promise<Job[]> {
     ],
   ];
 }
-function render(c: Context): Job[] {
+function render(c: Context, proven = false): Job[] {
   const state = consumerState(64),
     gates = state.lastGates;
   const inputs = renderInputs(state);
+  const prepare = proven ? renderFixture(c, state) : undefined;
   return inputs.map(([name, input]) => [
     `${name}:production`,
     50,
-    typeof c.a[name] === "function" ? () => call(c, name, input) : undefined,
-    (v) => validate(typeof v === "string" && gates.every((g) => v.includes(g.name)), "50 rendered gate rows"),
+    typeof c.a[name] === "function" && (!proven || typeof c.a.renderGateOutput === "function")
+      ? () => renderConsumer(c, name, input, proven)
+      : undefined,
+    (v) =>
+      validate(
+        typeof v === "string" &&
+          gates.every((g) => v.includes(g.name)) &&
+          (!proven ||
+            (!v.includes("[withheld:") &&
+              v.includes(
+                name === "renderReport"
+                  ? (gates[0]?.result.command ?? "")
+                  : String(call(c, "renderGateOutput", gates[0]?.result, 3000)),
+              ))),
+        "50 rendered gate rows",
+      ),
+    prepare,
   ]);
 }
 async function landLog(c: Context): Promise<Job[]> {
@@ -219,5 +237,6 @@ export const consumerRegistry: Record<string, (c: Context) => Promise<Job[]> | J
   ["event-drain", drain],
   ["feedback-sign", feedback],
   ["render-prompts", render],
+  ["render-prompts-proven", (c: Context) => render(c, true)],
   ["land-log", landLog],
 ]);

@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, expect, spyOn } from "bun:test";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { GateCommand, GateConfig } from "../src/gates/detect.ts";
-import { extractFailures } from "../src/gates/failures.ts";
+import { extractFailures, formatGateOutput, RENDER_LIMITS, renderGateOutput } from "../src/gates/failures.ts";
 import * as junit from "../src/gates/junit.ts";
 import { projectGateDiagnostics } from "../src/gates/output.ts";
 import { protectGateOutput } from "../src/gates/output-privacy.ts";
@@ -15,10 +15,15 @@ import * as identityModule from "../src/gates/text-privacy.ts";
 import { gateIdentities, gatePrivacyScope, IDENTITY_CAP, withheldText } from "../src/gates/text-privacy.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { coveringTestCommand } from "../src/pipeline/covering-tests.ts";
+import { postMergeConfirmationText } from "../src/pipeline/post-merge-confirmation.ts";
+import { formatGateFeedback, reviewPrompt } from "../src/pipeline/prompts.ts";
 import { createCredentialRegistry, credentialRegistry } from "../src/util/credential-matcher.ts";
 import {
+  capturePrivacySnapshot,
+  checkPrepared,
   createPrivacyRegistry,
   currentPrivacyGeneration,
+  preparePrivacyPolicy,
   privacyLimits,
 } from "../src/util/privacy-boundary.ts";
 import {
@@ -27,7 +32,8 @@ import {
   privacyWorkerHandler,
 } from "../src/util/privacy-checker.ts";
 import { issuePrivacyWorkerChunks } from "../src/util/privacy-chunks.ts";
-import { verifier } from "../src/util/privacy-proof.ts";
+import { provisionPrivacyPolicy } from "../src/util/privacy-policy.ts";
+import { checkAndSign, verifier } from "../src/util/privacy-proof.ts";
 import { agentEnv, type ProcResult, registerCredential, runProcess, sh } from "../src/util/proc.ts";
 import { fakeConfinement } from "./confinement.ts";
 import { test } from "./read-policy-support.ts";
@@ -68,7 +74,7 @@ const config = (checks: GateCommand[]): GateConfig => ({
   source: "detected",
   protectedPaths: [],
 });
-function fixture(entries: string[] = [], credential?: string) {
+function fixture(entries: string[] = [], credential?: string, now = Date.now) {
   const cwd = mkdtempSync(join(tmpdir(), "gate-output-"));
   dirs.push(cwd);
   const secrets = createCredentialRegistry();
@@ -76,7 +82,7 @@ function fixture(entries: string[] = [], credential?: string) {
   const registry = createPrivacyRegistry(secrets);
   registry.refreshPolicy = () => {};
   registry.replacePolicy(entries.map((value, entry) => ({ value, entry })));
-  const checker = createPrivacyChecker({ registry, workerFactory: port });
+  const checker = createPrivacyChecker({ registry, workerFactory: port, now });
   checkers.push(checker);
   const signer = () => Buffer.alloc(32, 23);
   const excerptGeneration = credentialRegistry.generation;
@@ -504,7 +510,10 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
       verifier(f.registry, f.signer).verify(rejected.textPrivacy?.output, "output", rejected.output),
     ).toBe(false);
     expect(rejected.failures).toBeUndefined();
+    expect(rejected.textPrivacy?.output).toEqual({ withheld: true, reason: "unproven" });
     expect(rejected.textPrivacy).not.toHaveProperty("failures");
+    expect(rejected.textPrivacy).not.toHaveProperty("renderings");
+    expect(formatGateOutput(rejected, 9_000)).toBe(withheldText("unproven"));
     expect(rejected.firstAttempt).toBe(r);
     expect(
       verifier(f.registry, f.signer).verify(rejected.firstAttempt?.textPrivacy?.output, "output", r.output),
@@ -526,6 +535,7 @@ test("JUnit readers run in separate event-loop turns and retry diagnostics omit 
 test("retry setup failure composes protected output, never the private setup command", async () => {
   const f = fixture(["private-case"]);
   const original = await f.gate("original diagnostic\n(fail) case");
+  expect(original.textPrivacy?.renderings?.[3000]?.withheld).toBe(false);
   const setup = await f.gate("setup diagnostic\n(fail) setup", "", {
     run: "bun emit.ts; : private-case; exit 1",
   });
@@ -545,7 +555,10 @@ test("retry setup failure composes protected output, never the private setup com
     false,
   );
   expect(r?.failures).toBeUndefined();
+  expect(r?.textPrivacy?.output).toEqual({ withheld: true, reason: "unproven" });
   expect(r?.textPrivacy).not.toHaveProperty("failures");
+  expect(r?.textPrivacy).not.toHaveProperty("renderings");
+  expect(r && formatGateOutput(r, 3_000)).toBe(withheldText("unproven"));
   expect(r?.firstAttempt).toBe(original);
   expect(
     verifier(f.registry, f.signer).verify(r?.firstAttempt?.textPrivacy?.output, "output", original.output),
@@ -710,6 +723,7 @@ test.each(["R1", "R3", "timeout", "cancelled", "cut"])(
     expect(r.failures).toBeUndefined();
     expect(r.textPrivacy.failures?.withheld).toBe(true);
     expect(cuts).not.toHaveBeenCalled();
+    expect(r.textPrivacy).not.toHaveProperty("renderings");
     expect(checks.mock.calls.at(-1)?.[0].text).toBe("[]");
     expect(r.textPrivacy.identities?.withheld).toBe(false);
   },
@@ -796,7 +810,7 @@ test.each(
   expect(r.textPrivacy?.identities?.withheld).toBe(false);
   if (stage === "source") {
     expect(r.output).toBe(`${"x".repeat(7905)}[redacted]\n(fail) case`.slice(-6000));
-    expect(cuts).not.toHaveBeenCalled();
+    expect(cuts.mock.calls.map(([input]) => input.text)).not.toContain(extractFailures(source));
   }
   if (stage === "unchanged") {
     expect(r.failures).toContain(prefix);
@@ -855,4 +869,368 @@ test("resumed historical tail proofs project as unproven while current tail proo
   expect(
     projectGateDiagnostics(restored, { mode: "outward", registry: f.registry, signer: f.signer }).output,
   ).toBe("x".repeat(6000));
+});
+
+const renderedResult = async (
+  f: ReturnType<typeof fixture>,
+  output = "z".repeat(6000),
+  failures = "checked diagnostic\n(fail) case",
+) => ({
+  name: "test",
+  command: "test",
+  ok: false,
+  exitCode: 1,
+  durationMs: 1,
+  ...(await f.scoped(() => protectGateOutput(capture(output), "[]", control(), failures, f.excerptCurrent))),
+});
+
+test("checked renderings restore excerpts and tail in feedback, review and confirmation", async () => {
+  const f = fixture(),
+    r = await renderedResult(f);
+  const c = {
+    name: "test",
+    result: r,
+    verdict: "regressed" as const,
+    blocking: true,
+    coordinatorConfirmation: {
+      worker: "test",
+      reason: "failed on coordinator",
+      originalVerdict: "regressed" as const,
+      result: r,
+    },
+  };
+  f.scoped(() => {
+    for (const limit of RENDER_LIMITS) {
+      const expected = `checked diagnostic\n(fail) case\n\n${"z".repeat(1000)}`;
+      expect(formatGateOutput(r, limit)).toBe(expected);
+      expect(formatGateOutput(r, limit)).toBe(renderGateOutput(r, limit));
+      for (const text of [
+        formatGateFeedback([c]),
+        reviewPrompt({
+          prompt: "test",
+          spec: null,
+          baseSha: "base",
+          stat: "",
+          gates: [c],
+          audit: [],
+          implementerReport: "",
+        }),
+        postMergeConfirmationText(c, true),
+      ])
+        expect(text).toContain(expected);
+    }
+  });
+});
+
+test("rendering cuts preserve complete identities and surrogate pairs", () => {
+  for (const limit of RENDER_LIMITS) {
+    for (const r of [
+      { output: `a😀${"z".repeat(limit - 1)}` },
+      { output: `a😀${"z".repeat(999)}`, failures: `${"😀".repeat(6000)}\n(fail) preserved` },
+    ]) {
+      const text = renderGateOutput(r, limit);
+      expect(text.length).toBeLessThanOrEqual(limit);
+      expect(text.isWellFormed()).toBe(true);
+      if (r.failures) {
+        expect(text).toContain("(fail) preserved");
+        expect(text).toContain(omitted);
+      }
+    }
+  }
+});
+
+test.each(["partial", "tail-normalization"])("rendering checks its exact cut bytes: %s", async (kind) => {
+  // Unlike the prefix-cut accent case, this cut removes the base letter at the head.
+  const entry = kind === "partial" ? "host.example" : "\u0301x";
+  const source = kind === "partial" ? `${"x".repeat(4000)}host.exa` : `a\u0301x${"!".repeat(2998)}`;
+  const f = fixture([entry]),
+    candidate = source.slice(-3000);
+  const policy = preparePrivacyPolicy(capturePrivacySnapshot(f.registry));
+  expect(checkPrepared(policy, source)).toEqual({ clean: true });
+  expect(checkPrepared(policy, candidate, { truncated: true })).toMatchObject({ match: { entries: [0] } });
+  const r = {
+    name: "test",
+    command: "test",
+    ok: true,
+    exitCode: 0,
+    durationMs: 1,
+    ...(await f.scoped(() => protectGateOutput(capture(source), "[]", control()))),
+  };
+  expect(r.textPrivacy.renderings?.[3000]).toEqual({ withheld: true, reason: "private-match" });
+  f.scoped(() => {
+    expect(formatGateOutput(r, 3000)).toBe(withheldText("unproven"));
+    expect(formatGateOutput(r, 9000)).toBe(source);
+  });
+});
+
+test("a private match in one rendering still checks and releases the other limit", async () => {
+  // The 3,000 cut drops the accent after the entry; the 9,000 rendering keeps the excerpt whole.
+  const keep = 3000 - 1002 - omitted.length - identity.length - 2;
+  const failures = `${"x".repeat(keep - 12)}host.example\u0301${"!".repeat(200)}\n${identity}`;
+  const f = fixture(["host.example"]),
+    cuts = spyOn(f.checker, "protectProducerCut");
+  const r = await renderedResult(f, "z".repeat(6000), failures);
+  const [short, long] = RENDER_LIMITS.map((limit) => renderGateOutput(r, limit));
+  const policy = preparePrivacyPolicy(capturePrivacySnapshot(f.registry));
+  expect(checkPrepared(policy, failures)).toEqual({ clean: true });
+  expect(checkPrepared(policy, long ?? "", { truncated: true })).toEqual({ clean: true });
+  expect(checkPrepared(policy, short ?? "", { truncated: true })).toMatchObject({ match: { entries: [0] } });
+  expect(r.failures).toBe(failures);
+  expect(cuts).toHaveBeenCalledTimes(3);
+  expect(r.textPrivacy.renderings?.[3000]).toEqual({ withheld: true, reason: "private-match" });
+  expect(r.textPrivacy.renderings?.[9000]?.withheld).toBe(false);
+  f.scoped(() => {
+    expect(formatGateOutput(r, 3000)).toBe(withheldText("unproven"));
+    expect(formatGateOutput(r, 9000)).toBe(`${failures}\n\n${"z".repeat(1000)}`);
+  });
+});
+
+test.each([2999, 3000, 3001, 6000])("exact output bytes reuse output proofs at %s units", async (size) => {
+  const f = fixture(),
+    cuts = spyOn(f.checker, "protectProducerCut"),
+    checks = spyOn(f.checker, "protectText");
+  const output = "z".repeat(size),
+    r = {
+      name: "test",
+      command: "test",
+      ok: true,
+      exitCode: 0,
+      durationMs: 1,
+      ...(await f.scoped(() => protectGateOutput(capture(output), "[]", control()))),
+    };
+  expect(checks).toHaveBeenCalledTimes(2);
+  expect(cuts).toHaveBeenCalledTimes(size > 3000 ? 1 : 0);
+  if (size <= 3000) expect(r.textPrivacy).not.toHaveProperty("renderings");
+  f.scoped(() => {
+    expect(formatGateOutput(r, 3000)).toBe(output.slice(-3000));
+    expect(formatGateOutput(r, 9000)).toBe(output);
+    expect(formatGateOutput({ ...r, output: `X${output.slice(1)}` }, 9000)).toBe(withheldText("unproven"));
+  });
+  const unsigned = await f.scoped(
+    () => protectGateOutput(capture(output), "[]", control()),
+    () => undefined,
+  );
+  expect(unsigned.textPrivacy).not.toHaveProperty("renderings");
+});
+
+test.each(["output", "excerpt", "limit", "kind", "cut", "key"])(
+  "rendering proof binds recomputed bytes and metadata: %s",
+  async (tamper) => {
+    const f = fixture(),
+      r = await renderedResult(f);
+    const record = r.textPrivacy.renderings?.[3000];
+    if (!record) throw Error("No rendering proof");
+    if (tamper === "output") {
+      r.output = `${r.output.slice(0, -1)}Q`;
+      const fresh = await f.scoped(() => protectGateOutput(capture(r.output), "[]", control()));
+      r.textPrivacy.output = fresh.textPrivacy.output;
+    }
+    if (tamper === "excerpt") r.failures = r.failures?.replace("diagnostic", "DIAGNOSTIC");
+    if (tamper === "limit") Object.assign(record, r.textPrivacy.renderings?.[9000]);
+    if (tamper === "kind") record.kind = "attested:lan";
+    if (tamper === "cut") record.truncated = false;
+    if (tamper === "key") {
+      const foreign = await f.scoped(
+        () => protectGateOutput(capture(r.output), "[]", control(), r.failures, f.excerptCurrent),
+        () => Buffer.alloc(32, 51),
+      );
+      Object.assign(record, foreign.textPrivacy.renderings?.[3000]);
+    }
+    f.scoped(() => expect(formatGateOutput(r, 3000)).toBe(withheldText("unproven")));
+  },
+);
+
+test("renderings observe current policy and credentials without rewriting text", async () => {
+  const f = fixture(),
+    file = join(f.cwd, "private-strings.txt");
+  writeFileSync(file, "");
+  provisionPrivacyPolicy(f.cwd, [], { registry: f.registry });
+  const r = await renderedResult(f, undefined, "fresh-render-credential-928\n(fail) case");
+  f.scoped(() => {
+    const text = formatGateOutput(r);
+    expect(text).toContain("fresh-render-credential-928");
+    writeFileSync(file, "different-policy-entry\n");
+    expect(formatGateOutput(r)).toBe(withheldText("unproven"));
+    writeFileSync(file, "");
+    expect(formatGateOutput(r)).toBe(text);
+    registerCredential("RENDER_TEST", "fresh-render-credential-928");
+    expect(formatGateOutput(r)).toBe(withheldText("credential-changed"));
+    expect(r.failures).toContain("fresh-render-credential-928");
+  });
+});
+
+test.each(["encoded", ...RENDER_LIMITS, "collector"] as const)(
+  "late credentials withhold renderings including collected credential fragments: %s",
+  async (kind) => {
+    const credential = `late-${randomUUID()}`,
+      encoded = [...Buffer.from(credential)].map((byte) => `%${byte.toString(16)}`).join(""),
+      identity = "(fail) case",
+      omitted = "[failure excerpts: diagnostic lines or failures left out]";
+    const keep = typeof kind === "number" ? kind - 1002 - omitted.length - identity.length - 2 : 0;
+    const collectorKeep = 8000 - omitted.length - identity.length - 3;
+    const collectedSource = `${"x".repeat(collectorKeep - 16)}${credential}${"!".repeat(200)}\n${identity}`;
+    const failures =
+      kind === "encoded"
+        ? `${encoded}\n${identity}`
+        : kind === "collector"
+          ? extractFailures(collectedSource)
+          : `${"x".repeat(keep - 15)}${credential}${"!".repeat(8000 - (keep - 15) - credential.length - identity.length - 1)}\n${identity}`;
+    if (!failures) throw Error("Missing failure excerpt");
+    if (kind === "collector") {
+      expect(failures).toContain(credential.slice(0, 16));
+      expect(failures).not.toContain(credential.slice(16));
+    }
+    const output = "z".repeat(6000),
+      f = fixture();
+    const r = {
+      name: "test",
+      command: "test",
+      ok: false,
+      exitCode: 1,
+      durationMs: 1,
+      ...(await f.scoped(() =>
+        protectGateOutput(
+          capture(`${kind === "collector" ? collectedSource : failures}\n${output}`),
+          "[]",
+          control(),
+          failures,
+          f.excerptCurrent,
+        ),
+      )),
+    };
+    f.scoped(() => {
+      for (const limit of RENDER_LIMITS) {
+        const text = formatGateOutput(r, limit);
+        expect(text).toBe(renderGateOutput(r, limit));
+        if (kind === "encoded") expect(text).toContain(encoded);
+        else if (limit === kind || (kind === "collector" && limit === 9000)) {
+          expect(text).toContain(credential.slice(0, 15));
+          expect(text).not.toContain(credential.slice(15));
+        }
+      }
+      registerCredential("LATE_RENDER_TEST", credential);
+      for (const limit of RENDER_LIMITS)
+        expect(formatGateOutput(r, limit)).toBe(withheldText("credential-changed"));
+      const feedback = formatGateFeedback([
+        { name: "test", result: r, verdict: "regressed", blocking: true },
+      ]);
+      expect(feedback).toContain(withheldText("credential-changed"));
+      expect(feedback).not.toContain(encoded);
+      expect(feedback).not.toContain(credential.slice(0, 15));
+      expect(r.output).toBe(output);
+      expect(r.failures).toBe(failures);
+      // Changing authenticated context or its generation claim cannot bypass the refusal.
+      if (typeof kind === "number") {
+        const changed = { ...r, failures: failures.replace(credential.slice(15), "safe") };
+        expect(formatGateOutput(changed, kind)).toBe(withheldText("unproven"));
+      }
+      const rendering = r.textPrivacy.renderings?.[9000];
+      if (!rendering) throw Error("Missing rendering proof");
+      const changed = structuredClone(r);
+      changed.textPrivacy.renderings = {
+        ...changed.textPrivacy.renderings,
+        9000: { ...rendering, credentials: "0".repeat(64) },
+      };
+      expect(formatGateOutput(changed, 9000)).toBe(withheldText("unproven"));
+    });
+  },
+);
+
+test.each(["deadline", "generation", "failure"])(
+  "rendering requests stop and preserve output on %s",
+  async (kind) => {
+    let now = Date.now();
+    const f = fixture([], undefined, () => now),
+      c = control(),
+      original = f.checker.protectProducerCut;
+    const calls = spyOn(f.checker, "protectProducerCut").mockImplementation((...args) => {
+      if (calls.mock.calls.length === 2) {
+        if (kind === "deadline") now = c.deadline;
+        if (kind === "generation") f.registry.replacePolicy([{ value: "unrelated-entry", entry: 0 }]);
+        if (kind === "failure") throw Error("checker failed");
+      }
+      return original(...args);
+    });
+    const r = await f.scoped(() =>
+      protectGateOutput(capture("z".repeat(6000)), "[]", c, "diagnostic\n(fail) case", f.excerptCurrent),
+    );
+    expect(calls).toHaveBeenCalledTimes(2); // R5 and R6; R7 is withheld without submission.
+    expect(
+      calls.mock.calls.every((args) => args[1]?.deadline === c.deadline && args[1]?.signal === c.signal),
+    ).toBe(true);
+    expect(r.output).toBe("z".repeat(6000));
+    expect(r.textPrivacy.output.withheld).toBe(false);
+    for (const limit of RENDER_LIMITS)
+      expect(r.textPrivacy.renderings?.[limit]).toEqual({
+        withheld: true,
+        reason:
+          kind === "deadline"
+            ? "checker-timeout"
+            : kind === "generation"
+              ? "stale-generation"
+              : "checker-failed",
+      });
+  },
+);
+
+test("R7 expiry keeps the released R6 rendering and shares its deadline", async () => {
+  let now = Date.now();
+  const f = fixture([], undefined, () => now),
+    c = control(),
+    protect = f.checker.protectProducerCut;
+  const cuts = spyOn(f.checker, "protectProducerCut").mockImplementation((...args) => {
+    if (cuts.mock.calls.length === 3) now = c.deadline;
+    return protect(...args);
+  });
+  const r = {
+    name: "test",
+    command: "test",
+    ok: false,
+    exitCode: 1,
+    durationMs: 1,
+    ...(await f.scoped(() =>
+      protectGateOutput(capture("z".repeat(6000)), "[]", c, "diagnostic\n(fail) case", f.excerptCurrent),
+    )),
+  };
+  expect(cuts).toHaveBeenCalledTimes(3);
+  expect(cuts.mock.calls.every((args) => args[1]?.deadline === c.deadline)).toBe(true);
+  expect(r.textPrivacy.output.withheld).toBe(false);
+  expect(r.textPrivacy.renderings?.[9000]).toEqual({ withheld: true, reason: "checker-timeout" });
+  const refresh = spyOn(f.registry, "refreshPolicy");
+  f.scoped(() => {
+    expect(formatGateOutput(r, 3000)).toBe(`diagnostic\n(fail) case\n\n${"z".repeat(1000)}`);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(formatGateOutput(r, 9000)).toBe(withheldText("unproven"));
+  });
+});
+
+test("a credential formed only by the rendering join refuses its cut proof", async () => {
+  const output = "j".repeat(6000),
+    failures = "producer-render-join-928\n(fail) unique";
+  const credential = `${failures}\n\n${output.slice(-1000)}`,
+    f = fixture([], credential);
+  const r = await renderedResult(f, output, failures);
+  expect(r.output).toBe(output);
+  expect(r.failures).toBe(failures);
+  expect(r.textPrivacy.output.withheld).toBe(false);
+  for (const limit of RENDER_LIMITS) {
+    expect(r.textPrivacy.renderings?.[limit]).toEqual({ withheld: true, reason: "private-match" });
+    f.scoped(() => expect(formatGateOutput(r, limit)).toBe(withheldText("unproven")));
+  }
+});
+
+test("a complete proof cannot authorize a rendering that needs cut semantics", async () => {
+  const f = fixture(["host.example"]),
+    r = await renderedResult(f, `${"x".repeat(4000)}host.exa`, "");
+  const bytes = renderGateOutput(r, 3000);
+  const proof = await checkAndSign({
+    checker: f.checker,
+    signer: f.signer,
+    kind: "complete",
+    field: "rendering:3000",
+    text: bytes,
+  });
+  if (!proof) throw Error("Complete text should pass without partial-prefix semantics");
+  r.textPrivacy.renderings = { "3000": { ...proof, withheld: false, truncated: false } };
+  f.scoped(() => expect(formatGateOutput(r, 3000)).toBe(withheldText("unproven")));
 });

@@ -697,6 +697,7 @@ test("consumer adapters select revision exports, reject leaking or malformed pro
         "event-drain",
         "feedback-sign",
         "render-prompts",
+        "render-prompts-proven",
         "land-log",
       ]) {
         const jobs = await registry[name]?.({ ...c, a: {} });
@@ -938,4 +939,27 @@ test("whole-gate fixtures use production scopes, validate outcomes and report me
       spawn.mockRestore();
     }
   });
+});
+
+test("proven prompt workload requires verified diagnostic renderings", async () => {
+  await temporary((root) =>
+    consumerContext(root, async (c) => {
+      const prompts = await import("../src/pipeline/prompts.ts"),
+        report = await import("../src/pipeline/report.ts"),
+        failures = await import("../src/gates/failures.ts");
+      Object.assign(c.a, prompts, report, failures);
+      const jobs = await registry["render-prompts-proven"]?.(c);
+      expect(jobs).toHaveLength(3);
+      for (const job of jobs ?? []) {
+        await job[4]?.();
+        const value = job[2]?.();
+        expect(job[3](await value)).toBe("50 rendered gate rows");
+        const markerOnly = Array.from(
+          { length: 50 },
+          (_, i) => `synthetic-${i}-gate [withheld: unproven]`,
+        ).join("\n");
+        expect(() => job[3](markerOnly)).toThrow("50 rendered gate rows");
+      }
+    }),
+  );
 });

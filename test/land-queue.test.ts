@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, spyOn } from "bun:test";
 import * as subprocess from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -19,8 +19,10 @@ import { Store } from "../src/db/store.ts";
 import { RunnerFailureEvidence } from "../src/gates/attribution.ts";
 import * as gateExecutorModule from "../src/gates/executor.ts";
 import { type GateExecutor, type GateRequest, gateProvenance } from "../src/gates/executor.ts";
+import { extractFailures, formatGateOutput } from "../src/gates/failures.ts";
 import { parseJUnit } from "../src/gates/junit.ts";
 import { redactGateData } from "../src/gates/output.ts";
+import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import * as gateRunModule from "../src/gates/run.ts";
 import { type GateResult, type GateRun, runLocalGates } from "../src/gates/run.ts";
 import { gateSlots } from "../src/gates/slots.ts";
@@ -473,6 +475,15 @@ function fakeLandGates(
   proveEvents = true,
 ) {
   const requests: GateRequest[] = [];
+  const eventResult = async (r: GateResult) => {
+    if (!proveEvents) return r;
+    const signed = await provenResult(redactGateData(r));
+    if (signed.textPrivacy && signed.failures === r.failures && r.textPrivacy?.failures)
+      signed.textPrivacy.failures = r.textPrivacy.failures;
+    if (signed.textPrivacy && r.textPrivacy?.renderings)
+      signed.textPrivacy.renderings = r.textPrivacy.renderings;
+    return signed;
+  };
   const executor: GateExecutor = {
     kind: "lan",
     freshCheckoutFor: () => true,
@@ -492,13 +503,13 @@ function fakeLandGates(
               yield {
                 type: "check" as const,
                 phase: "setup" as const,
-                result: proveEvents ? await provenResult(redactGateData(r)) : r,
+                result: await eventResult(r),
               };
             for (const r of completed.checks)
               yield {
                 type: "check" as const,
                 phase: "check" as const,
-                result: proveEvents ? await provenResult(redactGateData(r)) : r,
+                result: await eventResult(r),
               };
           },
         },
@@ -2833,7 +2844,7 @@ test("red CI on the pushed commit blocks the entry with the failing check names"
 test.each([
   ["(fail) identifier", "(fail) identifier"],
   ["\u001b[31m✗ colored identifier\u001b[0m", "✗ colored identifier"],
-])("a failing land check logs the checked tail without early excerpts: %s", async (result, identity) => {
+])("a failing land check logs checked excerpts and tail: %s", async (result, identity) => {
   const credential = "synthetic-land-gate-credential-409";
   registerCredential("LAND_GATE_TEST_TOKEN", credential);
   writeFileSync(
@@ -2862,9 +2873,9 @@ test.each([
   expect(blocked?.reason).toMatch(/^lint failed \(/);
   expect(blocked?.reason).not.toContain("secret in output");
   const log = readFileSync(blocked?.logPath ?? "", "utf8");
-  expect(log).not.toContain("error: values differ");
-  expect(log).not.toContain(identity);
-  expect(log).not.toContain("left out");
+  expect(log).toContain("error: values differ");
+  expect(log).toContain(identity);
+  expect(log).toContain("left out");
   expect(log).toContain("skipped summary");
   expect(log).toContain("credential: [redacted]");
   expect(log).not.toContain(credential);
@@ -6720,5 +6731,120 @@ test.each(["blocking", "exception"])(
       finalize.mockRestore();
       append.mockRestore();
     }
+  },
+);
+
+test.each(["proven", "unproven", "encoded", "fragment", "collector"] as const)(
+  "land entries use the original gate rendering, %s",
+  async (kind) => {
+    const { pr } = await retryLandFixture(undefined, "test", "prepare", "bun test; security-scan");
+    const credential = `late-${randomUUID()}`,
+      encoded = [...Buffer.from(credential)].map((byte) => `%${byte.toString(16)}`).join(""),
+      identity = "(fail) case",
+      omitted = "[failure excerpts: diagnostic lines or failures left out]",
+      keep = 9000 - 1002 - omitted.length - identity.length - 2;
+    const collectorKeep = 8000 - omitted.length - identity.length - 3,
+      collectedSource = `${"x".repeat(collectorKeep - 16)}${credential}${"!".repeat(200)}\n${identity}`,
+      late = kind === "encoded" || kind === "fragment" || kind === "collector";
+    const output = "z".repeat(6000),
+      failures =
+        kind === "encoded"
+          ? `${encoded}\n${identity}`
+          : kind === "collector"
+            ? extractFailures(collectedSource)
+            : kind === "fragment"
+              ? `${"x".repeat(keep - 15)}${credential}${"!".repeat(8000 - (keep - 15) - credential.length - identity.length - 1)}\n${identity}`
+              : `checked land diagnostic\n${identity}`;
+    if (kind === "collector") {
+      expect(failures).toContain(credential.slice(0, 16));
+      expect(failures).not.toContain(credential.slice(16));
+    }
+    const protectedOutput = await protectGateOutput(
+      {
+        capture: {
+          provenance: { kind: "complete" },
+          stdout: `${kind === "collector" ? collectedSource : failures}\n${output}`,
+          stderr: "",
+        },
+        stdout: "",
+        stderr: "",
+        exitCode: 1,
+        signal: null,
+        cancelled: false,
+        timedOut: false,
+        idleTimedOut: false,
+        truncated: false,
+        durationMs: 1,
+      },
+      "[]",
+      { deadline: Date.now() + 120000 },
+      failures,
+      () => true,
+    );
+    const result = {
+      ...testFailure,
+      ...protectedOutput,
+      name: "test",
+      command: "test",
+      ok: false,
+      exitCode: 1,
+      durationMs: 1,
+    };
+    const initial = formatGateOutput(result, 9000);
+    expect(initial).toContain(output.slice(-1000));
+    if (late) {
+      if (kind === "encoded") expect(initial).toContain(encoded);
+      else {
+        expect(initial).toContain(credential.slice(0, 15));
+        expect(initial).not.toContain(credential.slice(15));
+      }
+    }
+    const execute = gateExecutorModule.executeGate;
+    const execution = spyOn(gateExecutorModule, "executeGate").mockImplementation(
+      (req, signal, hooks, ...rest) =>
+        execute(
+          req,
+          signal,
+          {
+            ...hooks,
+            onResult(r, phase) {
+              // Register after event handling, immediately before the land entry is constructed.
+              if (r.failures === failures && late) registerCredential("LATE_LAND_RENDER_TEST", credential);
+              hooks?.onResult?.(r, phase);
+            },
+          },
+          ...rest,
+        ),
+    );
+    const fake = fakeLandGates(
+      (req) =>
+        retryRun(req, {
+          test: {
+            ...result,
+            ...(kind === "unproven" ? { textPrivacy: undefined } : {}),
+          },
+        }),
+      false,
+    );
+    let entry: LandEntry;
+    try {
+      entry = await queue({ gateExecutor: fake.executor }).request({ target: pr.run.id });
+      await settle();
+    } finally {
+      execution.mockRestore();
+    }
+    const path = store.getLandEntry(entry.id)?.logPath;
+    if (!path) throw Error("Missing land log");
+    const text = await signedLog.readLandLog(path);
+    if (kind === "proven") expect(text).toContain(`${failures}\n\n${output.slice(-1000)}`);
+    else {
+      expect(text).toContain(`[withheld: ${kind === "unproven" ? "unproven" : "credential-changed"}]`);
+      expect(text).not.toContain(failures);
+      expect(text).not.toContain(output.slice(-1000));
+      expect(text).not.toContain(encoded);
+      expect(text).not.toContain(credential.slice(0, 15));
+    }
+    expect(result.output).toBe(output);
+    expect(result.failures).toBe(failures);
   },
 );

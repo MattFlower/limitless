@@ -27,9 +27,10 @@ import {
   singleFlight,
 } from "../src/gates/cache.ts";
 import { detectGates, type GateConfig } from "../src/gates/detect.ts";
-import { extractFailures, FailureExcerpts, formatGateOutput } from "../src/gates/failures.ts";
+import { extractFailures, FailureExcerpts, formatGateOutput, RENDER_LIMITS } from "../src/gates/failures.ts";
 import { readJUnitSkips } from "../src/gates/junit.ts";
 import { projectGateDiagnostics, redactGateOutput } from "../src/gates/output.ts";
+import { protectGateOutput } from "../src/gates/output-privacy.ts";
 import {
   canonical,
   checkPrivateText,
@@ -580,7 +581,9 @@ describe("runGates / compareGates", () => {
       expect(checkedFailures(run.checks[0])).toBe(
         "error: values differ\nExpected: 1\nReceived: 2\n(fail) assertion",
       );
-      expect(formatGateFeedback(compareGates(null, run))).not.toContain("error: values differ");
+      const feedback = formatGateFeedback(compareGates(null, run));
+      expect(feedback).toContain("error: values differ\nExpected: 1\nReceived: 2\n(fail) assertion");
+      expect(feedback).toContain(output.slice(-1_000));
       expect(run.checks[1]?.ok).toBe(true);
       expect(run.checks[1]).not.toHaveProperty("failures");
       const repo = store.upsertRepo({
@@ -976,8 +979,8 @@ test("second assertion", () => { expect({ value: "received-two" }).toEqual({ val
     },
   );
 
-  test.each([3_000, 9_000])(
-    "formatting omits excerpts and guards the complete output at %i",
+  test.each([...RENDER_LIMITS])(
+    "formatting releases checked excerpts and tail within %i units",
     async (limit) => {
       const timeout = "  ^ this test timed out after 25ms.";
       const failures = extractFailures(
@@ -985,18 +988,35 @@ test("second assertion", () => { expect({ value: "received-two" }).toEqual({ val
       );
       expect(failures).toContain(`✗ second\n${timeout}`);
       const text = "summary\n".repeat(800);
-      const result = await provenResult({
+      const result = {
         name: "test",
         command: "test",
         ok: false,
         exitCode: 1,
         durationMs: 1,
-        output: text,
-        failures,
-      });
+        ...(await protectGateOutput(
+          {
+            capture: { provenance: { kind: "complete" }, stdout: text, stderr: "" },
+            stdout: text,
+            stderr: "",
+            exitCode: 1,
+            signal: null,
+            cancelled: false,
+            timedOut: false,
+            idleTimedOut: false,
+            truncated: false,
+            durationMs: 1,
+          },
+          "[]",
+          { deadline: Date.now() + 120_000 },
+          failures,
+          () => true,
+        )),
+      };
       const output = formatGateOutput(result, limit);
-      expect(output).toBe(text.length <= limit ? text : "[output withheld: unchecked-rendering]");
-      expect(output).not.toContain("(fail) first");
+      expect(output).toContain("error: first\n(fail) first");
+      expect(output).toContain(`✗ second\n${timeout}`);
+      expect(output).toEndWith(`\n\n${text.slice(-1_000)}`);
       expect(output.length).toBeLessThanOrEqual(limit);
     },
   );

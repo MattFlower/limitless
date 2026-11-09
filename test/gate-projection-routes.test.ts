@@ -230,7 +230,7 @@ test.each(["legacy", "forged", "foreign"] as const)(
 
 test("durable events retain proofs and release through HTTP, SSE and MCP", async () => {
   const f = fixture(),
-    r = await provenResult(result("clean output"));
+    r = await provenResult({ ...result("clean output"), failures: undefined });
   const durable = project(r, { mode: "durable" });
   expect(JSON.stringify(project(durable, { mode: "durable" }))).toBe(JSON.stringify(durable));
   expect(project(durable, { mode: "outward" })).toEqual(project(r, { mode: "outward" }));
@@ -561,6 +561,32 @@ test("remote claims never grant release; coordinator attested proofs do", async 
   expect(out.command).toBe(r.command);
   expect(out.textPrivacy?.output.kind).toBe("attested:lan");
   expect(out.remoteAttestation).toBeUndefined();
+});
+
+test("truncated attested LAN output survives durable then outward projection", async () => {
+  const output = "safe remote tail",
+    proof = await checkAndSign({
+      ...testGatePrivacy,
+      kind: "attested:lan",
+      field: "output",
+      text: output,
+      producerCut: true,
+    });
+  expect(proof).toBeDefined();
+  const r = await provenResult(result(output));
+  delete r.failures;
+  const signed = {
+    ...r,
+    textPrivacy: {
+      ...r.textPrivacy,
+      identities: r.textPrivacy?.identities ?? { withheld: true },
+      output: { withheld: false, truncated: true, ...proof },
+    },
+  };
+  const durable = project(signed, { mode: "durable" });
+  expect(durable.output).toBe(output);
+  expect(project(durable, { mode: "outward" }).output).toBe(output);
+  expect(project(project(durable, { mode: "durable" }), { mode: "outward" }).output).toBe(output);
 });
 
 test("projection snapshots are lazy and shared across nested result fields", async () => {
@@ -995,5 +1021,17 @@ test("8000-unit local excerpts leave events, HTTP, SSE and MCP byte-identical", 
     expect(text).toContain(base.output);
     expect(text).not.toContain("event-size");
     expect(text).not.toContain('"failures"');
+  }
+});
+
+test("outward and durable projections drop excerpts and all rendering records", async () => {
+  const r = await provenResult(result("clean output"));
+  if (!r.textPrivacy) throw Error("Missing output proof");
+  r.textPrivacy.renderings = { "3000": { ...r.textPrivacy.output }, "9000": { ...r.textPrivacy.output } };
+  for (const mode of ["outward", "durable"] as const) {
+    const projected = project(r, { mode });
+    expect(projected.output).toBe("clean output");
+    expect(projected).not.toHaveProperty("failures");
+    expect(projected.textPrivacy).not.toHaveProperty("renderings");
   }
 });

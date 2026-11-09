@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -596,6 +596,40 @@ test.each([true, false])("producer cuts refuse credential-changed bytes with sig
   });
   expect(proof).toBeUndefined();
   expect(refusals).toEqual(["private-match"]);
+});
+
+test("cut credential bindings survive restart and registration order but reject a changed set", async () => {
+  const f = fixture(),
+    text = "safe cut text",
+    proof = await f.sign(text, { producerCut: true, field: "rendering:9000" }),
+    path = join(f.dir, "restart.json");
+  writeFileSync(
+    path,
+    JSON.stringify({ key: f.signer()?.toString("hex"), proof, credentials: credentialRegistry.values() }),
+  );
+  const result = await sh(
+    [
+      process.execPath,
+      "-e",
+      `import { readFileSync } from "node:fs";
+      import { verifier } from ${JSON.stringify(join(import.meta.dir, "../src/util/privacy-proof.ts"))};
+      import { credentialRegistry } from ${JSON.stringify(join(import.meta.dir, "../src/util/credential-matcher.ts"))};
+      import { createPrivacyRegistry } from ${JSON.stringify(join(import.meta.dir, "../src/util/privacy-boundary.ts"))};
+      const saved = JSON.parse(readFileSync(process.argv[1], "utf8"));
+      for (const value of saved.credentials.reverse()) { credentialRegistry.add(value); credentialRegistry.add(value); }
+      const registry = createPrivacyRegistry();
+      registry.replacePolicy([]);
+      const snapshot = verifier(registry, () => Buffer.from(saved.key, "hex"));
+      console.log(snapshot.verify(saved.proof, "rendering:9000", "safe cut text", true) && snapshot.credentialsUnchanged(saved.proof));`,
+      path,
+    ],
+    { cwd: f.dir, env: agentEnv(), timeoutMs: 10_000 },
+  );
+  expect(result.stdout).toBe("true\n");
+  credentialRegistry.add(`late-${randomUUID()}`);
+  const snapshot = p.verifier(f.registry, f.signer);
+  expect(snapshot.verify(proof, "rendering:9000", text, true)).toBe(true);
+  expect(snapshot.credentialsUnchanged(proof)).toBe(false);
 });
 
 test("authentic proofs from before the cut binding cannot verify under either flag", async () => {

@@ -152,11 +152,10 @@ function lookupAgentGate(ctx: RunContext, key: AgentGateKey | null) {
 }
 
 function sessionResult(result: GateResult, tree: string) {
-  const safe = redactGateData(result);
   return {
     status: result.timedOut || result.exitCode === null || result.exitCode > 128 ? 1 : result.exitCode,
     text: redactGateOutput(
-      `Factory gate run of check test on tree ${tree}: ${result.ok ? "pass" : "FAIL"} (${Math.round(result.durationMs / 1000)}s)${result.reused ? `; reused factory gate execution ${result.reused.executionId}` : ""}\n${formatGateOutput(safe)}`,
+      `Factory gate run of check test on tree ${tree}: ${result.ok ? "pass" : "FAIL"} (${Math.round(result.durationMs / 1000)}s)${result.reused ? `; reused factory gate execution ${result.reused.executionId}` : ""}\n${formatGateOutput(result)}`,
     ),
   };
 }

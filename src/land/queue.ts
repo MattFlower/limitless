@@ -914,13 +914,7 @@ export class LandQueue {
         holder: "land",
         onResult: (r: GateResult) => {
           const projected = projectGateDiagnostics(r, { mode: "outward" });
-          void appendLandLog(landLog, [
-            "\n$ ",
-            projected.command,
-            "\n",
-            r.failures ? formatGateOutput(r, 9_000) : projected.output,
-            "\n",
-          ]);
+          void appendLandLog(landLog, ["\n$ ", projected.command, "\n", formatGateOutput(r, 9_000), "\n"]);
         },
       };
       await gateSlotScope(async () => {
