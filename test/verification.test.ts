@@ -478,7 +478,7 @@ test("streaming redaction reuses patterns without retaining every observed combi
         compiled++;
         replacements.push(String(args[0]));
       }
-      if (args[1] === "iu") boundaries.push(String(args[0]));
+      if (args[1] === "iyu") boundaries.push(String(args[0]));
       return Reflect.construct(target, args);
     },
   });
@@ -566,7 +566,7 @@ test("classification budgets precede regex work and cached observations are boun
   let compiled = 0;
   globalThis.RegExp = new Proxy(original, {
     construct(target, args) {
-      if (args[1] === "iu") compiled++;
+      if (args[1] === "iyu") compiled++;
       return Reflect.construct(target, args);
     },
   });
@@ -600,6 +600,24 @@ test("classification budgets precede regex work and cached observations are boun
   } finally {
     globalThis.RegExp = original;
   }
+});
+
+test("cold repetitive classification charges candidate comparisons and withholds on exhaustion", () => {
+  const publicSources = "a ".repeat(131072);
+  const literals = Array.from({ length: 8 }, (_, i) => `${"a ".repeat(1900)}X${i}`);
+  const work: number[] = [];
+  const redact = holdoutRedactor(boundedHoldout("private"), publicSources, (n) => work.push(n));
+  const value = literals.map((s) => `"${s}"`).join("\n");
+  whollyWithheld(redact(value));
+  expect(work.length).toBeGreaterThan(100);
+  expect(Math.max(...work)).toBeLessThanOrEqual(4_194_304);
+  expect(work.at(-1)).toBeGreaterThan(4_190_000);
+  // Exhausted observations aren't cached as public; retry still withholds safely.
+  whollyWithheld(redact(value));
+  expect(holdoutRedactor(boundedHoldout(), " KeyId_1 éName_2 ")("KeyId_1 ÉName_2")).toBe("KeyId_1 ÉName_2");
+  expect(holdoutRedactor(boundedHoldout(), "prefixKeyId_1suffix")("KeyId_1")).toBe(
+    "[private detail] [1 private details withheld]",
+  );
 });
 
 test("extraction limits precede unanchored matching for values and authored details", () => {

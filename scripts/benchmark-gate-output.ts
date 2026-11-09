@@ -1,7 +1,12 @@
-/** Synthetic producer and consumer workloads; no owner configuration or external services. */
+/** Synthetic producer and consumer workloads; no owner configuration or external services.
+ * Uncommitted source works with --worker <scratch-root> agent-stream (or holdout-repetitive).
+ * Copy src/ and package.json there and symlink the checkout's node_modules; use a fresh root per job.
+ * Run with --preload ./scripts/benchmark-resumptions.ts to measure whole turns, including callbacks.
+ */
 import { existsSync, promises as fs } from "node:fs";
 import { loadavg } from "node:os";
 import { join } from "node:path";
+import { agentRegistry } from "../test/benchmark-agent-output-support.ts";
 import {
   type API,
   type Checker,
@@ -17,7 +22,7 @@ import { consumerRegistry } from "./benchmark-gate-consumers.ts";
 import * as bench from "./benchmark-privacy-boundary.ts";
 
 const defaultWorkloads = Object.keys(registry);
-Object.assign(registry, consumerRegistry);
+Object.assign(registry, consumerRegistry, agentRegistry);
 
 export { environment, operation, registry, validate } from "../test/benchmark-gate-output-support.ts";
 
@@ -26,7 +31,7 @@ const field = (v: unknown, path: string): unknown =>
 export async function worker(root: string, name: string) {
   validate(Object.hasOwn(registry, name), "unknown workload");
   const paths =
-    "util/proc util/privacy-boundary util/privacy-checker util/privacy-chunks util/privacy-proof util/privacy-policy gates/text-privacy gates/output gates/run gates/junit gates/test-coverage gates/slots harness/sandbox harness/read-policy pipeline/context pipeline/prompts pipeline/report server/http land/land-log".split(
+    "harness/types util/proc util/privacy-boundary util/privacy-checker util/privacy-chunks util/privacy-proof util/privacy-policy gates/text-privacy gates/output gates/run gates/junit gates/test-coverage gates/slots harness/sandbox harness/read-policy pipeline/context pipeline/prompts pipeline/report server/http land/land-log".split(
       " ",
     );
   const modules = await Promise.all(

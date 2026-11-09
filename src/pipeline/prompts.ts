@@ -292,7 +292,7 @@ export function redactHoldoutText(
   return holdoutRedactor(holdout, publicSources)(value, includeObservedLiterals);
 }
 
-// UTF-16 units; limits bound extraction, literal regexes, scans per operation and retained state.
+// UTF-16 units and charged comparisons bound extraction, searches and retained state.
 const holdoutLimits = {
   input: 65_536,
   sources: 262_144,
@@ -304,7 +304,11 @@ const holdoutLimits = {
 };
 const holdoutWithheld = "[value withheld: holdout redaction limit or matcher failure]";
 
-export function holdoutRedactor(holdout: Holdout, publicSources = "") {
+export function holdoutRedactor(
+  holdout: Holdout,
+  publicSources = "",
+  classificationWork?: (work: number) => void,
+) {
   let work = 0;
   const check = (ok: boolean) => {
     if (!ok) throw new Error("Holdout redaction limit");
@@ -317,14 +321,36 @@ export function holdoutRedactor(holdout: Holdout, publicSources = "") {
         source.split(/[.!?\n]/u).every((part) => part.length <= 4096),
     );
   const privateLiterals = new Map<string, boolean>();
+  const charge = (units: number) => {
+    work += units;
+    check(work <= holdoutLimits.classification);
+    classificationWork?.(work);
+  };
   const isPrivate = (detail: string) => {
     let result = privateLiterals.get(detail);
     if (result === undefined) {
       check(publicSources.length <= holdoutLimits.sources);
       check(detail.length <= holdoutLimits.detail && privateLiterals.size < holdoutLimits.cache);
-      work += detail.length + publicSources.length;
-      check(work <= holdoutLimits.classification);
-      result = !!detail && !new RegExp(holdoutBoundaryPattern(detail), "iu").test(publicSources);
+      charge(detail.length + publicSources.length);
+      result = !!detail;
+      if (detail) {
+        // Scan candidate starts once, then charge each anchored literal comparison before
+        // running it. Repetitive near matches cannot hide quadratic work in one regex test.
+        const first = String.fromCodePoint(detail.codePointAt(0) ?? 0);
+        const starts = new RegExp(
+          `(?<![\\p{L}\\p{N}_$])${first.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+          "igu",
+        );
+        const literal = new RegExp(holdoutBoundaryPattern(detail), "iyu");
+        for (const match of publicSources.matchAll(starts)) {
+          charge(detail.length + 4);
+          literal.lastIndex = match.index;
+          if (literal.test(publicSources)) {
+            result = false;
+            break;
+          }
+        }
+      }
       privateLiterals.set(detail, result);
     }
     return result;

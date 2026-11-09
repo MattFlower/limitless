@@ -13,6 +13,8 @@ import { compareGates, runGates } from "../src/gates/run.ts";
 import { BunTestCoverage } from "../src/gates/test-coverage.ts";
 import { confinementScope, runSandboxed } from "../src/harness/sandbox.ts";
 import { withScratch } from "../src/harness/scratch.ts";
+import { redactJsonLine } from "../src/harness/types.ts";
+import { holdoutRedactor } from "../src/pipeline/prompts.ts";
 import { privacyLimits } from "../src/util/privacy-boundary.ts";
 import {
   CommandError,
@@ -42,6 +44,7 @@ async function withChunks<T>(
   run: () => Promise<T>,
   finish: {
     beforeEnd?: (child: subprocess.ChildProcess) => void | Promise<void>;
+    beforeChunk?: (index: number) => void | Promise<void>;
     code?: number;
     signal?: string;
   } = {},
@@ -67,8 +70,11 @@ async function withChunks<T>(
       const token = args?.[3];
       if (Array.isArray(chunks) && typeof token === "string" && token.startsWith("limitless-started-"))
         stdout.write(`${token}\n`);
-      for (const chunk of typeof chunks === "function" ? chunks(token) : chunks)
+      const input = typeof chunks === "function" ? chunks(token) : chunks;
+      for (const [i, chunk] of input.entries()) {
+        await finish.beforeChunk?.(i);
         ({ stdout, stderr })[chunk.stream].write(chunk.text);
+      }
       await finish.beforeEnd?.(child);
       stdout.end();
       stderr.end();
@@ -106,33 +112,35 @@ test.each([
       calls++;
       throw new Error("synthetic private exception content");
     };
-    const result = await withChunks(
-      [
-        {
-          stream: stream === "stderr" ? "stderr" : "stdout",
-          text: final ? "unterminated" : "first\nsecond\n",
-        },
-        { stream: final && stream === "stderr" ? "stdout" : "stderr", text: "earlier complete\n" },
-        { stream: stream === "stderr" ? "stderr" : "stdout", text: "later output" },
-      ],
-      () =>
-        runProcess({
-          ...options(),
-          captureComplete,
-          ...(stream === "raw" ? { onRawChunk: callback } : {}),
-          onStdoutLine:
-            stream === "stdout"
-              ? callback
-              : () => {
-                  calls++;
-                },
-          onStderrLine:
-            stream === "stderr"
-              ? callback
-              : () => {
-                  calls++;
-                },
-        }),
+    const result = await processDrainObserver.run({ budget: 1, highWater: 1, observe: () => {} }, () =>
+      withChunks(
+        [
+          {
+            stream: stream === "stderr" ? "stderr" : "stdout",
+            text: final ? "unterminated" : "first\nsecond\n",
+          },
+          { stream: final && stream === "stderr" ? "stdout" : "stderr", text: "earlier complete\n" },
+          { stream: stream === "stderr" ? "stderr" : "stdout", text: "later output" },
+        ],
+        () =>
+          runProcess({
+            ...options(),
+            captureComplete,
+            ...(stream === "raw" ? { onRawChunk: callback } : {}),
+            onStdoutLine:
+              stream === "stdout"
+                ? callback
+                : () => {
+                    calls++;
+                  },
+            onStderrLine:
+              stream === "stderr"
+                ? callback
+                : () => {
+                    calls++;
+                  },
+          }),
+      ),
     );
     expect(result.outputError).toBe("Invocation output callback failed");
     expect(result.exitCode).not.toBe(0);
@@ -217,7 +225,12 @@ const pieces = (text: string): Chunk[] =>
     text: text.slice(i * 131072, (i + 1) * 131072),
   }));
 
-test.each(["long", "short"])("captured %s-line bursts yield within the shared budget", async (kind) => {
+test.each([
+  [true, "long"],
+  [true, "short"],
+  [false, "long"],
+  [false, "short"],
+] as const)("capture=%s %s-line bursts yield within the shared budget", async (captureComplete, kind) => {
   const text = kind === "long" ? "x".repeat(8 * 1024 * 1024) : `${"first\nsecond\n".repeat(436906)}last`;
   const events: DrainEvent[] = [];
   let sentinel = false;
@@ -236,6 +249,7 @@ test.each(["long", "short"])("captured %s-line bursts yield within the shared bu
     () =>
       withChunks(pieces(text), () =>
         captured({
+          captureComplete,
           tailLimit: 100,
           maxLineLength: 65536,
           onStdoutLine: (line) => lines.push(line),
@@ -262,12 +276,19 @@ test.each(["long", "short"])("captured %s-line bursts yield within the shared bu
     stdoutTruncated: true,
     stderrTruncated: false,
   });
-  expect(result.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
+  expect(result.capture).toEqual(
+    captureComplete ? { provenance: { kind: "complete" }, stdout: text, stderr: "" } : undefined,
+  );
 });
 
-test.each(["stdout", "stderr"] as const)(
-  "captured redaction survives budget slice boundaries on %s",
-  async (stream) => {
+test.each([
+  [true, "stdout"],
+  [true, "stderr"],
+  [false, "stdout"],
+  [false, "stderr"],
+] as const)(
+  "capture=%s redaction survives budget slice boundaries on %s",
+  async (captureComplete, stream) => {
     const budget = 4096;
     const head = "synthetic-budget-head";
     const foot = "distinct-budget-footer";
@@ -284,6 +305,7 @@ test.each(["stdout", "stderr"] as const)(
     const result = await processDrainObserver.run({ budget, observe: (e) => events.push(e) }, () =>
       withChunks([{ stream, text }], () =>
         captured({
+          captureComplete,
           redactOutput: true,
           onRawChunk: (chunk) => raw.push(chunk),
           onStdoutLine: (line) => lines.push(line),
@@ -302,11 +324,11 @@ test.each(["stdout", "stderr"] as const)(
   },
 );
 
-test("concurrent captures share a round-robin turn budget", async () => {
+test("captured and agent output share a round-robin turn budget", async () => {
   const events: DrainEvent[] = [];
   const text = "entry\n".repeat(40000);
   const results = await processDrainObserver.run({ budget: 32768, observe: (e) => events.push(e) }, () =>
-    withChunks(pieces(text), () => Promise.all([captured(), captured()])),
+    withChunks(pieces(text), () => Promise.all([captured(), captured({ captureComplete: false })])),
   );
   const admissions = events.filter((e) => e.admitted);
   const turns = new Map<number, number>();
@@ -320,56 +342,258 @@ test("concurrent captures share a round-robin turn budget", async () => {
   }
   expect(new Set(admissions.slice(0, 2).map((e) => e.process)).size).toBe(2);
   expect([...progress.values()]).toEqual([text.length, text.length]);
-  for (const result of results)
-    expect(result.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
+  expect(results[0]?.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
+  expect(results[1]).toMatchObject({ stdout: text.slice(-64000), exitCode: 0 });
 });
 
-test("capture backpressure bounds a real fast writer beyond the capture cap", async () => {
+test("mixed output budgets include callback work across a whole turn", async () => {
+  let clock = 0;
+  let current: DrainEvent | undefined;
+  let sentinel = false;
+  let callbacks = 0;
+  const work = new Map<number, number>();
+  const progress = new Set<number>();
+  const text = `${"x".repeat(4095)}\n`.repeat(12);
   const events: DrainEvent[] = [];
-  let lines = 0;
-  const result = await processDrainObserver.run(
-    { budget: 32768, highWater: 65536, lowWater: 32768, observe: (e) => events.push(e) },
+  await processDrainObserver.run(
+    {
+      now: () => clock,
+      observe: (e) => {
+        events.push(e);
+        if (e.admitted) current = e;
+      },
+    },
     () =>
-      captured({
-        cmd: [process.execPath, "-e", 'process.stdout.write("x".repeat(32 * 1024 * 1024))'],
-        maxLineLength: 65536,
-        onStdoutLine: () => lines++,
-        timeoutMs: 15000,
+      withChunks(pieces(text), async () => {
+        const start = (captureComplete: boolean) =>
+          captured({
+            captureComplete,
+            onRawChunk: () =>
+              setImmediate(() => {
+                sentinel = true;
+              }),
+            onStdoutLine: () => {
+              if (!current) throw Error("missing admission");
+              if (++callbacks === 24) expect(sentinel).toBe(true);
+              progress.add(current.process);
+              if (callbacks === 3) expect(progress.size).toBe(2);
+              clock += 7;
+              work.set(current.turn, (work.get(current.turn) ?? 0) + 7);
+            },
+          });
+        const results = await Promise.all([start(true), start(false)]);
+        for (const r of results) expect(r.stdout).toBe(text);
       }),
   );
-  const peak = Math.max(...events.map((e) => e.queued));
-  const chunk = Math.max(...events.map((e) => e.received));
-  expect(peak).toBeLessThanOrEqual(65536 + chunk);
-  expect(events.some((e) => e.paused)).toBe(true);
-  expect(events.some((e, i) => i > 0 && events[i - 1]?.paused && !e.paused)).toBe(true);
-  expect(events.reduce((sum, e) => sum + e.admitted, 0)).toBe(32 * 1024 * 1024);
-  expect(lines).toBe(1);
-  expect(result).toMatchObject({ exitCode: 0, timedOut: false, stdout: "x".repeat(64000) });
-  expect(result.capture).toEqual({ provenance: { kind: "cut", truncated: true } });
-}, 20000);
+  expect(callbacks).toBe(24);
+  expect(work.size).toBeGreaterThan(1);
+  expect(Math.max(...work.values())).toBeLessThanOrEqual(14);
+  expect(events.filter((e) => e.admitted).every((e) => e.total <= 2 * 4096)).toBe(true);
+});
 
-test("end and close flushes finish queued unterminated lines before resolution", async () => {
-  const lines: string[] = [];
+test("queued byte-idle activity is recorded at receipt, before callback delivery", async () => {
+  let delivered = 0;
+  const idleReads: number[] = [];
+  await processDrainObserver.run({ budget: 1, highWater: 2, observe: () => {} }, () =>
+    withChunks([{ stream: "stdout", text: "one\ntwo\nlast" }], () =>
+      runProcess({
+        ...options(),
+        idleTimeoutMs: 100000,
+        idleNow: () => {
+          idleReads.push(delivered);
+          return 0;
+        },
+        onStdoutLine: () => {
+          delivered++;
+        },
+      }),
+    ),
+  );
+  expect(delivered).toBe(3);
+  expect(idleReads).toEqual([0, 0]); // Watchdog creation and one received chunk, never slices/flushes.
+});
+
+test("agent JSON lines redact split credentials and holdouts before outward delivery", async () => {
+  const secret = "synthetic-agent-stream-credential";
+  registerCredential("AGENT_STREAM_TEST", secret);
+  const redact = holdoutRedactor({
+    scenarios: [
+      {
+        id: "H-1",
+        description: "private phrase",
+        steps: "--hidden-switch",
+        expected: "ok",
+        edge_case: false,
+      },
+    ],
+  });
+  const first = JSON.stringify({ type: "message", text: `private phrase ${secret}` });
+  const last = JSON.stringify({ type: "message", text: "--hidden-switch" });
+  const split = first.indexOf(secret) + 9;
+  const seen = { stdout: [] as string[], stderr: [] as string[] };
   let resolved = false;
-  const observe = (stream: string) => (line: string) => {
+  const observe = (stream: "stdout" | "stderr") => (line: string) => {
     expect(resolved).toBe(false);
-    lines.push(`${stream}:${line}`);
+    seen[stream].push(redactJsonLine(line, redact));
   };
-  const result = await processDrainObserver.run({ budget: 1, observe: () => {} }, () =>
+  await processDrainObserver.run({ budget: 7, highWater: 32, observe: () => {} }, () =>
     withChunks(
       [
-        { stream: "stdout", text: "one\nlast-out" },
-        { stream: "stderr", text: "two\nlast-err" },
+        { stream: "stdout", text: first.slice(0, split) },
+        { stream: "stderr", text: `${first}\n${last}` },
+        { stream: "stdout", text: `${first.slice(split)}\n${last}` },
       ],
-      () => captured({ onStdoutLine: observe("out"), onStderrLine: observe("err") }),
-    ).then((result) => {
-      resolved = true;
-      return result;
-    }),
+      () =>
+        runProcess({
+          ...options(),
+          redactOutput: true,
+          onStdoutLine: observe("stdout"),
+          onStderrLine: observe("stderr"),
+        }),
+    ),
   );
-  expect(lines).toEqual(["out:one", "err:two", "out:last-out", "err:last-err"]);
-  expect(result).toMatchObject({ stdout: "one\nlast-out", stderr: "two\nlast-err" });
+  resolved = true;
+  const expected = [
+    '{"type":"message","text":"[private detail] [redacted] [1 private details withheld]"}',
+    '{"type":"message","text":"[private detail] [1 private details withheld]"}',
+  ];
+  expect(seen).toEqual({ stdout: expected, stderr: expected });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(seen).toEqual({ stdout: expected, stderr: expected });
 });
+
+test.each([true, false])(
+  "capture=%s capture backpressure bounds a real fast writer beyond the capture cap",
+  async (captureComplete) => {
+    const events: DrainEvent[] = [];
+    let lines = 0;
+    const result = await processDrainObserver.run(
+      { budget: 32768, highWater: 65536, lowWater: 32768, observe: (e) => events.push(e) },
+      () =>
+        captured({
+          captureComplete,
+          cmd: [process.execPath, "-e", 'process.stdout.write("x".repeat(32 * 1024 * 1024))'],
+          maxLineLength: 65536,
+          onStdoutLine: () => lines++,
+          timeoutMs: 15000,
+        }),
+    );
+    const peak = Math.max(...events.map((e) => e.queued));
+    const chunk = Math.max(...events.map((e) => e.received));
+    expect(peak).toBeLessThanOrEqual(65536 + chunk);
+    expect(events.some((e) => e.paused)).toBe(true);
+    expect(events.some((e, i) => i > 0 && events[i - 1]?.paused && !e.paused)).toBe(true);
+    expect(events.reduce((sum, e) => sum + e.admitted, 0)).toBe(32 * 1024 * 1024);
+    expect(lines).toBe(1);
+    expect(result).toMatchObject({ exitCode: 0, timedOut: false, stdout: "x".repeat(64000) });
+    expect(result.capture).toEqual(
+      captureComplete ? { provenance: { kind: "cut", truncated: true } } : undefined,
+    );
+  },
+  20000,
+);
+
+test.each([true, false])(
+  "capture=%s end and close flushes finish queued unterminated lines before resolution",
+  async (captureComplete) => {
+    const lines: string[] = [];
+    let resolved = false;
+    const observe = (stream: string) => (line: string) => {
+      expect(resolved).toBe(false);
+      lines.push(`${stream}:${line}`);
+    };
+    const result = await processDrainObserver.run({ budget: 1, observe: () => {} }, () =>
+      withChunks(
+        [
+          { stream: "stdout", text: "one\nlast-out" },
+          { stream: "stderr", text: "two\nlast-err" },
+        ],
+        () =>
+          captured({
+            captureComplete,
+            onStdoutLine: observe("out"),
+            onStderrLine: observe("err"),
+          }),
+      ).then((result) => {
+        resolved = true;
+        return result;
+      }),
+    );
+    expect(lines).toEqual(["out:one", "err:two", "out:last-out", "err:last-err"]);
+    expect(result).toMatchObject({ stdout: "one\nlast-out", stderr: "two\nlast-err" });
+  },
+);
+
+test.each([true, false])(
+  "capture=%s close clears child timers before waiting for queued output",
+  async (captureComplete) => {
+    const controller = new AbortController();
+    const schedule = setTimeout;
+    const clear = clearTimeout;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cleared = false;
+    let clearedAtClose = false;
+    let queued = 0;
+    let queuedAtClose = 0;
+    const lines: string[] = [];
+    const scheduling = spyOn(globalThis, "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      const handle = schedule(fn, ms, ...args);
+      if (ms === 100000) timer = handle;
+      return handle;
+    }) as typeof setTimeout);
+    const clearing = spyOn(globalThis, "clearTimeout").mockImplementation(((
+      handle: ReturnType<typeof setTimeout>,
+    ) => {
+      if (handle === timer) cleared = true;
+      clear(handle);
+    }) as typeof clearTimeout);
+    try {
+      const result = await processDrainObserver.run(
+        {
+          budget: 1,
+          observe: (e) => {
+            queued = e.queued;
+          },
+        },
+        () =>
+          withChunks(
+            [{ stream: "stdout", text: `${"pending".repeat(100)}\n` }],
+            () =>
+              captured({
+                captureComplete,
+                signal: controller.signal,
+                timeoutMs: 100000,
+                onStdoutLine: (line) => lines.push(line),
+              }),
+            {
+              beforeEnd: (child) => {
+                child.once("close", () => {
+                  clearedAtClose = cleared;
+                  queuedAtClose = queued;
+                  // Closing the child ends its deadlines, but delivery remains cancellable.
+                  controller.abort();
+                });
+              },
+            },
+          ),
+      );
+      expect(timer).toBeDefined();
+      expect(queuedAtClose).toBeGreaterThan(0);
+      expect(clearedAtClose).toBe(true);
+      expect(result).toMatchObject({ cancelled: true, timedOut: false, idleTimedOut: false });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(lines).toEqual([]);
+    } finally {
+      controller.abort();
+      scheduling.mockRestore();
+      clearing.mockRestore();
+    }
+  },
+);
 
 test("spawn and stdin diagnostics follow previously queued stream data", async () => {
   const lines: string[] = [];
@@ -393,189 +617,212 @@ test("spawn and stdin diagnostics follow previously queued stream data", async (
   expect(result.stderr).toBe("before\n\n[spawn error] spawn diagnostic\n[stdin error] input diagnostic");
 });
 
-test("a stream's EOF redaction flush stays ahead of later data on the other stream", async () => {
-  registerCredential("EOF_ORDER_TEST", "synthetic-eof-order-credential".padEnd(128, "q"));
-  const lines: string[] = [];
-  const result = await processDrainObserver.run({ budget: 16, observe: () => {} }, () =>
-    withChunks(
-      [{ stream: "stdout", text: "out\n" }],
-      () =>
-        captured({
-          redactOutput: true,
-          onStdoutLine: (line) => lines.push(line),
-          onStderrLine: (line) => lines.push(line),
-        }),
-      {
-        beforeEnd: async (child) => {
-          const stdout = child.stdout;
-          const stderr = child.stderr;
-          if (!(stdout instanceof PassThrough) || !(stderr instanceof PassThrough))
-            throw Error("missing fixture streams");
-          const ended = new Promise<void>((resolve) => stdout.once("end", resolve));
-          stdout.end();
-          await ended;
-          stderr.write(`err\n${"z".repeat(256)}\n`);
-        },
-      },
-    ),
-  );
-  expect(lines).toEqual(["out", "err", "z".repeat(256)]);
-  expect(result).toMatchObject({ stdout: "out\n", stderr: `err\n${"z".repeat(256)}\n` });
-});
-
-test("aborting mid-drain drops pending admission while another capture completes", async () => {
-  const controller = new AbortController();
-  const text = "line\n".repeat(50000);
-  let current: DrainEvent | undefined;
-  let cancelledId: number | undefined;
-  let admittedAfterAbort = 0;
-  const results = await processDrainObserver.run(
-    {
-      budget: 1024,
-      observe: (e) => {
-        if (e.process === cancelledId) admittedAfterAbort += e.admitted;
-        if (e.admitted) current = e;
-      },
-    },
-    () =>
-      withChunks(pieces(text), () =>
-        Promise.all([
+test.each([true, false])(
+  "capture=%s a stream's EOF redaction flush stays ahead of later data on the other stream",
+  async (captureComplete) => {
+    registerCredential("EOF_ORDER_TEST", "synthetic-eof-order-credential".padEnd(128, "q"));
+    const lines: string[] = [];
+    const result = await processDrainObserver.run({ budget: 16, observe: () => {} }, () =>
+      withChunks(
+        [{ stream: "stdout", text: "out\n" }],
+        () =>
           captured({
-            signal: controller.signal,
-            onStdoutLine: () => {
-              if (controller.signal.aborted) return;
-              expect(current?.queued).toBeGreaterThan(0);
-              cancelledId = current?.process;
-              controller.abort();
-            },
+            captureComplete,
+            redactOutput: true,
+            onStdoutLine: (line) => lines.push(line),
+            onStderrLine: (line) => lines.push(line),
           }),
-          captured(),
-        ]),
+        {
+          beforeEnd: async (child) => {
+            const stdout = child.stdout;
+            const stderr = child.stderr;
+            if (!(stdout instanceof PassThrough) || !(stderr instanceof PassThrough))
+              throw Error("missing fixture streams");
+            const ended = new Promise<void>((resolve) => stdout.once("end", resolve));
+            stdout.end();
+            await ended;
+            stderr.write(`err\n${"z".repeat(256)}\n`);
+          },
+        },
       ),
-  );
-  expect(cancelledId).toBeDefined();
-  expect(admittedAfterAbort).toBe(0);
-  expect(results[0]).toMatchObject({ cancelled: true, capture: { provenance: { kind: "legacy-unknown" } } });
-  expect(results[1]?.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
-});
+    );
+    expect(lines).toEqual(["out", "err", "z".repeat(256)]);
+    expect(result).toMatchObject({ stdout: "out\n", stderr: `err\n${"z".repeat(256)}\n` });
+  },
+);
 
-test("captured timeout stops a yielded drain with a backpressured child", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "proc-drain-timeout-"));
-  const ready = join(dir, "backpressured");
-  const drained = join(dir, "drained");
-  const events: DrainEvent[] = [];
-  const controller = new AbortController();
-  const children: subprocess.ChildProcess[] = [];
-  const spawn = subprocess.spawn;
-  const setTimer = globalThis.setTimeout;
-  const immediate = globalThis.setImmediate;
-  const held = Promise.withResolvers<void>();
-  let firstAdmission = true;
-  let holdNext = false;
-  let resumeDrain = () => {};
-  let fire: () => void = () => {
-    throw new Error("timeout was not installed");
-  };
-  const deadline = Promise.withResolvers<never>();
-  // Bound both readiness and close, independently of the intercepted timeout.
-  const deadlineTimer = setTimer(
-    () => deadline.reject(new Error("captured timeout did not complete")),
-    10000,
-  );
-  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
-    fn: (...args: unknown[]) => void,
-    ms?: number,
-    ...args: unknown[]
-  ) => {
-    if (ms !== 25) return setTimer(fn, ms, ...args);
-    fire = () => fn(...args);
-    return setTimer(() => {}, 60000);
-  }) as typeof setTimeout);
-  const scheduling = spyOn(globalThis, "setImmediate").mockImplementation(((
-    fn: (...args: unknown[]) => void,
-    ...args: unknown[]
-  ) => {
-    if (!holdNext) return immediate(fn, ...args);
-    holdNext = false;
-    resumeDrain = () => {
-      resumeDrain = () => {};
-      immediate(fn, ...args);
-    };
-    held.resolve();
-    return immediate(() => {});
-  }) as typeof setImmediate);
-  const spawning = spyOn(subprocess, "spawn").mockImplementation(((
-    ...args: Parameters<typeof subprocess.spawn>
-  ) => {
-    const child = spawn(...args);
-    children.push(child);
-    return child;
-  }) as typeof subprocess.spawn);
-  try {
-    const running = processDrainObserver.run(
+test.each([true, false])(
+  "capture=%s aborting mid-drain drops pending admission while another capture completes",
+  async (captureComplete) => {
+    const controller = new AbortController();
+    const text = "line\n".repeat(50000);
+    let current: DrainEvent | undefined;
+    let cancelledId: number | undefined;
+    let admittedAfterAbort = 0;
+    const results = await processDrainObserver.run(
       {
         budget: 1024,
-        highWater: 4096,
-        lowWater: 2048,
         observe: (e) => {
-          events.push(e);
-          if (e.admitted && firstAdmission) {
-            firstAdmission = false;
-            // This step consumes the whole budget; hold the drain's next scheduled turn.
-            holdNext = true;
-          }
+          if (e.process === cancelledId) admittedAfterAbort += e.admitted;
+          if (e.admitted) current = e;
         },
       },
       () =>
-        captured({
-          cmd: [
-            process.execPath,
-            "-e",
-            `import { writeFileSync } from "node:fs";
+        withChunks(pieces(text), () =>
+          Promise.all([
+            captured({
+              captureComplete,
+              signal: controller.signal,
+              onStdoutLine: () => {
+                if (controller.signal.aborted) return;
+                expect(current?.queued).toBeGreaterThan(0);
+                cancelledId = current?.process;
+                controller.abort();
+              },
+            }),
+            captured(),
+          ]),
+        ),
+    );
+    expect(cancelledId).toBeDefined();
+    expect(admittedAfterAbort).toBe(0);
+    expect(results[0]).toMatchObject({
+      cancelled: true,
+      ...(captureComplete ? { capture: { provenance: { kind: "legacy-unknown" } } } : {}),
+    });
+    expect(results[1]?.capture).toEqual({ provenance: { kind: "complete" }, stdout: text, stderr: "" });
+  },
+);
+
+test.each(["capture", "agent", "idle"])(
+  "%s timeout stops a yielded drain with a backpressured child",
+  async (mode) => {
+    const captureComplete = mode === "capture";
+    const idle = mode === "idle";
+    let idleClock = 0;
+    const dir = mkdtempSync(join(tmpdir(), "proc-drain-timeout-"));
+    const ready = join(dir, "backpressured");
+    const drained = join(dir, "drained");
+    const events: DrainEvent[] = [];
+    const controller = new AbortController();
+    const children: subprocess.ChildProcess[] = [];
+    const spawn = subprocess.spawn;
+    const setTimer = idle ? globalThis.setInterval : globalThis.setTimeout;
+    const immediate = globalThis.setImmediate;
+    const held = Promise.withResolvers<void>();
+    let firstAdmission = true;
+    let holdNext = false;
+    let resumeDrain = () => {};
+    let fire: () => void = () => {
+      throw new Error("timeout was not installed");
+    };
+    const deadline = Promise.withResolvers<never>();
+    // Bound both readiness and close, independently of the intercepted timeout.
+    const deadlineTimer = setTimer(
+      () => deadline.reject(new Error("captured timeout did not complete")),
+      10000,
+    );
+    const timer = spyOn(globalThis, idle ? "setInterval" : "setTimeout").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      if (ms !== 25) return setTimer(fn, ms, ...args);
+      fire = () => {
+        idleClock = 26;
+        fn(...args);
+      };
+      return setTimer(() => {}, 60000);
+    }) as typeof setTimeout);
+    const scheduling = spyOn(globalThis, "setImmediate").mockImplementation(((
+      fn: (...args: unknown[]) => void,
+      ...args: unknown[]
+    ) => {
+      if (!holdNext) return immediate(fn, ...args);
+      holdNext = false;
+      resumeDrain = () => {
+        resumeDrain = () => {};
+        immediate(fn, ...args);
+      };
+      held.resolve();
+      return immediate(() => {});
+    }) as typeof setImmediate);
+    const spawning = spyOn(subprocess, "spawn").mockImplementation(((
+      ...args: Parameters<typeof subprocess.spawn>
+    ) => {
+      const child = spawn(...args);
+      children.push(child);
+      return child;
+    }) as typeof subprocess.spawn);
+    try {
+      const running = processDrainObserver.run(
+        {
+          budget: 1024,
+          highWater: 4096,
+          lowWater: 2048,
+          observe: (e) => {
+            events.push(e);
+            if (e.admitted && firstAdmission) {
+              firstAdmission = false;
+              // This step consumes the whole budget; hold the drain's next scheduled turn.
+              holdNext = true;
+            }
+          },
+        },
+        () =>
+          captured({
+            captureComplete,
+            cmd: [
+              process.execPath,
+              "-e",
+              `import { writeFileSync } from "node:fs";
              if (process.stdout.write(Buffer.alloc(32 * 1024 * 1024, 120))) throw Error("expected backpressure");
              process.stdout.once("drain", () => writeFileSync(${JSON.stringify(drained)}, "drained"));
              writeFileSync(${JSON.stringify(ready)}, "ready");
              setInterval(() => {}, 1000);`,
-          ],
-          signal: controller.signal,
-          timeoutMs: 25,
-        }),
-    );
-    await Promise.race([held.promise, running, deadline.promise]);
-    while (!existsSync(ready)) await Promise.race([Bun.sleep(10), deadline.promise]);
-    const pending = events.at(-1);
-    expect(pending?.queued).toBeGreaterThan(0);
-    expect(pending?.paused).toBe(true);
-    expect(existsSync(drained)).toBe(false);
-    expect(events.reduce((sum, e) => sum + e.admitted, 0)).toBe(1024);
-    const beforeTimeout = events.length;
-    fire();
-    resumeDrain();
-    const result = await Promise.race([running, deadline.promise]);
-    expect(
-      events
-        .slice(beforeTimeout)
-        .reduce((sum, e) => sum + (e.process === pending?.process ? e.admitted : 0), 0),
-    ).toBe(0);
-    expect(result).toMatchObject({
-      timedOut: true,
-      cancelled: false,
-      capture: { provenance: { kind: "legacy-unknown" } },
-    });
-  } finally {
-    scheduling.mockRestore();
-    timer.mockRestore();
-    spawning.mockRestore();
-    controller.abort();
-    resumeDrain();
-    clearTimeout(deadlineTimer);
-    for (const child of children)
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    rmSync(dir, { recursive: true, force: true });
-  }
-}, 15000);
+            ],
+            signal: controller.signal,
+            ...(idle ? { idleTimeoutMs: 25, idleNow: () => idleClock } : { timeoutMs: 25 }),
+          }),
+      );
+      await Promise.race([held.promise, running, deadline.promise]);
+      while (!existsSync(ready)) await Promise.race([Bun.sleep(10), deadline.promise]);
+      const pending = events.at(-1);
+      expect(pending?.queued).toBeGreaterThan(0);
+      expect(pending?.paused).toBe(true);
+      expect(existsSync(drained)).toBe(false);
+      expect(events.reduce((sum, e) => sum + e.admitted, 0)).toBe(1024);
+      const beforeTimeout = events.length;
+      fire();
+      resumeDrain();
+      const result = await Promise.race([running, deadline.promise]);
+      expect(
+        events
+          .slice(beforeTimeout)
+          .reduce((sum, e) => sum + (e.process === pending?.process ? e.admitted : 0), 0),
+      ).toBe(0);
+      expect(result).toMatchObject({
+        timedOut: !idle,
+        idleTimedOut: idle,
+        cancelled: false,
+        ...(captureComplete ? { capture: { provenance: { kind: "legacy-unknown" } } } : {}),
+      });
+    } finally {
+      scheduling.mockRestore();
+      timer.mockRestore();
+      spawning.mockRestore();
+      controller.abort();
+      resumeDrain();
+      clearTimeout(deadlineTimer);
+      for (const child of children)
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+  15000,
+);
 
-test("the shared drain restores each capture's async context instead of its waker's", async () => {
+test("the shared drain restores capture and agent async contexts instead of its waker's", async () => {
   const store = new AsyncLocalStorage<string>();
   const received: string[] = [];
   const observed: string[] = [];
@@ -584,6 +831,7 @@ test("the shared drain restores each capture's async context instead of its wake
       const start = (name: string) =>
         store.run(name, () =>
           captured({
+            captureComplete: name === "waker",
             onRawChunk: () => received.push(name),
             onStdoutLine: () => {
               observed.push(name);
@@ -817,6 +1065,7 @@ test("legacy result shape and pre-dispatch encoding refusal", async () => {
 });
 
 test("bounded framing releases oversized lines on both streams and preserves separate startup lines", async () => {
+  const firstLine = Promise.withResolvers<void>();
   const lines: string[] = [];
   const observed: number[] = [];
   const body = "x".repeat(256_000);
@@ -842,7 +1091,10 @@ test("bounded framing releases oversized lines on both streams and preserves sep
           tailLimit: 128,
           onRawChunk: () => observed.push(lines.length),
           onStarted: () => lines.push("started"),
-          onStdoutLine: (line) => lines.push(line),
+          onStdoutLine: (line) => {
+            lines.push(line);
+            firstLine.resolve();
+          },
           onStderrLine: (line) => lines.push(line),
         },
         { write: [], protect: [] },
@@ -850,6 +1102,7 @@ test("bounded framing releases oversized lines on both streams and preserves sep
         async () => {},
         fakeConfinement,
       ),
+    { beforeChunk: (i) => (i === 1 ? firstLine.promise : undefined) },
   );
   const truncated = `${"x".repeat(128)} [truncated]`;
   expect(lines).toEqual([
@@ -1427,6 +1680,7 @@ test.each([
 ])("runner releases an unterminated %s string instead of holding the stream", async (_kind, introducer) => {
   const secret = "synthetic-released-string-credential";
   registerCredential("RELEASED_STRING_TEST_TOKEN", secret);
+  const firstLine = Promise.withResolvers<void>();
   const lines: string[] = [];
   const seenAtChunk: number[] = [];
   // Larger than any credential carry, which other tests' registrations can make long.
@@ -1441,8 +1695,12 @@ test.each([
         ...options(),
         redactOutput: true,
         onRawChunk: () => seenAtChunk.push(lines.length),
-        onStdoutLine: (line) => lines.push(line),
+        onStdoutLine: (line) => {
+          lines.push(line);
+          firstLine.resolve();
+        },
       }),
+    { beforeChunk: (i) => (i === 1 ? firstLine.promise : undefined) },
   );
   // Past the hold limit, the stray sequence's text is released while the stream is still running.
   expect(seenAtChunk[1]).toBeGreaterThanOrEqual(1);
@@ -1525,6 +1783,10 @@ test("cleanup records ownership before the first signal and deletes it after con
             scratchDirs: new Set(),
             runId: "recorded",
             cleanups: store,
+            beforeSpawn: (invocation) => {
+              if (!invocation) throw new Error("Missing invocation identity");
+              marker = invocation;
+            },
           },
           async () => {
             const result = await runProcess({
@@ -1542,7 +1804,7 @@ test("cleanup records ownership before the first signal and deletes it after con
               onStdoutLine: (line) => {
                 const data = JSON.parse(line) as { pid: number; marker: string };
                 member = data.pid;
-                marker = data.marker;
+                expect(data.marker).toBe(marker);
               },
             });
             expect(result.exitCode).toBe(0);
@@ -1755,7 +2017,7 @@ for (const [idle, code] of [
         end();
       };
       exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-      child.stdout?.once("data", () => fire());
+      child.stdout?.once("data", () => setImmediate(() => setImmediate(fire)));
       return child;
     }) as typeof subprocess.spawn);
     const inspect = async (_environment: boolean, marker: string) => {

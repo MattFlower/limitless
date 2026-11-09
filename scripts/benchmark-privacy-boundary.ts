@@ -328,10 +328,17 @@ export async function measureWorker(root: string, r = runtime, ops?: Ops) {
         throw error;
       }
       const turns: [number, number, number, string][] = [];
+      const turnMainThreadCpuMs: number[] = [];
       const [idle, pending] = [[] as number[][], [] as unknown[]];
       let [beating, last, heartbeat] = [true, r.now(), 0];
+      let lastCpu = process.threadCpuUsage();
       const beat = (now = r.now(), owned = open ? open.end - open.start : 0) => {
-        if (open) turns.push([open.start - start, owned, now - last, [...open.phases].join()]);
+        const cpu = process.threadCpuUsage();
+        if (open) {
+          turns.push([open.start - start, owned, now - last, [...open.phases].join()]);
+          turnMainThreadCpuMs.push(ms(cpu) - ms(lastCpu));
+        }
+        lastCpu = cpu;
         if (now - last - owned > 2) idle.push([now - start, now - last - owned]); // Unowned gap time, beside turns too.
         [open, last, heartbeat] = [undefined, now, heartbeat + 1];
         if (beating) resumptions.setImmediate(beat);
@@ -367,7 +374,18 @@ export async function measureWorker(root: string, r = runtime, ops?: Ops) {
       }
       const cpuMs = { workerAndRuntime: ms(all) - ms(thread), mainThreadWithHeartbeat: ms(thread) };
       const [slice, latencyMs] = [Math.max(0, ...turns.map((t) => t[1])), results.map((p) => p.latencyMs)];
-      const timing = { slice, heartbeat, wallMs, cpuMs, ...r.memory(), turns, idle };
+      const timing = {
+        slice,
+        maxTurnMainThreadCpuMs: Math.max(0, ...turnMainThreadCpuMs),
+        maxHeartbeatGapMs: Math.max(0, ...turns.map((t) => t[2]), ...idle.map((t) => t[1] ?? 0)),
+        heartbeat,
+        wallMs,
+        cpuMs,
+        ...r.memory(),
+        turns,
+        turnMainThreadCpuMs,
+        idle,
+      };
       const observed = { ...timing, latencyMs, ...producer?.check(value) };
       trials.push({ label, warmup: trial < 2, admitted: true, owned: true, ...observed });
     }
@@ -394,7 +412,7 @@ export async function measureWorker(root: string, r = runtime, ops?: Ops) {
     await series("byte backpressure (64 MiB pending)", [bmp, bmp, busy(bmp)]);
   }
   const resumed = ops ? " (producer resumptions owned via preloaded hooks); idle: unowned gap ms >2" : "";
-  const method = `slice: wall ms per daemon turn${resumed}; worker CPU: cpuUsage minus main threadCpuUsage`;
+  const method = `slice: wall ms per daemon turn${resumed}; turnMainThreadCpuMs: main-thread CPU between those heartbeats; worker CPU: cpuUsage minus main threadCpuUsage`;
   const size = { entries: policy.entries.length, credentials: policy.credentials.length };
   return { platform: r.platform, method, policy: size, groups, decision: decideC21c(raw) };
 }

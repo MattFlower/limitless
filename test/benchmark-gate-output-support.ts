@@ -581,7 +581,14 @@ export function describe(name: string, label: string, size: number, api: API) {
               : name === "scanner-files"
                 ? "headers"
                 : "bytes",
-    lines: name === "scanner-overflow" ? 2000 : name === "long-line" ? 1 : undefined,
+    lines:
+      name === "agent-stream" || name === "scanner-overflow" ? 2000 : name === "long-line" ? 1 : undefined,
+    holdoutScenarios: name === "agent-stream" ? 8 : name === "holdout-repetitive" ? 1 : undefined,
+    publicSourceUnits: name === "agent-stream" ? 20480 : name === "holdout-repetitive" ? 262144 : undefined,
+    registeredAgentCredentials: name === "agent-stream" ? 601 : undefined,
+    observedLiteralUnits: name === "holdout-repetitive" ? 3802 : undefined,
+    observedLiterals: name === "holdout-repetitive" ? 8 : undefined,
+    coldClassification: name === "holdout-repetitive" ? true : undefined,
     identityCap: name === "identities" ? (cap ?? null) : undefined,
     identityCoverage: name === "identities" ? identities : undefined,
     identityBytesSource:

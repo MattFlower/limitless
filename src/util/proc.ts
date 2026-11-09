@@ -803,11 +803,12 @@ export interface ProcResult {
 }
 
 const DEFAULT_TAIL = 64_000;
-/** Counts-only test seam; overrides are shared by the queues participating in a turn. */
+/** Test seam; byte/clock overrides are shared by the queues participating in a turn. */
 export const processDrainObserver = new AsyncLocalStorage<{
   budget?: number;
   highWater?: number;
   lowWater?: number;
+  now?: () => number;
   observe: (event: {
     process: number;
     turn: number;
@@ -824,13 +825,16 @@ let outputTurn = 0;
 let outputId = 0;
 function drainOutput() {
   const turn = ++outputTurn;
+  const now = outputQueues.values().next().value?.now ?? performance.now.bind(performance);
+  const started = now();
   let remaining = Math.min(256 * 1024, ...[...outputQueues].map((queue) => queue.budget));
   let total = 0;
-  while (remaining > 0 && outputQueues.size) {
+  // Leave headroom for one slice's framing, redaction and caller callbacks.
+  while (remaining > 0 && outputQueues.size && now() - started < 10) {
     const queue = outputQueues.values().next().value;
     if (!queue) break;
     outputQueues.delete(queue);
-    const used = queue.step(Math.min(remaining, 16 * 1024), turn, total);
+    const used = queue.step(Math.min(remaining, 4096), turn, total);
     remaining -= used;
     total += used;
     if (queue.pending()) outputQueues.add(queue);
@@ -858,6 +862,7 @@ function outputQueue(child: ChildProcessWithoutNullStreams) {
     for (const stream of [child.stdout, child.stderr]) paused ? stream.pause() : stream.resume();
   };
   const queue = {
+    now: seam?.now ?? performance.now.bind(performance),
     budget: seam?.budget ?? 256 * 1024,
     pending: () => items.length > 0,
     push(text: string, consume: (text: string) => void) {
@@ -1072,7 +1077,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
     let timedOut = false;
     let idleTimedOut = false;
     let settled = false;
-    const queue = opts.captureComplete ? outputQueue(child) : undefined;
+    const queue = outputQueue(child);
     const idle = idleWatchdog(opts.idleTimeoutMs ?? Infinity, opts.idleNow);
     let outputError: string | undefined;
     const guard = <T extends unknown[]>(callback?: (...args: T) => void) =>
@@ -1183,6 +1188,7 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         () => {
           if (shutdown === undefined && idle.expired()) {
             idleTimedOut = runningAtDeadline();
+            if (idleTimedOut) queue.stop();
             terminate();
           }
         },
@@ -1190,10 +1196,10 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       );
     }
 
-    const finishTimers = () => {
+    const finishTimers = (detachAbort = true) => {
       for (const t of timers) clearTimeout(t);
       if (idleTimer) clearInterval(idleTimer);
-      opts.signal?.removeEventListener("abort", onAbort);
+      if (detachAbort) opts.signal?.removeEventListener("abort", onAbort);
     };
 
     const onAbort = () => {
@@ -1223,10 +1229,6 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       };
       return {
         push(chunk: string) {
-          if (!capture) {
-            idle.reset();
-            rawChunk?.(chunk, stream);
-          }
           emit(opts.redactOutput ? redactor.push(chunk) : chunk);
         },
         flush() {
@@ -1263,10 +1265,15 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
         child[stream].on("error", capture.fail);
       }
     } else {
-      child.stdout.on("data", stdoutOutput.push);
-      child.stderr.on("data", stderrOutput.push);
-      child.stdout.on("end", stdoutOutput.flush);
-      child.stderr.on("end", stderrOutput.flush);
+      for (const stream of ["stdout", "stderr"] as const) {
+        const output = stream === "stdout" ? stdoutOutput : stderrOutput;
+        child[stream].on("data", (text: string) => {
+          idle.reset();
+          rawChunk?.(text, stream);
+          queue.push(text, output.push);
+        });
+        child[stream].on("end", () => queue.push("", output.flush));
+      }
     }
 
     child.on("error", (e) => {
@@ -1296,7 +1303,8 @@ function startProcess(opts: ProcOptions): Promise<ProcResult> {
       };
       if (queue) queue.push("", flush);
       else flush();
-      if (!queue) finishTimers();
+      // The child is closed; only cancellation still applies while queued output drains.
+      finishTimers(false);
       await terminate();
       if (queue) {
         await queue.wait();
