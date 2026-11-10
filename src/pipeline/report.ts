@@ -141,6 +141,25 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
       ),
     );
   const { state } = input;
+  // Keep the overview aligned with the displayed checks.
+  const gates = projectGateDiagnostics(state.lastGates ?? [], { mode: "outward" });
+  const gateIcon = (g: (typeof gates)[number]) =>
+    g.blocking ? "❌" : ["still_failing", "flaky", "not_run"].includes(g.verdict) ? "⚠️" : "✅";
+  const glance: string[] = [];
+  if (gates.length)
+    glance.push(
+      `checks ${gates.filter((g) => gateIcon(g) === "✅").length}/${gates.length} passed (${gates.filter((g) => g.blocking).length} blocking)`,
+    );
+  if (state.lastReview) {
+    const latestReview = state.reviewHistory?.at(-1);
+    const count =
+      latestReview && latestReview.sha === state.reviewedSha
+        ? ` (${latestReview.blocking.length} blocking)`
+        : "";
+    glance.push(`review: ${state.lastReview.verdict}${count}`);
+  }
+  if (state.sizeReport && "source" in state.sizeReport)
+    glance.push(`source +${state.sizeReport.source.added}/−${state.sizeReport.source.removed}`);
   const blocks: ReportPart[] = [
     input.discreet
       ? input.success
@@ -165,8 +184,14 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
           `Verified at \`${input.verifiedFailure.sha}\`; failed after verification at \`${input.verifiedFailure.stage}\`: \`${input.verifiedFailure.reason}\`. The PR may conflict with \`${input.verifiedFailure.base}\`.`,
         ]
       : []),
+    ...(glance.length ? [`**At a glance:** ${glance.join(" · ")}`] : []),
     ...(input.freeFirstRouting ? ["Routing: free-first (Dependabot)"] : []),
     "## Request",
+    // Isolate HTML wrappers so privacy projection failures cannot withhold neighboring headings.
+    reportText(
+      "prose",
+      `<details><summary>Full request (${input.prompt.match(/\S+/g)?.length ?? 0} words)</summary>`,
+    ),
     reportText(
       "prose",
       input.prompt
@@ -174,6 +199,7 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
         .map((l) => `> ${l}`)
         .join("\n"),
     ),
+    reportText("prose", "</details>"),
   ];
   const acceptance = state.acceptance?.outcome;
   if (acceptance)
@@ -331,9 +357,8 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
     blocks.push(
       table(
         ["Check", "Result", ...(commands ? ["Command"] : [])],
-        projectGateDiagnostics(state.lastGates, { mode: "outward" }).map((g) => {
-          const warn = g.verdict === "still_failing" || g.verdict === "flaky" || g.verdict === "not_run";
-          const icon = g.blocking ? "❌" : warn ? "⚠️" : "✅";
+        gates.map((g) => {
+          const icon = gateIcon(g);
           const row = [
             g.name,
             `${icon} ${docsGateSummary(g) ?? (g.result.timedOut ? "timed out" : g.verdict.replaceAll("_", " "))}`,
@@ -441,6 +466,10 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
     const written = work.reduce((n, inv) => n + inv.cacheWriteTokens, 0);
     blocks.push(
       "## Work log",
+      reportText(
+        "prose",
+        `<details><summary>Work log: ${work.length} invocations, ${money(input.totals.costUsd)} spent</summary>`,
+      ),
       table(
         ["Role", "Model", "Effort", "Status", "Tokens in / out", "Cached", "Cache write", "Cost", "Duration"],
         work.map((inv) => [
@@ -458,6 +487,7 @@ function renderArtifacts(input: ReportInput, publication?: (text: string) => str
       `**Total:** ${money(input.totals.costUsd)} spent, ${money(input.totals.costEquivUsd)} API-equivalent on subscriptions.`,
       `**Cache:** ${cacheHitRate(cached, promptTokens(work))} of prompt tokens read from cache (${cached.toLocaleString("en-US")} cached, ${written.toLocaleString("en-US")} written, ${uncached.toLocaleString("en-US")} not cached; cache writes older rows never recorded count here).`,
       ...(shadow.length ? [shadowSpend] : []),
+      reportText("prose", "</details>"),
     );
   }
 
