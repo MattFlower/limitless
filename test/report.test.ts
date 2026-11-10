@@ -4,7 +4,7 @@ import { computeStats } from "../src/db/stats.ts";
 import { Store } from "../src/db/store.ts";
 import { compareGates, type GateResult, type GateRun } from "../src/gates/run.ts";
 import type { RunState } from "../src/pipeline/context.ts";
-import { renderReport, verifiedFailureState } from "../src/pipeline/report.ts";
+import { type ReportInput, renderReport, verifiedFailureState } from "../src/pipeline/report.ts";
 
 const inv: Invocation = {
   waitMs: 0,
@@ -629,4 +629,110 @@ test("signal warnings are advisory and describe attempts without publishing comm
     expect(md).toContain("does not establish that a signal succeeded");
     expect(md).toContain(success ? "every gate below passed" : "needs a human");
   }
+});
+
+test("report opener summarizes evidence while keeping sections and details readable", () => {
+  const input: ReportInput = {
+    discreet: true,
+    success: false,
+    runId: "r",
+    runUrl: "u",
+    prompt: `Long request\n${"word ".repeat(300)}`,
+    invocations: [inv],
+    totals: { costUsd: 1.25, costEquivUsd: 2 },
+    state: {
+      lastGates: compareGates(null, {
+        setupOk: true,
+        setup: [],
+        checks: [passedCheck, { ...failedCheck, name: "lint" }],
+      }),
+      lastReview: {
+        modelId: "reviewer",
+        verdict: "request_changes",
+        summary: "Review summary",
+        findings: ["blocker", "major", "minor", "nit"].map((severity) => ({
+          severity: severity as "blocker" | "major" | "minor" | "nit",
+          security: false,
+          file: "",
+          line: 0,
+          title: "Finding",
+          detail: "Detail",
+          suggestion: "Fix",
+        })),
+      },
+      sizeReport: {
+        base: "base",
+        head: "head",
+        mode: "two-dot",
+        source: { added: 120, removed: 30 },
+        tests: { added: 0, removed: 0 },
+        docs: { added: 0, removed: 0 },
+        binary: 0,
+        renamesAcross: [],
+        stated: null,
+      },
+    },
+  };
+  const md = renderReport(input);
+  // These are all the headings the original renderer emitted for this input.
+  expect(md.match(/^## .+$/gm)).toEqual([
+    "## Request",
+    "## Size",
+    "## Checks",
+    "## Code review (`reviewer`)",
+    "## Work log",
+  ]);
+  const opener = md.split("<details>")[0] ?? "";
+  expect(opener.length).toBeLessThan(350);
+  expect(opener).not.toContain("> Long request");
+  expect(opener).toContain(
+    "**At a glance:** checks 1/2 passed (1 blocking) · review: request_changes · source +120/−30",
+  );
+  expect(md).toContain("<details><summary>Full request (302 words)</summary>\n\n> Long request");
+  expect(md).toContain("<details><summary>Work log: 1 invocations, $1.25 spent</summary>\n\n| Role");
+  expect(md).toContain("subscriptions.\n\n**Cache:**");
+  expect(md).toContain("here).\n\n</details>");
+  expect(renderReport({ ...input, state: {} })).not.toContain("**At a glance:**");
+});
+
+test("review glance counts only the latest matching review's stored blocking findings", () => {
+  const finding = {
+    severity: "major" as const,
+    security: false,
+    file: "",
+    line: 0,
+    title: "Nonblocking later-round finding",
+    detail: "Detail",
+    suggestion: "Fix",
+  };
+  const input: ReportInput = {
+    success: false,
+    runId: "r",
+    runUrl: "u",
+    prompt: "test",
+    invocations: [],
+    totals: { costUsd: 0, costEquivUsd: 0 },
+    state: {
+      reviewedSha: "current",
+      lastReview: {
+        modelId: "reviewer",
+        verdict: "request_changes",
+        summary: "Review summary",
+        findings: [finding],
+      },
+      reviewHistory: [
+        { round: 1, sha: "earlier", blocking: [finding], followUps: [] },
+        { round: 2, sha: "current", blocking: [], followUps: [finding] },
+      ],
+    },
+  };
+  expect(renderReport(input)).toContain("**At a glance:** review: request_changes (0 blocking)");
+  for (const reviewHistory of [undefined, []]) {
+    expect(renderReport({ ...input, state: { ...input.state, reviewHistory } })).toContain(
+      "**At a glance:** review: request_changes\n",
+    );
+  }
+  expect(renderReport({ ...input, state: { ...input.state, reviewedSha: "earlier" } })).toContain(
+    "**At a glance:** review: request_changes\n",
+  );
 });

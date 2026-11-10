@@ -683,7 +683,24 @@ test("arguments and quoted Request boundaries are strict without rewriting conte
     expect(() => replayArguments(args)).toThrow();
   expect(replayRequest(body)).toBe(prompt);
   expect(replayRequest("## Request\n\n> line\r\n> next\r\n> \n\n## Checks\n")).toBe("line\r\nnext\r\n");
+  const quote = prompt
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+  expect(
+    replayRequest(
+      `## Request\n\n<details><summary>Full request (10 words)</summary>\n\n${quote}\n\n</details>\n\n## Checks\n`,
+    ),
+  ).toBe(prompt);
+  expect(
+    replayRequest(
+      "## Request\r\n\r\n<details><summary>Full request (2 words)</summary>\r\n\r\n> line\r\n> next\r\n> \n\r\n</details>\r\n\r\n## Checks\n",
+    ),
+  ).toBe("line\r\nnext\r\n");
   for (const request of [
+    "## Request\n\n<details><summary>Full request (1 words)</summary>\n\n> ok",
+    "## Request\n\n<details><summary>Full request (1 words)</summary>\n> ok\n\n</details>",
+    "## Request\n\n<details><summary>Full request (1 words)</summary>\n\nnot quoted\n\n</details>",
     "",
     "## Request\n\n> ",
     "## Request\n\nnot quoted",

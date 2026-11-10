@@ -368,7 +368,11 @@ Flow: build
 
 ## Request
 
+<details><summary>Full request (2 words)</summary>
+
 > Fix input
+
+</details>
 
 ## Implementer's summary
 

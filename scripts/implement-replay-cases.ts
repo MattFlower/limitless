@@ -41,11 +41,19 @@ export function replayArguments(args: string[]) {
 export function replayRequest(body: string): string {
   const sections = body.split(/^## Request\r?\n/m);
   if (sections.length !== 2) throw new Error("Missing or ambiguous quoted Request block");
-  const block =
+  let block =
     (sections[1] ?? "")
       .split(/^## /m)[0]
       ?.replace(/^\r?\n/, "")
       .replace(/\n+$/, "") ?? "";
+  if (block.startsWith("<details>")) {
+    const collapsed =
+      /^<details><summary>Full request \(\d+ words\)<\/summary>\r?\n\r?\n([\s\S]*)\r?\n\r?\n<\/details>$/.exec(
+        block.replace(/[\r\n]+$/, ""),
+      );
+    if (!collapsed) throw new Error("Malformed collapsed Request block");
+    block = collapsed[1] ?? "";
+  }
   const lines = block.split("\n");
   if (lines.some((line) => line !== ">" && !line.startsWith("> ")))
     throw new Error("Malformed quoted Request block");
